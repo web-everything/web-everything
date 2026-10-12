@@ -170,6 +170,29 @@ export function unmergedPaths(porcelain) {
   return out;
 }
 
+/** A refusal the launcher itself wrote: the only kind of error whose message may be posted to the public PR. */
+export class LauncherError extends Error {}
+
+const SCRATCH_RE = /^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/;
+
+/**
+ * PURE. Paths a conflicted merge still needs `git add` for: unmerged rows plus anything whose WORKTREE column differs
+ * from the index (agent edits, deletions, untracked files). Changes the merge already staged (clean deletions, renames,
+ * additions) have a blank worktree column and are skipped: their old paths are gone from the index, so `git add` fails.
+ */
+export function unstagedPaths(porcelain) {
+  const records = String(porcelain ?? '').split('\0');
+  const paths = [];
+  for (let i = 0; i < records.length; i++) {
+    const row = records[i];
+    if (!row) continue;
+    const code = row.slice(0, 2);
+    if (/[RC]/.test(code[0])) i++; // the rename/copy source is never staged on its own
+    if (code[1] !== ' ' || UNMERGED_CODES.has(code)) paths.push(row.slice(3));
+  }
+  return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+}
+
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
 export function changedPaths(porcelain) {
   const records = String(porcelain ?? '').split('\0');
@@ -180,7 +203,35 @@ export function changedPaths(porcelain) {
     paths.push(row.slice(3));
     if (/[RC]/.test(row.slice(0, 2))) paths.push(records[++i]);
   }
-  return [...new Set(paths.filter(p => p && !/^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/.test(basename(p))))];
+  return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+}
+
+/** `merge` attribute values that still produce in-file conflict markers (unspecified, set, or the built-in text/union drivers). */
+const TEXT_MERGE_ATTRS = new Set(['unspecified', 'set', 'text', 'union']);
+const OID_RE = /^[0-9a-f]{40,64}$/;
+
+/**
+ * Which unmerged paths git merged as BINARY, i.e. left one side's bytes in the worktree with no conflict markers (so a
+ * marker scan would call them resolved). `git diff --numstat` cannot tell: it prints `0\t0` for an unmerged path. Instead:
+ * a `merge` attribute that is unset or names another driver, or any pair of the three index blobs that git diffs as binary
+ * (NUL in the first 8000 bytes of either side — the same test its merge uses, on all of base/ours/theirs).
+ */
+export function binaryConflictPaths(git, paths) {
+  const binary = new Set();
+  if (!paths.length) return binary;
+  const attrs = git('check-attr', '-z', 'merge', '--', ...paths).split('\0');
+  for (let i = 0; i + 2 < attrs.length; i += 3) if (!TEXT_MERGE_ATTRS.has(attrs[i + 2])) binary.add(attrs[i]);
+  const stages = new Map();
+  for (const entry of git('ls-files', '-u', '-z', '--', ...paths).split('\0')) {
+    const m = /^\d+ ([0-9a-f]+) ([123])\t([\s\S]*)$/.exec(entry);
+    if (!m || !OID_RE.test(m[1])) continue;
+    stages.set(m[3], { ...stages.get(m[3]), [m[2]]: m[1] });
+  }
+  for (const [path, s] of stages) {
+    const pairs = [[s[2], s[3]], [s[1], s[2]], [s[1], s[3]]].filter(([a, b]) => a && b && a !== b);
+    if (pairs.some(([a, b]) => git('diff', '--numstat', '--no-ext-diff', '--no-textconv', a, b).startsWith('-\t-\t'))) binary.add(path);
+  }
+  return binary;
 }
 
 /**
@@ -231,7 +282,7 @@ export function renderPrContext(json) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const found = comments.filter((c) => CHANGES_COMMENT_RE.test(String(c?.body ?? '')));
   const latest = found.sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))).at(-1);
-  if (!latest) throw new Error('no-finding: the PR has no changes-requested or advisory comment to apply');
+  if (!latest) throw new LauncherError('no-finding: the PR has no changes-requested or advisory comment to apply');
   return [
     '## PR CONTEXT (fetched by the launcher)',
     `Title: ${String(pr?.title ?? '')}`,
@@ -328,7 +379,7 @@ export async function runFixCli(argv = [], {
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
     // `@pr-base`: the dispatcher or launcher needs the live PR base; never guess `main`.
     const target = mergeOnto === PR_BASE_MERGE_TARGET ? String(prHead.baseRefName ?? '').trim() : mergeOnto;
-    if (mergeOnto && !target) throw new Error('cannot resolve PR base for conflict merge');
+    if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     const comments = await readComments(pr, { repo: launch.repo });
     const prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
@@ -349,7 +400,7 @@ export async function runFixCli(argv = [], {
     before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
-    if (risky.length) throw new Error(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
+    if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     const rearm = () => run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
@@ -370,10 +421,17 @@ export async function runFixCli(argv = [], {
     let unmerged = [];
     let mergePrompt = '';
     if (target) {
-      if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new Error(`invalid merge ref: ${target}`);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new LauncherError(`invalid merge ref: ${target}`);
       git('check-ref-format', '--branch', target);
       git('fetch', 'origin', target);
-      abortMerge = () => { if (inMerge()) git('merge', '--abort'); };
+      // Runs from the catch after the agent may have rewritten the lane config: `merge --abort` checks files out through
+      // any smudge filter, so re-verify the config first and, on a mismatch, leave the lane to be discarded instead.
+      abortMerge = () => {
+        if (!inMerge()) return;
+        const now = laneConfig();
+        if (now !== configBefore || riskyLaneConfig(now).length) throw new LauncherError('lane git config changed; not running merge --abort in it');
+        git('merge', '--abort');
+      };
       try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
       catch (e) {
         const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
@@ -381,12 +439,11 @@ export async function runFixCli(argv = [], {
         // Only a text both-modified/both-added conflict can be resolved by editing one file. Anything else (binary,
         // modify/delete, rename) is aborted BEFORE the agent runs and recorded as failed; after ROUTED_CODEX_MAX_UNPRODUCTIVE such
         // consecutive unproductive runs on the same head, the next repair falls back to Claude.
-        const binary = new Set(git('diff', '--numstat', '-z', '--', ...conflicts.map(c => c.path)).split('\0')
-          .filter(row => row.startsWith('-\t-\t')).map(row => row.slice(4)));
+        const binary = binaryConflictPaths(git, conflicts.map(c => c.path));
         const bad = conflicts.filter(c => !EDITABLE_CONFLICT_CODES.has(c.code) || binary.has(c.path));
         if (bad.length) {
           git('merge', '--abort');
-          throw new Error(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${binary.has(c.path) ? `${c.code} binary` : c.code})`).join(', ')}`);
+          throw new LauncherError(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${binary.has(c.path) ? `${c.code} binary` : c.code})`).join(', ')}`);
         }
         unmerged = conflicts.map(c => c.path);
       }
@@ -416,8 +473,9 @@ export async function runFixCli(argv = [], {
     } : {}) });
     finalMessage = agentFinalMessage(spawned) || finalMessage;
     const configAfterAgent = laneConfig();
-    if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new Error('lane git config changed while the agent ran; refusing to push');
-    const paths = changedPaths(git('status', '--porcelain=v1', '-z', '--untracked-files=all'));
+    if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
+    const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
+    const paths = changedPaths(statusAfterAgent);
     if (inMerge()) {
       // Every conflicted path is a text UU/AA conflict (checked above), so it must still exist as a regular file in the
       // lane with no conflict markers; a missing, symlinked, hardlinked or escaping path counts as unresolved.
@@ -433,9 +491,9 @@ export async function runFixCli(argv = [], {
       });
       if (unresolved.length) {
         git('merge', '--abort');
-        throw new Error(`conflict unresolved in ${unresolved.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
+        throw new LauncherError(`conflict unresolved in ${unresolved.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       }
-      const stage = [...new Set([...unmerged, ...paths])];
+      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
       if (stage.length) git('add', '--', ...stage);
       commitMerge();
     } else if (paths.length) {
@@ -456,7 +514,7 @@ export async function runFixCli(argv = [], {
       // risky, and run the push with the code-running keys pinned inert (env, so no gap after the check) and no hooks.
       const configAfter = laneConfig();
       if (configAfter !== configBefore || riskyLaneConfig(configAfter).length) {
-        throw new Error('lane git config changed while the agent ran; refusing to push');
+        throw new LauncherError('lane git config changed while the agent ran; refusing to push');
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
@@ -471,7 +529,7 @@ export async function runFixCli(argv = [], {
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
     outcome = 'failed'; reason = `${String(e?.message ?? e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
-    if (!finalMessage && e instanceof Error && !['status', 'signal', 'stderr', 'stdout', 'pid'].some(key => key in e)) {
+    if (!finalMessage && e instanceof LauncherError) {
       finalMessage = e.message;
     }
     try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }

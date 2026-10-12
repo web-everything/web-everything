@@ -305,7 +305,9 @@ describe('runFixCli', () => {
       if (args.includes('--git-path')) return 'MERGE_HEAD';
       if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
       if (args.includes('status')) return 'UD gone.txt\0UU img.png\0UU ok.txt\0';
-      if (args.includes('--numstat')) return '-\t-\timg.png\0' + '2\t1\tok.txt\0';
+      if (args.includes('check-attr')) return '';
+      if (args.includes('ls-files')) return [['a', 2, 'img.png'], ['b', 3, 'img.png'], ['c', 2, 'ok.txt'], ['d', 3, 'ok.txt']].map(([o, s, p]) => `100644 ${o.repeat(40)} ${s}\t${p}\0`).join('');
+      if (args.includes('--numstat')) return args.includes('a'.repeat(40)) ? '-\t-\timg.png\0' : '2\t1\tok.txt\0';
       if (args.includes('--abort')) merging = false;
       return m.run(cmd, args, opts);
     };
@@ -316,6 +318,157 @@ describe('runFixCli', () => {
     expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
     expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed',
       reason: 'conflict not resolvable by editing files: gone.txt(UD), img.png(UU binary)' }));
+  });
+  // Real-git harness: `main` = the PR head, `target` = the base it conflicts with. Fetch/push are stubbed; all merge IO is real.
+  const withRealMerge = async (setup, { agent, extra = [] }, check) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-real-merge-'));
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
+    const git = (...args) => execFileSync('git', [...HARDENED_GIT_ARGS, ...args], { cwd: dir, env, encoding: 'utf8', stdio: 'pipe' });
+    try {
+      git('init', '--initial-branch=main');
+      setup.base({ dir, git });
+      git('add', '-A'); git('commit', '-m', 'base');
+      git('checkout', '-b', 'target');
+      setup.theirs({ dir, git });
+      git('add', '-A'); git('commit', '-m', 'theirs');
+      git('update-ref', 'refs/remotes/origin/target', git('rev-parse', 'HEAD').trim());
+      git('checkout', 'main');
+      setup.ours({ dir, git });
+      git('add', '-A'); git('commit', '-m', 'ours');
+      const m = mk([]);
+      m.spawn.mockImplementation(async () => { agent({ dir }); return { finalMessage: 'resolved' }; });
+      const run = (cmd, args, opts) => {
+        if (cmd === 'git') {
+          m.calls.push([cmd, ...args]);
+          if (args.includes('fetch') || args.includes('push')) return '';
+          return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe' });
+        }
+        if (args.includes('acquire')) return dir;
+        return m.run(cmd, args, opts);
+      };
+      const recordOutcome = vi.fn();
+      const out = await runFixCli([...argv, '--merge-onto=target', ...extra], { ...m.io, run, recordOutcome });
+      await check({ out, m, git, dir, recordOutcome });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  it('aborts a real binary UU conflict before the agent runs (git prints 0/0 numstat for unmerged binaries)', async () => {
+    const bin = (...bytes) => Buffer.from(bytes);
+    await withRealMerge({
+      base: ({ dir }) => writeFileSync(join(dir, 'img.bin'), bin(0, 1, 2)),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'img.bin'), bin(0, 3, 4)),
+      ours: ({ dir }) => writeFileSync(join(dir, 'img.bin'), bin(0, 5, 6)),
+    }, { agent: () => {} }, async ({ out, m, git, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed',
+        reason: 'conflict not resolvable by editing files: img.bin(UU binary)' }));
+      expect(git('status', '--porcelain')).toBe('');
+    });
+  });
+  it('aborts a real conflict whose binary side is only the other stage, and one marked -merge', async () => {
+    await withRealMerge({
+      base: ({ dir }) => { writeFileSync(join(dir, 'a.dat'), 'one\n'); writeFileSync(join(dir, 'b.txt'), 'one\n'); writeFileSync(join(dir, '.gitattributes'), 'b.txt -merge\n'); },
+      theirs: ({ dir }) => { writeFileSync(join(dir, 'a.dat'), Buffer.from([0, 9, 9])); writeFileSync(join(dir, 'b.txt'), 'theirs\n'); },
+      ours: ({ dir }) => { writeFileSync(join(dir, 'a.dat'), 'text ours\n'); writeFileSync(join(dir, 'b.txt'), 'ours\n'); },
+    }, { agent: () => {} }, async ({ out, m, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('a.dat(UU binary)') }));
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('b.txt(UU binary)') }));
+    });
+  });
+  it('commits a resolved text conflict alongside a clean base deletion and rename', async () => {
+    await withRealMerge({
+      base: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'base\n'); writeFileSync(join(dir, 'gone.txt'), 'gone\n'); writeFileSync(join(dir, 'old.txt'), 'rename me please, enough content to detect\n'.repeat(5)); },
+      theirs: ({ dir, git }) => { writeFileSync(join(dir, 'file.txt'), 'theirs\n'); git('rm', 'gone.txt'); git('mv', 'old.txt', 'new.txt'); },
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n'),
+    }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'resolved\n') }, async ({ out, m, git, dir }) => {
+      expect(out.code).toBe(0);
+      expect(m.calls.some(c => c.includes('push'))).toBe(true);
+      expect(git('status', '--porcelain')).toBe('');
+      expect(existsSync(join(dir, 'gone.txt'))).toBe(false);
+      expect(existsSync(join(dir, 'new.txt'))).toBe(true);
+      expect(readFileSync(join(dir, 'file.txt'), 'utf8')).toBe('resolved\n');
+      expect(git('rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ')).toHaveLength(3);
+    });
+  });
+  it('still stages files the agent changed or created beyond the conflicted ones when merging', async () => {
+    await withRealMerge({
+      base: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'base\n'); writeFileSync(join(dir, 'other.txt'), 'x\n'); },
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n'),
+    }, { agent: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'resolved\n'); writeFileSync(join(dir, 'other.txt'), 'y\n'); writeFileSync(join(dir, 'added.txt'), 'z\n'); } },
+    async ({ out, git }) => {
+      expect(out.code).toBe(0);
+      expect(git('show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort()).toEqual(['added.txt', 'file.txt', 'other.txt']);
+    });
+  });
+  it('never runs merge --abort in the agent-writable lane after its git config changed', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let merging = false;
+    let listed = 0;
+    const run = (cmd, args, opts) => {
+      m.calls.push([cmd, ...args]);
+      if (args.includes('--show-scope')) return listed++ === 0 ? 'local\0user.name=x\0' : 'local\0filter.x.smudge=evil\0';
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU file.txt\0';
+      if (args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile: () => '<<<<<<< HEAD\n' });
+    expect(out.code).toBe(1);
+    expect(m.spawn).toHaveBeenCalledOnce();
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+    // The same guard covers the crash path: the agent throws after rewriting the config.
+    const m2 = mk(['aaa', 'aaa']);
+    let merging2 = false;
+    let listed2 = 0;
+    m2.spawn.mockImplementation(async () => { throw new Error('agent crashed'); });
+    const run2 = (cmd, args, opts) => {
+      m2.calls.push([cmd, ...args]);
+      if (args.includes('--show-scope')) return listed2++ === 0 ? 'local\0user.name=x\0' : 'local\0filter.x.smudge=evil\0';
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging2 = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU file.txt\0';
+      return m2.run(cmd, args, opts);
+    };
+    expect((await runFixCli([...argv, '--merge-onto=main'], { ...m2.io, run: run2, fileExists: p => (p.endsWith('MERGE_HEAD') ? merging2 : true), readFile: () => '<<<<<<< HEAD\n' })).code).toBe(1);
+    expect(m2.calls.some(c => c.includes('--abort'))).toBe(false);
+  });
+  it('still aborts the merge after a crash when the lane git config is unchanged', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let merging = false;
+    m.spawn.mockImplementation(async () => { throw new Error('agent crashed'); });
+    const run = (cmd, args, opts) => {
+      m.calls.push([cmd, ...args]);
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU file.txt\0';
+      if (args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile: () => '<<<<<<< HEAD\n' })).code).toBe(1);
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+  });
+  it('does not post an fs or parse error message to the PR (only launcher-authored refusals)', async () => {
+    const m = mk(['aaa']);
+    const comments = [];
+    const fsError = Object.assign(new Error("ENOENT: no such file, mkdtemp '/Users/someone/private/we-fix-x'"), { code: 'ENOENT', errno: -2, syscall: 'mkdtemp' });
+    const run = (cmd, args, opts) => {
+      if (args[0] === 'config') throw fsError;
+      if (args.includes('comment')) { comments.push(readFileSync(args.at(-1), 'utf8')); return ''; }
+      return m.run(cmd, args, opts);
+    };
+    const recordRouted = entry => ({ 'we#7': [entry, entry] });
+    expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).not.toContain('/Users/someone');
+    expect(comments[0]).not.toContain('ENOENT');
   });
   it('unmergedPaths keeps only unmerged rows and skips rename sources', () => {
     expect(unmergedPaths('R  new\0old\0UU a b\0 M c\0DD d\0AA e\0')).toEqual([
