@@ -415,6 +415,24 @@ describe('the merge-queue ruleset body matches rulesetSuggestion (docs/agent/mer
     expect(body.conditions.ref_name.include).toEqual(['~DEFAULT_BRANCH']);
     expect(body.rules.map((r) => r.type).sort()).toEqual(['merge_queue', 'required_status_checks', 'workflows']);
   });
+
+  // The body is "the current ruleset plus additions": everything outside the added rules must equal the saved GET,
+  // or the operator's PUT silently drops it (the admin bypass the hand-merges and the rollback rely on, above all).
+  const rollback = JSON.parse(readFileSync(join(root, 'scripts', 'rulesets', 'main-required-checks.rollback.json'), 'utf8'));
+  const rollbackRule = (type) => rollback.rules.filter((r) => r.type === type);
+  it('keeps the current ruleset fields outside the added rules: name, target, enforcement, conditions, admin bypass', () => {
+    for (const key of ['name', 'target', 'enforcement', 'conditions', 'bypass_actors']) expect(body[key], key).toEqual(rollback[key]);
+    expect(body.bypass_actors).toContainEqual({ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' });
+  });
+  it('keeps every current required check and its parameters, and adds only merge-gate', () => {
+    expect(rollbackRule('required_status_checks')).toHaveLength(1);
+    const { required_status_checks: was, ...wasParams } = rollbackRule('required_status_checks')[0].parameters;
+    const { required_status_checks: now, ...nowParams } = rule('required_status_checks')[0].parameters;
+    expect(nowParams).toEqual(wasParams);
+    for (const c of was) expect(now).toContainEqual(c);
+    expect(now.filter((c) => !was.some((w) => w.context === c.context)).map((c) => c.context)).toEqual(['merge-gate']);
+    expect(rollback.rules.map((r) => r.type)).toEqual(['required_status_checks']);
+  });
 });
 
 describe('enqueue clearance reader (for merge-gate)', () => {

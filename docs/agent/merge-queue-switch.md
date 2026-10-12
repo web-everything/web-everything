@@ -52,6 +52,8 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
 - [ ] `merge-gate` runs in **enforce**. PR #4715 does not itself set `mergeGate.mode`; enforce needs
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
   (`we:scripts/lib/merge-gate-ci.mjs`, `loadMergeGateMode`). Confirm the merge-gate log shows `mode=enforce`.
+  Apply step 4 re-checks this with a script and refuses to go on unless it prints `enforce`: in `shadow` the
+  required `merge-gate` check passes with "SHADOW: would HOLD", so the queue would merge PRs the drain holds.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
 - [ ] Card `xjdnlk0` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
   opened, synchronize and reopened (plus `merge_group`), so a label or body edit may not re-run the pinned
@@ -140,7 +142,17 @@ Two paths get past this, so close both for the whole switch:
    git -C <drain clone> merge-base --is-ancestor <merge commit sha> HEAD && echo ok
    ```
 
-4. Apply the ruleset with the operator's personal gh, not the App token:
+4. Apply the ruleset with the operator's personal gh, not the App token. First, from a checkout of main that
+   has the step-2 merge commit, resolve the merge-gate mode exactly as CI does (repo settings, then the
+   `MERGE_GATE_MODE` repository variable), and do not run the PUT unless it exits 0:
+
+   ```bash
+   MERGE_GATE_MODE="$(env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh variable get MERGE_GATE_MODE --repo web-everything/web-everything 2>/dev/null)" \
+     node --input-type=module -e "import { loadMergeGateMode } from './scripts/lib/merge-gate-ci.mjs'; const r = loadMergeGateMode(); console.log('merge-gate mode=' + r.mode + ' (' + r.source + ')'); process.exit(r.mode === 'enforce' ? 0 : 1)"
+   ```
+
+   It must print `merge-gate mode=enforce`. An unset or unreadable variable counts as not set, so a missing
+   enforce setting prints `shadow` and exits 1. Then apply:
 
    ```bash
    env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh api -X PUT repos/web-everything/web-everything/rulesets/24883772 --input scripts/rulesets/main-required-checks.merge-queue.json
