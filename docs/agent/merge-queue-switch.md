@@ -84,6 +84,19 @@ The drain reads `mergeDelivery` from its own clone's `scripts/settings/*.json`, 
 the drain lands something or its per-pass refresh succeeds (a failed refresh is non-fatal). So unfreeze only
 after every drain clone has the settings commit (the clone check below).
 
+Two paths get past this, so close both for the whole switch:
+
+- **A published main-fix PR.** The freeze does not hold it (the exemption above). If main goes red and a fix PR
+  is published while the switch is under way, stop and do not go on to the next step until that PR has landed or
+  been withdrawn and nothing is published. This matters most before the ruleset step: that is why the clone check
+  comes before the ruleset, not after it. A drain that already has the new setting only tries to enqueue, and
+  without the ruleset the enqueue fails, so nothing is recorded as landed.
+- **A drain run from a checkout that is not a drain clone.** The conveyor's `pr-watch` runs
+  `scripts/merge-ai-prs.mjs` from its own checkout (its event-driven land), and a manual `/drain` uses whichever
+  checkout it runs in. Such a checkout reads its own `scripts/settings/*.json`, which the clone check does not
+  cover. Stop the conveyor (or run `pr-watch` with `--no-fast-drain`) and run no manual drain until the last
+  apply step, or first pull main into each such checkout.
+
 ## Apply order
 
 1. Freeze the drain, then wait for the pass that was already running to end and for the next pass to log
@@ -104,8 +117,17 @@ after every drain clone has the settings commit (the clone check below).
    gh pr view 4950 --json state,mergeCommit --jq '.state, .mergeCommit.oid'   # MERGED, <sha>
    ```
 
-   Until step 3, the drain is `github-merge-queue` against an unqueued main, but it is frozen, so nothing runs.
-3. Apply the ruleset with the operator's personal gh, not the App token:
+   Until step 4, the drain is `github-merge-queue` against an unqueued main, but it is frozen, so nothing runs.
+3. Check every drain clone has the settings commit from step 2 (still frozen; a frozen pass still refreshes, so
+   wait one pass if a clone is behind). Do this **before** the ruleset, so no clone is still `drain-direct` once
+   the queue exists. Clones are listed by `daemonCloneRoots` in `we:scripts/lib/daemon-clone-registry.mjs`; for
+   each:
+
+   ```bash
+   git -C <drain clone> merge-base --is-ancestor <merge commit sha> HEAD && echo ok
+   ```
+
+4. Apply the ruleset with the operator's personal gh, not the App token:
 
    ```bash
    env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh api -X PUT repos/web-everything/web-everything/rulesets/24883772 --input scripts/rulesets/main-required-checks.merge-queue.json
@@ -123,14 +145,6 @@ after every drain clone has the settings commit (the clone check below).
    ```
 
    It must list `ci.yml`, `merge-gate.yml`, and `soak-replay-gate.yml`, each at `refs/heads/main`.
-4. Check every drain clone has the settings commit from step 2 (still frozen; a frozen pass still refreshes, so
-   wait one pass if a clone is behind). Clones are listed by `daemonCloneRoots` in
-   `we:scripts/lib/daemon-clone-registry.mjs`; for each:
-
-   ```bash
-   git -C <drain clone> merge-base --is-ancestor <merge commit sha> HEAD && echo ok
-   ```
-
 5. Unfreeze, so the next pass reads the new setting and starts enqueueing:
 
    ```bash
@@ -143,7 +157,10 @@ after every drain clone has the settings commit (the clone check below).
    merge-delivery policy: strategy=github-merge-queue (tool), batchSize=5 (tool), maxGroupWaitMinutes=5 (tool), mergeMethod=merge (tool)
    ```
 
-   If step 2 fails, nothing has changed: unfreeze and stop. If step 3 fails after step 2 succeeded, stay frozen.
+   If it logs `strategy=drain-direct` instead, freeze again at once (step 1) and re-check the clones (step 3)
+   before you unfreeze. Once it logs `github-merge-queue`, restart the conveyor (or drop `--no-fast-drain`).
+
+   If step 2 fails, nothing has changed: unfreeze and stop. If step 4 fails after step 2 succeeded, stay frozen.
    Retry it only for a transient error (a network failure or HTTP 5xx). For a refused body (HTTP 4xx) or a
    missing `workflows` rule, run the rollback below.
 
@@ -172,7 +189,8 @@ The order is the reverse of apply: ruleset first, then the settings revert, so t
 The same precondition applies (no published red).
 
 1. Freeze and wait for a post-freeze pass with no `gh pr merge`, as in apply step 1
-   (`--reason="merge-queue switch: rollback"`).
+   (`--reason="merge-queue switch: rollback"`). Stop the conveyor (or use `--no-fast-drain`) and run no manual
+   drain, as above.
 2. Restore the ruleset from the saved body, stripping read-only fields:
 
    ```bash
@@ -184,6 +202,7 @@ The same precondition applies (no published red).
 4. Put the drain back: revert this PR (remove the `mergeDelivery` block, or set its `strategy` to
    `drain-direct`) and merge the revert yourself with `gh pr merge <revert PR> --merge` (the frozen drain will
    not). Confirm `gh pr view <revert PR> --json state,mergeCommit` shows `MERGED`.
-5. Check every drain clone has the revert commit (apply step 4), then unfreeze
+5. Check every drain clone has the revert commit (apply step 3), then unfreeze
    (`node scripts/readiness/red-main-remediation.mjs unfreeze`) and confirm the next pass logs
-   `strategy=drain-direct`.
+   `strategy=drain-direct`. If it still logs `github-merge-queue`, freeze again and re-check the clones. Then
+   restart the conveyor.
