@@ -40,7 +40,9 @@ import { readAgyHold } from '../lib/antigravity-run-evidence.mjs';
 import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
-import { readFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, readdirSync, existsSync, openSync, fstatSync, readSync, closeSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -54,13 +56,13 @@ import {
 import {
   agentArgsFromEnv, briefPath, createDispatchSinks, defaultLoadItems, findItem, REPO_ROOT,
 } from './dispatch-lane-io.mjs';
-import { resolveDispatchRoute as decideDispatchRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { resolveDispatchRoute as decideDispatchRoute, readRoutingPolicy, resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
 import { assertMainNotStale } from './review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
-import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
+import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -77,14 +79,59 @@ import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from '../conveyor/ci-heal-salvage.mjs';
 
-import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixDispatchKilled,
-  fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
+import { loadFixerLadder } from '../conveyor/fixer-ladder.mjs';
+import { planRoundEscalation } from '../conveyor/fix-resume.mjs';
+import { deliveryDispatchLogPath } from './detached-dispatch.mjs';
+import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixLoopSessionRows, fixLoopDisposition,
+  classifyFixRunOutcome, fixDispatchKilled, fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
 
 const defaultFixLoop = {
   readRows: () => isUnderTest() && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
   append: row => { if (!isUnderTest() || process.env.WE_FIX_LOOP_LEDGER) appendFixLoopRow(row); },
   killed: () => isUnderTest() && !process.env.WE_FIX_DISPATCH_KILL_FILE ? false : fixDispatchKilled(),
 };
+
+/** PRs #4992/#4993/#4965, 2026-10-12: bounded launcher evidence must never prevent dispatch. */
+export function readSessionLog(sessionSlug, root = REPO_ROOT, { read = readSync, allowTruncated = true } = {}) {
+  let fd;
+  try {
+    fd = openSync(deliveryDispatchLogPath(sessionSlug, root), 'r');
+    const size = fstatSync(fd).size, start = Math.max(0, size - 64 * 1024);
+    if (start > 0 && !allowTruncated) return '';
+    const buffer = Buffer.alloc(size - start);
+    const count = read(fd, buffer, 0, buffer.length, start);
+    if (count !== buffer.length && !allowTruncated) return '';
+    const text = buffer.subarray(0, count).toString('utf8');
+    return start > 0 ? (text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '') : text;
+  } catch { return ''; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+function currentCheckoutBuild(root) {
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 64 * 1024 }).trim(); }
+  catch { return null; }
+}
+function postFixLoopParkComment({ repoSlug, pr, body }) {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-heal-park-'));
+  try {
+    const path = join(dir, 'comment.txt');
+    writeFileSync(path, body);
+    execFileSyncThrottled('gh', ['pr', 'comment', String(pr), '--repo', repoSlug, '--body-file', path], { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+/** Use the fixer's existing stronger rung, otherwise the routing policy's native Claude heal route. */
+export function resolveStrongerCiHealRoute({ loadLadder = loadFixerLadder, readPolicy = readRoutingPolicy,
+  resolveRoute = resolveOperationRoute } = {}) {
+  let table;
+  try { table = fixerTableFor(planRoundEscalation({ round: 3, fromRound: 3, fixerLadder: loadLadder() })); }
+  catch { table = null; }
+  if (table) return { policyRoute: { provider: 'claude', model: table.model, effort: table.effort, fallback: [] }, source: table.reason };
+  const policy = readPolicy();
+  const route = resolveRoute({ operation: 'ci-heal', available: ['claude'],
+    gateClosed: policy.criticalWorkGate.kinds.includes('ci-heal'), policy });
+  if (route?.provider !== 'claude') throw new Error('CI-heal stronger-model route did not resolve to Claude');
+  return { policyRoute: { provider: 'claude', model: route.model, effort: route.effort, fallback: [] }, source: 'routing-policy ci-heal default' };
+}
 
 function defaultSalvage({ entry, root, repoKey }) {
   if (isUnderTest() && !process.env.LANE_POOL_ROOT) return null;
@@ -171,6 +218,7 @@ export async function dispatchCiHeal(planned, {
   // sink launches it when the gate is open, the heal is not critical, and launching is on. Quota read
   // errors and an exhausted eligible roster refuse visibly; no exception silently selects a default.
   routeHeal = routeAvailableCiHeal,
+  resolveStrongerRoute = resolveStrongerCiHealRoute,
   pollAttempts = pollHealAttempts,
 } = {}) {
   // fix procedure (operator-approved 2026-09-27) — a live FIX CLAIM means another fixer owns this PR's repair;
@@ -222,14 +270,19 @@ export async function dispatchCiHeal(planned, {
       ITEM_NUM: planned.itemNum ?? '', PR_NUM: planned.pr, LANE_REF: planned.laneRef, LANE: planned.lane,
       SESSION_SLUG: sessionSlug, SCOPE: planned.scope.join(','), REASON: reason, ...tokens,
     }, BRIEF_REQUIRED_BY_KIND['ci-heal'], [...OPTIONAL_BRIEF_PLACEHOLDERS, 'ITEM_NUM', 'SCOPE'], REPO_AWARE_VALUE_PATTERNS);
-    const route = repo === 'we' ? routeHeal({ scope: planned.scope, reason }) : null;
+    const route = !planned.strongerModel && repo === 'we' ? routeHeal({ scope: planned.scope, reason }) : null;
+    const stronger = planned.strongerModel ? resolveStrongerRoute() : null;
+    if (stronger) {
+      if (stronger.policyRoute?.provider !== 'claude') throw new Error('stronger-model CI-heal requires a Claude policyRoute');
+      console.error(`ci-heal-pr-dispatch: PR #${planned.pr} stronger-model rung (claude) model=${stronger.policyRoute.model} effort=${stronger.policyRoute.effort} (source ${stronger.source})`);
+    }
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
     const out = await sinks[DISPATCH_EFFECT]({
       launchKind: 'ci-heal', prompt: withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
       // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry.
       pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' ? null : (route?.probationWorker ?? null),
-      routing: route,
+      routing: stronger ? { policyRoute: stronger.policyRoute } : route,
     });
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim
@@ -329,6 +382,8 @@ export async function runReconcileCiHealDispatch({
   salvage = defaultSalvage,
   fixLoop = defaultFixLoop,
   fixConfig = fixLoopConfig(),
+  currentBuild = () => currentCheckoutBuild(root),
+  postParkComment = postFixLoopParkComment,
   now = Date.now(),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
@@ -384,6 +439,8 @@ export async function runReconcileCiHealDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   const dispatched = [];
   const refusals = [];
+  let build = null;
+  try { build = await (fixLoop.currentBuild ?? currentBuild)(); } catch { /* Build lookup is best effort. */ }
   for (const entry of ciHealEntries) {
     if (fixLoop.killed()) {
       refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
@@ -413,13 +470,51 @@ export async function runReconcileCiHealDispatch({
     }
     let loopRows = [];
     try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
-    const loop = fixLoopState({ rows: loopRows, repo: repoKey, pr: entry.prNumber,
-      head: entry.headRefOid, now, config: fixConfig });
-    if (loop.held) {
-      refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
-        why: `${loop.count} ci-heal/fix sessions on head ${String(entry.headRefOid ?? '').slice(0, 7)} in ${fixConfig.windowHours}h with nothing pushed; auto-held until the head moves (WE_FIX_LOOP_HOLD=0 disables)` });
+
+    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now, config: fixConfig };
+    const raw = fixLoopState(identity);
+    const infraRows = [], sessionRows = fixLoopSessionRows(identity);
+    for (const session of new Set(raw.sessions)) {
+      let logText = '';
+      try { logText = await (fixLoop.readSessionLog ?? (slug => readSessionLog(slug, root, { allowTruncated: false })))(session); } catch { /* Unreadable logs never block. */ }
+      const matching = sessionRows.filter(row => row.session === session);
+      // These logs are shared across heads and runs and have no dispatch IDs.
+      // Never align a partial history, an older head, or a rolling-window slice.
+      const history = loopRows.filter(row => row?.repo === repoKey && row.pr === entry.prNumber
+        && row.session === session && ['ci-heal', 'fix'].includes(row.kind));
+      if (history.length !== matching.length || history.some(row => !matching.includes(row))) continue;
+      const terminals = String(logText ?? '').split('\n').map(classifyFixRunOutcome)
+        .filter(row => row?.pr === entry.prNumber);
+      if (terminals.length !== matching.length) continue;
+      terminals.forEach((outcome, i) => {
+        if (outcome.infra) infraRows.push(matching[i]);
+      });
+    }
+    const infraFailures = infraRows.length;
+    const loop = fixLoopState({ ...identity, infraFailures });
+    const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build });
+    const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
+    const counts = `${loop.count} ci-heal/fix sessions (${loop.rawCount} raw, ${loop.infraFailures} infrastructure discount) on head ${shortHead}`;
+    if (disposition.action === 'park' || disposition.action === 'parked') {
+      const why = `stood down to the operator queue on head ${shortHead}`;
+      try {
+        if (disposition.action === 'park') {
+          await postParkComment({ repoSlug: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber,
+            body: buildStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
+              detail: `${counts}; ${disposition.reason}. Head: ${entry.headRefOid}.` }) });
+          await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'park', reason: disposition.reason });
+        }
+        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-parked', why });
+      } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'fix-loop-park-failed', why: error.message }); }
       continue;
     }
+    if (disposition.action === 'hold') {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
+        why: `${counts}; re-arms on the stronger-model rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
+      continue;
+    }
+    const strongerModel = infraFailures >= 2 || disposition.action === 'rearm'
+      || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid);
     let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
     if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
     if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
@@ -447,6 +542,7 @@ export async function runReconcileCiHealDispatch({
       // entry (see this function's own docblock — "a CI-heal entry carries neither on `reconcile-core.mjs`'s
       // own `dispatch` row" was true of item/scope, never of `headRefOid`).
       headRefOid: entry.headRefOid ?? null,
+      ...(strongerModel ? { strongerModel: true } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — saved repair of a re-armed pause.
     };
 
@@ -456,8 +552,12 @@ export async function runReconcileCiHealDispatch({
     }
     planned.lane = lanes.shift();
     try {
-      // eslint-disable-next-line no-await-in-loop -- sequential by design: this repo's own lane pool is popped
-      // one at a time, so two entries in the same pass can never race for the same lane number.
+      if (disposition.action === 'rearm') {
+        await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'rearm', reason: disposition.reason });
+        console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} fix-loop-hold re-armed on head ${shortHead} (${disposition.reason}) → stronger-model rung (claude); rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})`);
+      }
+      if (infraFailures >= 2) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} codex launcher failed ${infraFailures}× on head ${shortHead} (infrastructure) → stronger-model rung (claude)`);
+      // eslint-disable-next-line no-await-in-loop -- sequential by design: each entry gets its own lane.
       const result = await dispatch(planned, { root, repo: repoKey, extraArgs: agentArgsFromEnv() });
       if (result?.held) {
         // #x0jphk5 — nothing was spawned, so the lane this iteration popped went unused — return it to the
@@ -470,7 +570,7 @@ export async function runReconcileCiHealDispatch({
       dispatched.push(result);
       try {
         await fixLoop.append({ repo: repoKey, pr: entry.prNumber, kind: 'ci-heal', head: entry.headRefOid,
-          session: result?.session ?? result?.sessionSlug ?? `ci-heal-${entry.prNumber}` });
+          session: result?.session ?? result?.sessionSlug ?? sessionSlugFor(null, 'ci-heal', entry.prNumber, '', repoKey), build });
       } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });

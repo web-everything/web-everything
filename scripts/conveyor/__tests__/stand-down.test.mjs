@@ -527,3 +527,12 @@ it('counts a live load-flake hold alongside terminal stand-downs, until the head
   expect(countStandDownComments([c, loadComment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T22:00:00Z')])).toBe(0);
   expect(standDownComments([c])).toEqual([]);
 });
+
+// PRs #4992/#4993/#4965, 2026-10-12: exhaustion is a visible operator handoff.
+it('builds a durable stand-down for an exhausted CI-heal loop', () => {
+  const body = buildStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
+    detail: '3 sessions on head abc1234; the Claude re-arm also produced nothing.' });
+  expect(body.startsWith(STAND_DOWN_MARKER)).toBe(true);
+  expect(body).toContain(STAND_DOWN_REASONS['fix-loop-exhausted']);
+  expect(body).toContain('<!-- stand-down reason=fix-loop-exhausted -->');
+});
