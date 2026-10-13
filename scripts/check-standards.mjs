@@ -83,6 +83,7 @@ import {
   findTestOnlyExports,
   scanPublishSecrets,
   scanHarnessScaffolding,
+  scanUnauthenticatedCommentMarkerParsers,
   findHandMaintainedRegistryIndex, REGISTRY_DISCOVERY_INDEX_FILES,
   findUnjournaledLaneMutations, LANE_MUTATION_FILES,
   findGitHookAllFlags,
@@ -1567,6 +1568,15 @@ mark("6f-i. PUBLISH-SEAM secret sweep on the committed corpus (#3015, under #297
 }
 
 mark("6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448)");
+// PR #5169: inline PR-comment markers must share the same trusted-author boundary.
+{
+  const files = SCOPE_TO_FILES ? [...EFFECTIVE_FILES]
+    : execFileSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\n');
+  const docs = files.filter(file => /^(scripts|skills-src)\/.*\.(mjs|js|ts)$/.test(file)
+    && !/__tests__|\.test\./.test(file) && existsSync(join(ROOT, file)))
+    .map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }));
+  for (const finding of scanUnauthenticatedCommentMarkerParsers(docs)) err(finding.message, finding.descriptor);
+}
 // ── 6f-i-c. REGISTRY-DISCOVERY anti-regression guard (#3729-style conflict prevention) ────────────
 // `soak/breaks/index.mjs` and `health-smells/index.mjs` build their registry by discovering every module file
 // in their own directory (`registry-discovery.mjs`) instead of a hand-maintained import list — the fix for the

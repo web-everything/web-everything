@@ -19,6 +19,8 @@ Shared flags: `--repo=owner/repo` defaults to `web-everything/web-everything`;
 `--actor`, `--channel`, `--reason` are required. Actor must be a registered
 operator login; channel must be nonblank and one line; reason is kept verbatim.
 `--preview` defaults to false. Exactly one target is accepted for each control.
+Item controls currently support only `web-everything/web-everything`; other repositories
+are rejected before reading coordination state or applying a mutation.
 `refresh --checkout=path` defaults to the script's repo root. `kind` defaults
 to `fix` and `n` to 1. Granting rounds requires the operator's own GitHub credential.
 Unpark does not bypass the clearance ceremony's evidence/independence refusals.
@@ -31,6 +33,8 @@ recorded action is not repeated on the same state. Sinks re-read and refuse stal
 plans. A mutation whose verification or record fails requires inspection before
 retrying; the record is evidence of verified completion, not a transaction journal.
 
-Preview refresh reads local git objects without fetching. If the PR head is not
-available in `--checkout`, the ancestry probe refuses rather than guessing.
+Refresh compares the PR head with main's live GitHub SHA. Preview reads local git
+objects without fetching; a missing main object conservatively plans a refresh.
+Apply fetches main when that object is missing. If the PR head is not available in
+`--checkout`, the ancestry probe refuses rather than guessing.
 A prepare retry changes dispatch eligibility once; it does not promise success.

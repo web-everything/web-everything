@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { planRoundExtension } from './extend-rounds.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { decideRearm } from '../conveyor/rearm-review.mjs';
@@ -13,16 +13,18 @@ export const OPERATOR_CONTROL_EFFECT = 'operator.control';
 export function validateOperatorAttribution({ actor, channel, reason }) {
   if (typeof actor !== 'string' || !OPERATOR_LOGINS.includes(actor.toLowerCase())) throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this action is the operator's`);
   if (typeof reason !== 'string' || !reason.trim()) throw new Error("--reason is required: the operator's words, verbatim");
-  if (typeof channel !== 'string' || !channel.trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
+  if (typeof channel !== 'string' || !channel.trim() || /[\r\n\u2028\u2029]/.test(channel)) throw new Error('--channel is required and must be one line');
   return { actor: actor.toLowerCase(), channel: channel.trim(), reason };
 }
 export function buildOperatorActionComment(record) {
   return [`🛠 operator action — ${record.op}`, '', `Operator @${record.actor} via ${record.channel}:`,
-    `> ${record.reason.replace(/\r?\n/g, '\n> ')}`, '', `Undo: ${record.details.undo}`, '',
-    `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')} -->`].join('\n');
+    `> ${record.reason.replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${record.details.undo}`, '',
+    `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')} -->`].join('\n');
 }
 export function parseOperatorActions(comments = []) {
-  return comments.flatMap(c => [...String(c?.body ?? c).matchAll(/^<!-- operator-action: (.*?) -->$/gm)].flatMap(m => {
+  return comments.filter(isTrustedMarkerAuthor).flatMap(c => String(c.body ?? '').split(/\r\n|[\r\n\u2028\u2029]/).flatMap(line => {
+    const m = /^<!-- operator-action: (.*?) -->$/.exec(line);
+    if (!m) return [];
     try { const r = JSON.parse(m[1]); return r.version === 1 && CONTROL_OPS.includes(r.op) && typeof r.key === 'string' ? [r] : []; } catch { return []; }
   }));
 }
@@ -44,6 +46,7 @@ export function validateControlInput(name, input) {
   if (!Number.isSafeInteger(pr) || pr < 0 || typeof item !== 'string' || typeof file !== 'string') throw new Error('invalid target');
   if (Number(pr > 0) + Number(Boolean(item)) + Number(Boolean(file)) !== 1) throw new Error('give exactly one target: --pr, --item or --file');
   if (item && (!['unpark', 'retry-prepare'].includes(name) || !/^[1-9]\d*$/.test(item))) throw new Error('--item must be a positive numeric card id for unpark or retry-prepare');
+  if (item && input.repo !== CONSTELLATION_REPOS.we.slug) throw new Error('item controls support only the web-everything/web-everything repository');
   if (name === 'retry-prepare' && !item) throw new Error('retry-prepare requires --item');
   if (file && (name !== 'clear-claim' || file.startsWith('/') || file.split('/').includes('..') || /[\r\n]/.test(file))) throw new Error('--file must be a repo path for clear-claim');
   if (name === 'grant-rounds' && !['fix', 'review'].includes(input.kind ?? 'fix')) throw new Error('--kind must be fix or review');
@@ -77,7 +80,7 @@ export function planOperatorControl(name, read, input) {
   } else if (name === 'refresh') {
     undo = 'restore the previous head only through a reviewed content-preserving git repair';
     if (read.crossRepo) throw new Error('refresh refuses cross-repo heads');
-    if (read.state !== 'OPEN' || read.containsMain) why = read.state !== 'OPEN' ? 'PR is not open' : 'PR head already contains origin/main';
+    if (read.state !== 'OPEN' || read.containsMain) why = read.state !== 'OPEN' ? 'PR is not open' : 'PR head already contains remote main';
     else steps.push(`refreshOntoMain(${read.headRef}) in ${input.checkout || 'the script repo root'}; recordRefreshed(${input.repo}#${input.pr}, newHead)`);
   } else if (name === 'grant-rounds') {
     undo = 'round grants are append-only; there is no supported revocation';

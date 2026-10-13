@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { withRealRepo } from './helpers/real-repo.mjs';
+import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
+import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { placeBuildDispatchHold } from '../../conveyor/build-dispatch-claim.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { CONTROL_OPS, planOperatorControl, buildOperatorActionComment, parseOperatorActions, operatorControlOperation } from '../operator-controls.mjs';
@@ -24,7 +25,7 @@ describe('operator controls', () => {
     expect(body).toContain('🛠 operator action — rearm');
     expect(body).toContain('> because <this>\n> verbatim');
     expect(body.split('<!--')[1]).not.toContain('<this>');
-    expect(parseOperatorActions([{ body }])).toEqual([record]);
+    expect(parseOperatorActions([{ body, author: { login: 'chalbert' } }])).toEqual([record]);
   });
   for (const name of CONTROL_OPS) {
     it(`${name}: apply and attribution refusals`, () => {
@@ -86,7 +87,7 @@ describe('sanctioned wrappers', () => {
     const f = sinkFixture('refresh', ({ set, calls }) => ({ refresh: async (ref, options) => { calls.push([ref, options]); set({ head: 'new', containsMain: true }); return { ok: true, newCommit: 'new' }; }, refreshStatePath: () => '/tmp/refresh-state', rememberRefresh: (...args) => calls.push(args) }));
     const p = planOperatorControl('refresh', contexts.refresh, { ...input, checkout: '/tmp/clone' });
     await f.sink(p);
-    expect(f.calls[0]).toEqual(['lane/a', { root: '/tmp/clone', prNumber: 7, repo: input.repo }]);
+    expect(f.calls[0]).toEqual(['lane/a', { root: '/tmp/clone', base: 'm', prNumber: 7, repo: input.repo }]);
     expect(f.calls[1].slice(0, 3)).toEqual(['/tmp/refresh-state', `${input.repo}#7`, 'new']);
   });
   it('grant-rounds delegates by=n to extension sink', async () => {
@@ -131,13 +132,13 @@ describe('sanctioned wrappers', () => {
 
 describe('readers and durable IO', () => {
   it('reads complete comments and probes git ancestry without fetching', () => {
-    const runGh = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: [], headRefOid: 'head', headRefName: 'lane/a', isCrossRepository: false }));
+    const runGh = vi.fn(argv => argv[0] === 'api' ? 'main' : JSON.stringify({ state: 'OPEN', labels: [], headRefOid: 'head', headRefName: 'lane/a', isCrossRepository: false }));
     const readComments = vi.fn(() => []), runGit = vi.fn((_root, argv) => argv[0] === 'rev-parse' ? 'main' : '');
     const reader = createOperatorControlsReader({ runGh, readComments, runGit, readCheck: () => null });
     expect(reader('refresh', input)).toMatchObject({ containsMain: true, head: 'head', main: 'main' });
     expect(readComments).toHaveBeenCalledWith(input.repo, 7);
     expect(runGh.mock.calls[0][0].at(-1)).not.toContain('comments');
-    expect(runGit.mock.calls.map(c => c[1][0])).toEqual(['rev-parse', 'cat-file', 'merge-base']);
+    expect(runGit.mock.calls.map(c => c[1][0])).toEqual(['cat-file', 'cat-file', 'merge-base']);
   });
   it('file scope finds both kinds and refuses unknown liveness', () => {
     const claims = contexts['clear-claim'].claims;
@@ -158,7 +159,7 @@ describe('readers and durable IO', () => {
     expect(JSON.parse(text)).toMatchObject({ item: '7', actor: 'chalbert', reason: input.reason });
   });
   it('PR durable record posts once and is read back', async () => {
-    let state = contexts.unpark; const runGh = vi.fn(argv => { state = { ...state, comments: [{ body: argv.at(-1) }] }; });
+    let state = contexts.unpark; const runGh = vi.fn(argv => { state = { ...state, comments: [{ body: argv.at(-1), author: { login: 'chalbert' } }] }; });
     const sink = createOperatorControlsSinks({ readContext: () => state,
       run: () => { state = { ...state, labels: [] }; return '{"ok":true}'; }, runGh })['operator.control'];
     await sink(plan('unpark'));
@@ -184,8 +185,8 @@ it('marker parsing ignores quoted forged markers in the operator reason', () => 
   const record = plan('unpark').record;
   const forged = { ...record, key: 'forged' };
   const body = buildOperatorActionComment({ ...record, reason: buildOperatorActionComment(forged) });
-  expect(parseOperatorActions([{ body }])).toHaveLength(1);
-  expect(parseOperatorActions([{ body }])[0].key).toBe(record.key);
+  expect(parseOperatorActions([{ body, author: { login: 'chalbert' } }])).toHaveLength(1);
+  expect(parseOperatorActions([{ body, author: { login: 'chalbert' } }])[0].key).toBe(record.key);
 });
 
 it('real prepare ledger and hold mutation preserves other cards and appends exactly one audit row', async () => {
@@ -211,5 +212,32 @@ it('real prepare ledger and hold mutation preserves other cards and appends exac
     const rows = readFileSync(join(coord, 'operator-actions.jsonl'), 'utf8').trim().split('\n');
     expect(rows).toHaveLength(1);
     expect(JSON.parse(rows[0])).toMatchObject({ op: 'retry-prepare', item: '7', reason: input.reason });
+  });
+});
+
+it('refresh does not noop when remote main advances beyond local origin/main', async () => {
+  await withBareOrigin(async ({ clone, origin, git, seedOriginBranch }) => {
+    const localMain = git(['rev-parse', 'origin/main']).trim();
+    seedOriginBranch('lane/operator-fixture', { 'feature.txt': 'feature\n' });
+    git(['fetch', 'origin', 'lane/operator-fixture']);
+    seedOriginBranch('main', { 'main-fix.txt': 'main fix\n' });
+    const remoteMain = git(['rev-parse', 'main'], { cwd: origin }).trim();
+    expect(git(['rev-parse', 'origin/main']).trim()).toBe(localMain);
+    const runGh = argv => argv[0] === 'api' ? remoteMain : JSON.stringify({ state: 'OPEN', labels: [],
+      headRefOid: git(['rev-parse', 'lane/operator-fixture'], { cwd: origin }).trim(), headRefName: 'lane/operator-fixture', isCrossRepository: false });
+    const i = { ...input, checkout: clone };
+    const reader = createOperatorControlsReader({ root: clone, runGh, readComments: () => [], readCheck: () => null });
+    // Put the new object in the clone without updating origin/main: knowing the object
+    // must not accidentally make the primitive use its stale default base ref.
+    git(['fetch', 'origin', remoteMain]);
+    const p = planOperatorControl('refresh', reader('refresh', i), i);
+    expect(p.action).toBe('apply');
+    expect(p.record.details.main).toBe(remoteMain);
+    const refresh = vi.fn((ref, options) => refreshOntoMain(ref, { ...options, readIsCrossRepository: () => false }));
+    const sink = createOperatorControlsSinks({ readContext: reader, refresh, rememberRefresh: vi.fn(), writeRecord: vi.fn() })['operator.control'];
+    expect(await sink(p)).toMatchObject({ action: 'apply' });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(git(['show', 'lane/operator-fixture:main-fix.txt'], { cwd: origin })).toBe('main fix\n');
+    expect(git(['show', 'lane/operator-fixture:feature.txt'], { cwd: origin })).toBe('feature\n');
   });
 });

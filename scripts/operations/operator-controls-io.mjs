@@ -15,7 +15,7 @@ import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
 import { createExtendRoundsSinks } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { planOperatorControl, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
+import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
@@ -41,6 +41,7 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
     return { state: p.state, labels: p.labels.map(l => l.name ?? l), head: p.headRefOid, headRef: p.headRefName, crossRepo: p.isCrossRepository, comments: readComments(repo, pr) };
   };
   return (name, input) => {
+    if (input.item) validateControlInput(name, input);
     const at = now();
     if (input.item) {
       const holds = readHolds().filter(h => String(h.num ?? h.meta?.num) === input.item && (h.meta?.repo ?? 'we') === 'we');
@@ -64,11 +65,20 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
     const p = readPr(input.repo, input.pr);
     if (name === 'refresh' && p.state === 'OPEN' && !p.crossRepo) {
       const checkout = input.checkout || root;
-      p.main = String(runGit(checkout, ['rev-parse', 'origin/main'])).trim();
+      // Read the repository's live main, not a potentially stale local tracking ref.
+      p.main = String(runGh(['api', `repos/${input.repo}/commits/main`, '--jq', '.sha'])).trim();
+      if (!p.main) throw new Error('remote main unavailable');
       p.requiredCheck = readCheck(input.repo, p.head);
       // Missing objects are uncertainty, never proof that the head is stale. No fetch in a preview.
       runGit(checkout, ['cat-file', '-e', `${p.head}^{commit}`]);
-      try { runGit(checkout, ['merge-base', '--is-ancestor', 'origin/main', p.head]); p.containsMain = true; }
+      try { runGit(checkout, ['cat-file', '-e', `${p.main}^{commit}`]); }
+      catch (error) {
+        if (![1, 128].includes(error.status)) throw error;
+        if (input.preview) return { ...p, containsMain: false, now: at };
+        runGit(checkout, ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+        runGit(checkout, ['cat-file', '-e', `${p.main}^{commit}`]);
+      }
+      try { runGit(checkout, ['merge-base', '--is-ancestor', p.main, p.head]); p.containsMain = true; }
       catch (error) { if (error.status !== 1) throw error; p.containsMain = false; }
     }
     return { ...p, now: at };
@@ -132,7 +142,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     else if (name === 'refresh') {
       const before = await readContext(name, i);
       if (controlFingerprint(name, before, i) !== p.fingerprint) throw new Error('refresh state changed before mutation');
-      const result = await refresh(before.headRef, { root: i.checkout || root, prNumber: i.pr, repo: i.repo });
+      const result = await refresh(before.headRef, { root: i.checkout || root, base: before.main, prNumber: i.pr, repo: i.repo });
       if (!result.ok) throw new Error(result.error || 'refresh failed');
       const after = await readContext(name, i);
       if (!after.containsMain || !after.head || (result.newCommit && result.newCommit !== after.head)) throw new Error('could not verify refreshed PR head');
@@ -152,6 +162,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     return !after.failures.some(f => f.held && !f.completed) && !after.holds.some(isPrepareHold);
   });
   return { [OPERATOR_CONTROL_EFFECT]: async p => {
+    validateControlInput(p.op, p.input);
     if (p.input.preview || p.action === 'noop') return { action: 'noop', why: 'preview or nothing to do' };
     const before = await readContext(p.op, p.input), existing = await getRecords(p, before);
     if (p.records.every(r => existing.some(old => old.key === r.key))) return { action: 'noop', why: 'operator action key already recorded' };

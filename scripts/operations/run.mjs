@@ -34,7 +34,7 @@ import { createRegistry } from './registry.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import {
-  createDefaultJudge, runOperationCli, buildCliSpec, cwdFlagValue, hasJsonFlag,
+  createDefaultJudge, runOperationCli, buildCliSpec, parseOperationArgv, cwdFlagValue, hasJsonFlag,
 } from './cli-adapter.mjs';
 import {
   reviewPrOperation, REVIEW_PR_OP, securitySeatFromRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
@@ -646,6 +646,16 @@ export function cliPreflight(name, { arm = armSelfReexecOnFastForward, assertFre
   return true;
 }
 
+/** Use the declared parser for both reader construction and CLI write policy. */
+export function operatorControlCliPolicy(name, argv) {
+  if (!CONTROL_OPS.includes(name)) return { zeroWrites: false, memoryStore: false };
+  const parsed = parseOperationArgv(operatorControlOperation(name), argv);
+  if (!parsed.ok) throw new Error(parsed.errors.join('\n'));
+  // Resumed runs retain the normal freshness guard and durable store, even for saved previews.
+  const preview = parsed.input.preview === true;
+  return { zeroWrites: preview, memoryStore: preview };
+}
+
 // The standard main check used across `we:scripts` — importing this module (tests do) must not run the CLI.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
@@ -655,6 +665,7 @@ if (IS_CLI) {
     process.exit(name ? 0 : 2);
   }
   let resolved;
+  let controlPolicy;
   try {
     // `rest` is this invocation's OWN argv, known before the declaration is — see `hasJsonFlag`'s doc for why
     // a full `parseOperationArgv` pass cannot run yet at this point.
@@ -664,7 +675,8 @@ if (IS_CLI) {
     const resumeId = name === REVIEW_PR_OP ? rest.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     let securitySeat = true;
     if (resumeId) { try { securitySeat = securitySeatFromRun(createFileRunStore().read(resumeId)); } catch { securitySeat = true; } }
-    resolved = resolveOperation(name, { preview: rest.includes('--preview') || rest.includes('--preview=true'), json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
+    controlPolicy = rest.includes('--help') ? { zeroWrites: false, memoryStore: false } : operatorControlCliPolicy(name, rest);
+    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);
@@ -679,14 +691,14 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: (CONTROL_OPS.includes(name) && (rest.includes('--preview') || rest.includes('--preview=true'))) || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
   }
   // Only runner-activity promises bounded CLI persistence, including --resume and call logging.
   // These queries need no persisted cursor or call log, including when their evidence stores are read-only.
-  const controlPreview = CONTROL_OPS.includes(name) && (rest.includes('--preview') || rest.includes('--preview=true'));
+  const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
     : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }

@@ -28,6 +28,77 @@ import { validateDeliveryTarget } from './lib/poc-branches.mjs';
 
 const requireCjs = createRequire(import.meta.url);
 
+/** Comment-marker parsers must use the shared authorship boundary, including aliased imports.
+ * Static guard for inline HTML-marker readers; delegated readers inherit their helper's check.
+ */
+export function scanUnauthenticatedCommentMarkerParsers(docs) {
+  const ts = requireCjs('typescript');
+  const findings = [];
+  for (const { file, content } of docs) {
+    if (!/\.(?:mjs|js|ts)$/.test(file) || /__tests__|\.test\./.test(file)) continue;
+    const tree = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const gates = new Map(), markers = new Set();
+    for (const node of tree.statements) {
+      if (ts.isVariableStatement(node)) for (const declaration of node.declarationList.declarations) {
+        if (declaration.initializer && /<!--/.test(declaration.initializer.getText(tree))) markers.add(declaration.name.getText(tree));
+      }
+      if (!ts.isImportDeclaration(node) || !node.moduleSpecifier.text?.endsWith('/marker-authorship.mjs')) continue;
+      const bindings = node.importClause?.namedBindings;
+      if (bindings && ts.isNamedImports(bindings)) for (const element of bindings.elements) {
+        const imported = (element.propertyName ?? element.name).text;
+        if (['isTrustedMarkerAuthor', 'countTrustedLeadingMarker'].includes(imported)) gates.set(element.name.text, imported);
+      }
+    }
+    const visit = node => {
+      if (ts.isFunctionLike(node) && node.body) {
+        const body = node.body.getText(tree);
+        const readsComments = node.parameters.some(p => /comments|thread/i.test(p.name.getText(tree)))
+          || (node.name && /parse|count|read/i.test(node.name.getText(tree)));
+        let referencesMarker = /<!--/.test(body);
+        const findMarker = child => {
+          if (ts.isIdentifier(child) && markers.has(child.text)) referencesMarker = true;
+          ts.forEachChild(child, findMarker);
+        };
+        findMarker(node.body);
+        if (readsComments && referencesMarker && /(?:\.body|bodyOf\()/.test(body)) {
+          let guarded = false;
+          const check = child => {
+            if (ts.isCallExpression(child)) {
+              const callee = child.expression;
+              if (ts.isIdentifier(callee) && gates.has(callee.text)) {
+                let expression = child, parent = child.parent;
+                while (parent && (ts.isParenthesizedExpression(parent) || ts.isPrefixUnaryExpression(parent))) {
+                  expression = parent; parent = parent.parent;
+                }
+                // A predicate's result must be consumed as a guard, never merely called.
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ((ts.isIfStatement(parent) && parent.expression === expression)
+                  || (ts.isConditionalExpression(parent) && parent.condition === expression)
+                  || (ts.isBinaryExpression(parent) && parent.left === expression && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken))) guarded = true;
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ts.isArrowFunction(parent) && parent.body === expression) {
+                  const filter = parent.parent;
+                  if (ts.isCallExpression(filter) && ts.isPropertyAccessExpression(filter.expression)
+                    && filter.expression.name.text === 'filter' && filter.arguments.includes(parent)) guarded = true;
+                }
+                if (gates.get(callee.text) === 'countTrustedLeadingMarker' && ts.isReturnStatement(parent)) guarded = true;
+              }
+              if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'filter'
+                && child.arguments.some(arg => ts.isIdentifier(arg) && gates.get(arg.text) === 'isTrustedMarkerAuthor')) guarded = true;
+            }
+            ts.forEachChild(child, check);
+          };
+          check(node.body);
+          if (!guarded) findings.push({ message: `${file}: comment-marker parser must filter authors through the shared marker-authorship helper`,
+            descriptor: { kind: 'comment-marker-authorship', file, line: tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1 } });
+          return;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+  }
+  return findings;
+}
+
 /** #2866: literal invisible characters are forbidden even in Markdown prose and fixtures.
  * Use visible Unicode escapes to document/test them. Offsets use zero-based UTF-16 code units.
  * Callers supply repository-relative, normalized paths; binary assets are not source text.
