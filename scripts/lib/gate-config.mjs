@@ -137,6 +137,22 @@ export const TRUST_CHAIN = [
     homes: ['scripts/lib/review-policy.mjs'],
   },
   {
+    role: 'drain-workflow-policy-settings',
+    file: 'drain-gate-settings.json',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'the drain workflow-human off switch is encoded policy; changing it can disable the human-only workflow boundary',
+    homes: ['scripts/drain-gate-settings.json'],
+  },
+  {
+    role: 'drain-workflow-human-boundary',
+    file: 'drain-workflow-edit-hold.mjs',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'owns the workflow-human default, setting cascade and exact-head clearance rule; these encoded policy choices have no separate declarative contract',
+    homes: ['scripts/lib/drain-workflow-edit-hold.mjs'],
+  },
+  {
     role: 'disposition-land-seam',
     file: 'disposition-land-seam.mjs',
     tier: 'policy',

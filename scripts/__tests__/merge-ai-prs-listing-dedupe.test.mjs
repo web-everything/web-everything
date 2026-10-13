@@ -231,17 +231,28 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
     expect(ghPrListCalls()).toHaveLength(2);
   });
 
-  it('a bare sweep with NO --label (RECONCILE off) is UNCHANGED — still exactly one `gh pr list` (never doubled by this fix), and its --json stays the UNWIDENED candidate-only field list (converge round 2: nothing reuses this call when RECONCILE is off, so it must not pay the extra context fields)', () => {
+  const bareSweepListsOncePerRepo = ({ workflowEditHuman, extraFields }) => {
+    const candidateOnlyFields = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels'.split(',');
     const r = spawnSync('node', [script, '--this-repo', '--dry-run', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: repoDir,
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, GH_FIXTURE_PRS: JSON.stringify([]) },
+      env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, GH_FIXTURE_PRS: JSON.stringify([]), WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditHuman },
     });
     expect(r.status).toBe(0);
     const calls = ghPrListCalls();
     expect(calls).toHaveLength(1);
     const jsonIdx = calls[0].argv.indexOf('--json');
     const fields = calls[0].argv[jsonIdx + 1].split(',');
-    for (const f of ['isDraft', 'files']) expect(fields).not.toContain(f); // context-only fields — never paid for on a call nothing reuses
+    // The default workflow-edit gate needs files; disabling it restores the old candidate-only list.
+    // Exact equality also rejects unrelated context widening such as isDraft.
+    expect(fields).toEqual([...candidateOnlyFields, ...extraFields]);
+  };
+
+  it('a bare sweep with NO --label (RECONCILE off), default workflow-edit gate: exactly ONE `gh pr list` per repo per pass, with the candidate fields plus the `files` the gate needs', () => {
+    bareSweepListsOncePerRepo({ workflowEditHuman: undefined, extraFields: ['files'] });
+  });
+
+  it('a bare sweep with NO --label (RECONCILE off), workflow-edit gate off: exactly ONE `gh pr list` per repo per pass, with only the required candidate fields', () => {
+    bareSweepListsOncePerRepo({ workflowEditHuman: 'off', extraFields: [] });
   });
 });

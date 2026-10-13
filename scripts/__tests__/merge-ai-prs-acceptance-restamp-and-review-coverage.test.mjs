@@ -543,7 +543,7 @@ function acceptanceView() {
   }] };
 }
 function acceptanceOptions(view = acceptanceView()) {
-  return { pr: 3432, repo: 'web-everything/web-everything', local: true,
+  return { pr: 3432, repo: 'web-everything/web-everything', local: true, files: ['src/example.js'],
     // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
     exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev }),
     // PR #4631 round 11: a moved head covered by diff identity reads the PR's formal reviews (none here).
