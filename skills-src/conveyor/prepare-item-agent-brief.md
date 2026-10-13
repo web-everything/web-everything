@@ -10,6 +10,8 @@
 > `## Design` / `## MVP` / `## Test plan` / `## Proof plan` / `## Follow-ups`, then `prepare-stamp`. You do the
 > prepare; you never build and never resolve.
 
+{{GROUP_MEMBERS}}
+
 ## Why this exists (the one-paragraph frame)
 
 The deterministic dispatcher (`we:scripts/readiness/dispatch-plan.mjs`) never dispatches a scoped story/task to

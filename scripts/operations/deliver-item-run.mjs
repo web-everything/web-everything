@@ -51,6 +51,7 @@
  * process's own log file. The dispatch observer (`dispatch-lane-io.mjs#createDispatchObservers`) resolves the
  * effect off the merged PR exactly as it already did for the agent path — unchanged by this wiring.
  */
+import { parseGroupMembers } from './dispatch-lane.mjs';
 import { assertCodexModel } from '../lib/codex-model-routing.mjs';
 import { settleDispatchEffect } from './deliver-item-settle.mjs';
 import { resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -115,6 +116,7 @@ export function parseDeliverItemRunArgv(argv = []) {
     ...(flags.effort ? { effort: String(flags.effort) } : {}),
     runId: String(flags['run-id'] ?? '').trim(),
     effectKey: String(flags['effect-key'] ?? '').trim(),
+    ...(flags['group-members'] !== undefined ? { groupMembers: parseGroupMembers(flags['group-members']) } : {}),
     resume: flags.resume === 'true',
   };
 }

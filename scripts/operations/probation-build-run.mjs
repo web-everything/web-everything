@@ -2,6 +2,7 @@
 import { resolveOperationRoute, resolvePolicyModel, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { parseAgyReportEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { machinePrTitle } from './machine-pr-title.mjs';
+import { parseGroupMembers } from './dispatch-lane.mjs';
 import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
 /**
  * @file scripts/operations/probation-build-run.mjs
@@ -257,7 +258,22 @@ export function parseArgs(argv) {
     lane: flags.lane ? Number(flags.lane) : null,
     scope: typeof flags.scope === 'string' && flags.scope ? flags.scope.split(',') : [],
     worker,
+    groupMembers: parseGroupMembers(flags['group-members'] ?? ''),
   };
+}
+
+/** Shared per-card preparation checks; the runner alone authors the stamp. */
+function validateAndStampPrepare(num, card, lanePath, io, autoSize) {
+  const fields = autoSize ? parseYamlFrontmatter(card.raw) : null;
+  if (fields && (fields.kind === 'task'
+    ? !(Number.isInteger(fields.estimatedLoc) && fields.estimatedLoc > 0)
+    : !String(fields.size ?? '').trim())) {
+    return { ok: false, out: 'Missing size: a task needs a positive integer estimatedLoc (a story needs size:) — author it from the touch set' };
+  }
+  const tests = missingTestScope(card.raw);
+  if (tests.length) return { ok: false, out: `Missing test scope: ${tests.join(', ')}` };
+  if (!prepareCardStatus(card.raw).hasSections) return { ok: false, out: 'Missing nonempty Design, MVP, Test plan, or Proof plan sections.' };
+  return io.stampPrepare(num, lanePath);
 }
 
 /**
@@ -278,7 +294,16 @@ export async function runProbationBuild(args, io) {
   let declinedReason = null;
   let modelEvidence = {};
   let couldNotPrepare = false;
-  let proposedEdges = [];
+  const proposedEdges = [];
+  const groupMembers = preparing ? parseGroupMembers(args.groupMembers ?? []).filter(n => n !== String(num)) : [];
+  const groupDropped = [], groupDropReasons = {};
+  const memberCards = new Map();
+  const dropMember = (n, reason) => {
+    const card = memberCards.get(n);
+    if (card) io.writeCard(lanePath, card.path, card.raw);
+    if (!groupDropped.includes(n)) groupDropped.push(n);
+    groupDropReasons[n] = sanitizeHoldReason(reason, { max: 600 });
+  };
   const finish = (outcome, executor, detail, row = {}) => {
     const evidence = preparing && !['opened-pr', 'could-not-prepare', 'prepare-already-done', 'prepare-needs-you'].includes(outcome) ? {
       error: detail, sessionAbsent: !workerRan,
@@ -294,7 +319,8 @@ export async function runProbationBuild(args, io) {
     }
     if (declinedReason) detail = `worker-declined: ${declinedReason} — ${detail}`;
     log(`${outcome} — ${detail}`);
-    const result = { outcome, executor, pr: row.pr ?? null, detail, ...failure };
+    const result = { outcome, executor, pr: row.pr ?? null, detail, ...failure,
+      ...(groupMembers.length ? { groupMembers, groupDropped, groupDropReasons } : {}) };
     if (preparing) {
       try { io.settlePrepare?.({ runId: args.runId, key: args.effectKey,
         status: ['opened-pr', 'prepare-already-done'].includes(outcome) ? 'applied' : 'failed', result }); }
@@ -399,8 +425,20 @@ export async function runProbationBuild(args, io) {
     // lane, never the dispatch's `--scope` argument: a stale or overridden dispatch scope must not widen what
     // the worker may touch. `--scope` is what the lane LEASED, so a touched path must fall inside BOTH: the card
     // grants the edit, the lease keeps it off files a sibling lane may hold.
-    const scopeEntries = preparing ? [item.path] : declaredScopePaths(item.scope);
+    // Prepare never claims/resolves a card; members use the same open-card precondition as the lead.
+    for (const n of groupMembers) {
+      try {
+        const card = io.findItem(n, lanePath);
+        if (!card) { dropMember(n, 'card not found in the lane'); continue; }
+        memberCards.set(n, { ...card });
+        const blockers = io.openBlockers(n, lanePath);
+        if (blockers.length) dropMember(n, `blockedBy not resolved on main: ${blockers.join(', ')}`);
+        else if (parseYamlFrontmatter(card.raw).status !== 'open') dropMember(n, 'prepare requires an open card');
+      } catch (error) { dropMember(n, error.message ?? String(error)); }
+    }
+    const scopeEntries = preparing ? [item.path, ...[...memberCards.values()].map(c => c.path)] : declaredScopePaths(item.scope);
     const leasedEntries = declaredScopePaths(args.scope);
+    const otherCardPaths = scopeEntries.filter(p => p !== item.path);
     if (!scopeEntries.length) {
       return abandon('not-applicable', 'the item declares no scope: — refusing before running any worker; a probation build needs a declared scope to bound what the worker may touch', {}, 'none');
     }
@@ -412,10 +450,13 @@ export async function runProbationBuild(args, io) {
     // once.
     const excludeFromDiff = preparing ? [] : [...preexisting, item.path];
 
-    const task = preparing ? io.readPrepareBrief(lanePath)
-      .replaceAll('{{ITEM_NUM}}', String(num)).replaceAll('{{ITEM_SPEC_PATH}}', item.path) +
+    const prepareBrief = preparing ? io.readPrepareBrief(lanePath) : null;
+    const fillPrepareBrief = (n, card) => prepareBrief
+      .replaceAll('{{ITEM_NUM}}', String(n)).replaceAll('{{ITEM_SPEC_PATH}}', card.path) +
       '\nTest scope is required before stamping: after any factual scope correction (#4658), the card scope must also list the existing or planned matching test file for each source entry (or one of the following narrow patterns).\n' +
-      declaredScopePaths(item.scope).map(sourceTestPattern).filter(Boolean).map(p => `we:${p}`).join('\n') : buildDocFixTask({ num, title: item.title, spec: item.spec, scope: item.scope, taskType }) +
+      declaredScopePaths(card.scope).map(sourceTestPattern).filter(Boolean).map(p => `we:${p}`).join('\n');
+    const task = preparing ? fillPrepareBrief(num, item) + groupMembers.filter(n => !groupDropped.includes(n))
+      .map(n => `\n\n## Also prepare #${n}\n${fillPrepareBrief(n, memberCards.get(n))}`).join('') : buildDocFixTask({ num, title: item.title, spec: item.spec, scope: item.scope, taskType }) +
       '\nIf the work already exists, check every Done-when against main and find the delivering commit in git log. ' +
       'When all checks pass, report "spec already done on main: commit <sha>" with the actual delivering SHA.\n';
     let taskFile = io.writeTaskFile(lanePath, 'probation-build-task.md', task);
@@ -424,10 +465,12 @@ export async function runProbationBuild(args, io) {
     // A guarded stamp validates authored prose too (e.g. locus prefixes). Let the
     // same worker repair that concrete diagnostic before discarding its result.
     let rescoped = null;
+    let memberReport = '';
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
       const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile }), lanePath);
       modelEvidence = run.modelEvidence ?? {};
+      if (preparing) memberReport += `\n${run.lastMessage ?? ''}`;
       workerRan = true;
       // x55dojc — checked BEFORE the `run.ok` gate below on purpose: even a worker that crashed or timed out
       // could have planted a hook before it did, so this must never be skipped just because the run itself
@@ -469,9 +512,11 @@ export async function runProbationBuild(args, io) {
       // that changed nothing: it counts as "no worker diff" only while the card is still byte-for-byte what the
       // runner wrote and nothing else changed - otherwise a second decline would skip this branch and the
       // runner-authored edit would read as a prepared card (PR #4323 review).
-      const workerMadeNoChange = !summary.files
+      const workerMadeNoChange = (groupMembers.length > 0 && postWorkerItem?.raw === item.raw) || !summary.files
         || (rescoped !== null && postWorkerItem?.raw === item.raw && summary.paths.every((p) => p === item.path));
-      const report = preparing && workerMadeNoChange ? classifyPrepareReport(run.lastMessage) : null;
+      const leadReport = groupMembers.length ? String(run.lastMessage ?? '').split('\n')
+        .filter(line => !/^Not prepared: #/i.test(line.trim())).join('\n') : run.lastMessage;
+      const report = preparing && workerMadeNoChange ? classifyPrepareReport(leadReport) : null;
       if (report?.outcome === 'no-change' || (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect')) {
         if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', `refused: worker moved HEAD before ${report.outcome} routing`, { diff: diffRow });
       }
@@ -530,7 +575,7 @@ export async function runProbationBuild(args, io) {
         io.writeCard(lanePath, item.path, clearScopeAndAppendFinding(unstamped, route));
         break;
       }
-      if (preparing && (!summary.files || summary.paths.some(p => p !== item.path))) {
+      if (preparing && (!summary.files || (groupMembers.length > 0 && postWorkerItem?.raw === item.raw) || summary.paths.some(p => !scopeEntries.includes(p)))) {
         return abandon('gate-red', `prepare requires a card-only diff; worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
       }
       if (!summary.files) {
@@ -573,7 +618,9 @@ export async function runProbationBuild(args, io) {
         const added = new Set(io.addedPaths?.(lanePath, baseSha) ?? []);
         const allowed = (p, entries) => pathInScope(p, entries)
           || (['bugfix', 'test-fix'].includes(taskType) && added.has(p) && !preexisting.includes(p) && ownedTest(p, entries));
-        const outOfScopePaths = summary.paths.filter((p) => !allowed(p, scopeEntries) || ((args.scope ?? []).length > 0 && !allowed(p, leasedEntries)));
+        // Member lease failures are isolated below; the lead still obeys its existing lease check.
+        const outOfScopePaths = summary.paths.filter((p) => !(preparing && otherCardPaths.includes(p))
+          && (!allowed(p, scopeEntries) || ((args.scope ?? []).length > 0 && !allowed(p, leasedEntries))));
         if (outOfScopePaths.length) {
           return abandon('gate-red', `not built: touched path(s) outside the item's own declared scope — a probation worker may edit only what the item names: ${outOfScopePaths.join(', ')}`, { diff: diffRow });
         }
@@ -581,7 +628,8 @@ export async function runProbationBuild(args, io) {
         if (summary.paths.some(isStatuteTierPath)) {
           return abandon('gate-red', 'not built: statute-tier paths are refused', { diff: diffRow });
         }
-        const fits = healDiffWithinEnvelope(summary, PROVEN_TASK_ENVELOPES[taskType]);
+        const leadSummary = preparing && groupMembers.length ? summarizeNumstat(io.diffNumstat(lanePath, baseSha, otherCardPaths), { exclude: otherCardPaths }) : summary;
+        const fits = healDiffWithinEnvelope(leadSummary, PROVEN_TASK_ENVELOPES[taskType]);
         if (!fits.ok) {
           // A test-only boundary violation is still refused; only size overflow routes to the builder.
           if (fits.reason.startsWith('test-fix refused')) return abandon('gate-red', `not built: ${fits.reason}`, { diff: diffRow });
@@ -604,7 +652,7 @@ export async function runProbationBuild(args, io) {
           const checkerTask = io.writeTaskFile(lanePath, 'probation-build-check.md', [
             `Check this ${taskType} against its spec. Answer APPROVE or REJECT on the first line, then reasons.`,
             'Reject scope creep, weakened tests, incorrect fixes, or work that is not simple and mechanical.',
-            item.spec, io.diffText(lanePath, baseSha),
+            item.spec, io.diffText(lanePath, baseSha, preparing ? [item.path] : []),
           ].join('\n\n'));
           const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask }), lanePath));
           checkerRow = { provider: worker.checker, verdict: verdict.verdict, reason: verdict.reason };
@@ -616,19 +664,7 @@ export async function runProbationBuild(args, io) {
           if (!verdict.approved) return abandon('gate-red', `the ${worker.checker} checker did not approve: ${verdict.reason}`, { diff: diffRow });
         }
 
-        const sizeFields = preparing && prepareAutoSize ? parseYamlFrontmatter(postWorkerItem.raw) : null;
-        const missingSize = sizeFields && (sizeFields.kind === 'task'
-          ? !(Number.isInteger(sizeFields.estimatedLoc) && sizeFields.estimatedLoc > 0)
-          : !String(sizeFields.size ?? '').trim());
-        const resolved = preparing
-          ? (missingSize
-            ? { ok: false, out: 'Missing size: a task needs a positive integer estimatedLoc (a story needs size:) — author it from the touch set' }
-            : missingTestScope(postWorkerItem.raw).length
-            ? { ok: false, out: `Missing test scope: ${missingTestScope(postWorkerItem.raw).join(', ')}` }
-            : prepareCardStatus(postWorkerItem?.raw).hasSections
-            ? io.stampPrepare(num, lanePath)
-            : { ok: false, out: 'Missing nonempty Design, MVP, Test plan, or Proof plan sections.' })
-          : io.resolveItem(num, lanePath);
+        const resolved = preparing ? validateAndStampPrepare(num, postWorkerItem, lanePath, io, prepareAutoSize) : io.resolveItem(num, lanePath);
         if (preparing && !resolved.ok && attempt === 0) {
           const diagnostic = resolved.reason ?? resolved.out ?? 'stamp failed';
           log(`prepare validation failed; returning to worker: ${diagnostic}`);
@@ -641,23 +677,80 @@ export async function runProbationBuild(args, io) {
       break;
     }
 
+    // A member failure restores only that card, before measuring/committing the surviving group.
+    for (const [n, card] of memberCards) {
+      if (groupDropped.includes(n)) { io.writeCard(lanePath, card.path, card.raw); continue; }
+      try {
+        const refusal = memberReport.split('\n').map(line => /^Not prepared: #([0-9a-z]+)\s*[—:-]\s*(.+)$/i.exec(line.trim()))
+          .find(match => match?.[1] === n);
+        if (refusal) { dropMember(n, refusal[2]); continue; }
+        if (couldNotPrepare) { dropMember(n, 'lead was not prepared'); continue; }
+        const current = io.findItem(n, lanePath);
+        if (!current || current.raw === card.raw) { dropMember(n, 'worker left no preparation diff'); continue; }
+        if (frontmatterTamperedBeyondClaim(card.raw, current.raw, PREPARE_OWNED_FRONTMATTER_KEYS)) {
+          dropMember(n, 'worker changed frontmatter outside the prepare allowlist'); continue;
+        }
+        if ((args.scope ?? []).length && !pathInScope(card.path, leasedEntries)) {
+          dropMember(n, 'card is outside the leased scope'); continue;
+        }
+        const memberSummary = summarizeNumstat(io.diffNumstat(lanePath, baseSha, scopeEntries.filter(p => p !== card.path)), { exclude: scopeEntries.filter(p => p !== card.path) });
+        const fits = healDiffWithinEnvelope(memberSummary, PROVEN_TASK_ENVELOPES.prepare);
+        if (!fits.ok) { dropMember(n, fits.reason); continue; }
+        if (worker.checker) {
+          const checkerTask = io.writeTaskFile(lanePath, 'probation-build-check.md', [
+            'Check this prepare against its spec. Answer APPROVE or REJECT on the first line, then reasons.',
+            'Reject scope creep, weakened tests, incorrect fixes, or work that is not simple and mechanical.',
+            card.spec, io.diffText(lanePath, baseSha, [card.path]),
+          ].join('\n\n'));
+          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask }), lanePath));
+          const checkerHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
+          if (checkerHooks.changed) {
+            if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
+            return abandon('escalated-needs-human', `refused: checker changed the git-hook surface: ${checkerHooks.reason}`, { diff: diffRow });
+          }
+          if (!verdict.approved) { dropMember(n, `the ${worker.checker} checker did not approve: ${verdict.reason}`); continue; }
+        }
+        const stamped = validateAndStampPrepare(n, current, lanePath, io, prepareAutoSize);
+        if (!stamped.ok) { dropMember(n, stamped.reason ?? stamped.out ?? 'stamp failed'); continue; }
+        const afterStamp = io.findItem(n, lanePath);
+        const fm = parseYamlFrontmatter(afterStamp?.raw ?? '');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fm.preparedDate ?? '')) || fm.preparedAgainstSha !== baseSha
+          || frontmatterTamperedBeyondClaim(card.raw, afterStamp?.raw, PREPARE_OWNED_FRONTMATTER_KEYS)) {
+          dropMember(n, 'prepare-unstamped or changed fields outside its envelope'); continue;
+        }
+        const edges = parseProposedBlockedBy(afterStamp.raw);
+        if (edges.length) {
+          const graph = io.blockedByGraph?.(lanePath);
+          const bad = graph ? validateProposedBlockedBy(n, edges, graph) : ['the backlog graph could not be read'];
+          if (bad.length) { dropMember(n, `prepare proposed invalid blockedBy changes: ${bad.join('; ')}`); continue; }
+          proposedEdges.push(...edges.map(e => ({ ...e, line: `#${n}: ${e.line}` })));
+        }
+      } catch (error) { dropMember(n, error.message ?? String(error)); }
+    }
+    if (groupMembers.length) {
+      summary = summarizeNumstat(io.diffNumstat(lanePath, baseSha, excludeFromDiff), { exclude: excludeFromDiff });
+      diffRow = { files: summary.files, loc: summary.loc };
+    }
+
     if (preparing && !couldNotPrepare) {
       const stamped = io.findItem(num, lanePath);
       const fm = parseYamlFrontmatter(stamped?.raw ?? '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fm.preparedDate ?? '')) || fm.preparedAgainstSha !== baseSha) return abandon('gate-red', 'prepare-unstamped', { diff: diffRow });
       if (frontmatterTamperedBeyondClaim(item.raw, stamped.raw, PREPARE_OWNED_FRONTMATTER_KEYS)
-        || summarizeNumstat(io.diffNumstat(lanePath, baseSha, [])).paths.some(p => p !== item.path)) {
+        || summarizeNumstat(io.diffNumstat(lanePath, baseSha, [])).paths.some(p => !scopeEntries.includes(p))) {
         return abandon('gate-red', 'prepare changed fields or files outside its envelope', { diff: diffRow });
       }
       // Ruling #4670 (2026-10-03): blockedBy edges are PROPOSED in the card body, never applied. Hold them to the
       // same DAG rules check:standards enforces (no resolved/missing/self target, no cycle) before the PR opens.
-      proposedEdges = parseProposedBlockedBy(stamped.raw);
-      if (proposedEdges.length) {
+      const leadEdges = parseProposedBlockedBy(stamped.raw);
+      if (leadEdges.length) {
         const graph = io.blockedByGraph?.(lanePath);
-        const bad = graph ? validateProposedBlockedBy(String(num), proposedEdges, graph) : ['the backlog graph could not be read'];
+        const bad = graph ? validateProposedBlockedBy(String(num), leadEdges, graph) : ['the backlog graph could not be read'];
         if (bad.length) return abandon('gate-red', `prepare proposed invalid blockedBy changes: ${bad.join('; ')}`, { diff: diffRow });
       }
     }
+
+    if (preparing && !couldNotPrepare) proposedEdges.push(...parseProposedBlockedBy(io.findItem(num, lanePath).raw));
 
     // x55dojc — re-checked immediately before the ONE commit this arc ever makes: `resolveItem` is its own
     // subprocess (`run.mjs resolve`) between the post-worker snapshot above and here, so this is not a
@@ -682,9 +775,11 @@ export async function runProbationBuild(args, io) {
     if (!gate.pass) return abandon('gate-red', `the gate is red after the build and the resolve: ${gate.failureDetail ?? gateFailureDetail(gate.output)}`, { diff: diffRow });
 
     if (preparing && !couldNotPrepare) {
-      const committed = parseYamlFrontmatter(io.readCommittedCard(lanePath, item.path));
-      if (!committed.preparedDate || committed.preparedAgainstSha !== baseSha) {
-        return abandon('gate-red', 'prepare-unstamped at HEAD', { diff: diffRow });
+      for (const path of [item.path, ...[...memberCards].filter(([n]) => !groupDropped.includes(n)).map(([, c]) => c.path)]) {
+        const committed = parseYamlFrontmatter(io.readCommittedCard(lanePath, path));
+        if (!committed.preparedDate || committed.preparedAgainstSha !== baseSha) {
+          return abandon('gate-red', 'prepare-unstamped at HEAD', { diff: diffRow });
+        }
       }
     }
 
@@ -695,7 +790,7 @@ export async function runProbationBuild(args, io) {
     // `submitted.ok === false` case already handled explicitly. `writePrBody`/`openPr` therefore never reach
     // `abandon` — a throw here reports `escalated-needs-human` and stops, exactly like a `!submitted.ok` result.
     try {
-      const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges });
+      const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges, groupMembers, groupDropped, groupDropReasons });
       const submit = attemptTag => io.openPr({ lanePath, num, slug: item.slug, attemptTag, bodyFile, taskType });
       const staleTip = result => !result.ok && /is not the tip of|push-rejected-stale-tip:/.test(result.reason ?? '');
       let submitted = submit(args.attemptTag);
@@ -814,9 +909,9 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
   const node = (script, args, opts) => trySh(process.execPath, [join(opts.cwd, script), ...args], opts);
   return {
     log: (m) => console.error(m),
-    openBlockers(n) {
-      const item = this.findItem(n, repoRoot);
-      if (!item) throw new Error(`no backlog/${n}-*.md file in the launch checkout`);
+    openBlockers(n, dir = repoRoot) {
+      const item = this.findItem(n, dir);
+      if (!item) throw new Error(`no backlog/${n}-*.md file in the checkout`);
       parseYamlFrontmatter(item.raw); // Reject executable frontmatter before the shared card parser.
       const { blockedBy: blockers } = parseCard(String(n), item.raw);
       if (!blockers.length) return [];
@@ -947,7 +1042,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       try { return JSON.parse(r.out).lastMessage ?? ''; } catch { return ''; }
     },
     addedPaths: (dir, base) => sh('git', ['-C', dir, 'diff', '--no-renames', '--diff-filter=A', '--name-only', base], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
-    diffText: (dir, base) => sh('git', ['-C', dir, 'diff', '--no-renames', base], { cwd: dir, env: laneEnv }),
+    diffText: (dir, base, paths = []) => sh('git', ['-C', dir, 'diff', '--no-renames', base, ...(paths.length ? ['--', ...paths] : [])], { cwd: dir, env: laneEnv }),
     untracked: (dir) => sh('git', ['-C', dir, 'ls-files', '--others', '--exclude-standard'], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
     diffNumstat: (dir, base, exclude = []) => {
       const created = newUntrackedPaths(exclude, sh('git', ['-C', dir, 'ls-files', '--others', '--exclude-standard'], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean));
@@ -994,15 +1089,19 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       const r = node('scripts/verify-lane.mjs', ['--json'], { cwd: dir, env: laneEnv, timeout: GATE_TIMEOUT_MS });
       return { pass: r.ok, output: r.out.slice(-12000), failureDetail: r.ok ? null : gateFailureDetail(r.out) };
     },
-    writePrBody: (dir, { num: n, worker: w, diff, taskType = 'doc-fix', declinedReason, proposedEdges = [] }) => {
+    writePrBody: (dir, { num: n, worker: w, diff, taskType = 'doc-fix', declinedReason, proposedEdges = [], groupMembers = [], groupDropped = [], groupDropReasons = {} }) => {
       const bodyFile = join(dir, '.pr-body.md');
+      const groupLines = groupMembers.length ? [
+        `Grouped prepare: ${[String(n), ...groupMembers.filter(m => !groupDropped.includes(m))].map(m => `#${m}`).join(', ')}`,
+        ...groupDropped.map(m => `Not prepared: #${m} — ${groupDropReasons[m] ?? 'not prepared'}`), '',
+      ] : [];
       writeFileSync(bodyFile, declinedReason ? [
         `Standalone worker declined #${n}; no implementation change.`, '',
         `> ${declinedReason}`, '',
         declinedReason.startsWith('scope exceeds')
           ? 'Implementation changes were discarded; the card is held for the builder with its scope preserved.'
           : 'The hold router removed scope and attached the finding. A prepare pass or human must re-scope the card.',
-        'Full review is owed; parked review:pending.', '',
+        'Full review is owed; parked review:pending.', '', ...groupLines,
       ].join('\n') : [
         `${taskType} build on probation (${w.executor}/${w.model}) for #${n} (agy-launcher-probation, #4291).`,
         '',
@@ -1013,6 +1112,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
         'Full review and a run rating are owed on this change; promotion out of probation stays an explicit',
         'human decision.',
         '',
+        ...groupLines,
         ...(proposedEdges.length ? [
           '## Proposed blockedBy changes — independent confirmation required (ruling #4670)',
           '',

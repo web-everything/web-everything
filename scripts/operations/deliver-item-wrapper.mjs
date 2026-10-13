@@ -117,7 +117,8 @@ import { markWorkerEnv } from './session-role.mjs';
 // (the fix for the sibling gap this same incident, #landing-freeze-2779, found in the wrapper's own fork).
 import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
-import { fillBrief } from './dispatch-lane.mjs';
+import { readBuildGroupingSettings } from '../conveyor/build-grouping.mjs';
+import { fillBrief, parseGroupMembers } from './dispatch-lane.mjs';
 import { tryReadDeliveryReport, resolveDeliveryReportsDir } from './delivery-report-store.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import {
@@ -331,6 +332,16 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
   // `runAgentToCompletion`'s own `resume` branch below; every other caller (every existing dispatch) never
   // sets it, so `deliverItem` is byte-identical for them.
   const { item, lane, scope, sessionSlug, attemptTag, runId, effectKey, resume = false } = launch;
+  const requestedMembers = parseGroupMembers(launch.groupMembers ?? []).filter((num) => num !== String(item));
+  let groupMembers = [...requestedMembers];
+  const groupDropped = [];
+  const groupDropReasons = {};
+  const grouping = readBuildGroupingSettings();
+  const recordDrops = (result) => {
+    for (const num of result.groupDropped) if (!groupDropped.includes(num)) groupDropped.push(num);
+    Object.assign(groupDropReasons, result.groupDropReasons);
+    groupMembers = groupMembers.filter((num) => !groupDropped.includes(num));
+  };
 
   // Every terminal exit funnels through here (alongside `finish()`, never instead of it): settle this
   // delivery's own run-store effect with the outcome just produced, and — for a non-PR outcome only — release
@@ -361,7 +372,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     }
     try {
       settleDispatchEffect({
-        runId, key: effectKey, status: error ? 'failed' : 'applied', result: mergeSettleResult(outcome, result), error,
+        runId, key: effectKey, status: error ? 'failed' : 'applied', result: mergeSettleResult(outcome, { ...result, ...(requestedMembers.length ? { groupMembers: requestedMembers, groupDropped, groupDropReasons } : {}) }), error,
       });
     } catch { /* best-effort — never mask the real outcome */ }
     if (releaseClaim) {
@@ -448,6 +459,13 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       spanAround('item.claim', { attributes: { item: String(item) } }, () => claimItem({ item, sessionSlug, lanePath: claimLanePath }));
     }
 
+    if (!resume) recordDrops(claimGroupMembers({ groupMembers, sessionSlug, lanePath: claimLanePath }));
+    if (groupDropped.length && grouping.groupMemberFailure === 'fail-group') {
+      releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
+      settleTerminal('group-member-dropped', { result: { reason: 'group-member-dropped' }, releaseClaim: true, hold: 'group-member-dropped' });
+      return finish('group-member-dropped', { status: 'error', outcome: 'group-member-dropped' });
+    }
+
     // ---- 2. Spawn the MINIMAL agent, wait for its structured report (SKETCH) -----------------------------
     // THE EXPENSIVE SPAN. This is the single longest phase in the system (capped at 60 minutes by
     // `DELIVERY_AGENT_SPAWN_TIMEOUT_MS`) and until #3383 it was timed by nothing at all — the exact gap
@@ -469,7 +487,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     let report;
     try {
       report = await runAgentToCompletion({
-        item, sessionSlug, lane, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath, resume,
+        item, sessionSlug, lane, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath, resume, groupMembers,
       });
       turn.ok({
         outcome: report && report.outcome ? String(report.outcome) : 'unreported',
@@ -512,6 +530,17 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // either case: a needs-human-judgment report still needs a green gate before anyone reviews it.
     // (The `verify.gate` span itself is emitted one level down, inside `runVerifyOperation`, so it is
     // captured identically for every wrapper rather than six times over — see that function.)
+    const collectDrops = () => {
+      const drops = processGroupDrops({ lanePath: claimLanePath, groupMembers });
+      recordDrops(drops);
+      return drops.groupDropped.length > 0;
+    };
+    collectDrops();
+    if (groupDropped.length && grouping.groupMemberFailure === 'fail-group') {
+      releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
+      settleTerminal('group-member-dropped', { result: { reason: 'group-member-dropped' }, releaseClaim: true, hold: 'group-member-dropped' });
+      return finish('group-member-dropped', { status: 'error', outcome: 'group-member-dropped' });
+    }
     const gate = await runGateWithOneRetry({
       lane, item, sessionSlug, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath,
     });
@@ -545,6 +574,15 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // #3850 Fork 2 — `provider.vendor` is the REAL executed vendor: `provider` is the object that actually
     // spawned this turn (`runAgentToCompletion` above), never a prediction. Falls back to `'claude'` for a
     // provider object that predates this field (defence-in-depth only — every registered provider sets it).
+    if (collectDrops()) {
+      if (grouping.groupMemberFailure === 'fail-group') {
+        releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
+        settleTerminal('group-member-dropped', { result: { reason: 'group-member-dropped' }, releaseClaim: true, hold: 'group-member-dropped' });
+        return finish('group-member-dropped', { status: 'error', outcome: 'group-member-dropped' });
+      }
+      const verification = runVerifyOperation(gate.lanePath);
+      if (!verification.ok) throw new Error('group drop restoration did not pass verification');
+    }
     const parkDecision = decideParkMode({
       report, convergeVerdict, filesTouched: report.filesTouched, lanePath: gate.lanePath,
       executedVendor: provider.vendor ?? 'claude',
@@ -576,7 +614,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     try {
       prResult = spanAround('pr.open', { attributes: { item: String(item), park: parkDecision.label } },
         () => openPr({
-          item, attemptTag, runId, effectKey, lane: gate.lanePath, park: parkDecision, report, slug: foundForPr.slug,
+          item, attemptTag, runId, effectKey, groupMembers: requestedMembers, groupDropped, groupDropReasons, lane: gate.lanePath, park: parkDecision, report, slug: foundForPr.slug,
           // #3903 main adaptation — the trial-evidence marker; see `delegationForBuild`.
           delegation: delegationForBuild(provider, scope),
         }));
@@ -652,7 +690,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     if (status === 'error') root.fail(attrs.outcome || result, attrs);
     else if (status === 'ok') root.ok(attrs);
     else root.end({ status: 'unset', statusMessage: String(result), attributes: attrs });
-    return { item, result };
+    return { item, result, ...(requestedMembers.length ? { groupMembers: requestedMembers, groupDropped, groupDropReasons } : {}) };
   }
 }
 
@@ -666,6 +704,37 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
 // for a `--purpose=review-loop` acquire rather than `conveyor-delivery`. `acquireLane`'s `purpose` parameter
 // defaults to `'conveyor-delivery'`, so every call site in THIS file (and every existing test) is unchanged.
 // See that module's own docblocks for the full #3627 live-run reasoning behind both functions.
+
+/** Claim members in the same lane as the lead; a refused member stays out of the agent brief. */
+export function claimGroupMembers({ groupMembers = [], sessionSlug, lanePath }, { run: runFn = run } = {}) {
+  const claimed = [], groupDropped = [], groupDropReasons = {};
+  for (const item of groupMembers) {
+    try { claimItem({ item, sessionSlug, lanePath }, { run: runFn }); claimed.push(item); }
+    catch (error) { groupDropped.push(item); groupDropReasons[item] = String(error.message ?? error); }
+  }
+  return { groupMembers: claimed, groupDropped, groupDropReasons };
+}
+
+/** Restore only declared members' cards. Unknown/malformed drop lines refuse publication. */
+export function processGroupDrops({ lanePath, groupMembers = [] }, { run: runFn = run, loadItems } = {}) {
+  const file = `${lanePath}/.delivery-group-drop`;
+  const groupDropped = [], groupDropReasons = {};
+  if (!existsSync(file)) return { groupDropped, groupDropReasons };
+  for (const line of readFileSync(file, 'utf8').split(/\r?\n/).filter((line) => line.trim())) {
+    const match = /^(\d+|x[0-9a-z]{6,}):\s*(.+)$/.exec(line);
+    if (!match || !groupMembers.includes(match[1])) throw new Error('invalid group member drop: ' + line);
+    const [, num, reason] = match;
+    if (!groupDropped.includes(num)) groupDropped.push(num);
+    groupDropReasons[num] = reason;
+  }
+  for (const num of groupDropped) {
+    const card = `backlog/${resolveItemSpecPathBasename(num, loadItems)}`;
+    runFn('git', ['checkout', 'origin/main', '--', card], { cwd: lanePath });
+    runFn('git', ['commit', '--allow-empty', '-m', `drop #${num} from group: ${groupDropReasons[num]}`, '--', card], { cwd: lanePath });
+  }
+  rmSync(file);
+  return { groupDropped, groupDropReasons };
+}
 
 /**
  * REAL — routed through the DECLARED `claim` operation (`scripts/operations/claim.mjs`, wired into
@@ -1462,7 +1531,7 @@ export function envelopeReportOrNull(envelope, sessionSlug) {
  */
 export async function runAgentToCompletion(
   {
-    item, sessionSlug, lane, attemptTag, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId,
+    item, sessionSlug, lane, attemptTag, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId, groupMembers = [],
     // build-path-codex-isolation-locus — `deliverItem`'s own resolved implementation-lane path for a non-`we`
     // locus item (`acquireImplLane`'s return value), or `null` for the unchanged `we`-locus case. Threaded
     // straight through to `provider.spawn` (both providers resolve their cwd as `lanePathOverride ??
@@ -1523,7 +1592,7 @@ export async function runAgentToCompletion(
   }
 
   const briefTemplate = readBrief();
-  const prompt = fillMinimalBrief(briefTemplate, { item, sessionSlug, lane, attemptTag }, { loadItems }); // SKETCH — see below
+  const prompt = fillMinimalBrief(briefTemplate, { item, sessionSlug, lane, attemptTag, groupMembers }, { loadItems }); // SKETCH — see below
 
   // #3627 bug 7 — `lane`/`sessionSlug`/`item`/`attemptTag` threaded through so the provider can resolve the
   // real lane path (`cwd`) and mint the real env vars the brief needs (`buildDeliveryAgentEnv`) — see
@@ -1576,10 +1645,11 @@ export function resolveItemSpecPathBasename(item, loadItems = () => defaultLoadI
 /** REAL. Substitutes the v2 brief's ONE placeholder through `fillBrief`, then appends the same env footer the
  *  sketch already carried (not a placeholder — this repo has no shared "env footer" convention to reuse; it is
  *  plain text outside the brief's own template, never itself a `{{TOKEN}}`). */
-export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag }, { loadItems } = {}) {
+export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag, groupMembers = [] }, { loadItems } = {}) {
   const basename = resolveItemSpecPathBasename(item, loadItems);
   const { prompt } = fillBrief(template, { ITEM_SPEC_PATH_BASENAME: basename }, V2_BRIEF_REQUIRED_NAMES, V2_BRIEF_OPTIONAL_NAMES);
-  return `${prompt}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`;
+  const groupSection = groupMembers.length ? `\n\nGROUPED BUILD\n${groupMembers.map((num) => `#${num} — backlog/${resolveItemSpecPathBasename(num, loadItems)}`).join('\n')}\nImplement ALL these cards in this one lane/PR; keep each card status: active (the merge resolves each one). If a member cannot be delivered, append a line <num>: <reason> to .delivery-group-drop in the lane root (never commit it) and leave that card's files untouched.` : '';
+  return `${prompt}${groupSection}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`;
 }
 
 // ================================================================================================
@@ -2105,7 +2175,7 @@ export function commitConvergeRound(
   { lane, item, round },
   { run: runFn = run, writeFile = writeFileSync, touchedFiles = convergeRoundTouchedFiles } = {},
 ) {
-  const paths = touchedFiles(lane, { run: runFn });
+  const paths = touchedFiles(lane, { run: runFn }).filter((path) => path !== '.delivery-group-drop');
   if (!paths.length) return { committed: false, paths: [] };
   const msgFile = `${convergeScratchDir(lane)}/.converge-commit-msg-r${round}.txt`;
   const message = `${machinePrTitle({ repo: repoProfileForLanePath(lane)?.canonicalPrefix?.toUpperCase() ?? 'WE', item, kind: 'fix',
@@ -2254,7 +2324,7 @@ export function commitBuildTurn(
     touchedFiles = convergeRoundTouchedFiles,
   } = {},
 ) {
-  const paths = touchedFiles(lane, { run: runFn });
+  const paths = touchedFiles(lane, { run: runFn }).filter((path) => path !== '.delivery-group-drop');
   if (!paths.length) return { committed: false, paths: [] };
   sanitizeOwnLocusMentions(lane, paths, { readFile, writeFile });
   const msgFile = `${lane}/.delivery-commit-msg-${phase}.txt`;
@@ -2493,7 +2563,7 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
  * {@link DELIVERY_REPORT_VERSION}'s schema carries; optional on a `done` outcome, so a report that supplied
  * none falls back to a generic, still-accurate line rather than an empty body section).
  */
-export function buildPrBody({ item, report, delegation = null }) {
+export function buildPrBody({ item, report, delegation = null, groupMembers = [], groupDropped = [], groupDropReasons = {} }) {
   const summary = (report && typeof report.reason === 'string' && report.reason.trim())
     || `Delivers item #${item} per its backlog spec.`;
   const filesLine = (report && Array.isArray(report.filesTouched) && report.filesTouched.length)
@@ -2502,7 +2572,10 @@ export function buildPrBody({ item, report, delegation = null }) {
   // #3903 main adaptation — see {@link delegationForBuild}. `buildDelegationMarker` returns '' for an invalid
   // triple, so a malformed delegation adds nothing rather than a partial attribution.
   const marker = delegation ? buildDelegationMarker(delegation) : '';
-  return `## #${item}\n\n${summary}${filesLine}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
+  const delivered = groupMembers.filter((num) => !groupDropped.includes(num));
+  const groupBody = (delivered.length ? `\n\nGrouped build (${delivered.length + 1} cards): #${item}, ${delivered.map((num) => `#${num}`).join(', ')}\nResolves ${delivered.map((num) => `#${num}`).join(', ')}\n` : '')
+    + groupDropped.map((num) => `\nDropped from group: #${num} — ${groupDropReasons[num] ?? 'not delivered'}`).join('');
+  return `## #${item}\n\n${summary}${filesLine}${groupBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
     + '(the mechanical wrapper drove review/gate/PR — the agent only built and reported).\n'
     + (marker ? `${marker}\n` : '');
 }
@@ -2535,9 +2608,9 @@ export function delegationForBuild(provider, scope) {
 
 /** REAL — writes {@link buildPrBody}'s content to the exact path `openPr`'s `--bodyFile` reads, so the file
  *  genuinely exists (with real content) by the time `openPr` runs. `writeFile` is injectable for tests. */
-export function writePrBody({ item, lane, report, delegation = null }, { writeFile = writeFileSync } = {}) {
+export function writePrBody({ item, lane, report, delegation = null, groupMembers, groupDropped, groupDropReasons }, { writeFile = writeFileSync } = {}) {
   const bodyFile = `${lane}/.pr-body.md`;
-  writeFile(bodyFile, buildPrBody({ item, report, delegation }));
+  writeFile(bodyFile, buildPrBody({ item, report, delegation, groupMembers, groupDropped, groupDropReasons }));
   return bodyFile;
 }
 
@@ -2554,12 +2627,12 @@ export function describeOpenPrRefusal({ reason, detail, pr }) {
  *  `scaffold.mjs#slugFor`). `run` is injectable (mirrors `computeLaneDiffStats`/`decideParkMode`'s own
  *  pattern), so this is testable with no hidden dependency and no real `open-pr` process. Flags otherwise
  *  lifted verbatim from the live brief's step 8, both branches. */
-export function openPr({ item, attemptTag, lane, park, report, slug, delegation = null, runId, effectKey }, { run: runFn = run } = {}) {
+export function openPr({ item, attemptTag, lane, park, report, slug, delegation = null, runId, effectKey, groupMembers, groupDropped, groupDropReasons }, { run: runFn = run } = {}) {
   if (!slug) {
     throw new Error(`deliver-item-wrapper: openPr needs the item's real slug for #${item} — never substitutes a literal placeholder`);
   }
   const ref = `lane/${item}${attemptTag ?? ''}-${slug}`;
-  const bodyFile = writePrBody({ item, lane, report, delegation }); // REAL — was a PLACEHOLDER path nothing wrote.
+  const bodyFile = writePrBody({ item, lane, report, delegation, groupMembers, groupDropped, groupDropReasons }); // REAL — was a PLACEHOLDER path nothing wrote.
   const args = [
     // build-path-codex-isolation-locus — ABSOLUTE, never the bare relative `scripts/operations/run.mjs`. This
     // call sets `cwd: lane` below so `run.mjs`'s OWN `process.cwd()` (which `pr-land.mjs`'s `REPO =

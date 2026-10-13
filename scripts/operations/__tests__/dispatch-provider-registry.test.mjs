@@ -328,3 +328,14 @@ describe('THE DEFAULT PATH — an empty environment is all-agent, so the sink\'s
     expect(seen).toEqual(['build']);
   });
 });
+
+describe('grouped mechanical build argv', () => {
+  it('passes members to the detached delivery process', async () => {
+    const calls = [];
+    await deliverItemDetachedProvider({ num: '1', lane: '2', sessionSlug: 'conveyor-1', groupMembers: ['2', 'xabc123'] }, {
+      spawnDetached: (argv) => { calls.push(argv); return { pid: 123 }; },
+      logPathFor: () => '/tmp/group-provider.log', readDeliveryAgentMarker: () => null,
+    });
+    expect(calls[0]).toContain('--group-members=2,xabc123');
+  });
+});

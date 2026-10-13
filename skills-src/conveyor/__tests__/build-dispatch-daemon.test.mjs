@@ -1,5 +1,6 @@
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
+import { cliEffects } from '../build-dispatch-daemon.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -1348,6 +1349,17 @@ describe('cliListSettledBuilds / cliListHolds (the real readers, not a stub)', (
       const rows = await cliListRunStoreInFlight({ launchKind: 'prepare-item', now: new Date(now), listAgents: () => [] });
       expect(rows).toHaveLength(expected);
     });
+
+  it('exposes the wrapper group result on a settled build row', async () => {
+    seedRun('dispatch-lane-grouped', [{
+      key: 'dispatch:0:0', type: DISPATCH_EFFECT, stepIndex: 0, index: 0, status: 'applied',
+      payload: { num: '1001', launchKind: 'build' },
+      result: { outcome: 'pr-opened', groupMembers: ['1002', '1003'], groupDropped: ['1003'] }, error: null,
+    }]);
+    expect(await cliListSettledBuilds()).toEqual([expect.objectContaining({
+      num: '1001', groupMembers: ['1002', '1003'], groupDropped: ['1003'],
+    })]);
+  });
 
   it('lists an `applied` build effect under the OUTCOME the wrapper actually settled it with', async () => {
     seedRun('dispatch-lane-1001', [{
@@ -3238,5 +3250,275 @@ describe('cliCardChangedSince', () => {
     expect(cliCardChangedSince('4354', '2026-10-09T12:00:00Z', { root: repo })).toEqual({ commit: mergeSha, at: '2026-10-09T17:00:00Z' });
     // A hold recorded after the merge is not released by it.
     expect(cliCardChangedSince('4354', '2026-10-09T18:00:00Z', { root: repo })).toBeNull();
+  });
+});
+
+describe('grouped BUILD daemon ticks', () => {
+  let root, log;
+  const rows = ['7101', '7102', '7103', '7104'].map((num, i) => ({ num, kind: 'task', size: 1,
+    parent: '7000', locus: 'we', scope: [`we:scripts/group/file${i}.mjs`] }));
+  const policy = { ...BUILD_DISPATCH_POLICY, maxConcurrentBuilds: 1, maxOpenItems: 1 };
+  function fixture({ queue = rows, claims = [], runs = [], settled = [], refuse = [], fail = false } = {}) {
+    for (const c of claims) acquireBuildDispatchClaim({ ...c, owner: 'fixture', pid: 123, lockRoot: root });
+    const effects = {
+      planTick: () => ({ decisions: { spawnBuilds: queue.map(({ num }) => ({ num })),
+        admission: { queue, cleared: [...queue, ...runs], held: [] } }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => listBuildDispatchClaims({ lockRoot: root }),
+      listRunStoreInFlight: () => runs, listSettledBuilds: () => settled, killSwitch: () => ({ engaged: false }),
+      acquireClaim: vi.fn(args => refuse.includes(args.num) ? { ok: false, reason: 'busy' }
+        : acquireBuildDispatchClaim({ ...args, owner: 'fixture', pid: 123, lockRoot: root })),
+      releaseClaim: vi.fn(args => releaseBuildDispatchClaim({ ...args, lockRoot: root })),
+      dispatch: vi.fn(() => ({ dispatching: !fail, reason: fail ? 'failed' : undefined, lane: 14 })),
+      recordBuildFailure: vi.fn(),
+    };
+    return effects;
+  }
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-')); log = vi.spyOn(console, 'error').mockImplementation(() => {}); });
+  afterEach(() => { vi.unstubAllEnvs(); log.mockRestore(); rmSync(root, { recursive: true, force: true }); });
+
+  it.each([1, 100])('cap one launches four related cards as one build, persists member claims, and logs every tick including dry-run (WIP=%s)', async maxOpenItems => {
+    const effects = fixture();
+    const capPolicy = { ...policy, maxOpenItems };
+    const result = await runBuildDispatchTick({ live: true, policy: capPolicy, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', groupMembers: ['7102', '7103', '7104'] }));
+    expect(effects.listClaims()).toHaveLength(4);
+    expect(effects.listClaims().find(c => c.meta.num === '7102').meta.groupLead).toBe('7101');
+    expect(result.dispatched[0].groupMembers).toEqual(['7102', '7103', '7104']);
+    expect(result.grouping.groups[0]).toMatchObject({ lead: '7101', members: ['7102', '7103', '7104'] });
+    expect(log.mock.calls.some(([s]) => s.startsWith('build-dispatch-daemon: grouped build #7101 members #7102,#7103,#7104'))).toBe(true);
+    const preview = await runBuildDispatchTick({ live: false, policy: capPolicy, effects });
+    expect(preview.grouping.settings.groupMin).toBe(3);
+    expect(log.mock.calls.filter(([s]) => s.startsWith('build-grouping:'))).toHaveLength(2);
+    expect(preview.plan.busy).toBe(1);
+    expect(preview.plan.openItems.count).toBe(1);
+    expect(preview.plan.inFlight[0].scope).toEqual(expect.arrayContaining(rows.flatMap(r => r.scope)));
+    expect(preview.plan.hold.some(h => ['7102', '7103', '7104'].includes(h.num))).toBe(false);
+  });
+
+  it('absorbs later picks and hot-file holds solely caused by this tick', async () => {
+    const queue = rows.map(r => ({ ...r, scope: ['we:scripts/group/shared.mjs'] }));
+    const effects = fixture({ queue });
+    const result = await runBuildDispatchTick({ live: true, policy: { ...policy, maxConcurrentBuilds: 4, maxOpenItems: 4 }, effects });
+    expect(result.dispatched).toHaveLength(1);
+    expect(result.dispatched[0].groupMembers).toHaveLength(3);
+    // Disjoint picks also become a single launch rather than four launches.
+    rmSync(root, { recursive: true, force: true });
+    const disjoint = await runBuildDispatchTick({ live: true, policy: { ...policy, maxConcurrentBuilds: 4, maxOpenItems: 4 }, effects: fixture() });
+    expect(disjoint.dispatched).toHaveLength(1);
+  });
+
+  it('does not absorb a hot-file hold that also conflicts with existing work or a routing refusal', async () => {
+    const queue = rows.map((r, i) => ({ ...r, scope: [rows[0].scope[0], ...(i === 2 ? ['we:busy/file.mjs'] : [])] }));
+    const effects = fixture({ queue, runs: [{ num: '7999', scope: ['we:busy/file.mjs'], executor: 'codex' }] });
+    effects.predictRoute = num => num === '7104' ? { refusal: 'no route' } : { executor: 'claude' };
+    const result = await runBuildDispatchTick({ live: true, policy: { ...policy, maxOpenItems: 2 }, effects });
+    expect(result.dispatched[0].groupMembers ?? []).toEqual([]);
+  });
+
+  it('drops refused member claims and releases acquired members when below minimum', async () => {
+    const effects = fixture({ refuse: ['7103', '7104'] });
+    const result = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(result.dispatched[0].groupMembers ?? []).toEqual([]);
+    expect(effects.listClaims().map(c => c.meta.num)).toEqual(['7101']);
+  });
+
+  it('releases all group claims on failed dispatch', async () => {
+    const effects = fixture({ fail: true });
+    await runBuildDispatchTick({ live: true, policy, effects });
+    expect(effects.acquireClaim).toHaveBeenCalledTimes(4);
+    expect(effects.listClaims()).toEqual([]);
+  });
+
+  it('retains members under a lead run or delivering PR and retires orphan members', async () => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7101' }], runs: [{ ...rows[0], executor: 'claude' }] });
+    const live = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(live.retired).toEqual([]);
+    expect(live.plan.busy).toBe(1);
+    effects.listRunStoreInFlight = () => [];
+    effects.fetchOpenPrs = () => [{ repo: 'we', prs: [{ number: 8000, headRefName: 'lane/7101-build', files: [], labels: [] }] }];
+    expect((await runBuildDispatchTick({ live: true, policy, effects })).retired.some(r => r.num === '7102')).toBe(false);
+    effects.fetchOpenPrs = () => [];
+    const orphan = await runBuildDispatchTick({ live: false, policy, effects });
+    expect(orphan.retired).toContainEqual(expect.objectContaining({ num: '7102', why: 'group-lead-gone', released: false }));
+  });
+
+  it('settled drops release members, persist exclusions, and subsequently dispatch the dropped card alone', async () => {
+    const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+      settled: [{ num: '7101', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+    effects.fetchOpenPrs = () => [{ repo: 'we', prs: [{ number: 8000, headRefName: 'lane/7101-build', files: [], labels: [] }] }];
+    const result = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(result.nextBookkeeping.groupDropped).toEqual(['7102']);
+    expect(result.retired).toContainEqual(expect.objectContaining({ num: '7102', why: 'group-member-dropped' }));
+    expect(result.dispatched).toEqual([]); // The lead's open PR still occupies the WIP slot.
+    effects.fetchOpenPrs = () => [];
+    effects.planTick = () => ({ decisions: { spawnBuilds: rows.slice(1),
+      admission: { queue: rows.slice(1), cleared: rows.slice(1) } }, nextState: {} });
+    // Exclusion survives a tick-core nextState that omits it and makes this lead ineligible for grouping.
+    const next = await runBuildDispatchTick({ live: true, policy, effects, bookkeeping: result.nextBookkeeping });
+    expect(next.nextBookkeeping.groupDropped).toEqual(['7102']);
+    expect(next.dispatched[0].groupMembers ?? []).toEqual([]);
+    expect(next.dispatched[0].num).toBe('7102');
+  });
+
+  it('fail-group records a lead failure, releases all members, and withholds the lead this tick', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+      settled: [{ num: '7101', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+    const result = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(effects.recordBuildFailure).toHaveBeenCalledTimes(1);
+    expect(effects.recordBuildFailure).toHaveBeenCalledWith(expect.objectContaining({ num: '7101', reason: 'group-member-dropped' }));
+    expect(result.retired.map(r => r.num).sort()).toEqual(rows.map(r => r.num));
+    expect(result.dispatched.some(r => r.num === '7101')).toBe(false);
+  });
+
+  it('ignores stale drop results from an older lead attempt', async () => {
+    const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+      settled: [{ num: '7101', startedAt: '2000-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+    const result = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(result.nextBookkeeping.groupDropped).toEqual([]);
+    expect(result.plan.busy).toBe(1);
+    expect(effects.releaseClaim).not.toHaveBeenCalled();
+  });
+
+  it('grouping off preserves individual dispatch', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_SMALL_FINDINGS', 'false');
+    const effects = fixture();
+    const result = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(result.grouping.groups).toEqual([]);
+    expect(result.dispatched).toHaveLength(1);
+    expect(effects.acquireClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['build', 'prepare-item'])('threads groupMembers to dispatch-lane argv (%s)', launchKind => {
+    const exec = vi.fn(() => JSON.stringify({ dispatching: true }));
+    cliDispatch({ num: '7101', groupMembers: ['7102', '7103'], launchKind }, { exec });
+    expect(exec.mock.calls[0][1]).toContain('--groupMembers=7102,7103');
+  });
+
+  it('live claim adapter preserves groupLead on disk', () => {
+    vi.stubEnv('WE_COORDINATION_ROOT', root);
+    const effects = cliEffects();
+    expect(effects.acquireClaim({ num: '7102', scope: rows[1].scope, groupLead: '7101' }).ok).toBe(true);
+    expect(effects.listClaims()[0].meta).toMatchObject({ num: '7102', groupLead: '7101', scope: rows[1].scope });
+  });
+});
+
+describe('grouped PREPARE daemon ticks', () => {
+  let root;
+  const rows = ['7201', '7202', '7203', '7204', '7205'].map((num, i) => ({ num, kind: 'task', size: 1,
+    parent: '7200', locus: 'we', scope: [`we:scripts/prepare/file${i}.mjs`] }));
+  function fixture({ claims = [], spawns = [rows[0]], queue = rows, busy = [], held = [], fail = false, refuse = [] } = {}) {
+    for (const claim of claims) acquireBuildDispatchClaim({ ...claim, lockRoot: root });
+    return {
+      planTick: () => ({ decisions: { spawnPrepareItems: spawns, admission: { queue, cleared: [],
+        held: queue.map(r => ({ num: r.num, reason: 'needs-prepare' })) } }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }), listHolds: () => held,
+      listPrepareInFlight: () => busy, listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: root }),
+      readPrepareStatus: vi.fn(() => ({ preparedDate: null })),
+      readPreparedStamp: vi.fn(() => ({ preparedDate: null })),
+      acquirePrepareClaim: vi.fn(args => refuse.includes(args.num) ? { ok: false, reason: 'busy' }
+        : acquireBuildDispatchClaim({ ...args, lockRoot: root })),
+      releasePrepareClaim: vi.fn(args => releaseBuildDispatchClaim({ ...args, lockRoot: root })),
+      dispatch: vi.fn(() => ({ dispatching: !fail, reason: 'failed', lane: 14 })),
+      placePrepareHold: vi.fn(),
+    };
+  }
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+  it('groups needs-prepare and prepare-stale queue cards into one prepare, claiming every member with its stamp', async () => {
+    const effects = fixture({ queue: rows.slice(0, 4) });
+    const plan = effects.planTick;
+    effects.planTick = () => { const out = plan(); out.decisions.admission.held[1].reason = 'prepare-stale'; return out; };
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
+    expect(tick.prepare.launched[0].groupMembers).toEqual(['7202', '7203', '7204']);
+    expect(effects.listPrepareClaims()).toHaveLength(4);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledWith(expect.objectContaining({ num: '7202', groupLead: '7201', replacesStamp: null }));
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('member claims retain ownership without consuming prepareCap', async () => {
+    const effects = fixture({ claims: rows.slice(0, 4).map((r, i) => ({ ...r, ...(i ? { groupLead: '7201' } : {}) })), spawns: [rows[4]] });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.inFlight).toEqual(['7201']);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7205' }));
+    expect(effects.releasePrepareClaim).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('orphan member retires without a failure hold (dry-run=%s)', async dry => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7201' }], spawns: [] });
+    const tick = await runBuildDispatchTick({ live: !dry, effects });
+    expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'group-lead-gone', released: !dry });
+    expect(tick.prepare.inFlight).toEqual([]);
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+    expect(effects.releasePrepareClaim).toHaveBeenCalledTimes(dry ? 0 : 1);
+  });
+
+  it('retains a member while the lead has a run row without a claim', async () => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7201' }], busy: [{ num: '7201' }], spawns: [] });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.inFlight).toEqual(['7201']);
+    expect(effects.releasePrepareClaim).not.toHaveBeenCalled();
+  });
+
+  it('stamped members retire even while the lead remains tracked', async () => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7201' }], busy: [{ num: '7201' }], spawns: [] });
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: num === '7202' ? '2026-10-13' : null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'prepared on main', released: true });
+  });
+
+  it('drops failed member claims and releases members when the surviving group is too small', async () => {
+    const effects = fixture({ queue: rows.slice(0, 3), refuse: ['7203'] });
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+    expect(effects.listPrepareClaims().map(c => c.meta.num)).toEqual(['7201']);
+  });
+
+  it('releases all member claims on failed dispatch', async () => {
+    const effects = fixture({ queue: rows.slice(0, 4), fail: true });
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(4);
+    expect(effects.listPrepareClaims()).toEqual([]);
+  });
+
+  it.each(['per-card', 'off'])('preserves single-card launches with %s', async mode => {
+    vi.stubEnv(mode === 'off' ? 'WE_BUILD_GROUP_SMALL_FINDINGS' : 'WE_BUILD_GROUP_PREPARE', mode === 'off' ? 'false' : mode);
+    const effects = fixture({ spawns: rows.slice(0, 2) });
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(2);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(2);
+    expect(effects.dispatch.mock.calls.every(([args]) => !args.groupMembers?.length)).toBe(true);
+  });
+
+  it('excludes busy, held, finished, and non-prepare queue members', async () => {
+    const effects = fixture({ busy: [{ num: '7202' }], held: [{ num: '7203', reason: 'needs-you' }] });
+    const plan = effects.planTick;
+    effects.planTick = () => { const out = plan(); out.decisions.admission.held[4].reason = 'blocked'; return out; };
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it('retires members in the same tick the lead retires, regardless of claim order', async () => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7201' }, rows[0]], spawns: [] });
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: num === '7201' ? '2026-10-13' : null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'group-lead-gone', released: true });
+    expect(effects.listPrepareClaims()).toEqual([]);
+  });
+
+  it('dry-run reports grouped plans without claiming or dispatching', async () => {
+    const effects = fixture({ spawns: rows.slice(0, 4), queue: rows.slice(0, 4) });
+    const tick = await runBuildDispatchTick({ effects });
+    expect(tick.prepare.planned).toHaveLength(1);
+    expect(tick.prepare.planned[0].groupMembers).toEqual(['7202', '7203', '7204']);
+    expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
+    expect(effects.dispatch).not.toHaveBeenCalled();
   });
 });

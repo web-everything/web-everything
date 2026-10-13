@@ -113,7 +113,7 @@ export const BRIEF_PLACEHOLDERS = Object.freeze([
   // brief is byte-identical to the pre-#3637 literal it replaced); a registered POC branch when the item's
   // `deliveryTarget:` names one. It had to be REGISTERED here, not just typed into the brief: `fillBrief`
   // strictly refuses an unknown placeholder, which is exactly the blocker #3637's survey named (#2 of five).
-  'DELIVERY_BASE',
+  'DELIVERY_BASE', 'GROUP_MEMBERS',
   // #3960 (multi-repo slice 4) — the FIX/CI-HEAL-ONLY quintet that makes a repair brief repo-aware instead of
   // hardcoding WE. `REPO` is the gh slug (`--repo=` for `rearm-review.mjs`/`stand-down.mjs`/`ci-heal-mark.mjs`/
   // `completion-cli.mjs`); `LANE_REPO` is what `lane-pool.mjs --repo=` itself expects (`.` for WE, an absolute
@@ -134,9 +134,9 @@ export const BRIEF_PLACEHOLDERS = Object.freeze([
 /**
  * {@link fillBrief}'s `optionalNames` argument for {@link BRIEF_PLACEHOLDERS} — names allowed to resolve to
  * `''` without tripping the "no value" refusal (#3110). `ATTEMPT_TAG` is legitimately blank on a fresh build's
- * first attempt — see {@link attemptTagFor}.
+ * first attempt — see {@link attemptTagFor}. `GROUP_MEMBERS` is blank for a single-card prepare.
  */
-export const OPTIONAL_BRIEF_PLACEHOLDERS = Object.freeze(['ATTEMPT_TAG']);
+export const OPTIONAL_BRIEF_PLACEHOLDERS = Object.freeze(['ATTEMPT_TAG', 'GROUP_MEMBERS']);
 
 /**
  * WHICH OF {@link BRIEF_PLACEHOLDERS} A GIVEN KIND'S FILL CALL ACTUALLY REQUIRES — and therefore the only
@@ -171,7 +171,7 @@ export const BRIEF_REQUIRED_BY_KIND = Object.freeze({
   build: ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'ATTEMPT_TAG', 'DELIVERY_BASE', 'WE_ROOT'],
   prepare: ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'WE_ROOT'],
   'prepare-decision': ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'WE_ROOT'],
-  'prepare-item': ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'WE_ROOT'],
+  'prepare-item': ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'WE_ROOT', 'GROUP_MEMBERS'],
   // `investigate` (#3567) fills the SAME names as the two prepare kinds — it targets an ITEM (not an
   // existing PR), same as `prepare`/`prepare-decision`, so it has no `PR_NUM`/`LANE_REF` to give either.
   investigate: ['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE', 'WE_ROOT'],
@@ -769,6 +769,15 @@ function shapeRow(row, what) {
   return row;
 }
 
+/** Validate the CLI's comma list before it reaches a dispatch effect. */
+export function parseGroupMembers(value = '') {
+  const members = Array.isArray(value) ? value.map(String) : value === '' ? [] : String(value).split(',');
+  if (members.some((num) => !/^(?:\d+|x[0-9a-z]{6,})$/.test(num))) {
+    throw new TypeError('dispatch-lane: invalid group member id');
+  }
+  return [...new Set(members)];
+}
+
 /**
  * SHAPE one tick read into the `read` finding, and FILL the brief while everything needed is in hand. PURE —
  * separated from the injected reader so every refusal below is testable without `gh`, `git` or a lane pool.
@@ -789,7 +798,8 @@ function shapeRow(row, what) {
  * @param {{num: string, expectedWithinMinutes: number}} asked
  * @returns {object} the `read` finding.
  */
-export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
+export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMembers: memberInput = '' } = {}) {
+  const groupMembers = parseGroupMembers(memberInput).filter((member) => member !== String(raw?.resolvedNum ?? num));
   if (!raw || typeof raw !== 'object') {
     throw new Error(`dispatch-lane.read: the injected reader returned ${typeof raw}, not a tick read`);
   }
@@ -1135,6 +1145,9 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
       SESSION_SLUG: sessionSlug,
       SCOPE: scope.join(','),
       ATTEMPT_TAG: attempt,
+      GROUP_MEMBERS: groupMembers.length
+        ? `GROUPED PREPARE — this prepare covers cards ${groupMembers.map((n) => `#${n}`).join(', ')} in addition to #${resolvedNum}. Prepare each listed card in this SAME lane and stamp each one's preparedDate; one prepare PR covers the group. A card you cannot prepare: leave it untouched and name it in the PR body under 'Not prepared'.`
+        : '',
       // #3637 — `main` unless the item declares a registered POC branch. Resolved here (the pure side) so the
       // run record freezes the branch this dispatch was actually aimed at, exactly as it freezes the brief.
       DELIVERY_BASE: deliveryBaseFor(item),
@@ -1153,7 +1166,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
     values,
     BRIEF_REQUIRED_BY_KIND[launchKind],
     undefined,
-    repairsExistingPr ? REPO_AWARE_VALUE_PATTERNS : { SCOPE: BRIEF_SCOPE_VALUE_RE },
+    repairsExistingPr ? REPO_AWARE_VALUE_PATTERNS : { SCOPE: BRIEF_SCOPE_VALUE_RE, GROUP_MEMBERS: /^[\s\S]*$/ },
   );
 
   // #3717 — THE ROUTE THIS DISPATCH TAKES, in two halves on opposite sides of this file's purity line.
@@ -1200,6 +1213,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
   return {
     ...base,
     dispatching: true,
+    groupMembers,
     // THE COMPUTED ROUTE, frozen onto the read exactly as the filled brief is: the run record must say which
     // provider was CHOSEN and which one actually RAN (#3717 step 4). `taskType` is carried separately because
     // the DERIVATION runs here even when no provider decision arrived.
@@ -1255,6 +1269,7 @@ export function dispatchLaneOperation({ readTick } = {}) {
       // A STRING, not a number: an item id may be a `xNNNNNN` JIT hash, and the shell's `normNum` is what turns
       // either spelling into one identity.
       num: 'string',
+      groupMembers: { type: 'string', required: false, default: '' },
       // The conveyor's live guard bookkeeping — the SESSION-EPHEMERAL `{ buildGuards, watched, … }` the tick
       // threads from tick to tick (`we:skills-src/conveyor/SKILL.md` §5). Passed as a FILE because it is the
       // runner's process state, not repo state: no parallel on-disk store is created by this operation, it only
@@ -1274,10 +1289,10 @@ export function dispatchLaneOperation({ readTick } = {}) {
     // ── 1. read ─────────────────────────────────────────────────────────────────────────────────────────────
     // ONE tick read, already selected for this num by the shell, shaped and turned into a filled brief.
     read: compute({
-      reads: ['input.num', 'input.bookkeepingFile', 'input.tickFile', 'input.expectedWithinMinutes'],
+      reads: ['input.groupMembers', 'input.num', 'input.bookkeepingFile', 'input.tickFile', 'input.expectedWithinMinutes'],
       fn: (view) => shapeDispatchRead(
         readTick({ num: view.input.num, bookkeepingFile: view.input.bookkeepingFile, tickFile: view.input.tickFile }),
-        { num: view.input.num, expectedWithinMinutes: view.input.expectedWithinMinutes },
+        { num: view.input.num, expectedWithinMinutes: view.input.expectedWithinMinutes, groupMembers: view.input.groupMembers },
       ),
     }),
 
@@ -1362,6 +1377,7 @@ export function dispatchLaneOperation({ readTick } = {}) {
           idempotent: false,
           payload: {
             num: read.num,
+            groupMembers: read.groupMembers,
             launchKind: read.launchKind,
             lane: read.lane,
             sessionSlug: read.sessionSlug,

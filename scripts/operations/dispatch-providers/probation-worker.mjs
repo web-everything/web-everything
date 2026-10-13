@@ -139,6 +139,7 @@ export function probationWorkerDetachedProvider(request, {
     argv = [String(script), `--num=${num}`, `--session=${sessionSlug}`, `--worker=${JSON.stringify(worker)}`];
     const attemptTag = typeof request?.attemptTag === 'string' ? request.attemptTag : '';
     if (attemptTag) argv.push(`--attempt=${attemptTag}`);
+    if (request.groupMembers?.length) argv.push(`--group-members=${request.groupMembers.join(',')}`);
   } else if (kind === 'ci-heal') {
     const pr = normNum(request?.pr);
     const reason = String(request?.reason ?? '').trim() || 'red-ci';
