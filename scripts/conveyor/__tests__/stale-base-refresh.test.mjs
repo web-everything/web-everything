@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { extractFailingTestFiles, decideStaleBaseRefresh, staleBaseBudgetSpent, buildStaleBaseComment,
   resolveStaleBaseSetting, createStaleBaseGate, readStaleBaseFacts } from '../stale-base-refresh.mjs';
+import { resolveLanePoolRepoPath } from '../lane-pool-health-watch.mjs';
 const file = 'scripts/conveyor/soak/__tests__/shard-files.test.mjs';
 const sha = 'a'.repeat(40);
 const log = `2026-10-13T13:30:00.1234567Z \u001b[31m FAIL \u001b[0m${file} > shard timings > the stored timings cover most break files\nAssertionError: expected 0.796875 to be greater than 0.8`;
@@ -78,6 +79,32 @@ describe('stale base gate', () => {
     expect(d.postComment).toHaveBeenCalledWith(5045, expect.objectContaining({ body: expect.stringContaining('outcome: rebased') }));
     expect(d.reconcileAcceptance).toHaveBeenCalledWith({ prNumber: 5045, newHead: sha, repo: 'web-everything/web-everything', root: '/repo' });
   });
+  it('uses the fui lane-pool root despite the dispatch seam passing the WE root', async () => {
+    const d = setup();
+    const root = resolveLanePoolRepoPath('frontierui');
+    expect(root).toBeTruthy();
+    expect(await createStaleBaseGate(d)({ planned: { pr: 5045 }, repo: 'frontierui', root: '/we' })).toMatchObject({ held: true });
+    expect(d.readFacts).toHaveBeenCalledWith(expect.objectContaining({ root }));
+    expect(d.refresh).toHaveBeenCalledWith('lane/5045', expect.objectContaining({ root }));
+    expect(d.readOriginTip).toHaveBeenCalledWith(expect.objectContaining({ root }));
+    expect(d.reconcileAcceptance).toHaveBeenCalledWith(expect.objectContaining({ root }));
+  });
+  it.each(['comment', 'acceptance', 'both'])('holds after successful refresh when %s fails, before routing or dispatch', async failure => {
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const d = setup({
+      postComment: vi.fn(() => { if (failure !== 'acceptance') throw new Error('comment deferred'); }),
+      reconcileAcceptance: vi.fn(() => { if (failure !== 'comment') throw new Error('acceptance failed'); }),
+    });
+    const route = vi.fn(() => ({ executor: 'claude' }));
+    const dispatch = vi.fn(() => ({ spawned: true }));
+    const run = createRoutedCiHealDispatch({ route, dispatch, createSinks: () => ({}), staleBaseGate: createStaleBaseGate(d) });
+    expect(await run({ pr: 5045 }, { repo: 'we', root: '/repo' })).toMatchObject({ held: true });
+    expect(d.postComment).toHaveBeenCalledOnce();
+    expect(d.reconcileAcceptance).toHaveBeenCalledOnce();
+    expect(route).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledWith(expect.stringContaining('failed'));
+  });
   it.each([() => ({ action: 'error', error: 'conflict' }), () => { throw new Error('failed'); },
     () => ({ action: 'current' }), () => ({ action: 'skip' })])('spends the budget even when refresh does not rebase', async refresh => {
     const d = setup({ refresh });
@@ -150,6 +177,12 @@ describe('stale base fact reader', () => {
     ]);
     expect(d.exec.mock.calls.at(-1)[1]).toEqual(['--literal-pathspecs', '-C', '/repo', 'diff', '--name-only', sha, 'origin/main', '--', file]);
     expect(d.readMainLatestCheckRuns).toHaveBeenCalledWith(expect.objectContaining({ mainRuns: [], exec: d.exec }));
+  });
+  it('reads changed failing files in fui even when passed a WE root', () => {
+    const d = fixture();
+    readStaleBaseFacts({ ...d.input, repo: 'frontier-ui/frontierui', root: '/we' });
+    expect(d.exec.mock.calls.at(-1)[1]).toEqual(['--literal-pathspecs', '-C', resolveLanePoolRepoPath('frontierui'),
+      'diff', '--name-only', sha, 'origin/main', '--', file]);
   });
   it('makes no IO calls when off', () => {
     const d = fixture();

@@ -110,7 +110,9 @@ export function staleBaseBudgetSpent({ comments, mergeBase } = {}) {
 
 const childOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-const repoRoot = (slug, root) => root ?? resolveLanePoolRepoPath(slug) ?? REPO_ROOT;
+// A dispatcher's root is the WE checkout, even when dispatching a sibling repo.
+// Use the same lane-pool resolver as ci-red-recovery-watch; WE has no fixed path.
+const repoRoot = (slug, root) => resolveLanePoolRepoPath(slug) ?? root ?? REPO_ROOT;
 
 /** IO: stop before the expensive reads whenever a common prerequisite rules out refresh. */
 export function readStaleBaseFacts({ repo, pr, defaultBranch = 'main', exec = execFileSyncThrottled, root,
@@ -232,11 +234,18 @@ export function createStaleBaseGate({ env = process.env, readFacts = readStaleBa
     catch (e) { result = { action: 'error', error: String(e?.message ?? e) }; }
     let onto = null;
     try { const tip = await readOriginTip({ root, repo: slug }); if (isSha(tip)) onto = tip; } catch { /* marker names unknown tip as none */ }
-    await postComment(planned.pr, { repo: slug, body: buildStaleBaseComment({ head: facts.headRefOid,
-      mergeBase: facts.mergeBase, onto, via: decision.via, failingTestFiles: decision.failingTestFiles,
-      outcome: result?.action ?? 'error' }) });
+    try {
+      await postComment(planned.pr, { repo: slug, body: buildStaleBaseComment({ head: facts.headRefOid,
+        mergeBase: facts.mergeBase, onto, via: decision.via, failingTestFiles: decision.failingTestFiles,
+        outcome: result?.action ?? 'error' }) });
+    } catch (e) {
+      log(`stale-base-refresh: PR #${planned.pr} budget comment failed: ${String(e?.message ?? e)}`);
+    }
     if (result?.action === 'rebased' && result.newCommit) {
-      await reconcileAcceptance({ prNumber: planned.pr, newHead: result.newCommit, repo: slug, root });
+      // The branch has already moved. Ancillary failures must never let the
+      // dispatch wrapper fail open and launch a fixer before the new CI runs.
+      try { await reconcileAcceptance({ prNumber: planned.pr, newHead: result.newCommit, repo: slug, root }); }
+      catch (e) { log(`stale-base-refresh: PR #${planned.pr} acceptance reconciliation failed: ${String(e?.message ?? e)}`); }
       log(`stale-base-refresh: PR #${planned.pr} refreshed onto main instead of a ci-heal (via ${decision.via}; failing tests ${decision.failingTestFiles.join(', ')} pass on main); ciHeal.staleBaseRefreshFirst=on (source ${setting.source})`);
       return { held: true, reason: 'stale-base refresh first: refreshed onto main, CI re-runs before any fixer' };
     }

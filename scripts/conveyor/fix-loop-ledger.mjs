@@ -74,8 +74,11 @@ export function ledgerInfraRows({ rows, repo, pr, head }) {
 }
 export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0 }) {
   const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
+  // Retain old attempts for pairing boundaries, but never use future outcomes
+  // as evidence for a session inside the current observation window.
+  const observed = (rows ?? []).filter(row => Date.parse(row?.at) <= new Date(now).getTime());
   infraFailures = Math.max(Number.isFinite(infraFailures) ? infraFailures : 0,
-    ledgerInfraRows({ rows, repo, pr, head }).length);
+    ledgerInfraRows({ rows: observed, repo, pr, head }).filter(row => matches.includes(row)).length);
   infraFailures = Number.isFinite(infraFailures) ? Math.max(0, Math.min(matches.length, Math.floor(infraFailures))) : 0;
   const count = matches.length - infraFailures;
   return { count, rawCount: matches.length, infraFailures, held: config.hold && count >= config.maxSessions,

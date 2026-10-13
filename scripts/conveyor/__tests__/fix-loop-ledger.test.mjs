@@ -212,3 +212,21 @@ it('unions caller and ledger infra positions without double counting', () => {
   expect(fixLoopDisposition({ ...args, infraRows: [sessions[0], sessions[1]] }).action).toBe('dispatch');
   expect(state(args.rows, { infraFailures: 2 })).toMatchObject({ infraFailures: 2, count: 1 });
 });
+
+it.each(['expired', 'future'])('%s infrastructure outcomes do not discount current sessions', position => {
+  const at = new Date(now + (position === 'expired' ? -7 : 1) * 3600000).toISOString();
+  const infra = row({ session: 'infra', at });
+  const rows = [infra, row({ kind: 'outcome', session: 'infra', at, outcome: 'failed', infra: true }),
+    ...Array.from({ length: 3 }, (_, i) => [row({ session: `s${i}` }),
+      row({ kind: 'outcome', session: `s${i}`, outcome: 'no-change', infra: false })]).flat()];
+  expect(state(rows)).toMatchObject({ rawCount: 3, infraFailures: 0, count: 3, held: true });
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now, config }).action).toBe('hold');
+});
+
+it('future infrastructure outcomes do not discount a current session', () => {
+  const rows = [...Array.from({ length: 3 }, (_, i) => row({ session: `s${i}` })),
+    row({ kind: 'outcome', session: 's0', outcome: 'failed', infra: true,
+      at: new Date(now + 1000).toISOString() })];
+  expect(state(rows)).toMatchObject({ rawCount: 3, infraFailures: 0, count: 3, held: true });
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now, config }).action).toBe('hold');
+});
