@@ -46,7 +46,7 @@ export function validateControlInput(name, input) {
   if (!Number.isSafeInteger(pr) || pr < 0 || typeof item !== 'string' || typeof file !== 'string') throw new Error('invalid target');
   if (Number(pr > 0) + Number(Boolean(item)) + Number(Boolean(file)) !== 1) throw new Error('give exactly one target: --pr, --item or --file');
   if (item && (!['unpark', 'retry-prepare'].includes(name) || !/^[1-9]\d*$/.test(item))) throw new Error('--item must be a positive numeric card id for unpark or retry-prepare');
-  if (item && input.repo !== CONSTELLATION_REPOS.we.slug) throw new Error('item controls support only the web-everything/web-everything repository');
+  if (item && input.repo !== CONSTELLATION_REPOS.we.slug) throw new Error(`item controls support only the ${CONSTELLATION_REPOS.we.slug} repository`);
   if (name === 'retry-prepare' && !item) throw new Error('retry-prepare requires --item');
   if (file && (name !== 'clear-claim' || file.startsWith('/') || file.split('/').includes('..') || /[\r\n]/.test(file))) throw new Error('--file must be a repo path for clear-claim');
   if (name === 'grant-rounds' && !['fix', 'review'].includes(input.kind ?? 'fix')) throw new Error('--kind must be fix or review');
