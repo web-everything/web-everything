@@ -11,6 +11,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 
 import {
   DRAIN_FOLLOWUP_KIND, ensureDepsLink, followupWorktreeLayout, handOffDrainFollowup, resolveDrainFollowupSetting,
@@ -21,13 +22,15 @@ const script = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-
 
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 const F = process.env.FU_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
-const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
+if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => !landed(p.number)), a.find(v => v.startsWith('query=')) || ''));
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);

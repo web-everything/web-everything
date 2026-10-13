@@ -23,6 +23,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(HERE, '..', 'merge-ai-prs.mjs'); // the REAL entrypoint under test
@@ -30,11 +31,12 @@ const SCRIPT = resolve(HERE, '..', 'merge-ai-prs.mjs'); // the REAL entrypoint u
 // ── fake gh: answers pr list / pr view from the fixture pointed to by $GATE_FIXTURE; succeeds quietly else ──
 const FAKE_GH = `#!/usr/bin/env node
 const fs = require('fs');
+const openPrPageFixture = ${openPrPageFixture};
 const fx = JSON.parse(fs.readFileSync(process.env.GATE_FIXTURE, 'utf8'));
 const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
 const fields = ji >= 0 ? String(a[ji + 1] || '') : '';
-function out(o) { process.stdout.write(JSON.stringify(o)); process.exit(0); }
+function out(o) { fs.writeSync(1, JSON.stringify(o)); process.exit(0); }
 // The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
 function headOf(pr) {
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
@@ -71,15 +73,17 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 // gate reads both from the listing, so a row missing them would model a malformed listing and defer every PR.
 // The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
 // tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
-if (a[0] === 'pr' && a[1] === 'list') out(fx.prs.map((pr) => {
+const listedRows = () => fx.prs.map((pr) => {
   const row = { ...pr };
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
   // These unrelated gate scenarios use known modifications; unknown/rename metadata
   // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
-  if (fields.split(',').includes('files') && !('files' in row)) row.files = (pr._files || []).map((f) => ({ changeType: 'MODIFIED', ...f }));
-  if (fields.split(',').includes('headRefOid') && !row.headRefOid) row.headRefOid = (tip && tip.oid) || headOf(pr);
+  if (!('files' in row)) row.files = (pr._files || []).map((f) => ({ changeType: 'MODIFIED', ...f }));
+  if (!row.headRefOid) row.headRefOid = (tip && tip.oid) || headOf(pr);
   return row;
-}));
+});
+if (a[0] === 'pr' && a[1] === 'list') out(listedRows());
+if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(listedRows(), a.find(v => v.startsWith('query=')) || ''));
 if (a[0] === 'pr' && a[1] === 'view') {
   const pr = fx.prs.find((p) => String(p.number) === String(a[2])) || {};
   const fieldList = fields.split(',');
@@ -100,7 +104,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
   // of returning the first match alone, matching real gh for any field combination a caller asks for.
   const resp = {};
   if (fields.includes('commits')) resp.commits = pr._commits || [];
-  if (fields.includes('files')) resp.files = pr._files || [];
+  if (fields.includes('files')) resp.files = (pr.files || pr._files || []).map(f => ({ changeType: 'MODIFIED', ...f }));
   if (fields.includes('body')) resp.body = pr.body || '';
   // #2409 reviewed-SHA staleness read: return the live head plus a reviewed-sha marker comment. When the fixture's
   // _reviewedSha differs from _headRefOid the accept is STALE (re-park); no marker → gate fails open.
