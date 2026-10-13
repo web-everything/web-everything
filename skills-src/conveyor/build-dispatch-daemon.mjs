@@ -705,7 +705,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     console.error(`build-dispatch-daemon: grouping card load failed; grouping disabled for this tick: ${String(e?.message || e).split('\n')[0]}`);
   }
   // A probation BUILD only delivers its lead; failed route predictions also fail closed for grouping.
-  const groupCapable = c => !effects.predictRoute || (!c.route?.error && c.route?.groupCapable === true);
+  // The planner's picks carry the predicted executor but not the route itself, so look it up on the candidate.
+  const routeByNum = new Map(candidates.map(c => [c.num, c.route]));
+  const groupCapable = c => {
+    const route = c.route ?? routeByNum.get(normNum(c.num));
+    return !effects.predictRoute || (!route?.error && route?.groupCapable === true);
+  };
   const groupedPlan = planBuildGroups({ picks: plan.dispatch.filter(groupCapable), pool: safePool.filter(groupCapable),
     rowsByNum: groupRowsByNum,
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings && groupingCardsLoaded }, exclude: groupDropped });
