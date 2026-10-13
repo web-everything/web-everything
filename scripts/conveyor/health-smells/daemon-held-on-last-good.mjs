@@ -10,7 +10,7 @@
  *
  * Reads `~/.claude/daemon-self-sync-state/<cloneKey>.rebuild.json`'s `held` field, passed through by
  * `health-watch.mjs#probeSelfSync` (see `daemon-rebuild.mjs`'s own doc for the exact shape:
- * `{since, reason: 'smoke-rejected'|'smoke-harness-broken'|'smoke-transient'|'smoke-threw'|'github-auth-broken'|'smoke-env-timeout', failed, details,
+ * `{since, reason: 'smoke-rejected'|'smoke-harness-broken'|'smoke-transient'|'smoke-threw'|'github-auth-broken'|'smoke-env-timeout'|'smoke-env-unavailable', failed, details,
  * lastGood, target, mainSha, updatedAt}`). Any later adoption clears `held` back to `null`, closing this
  * episode the very next tick.
  *
@@ -67,6 +67,8 @@ export default {
             ? `GitHub rejects the daemon's App token even after a forced re-mint — an ENVIRONMENT fault, not the tree. Check the App installation / private key (\`node scripts/conveyor/github-app-status.mjs\`); the clone keeps dispatching from its last-good build (${lastGood12 ?? '?'}) and re-checks every tick. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`
           : held.reason === 'smoke-env-timeout'
             ? `A smoke check${failedChecks ? ` (${failedChecks})` : ''} ran out of time even with widened budgets — the HOST is overloaded, not the new tree (no overlay is blamed, nothing is rejected). Find what is loading the machine (\`uptime\`, the heavy-admission queue); the clone keeps dispatching from its last-good build (${lastGood12 ?? '?'}) and adopts on the first tick the smoke fits in time. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`
+          : held.reason === 'smoke-env-unavailable'
+            ? `GitHub API degraded — an ENVIRONMENT fault, not the tree; nothing rejected, no overlay blamed. Check githubstatus.com / \`gh api rate_limit\`; the clone keeps dispatching from its last-good build (${lastGood12 ?? '?'}) and adopts on the first tick GitHub answers. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`
           : held.reason === 'smoke-harness-broken'
             ? `The smoke harness/environment itself fails${failedChecks ? ` (${failedChecks})` : ''} — it fails the same way even on the last-good build, so this is not a regression in the new tree. Fix the tool the named check exercises, not the clone; it keeps dispatching from its last-good build (${lastGood12 ?? '?'}) meanwhile. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`
             : `The new origin/main (or an overlay) fails ${failedChecks || 'the smoke gate'} — fix that in the tree, not the clone. Per the 2026-09-26 operator ruling, the clone keeps dispatching from its last-good build (${lastGood12 ?? '?'}) meanwhile rather than blocking delivery. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`,
