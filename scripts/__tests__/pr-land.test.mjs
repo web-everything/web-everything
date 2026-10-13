@@ -4,13 +4,15 @@
  *   substrate for #2138 Fork 5 (#2153): the `gh pr create`/`gh pr merge` arg construction and the
  *   check-classification that decides merge-vs-wait-vs-abort. The live gh/git driver is the I/O boundary.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
+
+afterEach(() => vi.unstubAllEnvs());
 
 // ── #2844 · the AUTHOR STAMP pr-land writes at PR-open ─────────────────────────────────────────────────────────
 // PR #1100 review: this half had ZERO coverage. `withAuthorStamp` was module-private and read a module-scope
@@ -65,6 +67,7 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
 
 describe('resolveProducerReviewLabel — #2307 deterministic review-escalation label AT PR-OPEN', () => {
   it('a DECLARATIVE-LEASH diff (the roster — the encoded policy itself) → review:human, applied', () => {
+    vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
     const v = resolveProducerReviewLabel({ changedFiles: ['scripts/lib/gate-config.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.apply).toBe(true);
@@ -79,6 +82,7 @@ describe('resolveProducerReviewLabel — #2307 deterministic review-escalation l
     expect(v.reasons.join(' ')).toMatch(/gate-derivation/);
   });
   it('#2771 Fork A — a STATUTE diff is UNCHANGED by the narrowing: still review:human', () => {
+    vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
     const v = resolveProducerReviewLabel({ changedFiles: ['docs/agent/platform-decisions.md'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.humanRequired).toBe(true);
@@ -812,6 +816,7 @@ describe('resolveProducerReviewLabel — the basis trust question (#3343)', () =
   });
 
   it('NEGATIVE DIRECTION — an un-narrowed basis still labels a genuine statute edit `review:human`; the flag never buys a PR its way past the gate', () => {
+    vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
     const v = resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: false });
     expect(v.humanRequired).toBe(true);
     expect(v.label).toBe('review:human');

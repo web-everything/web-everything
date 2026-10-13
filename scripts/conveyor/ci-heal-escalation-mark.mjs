@@ -181,16 +181,20 @@ export function isUnverifiedLaneEscalation(e) {
  * @param {string|null|undefined} headSha
  * @returns {{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), basePr:(string|null), baseHeadSha:(string|null), createdAt:(string|null)}|null}
  */
-export function latestCiHealEscalationForHead(comments, headSha, { recheck, baseHead = null } = {}) {
+export function latestCiHealEscalationForHead(comments, headSha, { recheck, voidNeedsHuman, baseHead = null } = {}) {
   const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
   if (!sha) return null;
   // card x9zznl9 — a `not-a-ci-break` verdict a LATER trusted void comment names (same head) is not the word on
   // this head any more; only when the declared setting is on (`ci-heal-verdict-settings.json`).
-  const on = recheck ?? resolveCiHealVerdictSettings().recheckNotCiBreak;
-  const voids = on ? parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha) : [];
+  const settings = recheck == null || voidNeedsHuman == null ? resolveCiHealVerdictSettings() : {};
+  const on = recheck ?? settings.recheckNotCiBreak;
+  const humanOn = voidNeedsHuman ?? settings.voidNeedsHumanWhenCiGreen;
+  const voids = parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha);
   const matches = parseEscalationsIndexed(comments)
     .filter(({ e }) => e.headSha === sha && !isUnverifiedLaneEscalation(e))
-    .filter(({ e, index }) => !(e.outcome === 'not-a-ci-break' && voids.some((v) => v.index > index)));
+    .filter(({ e, index }) => !(
+      ((on && e.outcome === 'not-a-ci-break') || (humanOn && e.outcome === 'needs-human'))
+      && voids.some((v) => v.voids === e.outcome && v.index > index)));
   const latest = matches.length ? matches[matches.length - 1].e : null;
   return escalationStaleAgainstBase(latest, baseHead) ? null : latest;
 }
@@ -265,8 +269,15 @@ export function buildInheritedRedBaseNote({ stackedPr, stackedHead, baseHeadSha,
 export const CI_HEAL_VERDICT_VOID_MARKER = '🚦 conveyor CI-heal — verdict void';
 
 /** Build the void comment. Pure. `red` = the required check names that completed failing. */
-export function buildCiHealVerdictVoidComment({ headSha, red = [] } = {}) {
+export function buildCiHealVerdictVoidComment({ headSha, red = [], voids = 'not-a-ci-break', cause } = {}) {
   if (!headSha || typeof headSha !== 'string') throw new TypeError('ci-heal verdict void: headSha is required');
+  if (voids === 'needs-human') return [
+    CI_HEAL_VERDICT_VOID_MARKER, '', 'voids: needs-human',
+    `head: ${headSha.trim().toLowerCase()}`,
+    `cause: ${String(cause ?? 'required-ci-green').replace(/\s+/g, ' ').trim()}`, '',
+    'every required check on this exact head is now green (merge-gate candidacy/freeze holds are not '
+      + 'CI failures); the needs-human escalation is void. No person is needed for this step.',
+  ].join('\n');
   // One line each: a check name is untrusted text, and a newline in it must never add a field to the marker.
   const names = (Array.isArray(red) ? red : []).map((n) => String(n).replace(/\s+/g, ' ').trim()).filter(Boolean);
   return [
@@ -282,7 +293,7 @@ export function buildCiHealVerdictVoidComment({ headSha, red = [] } = {}) {
   ].join('\n');
 }
 
-/** Every trusted void comment, `{ headSha, red, createdAt, index }`, in thread order. Pure. */
+/** Every trusted void comment, `{ voids, headSha, red, createdAt, index }`, in thread order. Pure. */
 export function parseCiHealVerdictVoids(comments) {
   if (!Array.isArray(comments)) return [];
   const out = [];
@@ -291,9 +302,10 @@ export function parseCiHealVerdictVoids(comments) {
     if (typeof body !== 'string' || !body.trimStart().startsWith(CI_HEAL_VERDICT_VOID_MARKER)) return;
     if (!isTrustedMarkerAuthor(c)) return;
     const headSha = (/^head:\s*([0-9a-fA-F]{7,40})\s*$/m.exec(body) || [])[1];
-    if (!headSha || !/^voids:\s*not-a-ci-break\s*$/m.test(body)) return;
+    const voids = /^voids:\s*(not-a-ci-break|needs-human)\s*$/m.exec(body)?.[1];
+    if (!headSha || !voids) return;
     const red = ((/^red:\s*(.+)$/m.exec(body) || [])[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    out.push({ headSha: headSha.toLowerCase(), red, createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null, index });
+    out.push({ voids, headSha: headSha.toLowerCase(), red, createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null, index });
   });
   return out;
 }
@@ -311,8 +323,18 @@ export function notCiBreakVerdictVoidState(comments, headSha) {
   const verdictIndex = parseEscalationsIndexed(comments)
     .filter(({ e }) => e.headSha === sha && e.outcome === 'not-a-ci-break')
     .reduce((latest, { index }) => Math.max(latest, index), -1);
-  const voids = parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha);
+  const voids = parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha && v.voids === 'not-a-ci-break');
   return { verdictIndex, voided: voids.some((v) => v.index > verdictIndex), voidCount: voids.length };
+}
+
+/** Latest trusted needs-human escalation and its later, typed voids on this head. Pure. */
+export function needsHumanVoidState(comments, headSha) {
+  const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
+  const escalationIndex = parseEscalationsIndexed(comments)
+    .filter(({ e }) => e.headSha === sha && e.outcome === 'needs-human' && !isUnverifiedLaneEscalation(e))
+    .reduce((latest, { index }) => Math.max(latest, index), -1);
+  const voids = parseCiHealVerdictVoids(comments).filter(v => v.headSha === sha && v.voids === 'needs-human');
+  return { escalationIndex, voided: voids.some(v => v.index > escalationIndex), voidCount: voids.length };
 }
 
 /**

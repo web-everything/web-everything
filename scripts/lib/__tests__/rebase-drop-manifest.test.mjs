@@ -237,12 +237,14 @@ describe('rebaseDropManifest', () => {
     expect(r.healed).toEqual([]);
   });
 
-  it('healCollision defaults OFF — no ls-tree/cat-file heal probing on the legacy path', () => {
+  it('healCollision defaults OFF — only root ls-tree, no cat-file heal probing on the legacy path', () => {
     const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING });
     const r = rebaseDropManifest({ laneRef: 'lane/x-legacy', run });
     expect(r.action).toBe('rebased');
     expect(r.healed).toEqual([]);
-    expect(calls.some((c) => c.args[0] === 'ls-tree')).toBe(false);
+    expect(calls.filter((c) => c.args[0] === 'ls-tree').map((c) => c.args)).toEqual([
+      ['ls-tree', '--name-only', 'cleanTree'.padEnd(40, '0')],
+    ]);
     expect(calls.some((c) => c.args[0] === 'cat-file')).toBe(false);
   });
 
@@ -486,5 +488,62 @@ describe('rebaseDropManifest scope-jump guard (PR #3794)', () => {
   it('a normal rebuild (count steady) still pushes', () => {
     const { run } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING, ...diffScript(8, 8) });
     expect(rebaseDropManifest({ laneRef: 'lane/ok', run }).action).toBe('rebased');
+  });
+});
+
+describe('fix evidence is drain-transient', () => {
+  it.each([
+    [['.fix-evidence.md'], 'manifest-only'],
+    [[LANE_MANIFEST, '.fix-evidence-4965.md'], 'manifest-only'],
+    [['.fix-evidence.md', 'src/a.js'], 'real'],
+  ])('classifies %j as %s', (conflictPaths, expected) => {
+    expect(manifestConflictDisposition({ clean: false, conflictPaths })).toBe(expected);
+  });
+  it('honours a custom manifest alongside evidence', () => {
+    expect(manifestConflictDisposition({ clean: false, conflictPaths: ['custom.json', '.fix-4958-evidence.md'] }, 'custom.json')).toBe('manifest-only');
+    expect(manifestConflictDisposition({ clean: false, conflictPaths: [LANE_MANIFEST] }, 'custom.json')).toBe('real');
+  });
+  it.each([false, true])('drops root evidence and rebuilds (clean merge: %s)', (clean) => {
+    const evidence = ['.fix-evidence.md', '.fix-4958-evidence.md'];
+    let removed = false;
+    const { run, calls } = scriptedRun({
+      ...RESOLVED_PLUMBING,
+      'merge-tree': clean ? MERGE_TREE_CLEAN['merge-tree'] : { status: 1, stdout: conflictOut([evidence[0]]) },
+      'ls-tree': { stdout: [...evidence, 'docs', 'src', '.fix-gate.txt'].join('\n') + '\n' },
+      rm: (args) => { if (args.includes('--') && evidence.every((p) => args.includes(p))) removed = true; return {}; },
+      'write-tree': () => ({ stdout: removed ? 'resolved-tree\n' : 'tip-with-evidence\n' }),
+      'rev-parse': { stdout: 'tip-with-evidence\n' },
+      'merge-base': { status: 0 },
+    });
+    const r = rebaseDropManifest({ laneRef: 'lane/evidence', cwd: '/test/repo', tmpIndex: '/test/index', run });
+    expect(r.action).toBe('rebased');
+    expect(r.droppedEvidence).toEqual(evidence);
+    const listing = calls.find((c) => c.args[0] === 'ls-tree');
+    expect(listing.args).toEqual(['ls-tree', '--name-only', clean ? 'cleanTree'.padEnd(40, '0') : 't'.repeat(40)]);
+    expect(listing.env).toEqual({ GIT_INDEX_FILE: '/test/index' });
+    expect(listing.cwd).toBe('/test/repo');
+    expect(calls.find((c) => c.args[0] === 'rm' && c.args.includes('--'))).toMatchObject({
+      args: ['rm', '--cached', '--ignore-unmatch', '--', ...evidence], env: listing.env, cwd: listing.cwd,
+    });
+    const message = calls.find((c) => c.args[0] === 'commit-tree').args.at(-1);
+    for (const path of evidence) expect(message).toContain(path);
+  });
+  it('a failed root listing does not abort the manifest drop', () => {
+    const { run } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING, 'ls-tree': { status: 1, stdout: '.fix-evidence.md\n' } });
+    const r = rebaseDropManifest({ laneRef: 'lane/list-failed', run });
+    expect(r.action).toBe('rebased');
+    expect(r.droppedEvidence).toEqual([]);
+  });
+  it('a clean tip without manifest or evidence remains current', () => {
+    const { run, calls } = scriptedRun({
+      ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'ls-tree': { stdout: 'docs\nsrc\n' },
+      'rev-parse': (args) => ({ stdout: args[1].endsWith('^{tree}') ? 'resolvedTree'.padEnd(40, '0') : 'tip-commit' }),
+      'merge-base': { status: 0 },
+    });
+    const r = rebaseDropManifest({ laneRef: 'lane/clean', run });
+    expect(r.action).toBe('current');
+    expect(r.droppedEvidence).toEqual([]);
+    expect(calls.some((c) => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
   });
 });

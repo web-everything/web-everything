@@ -11,7 +11,12 @@
  *
  * @module config
  */
-import type { AutoDefineFlavorName, CrossProviderFallbackPolicy } from './defineConfig';
+import type {
+  AutoDefineFlavorName,
+  BacklogIdNumberingSetting,
+  BacklogIdReachSetting,
+  CrossProviderFallbackPolicy,
+} from './defineConfig';
 
 /**
  * Platform default flavor id for `autoDefine`: **`strict-explicit`** — the native baseline (explicit
@@ -49,7 +54,23 @@ export const PLATFORM_FLAVOR_DEFAULTS = {
   /** Cross-provider seat fallback (xb1e9nj): wait for the provider seat for a bounded time, then park for a
    *  human. `same-provider-other-model` is an explicit opt-in and is never the default. */
   crossProviderFallback: 'wait-then-park' satisfies CrossProviderFallbackPolicy,
+  /** Number backlog IDs before the producer opens a PR (#3732). */
+  backlogIdNumbering: 'producer-at-pr-open' satisfies BacklogIdNumberingSetting,
+  /** Check the tip tree for unnumbered backlog IDs (#3732). */
+  backlogIdReach: 'tip-tree' satisfies BacklogIdReachSetting,
 } as const;
+
+/**
+ * Built backlog ID values (#3732 / #4985); other declared values must be refused by name.
+ * Data only: resolution lives in scripts/lib/backlog-id-settings.mjs, whose mirror is test-pinned.
+ */
+export const PLATFORM_BACKLOG_ID_BUILT_VALUES = {
+  backlogIdNumbering: ['producer-at-pr-open'],
+  backlogIdReach: ['tip-tree'],
+} as const satisfies {
+  backlogIdNumbering: readonly BacklogIdNumberingSetting[];
+  backlogIdReach: readonly BacklogIdReachSetting[];
+};
 
 /**
  * CI-heal defaults for the conveyor (per-repo overridable via `WE_CI_HEAL_INFRA_CANCELLED[_<REPOKEY>]`).

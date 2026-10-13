@@ -199,3 +199,7 @@ scripts/conveyor/run-scorecards.json
 # #4077 health watch state (episodes, per-daemon memory, last-tick stamp) — local state under the pinned state
 # root, never committed; the plist example points CONVEYOR_STATE_ROOT at the operator's own checkout.
 .conveyor/health/
+
+# Fixer before/after evidence scratch — never committed; post it as a PR comment
+/.fix-evidence*.md
+/.fix-*-evidence*.md
