@@ -173,10 +173,11 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: [],
-      fn: () => {
+      reads: ['input.operatorTask'],
+      fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, originMainSha: raw.originMainSha };
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask,
+          originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),
 

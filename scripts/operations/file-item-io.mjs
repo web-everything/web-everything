@@ -42,8 +42,17 @@ export function createFileItemReader({ root = REPO_ROOT,
   const read = createScaffoldReader({ root, today, ...opts });
   return () => {
     let originMainSha;
-    try { originMainSha = readTip(); } catch { /* only operator stamping needs a reachable main tip */ }
-    return { ...read(), operatorTask: readPolicy(), originMainSha };
+    let tipRead = false;
+    return {
+      ...read(), operatorTask: readPolicy(),
+      get originMainSha() {
+        if (!tipRead) {
+          tipRead = true;
+          try { originMainSha = readTip(); } catch { /* only operator stamping needs a reachable main tip */ }
+        }
+        return originMainSha;
+      },
+    };
   };
 }
 
