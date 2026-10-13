@@ -89,7 +89,7 @@ export function parseHolderStates(json) {
 
 /** One lazy, cached open-PR snapshot per pass, paginated at most five times. Never throws.
  * A partial or failed snapshot is unreadable rather than evidence that a holder is absent. */
-export function createHolderStateReader({ repo = 'web-everything/web-everything',
+export function createHolderStateReader({ repo, // owner/name slug (ghRepoSlug); missing = unreadable, fail closed
   exec = (command, args) => execFileSync(command, args, {
     encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   }),
@@ -99,7 +99,7 @@ export function createHolderStateReader({ repo = 'web-everything/web-everything'
     if (loaded) return;
     loaded = true;
     try {
-      const [owner, name] = repo.split('/');
+      const [owner, name] = String(repo ?? '').split('/');
       if (!owner || !name) return;
       const query = `query($owner: String!, $name: String!, $cursor: String) {
         repository(owner: $owner, name: $name) {

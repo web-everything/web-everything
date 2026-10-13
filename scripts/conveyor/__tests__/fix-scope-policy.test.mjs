@@ -252,13 +252,13 @@ describe('holder state reader', () => {
   });
   it('fails closed and caches subprocess or malformed response failures', () => {
     for (const exec of [() => { throw Error('offline'); }, () => '{}']) {
-      const reader = policyApi.createHolderStateReader({ exec });
+      const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec });
       expect(reader.stateFor(1)).toBeNull(); expect(reader.landingPrs(['review:accepted'])).toEqual([]);
     }
   });
   it('caps pagination at five pages and fails closed on an incomplete snapshot', () => {
     let calls = 0;
-    const reader = policyApi.createHolderStateReader({ exec: () => { calls++; return page([node(calls)], true, 'next' + calls); } });
+    const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: () => { calls++; return page([node(calls)], true, 'next' + calls); } });
     expect(reader.stateFor(1)).toBeNull(); expect(reader.landingPrs(['review:accepted'])).toEqual([]);
     expect(calls).toBe(5);
   });
