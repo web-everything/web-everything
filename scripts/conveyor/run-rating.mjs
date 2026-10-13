@@ -1065,6 +1065,12 @@ export function resolvePrBouncedViaGh(item, { exec = execFileSync, repo = DEFAUL
 
 // ── IO SHELL: recording a rating onto the scorecard store ───────────────────────────────────────────────────────
 
+/** A count field that is a non-negative safe integer, else `null` — a malformed value (string, object, NaN,
+ *  negative) never reaches the shared scorecard store as-is, and "not reported" stays distinct from zero. */
+function nonNegativeIntOrNull(v) {
+  return Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
 /**
  * A rating record → a valid `run-scorecard-store.mjs` row. Required-schema fields get a MECHANICAL proxy
  * (`score`: a fixed number per grade band, `deductions[]`: one entry per criterion that cost points); every
@@ -1114,6 +1120,11 @@ export function toScorecardRow(rating, { provider = 'anthropic', repoRoot = REPO
     waste: Array.isArray(rating.waste) ? rating.waste : [],
     costUsdPartial: rating.costUsdPartial ?? false,
     prepared: resolvePrepared(rating.item ?? null),
+    // Prepare-pass measurements (story-preparation-checklist items 11–13): plan-review rounds actually run and how
+    // many findings were classed SCOPE-GROWTH. Extra fields (the store passes them through) — null when not
+    // reported or not a non-negative integer.
+    reviewRounds: nonNegativeIntOrNull(rating.reviewRounds),
+    scopeGrowthCount: nonNegativeIntOrNull(rating.scopeGrowthCount),
   };
 }
 
