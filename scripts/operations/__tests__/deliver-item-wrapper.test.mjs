@@ -92,6 +92,7 @@ import { execFileSync } from 'node:child_process';
 import { SPAWN_TIMEOUT_MS, findItem } from '../dispatch-lane-io.mjs';
 import { tryReadDeliveryReport } from '../delivery-report-store.mjs';
 import { CODEX_DELIVERY_MODEL } from '../codex-delivery-provider.mjs';
+import { declaredResolvedIdsFromPr } from '../../lib/open-pr-items.mjs';
 import { parseDelegationMarker } from '../../lib/delegation-marker.mjs';
 import {
   DELIVERY_AGENT_PROVIDERS, DELIVERY_AGENT_SPAWN_TIMEOUT_MS, buildRestrictedProviderArgv,
@@ -3302,6 +3303,32 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     execFileSync.mockReset();
   });
 
+  it('recovery restores durable group members and publishes their resolution declarations', async () => {
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'group-recovery', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build', groupMembers: ['1235', 'xabc123'] }, result: null, error: null }] });
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+    const provider = { spawn: vi.fn() };
+    const result = await deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+      runId: 'group-recovery', effectKey: 'dispatch:0:0', resume: true }, provider);
+    expect(result.result).toContain('PR #4321');
+    expect(result.groupMembers).toEqual(['1235', 'xabc123']);
+    const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+    expect(body).toContain('Resolves #1235, #xabc123');
+    expect(provider.spawn).not.toHaveBeenCalled();
+  });
+
+  it('recovery fails closed before publishing when the original dispatch record is missing', async () => {
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+    await expect(deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+      runId: 'missing-recovery', effectKey: 'dispatch:0:0', resume: true }, { spawn: vi.fn() }))
+      .rejects.toThrow('recovery requires the original dispatch');
+    expect(execFileSync.mock.calls.some(c => c[1]?.[1] === 'open-pr')).toBe(false);
+  });
+
   it.each(['requeue-alone', 'fail-group'])('drives grouped delivery and drop settlement with %s policy', async (policy) => {
     const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
     process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
@@ -4483,4 +4510,21 @@ describe('group drop restoration with a real git index', () => {
       expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
     } finally { rmSync(lane, { recursive: true, force: true }); }
   });
+});
+
+
+describe('grouped resolution declarations', () => {
+  it.each([['1235', 'xabc123', '1236'], ['xabc123', '1235', '1236']])(
+    'a hash member cannot suppress any resolution in the generated body (%s, %s, %s)', (...members) => {
+      const groupMembers = members.slice(0, 3);
+      const body = buildPrBody({ item: '1234', groupMembers });
+      const diff = groupMembers.map(num => [
+        `diff --git a/backlog/${num}-card.md b/backlog/${num}-card.md`,
+        `--- a/backlog/${num}-card.md`, `+++ b/backlog/${num}-card.md`,
+        '@@ -1,3 +1,3 @@', ' ---', '-status: open', '+status: active', ' ---',
+      ].join('\n')).join('\n');
+      expect(declaredResolvedIdsFromPr('lane/1234-build', 'Build cards', {
+        body, diff, changedFiles: ['scripts/a.mjs', ...groupMembers.map(num => `backlog/${num}-card.md`)],
+      }).sort()).toEqual([...groupMembers].sort());
+    });
 });

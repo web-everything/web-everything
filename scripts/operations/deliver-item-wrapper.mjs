@@ -137,7 +137,7 @@ import { primaryCheckoutForLanePath, repoProfileForLanePath, deliveryLocusForSco
 // #4349 — settle this delivery's OWN run-store effect on exit (see that file's own header for why this is
 // the thin seam, not a new store) and release/hold the build-dispatch claim a finished no-op dispatch used to
 // leave stranded for hours (`we:scripts/conveyor/build-dispatch-claim.mjs`'s own #4349 note).
-import { resolveRunsDir } from './run-store.mjs';
+import { createFileRunStore, resolveRunsDir } from './run-store.mjs';
 import { settleDispatchEffect } from './deliver-item-settle.mjs';
 import { releaseBuildDispatchClaim, placeBuildDispatchHold } from '../conveyor/build-dispatch-claim.mjs';
 
@@ -333,7 +333,19 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
   // `runAgentToCompletion`'s own `resume` branch below; every other caller (every existing dispatch) never
   // sets it, so `deliverItem` is byte-identical for them.
   const { item, lane, scope, sessionSlug, attemptTag, runId, effectKey, resume = false } = launch;
-  const requestedMembers = parseGroupMembers(launch.groupMembers ?? []).filter((num) => num !== String(item));
+  // Recovery must recover the group from the original durable dispatch, even if an
+  // older resume launcher omitted --group-members. Missing/corrupt identity refuses publication.
+  let recoveryEntry = null;
+  if (resume) {
+    const record = runId && effectKey ? createFileRunStore().read(runId) : null;
+    recoveryEntry = record?.effects?.find(entry => entry.key === effectKey);
+    if (!recoveryEntry?.payload || String(recoveryEntry.payload.num) !== String(item)
+      || recoveryEntry.payload.launchKind !== 'build') {
+      throw new Error('builder recovery requires the original dispatch record before publishing');
+    }
+  }
+  const requestedMembers = parseGroupMembers(resume ? recoveryEntry.payload.groupMembers ?? [] : launch.groupMembers ?? [])
+    .filter((num) => num !== String(item));
   let groupMembers = [...requestedMembers];
   const groupDropped = [];
   const groupDropReasons = {};

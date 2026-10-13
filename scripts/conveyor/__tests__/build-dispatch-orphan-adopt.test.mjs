@@ -285,6 +285,15 @@ describe('checkResumable — TWO safety checks: lane-lease-currency, then foreig
     expect(r).toMatchObject({ resumable: false, reason: 'report-predates-dispatch' });
   });
 
+  it('group recovery accepts its members’ claim edits while still rejecting unrelated cards', () => {
+    const probe = changed => checkResumable({ ...base, groupMembers: ['7102', 'xabc123'],
+      readReport: () => report(), listLaneChangedFiles: () => changed });
+    expect(probe(['scripts/a.mjs', 'backlog/7102-member.md', 'backlog/xabc123-member.md']))
+      .toMatchObject({ resumable: true });
+    expect(probe(['scripts/a.mjs', 'backlog/9999-unrelated.md']))
+      .toMatchObject({ resumable: false, reason: 'lane-commits-not-this-item' });
+  });
+
   it('the item\'s OWN backlog card (edited by the wrapper\'s claim, not the agent) is never read as foreign', () => {
     const r = checkResumable({ ...base, readReport: () => report(), listLaneChangedFiles: () => ['scripts/a.mjs', 'backlog/4131-some-thing.md'] });
     expect(r).toMatchObject({ resumable: true });
@@ -309,6 +318,14 @@ describe('checkResumable — TWO safety checks: lane-lease-currency, then foreig
 });
 
 describe('spawnResumeDelivery — PR #2921 review: the resume settles the ORIGINAL run-store row', () => {
+  it('recovery forwards every grouped member to the resumed wrapper', () => {
+    let argv;
+    spawnResumeDelivery({ num: '7101', lane: 9, scope: 'we:a', sessionSlug: 'group',
+      runId: 'group-run', effectKey: 'step:1:0', groupMembers: ['7102', 'xabc123'] }, {
+      spawnDetached: a => { argv = a; return { pid: 7 }; }, logPathFor: () => '/dev/null',
+    });
+    expect(argv).toContain('--group-members=7102,xabc123');
+  });
   it('passes --run-id and --effect-key through to the resumed wrapper', () => {
     let argv = null;
     spawnResumeDelivery(
@@ -338,6 +355,51 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   const buildRow = ({ num, handle, status = 'in-flight', result = null, lane = 3, sessionSlug = `conveyor-${num}` }) => ({
     runId: 'dispatch-lane-x',
     entry: { key: 'step:1:0', status, handle, result, payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] } },
+  });
+
+  it.each(['pid:999', 'claude-session', 'resume'])('restart keeps member claims using the live lead worker evidence (%s)', async (mode) => {
+    for (const num of ['7101', '7102', 'xabc123']) acquireBuildDispatchClaim({ num, scope: [], lockRoot, pid: 17711,
+      ...(num !== '7101' ? { groupLead: '7101' } : {}) });
+    const row = buildRow({ num: '7101', handle: mode === 'resume' ? 'pid:888' : mode });
+    row.entry.payload.groupMembers = ['7102', 'xabc123'];
+    const results = await adoptOrphanedBuildClaims({
+      listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
+      isPidAlive: pid => pid === 999,
+      findRow: num => num === '7101' ? row : null,
+      readResumeMarker: num => mode === 'resume' && num === '7101'
+        ? { meta: { pid: 999, runId: row.runId, rowKey: row.entry.key } } : null,
+      sessionLivenessFor: () => ({ alive: true }),
+      resolveResumability: () => ({ resumable: false }),
+      releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
+      releaseResumeMarker: () => {}, settleRow: () => {},
+    });
+    expect(results.map(r => r.action)).toEqual(['leave', 'leave', 'leave']);
+    for (const member of ['7102', 'xabc123']) {
+      expect(results.find(r => r.num === member).reason).toBe('group lead #7101: alive');
+    }
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }).map(c => c.meta.num).sort())
+      .toEqual(['7101', '7102', 'xabc123']);
+  });
+
+  it('recovers one worker for the whole group, forwarding durable members through adoption', async () => {
+    const claims = ['7102', 'xabc123', '7101'].map(num => ({ pid: 17711,
+      meta: { num, kind: 'build', ...(num !== '7101' ? { groupLead: '7101' } : {}) } }));
+    const row = buildRow({ num: '7101', handle: 'pid:888' });
+    row.entry.payload.groupMembers = ['7102', 'xabc123'];
+    const spawned = [];
+    const results = await adoptOrphanedBuildClaims({ listClaims: () => claims, isPidAlive: () => false,
+      findRow: num => num === '7101' ? row : null, readResumeMarker: () => null,
+      resolveResumability: o => {
+        expect(o.groupMembers).toEqual(['7102', 'xabc123']);
+        return { resumable: true };
+      },
+      spawnResume: o => { spawned.push(o); return 999; }, markResume: () => {},
+      releaseClaim: () => { throw new Error('must retain the whole group'); },
+      settleRow: () => { throw new Error('must not settle a recovering worker'); },
+    });
+    expect(results.map(r => r.action)).toEqual(['leave', 'leave', 'resume']);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({ num: '7101', groupMembers: ['7102', 'xabc123'] });
   });
 
   it('LEAVES a claim whose recorded dispatch is still alive', async () => {
