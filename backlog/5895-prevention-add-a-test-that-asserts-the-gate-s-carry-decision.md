@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/merge-gate-ci.mjs", "we:scripts/lib/__tests__/merge-gate-carried-approval.test.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs"]
+
 dateOpened: "2026-10-11"
 tags: []
 ---
@@ -43,3 +43,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Findings (standalone worker, 2026-10-13)
+
+The build-dispatch daemon held #5895 with:
+
+> worker-declined: **could-not-prepare** — unresolved setting-policy choice: - Require both the gate and drain carry settings to permit CI carry. - Keep 'mergeGate.carryApproval' as CI’s sole switch and document the drain setting’s limited scope. The card explicitly offers both. Current 'we:scripts/lib/merge-gate-ci.mjs:100' hardcodes 'enabled: true'; the drain resolves its separate setting at 'we:scripts/lib/human-clearance-carry.mjs:286'. Research found no ruling settling their relationship. No files changed, stamps added, or tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

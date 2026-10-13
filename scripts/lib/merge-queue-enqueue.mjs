@@ -163,7 +163,7 @@ export function buildEnqueueArgs({ nodeId, headSha }) {
 
 /** Is a gh error the "already in the merge queue" case (idempotent success)? Pure. */
 export function isAlreadyQueuedError(text) {
-  return /already (?:in|queued in) the merge queue|is already queued/i.test(String(text || ''));
+  return /already (?:in|queued in) the (?:merge )?queue|is already queued/i.test(String(text || '')); // GitHub also says "already in the queue" (card 257)
 }
 
 /**
