@@ -1,4 +1,5 @@
 ---
+bornAs: xta0mzx
 kind: story
 size: 2
 status: open
