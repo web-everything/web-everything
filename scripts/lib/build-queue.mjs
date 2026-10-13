@@ -363,7 +363,8 @@ function buildPriorityAliases(item) {
   return [item.num == null ? null : normalizePriorityNum(item.num), item.bornAs,
     /^x[0-9a-z]{6,}$/.test(stem) ? stem : null].filter(x => x != null);
 }
-function buildPriorityPlacement(item, ids, ancestors) {
+/** Pure priority inheritance shared by queue ordering and batch retirement guards. */
+export function buildPriorityPlacement(item, ids, ancestors) {
   let buildPriorityIndex = null;
   let buildPriorityVia = null;
   const seen = new Set();

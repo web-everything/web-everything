@@ -95,6 +95,9 @@ import { createClaimReader, createClaimSinks } from './claim-io.mjs';
 // builder with the identical name under the `<op>Operation` convention. Aliasing at the import keeps the
 // convention intact in `./resolve.mjs` where it reads correctly.
 import { resolveOperation as buildResolveOperation, RESOLVE_OP } from './resolve.mjs';
+import { closeItemsOperation, CLOSE_ITEMS_OP } from './close-items.mjs';
+import { reopenItemsOperation, REOPEN_ITEMS_OP } from './reopen-items.mjs';
+import { createCloseItemsReader, createCloseItemsSinks, createReopenItemsReader, finishItemsOutcome } from './close-items-io.mjs';
 import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
@@ -252,6 +255,8 @@ export const OPERATIONS = Object.freeze({
   // #xrrpfo7 — `claim`'s sibling: the CLOSE of the lifecycle whose OPEN #3034 declared. Same shape (read →
   // plan → write), same guarded writer, and the guards are REPLAYED from `we:scripts/backlog.mjs`'s
   // `transition()` rather than reinvented.
+  [CLOSE_ITEMS_OP]: () => ({ declaration: closeItemsOperation({ readCloseItemsContext: createCloseItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
+  [REOPEN_ITEMS_OP]: () => ({ declaration: reopenItemsOperation({ readReopenItemsContext: createReopenItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
   [RESOLVE_OP]: () => ({
     declaration: buildResolveOperation({ readResolveContext: createResolveReader() }),
     sinks: createResolveSinks(),
