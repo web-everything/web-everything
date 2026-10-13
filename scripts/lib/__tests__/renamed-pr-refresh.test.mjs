@@ -154,14 +154,30 @@ describe('reconcile ownership', () => {
   const otherRed = { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'FAILURE' };
   it.each([
     { name: 'a second required check', requiredChecks: ['test', 'soak-replay-gate'], extra: [otherRed] },
-    { name: 'a check under the default required set', requiredChecks: null, extra: [otherRed] },
+    { name: 'a check under the default required set', requiredChecks: null, extra: [{ ...otherRed, name: 'smoke' }], other: 'smoke' },
     { name: 'a red check listed before test', requiredChecks: ['soak-replay-gate', 'test'], extra: [otherRed], first: true },
-  ])('keeps ci-heal when $name also fails', ({ requiredChecks, extra, first }) => {
+  ])('keeps ci-heal when $name also fails', ({ requiredChecks, extra, first, other = 'soak-replay-gate' }) => {
     const rollup = first ? [...extra, ...pr().statusCheckRollup] : [...pr().statusCheckRollup, ...extra];
     const result = planReconcile({ prs: [owedPr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks, now: Date.parse('2026-10-12T23:00:00Z') });
     expect(result.refusals.some(r => r.kind === 'owed-main-rule')).toBe(false);
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: expect.arrayContaining(['test', 'soak-replay-gate']) })]);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: expect.arrayContaining(['test', other]) })]);
   });
+  // Self-review variant: a superseded red `test` run must not prove a hold over the latest run.
+  const run = (id, conclusion) => ({ __typename: 'CheckRun', id, name: 'test', status: 'COMPLETED', conclusion, detailsUrl: `https://github.com/web-everything/web-everything/actions/runs/1/job/${id}` });
+  it.each([
+    { name: 'newer red run, older listed first', rollup: [run(111, 'FAILURE'), run(222, 'FAILURE')], job: '222' },
+    { name: 'newer red run, newer listed first', rollup: [run(222, 'FAILURE'), run(111, 'FAILURE')], job: '222' },
+    { name: 'latest run timed out', rollup: [run(111, 'FAILURE'), run(222, 'TIMED_OUT')], job: null },
+    { name: 'latest run green', rollup: [run(111, 'FAILURE'), run(222, 'SUCCESS')], job: null },
+  ])('proves the hold from the latest test run only: $name', ({ rollup, job }) => temporary(root => {
+    const calls = [];
+    const exec = (_command, args) => { calls.push(args[1]); throw new Error('stop after the log path'); };
+    readOwedMainRule(pr({ statusCheckRollup: rollup }), { slug: 'web-everything/web-everything', exec, cache: join(root, 'state.json'), authors });
+    expect(calls).toEqual(job ? [`repos/web-everything/web-everything/actions/jobs/${job}/logs`] : []);
+    const rows = [pr({ statusCheckRollup: rollup })];
+    enrichPrsWithOwedMainRule(rows, { repo: 'web-everything/web-everything', settings, mainAccepts: () => false, read: () => ({ owed: true, nums: [5994] }) });
+    expect(rows[0].owedMainRule === undefined).toBe(!job);
+  }));
   it('still holds when only test fails, and a non-required red does not lift the hold', () => {
     const nonRequired = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' };
     const rerun = { ...pr().statusCheckRollup[0] };
