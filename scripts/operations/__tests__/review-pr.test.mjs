@@ -4407,7 +4407,13 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
     it('NOT REPRODUCED: no referral; the claim is one advisory note with its original text and the reason; the run is not blocked', () => {
       const { reduce, run } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: NOT_REPRODUCED });
       expect(reduce.referrals).toEqual([]);
-      expect(reduce.verdict).toBe('accept');
+      // PR #5025 review: ONE verifier answer retires the referral but cannot end the hold: acceptance waits for a human.
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.humanRequired).toBe(true);
+      expect(reduce.uncorroboratedRetirements).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: NO_REPRO_REASON })]);
+      expect(reduce.pendingVerifications).toBeUndefined();
+      // the advisory still states its own outcome: the claim is settled for this head, only the acceptance waits
+      expect(deriveAdvisoryOutcome(reduce)).toBe('accept');
       const notes = reduce.findings.filter((f) => String(f.summary).includes('Unverified by a tool-bearing seat'));
       expect(notes).toHaveLength(1);
       expect(notes[0].summary).toContain('the guard holds on the head');
@@ -4503,7 +4509,22 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, {
         ...withAdvisory(), judge: BLOCKING_ANSWER, judgeReferralVerifier: NOT_REPRODUCED });
       expect(reduce.verdict).toBe('changes');
+      expect(reduce.humanRequired).toBe(false);
       expect(reduce.referrals).toEqual([]);
+    });
+
+    // PR #5025 review: the verifier reads attacker-controlled PR content, and its citation check is only a format filter (a steered
+    // verifier can echo the claim's own path:line). So a lone, well-formed negative may retire the REFERRAL, but the run cannot
+    // reach an agent-recorded accept on it: a human confirms. A second independent seat that would lift this is #xztd0mv.
+    it('a lone negative that echoes the claim\'s own path:line is held for a human: no agent accept, a human accept is allowed', () => {
+      const echoed = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: `${claim.file}:${claim.line} per the PR notes this does not reproduce` }] };
+      const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: echoed });
+      expect(reduce.verifications).toEqual([expect.objectContaining({ outcome: 'not-reproduced' })]);
+      expect(reduce.referrals).toEqual([]);
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.uncorroboratedRetirements).toHaveLength(1);
+      const view = { input: { repo: 'o/n', pr: 7, actor: 'operator' }, findings: { read: { ...shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' }) }, confirm: 'accept' }, verdict: reduce };
+      expect(() => planRecordDecision(view)).not.toThrow();
     });
 
     it.each([['docs', NET_PATHS[1]], ['config', NET_PATHS[0]], ['data', NET_PATHS[0]]])('a %s-kind claim is verified the same way', (category, file) => {
@@ -4607,6 +4628,21 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(reduce.referrals).toEqual([]);
       expect(reduce.verifications).toBeUndefined();
       expect(reduce.unverifiedClaims).toHaveLength(1);
+      // the earlier lone answer still holds acceptance on this head: a re-run does not turn it into an agent accept
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.uncorroboratedRetirements).toEqual([expect.objectContaining({ key })]);
+    });
+
+    it('SAME HEAD, not-reproduced before, and no seat re-raises the claim: the hold still stands (a quiet re-run is not a second signal)', () => {
+      const { reduce } = verifierRun({ netRev: PINNED_HEAD, comments: comments(record({ verified: [{ key, outcome: 'not-reproduced', reason: 'fine' }] })) },
+        { antigravityReview: true }, {});
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.uncorroboratedRetirements).toEqual([expect.objectContaining({ key })]);
+      // a NEW head starts clean: the earlier head's retirement holds nothing there
+      const fresh = verifierRun({ netRev: 'e'.repeat(40), comments: comments(record({ verified: [{ key, outcome: 'not-reproduced', reason: 'fine' }] })) },
+        { antigravityReview: true }, {});
+      expect(fresh.reduce.verdict).toBe('accept');
+      expect(fresh.reduce.uncorroboratedRetirements).toBeUndefined();
     });
 
     it('SAME HEAD, reproduced before: the claim stays a referral with NO new verifier turn', () => {

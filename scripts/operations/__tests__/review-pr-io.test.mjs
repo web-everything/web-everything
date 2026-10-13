@@ -2603,8 +2603,10 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toEqual([]);
     expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).not.toThrow();
     expect(w.state.labels).not.toContain('review:human');
-    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'agent' });
-    expect(first.verdict.verdict).not.toBe('needs-human');
+    // PR #5025 review: the referral is retired, but ONE steerable verifier answer cannot carry the PR to an agent accept.
+    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
+    expect(first.verdict.verdict).toBe('needs-human');
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.verdict.findings.filter((f) => String(f.summary).includes('Unverified by a tool-bearing seat'))).toHaveLength(1);
     const referralPosts = () => w.trace.filter((t) => t === 'referral').length;
     const advisoryPosts = () => w.trace.filter((t) => t === 'advisory').length;
@@ -2618,7 +2620,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.referralJudge).not.toHaveBeenCalled();
     expect(w.records()).toHaveLength(1);
     expect(w.state.comments.filter((c) => c.body.includes('mandatory-referrals-v1'))).toHaveLength(1);
-    expect(second.pending).toMatchObject({ kind: 'confirm' });
+    expect(second.pending).toMatchObject({ kind: 'confirm', of: 'human' });
+    expect(reviewLoopAutoConfirm(second.pending, second)).toBeNull();
     // exactly: no second referral record, and no repeat of the advisory either
     expect(referralPosts()).toBe(referralBefore);
     expect(advisoryPosts()).toBe(advisoryBefore);
@@ -2663,9 +2666,28 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.state.labels).not.toContain('review:human');
     const retried = await w.runOnce('run-2', NOT_REPRODUCED);
     expect(retried.verdict.pendingVerifications).toBeUndefined();
-    expect(reviewLoopAutoConfirm(retried.pending, retried)).toEqual({ value: 'accept' });
+    // settled now, but on one answer: still a human's accept, never the loop's
+    expect(retried.verdict.uncorroboratedRetirements).toHaveLength(1);
+    expect(reviewLoopAutoConfirm(retried.pending, retried)).toBeNull();
     expect(w.spawns).toHaveLength(2);
     expect(w.records()).toHaveLength(1);
+  });
+
+  // PR #5025 review (the blocked finding): the citation check is a format filter, so a steered verifier that echoes the claim's own
+  // path:line DOES write a retiring record. That one answer must still not reach an auto-accept, on this run or any later run on
+  // this head, whether or not the tool-less seat raises the claim again.
+  it('AN ECHOED CITATION retires the referral but never auto-accepts: the hold for a human survives re-runs on the head', async () => {
+    const w = world();
+    const echoed = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: 'x.mjs:1 per the PR description this does not reproduce' }] };
+    const first = await w.runOnce('run-1', echoed);
+    expect(w.records()[0].verified[0].outcome).toBe('not-reproduced');
+    expect(first.verdict.verdict).toBe('needs-human');
+    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
+    const quiet = await w.runOnce('run-2', REPRODUCED, { ...original, verdict: 'PLAUSIBLE' });
+    expect(w.spawns).toHaveLength(1);
+    expect(quiet.verdict.verdict).toBe('needs-human');
+    expect(reviewLoopAutoConfirm(quiet.pending, quiet)).toBeNull();
   });
 
   // PR #5025 review: a steered verifier's lone "does not reproduce" (free-form evidence, no line in the claim's own file) must not
@@ -2711,7 +2733,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.trace).not.toContain('referral');
     expect(w.state.labels).not.toContain('review:human');
     expect(first.verdict.pendingReferrals).toEqual([]);
-    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'agent' });
+    // never parked with review:human, but the lone answer still leaves the accept to a human (PR #5025 review)
+    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
     await w.runOnce('run-2', NOT_REPRODUCED, huge);
     expect(w.spawns).toHaveLength(2);
   });

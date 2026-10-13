@@ -2855,6 +2855,7 @@ describe('xc7ctn1 @pr<N> card citations reach every validator that consumes CARD
 import {
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification,
   downgradeUnverifiedFinding, verificationsToPersist, VERIFY_MAX_CANDIDATES, UNVERIFIED_NOTE_PREFIX, verifierEvidenceCitesClaim,
+  uncorroboratedRetirements,
 } from '../jury-core.mjs';
 
 describe('#4815 seat capability and the confirmation turn (pure)', () => {
@@ -3017,6 +3018,32 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     const cands = [0, 1, 2].map(i => ({ index: i, seat: 's', key: `k${i}`, original: claim({ summary: `c${i}` }) }));
     const settled = new Map([['k0', { outcome: 'reproduced', reason: 'e' }], ['k1', { outcome: 'not-reproduced', reason: 'why' }], ['k2', { outcome: 'failed', reason: 'boom' }]]);
     expect(verificationsToPersist(cands, settled).map(v => [v.key, v.outcome, v.reason])).toEqual([['k0', 'reproduced', undefined], ['k1', 'not-reproduced', 'why']]);
+  });
+
+  // PR #5025 review: one steerable verifier answer must not end the hold on its own. A claim retired on one `not-reproduced`
+  // answer (this run, or persisted earlier on this head) still needs a human to accept; #xztd0mv would add a second seat.
+  describe('uncorroboratedRetirements', () => {
+    const downgraded = [
+      { seat: 's', key: 'k-now', reason: 'k.mjs:1 fine' },
+      { seat: 's', key: 'k-before', reason: 'earlier' },
+      { seat: 's', key: 'k-failed', reason: 'the verifier was skipped' },
+      { seat: 's', key: 'k-now', reason: 'duplicate' },
+    ];
+    const settled = new Map([['k-now', { outcome: 'not-reproduced', reason: 'k.mjs:1 fine' }], ['k-failed', { outcome: 'failed', reason: 'x' }]]);
+
+    it('names every claim retired on one answer, this run or earlier on this head, once; a failed check is not one', () => {
+      const known = new Map([['k-before', 'not-reproduced'], ['k-ref', 'referred'], ['k-rep', 'reproduced']]);
+      expect(uncorroboratedRetirements({ downgraded, known, settled })).toEqual([
+        { seat: 's', key: 'k-now', reason: 'k.mjs:1 fine' }, { seat: 's', key: 'k-before', reason: 'earlier' }]);
+    });
+    it('STATE OVER TIME: a retirement recorded earlier on this head holds even when no seat re-raises the claim', () => {
+      expect(uncorroboratedRetirements({ downgraded: [], known: new Map([['k-gone', 'not-reproduced']]) }))
+        .toEqual([{ key: 'k-gone', reason: expect.stringMatching(/could not reproduce it on this head/) }]);
+    });
+    it('nothing retired means nothing held, and junk input holds nothing it cannot name', () => {
+      expect(uncorroboratedRetirements({})).toEqual([]);
+      expect(uncorroboratedRetirements({ downgraded: 'junk', known: 'junk', settled: 'junk' })).toEqual([]);
+    });
   });
 });
 

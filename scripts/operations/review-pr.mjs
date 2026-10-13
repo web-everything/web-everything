@@ -1,7 +1,7 @@
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
-  activeReferrals } from '../lib/jury-core.mjs';
+  uncorroboratedRetirements, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
@@ -654,7 +654,8 @@ export const ADVISORY_SEAT_STEPS = Object.freeze(ADVISORY_SEATS.map((s) => s.ste
  * reproduced it. Before such a claim becomes a mandatory referral (which holds the PR until someone rules on it), ONE tool-bearing
  * verifier gets one turn to reproduce it on the PR head. Reproduced: the claim stays CONFIRMED and is referred as before. Not
  * reproduced, with evidence citing a line in the claim's own file (a format filter, not a second signal; that is #xztd0mv): it is
- * an advisory note. Failed, inconclusive or uncited verification holds acceptance until a subsequent check settles it.
+ * an advisory note, and as ONE steerable answer it still leaves the accept to a human (`uncorroboratedRetirements`). Failed,
+ * inconclusive or uncited verification holds acceptance until a subsequent check settles it.
  * The step is declared only when a seated advisory seat
  * is not tool-bearing, and its request is a no-spawn answer when there is nothing to verify, so a run pays only for a claim.
  */
@@ -2996,10 +2997,16 @@ export function reviewPrOperation({
           .filter(({ key }) => knownVerified.get(key) !== 'not-reproduced'
             && settledClaims.get(key)?.outcome !== 'not-reproduced')
           .map(({ seat, key, reason }) => ({ seat, key, reason }));
-        const humanRequired = read.humanRequired === true || pendingVerifications.length > 0;
-        const verdict = derivePanelVerdict({
+        // PR #5025 review — a definitive negative is still ONE answer from a model that read attacker-controlled PR content, and its
+        // citation check is only a format filter. It retires the referral (above) but not the hold: an otherwise clean accept becomes
+        // `needs-human`, so the loop never auto-confirms it and a human accepts. Read from the head's records directly, so a later run
+        // on this head holds too, even with no tool-less seat re-raising the claim. A real blocker still reduces to `changes`.
+        const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
+          known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims });
+        const panelHumanRequired = read.humanRequired === true || pendingVerifications.length > 0;
+        const panelVerdict = derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
-          humanRequired,
+          humanRequired: panelHumanRequired,
           // #xu2pp2m — THE BASIS THIS PANEL ACTUALLY JUDGED ON. `read.degraded` is already the fact every
           // rendering surface prints as "⚠️ DEGRADED BASIS"; until now it changed nothing about the VERDICT,
           // so a panel that reviewed material it could not resolve still reduced to a clean, mechanically
@@ -3016,9 +3023,15 @@ export function reviewPrOperation({
           // It is the verdict basis WITHOUT the advisory Codex seat.
           findings: buildPanelFindings(verdictAdmitted),
         });
+        const acceptHeld = panelVerdict === VERDICTS.ACCEPT && retiredOnOneAnswer.length > 0;
+        const verdict = acceptHeld ? VERDICTS.NEEDS_HUMAN : panelVerdict;
+        const humanRequired = panelHumanRequired || acceptHeld;
         return {
           verdict,
           referrals,
+          // Every lone-answer retirement on this head, held or not; `acceptHeld` says it is the only reason for `needs-human`.
+          ...(retiredOnOneAnswer.length ? { uncorroboratedRetirements: retiredOnOneAnswer } : {}),
+          ...(acceptHeld ? { acceptHeld: true } : {}),
           // #4815 — the confirmation turn's recorded outcomes (`reproduced` / `not-reproduced`, never `failed`) for the referral
           // record, and the claims it turned into advisory notes. Both absent when no tool-less seat made a qualifying claim, so a
           // run without one is byte-identical to before.
@@ -3100,10 +3113,12 @@ export function reviewPrOperation({
         } : {};
         // The NAMED findings behind that count: the one list the advisory counts and prints (jury-core).
         const pendingFindings = Array.isArray(state.pendingFindings) ? state.pendingFindings : [];
+        // A lone-answer hold (`acceptHeld`) only ever replaced an accept: a block-ruled referral still means `changes`, for the fixer.
+        const holdGivesWay = basis.acceptHeld === true && blockedReferrals.length > 0;
         return { ...basis, ...liftedFields, deferredAdvisory, pendingReferrals, pendingFindings, blockedReferrals,
           verdict: pendingReferrals.length ? 'needs-human'
-            : blockedReferrals.length && basis.verdict !== 'needs-human' ? 'changes' : basis.verdict,
-          humanRequired: basis.humanRequired || pendingReferrals.length > 0 };
+            : blockedReferrals.length && (basis.verdict !== 'needs-human' || holdGivesWay) ? 'changes' : basis.verdict,
+          humanRequired: (basis.humanRequired && !holdGivesWay) || pendingReferrals.length > 0 };
       },
     }),
 
@@ -3211,7 +3226,8 @@ export function reviewPrOperation({
           + `(${perLens || 'no lens verdicts recorded'}); ${citationNote}`
           + `\`derivePanelVerdict\` reduced them to \`${v.verdict}\``
           + `${v.pendingVerifications?.length ? ` (${v.pendingVerifications.length} claim(s) awaiting tool-bearing verification)`
-            : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
+            : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) retired on one verifier answer: a human confirms the accept)`
+              : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
           + `Record which verdict? (${CONFIRM_OPTIONS.join(' | ')}; \`abstain\` writes nothing)`;
       },
       of: (view) => (view.verdict.humanRequired ? CONFIRM_ACTORS.HUMAN : CONFIRM_ACTORS.AGENT),

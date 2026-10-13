@@ -2868,7 +2868,8 @@ export function verificationCandidates({ seats, known = new Map() }) {
  *
  * THIS IS A FORMAT FILTER, NOT A SECOND SIGNAL. It turns away a lazy or free-form "does not reproduce", and makes every recorded
  * negative point at a line a reader can check. It does not prove the cited line supports the answer: the claim's own path and
- * line are in the verifier's input, so a steered verifier can echo them. Corroboration by an independent seat is #xztd0mv. PURE.
+ * line are in the verifier's input, so a steered verifier can echo them. So a negative that passes it retires the referral but
+ * NOT the hold: `uncorroboratedRetirements` keeps the accept for a human. Corroboration by an independent seat is #xztd0mv. PURE.
  */
 export function verifierEvidenceCitesClaim(original, evidence) {
   const file = exactCitedPath(original?.file);
@@ -2883,7 +2884,8 @@ export function verifierEvidenceCitesClaim(original, evidence) {
  * Read the verifier's answer against the candidates it was asked about: `key → { outcome, reason }`, outcome one of
  * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
  * evidence-free or explicitly inconclusive (reproduced=null, or dropped by a provider that strips nulls) answer is `failed`,
- * never persisted, and so is a `false` whose evidence cites no line in the claim's own file. PURE.
+ * never persisted, and so is a `false` whose evidence cites no line in the claim's own file. A `not-reproduced` is still ONE
+ * steerable answer: it retires the referral, and `uncorroboratedRetirements` holds the accept for a human. PURE.
  */
 export function settleVerification(candidates, answer) {
   const settled = new Map();
@@ -2916,8 +2918,9 @@ export function settleVerification(candidates, answer) {
       settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
     // A `false` RETIRES a mandatory hold, and the verifier reads attacker-controlled PR content (PR #5025 review). It is recorded
     // only when its stored reason cites a line in the claim's own file; free-form evidence stays held and is asked again. That is
-    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: retiring on ONE answer is the operator's ruling for
-    // #4815, and requiring a second independent signal is #xztd0mv. A `true` keeps the hold, so it needs no citation.
+    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: ONE answer retires the referral (the operator's ruling
+    // for #4815) but never the hold, which waits for a human (`uncorroboratedRetirements`); a second independent seat is #xztd0mv.
+    // A `true` keeps the hold, so it needs no citation.
     } else if (!r.reproduced && !verifierEvidenceCitesClaim(c.original, r.evidence)) {
       settled.set(c.key, { outcome: 'failed',
         reason: 'the verifier\'s not-reproduced answer cites no line in the claim\'s own file, so it cannot retire the claim' });
@@ -2965,6 +2968,32 @@ export function verificationsToPersist(candidates, settled) {
     return s && REFERRAL_VERIFY_OUTCOMES.includes(s.outcome)
       ? [{ seat: c.seat, key: c.key, original: c.original, outcome: s.outcome, ...(s.outcome === 'not-reproduced' ? { reason: s.reason } : {}) }] : [];
   });
+}
+
+/**
+ * The claims retired on ONE verifier answer on this head (PR #5025 review): `not-reproduced` this run (`settled`) or recorded
+ * earlier on this head (`known`, whether or not a seat raises the claim again: a quiet re-run is not a second signal). That one
+ * answer comes from a model reading attacker-controlled PR content, and the citation check is only a format filter, so it retires
+ * the REFERRAL (no ruling loop) but never the hold: the review reducer turns an otherwise clean accept into `needs-human` while
+ * this list is non-empty. A second independent seat that could lift it is #xztd0mv. `[{ seat?, key, reason }]`, once per key. PURE.
+ */
+export function uncorroboratedRetirements({ downgraded = [], known = new Map(), settled = new Map() } = {}) {
+  const knownOf = (key) => (known instanceof Map ? known.get(key) : undefined);
+  const settledOf = (key) => (settled instanceof Map ? settled.get(key) : undefined);
+  const out = [];
+  const seen = new Set();
+  for (const d of Array.isArray(downgraded) ? downgraded : []) {
+    if (typeof d?.key !== 'string' || seen.has(d.key)) continue;
+    if (knownOf(d.key) !== 'not-reproduced' && settledOf(d.key)?.outcome !== 'not-reproduced') continue;
+    seen.add(d.key);
+    out.push({ seat: d.seat, key: d.key, reason: d.reason });
+  }
+  for (const [key, outcome] of known instanceof Map ? known : []) {
+    if (outcome !== 'not-reproduced' || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, reason: 'a tool-bearing seat could not reproduce it on this head' });
+  }
+  return out;
 }
 
 const supersededRulings = (ruling) => ruling.supersedes == null ? []
