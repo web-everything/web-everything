@@ -5,8 +5,8 @@ size: 3
 status: open
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-10"
-preparedAgainstSha: "512c6aaa587a6836a3597b7bf9dae6446ae211ae"
+preparedDate: "2026-10-12"
+preparedAgainstSha: "ad738c104da6afa71d0dc164ea132e46f3b83225"
 tags: []
 ---
 
@@ -27,6 +27,8 @@ Old premise: the core lacked cross-run `not-real` carry, an operator ruling path
 - Scope narrowed: `we:scripts/conveyor/reconcile-core.mjs` and its test are dropped. Duplicate dispatch stops once the referral stops being raised falsely; no evidence from current code that reconciliation itself loops.
 
 Re-stamped 2026-10-10 against `main` @ 512c6aaa5 (stale-stamp refresh: `we:scripts/operations/review-pr.mjs` changed again — #4763 roster/seat work, juror seats concurrent). Premise re-checked: still **not delivered** (`requiresMandatoryReferral` verdict+impact only, `we:scripts/lib/jury-core.mjs:2788`; no seat `tools` field; no verifier step). Only that file's line citations moved (seat constants now 435/544/619/631, `ADVISORY_SEAT_STEPS` 638, panel `allowedTools` 1436, reduce call 2747-2748, advisory judge steps ~2519-2600); the operator-ruling test citation now points at `we:scripts/operations/__tests__/record-referral-ruling.test.mjs:49`. Design, MVP and goal unchanged.
+
+Re-stamped 2026-10-12 against `main` @ ad738c104 (stale-stamp refresh). Premise re-checked: still **not delivered** (`requiresMandatoryReferral` verdict+impact only, `we:scripts/lib/jury-core.mjs:2788`; reduce call `we:scripts/operations/review-pr.mjs:2748`; no seat `tools` field). Since 512c6aaa5 only `we:scripts/operations/__tests__/review-pr.test.mjs` changed among scope files (7-line edit); every cited `file:line` still holds. Design, MVP and goal unchanged.
 
 The incident counts (51 records on #3432) are reported context; the root-cause section below is the orchestrator's decode and is not re-verified here.
 
@@ -58,12 +60,14 @@ Musts only: (a) the explicit seat `tools` field + capability helper; (b) the sin
 - `we:scripts/lib/__tests__/jury-core.test.mjs` — capability helper: tool-less CONFIRMED broken → needs verification (RED today: no helper, every such finding is referred); tool-bearing → no; unknown capability → needs verification.
 - `we:scripts/operations/__tests__/review-pr.test.mjs` — reduce: tool-less CONFIRMED + verifier "not reproduced" → no referral, finding appears as advisory with original text (RED today: referral created); "reproduced" → referral as today; verifier failure → advisory, run not blocked; tool-bearing seat → no verifier turn; mixed findings: unrelated blocker still governs; non-code finding kinds (docs/config/data) behave the same.
 - `we:scripts/operations/__tests__/review-pr-io.test.mjs` — outcome persisted on the head snapshot; second run on same head does not respawn the verifier; new head re-verifies; pre-existing referral survives a failed verifier.
-- Seat-declaration case: each of the four seat constants declares `tools` (RED today: field absent).
+- Seat-declaration case: each of the four seat constants declares an explicit boolean `tools` (RED today: field absent; a missing or non-boolean value fails the test, so omission cannot pass as "declared"). The test pins the expected values from the review of 2026-10-12: `judgeAntigravityReview` and `judgeAgyCorrectness` = `false` (documented tool-free, `we:scripts/lib/antigravity-judge-spawn.mjs:107`); `judgeAdvisory` = `false` (Codex seat: a read-only shell that cannot write, clone or reproduce — `CODEX_ADVISORY_SANDBOX_CORRECTION`, `we:scripts/operations/review-pr.mjs:1455`; the "TOOL-FREE" comment at `we:scripts/operations/review-pr.mjs:2519` means "no reproduction capability"); `judgeCorrectnessAdvisory` = `true`. Here `tools` means "can reproduce a claim on the PR head", so a read-only-shell seat that cannot reproduce counts as `false`. The build re-confirms these against the request recipes and records any change here.
+- Verifier injection: the reduce tests answer the new verifier step through the same injected-judge map the other steps use (keyed by step name); the "reproduced" control uses round 1 and the reviewed head sha, so `classifyReferralsByRound` (`we:scripts/operations/review-pr.mjs:2747`) keeps it a referral.
+- Why (c) persistence is a Must: without it the "no re-verify on the same head" Done-when cannot hold across runs.
 - Only the helper, not-reproduced, seat-declaration, and same-head/new-head verifier-outcome cases are claimed red→green. Controls (already green, NOT claimed red→green): reproduced → referral as today, tool-bearing seat → no verifier turn, failed verifier keeps a pre-existing referral, non-code kinds, carried `not-real` ruling, operator `record-referral-ruling` path.
 
 ## Proof plan
 
-Harness: the existing `runReviewPr`-style operation tests with injected judge answers in `we:scripts/operations/__tests__/review-pr.test.mjs` and the injected sink in `we:scripts/operations/__tests__/review-pr-io.test.mjs`. Run the three scoped suites with `npx vitest run <the three files>`; the new cases above fail on pre-change `main` and pass after (record names + output in Progress). Then, through the operation engine with the injected sink harness, replay a synthetic #3432-shaped run (tool-less Antigravity CONFIRMED finding, verifier not-reproduced) and capture: referral records written (expect none), advisory note count (expect exactly one), verdict, and a second run on the same head (expect no new verifier turn, no new referral). Label it synthetic; the historical #3432 artifacts are a Follow-up. Never post to a live PR as part of proof. Then the lane verifier and standards gate.
+Harness: the existing `runReviewPr`-style operation tests with injected judge answers in `we:scripts/operations/__tests__/review-pr.test.mjs` and the injected sink in `we:scripts/operations/__tests__/review-pr-io.test.mjs`. Run the three scoped suites with `npx vitest run <the three files>`; the new cases above fail on pre-change `main` and pass after (record names + output in Progress). Then, through the operation engine with the injected sink harness, replay a synthetic #3432-shaped run (tool-less Antigravity CONFIRMED finding, verifier not-reproduced) and capture before (pre-change `main`) and after: referral records written (before ≥1, after 0), advisory note count (after exactly 1), verdict, and a second run on the same head (after: 0 verifier turns, 0 new referrals). Label it synthetic; the historical #3432 artifacts are a Follow-up. Never post to a live PR as part of proof. Then the lane verifier and standards gate.
 
 ## Done when
 
@@ -73,7 +77,7 @@ The three scoped suites pass with the new red→green cases: a tool-less juror's
 
 - Capture historical #3432 artifacts and reconcile reported run/comment counts with persisted snapshots.
 - Giving read-only tools to every reviewer (operator: later option).
-- Finding-identity redesign (key includes summary text, `we:scripts/lib/jury-core.mjs:2796`); needs separate evidence.
+- Finding-identity redesign (key includes summary text, `we:scripts/lib/jury-core.mjs:2797`); needs separate evidence.
 - Verify whether duplicate dispatch after a completed advisory still occurs once false referrals stop (`we:scripts/conveyor/reconcile-core.mjs`); file only if reproduced.
 
 ## Root cause found (orchestrator, 2026-10-02 ~7:30 AM ET)

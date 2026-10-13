@@ -70,7 +70,7 @@ describe('buildCodexJudgeArgv — the argv translation, per #3371\'s table', () 
       '--ephemeral',
       '-C', '/tmp/scratch',
       // #3635 Fork 1 — the pin is part of the BASELINE argv now, not an optional tail.
-      '-m', CODEX_MODEL,
+      '-m', 'gpt-6.1-sol', '-c', 'model_reasoning_effort=medium',
     ]);
     expect(argv.join(' ')).not.toContain('--json-schema');
     expect(argv.join(' ')).not.toContain('--append-system-prompt');
@@ -103,11 +103,11 @@ describe('buildCodexJudgeArgv — the argv translation, per #3371\'s table', () 
   // These assert the real argv, not merely that the call survives.
   // ═════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-  it('ALWAYS emits -m, with the ratified pin, when the caller names no model', () => {
+  it('ALWAYS emits -m from the review route when the caller names no model', () => {
     const argv = buildCodexJudgeArgv(base);
     const at = argv.indexOf('-m');
     expect(at, 'the judge seat must never ride the CLI\'s implicit default').toBeGreaterThan(-1);
-    expect(argv[at + 1]).toBe(CODEX_MODEL);
+    expect(argv[at + 1]).toBe('gpt-6.1-sol');
     // The pin is the RATIFIED value, not merely "some string" — a rename of the constant that silently
     // changed the model would still have to face this.
     expect(CODEX_MODEL).toBe('gpt-6-astra');
@@ -842,4 +842,11 @@ describe('#xqa9ttq stripNulls — strip a Codex answer\'s explicit nulls before 
     stripNulls(value);
     expect(value).toEqual(copy);
   });
+});
+
+
+it('routes a mandatory elevated judge to Astra/high', () => {
+  const argv = buildCodexJudgeArgv({ schemaFile: '/s', outputLastMessageFile: '/o', cwd: '/tmp', mandatoryLens: true, care: 'elevated' });
+  expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-6-astra');
+  expect(argv).toContain('model_reasoning_effort=high');
 });

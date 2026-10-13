@@ -35,7 +35,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine, MERGE_DELIVERY_STRATEGIES } from './merge-delivery-policy.mjs';
-import { mergeActionFor, enqueuePr, planQueueFollowUps } from './merge-queue-enqueue.mjs';
+import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSATISFIED } from './merge-queue-enqueue.mjs';
+import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
@@ -77,6 +78,45 @@ export function resolveDrainMergePolicy({ dryRun = false, env = process.env, loa
   if (!dryRun) return { policy, note: `${DRY_RUN_STRATEGY_ENV}=${raw} ignored (honoured only with --dry-run)` };
   if (!MERGE_DELIVERY_STRATEGIES.includes(raw)) return { policy, note: `${DRY_RUN_STRATEGY_ENV}=${raw} ignored (not one of ${MERGE_DELIVERY_STRATEGIES.join(', ')})` };
   return { policy: { ...policy, strategy: raw, sources: { ...policy.sources, strategy: `dry-run ${DRY_RUN_STRATEGY_ENV}` } }, note: null };
+}
+
+/** Whether this resolved pass policy sends local candidates to GitHub's required queue. */
+export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(resolved.policy) === 'enqueue'; }
+
+/** Union classic protection with effective ruleset requirements; an unreadable set grants no relief. */
+export function readQueueRequiredChecks({ repo, branch, exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
+  if (typeof repo !== 'string' || !repo.trim()) return null;
+  if (typeof branch !== 'string' || !branch.trim()) return null;
+  try {
+    const rules = JSON.parse(exec('gh', ['api', `repos/${repo}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
+      { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+    if (!Array.isArray(rules)) return null;
+    const { checks: classic, source } = readClassic({ repo, branch });
+    // Fresh cached reads and declared repository policy are supported; degraded reads are not authoritative.
+    if (!['live', 'cache', 'declared'].includes(source)) return null;
+    if (!Array.isArray(classic)) return null;
+    const checks = [...new Set([...classic, ...rules])];
+    if (!checks.length || checks.some(name => typeof name !== 'string' || !name.trim())) return null;
+    return checks.sort();
+  } catch { return null; }
+}
+
+/** Per-pass requirements lookup, confined to local enqueue candidates and their resolved default branch. */
+export function createQueueRequiredChecksOf({ queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf, readChecks = readQueueRequiredChecks, onRead = () => {} }) {
+  const memo = new Map();
+  return (repo) => {
+    if (!queueEnqueueMode || !isLocalRepo(repo)) return null;
+    const slug = repo || localSlug;
+    const branch = defaultBranchOf(repo);
+    if (typeof slug !== 'string' || !slug.trim() || typeof branch !== 'string' || !branch.trim()) return null;
+    const key = JSON.stringify([slug, branch]);
+    if (!memo.has(key)) {
+      const checks = readChecks({ repo: slug, branch });
+      memo.set(key, checks);
+      onRead(checks);
+    }
+    return memo.get(key);
+  };
 }
 
 /** The clearance comment body for one judged head. Pure. */
@@ -231,7 +271,12 @@ export function createDrainMergeStrategy({
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec });
-      if (!r.ok) throw new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
+      if (!r.ok) {
+        const err = new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
+        // required-workflows refusal (ruleset 24930207): carry the exact enqueue pin into the cascade catch.
+        if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
+        throw err;
+      }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.

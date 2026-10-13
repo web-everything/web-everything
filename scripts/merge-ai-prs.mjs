@@ -169,6 +169,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -181,7 +182,9 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
-import { createDrainMergeStrategy } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { reviewCiGate } from './lib/review-ci-gate.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -910,7 +913,7 @@ export function attachLiveFixClaim(data, { claimKey, readClaim }) {
  * `checking` forever with no reason. `defaultBranch` is the caller's per-repo resolution (never a literal
  * `'main'`); when it or `baseRefName` is unknown the arm is inert and the chain behaves exactly as before.
  */
-export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL } = {}) {
+export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null } = {}) {
   const num = pr?.number;
   const title = pr?.title || '';
   const aiGenerated = isAiGeneratedPr(pr);
@@ -942,6 +945,24 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
     : hasLabel(pr, REVIEW_LABELS.human) ? REVIEW_LABELS.human
       : hasLabel(pr, REVIEW_LABELS.heldMechanical) ? REVIEW_LABELS.heldMechanical
         : REVIEW_LABELS.pending;
+  let queueBlockedRelief = false;
+  let queueBlocker = '';
+  // Evaluated only at the merge-state arm, after certification, CI and mergeability pass.
+  const relieveQueueBlocked = () => {
+    if (state !== 'BLOCKED' || !Array.isArray(queueRequiredChecks) || !queueRequiredChecks.length) return false;
+    const reviewDecision = String(pr.reviewDecision || '').toUpperCase();
+    if (['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(reviewDecision)) {
+      queueBlocker = `; reviewDecision=${reviewDecision}`;
+      return false;
+    }
+    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
+    if (!gate.allowed) {
+      queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
+      return false;
+    }
+    queueBlockedRelief = true;
+    return true;
+  };
   let decision = 'merge';
   // #2820-review-fix (finding 3) — `reviewHeld` means the review hold is the OPERATIVE blocker: the PR is
   // otherwise fully landable (certified, green, cleanly mergeable, real body) and ONLY the uncleared review label
@@ -972,7 +993,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState) { decision = 'skip'; reason = unlandableStateReason(state); }
+  else if (!landableState && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -983,7 +1004,9 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // blocker does it flag `reviewHeld`, so the downstream passes see the hold in isolation. No review label ⇒ never
   // held ⇒ a no-op for the common case (#2820-review-fix finding 3 — "checked LAST so earlier reasons win").
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
+  if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, state, mergeable, offDefaultBase,
+    ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
 
@@ -1012,7 +1035,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
  * @param {{requiredCheck?:string, allowPendingReview?:boolean, defaultBranch?:(string|null), expectedHeadSha?:(string|null)}} [o]
  * @returns {{decision:string, reason:string, headSha?:string}}
  */
-export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendingReview = false, defaultBranch = null, expectedHeadSha = undefined } = {}) {
+export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendingReview = false, defaultBranch = null, expectedHeadSha = undefined, queueRequiredChecks = null } = {}) {
   if (!freshPr || freshPr.number == null) {
     return { decision: 'skip', reason: 'could not re-read the PR fresh right before merging — refusing to merge on stale pass-start data' };
   }
@@ -1022,7 +1045,7 @@ export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendi
     if (!freshHead) return { decision: 'skip', reason: 'the fresh re-read carried no head SHA — refusing to merge an unpinned head' };
     if (freshHead !== expectedHeadSha) return { decision: 'skip', reason: `head moved since the pass-start decision (${expectedHeadSha.slice(0, 9)} → ${freshHead.slice(0, 9)}) — the new head is re-judged next pass, review gate included` };
   }
-  const verdict = classifyPr(freshPr, { requiredCheck, allowPendingReview, defaultBranch });
+  const verdict = classifyPr(freshPr, { requiredCheck, allowPendingReview, defaultBranch, queueRequiredChecks });
   return expectedHeadSha !== undefined && verdict.decision === 'merge' ? { ...verdict, headSha: expectedHeadSha } : verdict;
 }
 
@@ -1901,7 +1924,7 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
  * @param {{prsByRepo:Map, readOf:function, repos:Array, requiredCheck?:string, escalationRelief?:object, label?:(string|null), isLocalRepo?:function, localSlug?:(string|null), defaultBranchOf?:function}} o
  * @returns {Array} verdicts (classify + manifest fields attached; NOT yet couple-joined)
  */
-export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null } = {}) {
+export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null } = {}) {
   const verdicts = [];
   const relief = escalationRelief || { prs: [], passWide: false };
   for (const repo of (Array.isArray(repos) ? repos : [])) {
@@ -1909,7 +1932,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
     for (const p of prs) {
       const read = (typeof readOf === 'function' ? readOf(repo, p.number) : null) || {};
       p.commits = read.commits || [];
-      const v = classifyPr(p, { requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
+      const v = classifyPr(p, { queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -2214,9 +2237,9 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
  * num)` returns the per-PR `{ commits, manifest }` read.
  * @returns {{prsByRepo:Map, verdicts:Array}}
  */
-export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null } = {}) {
+export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null } = {}) {
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos, isLocalRepo });
-  const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos, requiredCheck, escalationRelief, label, isLocalRepo, localSlug, defaultBranchOf });
+  const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos, requiredCheck, escalationRelief, label, isLocalRepo, localSlug, defaultBranchOf, queueRequiredChecksOf });
   return { prsByRepo, verdicts };
 }
 
@@ -2592,7 +2615,7 @@ export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,h
  *  off (a bare `/merge`/`/finish`/`/pr` sweep — no repo's context is ever collected that pass, #xc7p3q9 B3), so
  *  that path never pays {@link SWEEP_LIST_FIELDS}' extra connection fields (`files` prices a GraphQL page) for a
  *  widening it has no reuse to spend it on. */
-const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels';
+const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels';
 
 /** #4108 — {@link CANDIDATE_ONLY_FIELDS} (the certification inputs {@link CONTEXT_LIST_FIELDS} doesn't need)
  *  UNION'd with {@link CONTEXT_LIST_FIELDS}. `sweepOnce`'s per-repo candidate listing (`listOne`) requests this
@@ -4455,7 +4478,7 @@ async function runCli() {
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
       const raw = readGh(['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,commits'],
+        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || data.number == null) return null;
@@ -4960,7 +4983,16 @@ async function runCli() {
   // #xc7p3q9 (R11) — build verdicts from the SINGLE `prsByRepo` narrowed above (no second narrow inside
   // `prepareDrainVerdicts` — the round-1 double-narrow the reviewer flagged). The couple JOIN is deferred to
   // `planDrainPass` AFTER the escalation/park pass (R5), so `held` is read from each carrier's final decision.
+  const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
+  const queueEnqueueMode = queueEnqueueModeFromPolicy(resolvedMergePolicy);
+  const queueRequiredChecksOf = createQueueRequiredChecksOf({
+    queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf,
+    onRead: (checks) => {
+      if (checks && !AS_JSON) process.stderr.write(`  github-merge-queue: BLOCKED PRs with all required checks green (${checks.join(', ')}) are enqueue-eligible\n`);
+    },
+  });
   verdicts.push(...buildDrainVerdicts({
+    queueRequiredChecksOf,
     prsByRepo,
     readOf: (repo, num) => sweepReads.get(prCacheKey(repo, num))?.value,
     repos: REPOS,
@@ -6017,13 +6049,14 @@ async function runCli() {
   // a FRESH re-read right before the merge (see `revalidateForMerge`): reported, never silently dropped, and
   // left `skip` so it keeps blocking its dependents and is re-read fresh next pass.
   const revalidationAborted = [];
+  const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
   const MERGE_QUEUE = loadMergeQueueSettings();
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -6085,6 +6118,11 @@ async function runCli() {
     if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
     return false;
   };
+  // Queue-mode branch numbering (mq-number-before-enqueue): number cards on the PR branch before enqueue.
+  const numberCardsBeforeEnqueue = logQueueNumbering();
+  const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
+  if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
+  if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -6174,6 +6212,7 @@ async function runCli() {
           const carrierMerged = merged.some((m) => candKey(m) === ck);
           const carrier = coupleStep.ordered.find((x) => candKey(x) === ck) || null;
           const fresh = carrierMerged || !carrier ? null : await revalidateFresh(carrier.repo, carrier.num, {
+            queueRequiredChecks: queueRequiredChecksOf(carrier.repo),
             requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(carrier.num)) || (!!escalationRelief.passWide && !!label),
             defaultBranch: defaultBranchOf(carrier.repo), expectedHeadSha: carrier.listedHeadSha || carrier.headSha || null,
           });
@@ -6200,6 +6239,7 @@ async function runCli() {
           let siblingHold = null;
           for (const sib of siblings) {
             const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+              queueRequiredChecks: queueRequiredChecksOf(sib.repo),
               requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
               defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
             });
@@ -6279,6 +6319,7 @@ async function runCli() {
           // unjudged head under a still-present `review:accepted` label. `revalidated.headSha` is that pinned SHA.
           const reliefAllowsPendingNow = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
           const revalidated = await revalidateFresh(c.repo, c.num, {
+            queueRequiredChecks: queueRequiredChecksOf(c.repo),
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,
           });
@@ -6413,6 +6454,10 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
+          if (numberingOnBranch && mergeStrategy.enqueues(c.repo)) {
+            const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
+            if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
             if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
@@ -6475,6 +6520,12 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} confirmed merged despite the gh error above (local branch-delete/network failure, or a concurrent lander) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
+          // Defer required-workflows recovery until the live cascade finishes.
+          if (e?.code && e.code === REQUIRED_WORKFLOWS_UNSATISFIED) {
+            c.decision = 'skip'; const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+            requiredWorkflowsRefusals.push({ c, headSha: e.headSha || c.headSha, detail });
+            continue;
+          }
           // #xngv3vn — a REAL merge failure (not the idempotent-already-merged case just above): the trace
           // built earlier is NEVER posted here — `postMergeTrace` is simply not called on this path — so this
           // PR never carries a "landed head ... — merged by drain" claim it did not earn. The failure is
@@ -6497,9 +6548,47 @@ async function runCli() {
       }
       if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
     }
+    // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
+    if (requiredWorkflowsRefusals.length) {
+      const requiredWorkflowsRefresh = resolveRefreshOnUnsatisfiedWorkflows();
+      if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})${requiredWorkflowsRefresh.invalid.length ? ` · ignored invalid: ${requiredWorkflowsRefresh.invalid.join('; ')}` : ''}\n`);
+      for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
+        const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+        const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
+          setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
+          refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+        if (recovery.handled) {
+          revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+          if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+        } else {
+          failedMerges.push({ num: c.num, repo: c.repo, detail, headSha: c.headSha ?? null });
+          if (!AS_JSON) process.stderr.write(`  ✗ ${repoTag(c.repo)}${c.num} merge failed: ${detail}\n`);
+        }
+      }
+    }
     if (deferred.length && !AS_JSON) process.stderr.write(`  · ${deferred.length} deferred (blockedBy an unlanded PR): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
+  }
+  if (queueEnqueueMode) {
+    const staleMergeGateRefresh = resolveRefreshOnStaleMergeGate();
+    if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnStaleMergeGate=${staleMergeGateRefresh.value} (${staleMergeGateRefresh.source})${staleMergeGateRefresh.invalid.length ? ` · ignored invalid: ${staleMergeGateRefresh.invalid.join('; ')}` : ''}\n`);
+    for (const c of skipped) {
+      const pr = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
+      const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+      const recovery = await handleStaleMergeGate({ c: { ...c, repo: c.repo || localSlug }, pr,
+        requiredChecks: queueRequiredChecksOf(c.repo), classifyPr,
+        classifyOptions: { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(c.repo),
+          allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (escalationRelief.passWide && !!label) },
+        setting: staleMergeGateRefresh, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
+        tag: repoTag(c.repo), readAcceptance: readDrainAcceptance,
+        refreshStalePr, needsAcceptanceRestamp, restampAcceptance,
+        warn: line => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+      if (recovery.handled) {
+        revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+        if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+      } else if (recovery.reason) c.reason += `; ${recovery.reason}`;
+    }
   }
   const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 
@@ -6521,7 +6610,7 @@ async function runCli() {
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
   const followup = await handOffDrainFollowup({
     landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
-    buildInput: () => buildFollowupInput({ landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
+    buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
   });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
@@ -6593,11 +6682,15 @@ async function runCli() {
   // these buckets, and every bucket reaches the operator (stderr) AND `--json`. A withheld item that appears in
   // none of them is the silent skip this whole item was filed against.
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
+  if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
+  const queuedHashOnMain = !!numbered.files?.length;
+  if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
   if (landedLocal && !DRY_RUN) {
+    if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
     // the TTL-bounded numbering mutex so a concurrent drain/land never mints the same NNN off the same base.
     const numLock = withNumberingLock(() => {
-      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd()));
+      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), (numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
       const __resolveOnLandT0 = __t.mark(); // x2e120n — everything from here through the resolve loop below
       // #2899 A5 — RESOLVE-ON-LAND for the LABEL lander. This drain single-sourced lane-drain's NUMBERING but
       // never its RESOLVING, so it assigned the NNN and left `status:` untouched — delivered work kept ranking

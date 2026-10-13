@@ -13,8 +13,8 @@
  * — start loose, tighten from data; they live here so a change is one edit + a test, never scattered.
  */
 import { createHash } from 'node:crypto';
-import { permissionChangeFiles } from './permission-change.mjs';
-import { isTrustChainPath, isPolicyCorePath, isPolicySpecPath, isPolicyDerivationPath, isEngineTierPath, basenameOf, STATUTE_PATHS, isStatutePath, isDeclarativeLeashPath, principleSurfaceTriggers, isPrincipleSurface, statuteAnchorEditKind } from './gate-config.mjs';
+import { normalizeHumanSurfaces, resolveHumanReviewSurfaces, sensitiveSurfaceHits } from './human-review-surfaces.mjs';
+import { isTrustChainPath, isPolicyCorePath, isPolicySpecPath, isPolicyDerivationPath, isEngineTierPath, basenameOf, STATUTE_PATHS, isStatutePath, isDeclarativeLeashPath, principleSurfaceTriggers, statuteAnchorEditKind } from './gate-config.mjs';
 // #2892 — the statute predicate and the leash-path term now live beside `isPrincipleSurface` in gate-config.mjs (the
 // composition needs them and this module imports IT); re-exported so every existing importer is unchanged.
 export { isStatutePath, isDeclarativeLeashPath };
@@ -715,7 +715,9 @@ export function scoreEscalation({
   diffHunks = null,
   basisNarrowed = true,
   deviation = null,
+  humanSurfaces,
 } = {}) {
+  const resolvedSurfaces = humanSurfaces === undefined ? resolveHumanReviewSurfaces() : normalizeHumanSurfaces(humanSurfaces);
   const t = { ...DEFAULT_THRESHOLDS, ...thresholds };
   const reasons = [];
   const signals = {};
@@ -749,38 +751,33 @@ export function scoreEscalation({
   // #3317 — over `basisFiles`, not the own-delta: an ANCESTOR's edit to a high-blast-radius surface is part of
   // what this PR merges into main, so it is part of this PR's blast radius.
   const blastFiles = basisFiles.filter((f) => isBlastRadiusPath(f) || isTrustChainPath(f));
-  if (blastFiles.length) { signals.blastRadius = blastFiles; reasons.push(`blast-radius (${blastFiles.slice(0, 3).join(', ')}${blastFiles.length > 3 ? ', …' : ''})`); }
 
-  // #2390-review-fix — the human gate scores over the cumulative basis (a self-declared/mis-set stacked `base`
-  // can never shrink it), falling back to `changedFiles` when no separate basis is supplied.
-  // #2445 two-tier flip — ONLY the POLICY tier (isGateSelfPath) and the STATUTE layer force a human; the ENGINE
-  // tier (the lander) escalated via blast-radius above but is agent-reviewable, so it is NOT counted here.
-  // #2771/#2785 — the POLICY tier is SPLIT. Only the DECLARATIVE LEASH (`isDeclarativeLeashPath`: the contract,
-  // the roster, the invariant/conformance suites) still forces a human; the DERIVATION CODE that realizes it
-  // escalates to the sized independent committee instead. Both sets come from the ONE roster in gate-config.mjs.
-  // #3317 — these read `basisFiles` (⊇ the cumulative set they read before), so the gate they realize is
-  // unchanged where it already fired and only ever fires in MORE cases, never fewer.
+  // All touch-set gates use the cumulative basis and each file's own hunks. The configured categories
+  // decide which principle triggers require human review; inactive triggers still raise AI care via blast-radius.
   const gateBasis = basisFiles;
-  // #2892 — the human gate is the PRINCIPLE SURFACE (#2840, `#human-is-principle-surface-not-path`), evaluated per
-  // changed file against that file's own slice of the base-vs-head hunks. The two path OR-terms this replaces
-  // (`isDeclarativeLeashPath`, `isStatutePath`) are now two of its three TRIGGERS: the leash path is the one
-  // surviving PATH term (unconditional — a `POLICY_SPEC` file fires whatever its hunks say), the statute term
-  // narrowed from "any touch of the doc" to "a rule-text edit" (whitespace / reflow no longer fires), and a NEW
-  // content term fires on an edit to a `@principle`/`@invariant` block already present in base. A statute doc
-  // whose hunks are unavailable FAILS CLOSED to today's whole-file gate (see `isStatuteAnchorEdit`), so no input
-  // this cannot read can quietly clear a change the old gate held. A trust-chain file that is NOT a principle
-  // surface this diff still ESCALATES (blast-radius above / `gateDerivation` below) — to the committee.
   // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
   const fileHunksOf = fileHunksResolver(diffHunks);
   const surfaces = gateBasis.map((f) => { const hunks = fileHunksOf(f); return { file: f, hunks, triggers: principleSurfaceTriggers(f, hunks) }; });
-  const filesWith = (trigger) => surfaces.filter((x) => x.triggers.includes(trigger));
+  const categoryFor = { 'leash-path': 'gate-self', 'statute-anchor': 'statute', 'marked-invariant': 'marked-invariant' };
+  const demoted = {};
+  for (const [trigger, category] of Object.entries(categoryFor)) {
+    if (resolvedSurfaces.categories.includes(category)) continue;
+    const files = surfaces.filter(x => x.triggers.includes(trigger)).map(x => x.file);
+    if (files.length) {
+      demoted[category] = files;
+      for (const file of files) if (!blastFiles.includes(file)) blastFiles.push(file);
+    }
+  }
+  if (Object.keys(demoted).length) signals.humanSurfacesDemoted = demoted;
+  if (blastFiles.length) { signals.blastRadius = blastFiles; reasons.push(`blast-radius (${blastFiles.slice(0, 3).join(', ')}${blastFiles.length > 3 ? ', …' : ''})`); }
+  const filesWith = (trigger) => resolvedSurfaces.categories.includes(categoryFor[trigger])
+    ? surfaces.filter((x) => x.triggers.includes(trigger)) : [];
   const leashFiles = filesWith('leash-path').map((x) => x.file);
   const statuteFiles = filesWith('statute-anchor').map((x) => x.file);
   const markedFiles = filesWith('marked-invariant').map((x) => x.file);
   const derivationFiles = gateBasis.filter(isPolicyDerivationPath);
-  // @invariant human-gate-is-principle-surface (#human-is-principle-surface-not-path) — humanRequired fires ONLY when isPrincipleSurface says so; never re-add a bare path term
-  const humanRequired = gateBasis.some((f) => isPrincipleSurface(f, fileHunksOf(f)));
-  let humanForced = humanRequired;
+  // @invariant human-gate-is-principle-surface — human-review-surfaces.mjs controls touch-set holds (including active principle triggers); deviation also forces human review.
+  let humanForced = !!(leashFiles.length || statuteFiles.length || markedFiles.length);
   // #4502 — a disclosed rule deviation forces the human park regardless of file signals; the text rides
   // `reasons` verbatim so the #2324 body block and park comment quote it with no new comment path.
   if (typeof deviation === 'string' && deviation !== '') {
@@ -789,13 +786,11 @@ export function scoreEscalation({
     signals.deviation = deviation;
   }
 
-  // PERMISSION-CHANGE HOLD (operator decision 2026-10-08, after PR #4318 widened a workflow token and merged on
-  // the automatic accept). A diff that changes workflow `permissions:`, a sandbox grant, or branch-protection-adjacent
-  // config ALWAYS forces `review:human`, whatever else it scores. Additive: it only ever adds a human park.
-  const permissionHits = permissionChangeFiles(gateBasis, fileHunksOf);
+  // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
+  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
-    signals.permissionChange = permissionHits.map((x) => x.file);
+    signals.permissionChange = [...new Set(permissionHits.map((x) => x.file))];
     reasons.push(`permission-change (${permissionHits.map((x) => `${x.file}: ${x.kind}`).join(', ')}) — token permissions / sandbox / branch-protection config changed, human review required`);
   }
 
@@ -879,7 +874,7 @@ export function scoreEscalation({
   // #2635 roster recompute) can select over the SAME honest basis this scored, instead of the own-delta.
   // #3343 — `basisUntrusted` rides the verdict so a consumer (and the human who has to clear a `review:human`)
   // can tell a verdict scored on the PR's own file set from one scored on the base tip. Never a permission.
-  return { escalate: reasons.length > 0, humanRequired: humanForced, careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
+  return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0, humanRequired: humanForced, careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
 }
 
 /**

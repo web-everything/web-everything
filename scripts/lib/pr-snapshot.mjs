@@ -13,6 +13,14 @@
  * the wait. A FAILED refresh (rate limit, auth) THROWS the fetch error unchanged: the direct call would hit the
  * same wall, so falling back would only double the failed spend.
  *
+ * DISCOVERY ONLY: cached labels/head/comments can nominate candidates, never authorize a
+ * comment-dependent mutation. GitHub CLI comment connections may contain only the first 100
+ * comments; even a shorter array is cached, not proof of a complete, current thread. Writers
+ * must re-read live metadata and the complete paginated thread, then recompute their plan.
+ * Each composed mutation pass needs its own read, including after preceding passes write.
+ * “Flags only” is a usage contract: the schema, field union and projection stay unchanged.
+ * The review-hold chain enforces this boundary; other consumers need a separate inventory.
+ *
  * FRESHNESS: a snapshot is served while younger than the TTL (`WE_PR_SNAPSHOT_TTL_MS`, default 75s — under the
  * 120s daemon tick, so each tick sees at most one refresh per repo) AND no write landed after it
  * (`gh-throttle.mjs` marks it dirty on every successful mutation), with a {@link DIRTY_REFRESH_FLOOR_MS} floor so
