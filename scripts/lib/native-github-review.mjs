@@ -23,7 +23,7 @@
  *   App's own installation token (the shared cache, else minted now); with no token it is queued
  *   ({@link nativeReviewQueuePath}) and the next run as the reviewer App dismisses it before its own work.
  */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -279,37 +279,64 @@ export function nativeReviewQueuePath(env = process.env) {
   return env.WE_NATIVE_REVIEW_DISMISSAL_QUEUE || join(homedir(), '.claude', 'conveyor', 'native-review-dismissals.jsonl');
 }
 
+/** A claim file older than this is taken over even if its owner pid is (or was reused as) alive. */
+export const QUEUE_CLAIM_STALE_MS = 10 * 60 * 1000;
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
 /**
- * The file-backed queue. `claim()` renames the queue (and any claim a crashed drainer left) to a fresh claim file,
- * so an append racing the drain lands in a new queue file and nothing is read twice by two live drainers' renames;
- * `done()` deletes the claims once their entries are dismissed or re-queued.
+ * The file-backed queue. `claim()` renames the queue to a claim file named for this process, and takes over another
+ * drainer's claim only when its pid is gone or the claim is stale ({@link QUEUE_CLAIM_STALE_MS}), so two live
+ * drainers never process the same entries. An append whose open raced the rename lands in the claim file after it
+ * was read; `done()` re-reads each claim and re-queues any such late line before deleting it.
  */
-export function fileDismissalQueue(path) {
+export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAlive } = {}) {
   const dir = dirname(path);
   const base = basename(path);
+  const claimRe = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.claim-(\\d+)-`);
+  const takeable = (name) => {
+    if (name === base) return true;
+    const m = claimRe.exec(name);
+    if (!m) return false;
+    if (!alive(Number(m[1]))) return true;
+    try { return now() - statSync(join(dir, name)).mtimeMs > QUEUE_CLAIM_STALE_MS; } catch { return false; }
+  };
+  const append = (text) => {
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(path, text);
+  };
   return {
-    append(entry) {
-      mkdirSync(dir, { recursive: true });
-      appendFileSync(path, `${JSON.stringify(entry)}\n`);
-      return true;
-    },
+    append(entry) { append(`${JSON.stringify(entry)}\n`); return true; },
     claim() {
       let names = [];
-      try { names = readdirSync(dir).filter(name => name === base || name.startsWith(`${base}.claim-`)); } catch { names = []; }
+      try { names = readdirSync(dir).filter(takeable); } catch { names = []; }
       const claims = [];
       const entries = [];
       for (const name of names) {
         const claim = join(dir, `${base}.claim-${process.pid}-${randomUUID()}`);
         try { renameSync(join(dir, name), claim); } catch { continue; }
-        claims.push(claim);
         let text = '';
         try { text = readFileSync(claim, 'utf8'); } catch { text = ''; }
+        claims.push({ claim, length: text.length });
         for (const line of text.split('\n')) {
           if (!line.trim()) continue;
           try { entries.push(JSON.parse(line)); } catch { /* A torn line is dropped. */ }
         }
       }
-      return { entries, done() { for (const claim of claims) { try { unlinkSync(claim); } catch { /* Re-claimed by another drainer. */ } } } };
+      return {
+        entries,
+        done() {
+          for (const { claim, length } of claims) {
+            try {
+              const late = readFileSync(claim, 'utf8').slice(length);
+              if (late.trim()) append(late.endsWith('\n') ? late : `${late}\n`);
+              unlinkSync(claim);
+            } catch { /* Kept: the next drainer re-claims it once this pid is gone. */ }
+          }
+        },
+      };
     },
   };
 }
@@ -374,7 +401,8 @@ function readViewer(run) {
 
 /** The PR's full review history; throws when any row is unreadable. */
 function readReviews(run, endpoint) {
-  const raw = run(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `${endpoint}/reviews`, '--jq', '.[] | {id, state, commit_id, user: {login: .user.login, type: .user.type}}']);
+  // A deleted account's review has `user: null`: read it as nobody's, never as an unreadable history.
+  const raw = run(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `${endpoint}/reviews`, '--jq', '.[] | {id, state, commit_id, user: {login: (.user.login // ""), type: (.user.type // "")}}']);
   const reviews = String(raw).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
   if (reviews.some(review => !review || typeof review.id !== 'number' || typeof review.state !== 'string'
     || typeof review.commit_id !== 'string' || typeof review.user?.login !== 'string' || typeof review.user?.type !== 'string')) throw new Error('reviews-unreadable');
@@ -390,25 +418,43 @@ const validQueueEntry = entry => entry && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.t
   && /^[0-9a-f]{40}$/.test(entry.head ?? '') && /^[a-z-]{1,32}$/.test(entry.verdict ?? '')
   && Array.isArray(entry.ids) && entry.ids.length > 0 && entry.ids.every(id => Number.isInteger(id) && id > 0);
 
+/** The review states our CURRENT label verdict stands behind; a queued dismissal never removes one of them. Pure. */
+export function endorsedStates(labels) {
+  const names = (labels ?? []).map(label => (typeof label === 'string' ? label : label?.name));
+  const endorsed = [];
+  if (names.includes('review:changes')) endorsed.push('CHANGES_REQUESTED');
+  if (names.includes('review:accepted') && !names.includes('review:human')) endorsed.push('APPROVED');
+  return endorsed;
+}
+
 /**
- * Dismiss every queued review that is still one of ours and still standing, running as the reviewer App. Only the
- * ids recorded at queue time are touched, never a later verdict. Failures are re-queued (bounded). Never throws.
+ * Dismiss every queued review that is still one of ours, still standing, and not endorsed by the PR's CURRENT label
+ * (a later verdict may agree with it again), running as the reviewer App. Only the ids recorded at queue time are
+ * touched. Entries for another owner wait for a run there; failures re-queue up to {@link QUEUE_MAX_ATTEMPTS}, and a
+ * give-up is logged as a disagreement. Never throws.
  */
-function drainDismissalQueue({ queue, run, reviewerLogin, record }) {
+function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
   let claimed;
   try { claimed = queue.claim(); } catch { return; }
   const retry = [];
   for (const entry of claimed?.entries ?? []) {
     if (!validQueueEntry(entry)) continue;
+    // This token is the reviewer App's installation for `owner` only.
+    if (entry.repo.split('/')[0].toLowerCase() !== owner) { retry.push(entry); continue; }
     const endpoint = `repos/${entry.repo}/pulls/${entry.pr}`;
     const line = { repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: null };
-    let standing;
-    try { standing = new Set(ownStandingReviews({ reviews: readReviews(run, endpoint), reviewerLogin, states: DECISIVE })); }
-    catch (error) {
-      retry.push(entry);
+    const attempt = { ...entry, attempts: (Number(entry.attempts) || 0) + 1 };
+    let reviews;
+    let endorsed;
+    try {
+      endorsed = endorsedStates(JSON.parse(run(['api', `repos/${entry.repo}/issues/${entry.pr}`, '--jq', '[.labels[].name]'])));
+      reviews = readReviews(run, endpoint);
+    } catch (error) {
+      retry.push(attempt);
       record({ ...line, outcome: 'failed', dismissal: 'failed', reason: `queued dismissal: ${failureReason(error)}` });
       continue;
     }
+    const standing = new Set(ownStandingReviews({ reviews, reviewerLogin, states: DECISIVE.filter(state => !endorsed.includes(state)) }));
     const left = [];
     const errors = [];
     let dismissed = 0;
@@ -417,11 +463,14 @@ function drainDismissalQueue({ queue, run, reviewerLogin, record }) {
       try { dismiss(run, endpoint, id, entry.verdict, entry.head); dismissed++; }
       catch (error) { left.push(id); errors.push(`dismissal ${id}: ${failureReason(error)}`); }
     }
-    if (left.length) retry.push({ ...entry, ids: left, attempts: (Number(entry.attempts) || 0) + 1 });
+    if (left.length) retry.push({ ...attempt, ids: left });
     if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
   }
   for (const entry of retry) {
-    if ((Number(entry.attempts) || 0) >= QUEUE_MAX_ATTEMPTS) continue;
+    if ((Number(entry.attempts) || 0) >= QUEUE_MAX_ATTEMPTS) {
+      record({ repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: null, outcome: 'failed', dismissal: 'failed', reason: `queued dismissal given up after ${entry.attempts} attempts` });
+      continue;
+    }
     try { queue.append(entry); } catch { /* Best effort: the claim file is kept below so the next drainer retries. */ return; }
   }
   try { claimed?.done?.(); } catch { /* Best effort. */ }
@@ -489,7 +538,9 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
       if (!live || typeof live.head !== 'string' || typeof live.author !== 'string' || !live.author.trim() || typeof live.authorType !== 'string' || typeof live.state !== 'string') return finish('skipped', 'pr-unreadable');
     } catch { return finish('skipped', 'pr-unreadable'); }
     if (live.state !== 'open') return finish('skipped', 'pr-not-open');
-    if (live.head !== headSha) return finish('skipped', `head-moved (live=${live.head.slice(0, 12)})`);
+    // A review is pinned to the reviewed head; dismissing our own review is not, so a push racing a rearm or a
+    // clearance never leaves our verdict standing beside the label.
+    if (live.head !== headSha && event) return finish('skipped', `head-moved (live=${live.head.slice(0, 12)})`);
     const resolvedIdentity = identity ?? readDeliveryIdentity({ env });
     const prAuthor = { login: live.author, type: live.authorType };
     const checked = checkReviewerIdentity({ identity: resolvedIdentity, viewer: readViewer(run), prAuthor });
@@ -500,7 +551,7 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     const reviewerLogin = checked.reviewerLogin;
     const pending = queue ?? (underTest ? null : fileDismissalQueue(nativeReviewQueuePath(env)));
     // As the reviewer App, first finish any dismissal an earlier non-reviewer run queued, then read this PR fresh.
-    if (checked.ok && pending) drainDismissalQueue({ queue: pending, run, reviewerLogin, record });
+    if (checked.ok && pending) drainDismissalQueue({ queue: pending, run, owner: String(repo).split('/')[0].toLowerCase(), reviewerLogin, record });
     let reviews;
     try { reviews = readReviews(run, endpoint); }
     catch { return finish('skipped', checked.ok ? 'reviews-unreadable' : `${checked.reason}; reviews-unreadable`); }

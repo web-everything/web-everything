@@ -3,10 +3,10 @@ import {
   NATIVE_REVIEW_MODES, NATIVE_REVIEW_ENV, STANDARD_NATIVE_REVIEW_MODE, EVENT_STATE,
   parseNativeReviewMode, resolveNativeReviewMode, loadNativeReviewMode, planNativeReview,
   normaliseLogin, reviewerBotLogin, isReviewerBotUser, checkReviewerIdentity, findExistingNativeReview, ownStandingReviews,
-  nativeReviewBody, formatComparisonLine, mirrorNativeReview, readReviewerToken, fileDismissalQueue,
+  nativeReviewBody, formatComparisonLine, mirrorNativeReview, readReviewerToken, fileDismissalQueue, endorsedStates, QUEUE_CLAIM_STALE_MS,
   STANDARD_PROMOTION, resolvePromotionCriteria, loadPromotionCriteria, parseComparisonLine, summarizeReadiness, formatReadinessLine,
 } from '../native-github-review.mjs';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { roleCachePath } from '../github-app-identity.mjs';
@@ -185,7 +185,7 @@ describe('synchronous mirror shell', () => {
     expect(f.posts[0]).toEqual(['api', '--method', 'POST', 'repos/owner/repo/pulls/123/reviews', '-f', `commit_id=${head}`, '-f', 'event=APPROVE', '-f', `body=${nativeReviewBody({ verdict: 'accepted', event: 'APPROVE', head })}`]);
     expect(f.calls[0]).toEqual(['api', 'repos/owner/repo/pulls/123', '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state}']);
     expect(f.calls[1]).toEqual(['api', 'graphql', '-f', 'query=query{viewer{__typename login}}', '--jq', '.data.viewer | "\\(.__typename) \\(.login)"']);
-    expect(f.calls[2]).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/owner/repo/pulls/123/reviews', '--jq', '.[] | {id, state, commit_id, user: {login: .user.login, type: .user.type}}']);
+    expect(f.calls[2]).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/owner/repo/pulls/123/reviews', '--jq', '.[] | {id, state, commit_id, user: {login: (.user.login // ""), type: (.user.type // "")}}']);
     expect(f.result.line).toMatch(/^native-review: /);
     expect(f.result.line).toContain('label=accepted native=APPROVE outcome=posted agree=yes mode=mirror(tool)');
     expect(f.log).toHaveBeenCalledWith(f.result.line);
@@ -231,7 +231,18 @@ describe('synchronous mirror shell', () => {
     expect(f.result.outcome).toBe(outcome);
     expect(f.puts).toHaveLength(0);
   });
-  it('head movement prevents dismissal too', () => expect(fixture({ verdict: 'clear-human' }, { head: otherHead, reviews: [review(7, 'CHANGES_REQUESTED')] }).puts).toHaveLength(0));
+  it('head movement prevents posting, never the dismissal of our own review', () => {
+    expect(fixture({}, { head: otherHead, reviews: [review(7, 'CHANGES_REQUESTED')] })).toMatchObject({ posts: [], puts: [] });
+    for (const verdict of ['clear-human', 'rearm']) {
+      const f = fixture({ verdict }, { head: otherHead, reviews: [review(7, 'CHANGES_REQUESTED')] });
+      expect(f.puts).toHaveLength(1);
+      expect(f.result.outcome).toBe('dismissed');
+    }
+  });
+  it('a deleted account\'s review (user null) is nobody\'s, not an unreadable history', () => {
+    const f = fixture({ verdict: 'rearm' }, { reviewsRaw: [JSON.stringify({ id: 6, state: 'APPROVED', commit_id: head, user: { login: '', type: '' } }), JSON.stringify(review(7, 'APPROVED'))].join('\n') });
+    expect(f.result).toMatchObject({ outcome: 'dismissed', dismissed: 1 });
+  });
   it('human accepted posts a comment and dismisses a prior own hold', () => {
     const f = fixture({ labels: ['review:human'] }, { reviews: [review(7, 'CHANGES_REQUESTED')] });
     expect(f.posts[0]).toContain('event=COMMENT');
@@ -266,7 +277,7 @@ describe('synchronous mirror shell', () => {
 });
 
 /** A fake GitHub: one PR whose review list the mirror reads, posts to and dismisses on, so a verdict SEQUENCE is real. */
-function fakeGithub({ viewer = 'Bot plateau-reviewer' } = {}) {
+function fakeGithub({ viewer = 'Bot plateau-reviewer', labels = [] } = {}) {
   const reviews = [];
   let nextId = 100;
   const exec = (argv) => {
@@ -281,6 +292,7 @@ function fakeGithub({ viewer = 'Bot plateau-reviewer' } = {}) {
       return '{}';
     }
     if (argv.includes('graphql')) return viewer;
+    if (/\/issues\/\d+$/.test(argv[1])) return JSON.stringify(labels);
     if (argv.includes('--paginate')) return reviews.map(JSON.stringify).join('\n');
     return JSON.stringify({ head, author: 'web-everything[bot]', authorType: 'Bot', state: 'open' });
   };
@@ -384,6 +396,31 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(gh.reviews.find(r => r.id === 8).state).toBe('CHANGES_REQUESTED');
     expect(queue.append).not.toHaveBeenCalled();
   });
+  const drainWith = (gh, entries, extra = {}) => {
+    const appended = [];
+    const lines = [];
+    const queue = { append: (e) => { appended.push(e); return true; }, claim: () => ({ entries, done: () => {} }) };
+    mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'advisory', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: (l) => lines.push(l), appendLog: () => {}, queue, ...extra });
+    return { appended, lines };
+  };
+  it('a queued dismissal never removes a review the CURRENT label agrees with again', () => {
+    const gh = fakeGithub({ labels: ['review:changes'] });
+    gh.reviews.push(review(5, 'CHANGES_REQUESTED'), review(6, 'APPROVED', otherHead));
+    drainWith(gh, [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [5, 6] }]);
+    expect(gh.reviews.find(r => r.id === 5).state).toBe('CHANGES_REQUESTED');
+    expect(gh.reviews.find(r => r.id === 6).state).toBe('DISMISSED');
+    expect(endorsedStates(['review:accepted', 'review:human'])).toEqual([]);
+    expect(endorsedStates([{ name: 'review:accepted' }])).toEqual(['APPROVED']);
+  });
+  it('an entry for another owner waits for a run there, unchanged; a hopeless one is given up loudly', () => {
+    const gh = fakeGithub();
+    const other = { v: 1, repo: 'elsewhere/repo', pr: 4, head, verdict: 'rearm', ids: [9] };
+    const tired = { v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [7], attempts: 19 };
+    const failing = { ...gh, exec: (argv) => (argv.includes('--paginate') ? (() => { throw new Error('read failed'); })() : gh.exec(argv)) };
+    const { appended, lines } = drainWith(failing, [other, tired]);
+    expect(appended).toEqual([other]);
+    expect(lines.some(l => l.includes('label=clear-human') && l.includes('agree=no') && l.includes('given up after 20 attempts'))).toBe(true);
+  });
 });
 
 describe('reviewer token and dismissal queue IO', () => {
@@ -406,19 +443,41 @@ describe('reviewer token and dismissal queue IO', () => {
     expect(readReviewerToken({ ...ids, repo: 'other/repo' })).toEqual({ reason: 'reviewer-app-not-installed (other)' });
     expect(readReviewerToken({ ...ids, identity: {} })).toEqual({ reason: 'reviewer-app-unconfigured' });
   });
-  it('the file queue appends, claims atomically and keeps a crashed claim for the next drainer', () => {
+  it('the file queue never takes a live drainer\'s claim, but takes a dead or stale one', () => {
     dir = mkdtempSync(join(tmpdir(), 'nrq-'));
-    const q = fileDismissalQueue(join(dir, 'q.jsonl'));
+    let alive = true;
+    let clock = Date.now();
+    const q = fileDismissalQueue(join(dir, 'q.jsonl'), { alive: () => alive, now: () => clock });
     expect(q.claim().entries).toEqual([]);
     q.append({ a: 1 });
     q.append({ a: 2 });
-    const crashed = q.claim();
-    expect(crashed.entries).toEqual([{ a: 1 }, { a: 2 }]);
+    const first = q.claim(); // still running: its claim is its own
+    expect(first.entries).toEqual([{ a: 1 }, { a: 2 }]);
     q.append({ a: 3 });
-    const next = q.claim(); // the crashed drainer never called done(): its claim is re-claimed
-    expect(next.entries).toEqual(expect.arrayContaining([{ a: 1 }, { a: 2 }, { a: 3 }]));
-    next.done();
+    const second = q.claim();
+    expect(second.entries).toEqual([{ a: 3 }]);
+    second.done();
+    clock += QUEUE_CLAIM_STALE_MS + 1000; // the first claim is stale now: taken over
+    const stale = q.claim();
+    expect(stale.entries).toEqual([{ a: 1 }, { a: 2 }]);
+    clock = Date.now();
+    alive = false; // its owner died without done(): re-claimed at once
+    const dead = q.claim();
+    expect(dead.entries).toEqual([{ a: 1 }, { a: 2 }]);
+    dead.done();
     expect(readdirSync(dir)).toEqual([]);
+  });
+  it('done() re-queues a line an append wrote into the claim after it was read', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    const path = join(dir, 'q.jsonl');
+    const q = fileDismissalQueue(path, { alive: () => true });
+    q.append({ a: 1 });
+    const claimed = q.claim();
+    const [claimFile] = readdirSync(dir);
+    appendFileSync(join(dir, claimFile), `${JSON.stringify({ a: 2 })}\n`); // the racing append's fd followed the rename
+    claimed.done();
+    expect(readdirSync(dir)).toEqual(['q.jsonl']);
+    expect(q.claim().entries).toEqual([{ a: 2 }]);
   });
 });
 
