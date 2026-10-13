@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
   recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord } from '../verdict-ledger.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, verdictLedgerPath } from '../verdict-ledger.mjs';
 import { recordDrainHold } from '../../merge-ai-prs.mjs';
 const repo = 'o/r', head = 'a'.repeat(40), old = 'b'.repeat(40), now = '2026-10-13T12:00:00.000Z';
 const base = { repo, pr: 1, at: now, source: 'test', declaredActor: 'test' };
@@ -168,6 +171,20 @@ describe('drain ledger facts — the recorders read the store their writes land 
     expect(recordDrainHold({ repo: 'x/y', pr: 1, reason: 'review', read, append })).toMatchObject({ ok: true, appended: true });
     expect(recordDrainHold({ repo: 'z/w', pr: 1, reason: 'review', read, append })).toMatchObject({ ok: true, appended: true });
     expect(writes.map(r => [r.type, r.repo])).toEqual([['hold', 'x/y'], ['hold', 'z/w']]);
+  });
+  it('a lasting read failure dedups the hold against home instead of appending one every pass', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'drain-facts-home-')), prev = process.env.WE_VERDICT_LEDGER_DIR;
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      writeFileSync(verdictLedgerPath(repo), `${JSON.stringify(hold)}\n`);
+      const writes = [], read = () => { throw new Error('no-board'); };
+      expect(recordDrainHold({ repo, pr: 1, reason: 'review', read, append: row => { writes.push(row); return { ok: true }; } }))
+        .toMatchObject({ ok: true, appended: false });
+      expect(writes).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.WE_VERDICT_LEDGER_DIR; else process.env.WE_VERDICT_LEDGER_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

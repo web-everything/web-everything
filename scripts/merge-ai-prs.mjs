@@ -3072,10 +3072,11 @@ export function drainHoldReasonCode(reason) {
 export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
   try {
     const reasonCode = drainHoldReasonCode(reason);
-    const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
-    // An unreadable ledger still records the hold (F4: a hold is never dropped; a duplicate hold is harmless).
+    const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
+    // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups against home, which
+    // holds every spilled hold, so a lasting read failure cannot append a duplicate on every pass.
     let events;
-    try { events = readEvents(repo); } catch { events = []; }
+    try { events = (read ?? readHome)(repo); } catch { events = readHome(repo); }
     const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
     if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({
