@@ -2413,6 +2413,17 @@ export function holdText(h) {
   return h ? `held [${h.stage}] ${h.reason}${h.detail ? ` — ${h.detail}` : ''}` : 'not a candidate';
 }
 
+/** PURE: priority visibility for a completed tick; key advances even when the line is suppressed. */
+export function buildPriorityLog(buildPriority, result, previousKey) {
+  const key = JSON.stringify(buildPriority);
+  // Descendants rank by their listed epic, so name actual launches as well as the configured ids.
+  const launches = [...(result.dispatched ?? []).map(d => `build #${normNum(d.num)}`),
+    ...(result.prepare?.launched ?? []).map(p => `prepare #${normNum(p.num)}`)];
+  if (!buildPriority.ids.length || (key === previousKey && !launches.length)) return { key, line: null };
+  const head = buildPriority.ids.slice(0, 5).join(',') + (buildPriority.ids.length > 5 ? ',…' : '');
+  return { key, line: `build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}` };
+}
+
 async function live(flags) {
   if (flags['self-sync'] !== undefined && flags['self-sync'] !== true) {
     console.error('build-dispatch-daemon: --self-sync takes no value'); process.exit(1);
@@ -2449,16 +2460,9 @@ async function live(flags) {
       effects.listPrepareInFlight = () => prepareRows;
       const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
       bookkeeping = r.nextBookkeeping;
-      const priorityKey = JSON.stringify(buildPriority);
-      // The tick's launches, named so the log shows whether they follow the list (a descendant of a listed epic
-      // ranks by that epic's position, so the list alone cannot say which launch is "listed").
-      const launches = [...(r.dispatched ?? []).map(d => `build #${normNum(d.num)}`),
-        ...(r.prepare?.launched ?? []).map(p => `prepare #${normNum(p.num)}`)];
-      if (buildPriority.ids.length && (priorityKey !== lastBuildPriority || launches.length)) {
-        const head = buildPriority.ids.slice(0, 5).join(',') + (buildPriority.ids.length > 5 ? ',…' : '');
-        console.error(`build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}`);
-      }
-      lastBuildPriority = priorityKey;
+      const priorityLog = buildPriorityLog(buildPriority, r, lastBuildPriority);
+      if (priorityLog.line !== null) console.error(priorityLog.line);
+      lastBuildPriority = priorityLog.key;
       return r;
     } finally { await round.end(); }
   };
