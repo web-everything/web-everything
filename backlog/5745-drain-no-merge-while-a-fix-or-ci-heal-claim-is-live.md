@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-13"
-preparedAgainstSha: "c696f9339c0f373a72286d6495f47787df225675"
+preparedAgainstSha: "b00263a49d03d1c6a676c6f9c6c36d5e67175745"
 tags: []
 ---
 
@@ -84,3 +84,4 @@ Guard cases (pass today, must stay green; not RED):
 - 2026-10-12 prepare: premise check found the fix half delivered. Old scope: we:scripts/merge-ai-prs.mjs only. Corrected scope adds we:scripts/conveyor/fix-procedure.mjs and we:scripts/lib/drain-skip-reasons.mjs (plus their tests), per the code above. Goal unchanged.
 - 2026-10-13 review: adversarial pass found a fail-open hole (dispatch claims lack `meta.who`), an overstated corrupt-file claim, and mislabelled RED cases; all fixed above.
 - 2026-10-13 re-prepare: premise re-checked against current `main`; claim code unchanged (`readLiveFixClaim` reads kind `fixing` only; no `claim-held` kind). Citations refreshed: merge-site call now we:scripts/merge-ai-prs.mjs:4485, head pin at :6466. Goal, scope and plan unchanged.
+- 2026-10-13 re-stamp: re-checked against b00263a4; in-scope files unchanged since c696f93 (only ci-red-recovery-watch moved, not in scope); plan unchanged, stamp refreshed.
