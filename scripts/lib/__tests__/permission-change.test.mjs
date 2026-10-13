@@ -25,7 +25,7 @@ describe('replay of PR #4318 (workflow permissions widened)', () => {
   it('is humanRequired with a permission-change reason', () => {
     expect(s.humanRequired).toBe(true);
     expect(s.signals.permissionChange).toEqual([WF]);
-    expect(s.reasons.join('\n')).toMatch(/^permission-change \(.github\/workflows\/apply-review-request.yml: workflow-permissions\)/m);
+    expect(s.reasons.join('\n')).toMatch(/^permission-change \([^\n]*.github\/workflows\/apply-review-request.yml: workflow-permissions\)/m);
     expect(s.careLevel).toBe('high');
   });
   it('the reason derives a human-cleared disposition (no auto-land)', () => {

@@ -145,10 +145,10 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
 
   // #x8wbivt — the ratified model/effort pin. The whole point is that a real constructed argv NEVER omits
   // `-m`/`-c` even when a caller passes neither — never inherit the CLI's own implicit default.
-  it('#x8wbivt: pins -m to CODEX_MODEL (gpt-6-astra) when no model is given', () => {
+  it('uses the worker route while keeping CODEX_MODEL as Astra identity', () => {
     expect(CODEX_MODEL).toBe('gpt-6-astra');
     const argv = buildCodexDirectTaskArgv({ cwd: '/d' });
-    expect(flagValue(argv, '-m')).toBe('gpt-6-astra');
+    expect(flagValue(argv, '-m')).toBe('gpt-6.1-sol');
   });
 
   it('#x8wbivt: an explicit model still overrides the pin', () => {
@@ -880,6 +880,26 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     }
   });
 
+  it('reports the actual route once and observes the rollout bucket even after quota collection', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-route-'));
+    const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n');
+    const lines = [];
+    try {
+      const report = await codexDirectTask({ task: 't', dir, review: true, taskKind: 'prepare', size: 8,
+        model: 'x', tier: 'haiku', stream: false, spawnFn, log: l => lines.push(l),
+        execFn: (_bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '',
+        clearRolloutAfterRun: true,
+        collectQuotaFn: () => ({ quota: { raw: { limit_id: 'observed-bucket', primary: { used_percent: 9 } } }, deleted: true }),
+      });
+      expect(report.route).toEqual({ kind: 'prepare-complex', model: 'x', effort: 'low', sources: { model: 'explicit', effort: 'explicit' }, bucket: null });
+      expect(report).toMatchObject({ model: 'x', effort: 'low' });
+      expect(flagValue(seen.argv, '-m')).toBe('x');
+      expect(seen.argv).toContain('model_reasoning_effort=low');
+      expect(lines.filter(l => l.startsWith('codex-route ·'))).toHaveLength(1);
+      expect(lines).toContain('codex-usage · bucket=observed-bucket primary.used_percent=9');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('codexDirectTask: with an explicit --dir, does NOT create a scratch clone, and captures a real diff via execFn', async () => {
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
     const { fn: spawnFn } = fakeSpawn(stdout);
@@ -1056,5 +1076,57 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+
+describe('direct task routes', () => {
+  it.each([
+    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'medium'],
+    [{ taskKind: 'prepare', size: 8 }, 'gpt-6-astra', 'high'],
+    [{ taskKind: 'trivial' }, 'gpt-6-luna', 'low'],
+    [{ taskKind: 'trivial', model: 'x', tier: 'opus' }, 'x', 'high'],
+    [{ review: true }, 'gpt-6.1-sol', 'medium'],
+  ])('routes argv %j', (opts, model, effort) => {
+    const argv = buildCodexDirectTaskArgv({ cwd: '/tmp/task', ...opts });
+    expect(flagValue(argv, '-m')).toBe(model);
+    expect(argv).toContain(`model_reasoning_effort=${effort}`);
+  });
+});
+
+
+describe('direct CLI flags reach the actual spawn and JSON result', () => {
+  it.each([
+    [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'medium', 'tool', 'tool'],
+    [['--task-kind=prepare', '--size=8'], 'prepare-complex', 'gpt-6-astra', 'high', 'tool', 'tool'],
+    [['--task-kind=trivial'], 'trivial', 'gpt-6-luna', 'low', 'tool', 'tool'],
+    [['--task-kind=trivial', '--model=x', '--tier=opus'], 'trivial', 'x', 'high', 'explicit', 'explicit'],
+    [['--review'], 'review', 'gpt-6.1-sol', 'medium', 'tool', 'tool'],
+  ])('%j', (flags, kind, model, effort, modelSource, effortSource) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-'));
+    const preload = `import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (_bin, argv) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', '--task=fixture', `--dir=${dir}`, '--json', '--no-stream', '--ephemeral', ...flags],
+      { encoding: 'utf8', env: { ...process.env, WE_CODEX_MODEL_BY_TASK: '{}' } });
+      const report = JSON.parse(stdout);
+      expect(report.route).toMatchObject({ kind, model, effort, sources: { model: modelSource, effort: effortSource } });
+      expect(flagValue(report.argv, '-m')).toBe(model);
+      expect(report.argv).toContain(`model_reasoning_effort=${effort}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

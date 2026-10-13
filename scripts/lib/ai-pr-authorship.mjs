@@ -128,6 +128,7 @@ export function isMechanicalMergeCommit(commit) {
 const DRAIN_BOOKKEEPING_SUBJECTS = [
   /^drain: JIT-number \S+→#\d+(?:, \S+→#\d+)* at land \(#2288\)$/, // lane-drain.mjs
   /^drain: resolve #\d+ on land \(#2748\)$/, // lane-drain.mjs
+  /^drain: mark card \d+ resolved on land \(#2748\)$/, // lane-drain.mjs resolveLandedItem (#2779 subject); also queue-branch-numbering.mjs
   /^drain: unqueue \+ cleanup #\d+ lane manifest post-land \(#2175\)$/, // lane-drain.mjs
   /^drain: reopen stranded #\d+ after failed land \(#2175\)$/, // lane-drain.mjs
   /^drain: resolve epic #?[\w-]+ on last-child #?[\w-]+ land \(#2752\)$/, // conveyor/pr-watch.mjs

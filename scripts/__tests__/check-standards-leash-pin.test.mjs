@@ -12,7 +12,7 @@ import { TRUST_CHAIN, POLICY_SPEC_BASENAMES, RATIFIED_POLICY_SPEC_FLOOR } from '
 import { scoreEscalation } from '../lib/review-escalation.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const realGate = (path, hunks) => scoreEscalation({ changedFiles: [path], diffHunks: hunks }).humanRequired;
+const realGate = (path, hunks) => scoreEscalation({ humanSurfaces: 'broad', changedFiles: [path], diffHunks: hunks }).humanRequired;
 const real = (over = {}) => checkLeashPin({ specBasenames: POLICY_SPEC_BASENAMES, roster: TRUST_CHAIN, isHumanGated: realGate, homeExists: (rel) => existsSync(join(ROOT, rel)), ...over });
 
 describe('checkLeashPin — the live tree', () => {

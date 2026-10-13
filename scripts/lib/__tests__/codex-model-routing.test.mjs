@@ -23,7 +23,10 @@ import { dirname, join, relative } from 'node:path';
 
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort,
+  CODEX_MODEL_CATALOGUE, CODEX_TASK_KINDS, CODEX_MODEL_BY_TASK_DEFAULT, CODEX_USAGE_BUCKETS,
+  classifyCodexTask, codexModelSupportsEffort, formatCodexRouteLine, logCodexRoute, parseRolloutUsageBucket,
 } from '../codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_ROOT = join(HERE, '..', '..');
@@ -116,7 +119,7 @@ describe('#3635 Fork 1 — the repo-wide rule, enforced across every discovered 
     for (const [name, argv] of argvs) {
       const at = argv.indexOf('-m');
       expect(at, `${name} omitted -m`).toBeGreaterThan(-1);
-      expect(argv[at + 1], `${name} passed the wrong model`).toBe(CODEX_MODEL);
+      expect(argv[at + 1], `${name} passed the wrong model`).toBe(name === 'codex-delivery-provider' ? CODEX_MODEL : 'gpt-6.1-sol');
     }
   });
 });
@@ -190,5 +193,74 @@ describe('assertCodexModel', () => {
 
   it('names the calling module in its error, so a failure points at the call site', () => {
     expect(() => assertCodexModel('-x', 'codex-judge-spawn')).toThrow(/^codex-judge-spawn:/);
+  });
+});
+
+
+describe('per-task model AND effort routing (2026-10-12)', () => {
+  const route = (opts = {}) => resolveCodexTaskRoute({ tool: {}, platform: {}, env: {}, log: false, ...opts });
+  const defaults = [
+    ['prepare', 'gpt-6-astra', 'medium'], ['prepare-complex', 'gpt-6-astra', 'high'],
+    ['takeover', 'gpt-6-astra', 'high'], ['design', 'gpt-6-astra', 'high'],
+    ...['fix', 'ci-heal', 'build', 'worker', 'review'].map(k => [k, 'gpt-6.1-sol', 'medium']),
+    ['trivial', 'gpt-6-luna', 'low'], ['review-mandatory', 'gpt-6-astra', 'high'],
+  ];
+  it.each(defaults)('%s names both defaults', (kind, model, effort) => {
+    expect(CODEX_MODEL_BY_TASK_DEFAULT[kind]).toEqual({ model, effort });
+    expect(route({ kind })).toEqual({ kind, model, effort, sources: { model: 'standard', effort: 'standard' }, bucket: 'codex' });
+    expect(Object.isFrozen(CODEX_MODEL_BY_TASK_DEFAULT[kind])).toBe(true);
+  });
+  it('freezes the vocabulary and catalogue, preserving the strong identity', () => {
+    expect([...CODEX_TASK_KINDS].sort()).toEqual(defaults.map(x => x[0]).sort());
+    for (const value of [CODEX_TASK_KINDS, CODEX_MODEL_CATALOGUE, CODEX_MODEL_BY_TASK_DEFAULT, CODEX_USAGE_BUCKETS, ...Object.values(CODEX_MODEL_CATALOGUE)]) expect(Object.isFrozen(value)).toBe(true);
+    expect(CODEX_MODEL).toBe('gpt-6-astra');
+  });
+  it.each([{ size: 8 }, { size: 13 }, { epic: true }, { decision: true }, { care: 'elevated' }, { care: 'high' }])('classifies complex preparation %j', inputs => {
+    expect(classifyCodexTask({ kind: 'prepare', ...inputs })).toBe('prepare-complex');
+  });
+  it('keeps ordinary prepare and upgrades only mandatory elevated reviews', () => {
+    expect(classifyCodexTask()).toBe('worker');
+    expect(classifyCodexTask({ kind: 'prepare', size: 5 })).toBe('prepare');
+    expect(classifyCodexTask({ kind: 'review', mandatoryLens: true, care: 'elevated' })).toBe('review-mandatory');
+    expect(classifyCodexTask({ kind: 'review', mandatoryLens: true, care: 'high' })).toBe('review-mandatory');
+    expect(classifyCodexTask({ kind: 'review', care: 'high' })).toBe('review');
+    expect(classifyCodexTask({ kind: 'review', mandatoryLens: true, care: 'normal' })).toBe('review');
+    expect(() => classifyCodexTask({ kind: 'oops' })).toThrow(/allowed.*prepare.*review-mandatory/i);
+    expect(() => classifyCodexTask({ kind: 'constructor' })).toThrow(TypeError);
+  });
+  it.each([['stronger','takeover'], ['stronger-model','takeover'], ...['card','card-filing','prevention-card','card-rename','conflict'].map(k => [k,'trivial']), ['delivery','build'], ['heal','ci-heal']])('aliases %s', (kind, expected) => expect(classifyCodexTask({ kind })).toBe(expected));
+  it('resolves platform, tool, and partial env per leaf with provenance', () => {
+    expect(route({ kind: 'fix', platform: { fix: { model: 'gpt-6-astra', effort: 'high' } }, tool: { fix: { model: 'gpt-6-luna' } }, env: { WE_CODEX_MODEL_BY_TASK: '{"fix":{"effort":"low"}}' } })).toMatchObject({ model: 'gpt-6-luna', effort: 'low', sources: { model: 'tool', effort: 'env' } });
+    expect(route({ kind: 'fix', platform: { fix: { effort: 'high' } } }).sources.effort).toBe('platform');
+    expect(resolveCodexTaskRoute({ kind: 'fix', env: {}, platform: {}, log: false }).sources).toEqual({ model: 'tool', effort: 'tool' });
+  });
+  it('ignores invalid leaves without discarding valid siblings and names invalid JSON', () => {
+    expect(route({ kind: 'fix', tool: { fix: { model: 'unknown', effort: 'high' } }, env: { WE_CODEX_MODEL_BY_TASK: '{"fix":{"effort":"bogus"}}' } })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high', sources: { model: 'standard', effort: 'tool' } });
+    const lines = [];
+    expect(route({ env: { WE_CODEX_MODEL_BY_TASK: '{oops' }, log: l => lines.push(l) }).model).toBe('gpt-6.1-sol');
+    expect(lines.join(' ')).toMatch(/invalid.*WE_CODEX_MODEL_BY_TASK/);
+  });
+  it('explicit unknown models remain allowed, with vocabulary and final pair validation', () => {
+    expect(route({ model: 'x', effort: 'max' })).toMatchObject({ model: 'x', effort: 'max', sources: { model: 'explicit', effort: 'explicit' }, bucket: null });
+    expect(() => route({ kind: 'trivial', effort: 'ultra' })).toThrow(/gpt-6-luna.*ultra.*low.*max/);
+    expect(() => route({ model: 'x', effort: 'bogus' })).toThrow(TypeError);
+    expect(route({ model: 'constructor' }).bucket).toBeNull();
+    expect(codexModelSupportsEffort('x', 'high')).toBe(true);
+    expect(codexModelSupportsEffort('x', 'bogus')).toBe(false);
+    expect(codexModelSupportsEffort('gpt-5.5', 'max')).toBe(false);
+  });
+  it('logs every route, exactly formatted, and logging never throws', () => {
+    const r = route({ kind: 'fix' });
+    const expected = 'codex-route · kind=fix model=gpt-6.1-sol (standard) effort=medium (standard) bucket=codex';
+    expect(formatCodexRouteLine(r)).toBe(expected);
+    const lines = [];
+    for (let i = 0; i < 2; i++) logCodexRoute(r, { log: l => lines.push(l) });
+    expect(lines).toEqual([expected, expected]);
+    expect(() => logCodexRoute(r, { log: () => { throw Error('sink failed'); } })).not.toThrow();
+  });
+  it('reads the last token_count bucket, tolerating malformed and unrelated lines', () => {
+    const event = (id, used) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used } } } });
+    expect(parseRolloutUsageBucket(event('old', 1) + '\ninvalid\n' + event('codex', 12))).toEqual({ limit_id: 'codex', used_percent: 12 });
+    expect(parseRolloutUsageBucket('{}\ninvalid')).toBeNull();
   });
 });
