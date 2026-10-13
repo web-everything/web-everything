@@ -37,3 +37,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5160 (finding 1: `we:backlog/5943-red-main-repair-patterns-resolve-host-wide-not-per-caller.md:63` — Add a preparation gate requiring each explicit behavioral guarantee to reference a named planned test and its observable assertion; review that assertion for semantic adequacy.) · key `approval-prevention-key:web-everything/web-everything#5160@bbbcd56e8249ec6895433e4b4959981c9c10eb35`
