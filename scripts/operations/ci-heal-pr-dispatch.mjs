@@ -285,13 +285,15 @@ export async function dispatchCiHeal(planned, {
       console.error(`ci-heal-pr-dispatch: PR #${planned.pr} stronger-model rung (claude) model=${stronger.policyRoute.model} effort=${stronger.policyRoute.effort} (source ${stronger.source})`);
     }
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
+    const briefOnly = reason === 'codeql' || !!planned.owedMainRule;
     const out = await sinks[DISPATCH_EFFECT]({
       launchKind: 'ci-heal', prompt: withOwedMainRuleSection(withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), planned), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
       // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry; so does
       // a heal that must keep drain-assigned card numbers (PR #5082).
-      pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' || planned.owedMainRule ? null : (route?.probationWorker ?? null),
-      routing: stronger ? { policyRoute: stronger.policyRoute } : route,
+      // The sink falls back to `routing.probationWorker` when this is null, so a suppressed pick is cleared on both.
+      pr: planned.pr, reason, repo, probationWorker: briefOnly ? null : (route?.probationWorker ?? null),
+      routing: stronger ? { policyRoute: stronger.policyRoute } : (briefOnly && route ? { ...route, probationWorker: null } : route),
     });
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim

@@ -601,10 +601,25 @@ describe('xp0lsdi quota routing boundary', () => {
       const { calls, sinks } = recordingSink();
       await dispatchCiHeal({ ...PLANNED, reason, codeql: { alerts: [] } }, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
       expect(calls).toHaveLength(1);
-      expect(calls[0].routing).toBe(route);
-      // only a codeql heal forces the native worker (the probation prompt does not carry the alert)
+      // only a codeql heal forces the native worker (the probation prompt does not carry the alert); the pick is
+      // cleared on `routing` too, since the sink falls back to `routing.probationWorker` (PR #5082 review)
+      expect(calls[0].routing).toEqual(reason === 'codeql' ? { ...route, probationWorker: null } : route);
       expect(calls[0].probationWorker).toEqual(reason === 'codeql' ? null : route.probationWorker);
     }
+  });
+  it('keeps a brief-only heal off the probation worker as the sink resolves it (PR #5082 review)', async () => {
+    const route = { outcome: 'ok', probationWorker: { id: 'codex', supervision: 'full' }, policyRoute: 'p' };
+    // The sink's own resolution (dispatch-lane-io.mjs): the direct pick, else the routing record's.
+    const sinkWorker = p => p?.probationWorker ?? p?.routing?.probationWorker ?? null;
+    for (const planned of [{ ...PLANNED, reason: 'codeql', codeql: { alerts: [] } }, { ...PLANNED, owedMainRule: { check: 'test', nums: [5994] } }]) {
+      const { calls, sinks } = recordingSink();
+      await dispatchCiHeal(planned, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
+      expect(sinkWorker(calls[0])).toBeNull();
+      expect(calls[0].routing.policyRoute).toBe('p');
+    }
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
+    expect(sinkWorker(calls[0])).toEqual(route.probationWorker);
   });
   it('blocks direct retry while an earlier attempt has unpublished accounting', async () => {
     const { calls, sinks } = recordingSink();
