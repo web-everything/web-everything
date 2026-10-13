@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { roleCachePath } from '../github-app-identity.mjs';
 import { installationCachePath } from '../github-app-installations.mjs';
 import { CACHE_VERSION } from '../github-app-auth-env.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
+import { fileURLToPath } from 'node:url';
 
 const head = 'a'.repeat(40);
 const otherHead = 'b'.repeat(40);
@@ -466,6 +468,11 @@ describe('reviewer token and dismissal queue IO', () => {
     expect(dead.entries).toEqual([{ a: 1 }, { a: 2 }]);
     dead.done();
     expect(readdirSync(dir)).toEqual([]);
+  });
+  // CI on 8638c5344: the mint child's `import(<env var>)` marked every daemon closure reaching this module incomplete.
+  it('keeps every daemon import closure that reaches this module complete (no non-literal dynamic import)', () => {
+    const root = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
+    expect(collectImportClosure({ root, entries: ['scripts/lib/native-github-review.mjs'] })?.complete).toBe(true);
   });
   it('done() re-queues a line an append wrote into the claim after it was read', () => {
     dir = mkdtempSync(join(tmpdir(), 'nrq-'));

@@ -341,16 +341,23 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
   };
 }
 
-/** Mint an installation token synchronously in a child process (minting is async; this shell is not). */
+/**
+ * Mint an installation token synchronously in a child process (minting is async; this shell is not). The child loads
+ * the minter with a STATIC import of a built specifier: a non-literal dynamic import anywhere in this file would mark
+ * every daemon import closure that reaches it incomplete (`we:scripts/lib/import-closure.mjs`).
+ */
 function mintTokenSync({ appId, installationId, key, env }) {
   const script = [
-    'const m = await import(process.env.WE_NRV_MODULE);',
-    'const key = JSON.parse(process.env.WE_NRV_KEY);',
-    "const r = await m.mintInstallationToken({ appId: process.env.WE_NRV_APP, installationId: process.env.WE_NRV_INSTALLATION, privateKeyPath: key.file ?? `keychain:${key.keychain.service}`, ...(key.keychain ? { readKey: () => m.readPrivateKeyRef(key) } : {}) });",
-    'process.stdout.write(r.token);',
+    `import * as m from ${JSON.stringify(new URL('./github-app-token.mjs', import.meta.url).href)};`,
+    'try {',
+    '  const key = JSON.parse(process.env.WE_NRV_KEY);',
+    "  const r = await m.mintInstallationToken({ appId: process.env.WE_NRV_APP, installationId: process.env.WE_NRV_INSTALLATION, privateKeyPath: key.file ?? `keychain:${key.keychain.service}`, ...(key.keychain ? { readKey: () => m.readPrivateKeyRef(key) } : {}) });",
+    '  process.stdout.write(r.token);',
+    // One line, the error's own message: the caller reports the last stderr line, never a stack.
+    "} catch (e) { process.stderr.write(`mint failed: ${String(e?.message ?? e).split('\\n')[0]}\\n`); process.exitCode = 1; }",
   ].join('\n');
   return String(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
-    env: { ...env, WE_NRV_MODULE: new URL('./github-app-token.mjs', import.meta.url).href, WE_NRV_KEY: JSON.stringify(key), WE_NRV_APP: String(appId), WE_NRV_INSTALLATION: String(installationId) },
+    env: { ...env, WE_NRV_KEY: JSON.stringify(key), WE_NRV_APP: String(appId), WE_NRV_INSTALLATION: String(installationId) },
     encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
   })).trim();
 }
