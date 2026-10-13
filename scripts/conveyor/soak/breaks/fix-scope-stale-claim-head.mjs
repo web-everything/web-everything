@@ -1,7 +1,8 @@
 /** PR #5087: a fixer pushes B while its live claim still records acquisition head A.
  * Replay the live region callback and scope gate, with hermetic head/region observations.
  * A edits line 10; B and the waiting candidate edit line 100. A must never release the hold.
- * The fix (62aa4e99a) now lives in createLiveRegionOverlap, which reconcile-fix-dispatch wires up.
+ * The fix (62aa4e99a, in reconcile-fix-dispatch) later moved into createLiveRegionOverlap, so red-green.mjs
+ * cannot reverse-apply it; the RED proof is re-adding `e.claim?.meta?.headSha ||` to the helper's headFor.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,11 +16,12 @@ export default {
   id: 'fix-scope-stale-claim-head',
   title: 'region scope observes the current fixer head rather than its acquisition head',
   card: 'PR #5087',
-  fixedBy: { sha: '62aa4e99a', where: 'lane/scope-hold-policy', paths: [SOURCE] },
+  fixedBy: { sha: '62aa4e99a', where: 'lane/scope-hold-policy', paths: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] },
+  // Soak probes are synchronous source checks; run() is the behavioural proof. Any headSha read in the helper is stale.
   fixPresent(root) {
     const source = readFileSync(join(root, SOURCE), 'utf8');
     const start = source.indexOf('export function createLiveRegionOverlap');
-    return start >= 0 && !source.slice(start, source.indexOf('\n}\n', start)).includes('claim?.meta?.headSha');
+    return start >= 0 && !/headSha/.test(source.slice(start, source.indexOf('\n}\n', start)));
   },
   async run() {
     const now = Date.parse('2026-10-13T02:17:23Z');
