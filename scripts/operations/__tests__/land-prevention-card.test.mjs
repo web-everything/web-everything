@@ -9,12 +9,12 @@
  * Every subprocess call is a scripted stub (`exec`) — no real `node`, `git`, `lane-pool.mjs` or `gh` runs
  * here, matching the no-fs/no-subprocess convention every sibling operation test already uses.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  landPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
+  landPreventionCard as realLandPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
   boundCardText, boundLandPreventionCardInput, CARD_TEXT_CAPS, buildLandingRetractionComment, postLandingRetraction,
   runCardDedupe,
 } from '../land-prevention-card.mjs';
@@ -25,6 +25,10 @@ import {
 import { findBadBodyLinks } from '../../check-standards-rules.mjs';
 import { renderItem } from '../../backlog/scaffold.mjs';
 import yaml from 'js-yaml';
+
+const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
+  batch: async () => ({ batched: false, reason: 'per-card test' }), ...deps,
+});
 
 const INPUT = {
   title: 'File the prevention guard(s) owed by o/r#42\'s independent review',
@@ -262,10 +266,12 @@ describe('landPreventionCard — dedupe before filing', () => {
     try {
       const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
       const written = [];
+      const batch = vi.fn();
       const result = await landPreventionCard(input(), {
-        exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, dedupe,
+        exec, batch, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, dedupe,
         writeFile: (p, c, e) => { written.push({ p, c }); if (p.startsWith(lane)) writeFileSync(p, c, e); },
       });
+      expect(batch).not.toHaveBeenCalled();
       expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
       expect(calls.some((c) => c.args.includes('file-item'))).toBe(false);
       expect(calls[1].args).toEqual(['-C', lane, 'add', '--', REL]);
@@ -276,6 +282,27 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(after).toContain('approval-prevention-key:o/r#77@abc');
       expect(written.find(({ p }) => p.endsWith('commit-msg.txt')).c.split('\n')[0]).toMatch(/^WE #4706: prevention — also raised: /);
       expect(calls[4].args.find((a) => a.startsWith('--ref='))).toBe('--ref=lane/prevention-card-test');
+    } finally { cleanup(); }
+  });
+
+  it('a partial dedupe keeps the new card and lane-local mention together on the per-card path', async () => {
+    const acquire = setup();
+    try {
+      const mixed = input();
+      mixed.digest = mixed.digest.replace('\n\nIdempotency key',
+        '\n\n2. `we:scripts/other-check.mjs:10` — Reject malformed flags before dispatch.\n\nIdempotency key');
+      mixed.scope += ',we:scripts/other-check.mjs';
+      const { exec, calls } = scriptedExec([acquire, 'mention-added', FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const batch = vi.fn(async () => ({ batched: true, batchRef: 'should-not-be-used' }));
+      const result = await landPreventionCard(mixed, {
+        exec, batch, dedupe, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {},
+        writeFile: (p, c, e) => { if (p.startsWith(lane)) writeFileSync(p, c, e); },
+      });
+      expect(result).toMatchObject({ ok: true, step: 'done', rel: 'backlog/9001-file-the-prevention.md', mentions: 1 });
+      expect(readFileSync(join(lane, REL), 'utf8')).toContain('## Also raised by');
+      expect(batch).not.toHaveBeenCalled();
+      expect(calls.some(({ args }) => args.includes('file-item'))).toBe(true);
+      expect(calls.some(({ args }) => args.includes('open-pr'))).toBe(true);
     } finally { cleanup(); }
   });
 
@@ -571,5 +598,44 @@ describe('postLandingRetraction — a failed job retracts its own marker on the 
     expect(lines.join('')).toMatch(/gh down/);
     expect(lines.join('')).toMatch(/invalid head/);
     expect(buildLandingRetractionComment({ headSha: 'zz', session: 's' })).toBe('');
+  });
+});
+
+
+describe('prevention batch landing', () => {
+  const deps = { dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {} };
+  it.each([null, { repo: 'o/r', pr: '42', headSha: 'abc' }])('hands a new hash card to the batch and releases without publishing (%j)', async (retract) => {
+    const rel = 'backlog/x123456-prevention.md';
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, JSON.stringify({ verdict: { rel } }), 'released']);
+    const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
+    const write = vi.fn();
+    const result = await realLandPreventionCard({ ...INPUT, title: 'Prevention guard', retract }, { ...deps, exec, batch, write });
+    expect(result).toEqual({ ok: true, step: 'batched', num: null, rel, pr: null, url: null, reason: null, batchRef: 'lane/card-batch-prevention-1' });
+    expect(batch).toHaveBeenCalledWith({ laneDir: JSON.parse(ACQUIRE_OK).path, cardPath: rel, kind: 'prevention',
+      actor: 'mechanical', idemKey: 'prevention:x123456',
+      source: { repo: 'web-everything/web-everything', pr: retract?.pr ?? null, head: retract?.headSha ?? null, note: retract ? 'Prevention guard (from o/r#42)' : 'Prevention guard' } });
+    expect(calls).toHaveLength(3);
+    expect(calls[2].args).toContain('release');
+    expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some((op) => args.includes(op)))).toBe(false);
+    expect(write).toHaveBeenCalledWith('land-prevention-card: batched ' + rel + ' into lane/card-batch-prevention-1\n');
+  });
+  it.each([false, true])('falls back on refusal or throw (throw=%s)', async (throws) => {
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+    const batch = vi.fn(async () => { if (throws) throw new Error('batch unavailable'); return { batched: false, reason: 'batch unavailable' }; });
+    const write = vi.fn();
+    expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, write })).toMatchObject({ ok: true, step: 'done', pr: 5555 });
+    expect(batch).toHaveBeenCalledTimes(1);
+    for (const op of ['commit', 'verify', 'open-pr', 'release']) expect(calls.some(({ args }) => args.includes(op))).toBe(true);
+    expect(write.mock.calls.flat().join('')).toContain('batch unavailable');
+  });
+  it('CLI treats batched as success without retracting the filing marker', async () => {
+    const retract = vi.fn();
+    const { code } = await runLandPreventionCardCli(
+      ['--title=t', '--kind=story', '--size=3', '--digest=d', '--scope=we:a.mjs', '--queue=true', '--session=s',
+        '--retract-repo=o/r', '--retract-pr=7', '--retract-head=abc'],
+      { land: async () => ({ ok: true, step: 'batched', pr: null, batchRef: 'lane/card-batch-prevention-1' }),
+        retract, write: () => {}, writeErr: () => {} });
+    expect(code).toBe(0);
+    expect(retract).not.toHaveBeenCalled();
   });
 });
