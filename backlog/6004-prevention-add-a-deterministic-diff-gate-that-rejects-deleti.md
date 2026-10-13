@@ -1,4 +1,5 @@
 ---
+bornAs: xon0clg
 kind: story
 size: 3
 parent: "4075"
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x7utn5x-prevention-add-a-deterministic-regression-test-using-a-long.md:1` — Add a deterministic diff gate that rejects deletion of open prevention cards unless their idempotency key is preserved in a replacement or an explicit completion record links the implementing test.
+1. `we:backlog/5980-prevention-add-a-deterministic-regression-test-using-a-long.md:1` — Add a deterministic diff gate that rejects deletion of open prevention cards unless their idempotency key is preserved in a replacement or an explicit completion record links the implementing test.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5038@7c00413f2de8dec7dbee086b5408822cb705dd96
 
