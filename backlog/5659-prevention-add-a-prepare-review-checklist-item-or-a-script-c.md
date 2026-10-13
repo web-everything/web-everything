@@ -46,3 +46,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5147 (finding 4: `we:backlog/5954-lazy-restacking-for-stacked-prs-stack-restack-eager-lazy.md` — Add a preparation checklist requiring each explicit behavioral guarantee to identify a named planned test and observable assertion; include the four change kinds as parameterized cases.)
