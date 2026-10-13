@@ -1,0 +1,7 @@
+{
+  "$comment": "mergeQueue.refreshWhenMainAcceptsDrainNumbers refreshes PRs rejected only for numbers assigned by the drain once main accepts those numbers. mergeQueue.refreshEvidenceOnlyConflicts refreshes lane PRs whose only conflicts are root fixer evidence scratch files, including drafts. Both default to true. Override with WE_MQ_REFRESH_WHEN_MAIN_ACCEPTS_DRAIN_NUMBERS or WE_MQ_REFRESH_EVIDENCE_ONLY_CONFLICTS (on/off/true/false/1/0). Each PR head is refreshed at most once after a successful refresh.",
+  "mergeQueue": {
+    "refreshWhenMainAcceptsDrainNumbers": true,
+    "refreshEvidenceOnlyConflicts": true
+  }
+}

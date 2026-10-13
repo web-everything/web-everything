@@ -61,17 +61,17 @@ describe('prevention.* batch settings cascade', () => {
   const standard = loadCardBatchPolicy().prevention;
   it('uses standard defaults without optional preferences', () => {
     const settings = loadPreventionBatchSettings({ env: {}, repo: {}, read: () => { throw new Error('missing'); } });
-    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10,
-      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard' }, invalid: [] });
+    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15,
+      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard' }, invalid: [] });
   });
   it.each(['platform', 'repo', 'env'])('%s wins for each key', (layer) => {
-    const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3 } };
-    if (layer !== 'platform') layers.repo = { batchFiling: true, batchWindowMinutes: 40, batchMaxCards: 4 };
-    if (layer === 'env') layers.env = { WE_PREVENTION_BATCH_FILING: 'false', WE_PREVENTION_BATCH_WINDOW_MINUTES: '50', WE_PREVENTION_BATCH_MAX_CARDS: '5' };
+    const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3, batchLeaseWaitMinutes: 3 } };
+    if (layer !== 'platform') layers.repo = { batchFiling: true, batchWindowMinutes: 40, batchMaxCards: 4, batchLeaseWaitMinutes: 4 };
+    if (layer === 'env') layers.env = { WE_PREVENTION_BATCH_FILING: 'false', WE_PREVENTION_BATCH_WINDOW_MINUTES: '50', WE_PREVENTION_BATCH_MAX_CARDS: '5', WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES: '5' };
     const settings = resolvePreventionBatchSettings(layers);
     const n = { platform: 3, repo: 4, env: 5 }[layer];
-    expect(settings).toMatchObject({ batchFiling: layer === 'repo', batchWindowMinutes: n * 10, batchMaxCards: n,
-      sources: { batchFiling: layer, batchWindowMinutes: layer, batchMaxCards: layer } });
+    expect(settings).toMatchObject({ batchFiling: layer === 'repo', batchWindowMinutes: n * 10, batchMaxCards: n, batchLeaseWaitMinutes: n,
+      sources: { batchFiling: layer, batchWindowMinutes: layer, batchMaxCards: layer, batchLeaseWaitMinutes: layer } });
   });
   it.each([['0', false], ['1', true], ['true', true], ['false', false]])('parses boolean env %s', (raw, value) => {
     expect(resolvePreventionBatchSettings({ standard, env: { WE_PREVENTION_BATCH_FILING: raw } })).toMatchObject({
@@ -87,15 +87,33 @@ describe('prevention.* batch settings cascade', () => {
       'env.batchFiling', 'env.batchWindowMinutes', 'env.batchMaxCards']);
     expect(formatPreventionBatchSettings(settings)).toContain('ignored invalid: platform.batchFiling');
   });
+  it.each([0, -1, 1.5, '3', true, null, Number.MAX_SAFE_INTEGER + 1])('ignores invalid lease wait %j in optional layers', (value) => {
+    const settings = resolvePreventionBatchSettings({ standard,
+      platform: { batchLeaseWaitMinutes: value }, repo: { batchLeaseWaitMinutes: value } });
+    expect(settings.batchLeaseWaitMinutes).toBe(15);
+    expect(settings.sources.batchLeaseWaitMinutes).toBe('standard');
+    expect(settings.invalid).toEqual(['platform.batchLeaseWaitMinutes', 'repo.batchLeaseWaitMinutes']);
+  });
+  it.each(['0', '-1', '1.5', 'oops', '9007199254740992'])('ignores invalid lease wait env %s and retains repo', (value) => {
+    const settings = resolvePreventionBatchSettings({ standard, repo: { batchLeaseWaitMinutes: 7 },
+      env: { WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES: value } });
+    expect(settings).toMatchObject({ batchLeaseWaitMinutes: 7, sources: { batchLeaseWaitMinutes: 'repo' },
+      invalid: ['env.batchLeaseWaitMinutes'] });
+  });
+  it('reads the platform lease wait through the loader', () => {
+    expect(loadPreventionBatchSettings({ env: {}, repo: {},
+      read: () => JSON.stringify({ prevention: { batchLeaseWaitMinutes: 8 } }) }))
+      .toMatchObject({ batchLeaseWaitMinutes: 8, sources: { batchLeaseWaitMinutes: 'platform' } });
+  });
   it('reads the platform prevention block', () => {
     expect(loadPreventionBatchSettings({ env: {}, repo: {}, read: () => JSON.stringify({ prevention: { batchWindowMinutes: 25 } }) }))
       .toMatchObject({ batchWindowMinutes: 25, sources: { batchWindowMinutes: 'platform' } });
   });
   it('ships the operator window in declared repo settings and logs the sources', () => {
     const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
-    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 10,
-      sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo' } });
-    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=10 (repo)');
+    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 10, batchLeaseWaitMinutes: 15,
+      sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo', batchLeaseWaitMinutes: 'repo' } });
+    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=10 (repo), prevention.batchLeaseWaitMinutes=15 (repo)');
     expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
   });
   it('overlays prevention independently of filing and retains bypass policy', () => {

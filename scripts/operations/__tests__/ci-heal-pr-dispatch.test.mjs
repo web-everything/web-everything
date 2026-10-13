@@ -156,6 +156,23 @@ describe('dispatchCiHeal (#3852)', () => {
     );
   });
 
+  it('tells the healer to keep drain-assigned numbers and skips the brief-less probation worker (PR #5082)', async () => {
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal({ ...PLANNED, owedMainRule: { check: 'test', nums: [5994] } }, { readBrief: () => TEMPLATE, sinks });
+    expect(calls[0].prompt).toContain('## Leave the drain-assigned card numbers alone');
+    expect(calls[0].prompt).toContain('#5994');
+    expect(calls[0].probationWorker).toBeNull();
+  });
+
+  it('gives a CodeQL heal under the drain-number hold one consistent ask: fix the alert, keep the numbers (PR #5082)', async () => {
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal({ ...PLANNED, reason: 'codeql', codeql: { checkRunId: 7, alerts: [{ rule: 'js/sql-injection', path: 'x.mjs', line: 1, message: 'new' }] }, owedMainRule: { check: 'test', nums: [5994] } }, { readBrief: () => TEMPLATE, sinks });
+    expect(calls[0].prompt).toContain('js/sql-injection');
+    expect(calls[0].prompt).toContain('## Leave the drain-assigned card numbers alone');
+    expect(calls[0].prompt).toMatch(/Repair the CodeQL alert above/);
+    expect(calls[0].prompt).not.toMatch(/Repair only the other failing required checks/);
+  });
+
   it('hands one ci-heal payload keyed on the PR to the dispatch effect sink', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
@@ -593,10 +610,25 @@ describe('xp0lsdi quota routing boundary', () => {
       const { calls, sinks } = recordingSink();
       await dispatchCiHeal({ ...PLANNED, reason, codeql: { alerts: [] } }, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
       expect(calls).toHaveLength(1);
-      expect(calls[0].routing).toBe(route);
-      // only a codeql heal forces the native worker (the probation prompt does not carry the alert)
+      // only a codeql heal forces the native worker (the probation prompt does not carry the alert); the pick is
+      // cleared on `routing` too, since the sink falls back to `routing.probationWorker` (PR #5082 review)
+      expect(calls[0].routing).toEqual(reason === 'codeql' ? { ...route, probationWorker: null } : route);
       expect(calls[0].probationWorker).toEqual(reason === 'codeql' ? null : route.probationWorker);
     }
+  });
+  it('keeps a brief-only heal off the probation worker as the sink resolves it (PR #5082 review)', async () => {
+    const route = { outcome: 'ok', probationWorker: { id: 'codex', supervision: 'full' }, policyRoute: 'p' };
+    // The sink's own resolution (dispatch-lane-io.mjs): the direct pick, else the routing record's.
+    const sinkWorker = p => p?.probationWorker ?? p?.routing?.probationWorker ?? null;
+    for (const planned of [{ ...PLANNED, reason: 'codeql', codeql: { alerts: [] } }, { ...PLANNED, owedMainRule: { check: 'test', nums: [5994] } }]) {
+      const { calls, sinks } = recordingSink();
+      await dispatchCiHeal(planned, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
+      expect(sinkWorker(calls[0])).toBeNull();
+      expect(calls[0].routing.policyRoute).toBe('p');
+    }
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
+    expect(sinkWorker(calls[0])).toEqual(route.probationWorker);
   });
   it('blocks direct retry while an earlier attempt has unpublished accounting', async () => {
     const { calls, sinks } = recordingSink();
