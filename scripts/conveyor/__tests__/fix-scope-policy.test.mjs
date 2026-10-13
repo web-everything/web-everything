@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import * as policyApi from '../fix-scope-policy.mjs';
 import { filterFixesByInFlightScope, planFixesFromReconcile } from '../reconcile-fix-dispatch.mjs';
@@ -14,7 +15,7 @@ const gate = (planned, claims = [], overrides = {}, options = {}) => filterFixes
 
 describe('live region head freshness', () => {
   // Exercise the production closure: unit dispatch deliberately disables region IO.
-  const source = readFileSync(new URL('../reconcile-fix-dispatch.mjs', import.meta.url), 'utf8');
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../reconcile-fix-dispatch.mjs'), 'utf8');
   const start = source.indexOf('  const observedHeads = new Map();');
   const end = source.indexOf('\n  };', source.indexOf('  const regionOverlap =', start)) + '\n  };'.length;
   const makeOverlap = new Function('holderEntries', 'readPrHeads', 'regionReader', 'scopePolicy', 'regionOverlapDecision', 'root', `${source.slice(start, end)}\nreturn regionOverlap;`);
