@@ -62,7 +62,7 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
@@ -77,8 +77,9 @@ import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconci
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
-import { contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
-import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
+import { excusePrMergeGateHolds } from '../../scripts/lib/merge-gate-hold-class.mjs';
+import { ciGreenForEscalation, contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
+import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState, needsHumanVoidState, latestCiHealEscalationForHead } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
 import { getRequiredStatusChecks } from '../../scripts/lib/required-status-checks.mjs'; // card x9zznl9
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
@@ -311,11 +312,21 @@ export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_RE
  * @param {{repo:string, reconcile?:Function, readPrs?:Function}} o
  * @returns {{notes:Array<object>, prsByNumber:Map<number,object>}}
  */
-export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, readPrs = defaultReadPrs } = {}) {
+export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds, enrichCodeQL = enrichPrsWithCodeQL } = {}) {
   let capturedPrs = [];
   const result = reconcile({
     repo,
     readPrs: (o) => { capturedPrs = readPrs(o); return capturedPrs; },
+    // Retain hydrated, excused rows: the original read remains red for candidacy/freeze holds.
+    excuseMergeGateHolds: (prs, options) => {
+      capturedPrs = excuseMergeGateHolds(prs, options);
+      return capturedPrs;
+    },
+    // CodeQL is enriched after the rollup: keep its non-required drain hold for the void recheck too.
+    enrichCodeQL: (prs, options) => {
+      capturedPrs = enrichCodeQL(prs, options);
+      return capturedPrs;
+    },
   });
   return {
     notes: Array.isArray(result?.notes) ? result.notes : [],
@@ -360,11 +371,17 @@ export function defaultParkToHuman({ repo, pr, addLabel, removeLabels, exec = ex
  *   dryRun, error?, parked?, parkError?}` (`body` is present only when a comment was newly planned — omitted once `alreadyPosted`,
  *   nothing new to show).
  */
+let loggedNeedsHumanVoidSetting = false;
+
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   ...tickOpts
 } = {}) {
+  if (!loggedNeedsHumanVoidSetting) {
+    process.stderr.write(`ciHealVerdict.voidNeedsHumanWhenCiGreen=${verdictSettings.voidNeedsHumanWhenCiGreen ? 'on' : 'off'} source=${verdictSettings.voidNeedsHumanSource ?? 'caller'}\n`);
+    loggedNeedsHumanVoidSetting = true;
+  }
   const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
   const notes = [];
   const refusals = [];
@@ -383,13 +400,16 @@ export function runReconcileNotesAllRepos({
       // card x9zznl9 (live #4535) — a `not-a-ci-break` verdict a required check has since contradicted is voided
       // (once per VERDICT — a later verdict on the same head owes its own void, up to MAX_VERDICT_VOIDS_PER_HEAD) instead
       // of telling the operator it needs a decision; the ordinary ci-heal path resumes.
-      const voidRow = planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks });
+      const voidRow = n.kind === 'ci-heal-escalation-moot'
+        ? planNeedsHumanVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks })
+        : planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks });
       if (voidRow) {
         if (voidRow.alreadyPosted || dryRun) { comments.push({ ...voidRow, posted: false, dryRun }); continue; }
         const outcome = postComment({ repo, pr: n.prNumber, body: voidRow.body });
         comments.push({ ...voidRow, posted: !!outcome.ok, dryRun: false, ...(outcome.ok ? {} : { error: outcome.error }) });
         continue;
       }
+      if (n.kind === 'ci-heal-escalation-moot') continue; // internal signal, never an operator note
       const plan = planNoteComment(tagged, pr?.comments);
       // Parking retries independently of the one-comment-per-episode dedup.
       const parking = n.parkToHuman ? { parked: false } : {};
@@ -471,6 +491,31 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
   // stands, and the ordinary note tells the operator this head needs a decision.
   if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
   return { ...row, alreadyPosted: false, body: buildCiHealVerdictVoidComment({ headSha: head, red }) };
+}
+
+/** Reverify a green-head retirement and plan its durable void, once per escalation and bounded per head. */
+export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequiredChecks }) {
+  if (!verdictSettings?.voidNeedsHumanWhenCiGreen || note?.kind !== 'ci-heal-escalation-moot'
+      || note.outcome !== 'needs-human' || !pr || pr.codeqlFailure) return null;
+  const head = String(note.headSha ?? '').trim().toLowerCase();
+  if (!head || head !== String(pr.headRefOid ?? '').trim().toLowerCase()
+      || String(pr.state ?? 'OPEN').toUpperCase() !== 'OPEN'
+      || String(pr.mergeStateStatus ?? '').toUpperCase() === 'DIRTY') return null;
+  // Read the underlying escalation even after a void, so retries report alreadyPosted.
+  const escalation = latestCiHealEscalationForHead(pr.comments, head, {
+    baseHead: pr.escalationBaseHead ?? null, recheck: verdictSettings.recheckNotCiBreak, voidNeedsHuman: false,
+  });
+  if (escalation?.outcome !== 'needs-human') return null;
+  const { escalationIndex, voided, voidCount } = needsHumanVoidState(pr.comments, head);
+  const row = { repo, prNumber: note.prNumber, kind: 'ci-heal-needs-human-void',
+    key: `ci-heal-needs-human-void:${note.prNumber}:${head}:${escalationIndex}` };
+  if (voided) return { ...row, alreadyPosted: true };
+  if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
+  let requiredChecks;
+  try { requiredChecks = readRequiredChecks({ repo }); } catch { return null; }
+  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })) return null;
+  return { ...row, alreadyPosted: false,
+    body: buildCiHealVerdictVoidComment({ headSha: head, voids: 'needs-human', cause: 'required-ci-green' }) };
 }
 
 /**
