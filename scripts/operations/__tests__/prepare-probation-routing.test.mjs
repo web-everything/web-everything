@@ -23,7 +23,10 @@ describe('prepare probation routing', () => {
     expect(argv).toContain('--run-id=original-run');
     expect(argv).toContain('--effect-key=original-key');
     expect(argv[0]).toMatch(/probation-build-run.mjs$/);
-    expect(routeDispatchProvider({ ...request, probationWorker: null }, { agent: () => 'claude' })).toBe('claude');
+    const agent = () => 'claude';
+    expect(() => routeDispatchProvider({ ...request, probationWorker: null }, { agent }))
+      .toThrow(/group-capable worker provider/);
+    expect(routeDispatchProvider({ ...request, probationWorker: null, groupMembers: [] }, { agent })).toBe('claude');
   });
   it('offers Gemini only for simple preparation when Codex is vetoed', () => {
     const codex = selectProbationWorker({ taskType: 'prepare' }).worker;

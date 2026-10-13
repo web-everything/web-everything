@@ -3317,7 +3317,7 @@ describe('grouped BUILD daemon ticks', () => {
     const inputs = { loadItems: () => cards };
     const loadInputs = vi.fn(async () => inputs);
     const effects = fixture({ queue: rows.map(({ num, scope }) => ({ num, scope, preparedDate: '2026-10-13' })) });
-    const predictor = createRoundRoutePredictor({ loadInputs, predict: vi.fn(() => ({ executor: 'claude' })) });
+    const predictor = createRoundRoutePredictor({ loadInputs, predict: vi.fn(() => ({ executor: 'claude', groupCapable: true })) });
     effects.predictRoute = predictor;
     effects.loadGroupingCards = predictor.loadGroupingCards;
     const tick = await runBuildDispatchTick({ policy, effects });

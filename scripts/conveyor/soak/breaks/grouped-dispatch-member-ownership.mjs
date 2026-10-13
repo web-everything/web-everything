@@ -17,7 +17,7 @@ export default {
   },
   async run({ log } = {}) {
     const violations = [];
-    const rows = ['7101', '7102', '7103'].map((num, i) => ({ num, kind: 'task', size: 1,
+    const rows = ['7101', '7102', '7103'].map((num, i) => ({ num, kind: 'task', estimatedLoc: 100,
       parent: '7100', locus: 'we', scope: [`we:scripts/group/file${i}.mjs`] }));
     const common = { fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }) };
