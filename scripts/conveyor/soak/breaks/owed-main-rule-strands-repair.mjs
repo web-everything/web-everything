@@ -10,7 +10,7 @@ export default {
   title: 'old numbering-rule classification strands PRs outside automatic refresh ownership',
   card: 'PR #5082 review findings',
   fixedBy: { sha: 'pending', where: 'lane/refresh-renamed-prs', paths: ['scripts/lib/renamed-pr-refresh.mjs', 'scripts/conveyor/reconcile-core.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('pr.owedMainRule.ownsRepair === true && onlyTestRed'); },
+  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('if (owedMainRuleHold && onlyTestRed)'); },
   run() {
     const violations = [];
     // `other-red`: red-team break on 0f5822e8c — a second failing required check must keep its ci-heal.
