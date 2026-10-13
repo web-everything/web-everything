@@ -779,6 +779,14 @@ if (!LOCAL_MODE) {
     for (const msg of born.errors) err(msg);
     for (const msg of born.warnings) warn(msg);
   }
+  const { isMergeGroupCiRun, resolveQueueNumbering, mergeGroupHashRefusals, exemptDrainNumberedItems, drainNumberedPairs } = await import('./lib/queue-branch-numbering.mjs');
+  const setting = resolveQueueNumbering();
+  for (const message of setting.invalid) warn(message);
+  if (isMergeGroupCiRun()) {
+    try {
+      for (const m of mergeGroupHashRefusals({ files: readdirSync(join(ROOT, 'backlog')).map((f) => `backlog/${f}`) })) err(m);
+    } catch (e) { err(`Cannot inspect merge group backlog for non-numeric ids: ${e.message}`); }
+  }
   // #2319 — hash-on-main invariant: a backlog file on origin/main with a non-numeric leading id means a land route
   // bypassed JIT numbering (#2288) and stranded a hash. Read the MAIN tree (not the working tree) so in-lane
   // pre-land hashes on a lane/* branch don't false-trip. Fail-SOFT: origin/main unresolvable (fresh/offline
@@ -813,7 +821,7 @@ if (!LOCAL_MODE) {
     // because pr-land.mjs's runHeal() self-check runs on a locally-renumbered, not-yet-pushed tree that this
     // gate cannot distinguish from a real mistake — the heal IS the sanctioned numbering path.
     if (!process.env.WE_SKIP_HAND_NUMBERED_GATE) {
-      for (const msg of handNumberedNewItems(backlog, mainBacklog)) err(msg);
+      for (const msg of handNumberedNewItems(exemptDrainNumberedItems(backlog, { drainNumbered: drainNumberedPairs({ cwd: ROOT }) }), mainBacklog)) err(msg);
     }
   } catch { /* origin/main not resolvable here — the drain's post-land assert still guards the land path */ }
 }
