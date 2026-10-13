@@ -27,6 +27,8 @@
  *   - `auth status`                                                          → exit 0 unconditionally
  *   - `pr list [--repo R] [--state open|closed|merged|all] [--limit N]
  *              [--head B] [--base B] [--label L] --json FIELDS [--jq Q]`
+ *   - `api graphql -f query=…` — ONLY the drain's paged open-PR query (`pr-list-paged.mjs`; #5238 moved the drain's
+ *              candidate listing off `pr list` onto it), served from the same PR views in the GraphQL connection shape
  *   - `pr view <n> [--repo R] --json FIELDS [--jq Q]`
  *   - `pr create --base B --head H [--title T] [--body Bd] [--fill]`         (no `--repo` — cwd-derived,
  *                                                                              matches `forge-land-provider.mjs`)
@@ -71,6 +73,7 @@ import {
   refOid, createMergeCommit, listChangedFilesNative, listChangedFilesRest,
   buildPrGraphqlView, pushCommitToRef,
 } from './fake-gh.mjs';
+import { openPrPageFixture } from '../../../__tests__/fixtures/open-pr-page-fixture.mjs';
 
 const STORE_PATH = process.env.FAKE_GH_STORE;
 const LOG_PATH = process.env.FAKE_GH_LOG;
@@ -241,6 +244,21 @@ function handlePrList(store, rest) {
     const views = prs.map((pr) => buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields }));
     const picked = json ? views.map((v) => pickFields(v, json)) : views;
     return jsonResult(picked, jq);
+  });
+}
+
+/** `gh api graphql -f query=…` for the ONE query the drain's paged open-PR reader sends
+ *  (`scripts/lib/pr-list-paged.mjs#buildOpenPrPageQuery`): the repo is in the query text, the page window in
+ *  `first:N` / `after:"cursor"`. Served from the same PR views as `pr list`, in the GraphQL connection shape. */
+function handleGraphqlOpenPrPage(store, rest) {
+  return guarded(() => {
+    const query = (rest.map((a) => /^query=/.test(a) ? a.slice('query='.length) : null).find(Boolean)) || '';
+    const m = query.match(/repository\(owner:"([^"]+)",name:"([^"]+)"\)\{pullRequests\(/);
+    if (!m) return { stderr: `fake-gh: unsupported graphql query ${query.slice(0, 80)}\n`, exitCode: 1 };
+    const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
+    const views = filterPrs(repoState, { state: 'open' })
+      .map((pr) => buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields: null }));
+    return jsonResult(openPrPageFixture(views, query), null);
   });
 }
 
@@ -452,8 +470,9 @@ function handleApi(store, rest) {
     });
     // Real `gh api` expands `{owner}/{repo}` from the cwd's remote; mirror that (PR #3794 fallback reads use it).
     if (path && path.includes('{owner}/{repo}')) path = path.replace('{owner}/{repo}', resolveRepoSlug(store, null));
+    if (path === 'graphql') return handleGraphqlOpenPrPage(store, rest);
     if (method !== 'GET') return { stderr: `fake-gh: unsupported api --method ${method}\n`, exitCode: 1 };
-    if (!path) return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
+    if (!path)return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
 
     let m;
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)$/))) {
