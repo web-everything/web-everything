@@ -1,0 +1,18 @@
+{
+  "$comment": "Minute keys set the minimum ages for idle PRs, unowned red CI, refused updates, held lanes and dead holders; reviewRoundCap sets the base review cap, maxRungAttempts bounds repeated recovery, and rungs enables individual actions. The cascade is the standard default in liveness-sweep-core.mjs → platform preference livenessSweep in scripts/lib/delivery-platform-preferences.json → this file → env. Rungs default to dry-run: only rungs set true here ever act, and only under --apply; operator notification is always on and no recovery loosens a gate or human review.",
+  "livenessSweep": {
+    "prNoMovementMinutes": 120,
+    "prRedUnownedMinutes": 60,
+    "selfUpdateRefusedMinutes": 30,
+    "laneHeldMinutes": 30,
+    "claimHolderGoneMinutes": 60,
+    "reviewRoundCap": 5,
+    "maxRungAttempts": 2,
+    "rungs": {
+      "retry-self-update": true,
+      "release-dead-lane": true,
+      "refresh-stale-base": false,
+      "release-dead-claim": false
+    }
+  }
+}

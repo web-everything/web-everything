@@ -1,0 +1,9 @@
+[drain-daemon] 2026-10-13T16:41:28.481Z daemon-rebuild: ready-candidate-adopted {"target":"22774ed7a999ae832583475ac7a670b6148321b6","match":"exact","passedAt":"2026-10-13T16:38:21.611Z","passedBy":"8577@Mac"}
+[drain-daemon] 2026-10-13T16:53:00.578Z data clone refreshed: e1320124c -> 08e0e3039 (origin/main)
+[drain-daemon] 2026-10-13T16:53:05.195Z daemon-rebuild: overlay-conflict-unresolved {"ref":"lane/smoke-gh-env-failure","pr":5045,"sha":"11b6d2ef79ae40c82185e90173504163a95c6380","files":["scripts/ci/test-timings.json"],"tried":["replay"]}
+[drain-daemon] 2026-10-13T16:53:05.196Z daemon-rebuild: pinned-overlay-conflict {"ref":"lane/smoke-gh-env-failure","pr":5045,"sha":"11b6d2ef79ae40c82185e90173504163a95c6380","dropReason":"conflict","pinnedBy":"mechanism","message":"pinned overlay conflicts with main — needs a rebase","skipRefusedBecause":"main-lacks-mechanism: scripts/lib/daemon-rebuild/smoke-classify/env-unavailable.mjs"}
+[drain-daemon] 2026-10-13T16:53:05.254Z code clone: pinned-overlay-conflict head=22774ed7a
+[drain-daemon] 2026-10-13T17:00:33.511Z pass at 2026-10-13T16:53:05.465Z: considered 11, merged 2 (#5191, #5198), failed 0, deferred 4, parked 1 (exit 0)
+[drain-daemon] 2026-10-13T17:01:42.479Z daemon-rebuild: clone-held-stale {"reason":"still-rejected","mainSha":"5d0359792f9aa88bb3558a4e667b57dfebcb1068","target":"7659d9a9bc56090ad3324985f2c2175aeb1dbbd9","retryAt":null,"attempts":null,"broken":{"failed":"lane/smoke-gh-env-failure (PR #5045): pinned overlay conflicts with main — needs a rebase","detail":""},"message":"the rebuild is holding this clone off origin/main — it keeps dispatching from its last-good build (x5wbsbc) until this clears"}
+[drain-daemon] 2026-10-13T17:01:42.504Z code clone: still-rejected head=22774ed7a
+[drain-daemon] 2026-10-13T17:05:35.521Z pass at 2026-10-13T17:01:42.718Z: considered 10, merged 0, failed 0, deferred 4, parked 1 (exit 0)
