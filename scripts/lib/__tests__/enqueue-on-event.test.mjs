@@ -360,6 +360,86 @@ describe('planCatchUp', () => {
 });
 
 describe('readCatchUpCandidates', () => {
+  it('considers a ready candidate after a full page of drafts', async () => {
+    const calls = [];
+    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+      calls.push(args);
+      const repository = calls.length === 1
+        ? { pullRequests: {
+          nodes: Array.from({ length: 100 }, (_, i) => ({ number: i + 1, isDraft: true })),
+          pageInfo: { hasNextPage: true, endCursor: 'page-one' },
+        }, mergeQueue: { entries: { totalCount: 2 } } }
+        : calls.length === 2
+          ? { pullRequests: { nodes: [{ number: 101, isDraft: false, isInMergeQueue: false }],
+            pageInfo: { hasNextPage: false, endCursor: 'page-two' } } }
+          : { p101: { timelineItems: { nodes: [{ createdAt: '2026-10-01', label: { name: 'ready-to-merge' } }] } } };
+      cb(null, JSON.stringify({ data: { repository } }));
+    } });
+    expect(result.ok).toBe(true);
+    expect(planCatchUp({ ...result, capacity: 3 }).run.map((p) => p.num)).toEqual([101]);
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toContain('cursor=page-one');
+    expect(result.prs[100].readyAt).toBe(Date.parse('2026-10-01'));
+    const { handle, calls: drains } = catchUpSetup({ readCandidates: async () => result });
+    const ran = await handle.catchUp();
+    expect(ran.map((p) => p.num)).toEqual([101]);
+    expect(drains.map((c) => c.args[1])).toEqual(['--only=101']);
+  });
+
+  it('refuses a partial listing when a later page fails', async () => {
+    let calls = 0;
+    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+      if (++calls === 1) cb(null, JSON.stringify({ data: { repository: {
+        pullRequests: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'next' } },
+      } } }));
+      else cb(new Error('HTTP 504'));
+    } });
+    expect(result).toEqual({ ok: false, error: 'HTTP 504' });
+    expect(calls).toBe(2);
+  });
+
+  it('bounds ready-time reads across pages and preserves successful batches on a time-read failure', async () => {
+    const calls = [];
+    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+      calls.push(args);
+      const n = calls.length;
+      if (n <= 2) {
+        const nodes = Array.from({ length: n === 1 ? 100 : 1 }, (_, i) => ({ number: n === 1 ? i + 1 : 101 }));
+        cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes,
+          pageInfo: { hasNextPage: n === 1, endCursor: `page-${n}` },
+        }, mergeQueue: null } } }));
+      } else if (n === 3) cb(new Error('HTTP 502'));
+      else cb(null, JSON.stringify({ data: { repository: {
+        p101: { timelineItems: { nodes: [{ createdAt: '2026-10-01', label: { name: 'ready-to-merge' } }] } },
+      } } }));
+    } });
+    expect(result.ok).toBe(true);
+    expect(result.prs).toHaveLength(101);
+    expect(calls).toHaveLength(4);
+    expect(calls[2]).toContain(`query=${readyAtQuery(Array.from({ length: 100 }, (_, i) => i + 1))}`);
+    expect(calls[3]).toContain(`query=${readyAtQuery([101])}`);
+    expect(result.prs[0].readyAt).toBeNull();
+    expect(result.prs[100].readyAt).toBe(Date.parse('2026-10-01'));
+  });
+
+  it.each([null, 'same'])('refuses a missing or repeated continuation cursor (%s)', async (cursor) => {
+    let calls = 0;
+    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+      calls += 1;
+      cb(null, JSON.stringify({ data: { repository: { pullRequests: {
+        nodes: [], pageInfo: { hasNextPage: true, endCursor: cursor },
+      } } } }));
+    } });
+    expect(result).toEqual({ ok: false, error: 'invalid pullRequests pagination cursor' });
+    expect(calls).toBe(cursor ? 2 : 1);
+  });
+
+  it('refuses a listing without pagination metadata', async () => {
+    expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+      cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [] } } } }));
+    } })).toEqual({ ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' });
+  });
+
   it('lists through the GraphQL connection, then reads each open PR\'s latest ready label time per PR', async () => {
     const env = { TEST: 'yes' };
     const ready = (createdAt, name = 'ready-to-merge') => ({ createdAt, label: { name } });
@@ -372,7 +452,7 @@ describe('readCatchUpCandidates', () => {
             { number: 42, isDraft: false, isInMergeQueue: true },
             { number: 43, isDraft: true, isInMergeQueue: false },
             { number: 44, isDraft: false, isInMergeQueue: false },
-          ] },
+          ], pageInfo: { hasNextPage: false, endCursor: null } },
           mergeQueue: { entries: { totalCount: 4 } },
         } }
         : { repository: { p44: { timelineItems: { nodes: [ready('2026-10-01'), ready('2026-10-03', 'other'), ready('2026-10-02')] } } } };
@@ -392,7 +472,7 @@ describe('readCatchUpCandidates', () => {
     let n = 0;
     const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_c, _a, _o, cb) => {
       n += 1;
-      if (n === 1) cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ number: 7, isDraft: false, isInMergeQueue: false }] }, mergeQueue: null } } }));
+      if (n === 1) cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ number: 7, isDraft: false, isInMergeQueue: false }], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } }));
       else cb(new Error('HTTP 502'));
     } });
     expect(result).toEqual({ ok: true, queued: 0, prs: [candidate(7, null)] });
@@ -400,7 +480,7 @@ describe('readCatchUpCandidates', () => {
 
   it('treats a null merge queue as empty', async () => {
     expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => cb(null,
-      JSON.stringify({ data: { repository: { pullRequests: { nodes: [] }, mergeQueue: null } } })),
+      JSON.stringify({ data: { repository: { pullRequests: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } })),
     })).toEqual({ ok: true, prs: [], queued: 0 });
   });
 

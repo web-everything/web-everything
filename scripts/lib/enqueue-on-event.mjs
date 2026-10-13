@@ -207,8 +207,8 @@ export function readPrForWake({ repo, num, env = process.env, execFileImpl = exe
   });
 }
 
-export const CATCH_UP_QUERY = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number isDraft isInMergeQueue}}
+export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
+  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number isDraft isInMergeQueue} pageInfo{hasNextPage endCursor}}
   mergeQueue(branch:"main"){entries(first:100){totalCount}}}}`;
 
 /**
@@ -230,11 +230,12 @@ function latestReadyAt(timelineItems) {
   return dates.length ? Math.max(...dates) : null;
 }
 
-function ghGraphql({ query, owner, name, env, execFileImpl }) {
+function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
   return new Promise((resolve) => {
     const fail = (error) => resolve({ ok: false, error: String(error?.message || error).split('\n')[0] });
     try {
-      execFileImpl('gh', ['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`],
+      execFileImpl('gh', ['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`,
+        ...(cursor === undefined ? [] : ['-f', `cursor=${cursor}`])],
         { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
           if (err) { fail(err); return; }
           try {
@@ -257,17 +258,32 @@ function ghGraphql({ query, owner, name, env, execFileImpl }) {
 export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile }) {
   const [owner, name] = String(repo ?? '').split('/');
   if (!owner || !name) return { ok: false, error: `not an owner/name repo: ${JSON.stringify(repo)}` };
-  const list = await ghGraphql({ query: CATCH_UP_QUERY, owner, name, env, execFileImpl });
-  if (!list.ok) return list;
-  const nodes = list.repository.pullRequests?.nodes;
-  if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
-  const prs = nodes.map((pr) => ({ num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null }));
-  const open = prs.filter((p) => !p.isDraft && !p.inQueue);
-  if (open.length) {
-    const times = await ghGraphql({ query: readyAtQuery(open.map((p) => p.num)), owner, name, env, execFileImpl });
-    if (times.ok) for (const p of open) p.readyAt = latestReadyAt(times.repository[`p${p.num}`]?.timelineItems);
+  const prs = [];
+  const seenCursors = new Set();
+  let cursor;
+  let queued = 0;
+  for (;;) {
+    const list = await ghGraphql({ query: CATCH_UP_QUERY, owner, name, cursor, env, execFileImpl });
+    if (!list.ok) return list;
+    const { nodes, pageInfo } = list.repository.pullRequests ?? {};
+    if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
+    if (typeof pageInfo?.hasNextPage !== 'boolean') return { ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' };
+    if (cursor === undefined) queued = list.repository.mergeQueue?.entries?.totalCount ?? 0;
+    prs.push(...nodes.map((pr) => ({ num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null })));
+    if (!pageInfo.hasNextPage) break;
+    const next = pageInfo.endCursor;
+    if (typeof next !== 'string' || !next || seenCursors.has(next)) return { ok: false, error: 'invalid pullRequests pagination cursor' };
+    seenCursors.add(next);
+    cursor = next;
   }
-  return { ok: true, prs, queued: list.repository.mergeQueue?.entries?.totalCount ?? 0 };
+  const open = prs.filter((p) => !p.isDraft && !p.inQueue);
+  // Keep each aliased timeline query bounded even when the listing spans many pages.
+  for (let offset = 0; offset < open.length; offset += 100) {
+    const batch = open.slice(offset, offset + 100);
+    const times = await ghGraphql({ query: readyAtQuery(batch.map((p) => p.num)), owner, name, env, execFileImpl });
+    if (times.ok) for (const p of batch) p.readyAt = latestReadyAt(times.repository[`p${p.num}`]?.timelineItems);
+  }
+  return { ok: true, prs, queued };
 }
 
 /** IO: the same merge-delivery policy used by the drain. */
