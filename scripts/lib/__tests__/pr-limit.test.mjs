@@ -1101,3 +1101,18 @@ describe('pr-land card-only open exemption — the changed-file list keeps both 
     expect(m[1]).toContain("'--no-renames'");
   });
 });
+
+describe('non-implementing retry branch grants', () => {
+  it.each(['prepare', 'scope'])('covers only a single-letter retry of the same %s ref', kind => {
+    const state = allowBranch(emptyLimitState(), `lane/5754-${kind}-example`, { reason: 'operator', untilMs: 2000 }, 0);
+    expect(isBranchAllowedNow(state, `lane/5754b-${kind}-example`, 1000)).toBe(true);
+    expect(isBranchAllowedNow(state, `lane/5754e-${kind}-example`, 1000)).toBe(true);
+    for (const ref of [`lane/5755b-${kind}-example`, `lane/5754b-${kind}-other`,
+      'lane/5754b-example', `lane/5754bb-${kind}-example`, `lane/5754B-${kind}-example`]) {
+      expect(isBranchAllowedNow(state, ref, 1000)).toBe(false);
+    }
+    expect(isBranchAllowedNow(state, `lane/5754b-${kind}-example`, 2000)).toBe(false);
+    const build = allowBranch(emptyLimitState(), 'lane/5754-example', { reason: 'operator' }, 0);
+    expect(isBranchAllowedNow(build, 'lane/5754b-example', 1000)).toBe(false);
+  });
+});

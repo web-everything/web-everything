@@ -696,7 +696,18 @@ export async function runProbationBuild(args, io) {
     // `abandon` — a throw here reports `escalated-needs-human` and stops, exactly like a `!submitted.ok` result.
     try {
       const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges });
-      const submitted = io.openPr({ lanePath, num, slug: item.slug, attemptTag: args.attemptTag, bodyFile, taskType });
+      const submit = attemptTag => io.openPr({ lanePath, num, slug: item.slug, attemptTag, bodyFile, taskType });
+      const staleTip = result => !result.ok && /is not the tip of|push-rejected-stale-tip:/.test(result.reason ?? '');
+      let submitted = submit(args.attemptTag);
+      if (preparing && !args.attemptTag) {
+        for (const tag of ['b', 'c', 'd', 'e']) {
+          if (!staleTip(submitted)) break;
+          submitted = submit(tag);
+        }
+      }
+      if (preparing && staleTip(submitted) && !submitted.reason.startsWith('push-rejected-stale-tip:')) {
+        submitted = { ...submitted, reason: `push-rejected-stale-tip: ${submitted.reason}` };
+      }
       if (!submitted.ok) {
         // The build is committed and gate-green in the lane either way — never discarded here. A
         // `blocked-on-infra` ref push is auto-retried by the conveyor's own recovery pass; anything else is a
@@ -1016,13 +1027,23 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
     },
     openPr: ({ lanePath: dir, num: n, slug, attemptTag, bodyFile, taskType }) => {
       const r = node('scripts/operations/run.mjs', openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType }), { cwd: dir, env: laneEnv });
+      // Detect before truncating the operation dump.
+      const marker = taskType === 'prepare' && /is not the tip of/.test(r.out) ? 'push-rejected-stale-tip: ' : '';
+      let submit;
+      try { submit = extractSubmitResult(JSON.parse(r.stdout ?? r.out)); } catch { /* handled below */ }
+      if (submit?.outcome === 'refused' && submit?.reason === 'pr-limit') {
+        const ref = openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType })[1].slice('--ref='.length);
+        return { ok: false, blockedOnInfra: false, reason: `open-pr reported no PR number: ref=${ref} ${JSON.stringify(submit)}` };
+      }
       if (!r.ok) {
         const blockedOnInfra = /blocked-on-infra|outside dependency|network fault/i.test(r.out);
-        return { ok: false, blockedOnInfra, reason: r.out.trim().slice(0, 1000) };
+        return { ok: false, blockedOnInfra, reason: marker + r.out.trim().slice(0, 1000) };
       }
       try {
-        const submit = extractSubmitResult(JSON.parse(r.out));
-        if (!submit?.pr) return { ok: false, blockedOnInfra: false, reason: `open-pr reported no PR number: ${r.out.slice(0, 500)}` };
+        submit ??= extractSubmitResult(JSON.parse(r.out));
+        if (!submit?.pr) {
+          return { ok: false, blockedOnInfra: false, reason: `${marker}open-pr reported no PR number: ${r.out.slice(0, 500)}` };
+        }
         return { ok: true, pr: submit.pr, url: submit.url ?? null };
       } catch (e) {
         return { ok: false, blockedOnInfra: false, reason: `open-pr --json did not parse: ${e?.message ?? e}` };

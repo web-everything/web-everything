@@ -638,11 +638,15 @@ export function isBranchAllowedNow(state, branch, nowMs = Date.now()) {
   const name = normalizeBranchName(branch);
   if (!name) return false;
   const branches = state?.branches || {};
-  const entry = branches[name] || Object.entries(branches).find(([k]) => normalizeBranchName(k) === name)?.[1];
-  if (!entry) return false;
-  if (!entry.until) return true;
-  const untilMs = Date.parse(entry.until);
-  return !Number.isFinite(untilMs) || nowMs < untilMs;
+  const base = name.replace(/^(\d+)[a-z](-(scope|prepare)-.+)$/, '$1$2');
+  return Object.entries(branches).some(([key, entry]) => {
+    const normalized = normalizeBranchName(key);
+    if (normalized !== name && normalized !== base) return false;
+    if (!entry) return false;
+    if (!entry.until) return true;
+    const untilMs = Date.parse(entry.until);
+    return !Number.isFinite(untilMs) || nowMs < untilMs;
+  });
 }
 
 // ── WHO MAY GRANT AN EXCEPTION (xfaz7ho) ──────────────────────────────────────────────────────────────────

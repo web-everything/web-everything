@@ -45,11 +45,6 @@ describe('prepare failure evidence and durable decisions', () => {
     expect(fileCard).toHaveBeenCalledTimes(2);
   });
   it.each([
-    ['pr-limit refusal', { error: `open-pr reported no PR number: ${JSON.stringify({
-      runId: 'prepare-5754', stopped: 'effect-halted', verdict: {}, findings: { submit: {
-        result: { outcome: 'refused', reason: 'pr-limit', detail: 'open-PR backpressure limit reached …' },
-      } },
-    }, null, 2)}` }, 'open-pr reported no PR number (stopped=effect-halted; outcome=refused; reason=pr-limit; detail=open-PR backpressure limit reached …)'],
     ['truncated dump', { error: 'open-pr reported no PR number: {\n  "stopped": "effect-halted",\n  "findings": {' },
       'open-pr reported no PR number (stopped=effect-halted)'],
     ['bare brace', { error: '{', reason: 'prepare-unstamped' }, 'prepare-unstamped'],
@@ -480,5 +475,115 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
   it('a needs-you hold is releasable by a reviewed, commit-cited release entry', () => {
     const entry = { target: '4355', attempt: 'run 4355', cause: 'needs-you', evidence: 'ruled in the card', fixCommit: 'a'.repeat(40) };
     expect(validatePrepareRelease(entry, () => true)).toEqual(entry);
+  });
+});
+
+describe('prepare publication failures', () => {
+  let dir, path;
+  const prRef = 'lane/5754-prepare-example';
+  const refusal = 'open-pr reported no PR number: ' + JSON.stringify({
+    runId: 'prepare-5754', outcome: 'refused', reason: 'pr-limit', ref: prRef,
+  }, null, 2);
+  const stale = 'open-pr: pr-land did not report a result — push-failed — the lane HEAD is not the tip of ' + prRef;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'prepare-publish-')); path = join(dir, 'failures.json'); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  it.each([
+    [refusal, 'pr-limit'], [JSON.stringify(refusal), 'pr-limit'],
+    ['open-PR backpressure limit reached for we: 15/15', 'pr-limit'],
+    [stale, 'stale-prepare-branch'], ['push-rejected-stale-tip: truncated', 'stale-prepare-branch'],
+    ['the lane HEAD is not the tip of lane/5754-build-example', 'unknown'],
+    ['unrelated failure', 'unknown'],
+  ])('classifies %s', (error, cause) => expect(classifyPrepareFailure({ error })).toBe(cause));
+  it('holds a refusal without spending an unstamped retry or filing a card', async () => {
+    const fileCard = vi.fn();
+    const f = await recordPrepareFailure({ num: '5754', attempt: 'a', stage: 'result', evidence: { error: refusal } },
+      { path, fileCard, preparePolicy: { retryUnstampedOnce: true } });
+    expect(f).toMatchObject({ cause: 'pr-limit', held: true, retry: false, prRef,
+      holdReason: expect.stringMatching(/^needs-you: prepare PR refused by the open-PR limit/) });
+    expect(f.unstampedRetry).toBeUndefined();
+    expect(fileCard).not.toHaveBeenCalled();
+  });
+  it('gives stale refs their own one-retry budget', async () => {
+    const fileCard = vi.fn();
+    const record = attempt => recordPrepareFailure({ num: '5754', attempt, stage: 'result', evidence: { error: stale } }, { path, fileCard });
+    expect(await record('a')).toMatchObject({ cause: 'stale-prepare-branch', retry: true, held: false });
+    expect(await record('b')).toMatchObject({ retry: false, held: true, holdReason: expect.stringMatching(/^needs-you:/) });
+    expect(fileCard).not.toHaveBeenCalled();
+  });
+  it.each(['true', 'false', 'throws', 'omitted'])('releases pr-limit only on clear: %s', mode => {
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { a: {
+      num: '5754', cause: 'pr-limit', held: true, retry: false, prRef,
+    } } }));
+    const prLimitClear = mode === 'omitted' ? undefined : () => { if (mode === 'throws') throw Error('read'); return mode === 'true'; };
+    expect(releaseDuePrepareRetries({ path, prLimitClear, now: 1000 })).toEqual(mode === 'true' ? ['5754'] : []);
+    const f = readFailureState(path).failures.a;
+    expect(f.held).toBe(mode !== 'true');
+    if (mode === 'true') expect(f).toMatchObject({ retry: true, releasedAt: new Date(1000).toISOString(), releasedBy: { prLimit: true } });
+  });
+  const runId = 'open-pr-8bfa7c5c-a2bf-49ae-aa80-e7e928e0563d';
+  const truncated = '{\n  "runId" : "' + runId + '",\n  "op": "open-pr",\n  "stopped": "effect-halted",\n  "applied": [],\n  "pending": {';
+  function seedTruncated(error = truncated) {
+    const failure = {
+      num: '5754', cause: 'unknown', stage: 'result', held: true, retry: false,
+      holdReason: 'needs-you: prepare ended unstamped twice - old', evidence: { error },
+    };
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { a: failure } }));
+    return failure;
+  }
+  it.each([truncated, 'open-pr reported no PR number: ' + truncated, JSON.stringify(truncated)])(
+    'recovers a stale-tip failure from the run behind a truncated dump: %s', error => {
+      seedTruncated(error);
+      const openPrRun = vi.fn(() => ({ effects: [{ error: stale }] }));
+      expect(releaseDuePrepareRetries({ path, openPrRun })).toEqual(['5754']);
+      expect(openPrRun).toHaveBeenCalledWith(runId);
+      const f = readFailureState(path).failures.a;
+      expect(f).toMatchObject({ cause: 'stale-prepare-branch', held: false, retry: true, publicationDetail: stale });
+      expect(f.holdReason).toBeUndefined();
+      expect(f.evidence).toEqual({ error });
+    });
+  it.each([false, true])('recovers a PR-limit refusal and checks clearance in the same call: %s', clear => {
+    seedTruncated();
+    const result = { outcome: 'refused', reason: 'pr-limit' };
+    const openPrRun = () => ({ input: { ref: prRef }, effects: [{ result }] });
+    const prLimitClear = vi.fn(f => {
+      expect(f).toMatchObject({ cause: 'pr-limit', prRef });
+      return clear;
+    });
+    expect(releaseDuePrepareRetries({ path, openPrRun, prLimitClear })).toEqual(clear ? ['5754'] : []);
+    expect(prLimitClear).toHaveBeenCalledOnce();
+    const f = readFailureState(path).failures.a;
+    expect(f).toMatchObject({ cause: 'pr-limit', held: !clear, retry: clear, prRef,
+      publicationDetail: JSON.stringify(result) });
+    if (clear) expect(f.holdReason).toBeUndefined();
+    else expect(f.holdReason).toMatch(/^needs-you: prepare PR refused by the open-PR limit/);
+  });
+  it.each(['omitted', 'null', 'throws'])('keeps the old hold when run lookup is %s', mode => {
+    const original = seedTruncated();
+    const openPrRun = mode === 'omitted' ? undefined : () => {
+      if (mode === 'throws') throw Error('unreadable');
+      return null;
+    };
+    expect(releaseDuePrepareRetries({ path, openPrRun })).toEqual([]);
+    expect(readFailureState(path).failures.a).toEqual(original);
+  });
+  it('redacts publication detail before limiting its length', () => {
+    seedTruncated();
+    const secret = 'ghp_' + 'a'.repeat(36);
+    const openPrRun = () => ({ effects: [{ error: stale + ' ' + secret + ' ' + 'x'.repeat(600) }] });
+    expect(releaseDuePrepareRetries({ path, openPrRun })).toEqual(['5754']);
+    const f = readFailureState(path).failures.a;
+    expect(f.publicationDetail).toHaveLength(500);
+    expect(f.publicationDetail).not.toContain(secret);
+    expect(JSON.stringify(f)).not.toContain(secret);
+  });
+  it.each([[stale, 'stale-prepare-branch'], [refusal, 'pr-limit']])('heals an old twice-unstamped hold: %s', (error, cause) => {
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { a: {
+      num: '5754', cause: 'unknown', stage: 'result', held: true, retry: false,
+      holdReason: 'needs-you: prepare ended unstamped twice - old', evidence: { error },
+    } } }));
+    expect(releaseDuePrepareRetries({ path, prLimitClear: () => true })).toEqual(['5754']);
+    expect(readFailureState(path).failures.a).toMatchObject({ cause, held: false, retry: true });
+    expect(readFailureState(path).failures.a.holdReason).toBeUndefined();
+    expect(releaseDuePrepareRetries({ path, prLimitClear: () => true })).toEqual([]);
   });
 });
