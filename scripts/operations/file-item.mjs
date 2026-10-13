@@ -56,6 +56,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -149,6 +150,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
   return op(FILE_ITEM_OP, {
     input: {
       title: 'string',
+      ...OPERATOR_TASK_INPUT,
       kind: { type: 'string', required: false, default: '' },
       type: { type: 'string', required: false, default: '' },
       workItem: { type: 'string', required: false, default: '' },
@@ -159,7 +161,6 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       blockedBy: { type: 'string', required: false, default: '' },
       scope: { type: 'string', required: false, default: '' },
       session: { type: 'string', required: false, default: '' },
-      operatorTask: { type: 'boolean', required: false, default: false },
       priority: { type: 'string', required: false, default: '' },
       // Opt OUT of the auto-clear, not opt in — the default behaviour is the whole point of this operation
       // over bare `scaffold`; a caller who wants scaffold-only behaviour passes `--queue=false` (or calls
@@ -185,7 +186,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'input.operatorTask', 'input.priority', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'input.priority', 'findings.read',
       ],
       fn: (view) => planFileItem(view.findings.read, view.input),
     }),

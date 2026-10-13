@@ -1,3 +1,10 @@
+import { validateBacklogItem } from '../../check-standards-rules.mjs';
+import { planScaffold } from '../scaffold.mjs';
+import { composeOperatorTaskBrief, resolveOperatorPostBuild } from '../operator-task-brief.mjs';
+import { readFileSync } from 'node:fs';
+import { readTick, routeDispatchProvider } from '../dispatch-lane-io.mjs';
+import { shapeDispatchRead } from '../dispatch-lane.mjs';
+import { renderOperatorReport } from '../../worker-brief.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { planFileItem, fileItemOperation } from '../file-item.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -92,6 +99,19 @@ describe('operator task admission', () => {
 });
 
 describe('operator task settings', () => {
+  it('resolves admission and post-build leaves together, retaining defaults for invalid overrides', () => {
+    expect(resolveOperatorTaskSettings({
+      platform: { operatorTask: { enabled: false, maxPriority: 'P2', postBuild: { edgeLoad: false, report: false } } },
+      tool: { operatorTask: { enabled: true, postBuild: { edgeLoad: 'yes', liveProof: false, report: true } } },
+    })).toMatchObject({
+      value: { enabled: true, maxPriority: 'P2', postBuild: { edgeLoad: false, liveProof: false, report: true } },
+      sources: { enabled: 'tool', maxPriority: 'platform', 'postBuild.edgeLoad': 'platform',
+        'postBuild.liveProof': 'tool', 'postBuild.report': 'tool' },
+      invalid: ['tool.postBuild.edgeLoad="yes"'],
+    });
+    expect(resolveOperatorTaskSettings().value).toEqual({ enabled: true, maxPriority: 'P0',
+      postBuild: { edgeLoad: true, liveProof: true, report: true } });
+  });
   it('cascades valid leaves and logs their source', () => {
     expect(resolveOperatorTaskSettings({ platform: { operatorTask: { enabled: false, maxPriority: 'P1' } },
       tool: { operatorTask: { enabled: true, maxPriority: 'typo' } } })).toMatchObject({
@@ -126,5 +146,93 @@ describe('operator filing IO', () => {
         read: () => ({ build: { operatorTask: { enabled: false, maxPriority: 'P1' } } }) });
       expect(log).toHaveBeenCalledWith(expect.stringContaining('build.operatorTask: enabled=false (tool), maxPriority="P1" (tool)'));
     } finally { log.mockRestore(); resetCascadeLogForTest(); }
+  });
+});
+
+const ctx = { projectById: new Map(), graduatedKinds: new Set(), knownNums: new Set(), reportExists: () => true };
+const item = { id: '123-test', title: 'Test', kind: 'story', size: 1, status: 'open', summary: 'Test.', dateOpened: '2026-10-13' };
+const errors = fields => validateBacklogItem({ ...item, ...fields }, ctx).errors.map(e => e.message).join('\n');
+const template = 'open-pr\n### 9. Append a structured learnings entry\nEXIT';
+describe('operator task post-build', () => {
+  it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
+    expect(errors({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
+    for (const edgeClone of ['/tmp/daemon', 'C:\\daemon', '../daemon', 'other']) expect(errors({ edgeClone })).toContain('edgeClone');
+    for (const liveProof of [true, {}, { command: 'echo ok' }, { command: '', expect: 'ok' }, { command: 'echo ok', expect: '/[/' }]) expect(errors({ liveProof })).toContain('liveProof');
+    expect(errors({ report: 'true' })).toContain('report must');
+  });
+  it('writes the flags through the existing scaffold renderer', () => {
+    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'Test', kind: 'investigation', edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
+    expect(result.content).toContain('edgeClone: "review"');
+    expect(result.content).toContain('liveProof: {"command":"printf \\"ready\\"","expect":"ready"}');
+    expect(result.content).toContain('report: true');
+    expect(() => planScaffold({ existingIds: [], today: '2026-10-13' }, { title: 'Test', kind: 'investigation', edgeClone: '/tmp/daemon' })).toThrow(/edgeClone/);
+  });
+  it('adds only requested steps after open-pr and before exit', () => {
+    const settings = { operatorTask: { edgeClones: { review: 'daemon/review' }, postBuild: { edgeLoad: true, liveProof: true, report: true } } };
+    expect(composeOperatorTaskBrief(template, {}, { settings })).toBe(template);
+    const brief = composeOperatorTaskBrief(template, { edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true }, { settings });
+    expect(brief.indexOf('**Edge.**')).toBeGreaterThan(brief.indexOf('open-pr'));
+    expect(brief).toContain('daemon-load-overlay.mjs');
+    expect(brief).toContain('printf ready');
+    expect(brief).toContain('after adoption');
+    expect(brief).toContain('<!-- operator-task-report -->');
+    expect(composeOperatorTaskBrief(template, { report: true }, { settings })).not.toContain('**Edge.**');
+    expect(composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings })).not.toContain('operator-task-report');
+    const proofOnly = composeOperatorTaskBrief(template, { liveProof: { command: 'printf ready', expect: 'ready' } }, { settings });
+    expect(proofOnly).toContain('printf ready');
+    expect(proofOnly).not.toContain('**Edge.**');
+    expect(proofOnly).not.toContain('operator-task-report');
+    expect(composeOperatorTaskBrief(template, { report: false }, { settings })).toBe(template);
+    expect(composeOperatorTaskBrief(template, { report: true }, { settings, policy: { edgeLoad: false, liveProof: false, report: false } })).toBe(template);
+  });
+  it('resolves each policy leaf through the cascade and logs sources', () => {
+    const lines = [];
+    const p = resolveOperatorPostBuild({ operatorTask: { postBuild: { report: false } } }, { platform: { operatorTask: { postBuild: { edgeLoad: false } } }, env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => lines.push(line) });
+    expect(p).toEqual({ edgeLoad: false, liveProof: true, report: false });
+    expect(lines.join('\n')).toContain('postBuild.report=false (tool)');
+  });
+  it('carries real filing inputs and loaded metadata through dispatch and provider selection', () => {
+    const declaration = fileItemOperation({ readScaffoldContext: () => context });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const parsed = parseOperationArgv(declaration, ['--title=we: operator report', '--kind=investigation',
+      '--operatorTask', '--priority=P0', '--scope=we:scripts/example.mjs', `--digest=${brief}`,
+      '--report', '--edgeClone=review', '--liveProof-command=printf ready', '--liveProof-expect=ready']);
+    expect(parsed.errors).toEqual([]);
+    const run = advanceWhileRunning(startRun({ op: 'file-item', id: 'operator-file', registry, input: parsed.input }), { registry });
+    expect(readField(run.verdict.content, 'priority')).toBe('P0');
+    expect(readField(run.verdict.content, 'preparedDate')).toBe(context.today);
+    expect(readField(run.verdict.content, 'preparedAgainstSha')).toBe(context.originMainSha);
+    expect(run.verdict.content).toContain('operatorTask: true');
+    expect(run.verdict.content).toContain('report: true');
+    expect(run.verdict.content).toContain('liveProof: {"command":"printf ready","expect":"ready"}');
+    expect(run.verdict.content).toContain('edgeClone: "review"');
+    const root = process.cwd();
+    const raw = readTick({
+      root, num: '123',
+      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
+      readText: path => readFileSync(path, 'utf8'),
+      loadItems: () => [{ num: '123', slug: 'test', report: true, scope: ['we:scripts/worker-brief.mjs'] }],
+      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
+      readDeliveryAgentOverride: () => null,
+    });
+    expect(raw.item.report).toBe(true);
+    const shaped = shapeDispatchRead(raw, { num: '123' });
+    expect(shaped.prompt).toContain('<!-- operator-task-report -->');
+    expect(shaped.operatorPostBuild).toBe(true);
+    let seen;
+    expect(routeDispatchProvider({ launchKind: 'build', operatorPostBuild: shaped.operatorPostBuild, prompt: shaped.prompt }, {
+      modes: { build: 'mechanical' }, registry: { build: { provider: () => { throw new Error('wrapper loses post-build brief'); } } },
+      agent: request => { seen = request; return 'agent-handle'; },
+    })).toBe('agent-handle');
+    expect(seen.prompt).toBe(shaped.prompt);
+  });
+  it('formats a stable report in at most eight lines without marker injection', () => {
+    const report = renderOperatorReport({ pr: 42, adoptionSha: 'abc', proof: 'PASS\nextra' });
+    expect(report.split('\n')[0]).toBe('<!-- operator-task-report -->');
+    expect(report.split('\n').length).toBeLessThanOrEqual(8);
+    expect(report).toContain('PR: 42');
+    expect(report).toContain('Adoption SHA: abc');
+    expect(report).toContain('Proof: PASS extra');
   });
 });
