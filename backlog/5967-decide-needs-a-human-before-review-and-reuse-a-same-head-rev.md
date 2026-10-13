@@ -3,7 +3,7 @@ bornAs: xweb502
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/operations/__tests__/review-dispatch.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "b4676cf68f6edcf092c80d4f878fa7003a340756"
