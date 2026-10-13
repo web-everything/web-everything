@@ -1011,7 +1011,10 @@ export function sweepMissingRunRecovery({
   repo = null, apply = false, defaultBranch = 'main',
   mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr, readIsCrossRepository = defaultReadIsCrossRepository,
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
-  readAttributedRequiredChecks = defaultReadAttributedRequiredChecks,
+  // A caller injecting the protection reader (a soak/test fixture) gets it reused here, never a live ruleset read
+  // — the same compatibility rule {@link sweepCiRedRecovery} applies.
+  readAttributedRequiredChecks = readRequiredContexts === defaultReadRequiredContexts
+    ? defaultReadAttributedRequiredChecks : readRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
