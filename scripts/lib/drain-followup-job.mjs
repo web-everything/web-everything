@@ -103,11 +103,32 @@ export function assertLinkedWorktree({ exec = execFileSync, cwd }) {
   if (gitDir === common) throw new Error(`drain-followup: ${cwd} is not a linked worktree — refusing to reset it (the job never runs in a daemon or lane clone)`);
 }
 
+// A `git fetch` that loses the race for a remote-tracking ref (another fetch in the same shared object store moved
+// `origin/main` between this fetch's read and its update) fails with "cannot lock ref … is at X but expected Y" or a
+// stale `.lock`. The ref is already at the newer tip, so the next fetch just works; failing the whole step instead
+// burned a job attempt and left main's hash cards un-numbered (red main @ cd8d6e3bd, 2026-10-12).
+const REF_LOCK_RACE = /cannot lock ref|Unable to create '[^']*\.lock'|unable to update local ref/i;
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** `git fetch <remote> <base>`, retried a few times when it only lost a ref-lock race. Any other failure throws at once. */
+export function fetchRemoteTip({ exec = execFileSync, cwd, remote = 'origin', base = 'main', attempts = 4, sleep = sleepMs }) {
+  for (let n = 1; ; n++) {
+    try {
+      exec('git', ['fetch', remote, base, '--quiet'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return;
+    } catch (e) {
+      const text = `${(e && e.stderr) || ''}\n${(e && e.message) || e}`;
+      if (n >= attempts || !REF_LOCK_RACE.test(text)) throw e;
+      sleep(250 * n);
+    }
+  }
+}
+
 /** Reset the job's own worktree to the fresh remote tip. Idempotent, and the first thing every step does. */
-export function resetToRemoteTip({ exec = execFileSync, cwd, remote = 'origin', base = 'main' }) {
+export function resetToRemoteTip({ exec = execFileSync, cwd, remote = 'origin', base = 'main', sleep }) {
   assertLinkedWorktree({ exec, cwd });
   const git = (args) => exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  git(['fetch', remote, base, '--quiet']);
+  fetchRemoteTip({ exec, cwd, remote, base, ...(sleep ? { sleep } : {}) });
   git(['reset', '--hard', '--quiet', `${remote}/${base}`]);
   git(['clean', '-fdq', '--', 'backlog']); // a crashed attempt's untracked renames never leak into the next one
   return String(git(['rev-parse', 'HEAD'])).trim();
@@ -123,7 +144,7 @@ export function makeFollowupWorktreePreparer({ repoDir, worktreeDir, exec = exec
     if (!existsSync(resolve(worktreeDir, '.git'))) {
       mkdirSync(dirname(worktreeDir), { recursive: true });
       exec('git', ['worktree', 'prune'], { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
-      exec('git', ['fetch', remote, base, '--quiet'], { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+      fetchRemoteTip({ exec, cwd: repoDir, remote, base });
       exec('git', ['worktree', 'add', '--detach', '--force', worktreeDir, `${remote}/${base}`], { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
     }
     assertLinkedWorktree({ exec, cwd: worktreeDir });

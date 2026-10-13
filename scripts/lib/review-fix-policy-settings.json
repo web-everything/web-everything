@@ -1,5 +1,8 @@
 {
-  "$comment": "Declared settings for the review/fix policy rules (protocol card 5468). Each rule's built-in value is today's behaviour (off); this file is what the host runs. classSweep: card xet6iu0 (warn first, since 2026-10-08).",
+  "$comment": "Declared settings for the review/fix policy rules (protocol card 5468). Each rule's built-in value is today's behaviour (off); this file is what the host runs. classSweep: card xet6iu0 (warn first, since 2026-10-08). convertAdvisory: #xconv1 review-daemon stage, on by default since 2026-10-12 (#5020 stuck forever while off)",
+  "convertAdvisory": {
+    "enabled": true
+  },
   "classSweep": {
     "mode": "warn",
     "since": "2026-10-08"
