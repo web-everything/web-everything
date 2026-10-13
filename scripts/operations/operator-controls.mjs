@@ -6,6 +6,7 @@ import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { planRoundExtension } from './extend-rounds.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { decideRearm } from '../conveyor/rearm-review.mjs';
+import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim']);
 export const OPERATOR_CONTROL_EFFECT = 'operator.control';
@@ -98,7 +99,7 @@ export function planOperatorControl(name, read, input) {
 }
 export function operatorControlOperation(name, { readContext } = {}) {
   const optional = (type, value) => ({ type, required: false, default: value });
-  const input = { repo: optional('string', 'web-everything/web-everything'), pr: optional('number', 0),
+  const input = { repo: optional('string', CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug), pr: optional('number', 0),
     actor: 'string', channel: 'string', reason: 'string', preview: optional('boolean', false) };
   if (['unpark', 'retry-prepare'].includes(name)) input.item = optional('string', '');
   if (name === 'clear-claim') input.file = optional('string', '');

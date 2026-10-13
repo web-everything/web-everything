@@ -1,6 +1,7 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
+import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const WHY_OP = 'why';
 const compact = value => String(value ?? '').replace(/[\r\n]+/g, ' ');
@@ -17,7 +18,7 @@ export function explainWhy(facts) {
   const f = facts, subject = f.subject, isPr = subject.kind === 'pr';
   const labels = names(f.pr?.labels), has = label => labels.includes(label);
   const log = name => f.logs?.find(l => l.name === name)?.line ?? '';
-  const target = `--${subject.kind}=${subject.id} --repo=${f.repo ?? 'web-everything/web-everything'}`;
+  const target = `--${subject.kind}=${subject.id} --repo=${f.repo ?? CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug}`;
   const audit = '--actor=<login> --channel=<where> --reason="<why>"';
   const command = (name, extra = '') => `node scripts/operations/run.mjs ${name} --preview ${target}${extra ? ` ${extra}` : ''} ${audit}`;
   const row = (owner, waitingFor, suggestedOp = null) => ({ owner, waitingFor, suggestedOp });
@@ -72,7 +73,7 @@ export function explainWhy(facts) {
 export function whyOperation({ readWhy } = {}) {
   if (typeof readWhy !== 'function') throw new TypeError('why: needs a readWhy reader');
   return op(WHY_OP, {
-    input: { pr: { type: 'number', required: false, default: 0 }, item: { type: 'string', required: false, default: '' }, repo: { type: 'string', required: false, default: 'web-everything/web-everything' } },
+    input: { pr: { type: 'number', required: false, default: 0 }, item: { type: 'string', required: false, default: '' }, repo: { type: 'string', required: false, default: CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug } },
     verdictFrom: 'explain',
     read: compute({ reads: ['input.pr', 'input.item', 'input.repo'], fn: ({ input }) => {
       if ((input.pr > 0) === Boolean(input.item?.trim()) || !Number.isInteger(input.pr) || input.pr < 0) throw new Error('why: give exactly one of pr or item');

@@ -19,7 +19,7 @@ import { planOperatorControl, controlFingerprint, parseOperatorActions, buildOpe
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
-const git = (root, args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 60000 });
+const git = (root, args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
 export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = resolveCoordinationRoot(), runGh = gh,
   runGit = git, readText = path => readFileSync(path, 'utf8'), pathExists = existsSync,
   readComments = (repo, pr) => readCompletePrComments(pr, { repo }),

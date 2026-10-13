@@ -117,11 +117,11 @@ import { createExploreSinks, agentArgsFromEnv as exploreAgentArgsFromEnv } from 
 import { gapSweepStatusOperation, GAP_SWEEP_STATUS_OP } from './gap-sweep-status.mjs';
 import { createGapSweepSinks } from './gap-sweep-status-io.mjs';
 import { clearStuckSessionOperation, CLEAR_STUCK_SESSION_OP } from './clear-stuck-session.mjs';
-// The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { whyOperation, WHY_OP } from './operator-why.mjs';
 import { createWhyReader } from './operator-why-io.mjs';
 import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './operator-controls.mjs';
 import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
+// The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
 import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
