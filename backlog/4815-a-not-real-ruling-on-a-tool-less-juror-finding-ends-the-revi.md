@@ -82,8 +82,8 @@ The three scoped suites pass with the new red→green cases: a tool-less juror's
 - Capture historical #3432 artifacts and reconcile reported run/comment counts with persisted snapshots.
 - Giving read-only tools to every reviewer (operator: later option).
 - Finding-identity redesign (key includes summary text, `we:scripts/lib/jury-core.mjs:2797`); needs separate evidence.
-- Retire a claim on a verifier's "not reproduced" only with a second independent signal (a steered verifier must not silently drop a real hold): #xztd0mv.
-- Hold auto-land while a run carries unverified tool-less CONFIRMED claims: #xf74q20.
+- Retire a claim on a verifier's "not reproduced" only with a second independent signal (a steered verifier must not silently drop a real hold): #6054.
+- Hold auto-land while a run carries unverified tool-less CONFIRMED claims: #6053.
 - Verify whether duplicate dispatch after a completed advisory still occurs once false referrals stop (`we:scripts/conveyor/reconcile-core.mjs`); file only if reproduced.
 
 ## Root cause found (orchestrator, 2026-10-02 ~7:30 AM ET)

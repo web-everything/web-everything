@@ -1,4 +1,5 @@
 ---
+bornAs: xf74q20
 kind: story
 size: 3
 status: open
@@ -20,7 +21,7 @@ Found by the converge panel's security lens on #4815 (a carve-out there: the car
 ## Non-goals
 
 - [N1] (superseded on PR #5025 round 7) Keeping an unverified claim an advisory note: an unfinished verification now fails closed and the claim stays a mandatory referral.
-- [N2] Retiring a claim on a single answer (that is the sibling card `xztd0mv`).
+- [N2] Retiring a claim on a single answer (that is the sibling card `6054`).
 
 ## Edge cases this change must handle
 

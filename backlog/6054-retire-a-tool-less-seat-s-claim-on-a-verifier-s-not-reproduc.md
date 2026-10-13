@@ -1,4 +1,5 @@
 ---
+bornAs: xztd0mv
 kind: story
 size: 3
 status: open
@@ -20,7 +21,7 @@ Found by the converge panel's security lens on #4815 (a carve-out there, because
 ## Non-goals
 
 - [N1] Giving every reviewer tools (the operator's later option on #4815).
-- [N2] Treating an unavailable verifier differently (that is the sibling card `xf74q20`).
+- [N2] Treating an unavailable verifier differently (that is the sibling card `6053`).
 
 ## Edge cases this change must handle
 
