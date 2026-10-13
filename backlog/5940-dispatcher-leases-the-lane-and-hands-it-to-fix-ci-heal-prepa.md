@@ -29,34 +29,65 @@ Deliver one lease lifecycle across the active fresh Claude fix/CI-heal/prepare r
 
 ## Acceptance
 
-- [A1] The queued test command below must pass after implementation; newly added deterministic contention/handoff cases must fail against the current implementation.
+- [A1] The queued test command below names every test file in the Test plan, and it must pass after implementation. Vitest treats each path as a filter and silently drops a path that matches nothing, so a green exit alone is not enough. A1 fails if any named file is missing from the run output, any test named in the Test plan is absent, or any named test is skipped, marked todo, or runs zero cases. Every newly added contention, handoff and truncation case must fail against the current implementation.
 - [A2] Must refuse before spawn on contention or invalid handoff; no force-taking, foreign release, or silent second acquisition.
 - [A3] Must apply identical ownership checks to source, docs, configuration and data scopes, including empty-scope CI-heal without inventing a scope.
 - [A4] Review auto-selection must exclude the PR's own lane even when that lane is free; resumed fixes must consume zero additional lanes.
 - [A5] Definite spawn failure releases the matching reservation; an uncertain spawn retains it and remains observable.
+- [A6] Truncated or incomplete pool state, lease records and supplied handoff data fail closed. Acquire, adopt and dispatch refuse; no free lane is guessed; no fallback acquisition, takeover or release happens; existing lease generation, holder, occupant and checkout contents stay unchanged. The four `truncated` tests mapped below enforce this.
 
 ## Test plan
 
 Use hermetic temporary repositories and injectable launchers; never exercise the workstation pool in unit tests. Matching tests are included alongside every source entry in scope; brief coverage belongs to `we:scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs`.
 
-- Extend pool tests under `we:scripts/__tests__/lane-pool*.test.mjs` for excluded lanes, all candidates excluded, two contenders, expected-session/generation adoption, replacement between read and update, idempotent adoption, and wrong-pool rejection. Assert no foreign marker or checkout changes.
-- Add named pool cases under `we:scripts/__tests__/lane-pool*.test.mjs`: `rejects truncated pool state without selecting a free lane` and `rejects truncated lease records without changing ownership`. Parameterize each over a mid-record cut, valid JSON missing required ownership fields, a bounded read returning only a prefix (page/record limit, byte-buffer cap or last-N-lines window), and a read error surfaced as empty data. Assert acquire/adopt refuses, no fallback or takeover occurs, and existing lease generation, holder, occupant and checkout contents remain unchanged.
-- Add `truncated reservation data refuses dispatch before spawn` in `we:scripts/operations/__tests__/dispatch-lane-io.test.mjs`, `we:scripts/conveyor/__tests__/reconcile-fix-dispatch*.test.mjs` and `we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs`. Inject each pool-state/lease-record failure shape above through the reservation boundary for every supported fresh fix, CI-heal and prepare route; assert zero child starts, no guessed free lane or second acquisition, and no release or mutation of an existing lease.
+- Add `we:scripts/__tests__/lane-pool-dispatch-handoff.test.mjs` (planned, not an existing suite) for excluded lanes, all candidates excluded, two contenders, expected-session/generation adoption, replacement between read and update, idempotent adoption, and wrong-pool rejection. Assert no foreign marker or checkout changes. Also assert the adopting worker records its own occupant while the dispatcher's holder and release identity stay in the lease and journal records.
+- Add `we:scripts/__tests__/lane-pool-truncated-state.test.mjs` (planned, not an existing suite) with two named cases: `rejects truncated pool state without selecting a free lane` and `rejects truncated lease records without changing ownership`. Parameterize each over a mid-record cut, valid JSON missing required ownership fields, a bounded read returning only a prefix (page/record limit, byte-buffer cap or last-N-lines window), and a read error surfaced as empty data. Assert acquire/adopt refuses, no fallback or takeover occurs, and existing lease generation, holder, occupant and checkout contents remain unchanged.
+- Add `truncated reservation data refuses dispatch before spawn` in `we:scripts/operations/__tests__/dispatch-lane-io.test.mjs`, `we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs` and `we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs`. Inject each pool-state/lease-record failure shape above through the reservation boundary for every supported fresh fix, CI-heal and prepare route; assert zero child starts, no guessed free lane or second acquisition, and no release or mutation of an existing lease.
 - Add `truncated supplied handoff refuses launch or adoption without standalone fallback` in `we:scripts/operations/__tests__/fix-run.test.mjs`, `we:scripts/operations/__tests__/probation-build-run.test.mjs`, both provider-local suites below, and `we:scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs`. Cover each truncation/read-failure shape above, including valid JSON missing repository/pool, lane, session/generation/holder or expected-base fields. Assert refusal before launcher spawn or worker edits, zero fallback acquisition, and unchanged existing lease ownership/occupancy; exercise supported Codex fix and probation prepare/CI-heal branches and the three active briefs.
-- Extend `we:scripts/operations/__tests__/review-job*.test.mjs` for free and occupied PR-own lanes, unavailable identity lookup, no local mapping, bounded pool-full deferral, and preserved job-slot behavior.
-- Extend `we:scripts/operations/__tests__/dispatch-lane-io.test.mjs`, `we:scripts/conveyor/__tests__/reconcile-fix-dispatch*.test.mjs` and `we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs`: acquire precedes every fresh spawn; busy means zero spawn; correct repo/base/scope/lease identity; resume means zero acquire; definite failure releases once; ambiguous failure retains; retry cannot release a replacement lease.
+- Extend `we:scripts/operations/__tests__/review-job.test.mjs` for free and occupied PR-own lanes, unavailable identity lookup, no local mapping, bounded pool-full deferral, and preserved job-slot behavior.
+- Extend `we:scripts/operations/__tests__/dispatch-lane-io.test.mjs`, `we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs` and `we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs`: acquire precedes every fresh spawn; busy means zero spawn; correct repo/base/scope/lease identity; resume means zero acquire; definite failure releases once; ambiguous failure retains; retry cannot release a replacement lease.
+- Add `empty-scope CI-heal is leased without inventing a scope` in `we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs`: the reservation and handoff carry the existing empty scope unchanged and pass the same ownership checks as a scoped route.
 - Extend `we:scripts/operations/__tests__/fix-run.test.mjs`, `we:scripts/operations/__tests__/probation-build-run.test.mjs`, `we:scripts/operations/__tests__/dispatch-provider-registry.test.mjs` and `we:scripts/operations/__tests__/dispatch-lane-routing-record.test.mjs` for end-to-end handoff forwarding and no second checkout. Include standalone invocation and missing-runtime refusals.
 - Add `we:scripts/operations/dispatch-providers/__tests__/fix.test.mjs` and `we:scripts/operations/dispatch-providers/__tests__/probation-worker.test.mjs` for provider-local handoff forwarding through captured launcher argv, malformed-handoff refusal before spawn, and preservation of standalone invocation. Cover probation prepare and CI-heal branches with injected launch and attempt hooks; retain the broader routing and wrapper tests above. These are planned test files, not existing suites.
-- Extend `we:scripts/operations/__tests__/dispatch-lane.test.mjs` and `we:scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs` for actual filled brief instructions and required/invalid handoff fields, across source/docs/config/data scopes.
+- Extend `we:scripts/operations/__tests__/dispatch-lane.test.mjs` and `we:scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs` for actual filled brief instructions and required/invalid handoff fields. Add `applies identical lease checks to source, docs, config and data scopes` in both files: one case per scope kind, each asserting the same reservation, handoff and adoption checks.
+- In both provider-local suites, assert that refs, scopes and identities containing quotes, newlines or a leading `--` reach the launcher as separate argv values, never interpolated into a shell string.
 
-Run affected tests only through the host queue, for example (WE checkout-relative CLI arguments):
+Guarantee → enforcing test (every file is in the queued command below):
+
+| guarantee | test file(s) |
+| --- | --- |
+| A2 refuse on contention/invalid handoff | `lane-pool-dispatch-handoff`, `dispatch-lane-io`, `reconcile-fix-dispatch`, `ci-heal-pr-dispatch`, both provider-local suites |
+| A3 identical checks per scope kind, empty-scope CI-heal | `dispatch-lane`, `dispatch-lane-fixture-harness` (`applies identical lease checks…`), `ci-heal-pr-dispatch` (`empty-scope CI-heal…`) |
+| A4 review excludes own lane; resume takes no lane | `review-job`, `lane-pool-dispatch-handoff`, `dispatch-lane-io`, `reconcile-fix-dispatch` |
+| A5 definite failure releases, uncertain retains | `dispatch-lane-io`, `reconcile-fix-dispatch`, `ci-heal-pr-dispatch` |
+| A6 / edge case 2 truncated data fails closed | `lane-pool-truncated-state` (two cases); `truncated reservation data…` in `dispatch-lane-io`, `reconcile-fix-dispatch`, `ci-heal-pr-dispatch`; `truncated supplied handoff…` in `fix-run`, `probation-build-run`, both provider-local suites, `dispatch-lane-fixture-harness` |
+| Edge case 1 untrusted text as argv | both provider-local suites |
+| Edge cases 3, 5, 7 shared state, identity scoping, holder vs occupant | `lane-pool-dispatch-handoff` |
+| Edge cases 4, 6 fail closed, retries/resume | `dispatch-lane-io`, `reconcile-fix-dispatch`, `ci-heal-pr-dispatch`, `fix-run`, `probation-build-run` |
+| End-to-end forwarding, no second checkout | `fix-run`, `probation-build-run`, `dispatch-provider-registry`, `dispatch-lane-routing-record` |
+
+Run affected tests only through the host queue (WE checkout-relative CLI arguments). This command is the A1 gate; it names every test file in this Test plan:
 
 ```bash
-node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/operations/__tests__/dispatch-lane-io.test.mjs scripts/operations/__tests__/review-job.test.mjs scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs scripts/operations/__tests__/fix-run.test.mjs scripts/operations/__tests__/probation-build-run.test.mjs scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs
+node scripts/readiness/heavy-admission.mjs run -- npx vitest run \
+  scripts/__tests__/lane-pool-dispatch-handoff.test.mjs \
+  scripts/__tests__/lane-pool-truncated-state.test.mjs \
+  scripts/operations/__tests__/dispatch-lane-io.test.mjs \
+  scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs \
+  scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs \
+  scripts/operations/__tests__/review-job.test.mjs \
+  scripts/operations/__tests__/fix-run.test.mjs \
+  scripts/operations/__tests__/probation-build-run.test.mjs \
+  scripts/operations/dispatch-providers/__tests__/fix.test.mjs \
+  scripts/operations/dispatch-providers/__tests__/probation-worker.test.mjs \
+  scripts/operations/__tests__/dispatch-provider-registry.test.mjs \
+  scripts/operations/__tests__/dispatch-lane-routing-record.test.mjs \
+  scripts/operations/__tests__/dispatch-lane.test.mjs \
+  scripts/operations/__tests__/dispatch-lane-fixture-harness.test.mjs
 node scripts/readiness/heavy-admission.mjs run -- npm run check:standards
 ```
 
-Run the remaining affected test files through that same queue before delivery, including any newly authored pool tests.
+Check the run output against A1: all 14 files appear, and every named test above ran and passed. Any other test file the implementation touches also runs through the same queue; it adds to this command and never replaces it.
 
 ## Proof plan
 
@@ -73,7 +104,7 @@ Before graduation, use an isolated disposable pool and controlled child workers 
 ## Edge cases this change must handle
 
 1. **Untrusted text** — pass refs/scopes/identities as validated argv data; no shell interpolation of PR or card prose.
-2. **Truncated reads** — incomplete pool/lease/handoff data refuses dispatch; never guess a free lane.
+2. **Truncated reads** — incomplete pool/lease/handoff data refuses dispatch; never guess a free lane. Enforced by [A6] and the four named `truncated` tests in the Test plan.
 3. **Shared state files** — acquire, adopt and conditional release must coordinate against competing release/reclaim; no read-then-overwrite of a replacement lease.
 4. **Fail closed** — invalid handoff or ambiguous launch cannot trigger takeover or premature release.
 5. **Identity scoping** — qualify lane identity by repository/pool plus lease generation/session; a reusable slug alone is insufficient.
@@ -94,3 +125,4 @@ Before graduation, use an isolated disposable pool and controlled child workers 
 - Corrected scope adds shared dispatch, CI-heal payload plumbing, worker/provider consumers and the three briefs, with matching existing tests or permitted pool/review/fix test patterns. Size changes **3 → 8**: approximately 150–220 changed lines in pool ownership/exclusion, 180–260 across shared/separate dispatch and payload plumbing, 100–160 across worker/provider consumers, 40–70 in review selection, 40–70 in briefs, and 300–450 in associated tests (roughly 810–1,230 total). This is a story, so no `estimatedLoc` is added. The source boundaries above support the larger estimate.
 - No dependency change proposed. Preparation edits only this card; runner-owned stamping, gates and review remain pending. Historical incidents were not replayed and implementation tests were not run for this documentation-only preparation.
 - Prepare-validation repair: the previous scope paired provider sources only with broader registry/routing tests; it omitted matching provider-local test paths. Add planned `we:scripts/operations/dispatch-providers/__tests__/fix.test.mjs` and `we:scripts/operations/dispatch-providers/__tests__/probation-worker.test.mjs` to scope and the test plan. Evidence: argv construction and spawn at `we:scripts/operations/dispatch-providers/fix.mjs:105-131` and `we:scripts/operations/dispatch-providers/probation-worker.mjs:136-169` provide injectable boundaries for direct handoff tests. Neither planned suite exists yet. The implementation scope and size **8** remain unchanged; the provider suites allocate coverage already included in the associated-test estimate above.
+- Review repair (PR 5140, round 3): the truncated-data tests were named but their files were missing from the A1 command, so a passing A1 run never executed them. Every Test-plan file is now named exactly (no globs) and listed in the A1 command; new files are marked planned. A1 now fails on a missing file, absent test or zero-case run. [A6] states the truncated-data guarantee, and a guarantee → test table maps A2–A6 and the edge cases to files.
