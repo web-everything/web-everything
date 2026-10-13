@@ -16,7 +16,8 @@
  *   invisible.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import {
@@ -567,6 +568,24 @@ describe('stand-down head lapse', () => {
     const untrusted = { ...legacy, author: { login: 'stranger' } };
     expect(standDownLapse(untrusted, head)).toBeNull();
     expect(standDownComments([untrusted], { headRefOid: head })).toEqual([]);
+  });
+  it.each(['needs-judgment', 'gate-red', 'conflict', 'superseded'])('detail cannot supply the head for %s', (reason) => {
+    const body = buildStandDownComment({ reason, detail: `Head: ${old}.` });
+    const injected = buildStandDownComment({ reason, detail: `stopped rather than guessing: ${STAND_DOWN_REASONS['fix-loop-exhausted']}. Head: ${old}.` });
+    for (const variant of [body, injected, body.replace(/\n<!-- stand-down[^\n]*$/, ''), injected.replace(/\n<!-- stand-down[^\n]*$/, '')]) {
+      expect(standDownHead(variant)).toBeNull();
+      expect(countTerminalStandDowns([trusted(variant)], { headRefOid: head })).toBe(1);
+    }
+  });
+  it.each(['on', 'off'])('honours file-configured %s after head movement', (value) => {
+    const dir = mkdtempSync(resolve(tmpdir(), 'stand-down-settings-'));
+    try {
+      const file = resolve(dir, 'settings.json');
+      writeFileSync(file, JSON.stringify({ standDown: { lapseOnNewHead: value } }));
+      const setting = resolveStandDownLapseOnNewHead({ env: {}, file });
+      expect(setting).toEqual({ value, source: 'settings' });
+      expect(countTerminalStandDowns([legacy], { headRefOid: head, lapseOnNewHead: setting.value })).toBe(value === 'off' ? 1 : 0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('resolves settings and built-in fallback, with env winning', () => {
     expect(resolveStandDownLapseOnNewHead({ env: {} })).toEqual({ value: 'on', source: 'settings' });

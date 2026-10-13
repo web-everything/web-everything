@@ -169,7 +169,13 @@ export function resolveStandDownLapseOnNewHead({ env = process.env, file = STAND
 /** Read only the machine trailer or the legacy ci-heal Head sentence. */
 export function standDownHead(body) {
   if (typeof body !== 'string') return null;
-  return STAND_DOWN_TRAILER_RE.exec(body)?.[2] ?? /\bHead: ([0-9a-f]{40})\b/.exec(body)?.[1] ?? null;
+  const trailer = STAND_DOWN_TRAILER_RE.exec(body);
+  if (trailer?.[2]) return trailer[2];
+  // Only ci-heal's old fix-loop hold recorded a head in prose. Other reasons' detail is untrusted.
+  const legacyFixLoop = trailer ? trailer[1] === 'fix-loop-exhausted'
+    : body.split('\n')[2]?.split('stopped rather than guessing: ')[1]?.startsWith(`${STAND_DOWN_REASONS['fix-loop-exhausted']}.`);
+  if (!legacyFixLoop) return null;
+  return /\bHead: ([0-9a-f]{40})\b/.exec(body)?.[1] ?? null;
 }
 
 /** A trusted head-bound hold lapses when a different safe head arrives. */
@@ -472,6 +478,7 @@ export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
  */
 export function standDownComments(comments, { headRefOid = null, lapseOnNewHead } = {}) {
   if (!Array.isArray(comments)) return [];
+  if (headRefOid && lapseOnNewHead === undefined) lapseOnNewHead = resolveStandDownLapseOnNewHead().value;
   const out = [];
   for (const c of comments) {
     if (c?.standDownLapsed || (headRefOid && standDownLapse(c, headRefOid, { lapseOnNewHead }))) continue;
@@ -611,6 +618,9 @@ export function isStandDownSuperseded(comments, index) {
  */
 export function countTerminalStandDowns(comments, options = {}) {
   if (!Array.isArray(comments)) return 0;
+  if (options.headRefOid && options.lapseOnNewHead === undefined) {
+    options = { ...options, lapseOnNewHead: resolveStandDownLapseOnNewHead().value };
+  }
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
