@@ -58,7 +58,7 @@
  */
 import { resolve } from 'node:path';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { DECLARED_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
+import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
@@ -213,7 +213,7 @@ export function defaultPostRebaseComment(prNumber, {
  * credential.
  * @param {{repo?:string|null, apply?:boolean, requiredCheck?:string, defaultBranch?:string,
  *   readOpenPrs?:Function, readMainRuns?:Function, readAheadBy?:Function, readMainLatestCheckRuns?:Function,
- *   readMainGreenFixFacts?:Function,
+ *   readMainGreenFixFacts?:Function, readRequiredContexts?:Function, readAttributedRequiredChecks?:Function,
  *   refresh?:Function}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>, mainRedWindows:Array<object>,
  *   mainLatestCheckRuns:Array<object>}}
@@ -221,7 +221,8 @@ export function defaultPostRebaseComment(prNumber, {
 export function sweepCiRedRecovery({
   repo = null, apply = false, requiredCheck = null, defaultBranch = 'main',
   readOpenPrs = defaultReadOpenPrs, readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
-  readRequiredContexts = defaultReadRequiredContexts,
+  readRequiredContexts, // Compatibility for callers injecting the original main-red reader.
+  readAttributedRequiredChecks = readRequiredContexts ?? defaultReadAttributedRequiredChecks,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
@@ -234,13 +235,13 @@ export function sweepCiRedRecovery({
   readPriority = () => readMainRedPriority(),
 } = {}) {
   const prs = readOpenPrs({ repo });
-  // soak-main-red — judge every REQUIRED check (live branch-protection list when readable, else
+  // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
-  // The branch-protection read is paid only when some open PR has ANY failing check at all.
+  // The shared required-check read is paid only when some open PR has ANY failing check at all.
   const prList = Array.isArray(prs) ? prs : [];
   const anyRed = prList.some((pr) => collapseRollupToLatestPerName(pr?.statusCheckRollup).some((c) => isRequiredCheckFailed(pr, c?.name || c?.context)));
   const checks = requiredCheck ? [requiredCheck]
-    : ((anyRed ? readRequiredContexts({ repo, branch: defaultBranch }) : null) ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS);
+    : ((anyRed ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : null) ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS);
   // The `gh run list --branch main` read only matters when at least one PR has a failing required check to
   // judge against it — mirrors `reconcile-pass.mjs#enrichPrsWithMainRedFacts`'s own "pay for it only when needed".
   const needWindows = prList.some((pr) => isAnyRequiredCheckFailed(pr, checks));
@@ -731,6 +732,27 @@ export function formatHungReport({ dispatch = [], refusals = [], applied = [] } 
   for (const r of refusals) if (r.kind !== 'not-hung') lines.push(`  ✗ ${r.kind} PR #${r.prNumber} — ${r.why}`);
   for (const a of applied) lines.push(a.ok ? `  ✓ applied: ${a.action} run ${a.runId ?? '?'} (PR #${a.prNumber}) — ${a.why ?? '(no reason recorded)'}` : `  ✗ apply ${a.action} PR #${a.prNumber} run ${a.runId ?? '?'} — ${a.error} (reason it was attempted: ${a.why ?? '(none)'})`);
   return lines.join('\n');
+}
+
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadAttributedRequiredChecks — the main-red pass's
+ * shared ruleset ∪ classic-protection set, with the same cache and declared-policy degradation as reconcile.
+ * Live #5079/#5055: ruleset-only `merge-gate` must be judged alongside classic-protection checks.
+ * Returns `null` (UNKNOWN) without a repo or a usable shared array, preserving the main-red fallback.
+ * An explicitly empty shared array is preserved as `[]`.
+ * @param {{repo?:string|null, branch?:string, readRequiredChecks?:Function}} [o]
+ * @returns {string[]|null}
+ */
+export function defaultReadAttributedRequiredChecks({
+  repo = null, branch = 'main', readRequiredChecks = getRequiredStatusChecks,
+} = {}) {
+  if (!repo) return null;
+  try {
+    const checks = readRequiredChecks({ repo, branch })?.checks;
+    return Array.isArray(checks) ? checks : null;
+  } catch {
+    return null;
+  }
 }
 
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────

@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xhxg1h6-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md"]
+scope: ["we:backlog/6011-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md"]
 dateOpened: "2026-10-12"
 tags: []
 ---
@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xhxg1h6-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md:17` — Have the approval-time prevention filer group items that share the same file and symbol, and keep only the strictest alternative.
+1. `we:backlog/6011-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md:17` — Have the approval-time prevention filer group items that share the same file and symbol, and keep only the strictest alternative.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5036@5a7f07387a07ef126077ccead80d522c01b47bd4
 

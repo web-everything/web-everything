@@ -14,7 +14,7 @@ import {
   buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, describeExecError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
-  defaultReadRequiredContexts, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
+  defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
 } from '../ci-red-recovery-watch.mjs';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
@@ -77,6 +77,34 @@ describe('ci-red-recovery-watch — a daemon-soak-only red PR (soak-main-red)', 
     });
     expect(readRequiredContexts).toHaveBeenCalledTimes(1);
     expect(result.dispatch).toEqual([]);
+  });
+});
+
+describe('ci-red-recovery-watch — ruleset-only merge-gate failure (#5079/#5055)', () => {
+  it('plans rebase-onto-main after main recovers when merge-gate is the only failing required check', () => {
+    const pr = {
+      number: 5079, headRefName: 'lane/merge-gate-recovery', headRefOid: 'stale-head',
+      statusCheckRollup: [
+        { ...greenCheck, completedAt: '2026-09-25T01:57:47Z' },
+        { ...failingCheck('2026-09-25T01:57:47Z'), name: 'merge-gate' },
+      ],
+    };
+    const readAttributedRequiredChecks = vi.fn(() => ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']);
+    const refresh = vi.fn();
+    const result = sweepCiRedRecovery({
+      repo: 'web-everything/web-everything', readOpenPrs: () => [pr], readMainRuns: () => MAIN_RUNS,
+      readAheadBy: () => 5, readComments: () => [], readAttributedRequiredChecks,
+      readMainLatestCheckRuns: () => [{
+        name: 'merge-gate', status: 'completed', conclusion: 'success',
+        completed_at: '2026-09-25T02:31:25Z', head_sha: 'green-main',
+      }],
+      refresh,
+    });
+    expect(readAttributedRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'main' });
+    expect(result.dispatch).toEqual([expect.objectContaining({
+      prNumber: 5079, kind: 'rebase-onto-main', aheadBy: 5, failingCheckName: 'merge-gate',
+    })]);
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 
@@ -739,6 +767,42 @@ describe('ci-red-recovery-watch — formatHungReport', () => {
     });
     expect(report).toContain('repeat-hang PR #2636 run 36187480460 — job hung twice');
     expect(report).not.toContain('hung-cancel-rerun');
+  });
+});
+
+describe('ci-red-recovery-watch — defaultReadAttributedRequiredChecks', () => {
+  it('returns the shared ruleset ∪ classic protection set, including ruleset-only merge-gate', () => {
+    const checks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+    const readRequiredChecks = vi.fn(() => ({ checks, source: 'live' }));
+    const contexts = defaultReadAttributedRequiredChecks({
+      repo: 'web-everything/web-everything', branch: 'release', readRequiredChecks,
+    });
+    expect(contexts).toEqual(checks);
+    expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'release' });
+  });
+
+  it('returns null (unknown) on a shared read failure', () => {
+    const readRequiredChecks = vi.fn(() => { throw new Error('read failed'); });
+    expect(defaultReadAttributedRequiredChecks({
+      repo: 'web-everything/web-everything', readRequiredChecks,
+    })).toBeNull();
+  });
+
+  it('returns null without reading when no repo is given', () => {
+    const readRequiredChecks = vi.fn();
+    expect(defaultReadAttributedRequiredChecks({ repo: null, readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks).not.toHaveBeenCalled();
+  });
+
+  it('preserves an empty shared array and returns null when no usable array is available', () => {
+    expect(defaultReadAttributedRequiredChecks({
+      repo: 'web-everything/web-everything', readRequiredChecks: () => ({ checks: [], source: 'unavailable' }),
+    })).toEqual([]);
+    for (const result of [null, undefined, {}, { checks: null }, { checks: 'test' }]) {
+      expect(defaultReadAttributedRequiredChecks({
+        repo: 'web-everything/web-everything', readRequiredChecks: () => result,
+      })).toBeNull();
+    }
   });
 });
 

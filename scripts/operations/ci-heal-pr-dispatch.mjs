@@ -303,6 +303,27 @@ export async function dispatchCiHeal(planned, {
 }
 
 /**
+ * Stable, non-mutating queue order. Current reconcile heal rows carry check NAMES, not timestamps
+ * (`check` is just a state string); those rows use ascending PR number. When failure completion
+ * evidence or waitingSince is carried, dated rows come first, earliest first; equal dates retain input order.
+ */
+export function orderCiHealEntriesOldestFirst(entries) {
+  const timestamp = value => typeof value === 'string' && value.trim() ? Date.parse(value) : NaN;
+  const owedAt = entry => {
+    const completed = (entry.failingRequiredChecks ?? []).map(check => timestamp(check?.completedAt))
+      .filter(Number.isFinite);
+    if (completed.length) return Math.min(...completed);
+    return timestamp(entry.waitingSince);
+  };
+  return entries.map(entry => ({ entry, time: owedAt(entry) })).sort((a, b) => {
+    const aKnown = Number.isFinite(a.time), bKnown = Number.isFinite(b.time);
+    if (aKnown && bKnown) return a.time - b.time;
+    if (aKnown !== bKnown) return aKnown ? -1 : 1;
+    return a.entry.prNumber - b.entry.prNumber;
+  }).map(row => row.entry);
+}
+
+/**
  * we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch — THE WHOLE PASS (multi-repo slice
  * 7, `we:backlog/3967-*.md`): read `reconcile-core.mjs`'s plan (via `reconcile-pass.mjs#runReconcilePass`,
  * reused, not re-run by hand), narrow it to the `kind:'ci-heal'` entries, and dispatch each — mirroring
@@ -411,7 +432,7 @@ export async function runReconcileCiHealDispatch({
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
   }
-  const ciHealEntries = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal');
+  const ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
   if (!ciHealEntries.length && timeoutResults.length) return {
     dispatched: timeoutResults.filter((r) => r.status === 'requested'),
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
