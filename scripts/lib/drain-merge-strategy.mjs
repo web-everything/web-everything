@@ -39,6 +39,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { createAdaptiveBatching } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
@@ -202,7 +203,7 @@ export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
-  cancelObsoleteRuns = cancelObsoleteQueueRuns,
+  cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -233,6 +234,7 @@ export function createDrainMergeStrategy({
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
+  const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
 
@@ -264,6 +266,13 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
+      try {
+        const g = adaptiveBatching().gate(c.num);
+        if (!g.admit) {
+          say(`  merge-queue batching: defer #${c.num} (${g.reason})`);
+          return { enqueued: false, deferred: true, reason: g.reason };
+        }
+      } catch (e) { say(`  ⚠ merge-queue batching admission failed (${firstLine(e)}) — continuing enqueue`); }
       // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.
       if (readQueueState(statePath, readFile).unreadable) throw new Error(`github-merge-queue: follow-up state ${statePath} is unreadable — refusing to enqueue (and NOT merging directly); fix or remove it`);
       // Skip the stamp only for a marker the DRAIN itself posted: a lookup of the drain's identity (made at most once
@@ -280,6 +289,7 @@ export function createDrainMergeStrategy({
         if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
         throw err;
       }
+      try { adaptiveBatching().confirm?.(c.num); } catch { /* batching bookkeeping never blocks an enqueue */ }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
@@ -306,6 +316,8 @@ export function createDrainMergeStrategy({
       if (enqueueMode) {
         try { cancelObsoleteRuns({ repo: localSlug, exec, dryRun, log }); }
         catch (e) { say(`  ⚠ merge-queue: obsolete run cancellation failed (${firstLine(e)}) — continuing drain pass`); }
+        try { adaptiveBatching().observe({}); }
+        catch (e) { say(`  ⚠ merge-queue batching observation failed (${firstLine(e)}) — continuing drain pass`); }
       }
       const state = readQueueState(statePath, readFile);
       if (state.unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — no queue follow-up this pass (file left untouched); fix or remove it`); return []; }
