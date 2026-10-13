@@ -2,9 +2,10 @@
 bornAs: xec3amn
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-workflow-edit-hold.mjs"]
 dateOpened: "2026-10-11"
+dateResolved: "2026-10-13"
 tags: []
 ---
 
