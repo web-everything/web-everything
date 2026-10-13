@@ -47,6 +47,7 @@
  * SERIAL contract: items are planned one at a time, each AFTER its predecessor pushed (`recordPushed`) — the
  * frontier a stacked item bases on is always an already-pushed tip.
  */
+import { isDrainTransientPath } from '../lib/transient-paths.mjs';
 
 /**
  * The default chain-depth cap (#2387: "cap chain depth — fall back to siblings past the cap"). Each stacked
@@ -92,9 +93,11 @@ export function pathsOverlap(a, b) {
  * The first overlapping pair between two scope lists, or `null`. Entries are repo-qualified strings or
  * `{repo,path}` objects; entries in different repos never overlap. Directory-prefix rule (a superset of the
  * exact-match `intersects` the batch planner uses) — the ONE overlap definition for concurrent dispatch.
+ * Ignore drain-transient paths even in stale claims (2026-10-13: #4965/#5083/#5026 blocked behind #5038 on evidence).
  */
 export function firstScopeOverlap(scopeA, scopeB) {
-  const parse = (list) => (list || []).map((e) => (typeof e === 'string' ? parseScopeEntry(e) : e)).filter(Boolean);
+  const parse = (list) => (list || []).map((e) => (typeof e === 'string' ? parseScopeEntry(e) : e))
+    .filter((e) => e && !isDrainTransientPath(e.path));
   const bs = parse(scopeB);
   for (const a of parse(scopeA)) {
     for (const b of bs) {
