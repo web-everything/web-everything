@@ -144,6 +144,19 @@ export function buildRearmComment({ actor, decision }) {
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) {
+  const { isUnderTest } = await import('../lib/under-test.mjs');
+  const pr = Number(process.argv[2]);
+  const repo = process.argv.find(a => a.startsWith('--repo='))?.slice('--repo='.length);
+  if (repo && Number.isSafeInteger(pr) && pr > 0 && !isUnderTest()) {
+    const { createReviewClearanceGuard } = await import('../lib/review-clearance-guard.mjs');
+    const result = createReviewClearanceGuard({ repo }).guardRearm({ pr });
+    if (result.refuse) {
+      const { writeLineSync } = await import('../lib/write-all-sync.mjs');
+      writeLineSync(1, JSON.stringify({ ok: true, pr, rearmed: false, refused: 'same-head-clearance', reason: result.why }));
+      console.error(`rearm-review: PR #${pr} kept clearance — ${result.why}`);
+      process.exit(0);
+    }
+  }
   // #xkmu3gv — `--round=conflict` selects the MECHANICAL conflict-resolution comment/marker
   // (`CONFLICT_FIX_COMMENT_MARKER`, its own smaller `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP`,
   // #xkmu3gv) instead of the ordinary rearm marker. THE LABEL SWAP ITSELF IS IDENTICAL EITHER WAY — the SAME

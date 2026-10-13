@@ -1,0 +1,10 @@
+{
+  "$comment": "PR #5193, 2026-10-13: stale review-only CI replayed a pending re-arm without a push and destroyed operator clearance. All keys accept on|off, standard default on. Cascade: standard -> platform preferences -> this file -> named env variable. Any invalid layer fails to off. rerunStaleGateOnClearance: on reruns a review-only merge-gate failure older than live clearance; off leaves the stale failed job unchanged; env WE_REVIEW_CLEARANCE_RERUN_STALE_GATE. reviewHoldIsNotCiFailure: on excludes review-gate and proven review-only merge-gate failures from CI breaks; off counts those failures as CI breaks; env WE_REVIEW_CLEARANCE_REVIEW_HOLD_NOT_CI. rearmRequiresHeadChange: on protects accepted clearance when PR and git-ref reads both match its SHA; off allows same-head re-arms; env WE_REVIEW_CLEARANCE_REARM_REQUIRES_HEAD_CHANGE. ciHealRequiresFailingChecks: on requires a live failing CI check for red-ci heals; CodeQL heals stay unchanged; off allows heals without failing checks; env WE_REVIEW_CLEARANCE_CI_HEAL_REQUIRES_FAILING_CHECKS. restoreNoPushRearm: on restores an original same-head clearance removed by a proven trusted no-push re-arm; off leaves the removed acceptance pending; env WE_REVIEW_CLEARANCE_RESTORE_NO_PUSH_REARM.",
+  "reviewClearance": {
+    "rerunStaleGateOnClearance": "on",
+    "reviewHoldIsNotCiFailure": "on",
+    "rearmRequiresHeadChange": "on",
+    "ciHealRequiresFailingChecks": "on",
+    "restoreNoPushRearm": "on"
+  }
+}
