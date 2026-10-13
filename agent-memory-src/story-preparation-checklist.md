@@ -137,7 +137,7 @@ as follow-ups — never hold a card open chasing scope-growth past the cap. **If
 and escalate it for a human call (re-scope or drop). The count is per card and resets only when a new
 `preparedAgainstSha` re-prepare starts (a stale card re-prepared). Run rating can carry `reviewRounds` and
 `scopeGrowthCount` on a prepare row (`we:scripts/conveyor/run-rating.mjs` passes them through); the producer that
-supplies them is a follow-up (`we:backlog/xxgbekk`), so until it lands those fields read null.
+supplies them is a follow-up (`we:backlog/6028`), so until it lands those fields read null.
 
 **Also check (lint-backed, #4438):** every MVP Must is cited by number (`Must N` / `Musts A-B`) in a `## Done when` clause, and every `we:backlog/<id>` ref resolves (or is marked `(pending-lane)`).
 

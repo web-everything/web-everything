@@ -257,11 +257,11 @@ Each is a future backlog item, filed by the eventual BUILDER (not by this prepar
   `toScorecardRow`, 2 unit tests, 137/137 green) and Could B (decision-brief step-5 paragraph) built. Probes:
   bold `11.`/`12.`/`13.` item lines in the checklist 0 → 3; "10-item" → "13-item"; item-10 stamp sentence now
   carries "within item 13's round cap". Could C (`we:skills-src/conveyor/prepare-item-agent-brief.md`) is outside
-  this card's `scope:` → filed as `we:backlog/xj0j0lg`.
+  this card's `scope:` → filed as `we:backlog/6027`.
 - **2026-10-13 pre-PR `/converge` round 1 (5-lens panel, care elevated):** 0 refuted. Fixed in the lane — item 13
   over-claimed that run rating "records" the counts (nothing produces them: reworded, producer filed as
-  `we:backlog/xxgbekk`); item 13 had no path for a BLOCKER still open after round 2 (now: no stamp, no third round,
+  `we:backlog/6028`); item 13 had no path for a BLOCKER still open after round 2 (now: no stamp, no third round,
   escalate); item 13 / the workflow paragraph said "MVP-Must blocker" while item 12 also counts real harm (aligned
   to "BLOCKER"); `toScorecardRow` copied the two fields unvalidated (now non-negative integer or null, tested);
-  `we:backlog/xj0j0lg` A1 grep could miss on a re-wrap (now keys on the checklist file name). Round 2 re-judge and
+  `we:backlog/6027` A1 grep could miss on a re-wrap (now keys on the checklist file name). Round 2 re-judge and
   receipt not run (advise-mode gate; stated in the PR body).
