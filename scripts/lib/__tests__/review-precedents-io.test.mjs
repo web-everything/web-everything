@@ -95,10 +95,14 @@ describe('settings and drafting', () => {
     io.loadPrecedentSettings(args);
     expect(log).toHaveBeenCalledTimes(1);
   });
-  it('reads PR info with the declared gh fields', () => {
-    const exec = vi.fn(() => JSON.stringify(info));
-    expect(io.readPrInfo({ repo, pr: 5184, exec })).toEqual(info);
-    expect(exec).toHaveBeenCalledWith('gh', ['pr', 'view', '5184', '--repo', repo, '--json', 'number,title,body,headRefOid,state,files,comments']);
+  it('reads PR info with the declared gh fields and the COMPLETE comment thread', () => {
+    const { comments, ...head } = info;
+    const exec = vi.fn(() => JSON.stringify(head));
+    const readComments = vi.fn(() => comments);
+    expect(io.readPrInfo({ repo, pr: 5184, exec, readComments })).toEqual(info);
+    // The thread never comes from `gh pr view` (one page only): it comes from the paginated reader.
+    expect(exec).toHaveBeenCalledWith('gh', ['pr', 'view', '5184', '--repo', repo, '--json', 'number,title,body,headRefOid,state,files']);
+    expect(readComments).toHaveBeenCalledWith(5184, repo);
   });
   it('drafts through a routed model with fenced decision data and fails harmlessly', () => {
     const route = () => ({ provider: 'claude', model: 'test-policy-model' });

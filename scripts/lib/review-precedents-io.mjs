@@ -18,6 +18,7 @@ import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 import { OPERATOR_LOGINS, AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { parseOperatorRulingComment } from './jury-core.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const PRECEDENT_TRANSPORT_BRANCH = 'ops/review-requests';
 export const PRECEDENT_PUSH_REF = 'refs/heads/ops/review-requests';
@@ -114,8 +115,15 @@ export function readPrecedents({ board, repo, run } = {}) {
 }
 
 const defaultExec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-export function readPrInfo({ repo, pr, exec = defaultExec }) {
-  return JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,title,body,headRefOid,state,files,comments']));
+/**
+ * One PR's head, files and its COMPLETE comment thread. The thread comes from the paginated full-thread reader
+ * (`readCompletePrComments`, we:scripts/conveyor/pr-comments-complete.mjs), never `gh pr view --json` with the
+ * thread field, which returns one page: a decision past comment 100 would be missed. A failed read throws.
+ */
+const defaultReadComments = (pr, repo) => readCompletePrComments(pr, { repo });
+export function readPrInfo({ repo, pr, exec = defaultExec, readComments = defaultReadComments }) {
+  const info = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,title,body,headRefOid,state,files']));
+  return { ...info, comments: readComments(pr, repo) };
 }
 
 const defaultRoute = () => resolveOperationRoute({ operation: 'precedent-draft', taskType: 'summarize', available: ['claude'] });
