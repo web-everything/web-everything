@@ -194,6 +194,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
+import { drainReviewGateFact, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
@@ -3071,8 +3072,8 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
-    const prior = readEvents(repo).filter((e) => e.type === EVENT_TYPES.HOLD && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
-    if (prior.length && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
+    const prior = readEvents(repo).filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
+    if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({
       type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
       declaredActor: 'drain', reasonCode, holdSource: 'drain',
@@ -5680,6 +5681,7 @@ async function runCli() {
         process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} ${gate.reason}\n`);
         continue;
       }
+      v.reviewGate = drainReviewGateFact(gate); // ledger facts only (drain-ledger-facts.mjs); never read for a decision
       v.escalated = score.escalate ? 'yes' : 'no';
       // #2365 — gate.humanRequired (not score.humanRequired): decideReviewGate's verdict is the sticky one (#2362
       // makes an already-applied review:human label win even when a rebase narrows the diff back to
@@ -6064,6 +6066,8 @@ async function runCli() {
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason });
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
+    const facts = recordDrainLedgerFacts({ verdicts, localSlug });
+    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
     for (const v of skipped) {
       // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
       // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).

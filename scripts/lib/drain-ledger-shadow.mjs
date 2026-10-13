@@ -115,7 +115,7 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
     } catch { folded = null; derived = null; }
   }
   const ledger = decideLedgerGate({ folded, derived, head, labelsClear, authority: 'ledger' });
-  const noRow = folded && !folded.history?.length;
+  const noRow = folded && !folded.history?.length && derived?.reviewExempt !== true;
   const ledgerHolds = [...(noRow ? ['no-ledger-row'] : (derived?.holds ?? []).map(h => h?.code ?? 'unknown')), ...factHolds];
   const result = { ...base, ledgerHolds };
   if (ledger.defer) return { ...result, ledgerVerdict: 'unreadable', status: 'unreadable', direction: null, reason: ledger.reason };

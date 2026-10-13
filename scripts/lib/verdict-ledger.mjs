@@ -531,6 +531,7 @@ export const LEDGER_EVENT_VERSION = 2;
  *  repo + PR + append order. Transitions are NOT a type: they are derived from these events plus GitHub facts. */
 export const EVENT_TYPES = Object.freeze({
   VERDICT: 'verdict',       // the v1 row, unchanged
+  REVIEW_EXEMPT: 'review-exempt', // the drain decided this head needs no review (no escalation signal, no review label); keyed to the head sha
   REFERRAL: 'referral',     // findings opened on a head, with finding keys
   RULING: 'ruling',         // a ruling on one finding key
   REVIEW_RUN: 'review-run', // a review run on a head (counts visits; bears on nothing else)
@@ -572,6 +573,10 @@ function delegationOrNull(v) {
 }
 
 const EVENT_PAYLOAD = Object.freeze({
+  [EVENT_TYPES.REVIEW_EXEMPT]: [
+    ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
+    ['basis', isStr, (v) => oneLine(v, 200)],
+  ],
   [EVENT_TYPES.REFERRAL]: [
     ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
     ['findingKeys', (v) => Array.isArray(v) && v.length > 0 && v.every(isStr), (v) => v.map((k) => oneLine(k, 200))],
@@ -633,7 +638,7 @@ const EVENT_DEFAULTS = Object.freeze({ posted: null, delegation: null, lines: Ob
 /** Which event types BEAR on whether a PR may land (plan 3.1). `review-run` bears on caps only; the others that
  *  bear do so through the derive function, which is a later slice. Pure. */
 export function eventBears(type) {
-  return [EVENT_TYPES.VERDICT, EVENT_TYPES.REFERRAL, EVENT_TYPES.RULING, EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE,
+  return [EVENT_TYPES.VERDICT, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.REFERRAL, EVENT_TYPES.RULING, EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE,
     EVENT_TYPES.APPROVAL, EVENT_TYPES.SEND_BACK].includes(String(type ?? ''));
 }
 
@@ -1142,6 +1147,7 @@ export function verdictLedgerPath(repo) {
 /** Whether a normalized ledger event CLEARS a hold (so a git miss must not leave a home row, F4). A verdict follows
  *  {@link verdictClears}; a v2 event has no `verdict`, and a ruling that is not `block` clears its finding's hold. */
 function eventClears(row) {
+  if (row?.type === EVENT_TYPES.REVIEW_EXEMPT) return true;
   if (row?.type === EVENT_TYPES.RULING) return row.ruling !== 'block';
   return verdictClears(row?.verdict);
 }
