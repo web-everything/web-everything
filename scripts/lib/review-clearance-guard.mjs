@@ -1,22 +1,16 @@
 /** Preserve a trusted clearance when a repair dispatch has not moved the head. */
-import { readFileSync } from 'node:fs';
-import { isCandidacyHold, readMergeGateVerdict, resolveHumanGateRemovalSetting } from './merge-gate-hold-class.mjs';
+import { isCandidacyHold, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting } from './review-clearance-settings.mjs';
+
+export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
-import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
-import { readDeclaredSettings } from './settings-files.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 
-export const REVIEW_CLEARANCE_SETTINGS = {
-  rerunStaleGateOnClearance: { envKey: 'WE_REVIEW_CLEARANCE_RERUN_STALE_GATE' },
-  reviewHoldIsNotCiFailure: { envKey: 'WE_REVIEW_CLEARANCE_REVIEW_HOLD_NOT_CI' },
-  rearmRequiresHeadChange: { envKey: 'WE_REVIEW_CLEARANCE_REARM_REQUIRES_HEAD_CHANGE' },
-  ciHealRequiresFailingChecks: { envKey: 'WE_REVIEW_CLEARANCE_CI_HEAL_REQUIRES_FAILING_CHECKS' },
-  restoreNoPushRearm: { envKey: 'WE_REVIEW_CLEARANCE_RESTORE_NO_PUSH_REARM' },
-};
+let sweepOffset = 0;
 export const REARM_MARKER = '🔧 conveyor fix — re-armed for re-review';
 const RESTORE_MARKER = '🔔 conveyor — review clearance restored (no push since the clearance)';
 const holds = ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'];
@@ -27,33 +21,6 @@ const starts = (c, marker) => typeof c?.body === 'string' && c.body.split(/\r?\n
 const sameHead = (record, prHead, refHead) => /^[0-9a-f]{40}$/.test(record?.sha ?? '') && record.sha === prHead && record.sha === refHead;
 const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());
-
-export function resolveReviewClearanceSetting({ key, platform = {}, repo = {}, env = {}, readErrors = [] } = {}) {
-  if (!REVIEW_CLEARANCE_SETTINGS[key]) return { value: 'off', source: 'unreadable', why: 'unknown reviewClearance setting' };
-  if (readErrors.length) return { value: 'off', source: 'unreadable', why: readErrors.join('; ') };
-  const { ignored, ...result } = resolveHumanGateRemovalSetting({ platform, repo, env, blockName: 'reviewClearance', key, envKey: REVIEW_CLEARANCE_SETTINGS[key].envKey });
-  return result;
-}
-const logged = new Set();
-let sweepOffset = 0;
-export function loadReviewClearanceSetting({ key, env = process.env, readFile = readFileSync, readDeclared = readDeclaredSettings, log = line => console.error(line) } = {}) {
-  let platform = {}, repo = {};
-  const readErrors = [];
-  try { platform = JSON.parse(readFile(PLATFORM_PREFERENCES_PATH, 'utf8')); }
-  catch (e) { if (e?.code !== 'ENOENT') readErrors.push(`platform unreadable: ${e.message}`); }
-  try {
-    const declared = readDeclared();
-    repo = declared.settings;
-    if (declared.errors?.length) readErrors.push('repo settings unreadable');
-    if (declared.duplicates?.some(d => /^reviewClearance(?:\.|$)/.test(d.path))) readErrors.push('duplicate reviewClearance settings');
-  } catch (e) { readErrors.push(`repo settings unreadable: ${e.message}`); }
-  const result = resolveReviewClearanceSetting({ key, platform, repo, env, readErrors });
-  if (!logged.has(key)) {
-    logged.add(key);
-    log(`review-clearance · reviewClearance.${key}=${result.value} (source: ${result.source})`);
-  }
-  return result;
-}
 
 export function classifyGateFailure({ name, verdict } = {}) {
   if (name === 'review-gate') return { ciBreak: false, kind: 'review-gate', why: 'review-gate reads review labels' };

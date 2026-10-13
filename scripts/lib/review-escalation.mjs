@@ -24,6 +24,7 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { loadReviewClearanceSetting } from './review-clearance-settings.mjs';
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -1901,9 +1902,13 @@ export function parseOperatorClearance(comments) {
  * `reviewed-sha` + `cleared-human` comment posted after a REAL plain accept upgraded that accept into a human
  * clearance (review round 1 on PR #2716 — the "piggyback").
  */
-export function parseLatestHumanClearedSha(comments) {
+export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaCarriesSetting() } = {}) {
   let latestSha = null;
   let latestWasHumanCleared = false;
+  // #5193 (2026-10-13, reviewClearance.humanClearanceSurvivesSameShaAccept): a later plain accept of the SAME sha a
+  // human cleared does not revoke that clearance — the human looked at exactly this tree. Tracked per run of
+  // consecutive same-sha records, so a clearance never carries across a record for a different tree (#xuboo0q).
+  let humanInSameShaRun = false;
   for (const c of Array.isArray(comments) ? comments : []) {
     const body = c && typeof c.body === 'string' ? c.body : '';
     if (!body) continue;
@@ -1919,10 +1924,16 @@ export function parseLatestHumanClearedSha(comments) {
       CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
       bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
     }
+    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun) || bodyHumanCleared;
     latestSha = bodySha;
     latestWasHumanCleared = bodyHumanCleared;
   }
-  return latestWasHumanCleared ? latestSha : null;
+  return latestWasHumanCleared || (sameShaCarries && humanInSameShaRun) ? latestSha : null;
+}
+
+/** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */
+function sameShaCarriesSetting() {
+  try { return loadReviewClearanceSetting({ key: 'humanClearanceSurvivesSameShaAccept' }).value === 'on'; } catch { return false; }
 }
 
 /**
