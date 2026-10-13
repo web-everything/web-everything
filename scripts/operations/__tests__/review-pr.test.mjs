@@ -4639,7 +4639,7 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
     it('the read finding carries what each head already settled, and nothing for unreadable comments', () => {
       const rows = (cs) => shapeReadFinding(stubReader({ netRev: PINNED_HEAD, comments: cs })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' }).referralVerified;
       expect(rows(comments(record({ verified: [{ key, outcome: 'reproduced' }] })))).toEqual([{ head: PINNED_HEAD, key, outcome: 'reproduced' }]);
-      expect(rows(comments(record({ verified: [{ key, outcome: 'not-reproduced', reason: 'fine' }] })))).toEqual([{ head: PINNED_HEAD, key, outcome: 'not-reproduced' }]);
+      expect(rows(comments(record({ verified: [{ key, outcome: 'not-reproduced', reason: 'fine' }] })))).toEqual([{ head: PINNED_HEAD, key, outcome: 'not-reproduced', reason: 'fine' }]);
       expect(rows(comments(record()))).toEqual([{ head: PINNED_HEAD, key, outcome: 'referred' }]);
       expect(rows([])).toBeUndefined();
       expect(rows([{ body: '<!-- mandatory-referrals-v1: %7Bbroken', author: { login: 'web-everything' } }])).toBeUndefined();

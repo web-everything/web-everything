@@ -2823,7 +2823,11 @@ export const VERIFY_REASON_MAX = 300;
 export const VERIFY_MAX_CANDIDATES = 12;
 
 /** One line, no backticks, capped: the form a verifier's own words take wherever they are stored or shown. PURE. */
-export const foldVerifyReason = (text, fallback) => (foldUntrusted(text).replace(/\s+/g, ' ').trim().slice(0, VERIFY_REASON_MAX)) || fallback;
+// Control, format (bidi, zero-width), separator, private-use and lone-surrogate code points become spaces: the reason is printed raw
+// to the human asked to confirm (PR #5025 self-review), so a terminal escape must not be able to hide or rewrite that question.
+const VERIFY_REASON_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cs}]+/gu;
+export const foldVerifyReason = (text, fallback) => ([...foldUntrusted(text).replace(VERIFY_REASON_UNSAFE, ' ').replace(/\s+/g, ' ').trim()]
+  .slice(0, VERIFY_REASON_MAX).join('').trim()) || fallback;
 
 /**
  * `key → outcome` for one head, from the `{ head, key, outcome }` rows the `read` step recorded. Outcome is
@@ -2975,25 +2979,41 @@ export function verificationsToPersist(candidates, settled) {
  * earlier on this head (`known`, whether or not a seat raises the claim again: a quiet re-run is not a second signal). That one
  * answer comes from a model reading attacker-controlled PR content, and the citation check is only a format filter, so it retires
  * the REFERRAL (no ruling loop) but never the hold: the review reducer turns an otherwise clean accept into `needs-human` while
- * this list is non-empty. A second independent seat that could lift it is #xztd0mv. `[{ seat?, key, reason }]`, once per key. PURE.
+ * this list is non-empty. A second independent seat that could lift it is #xztd0mv. `reasons` is `key → the verifier's reason as
+ * stored on the head's record`, so a later run shows the human what was actually answered. `[{ seat?, key, reason }]`, once per
+ * key, every reason folded (`foldVerifyReason`). PURE.
  */
-export function uncorroboratedRetirements({ downgraded = [], known = new Map(), settled = new Map() } = {}) {
+export function uncorroboratedRetirements({ downgraded = [], known = new Map(), settled = new Map(), reasons = new Map() } = {}) {
   const knownOf = (key) => (known instanceof Map ? known.get(key) : undefined);
   const settledOf = (key) => (settled instanceof Map ? settled.get(key) : undefined);
+  const storedOf = (key) => (reasons instanceof Map ? reasons.get(key) : undefined);
+  const fallback = 'a tool-bearing seat could not reproduce it on this head';
   const out = [];
   const seen = new Set();
   for (const d of Array.isArray(downgraded) ? downgraded : []) {
     if (typeof d?.key !== 'string' || seen.has(d.key)) continue;
-    if (knownOf(d.key) !== 'not-reproduced' && settledOf(d.key)?.outcome !== 'not-reproduced') continue;
+    const now = settledOf(d.key);
+    if (knownOf(d.key) !== 'not-reproduced' && now?.outcome !== 'not-reproduced') continue;
     seen.add(d.key);
-    out.push({ seat: d.seat, key: d.key, reason: d.reason });
+    const reason = now?.outcome === 'not-reproduced' ? now.reason : storedOf(d.key) ?? d.reason;
+    out.push({ seat: d.seat, key: d.key, reason: foldVerifyReason(reason, fallback) });
   }
   for (const [key, outcome] of known instanceof Map ? known : []) {
     if (outcome !== 'not-reproduced' || seen.has(key)) continue;
     seen.add(key);
-    out.push({ key, reason: 'a tool-bearing seat could not reproduce it on this head' });
+    out.push({ key, reason: foldVerifyReason(storedOf(key), fallback) });
   }
   return out;
+}
+
+/** The stored `not-reproduced` reasons for ONE head, from the `read` step's `{ head, key, outcome, reason }` rows. PURE. */
+export function knownVerificationReasons(rows, head) {
+  const reasons = new Map();
+  if (typeof head !== 'string' || !head) return reasons;
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r && r.head === head && r.outcome === 'not-reproduced' && typeof r.key === 'string' && typeof r.reason === 'string') reasons.set(r.key, r.reason);
+  }
+  return reasons;
 }
 
 const supersededRulings = (ruling) => ruling.supersedes == null ? []

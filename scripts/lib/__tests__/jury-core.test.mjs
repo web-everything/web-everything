@@ -2855,7 +2855,7 @@ describe('xc7ctn1 @pr<N> card citations reach every validator that consumes CARD
 import {
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification,
   downgradeUnverifiedFinding, verificationsToPersist, VERIFY_MAX_CANDIDATES, UNVERIFIED_NOTE_PREFIX, verifierEvidenceCitesClaim,
-  uncorroboratedRetirements,
+  uncorroboratedRetirements, knownVerificationReasons,
 } from '../jury-core.mjs';
 
 describe('#4815 seat capability and the confirmation turn (pure)', () => {
@@ -3039,6 +3039,15 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     it('STATE OVER TIME: a retirement recorded earlier on this head holds even when no seat re-raises the claim', () => {
       expect(uncorroboratedRetirements({ downgraded: [], known: new Map([['k-gone', 'not-reproduced']]) }))
         .toEqual([{ key: 'k-gone', reason: expect.stringMatching(/could not reproduce it on this head/) }]);
+    });
+    it('a later run shows the reason stored on the head\'s record, and every reason is one safe line (no escape, invisible or newline)', () => {
+      const known = new Map([['k-before', 'not-reproduced'], ['k-gone', 'not-reproduced']]);
+      const reasons = new Map([['k-before', 'x.mjs:1 stored answer'], ['k-gone', 'x.mjs:2 \u001b[2K\u001b[1Ahidden​‮text\nnext']]);
+      const got = uncorroboratedRetirements({ downgraded: [{ seat: 's', key: 'k-before', reason: 'generic' }], known, reasons });
+      expect(got.map((r) => r.reason)).toEqual(['x.mjs:1 stored answer', expect.stringContaining('hidden')]);
+      expect(got[1].reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f​‮]/);
+      expect(knownVerificationReasons([{ head: 'h', key: 'k', outcome: 'not-reproduced', reason: 'r' }, { head: 'o', key: 'k2', outcome: 'not-reproduced', reason: 'x' },
+        { head: 'h', key: 'k3', outcome: 'reproduced', reason: 'y' }], 'h')).toEqual(new Map([['k', 'r']]));
     });
     it('nothing retired means nothing held, and junk input holds nothing it cannot name', () => {
       expect(uncorroboratedRetirements({})).toEqual([]);

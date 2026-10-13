@@ -1,7 +1,7 @@
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
-  uncorroboratedRetirements, activeReferrals } from '../lib/jury-core.mjs';
+  uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
@@ -1353,7 +1353,8 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     referralVerified = readReferralRecords(raw.comments ?? []).records.flatMap((rec) => rec.referrals.flatMap((f) => {
       const v = (rec.verified ?? []).find((x) => x.key === f.key);
       const outcome = v?.outcome ?? (activeReferrals(rec).some((a) => a.key === f.key) ? 'referred' : null);
-      return outcome ? [{ head: rec.head, key: f.key, outcome }] : [];
+      // A `not-reproduced` row keeps the verifier's stored reason, so a later run shows the human what was answered (PR #5025).
+      return outcome ? [{ head: rec.head, key: f.key, outcome, ...(outcome === 'not-reproduced' && v?.reason ? { reason: v.reason } : {}) }] : [];
     }));
   } catch { referralVerified = []; }
   return {
@@ -2166,6 +2167,19 @@ function renderRevProvenance(netBasis) {
 /** The stated outcome of a note posted while mandatory referrals are unruled: neither `accept` nor `changes`. */
 const ADVISORY_PENDING_REFERRAL_OUTCOME = 'pending-referral';
 
+/** PR #5025 — at most this many lone-answer retirement reasons are listed to the human; the rest are counted. */
+const RETIREMENT_REASONS_SHOWN = 5;
+
+/**
+ * The reasons of the claims retired on one verifier answer, each folded to one safe line (`foldVerifyReason`: no newline, backtick,
+ * control or invisible character, capped) — the human-facing list shared by the confirm question and the advisory note. PURE.
+ */
+export function listRetirementReasons(retirements) {
+  const list = Array.isArray(retirements) ? retirements : [];
+  const shown = list.slice(0, RETIREMENT_REASONS_SHOWN).map((r) => foldVerifyReason(r?.reason, 'no reason recorded'));
+  return list.length > RETIREMENT_REASONS_SHOWN ? [...shown, `and ${list.length - RETIREMENT_REASONS_SHOWN} more`] : shown;
+}
+
 /**
  * THE ADVISORY'S OWN OUTCOME — `accept` or `changes` — with the human gate FACTORED OUT. PURE.
  *
@@ -2287,7 +2301,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     ...(Array.isArray(v.uncorroboratedRetirements) && v.uncorroboratedRetirements.length
       ? ['', `**Retired on one verifier answer (${v.uncorroboratedRetirements.length}):** a tool-bearing seat answered "not reproduced" `
         + 'and nothing corroborated it, so these are no longer referrals but still need your look before you accept:',
-      ...v.uncorroboratedRetirements.map((r) => `- ${foldUntrusted(String(r?.reason ?? 'no reason recorded')).replace(/\s+/g, ' ').slice(0, 300)}`)]
+      ...listRetirementReasons(v.uncorroboratedRetirements).map((line) => `- ${line}`)]
       : []),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
     // The `**Verdict:**` line above cannot carry it: on a `review:human` PR it is always "human review required".
@@ -3015,7 +3029,8 @@ export function reviewPrOperation({
         // `needs-human`, so the loop never auto-confirms it and a human accepts. Read from the head's records directly, so a later run
         // on this head holds too, even with no tool-less seat re-raising the claim. A real blocker still reduces to `changes`.
         const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
-          known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims });
+          known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims,
+          reasons: knownVerificationReasons(read.referralVerified, read.netBasis?.rev) });
         const panelHumanRequired = read.humanRequired === true || pendingVerifications.length > 0;
         const panelVerdict = derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
@@ -3245,7 +3260,7 @@ export function reviewPrOperation({
           + `${v.pendingVerifications?.length ? ` (${v.pendingVerifications.length} claim(s) awaiting tool-bearing verification)`
             // The held run is often NOT a `review:human` PR, so no advisory note is posted: the question itself names each claim.
             : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) retired on one verifier answer: a human confirms the accept — `
-              + `${v.uncorroboratedRetirements.map((r) => foldUntrusted(String(r?.reason ?? 'no reason recorded')).replace(/\s+/g, ' ').slice(0, 300)).join('; ')})`
+              + `${listRetirementReasons(v.uncorroboratedRetirements).join('; ')})`
               : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
           + `Record which verdict? (${CONFIRM_OPTIONS.join(' | ')}; \`abstain\` writes nothing)`;
       },
