@@ -5,6 +5,7 @@ import { planReconcile } from '../reconcile-core.mjs';
 import { resolvePrOwnershipSettings, loadPrOwnershipSettings } from '../pr-ownership-settings.mjs';
 import { ownerFor, assessPrOwnership, assessOwnership } from '../../operations/pr-ownership.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 const checks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/pr-ownership/${name}.json`, import.meta.url), 'utf8'));
 const before = 'pr-5157-before-ci-heal';
@@ -54,6 +55,44 @@ describe('cards 273 and 278 incident replays', () => {
         body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${pr.headRefOid}\`` });
     });
     expect(reviews(result)).toEqual([]);
+  });
+  it.each(['merge-gate', 'review-gate', 'both'])('keeps the advisory fixer reachable on a red %s hold across ticks', gate => {
+    const fx = fixture(before);
+    annotate(fx.pr);
+    const merge = fx.pr.statusCheckRollup.filter(r => r.name === 'merge-gate').at(-1);
+    if (gate === 'review-gate') merge.conclusion = 'SUCCESS';
+    if (gate !== 'merge-gate') fx.pr.statusCheckRollup.filter(r => r.name === 'review-gate').at(-1).conclusion = 'FAILURE';
+    const options = { repo: 'we', prs: [fx.pr], now: Date.parse(fx.observedAt),
+      requiredChecks: [...checks, 'review-gate'], ...on };
+    expect(reviews(planReconcile(options))).toHaveLength(1);
+    fx.pr.labels = fx.pr.labels.filter(l => l.name !== 'review:pending');
+    fx.pr.labels.push({ name: 'advisory:changes' });
+    fx.pr.comments.push({ author: { login: 'web-everything' }, createdAt: fx.observedAt,
+      body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Changes requested\n\n**Advisory outcome:** \`changes\`\n\nAdmitted finding: the test games the gate.\n\nNet basis: \`${'0'.repeat(40)}..${fx.pr.headRefOid}\`` });
+    for (let tick = 1; tick <= 3; tick++) {
+      const result = planReconcile({ ...options, now: options.now + tick * 60_000 });
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'advisory-fix' })]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-hold-red' }));
+    }
+    const capped = planReconcile({ ...options, advisoryFixCap: 0, roundCapAction: 'person' });
+    expect(capped.dispatch).toEqual([]);
+    expect(capped.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', capKind: 'advisory-fix' }));
+    const empty = planReconcile({ ...options, prs: [{ ...fx.pr, comments: [] }] });
+    expect(empty.dispatch).toEqual([]);
+    expect(empty.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings' }));
+    const moved = { ...fx.pr, headRefOid: 'b'.repeat(40) };
+    for (const addressed of [false, true]) {
+      const pr = { ...moved, comments: [...moved.comments,
+        ...(addressed ? [{ author: { login: 'web-everything' }, body: buildAdvisoryFixComment({}) }] : [])] };
+      const recovery = { ...options, prs: [pr], advisoryFixCap: 0, roundCapAction: 'person' };
+      expect(planReconcile(recovery).dispatch).toEqual([expect.objectContaining({ kind: 'review',
+        advisoryReview: { head: pr.headRefOid, reason: 'review-hold', ciWaived: true } })]);
+      for (const blocker of [{ isDraft: true }, { referralHold: { kind: 'same-head', why: 'awaiting ruling' } }]) {
+        expect(planReconcile({ ...recovery, prs: [{ ...pr, ...blocker }] }).dispatch).toEqual([]);
+      }
+    }
+    fx.pr.statusCheckRollup.filter(r => r.name === 'test').at(-1).conclusion = 'FAILURE';
+    expect(planReconcile(options).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
   });
   it('respects the restore grace at observation time', () => {
     expect(replay(unlabeled, { unlabeledRedAgentPr: 'review-label' }).dispatch).toEqual([]);

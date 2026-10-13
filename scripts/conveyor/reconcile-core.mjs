@@ -2707,17 +2707,22 @@ export function planReconcile({
       continue;
     }
 
-    if (ciRepairOwed) {
-      const heldGates = splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required;
-      const latestMergeGate = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(r => r.name === 'merge-gate');
-      if (advisoryReviewOnHumanHandoff === 'on'
-          && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
-          && heldGates.length && heldGates.every(name => name === 'review-gate'
-            || (name === 'merge-gate' && latestMergeGate?.mergeGateReviewHold))) {
-        refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+    const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
+    const latestMergeGate = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(r => r.name === 'merge-gate');
+    const reviewHoldRed = advisoryReviewOnHumanHandoff === 'on'
+      && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      && heldGates.length > 0 && heldGates.every(name => name === 'review-gate'
+        || (name === 'merge-gate' && latestMergeGate?.mergeGateReviewHold));
+    if (reviewHoldRed) {
+      refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+      // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
+      // guards below reachable, without healing held gates or dispatching a second review.
+      if (!(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {
         humanHandoffAdvisory('review-hold');
         continue;
       }
+    }
+    if (ciRepairOwed && !reviewHoldRed) {
       // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
       const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
@@ -3176,6 +3181,7 @@ export function planReconcile({
           const latest = headSha ? latestAdvisory(trustedComments) : undefined;
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
+            if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
             if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
@@ -3234,6 +3240,7 @@ export function planReconcile({
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
+      if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
