@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main, readSelfLogin } from '../pr-label-mirror.mjs';
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
-import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
+import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
 
 const fam = (family, missing = [], extra = []) => ({ family, missing, extra, agree: !missing.length && !extra.length });
@@ -92,6 +92,7 @@ function world({ labels = [], verdict = 'human', timeline = { status: 'ok', item
     listPrs: () => [{ number: 7, labels: w.labels.map((name) => ({ name })) }],
     readEvents: async () => ({ status: 'ok', rows: [...w.rows], store: { name: 'home', shared: false } }),
     buildRows: (o) => buildDerivedRows({ ...o, readFacts: () => FACTS }),
+    readFacts: () => FACTS,
     readTimeline: async () => timeline,
     selfLogin: 'mirror-bot-login',
     appendRow: async (row) => { w.log.push(`append:${row.label}:${row.change}`); if (!appendOk) return { ok: false, errors: ['refused'] }; w.rows.push(row); return { ok: true, errors: [] }; },
@@ -101,6 +102,20 @@ function world({ labels = [], verdict = 'human', timeline = { status: 'ok', item
 }
 
 describe('#5649 runMirrorApply', () => {
+  it('does not append a stale hand-added hold after clear-human completes during the timeline read', async () => {
+    const w = world({ labels: ['review:human'] });
+    w.opts.readTimeline = async () => {
+      w.rows.push({ type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'accepted', at: '2026-10-12T12:00:00.000Z', reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) });
+      w.rows.push(buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.000Z', source: 'review-set-label', approval: 'clear-human' }));
+      w.labels = ['review:accepted'];
+      return { status: 'ok', items: [tl('review:human', 'added', 'operator', '2026-10-12T10:00:00Z')] };
+    };
+    const out = await runMirrorApply(w.opts);
+    expect(out.failures).toEqual([]);
+    expect(w.log).toEqual([]);
+    expect(out.rowsAppended).toEqual([]);
+  });
+
   it('a hand-removed review:human becomes a removed label-input row and is restored (--apply)', async () => {
     const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'added', 'mirror-bot-login', '2026-10-12T10:30:00Z'), tl('review:human', 'removed', 'operator')] } });
     const report = await runMirrorReport(w.opts); // RED reason today: the report plans the add but has no way to write it
@@ -193,9 +208,9 @@ describe('#5649 runMirrorApply', () => {
     const r = await readLabelTimeline({ repo: REPO, pr: 7, read });
     expect(r.status).toBe('ok');
     expect(r.items).toEqual([
-      { label: 'review:human', change: 'removed', actor: 'operator', actorType: 'User', createdAt: '2026-10-12T11:00:00Z' },
       { label: 'review:human', change: 'added', actor: 'ci', actorType: 'Bot', createdAt: '2026-10-12T09:00:00Z' },
       { label: 'bug', change: 'added', actor: null, actorType: null, createdAt: '2026-10-12T09:30:00Z' },
+      { label: 'review:human', change: 'removed', actor: 'operator', actorType: 'User', createdAt: '2026-10-12T11:00:00Z' },
     ]);
     expect(queries[0]).not.toContain('before:');
     expect(queries[1]).toContain('before:"CUR1"');
@@ -209,6 +224,20 @@ describe('#5649 runMirrorApply', () => {
     expect(await readLabelTimeline({ repo: REPO, pr: 7, read: () => '{"data":{"repository":{"pullRequest":null}}}' })).toMatchObject({ status: 'unreadable' });
     expect(await readLabelTimeline({ repo: REPO, pr: 7, read: () => { throw new Error('gh down'); } })).toMatchObject({ status: 'unreadable', reason: expect.stringContaining('gh down') });
     expect(await readLabelTimeline({ repo: 'bad repo', pr: 7, read: more })).toMatchObject({ status: 'unreadable', reason: 'bad-target' });
+  });
+
+  it('keeps connection order for equal timestamps across older timeline pages', async () => {
+    const node = (change, label, createdAt) => ({ __typename: change === 'added' ? 'LabeledEvent' : 'UnlabeledEvent', label: { name: label }, createdAt, actor: { __typename: 'User', login: 'operator' } });
+    const events = [node('added', 'review:human', '2026-10-12T09:00:00Z'), node('removed', 'review:human', '2026-10-12T10:00:00Z'), node('added', 'review:human', '2026-10-12T10:00:00Z'), ...Array.from({ length: 99 }, () => node('added', 'bug', '2026-10-12T11:00:00Z'))];
+    let page = 0;
+    const read = () => JSON.stringify({ data: { repository: { pullRequest: { timelineItems: {
+      nodes: page++ === 0 ? events.slice(2) : events.slice(0, 2),
+      pageInfo: { hasPreviousPage: page === 1, startCursor: 'older' },
+    } } } } });
+    const timeline = await readLabelTimeline({ repo: REPO, pr: 7, read });
+    expect(timeline.status).toBe('ok');
+    const rows = planLabelInputRows({ repo: REPO, pr: 7, items: timeline.items, liveLabels: ['review:human'], selfLogin: 'mirror' });
+    expect(rows).toEqual([expect.objectContaining({ label: 'review:human', change: 'added' })]);
   });
 
   it('readSelfLogin reads the gh api user login and refuses an empty one', () => {
@@ -246,6 +275,23 @@ describe('#5649 runMirrorApply', () => {
     const out = await runMirrorApply(w.opts);
     expect(w.log).toEqual([]);
     expect(out.failures).toEqual([{ pr: 7, reason: 'ledger-unreadable: store-read-failed' }]);
+  });
+
+  it('refuses writes if the live-label refresh is missing, truncated, or throws, or fresh facts are unreadable', async () => {
+    for (const refresh of [() => [], () => Array.from({ length: 200 }, () => ({ number: 7, labels: [] })), () => { throw new Error('offline'); }]) {
+      const w = world({ timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+      const initial = w.opts.listPrs;
+      let reads = 0;
+      w.opts.listPrs = (...args) => ++reads === 1 ? initial(...args) : refresh();
+      const out = await runMirrorApply(w.opts);
+      expect(w.log).toEqual([]);
+      expect(out.failures).toEqual([{ pr: 7, reason: expect.stringContaining('labels-unreadable:') }]);
+    }
+    const w = world({ timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+    w.opts.readFacts = () => null;
+    const out = await runMirrorApply(w.opts);
+    expect(w.log).toEqual([]);
+    expect(out.failures).toEqual([{ pr: 7, reason: expect.stringContaining('facts-unreadable:') }]);
   });
 
   it('an unknown mirror login refuses to write at all, and a PR whose facts are unreadable is never a candidate', async () => {
@@ -289,6 +335,21 @@ describe('#5649 planLabelInputRows', () => {
     expect(row).toMatchObject({ type: 'label-input', label: 'review:human', change: 'removed', sender: 'operator', at: '2026-10-12T11:00:00Z' });
     expect(planLabelInputRows({ ...base, liveLabels: [], items, events: [row] })).toEqual([]);
     expect(planLabelInputRows({ ...base, liveLabels: [], items, events: [{ ...row, pr: 8 }] })).toHaveLength(1); // another PR's row never suppresses it
+  });
+  it('ignores historical additions cleared by an approval even while live labels lag, but preserves newer holds and audit removals', () => {
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z', source: 'review-set-label', approval: 'clear-human' });
+    const opts = { ...base, events: [approval], liveLabels: ['review:human'], now: Date.parse('2026-10-12T13:00:00Z') };
+    for (const time of ['2026-10-12T11:00:00Z', '2026-10-12T12:00:00Z']) {
+      expect(planLabelInputRows({ ...opts, items: [tl('review:human', 'added', 'operator', time)] })).toEqual([]);
+    }
+    expect(planLabelInputRows({ ...opts, items: [tl('review:human', 'added', 'operator', '2026-10-12T12:00:01Z')] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, events: [{ ...approval, pr: 8 }], items: [tl('review:human', 'added', 'operator')] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, events: [{ ...approval, delegation: { by: 'judge', scope: 'review', expires: '2026-10-12T12:30:00Z' } }], items: [tl('review:human', 'added', 'operator')] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, liveLabels: [], items: [tl('review:human', 'removed', 'operator')] })).toHaveLength(1);
+    const clear = { type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'accepted', at: approval.at, reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) };
+    const addition = [tl('review:human', 'added', 'operator')];
+    expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
+    expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);

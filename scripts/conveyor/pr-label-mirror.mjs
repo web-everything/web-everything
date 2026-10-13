@@ -17,8 +17,10 @@
  */
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
-import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
+import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears } from '../lib/verdict-ledger.mjs';
 import { HOLD_LABELS } from '../lib/pr-state/holds/label-input.mjs';
+import { approvalValid, acceptanceCovers } from '../lib/pr-state/holds/verdict.mjs';
+import { readPrFacts } from '../lib/pr-state-io.mjs';
 import { readGh } from '../lib/proc-read.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
@@ -102,7 +104,9 @@ export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TI
         nodes { __typename ... on LabeledEvent { ${actor} } ... on UnlabeledEvent { ${actor} } } } } } }`;
       const tl = JSON.parse(String(read(['api', 'graphql', '-f', `query=${query}`]))).data?.repository?.pullRequest?.timelineItems;
       if (!tl || !Array.isArray(tl.nodes)) return { status: 'unreadable', reason: 'no-timeline' };
-      items.push(...tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))
+      // `last` pages arrive newest first; prepend each older page without reversing its connection order.
+      // Equal createdAt values must retain that order across page boundaries as well as within a page.
+      items.unshift(...tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))
         .map((n) => ({ label: String(n.label.name), change: n.__typename === 'LabeledEvent' ? 'added' : 'removed',
           actor: n.actor?.login ? String(n.actor.login) : null, actorType: n.actor?.__typename ? String(n.actor.__typename) : null, createdAt: String(n.createdAt) })));
       if (tl.pageInfo?.hasPreviousPage === false) return { status: 'ok', items };
@@ -134,7 +138,7 @@ const sameTime = (a, b) => Number.isFinite(Date.parse(a)) && Date.parse(a) === D
  * hand-made for `added` (tighten) and NOT for `removed`. Rows already in `events` (repo + pr + label + change + time)
  * are dropped.
  */
-export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], selfLogin, events = [] } = {}) {
+export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], selfLogin, events = [], now = Date.now(), headSha } = {}) {
   const self = String(selfLogin ?? '').toLowerCase();
   const live = new Set(liveLabels);
   const latest = new Map();
@@ -145,6 +149,12 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     if ((it.change === 'added') !== live.has(it.label)) continue; // the PR has moved on since this change
     if (it.actor && it.actor.toLowerCase() === self) continue;     // the mirror's own (or its account's) write
     if (it.change === 'removed' && (!it.actor || isBot(it))) continue;
+    // A delayed observation must not move an old addition after its clearing ceremony in append order.
+    // This also covers the interval between clear-human's approval append and its live label swap.
+    if (it.change === 'added' && events.some((e) => e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
+      && Date.parse(e.at) >= Date.parse(it.createdAt)
+      && (approvalValid(e, now) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
+        && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
       && e.label === it.label && e.change === it.change && sameTime(e.at, it.createdAt));
     if (dup) continue;
@@ -172,6 +182,7 @@ export async function addApplyLabel(repo, pr, label, { provider } = {}) {
  */
 export async function runMirrorApply({
   repo = DEFAULT_REPO, store, limit = 200, listPrs = readOpenPrs, readEvents = readLedgerEventsFromStore, buildRows = buildDerivedRows,
+  readFacts = readPrFacts,
   readTimeline = readLabelTimeline, selfLogin = readSelfLogin, appendRow = (row) => appendVerdictAsync(row, store ? { store } : {}),
   addLabel = addApplyLabel,
 } = {}) {
@@ -195,10 +206,19 @@ export async function runMirrorApply({
     const fail = (reason) => out.failures.push({ pr: p.number, reason });
     const tl = await readTimeline({ repo, pr: p.number });
     if (tl?.status !== 'ok') { fail(`timeline-unreadable: ${tl?.reason ?? 'unknown'}`); continue; }
+    let current, facts;
+    try {
+      const live = await listPrs({ repo, limit });
+      if (!Array.isArray(live) || live.length >= limit) throw new Error('possibly truncated open-PR list');
+      current = live.find((entry) => entry.number === p.number);
+      if (!current || !Array.isArray(current.labels)) throw new Error('PR or labels missing');
+    } catch (e) { fail(`labels-unreadable: ${firstLine(e)}`); continue; }
+    try { facts = await readFacts(p.number, { repo }); } catch (e) { fail(`facts-unreadable: ${firstLine(e)}`); continue; }
+    if (!facts || !facts.head?.sha || (facts.probeErrors ?? []).length) { fail('facts-unreadable: missing head or failed probe'); continue; }
     const fresh = await readEvents(repo, { store }); // best-effort idempotency: a fresh read just before the append (not atomic)
     if (fresh.status !== 'ok') { fail(`ledger-unreadable: ${fresh.reason}`); continue; }
     let toAppend;
-    try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(p), selfLogin: self, events: fresh.rows }); } catch (e) {
+    try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(current), selfLogin: self, events: fresh.rows, headSha: facts.head.sha, now: facts.now ?? Date.now() }); } catch (e) {
       fail(`bad-label-input-row: ${firstLine(e)}`); continue;
     }
     let ok = true;
@@ -209,11 +229,11 @@ export async function runMirrorApply({
       out.writes += 1;
       out.rowsAppended.push({ pr: p.number, label: row.label, change: row.change, sender: row.sender, at: row.at });
     }
-    if (!ok || !wantsAdd.get(p.number) || liveNames(p).includes(APPLY_ADD_LABEL)) continue;
+    if (!ok || !wantsAdd.get(p.number) || liveNames(current).includes(APPLY_ADD_LABEL)) continue;
     // The add was planned from the snapshot taken at the start of the pass: a `clear-human` that landed since must win.
     // Re-derive this one PR from a fresh ledger read and add only if `review:human` is still wanted.
     const latest = await readEvents(repo, { store });
-    const again = latest.status === 'ok' ? deriveRowsFor(buildRows, { repo, prs: [p], events: latest.rows })[0] : null;
+    const again = latest.status === 'ok' ? deriveRowsFor(buildRows, { repo, prs: [current], events: latest.rows })[0] : null;
     if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
     if (!again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
     try { await addLabel(repo, p.number, APPLY_ADD_LABEL); out.writes += 1; out.labelsAdded.push({ pr: p.number, label: APPLY_ADD_LABEL }); } catch (e) {
