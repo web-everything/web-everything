@@ -39,6 +39,26 @@ describe('ci-heal reserve slot', () => {
     const r = createCiHealReserve({ ...idle, env: {}, listClaims: () => [claim('fix', 1), claim('ci-heal', 4283)] });
     expect(r.tryAdmit()).toMatchObject({ admit: true });
   });
+  it('three claims for PR #5042 consume one of three reserved slots', () => {
+    const r = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '3' },
+      listClaims: () => Array.from({ length: 3 }, () => claim('ci-heal', 5042)) });
+    expect(r.tryAdmit()).toMatchObject({ admit: true, reserved: true });
+    expect(r.tryAdmit()).toMatchObject({ admit: true, reserved: true });
+    const refused = r.tryAdmit();
+    expect(refused).toMatchObject({ admit: false, kind: 'fix-cap' });
+    expect(refused.why).toContain('(3 live ci-heal)');
+    expect(refused.why).toContain('held by ci-heal #5042; queued oldest-first');
+    expect(refused.why).not.toContain('next in line');
+  });
+  it('deduplicates named holders but counts each claim without a PR separately', () => {
+    const r = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '4' },
+      listClaims: () => [claim('ci-heal', 5042), claim('ci-heal', 5042), claim('ci-heal', 5051),
+        claim('ci-heal', undefined), claim('ci-heal', null), claim('fix', 5087)] });
+    const refused = r.tryAdmit();
+    expect(refused).toMatchObject({ admit: false, kind: 'fix-cap' });
+    expect(refused.why).toContain('(4 live ci-heal)');
+    expect(refused.why).toContain('held by ci-heal #5042, #5051, unknown PR, unknown PR; queued oldest-first');
+  });
   it('reserve 0 is off; host load still refuses', () => {
     expect(createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '0' } }).tryAdmit().admit).toBe(false);
     expect(createCiHealReserve({ sample: () => ({ ok: false }), loadavg: () => 36, cpuCount: () => 12, env: {} }).tryAdmit()).toMatchObject({ admit: false, kind: 'host-load' });
