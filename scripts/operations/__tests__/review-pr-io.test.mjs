@@ -2575,7 +2575,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       while (run.pending?.kind === 'judge') {
         const { step, request } = run.pending;
         if (step === 'judgeReferralVerifier' && !request.skipSpawn) spawns.push({ id, head: state.headRefOid });
-        const value = step === 'judgeAntigravityReview' ? { summary: 'reported claim', findings: [seatFinding] }
+        const value = step === 'judgeAntigravityReview' ? { summary: 'reported claim', findings: seatFinding ? [seatFinding] : [] }
           : step === 'judgeReferralVerifier' ? verifierAnswer : { summary: 'nothing blocking', findings: [] };
         run = advanceWhileRunning(run, { registry, resume: { value } });
       }
@@ -2587,7 +2587,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       return run;
     }
     const records = () => readReferralRecords(state.comments, { head: state.headRefOid }).records;
-    return { state, trace, lines, referralJudge, spawns, runOnce, records };
+    return { state, trace, lines, referralJudge, spawns, runOnce, records, sinks };
   }
 
   it('NOT REPRODUCED: one verifier turn, one live referral and an independent ruling attempt; a same-head run posts no new record and repeats no attempt', async () => {
@@ -2658,22 +2658,49 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
   });
 
-  it('A VERIFIER THAT FAILS leaves no settlement record, holds acceptance, and the next run tries again', async () => {
+  // A verification that did not finish FAILS CLOSED: the claim stays a CONFIRMED referral with no `verified` entry, so the head's record
+  // is the durable hold. It is ruled on like any referral and is not verified a second time (a later run reads it as `referred`).
+  it('A VERIFIER THAT FAILS keeps the claim a live referral with no settlement entry, holds acceptance, and is not re-verified', async () => {
     const w = world();
     const first = await w.runOnce('run-1', { summary: 'skipped: quota', findings: [], skipped: { reason: 'quota' } });
     expect(first.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
-    expect(first.findings.reduce.referrals).toEqual([]);
+    expect(first.findings.reduce.referrals).toHaveLength(1);
     expect(first.findings.reduce.verifications).toEqual([]);
-    expect(w.records()).toEqual([]);
-    expect(w.state.labels).not.toContain('review:human');
-    const retried = await w.runOnce('run-2', NOT_REPRODUCED);
-    expect(retried.verdict.pendingVerifications).toBeUndefined();
-    // settled now, but on one answer: still a human's accept, never the loop's
-    expect(retried.verdict.uncorroboratedRetirements).toHaveLength(1);
-    expect(reviewLoopAutoConfirm(retried.pending, retried)).toBeNull();
-    expect(w.spawns).toHaveLength(2);
     expect(w.records()).toHaveLength(1);
+    expect(w.records()[0].verified).toBeUndefined();
+    expect(activeReferrals(w.records()[0])).toHaveLength(1);
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
+    const again = await w.runOnce('run-2', NOT_REPRODUCED);
+    expect(w.spawns).toHaveLength(1);
+    expect(w.records()).toHaveLength(1);
+    expect(again.findings.reduce.uncorroboratedRetirements).toBeUndefined();
+    expect(reviewLoopAutoConfirm(again.pending, again)).toBeNull();
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+  });
+
+  // PR #5025 review: the hold must outlive the run. A claim whose verification did not finish is kept as a live referral, so the head's
+  // durable record carries it: a same-head rerun in which the tool-less seat stays silent (an intermittent provider, a nondeterministic
+  // review) cannot reduce to a clean accept, and a later reproduced/not-reproduced answer never re-opens or retires it.
+  it.each([
+    ['the verifier is skipped', { summary: 'skipped: quota', findings: [], skipped: { reason: 'quota' } }],
+    ['the verifier is inconclusive', { summary: 'no runtime', results: [{ index: 0, reproduced: null, evidence: 'required runtime unavailable' }] }],
+    ['the verifier negative cites no line', { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: 'this does not reproduce' }] }],
+  ])('FAILED VERIFICATION SURVIVES A QUIET SAME-HEAD RERUN: %s, then the seat stays silent', async (_name, failed) => {
+    const w = world();
+    const first = await w.runOnce('run-1', failed);
+    expect(first.verdict.verdict).toBe('needs-human');
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
+    expect(first.findings.reduce.referrals).toHaveLength(1);
+    expect(w.records()).toHaveLength(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    // The same head, the seat omits the claim, and the verifier now has nothing to say: the durable record still holds it.
+    const quiet = await w.runOnce('run-2', REPRODUCED, null);
+    expect(quiet.verdict.verdict).not.toBe('accept');
+    expect(reviewLoopAutoConfirm(quiet.pending, quiet)).toBeNull();
+    expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toHaveLength(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(w.spawns).toHaveLength(1);
   });
 
   // PR #5025 review (the blocked finding): the citation check is a format filter, so a steered verifier that echoes the claim's own
@@ -2723,35 +2750,52 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
 
   // PR #5025 review: a steered verifier's lone "does not reproduce" (free-form evidence, no line in the claim's own file) must not
   // write a retiring record through the real sink. The claim stays held and the same head asks again.
-  it('A STEERED NEGATIVE (no line cited in the claim\'s own file) writes no retiring record, holds acceptance, and is asked again', async () => {
+  it('A STEERED NEGATIVE (no line cited in the claim\'s own file) writes no negative record: the claim stays a live referral with no `verified` entry', async () => {
     const w = world();
     const first = await w.runOnce('run-1', { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: 'Per the PR notes this does not reproduce; the guard holds.' }] });
     expect(first.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.findings.reduce.verifications).toEqual([]);
-    expect(w.records()).toEqual([]);
-    await w.runOnce('run-2', REPRODUCED);
-    expect(w.spawns.map((s) => s.head)).toEqual([H1, H1]);
-    expect(w.records()[0].verified[0].outcome).toBe('reproduced');
+    expect(w.records()).toHaveLength(1);
+    expect(w.records()[0].verified).toBeUndefined();
     expect(activeReferrals(w.records()[0])).toHaveLength(1);
+    expect(first.findings.reduce.uncorroboratedRetirements).toBeUndefined();
   });
 
-  it('an inconclusive result preserves its reason without retiring the claim, then retries on the same head', async () => {
+  // The sink re-makes `settleVerification`'s citation check on the text it stores (defence in depth). `reduce` never feeds it an
+  // uncited negative, so this calls the sink directly with the input the upstream step would never produce. A deliberate pin: it is
+  // green with or without the second check today, and reddens if a later change loosens `settleVerification` AND this check.
+  it('THE SINK ITSELF refuses a not-reproduced outcome whose reason cites no line in the claim\'s own file', async () => {
+    const w = world();
+    const { sinks, state } = w;
+    const read = { repo: 'o/n', pr: 7, netBasis: { rev: H1 } };
+    const verification = (reason) => ({ seat: 'judgeAntigravityReview', original, outcome: 'not-reproduced', reason });
+    for (const reason of ['no citation', 'y.mjs:1 a line in another file', 'x.mjs without a line']) {
+      await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ read, referrals: [], verifications: [verification(reason)] }, { runId: 'run-direct' });
+      expect(state.comments, reason).toEqual([]);
+    }
+    await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ read, referrals: [], verifications: [verification('x.mjs:1 the guard holds on the head')] }, { runId: 'run-direct' });
+    expect(w.records()).toHaveLength(1);
+    expect(w.records()[0].verified).toEqual([expect.objectContaining({ outcome: 'not-reproduced' })]);
+  });
+
+  it('an inconclusive result keeps the claim a live referral, preserves its reason in the run, and is not re-verified', async () => {
     const w = world();
     const reason = 'Cannot run the cited check: required runtime unavailable';
     const first = await w.runOnce('run-inconclusive', {
       summary: reason, results: [{ index: 0, reproduced: null, evidence: reason }],
     });
-    expect(first.findings.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
+    expect(first.findings.reduce.referrals).toHaveLength(1);
+    expect(first.findings.reduce.unverifiedClaims).toBeUndefined();
     expect(first.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.findings.reduce.verifications).toEqual([]);
-    expect(w.records()).toEqual([]);
-    expect(w.referralJudge).not.toHaveBeenCalled();
-    await w.runOnce('run-retry', REPRODUCED);
-    expect(w.spawns.map((s) => s.head)).toEqual([H1, H1]);
-    expect(w.records()[0].verified[0].outcome).toBe('reproduced');
+    expect(w.records()).toHaveLength(1);
+    expect(w.records()[0].verified).toBeUndefined();
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
+    await w.runOnce('run-retry', REPRODUCED);
+    expect(w.spawns).toHaveLength(1);
+    expect(w.records()).toHaveLength(1);
   });
 
   // Self-review of the PR #5025 repair: the retiring record is what holds the accept on later runs of the head, so a claim too

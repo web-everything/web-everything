@@ -2855,7 +2855,7 @@ describe('xc7ctn1 @pr<N> card citations reach every validator that consumes CARD
 import {
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification,
   downgradeUnverifiedFinding, verificationsToPersist, VERIFY_MAX_CANDIDATES, UNVERIFIED_NOTE_PREFIX, verifierEvidenceCitesClaim,
-  uncorroboratedRetirements, knownVerificationReasons,
+  uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, VERIFY_REASON_MAX,
 } from '../jury-core.mjs';
 
 describe('#4815 seat capability and the confirmation turn (pure)', () => {
@@ -2991,11 +2991,14 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
         expect(applyVerification({ seat, findings: [f], known: new Map([[key, outcome]]) }).findings[0]).toBe(f);
       }
     });
-    it('a failed verifier, or no verification at all, leaves the claim an advisory note (never a blocker)', () => {
+    // PR #5025 review: an unfinished check FAILS CLOSED. The claim stays CONFIRMED (so it is referred and the head's durable record
+    // holds it); only a definitive negative turns it into a note.
+    it('a failed verifier, or no verification at all, leaves the claim CONFIRMED and referred (fail closed)', () => {
       for (const settled of [new Map([[key, { outcome: 'failed', reason: 'the verifier was skipped: quota' }]]), new Map()]) {
         const { findings, downgraded } = applyVerification({ seat, findings: [f], settled });
-        expect(requiresMandatoryReferral(findings[0])).toBe(false);
-        expect(downgraded).toHaveLength(1);
+        expect(findings).toEqual([f]);
+        expect(requiresMandatoryReferral(findings[0])).toBe(true);
+        expect(downgraded).toEqual([]);
       }
     });
     it('a claim already settled not-reproduced on this head is downgraded without a fresh verification', () => {
@@ -3073,6 +3076,29 @@ describe('#4815 the `verified` list on a referral record', () => {
       [{ key, outcome: 'reproduced', reason: 'extra' }], [{ key, outcome: 'failed' }], [{ key: 'unknown', outcome: 'reproduced' }],
       [{ key, outcome: 'reproduced' }, { key, outcome: 'reproduced' }], 'reproduced', [null],
     ]) expect(validateReferralRecord(rec({ verified })), JSON.stringify(verified)).toBe(false);
+  });
+
+  // PR #5025 review: the writer's cap and the validator's cap must be ONE definition. The validator counts UTF-16 code units
+  // (`.length`); a writer counting code points let a cited reason followed by supplementary characters (emoji) pass settlement and
+  // then fail validation, so the record could not persist.
+  it.each([
+    ['emoji', '😀'], ['a non-BMP letter', '𝒜'], ['a ZWJ-free flag pair', '🇫🇷'], ['ASCII', 'x'], ['a combining mark', 'é'],
+  ])('a stored reason is within the validator\'s length whatever follows the citation (%s), is stable under a re-fold, and still cites the claim', (_n, filler) => {
+    const claim = { ...finding, summary: 'the guard is inverted' };
+    const evidence = `a.mjs:3 the guard holds ${filler.repeat(400)}`;
+    const candidates = [{ index: 0, seat, key: referralFindingKey(seat, claim), original: claim }];
+    const settled = settleVerification(candidates, { results: [{ index: 0, reproduced: false, evidence }] });
+    const { reason, outcome } = settled.get(candidates[0].key);
+    expect(outcome).toBe('not-reproduced');
+    expect(reason.length).toBeLessThanOrEqual(VERIFY_REASON_MAX);
+    expect(foldVerifyReason(reason, '')).toBe(reason);
+    expect(verifierEvidenceCitesClaim(claim, reason)).toBe(true);
+    // no lone surrogate is left behind by the cut
+    expect(reason.isWellFormed()).toBe(true);
+    const [persisted] = verificationsToPersist(candidates, settled);
+    expect(persisted).toMatchObject({ outcome: 'not-reproduced', reason });
+    expect(validateReferralRecord(rec({ referrals: [{ key: persisted.key, seat, original: claim, finding: normalizeFinding(claim) }],
+      verified: [{ key: persisted.key, outcome: persisted.outcome, reason: foldVerifyReason(persisted.reason, '') }] }))).toBe(true);
   });
 
   it('a negative verifier result cannot retire a mandatory referral, including historical records', () => {

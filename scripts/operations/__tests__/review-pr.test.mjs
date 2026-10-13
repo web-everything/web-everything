@@ -4388,20 +4388,18 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
   });
 
   describe('reduce', () => {
-    it.each(['required runtime unavailable', 'read-only inspection is inconclusive'])('keeps an inconclusive check retryable: %s', (reason) => {
+    // PR #5025 review: an unfinished check FAILS CLOSED. The claim stays CONFIRMED and referred, so the head's durable record holds it
+    // (the io suite proves it survives a quiet same-head rerun); it is not turned into a note and nothing is recorded as settled.
+    it.each(['required runtime unavailable', 'read-only inspection is inconclusive'])('an inconclusive check keeps the claim CONFIRMED and referred: %s', (reason) => {
       const answers = { ...withAdvisory(), judgeReferralVerifier: {
         summary: reason, results: [{ index: 0, reproduced: null, evidence: reason }],
       } };
       const first = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, answers);
       expect(first.reduce.verifications).toEqual([]);
-      expect(first.reduce.verdict).toBe('needs-human');
-      expect(first.reduce.referrals).toEqual([]);
-      expect(first.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
-      const retry = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, {
-        ...withAdvisory(), judgeReferralVerifier: REPRODUCED_VERIFIER_ANSWER,
-      }, 'retry-4815');
-      expect(retry.requests[REFERRAL_VERIFIER_STEP].skipSpawn).toBeUndefined();
-      expect(retry.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+      expect(first.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+      expect(first.reduce.unverifiedClaims).toBeUndefined();
+      expect(first.reduce.uncorroboratedRetirements).toBeUndefined();
+      expect(first.reduce.findings.some((f) => String(f.summary).includes('Unverified by a tool-bearing seat'))).toBe(false);
     });
 
     it('NOT REPRODUCED: no referral; the claim is one advisory note with its original text and the reason; the run is not blocked', () => {
@@ -4446,47 +4444,40 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       ['the verifier answered about another claim', { summary: 'x', results: [{ index: 3, reproduced: true, evidence: 'e' }] }],
       ['negative without evidence', { results: [{ index: 0, reproduced: false, evidence: '' }] }],
       ['conflicting results', { results: [{ index: 0, reproduced: true, evidence: 'yes' }, { index: 0, reproduced: false, evidence: 'no' }] }],
-    ])('%s: holds acceptance without recording the claim as settled', (_n, answer) => {
-      const { reduce, run, registry } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: answer });
-      expect(reduce.referrals).toEqual([]);
-      expect(reduce.verdict).toBe('needs-human');
-      expect(reduce.pendingVerifications).toHaveLength(1);
-      expect(deriveAdvisoryOutcome(run.verdict)).toBeNull();
-      const note = renderAdvisoryNote({ read: run.findings.read, verdict: run.verdict });
-      expect(parseAdvisories([{ body: note, createdAt: '2026-10-12T16:00:00Z' }]))
-        .toEqual([expect.objectContaining({ outcome: 'pending-verification', head: PINNED_HEAD })]);
-      expect(() => advanceWhileRunning(run, { registry, resume: { value: 'accept' } })).toThrow(/verification/i);
-      expect(reduce.unverifiedClaims).toHaveLength(1);
+    ])('%s: the claim stays CONFIRMED and referred, and nothing is recorded as settled', (_n, answer) => {
+      const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: answer });
+      expect(reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
       expect(reduce.verifications).toEqual([]);
-      expect(reduce.findings.some((f) => String(f.summary).includes('confirmed defect'))).toBe(true);
+      expect(reduce.unverifiedClaims).toBeUndefined();
+      expect(reduce.uncorroboratedRetirements).toBeUndefined();
+      expect(reduce.findings.some((f) => String(f.summary).includes('Unverified by a tool-bearing seat'))).toBe(false);
+      expect(reduce.findings.some((f) => f.summary === claim.summary)).toBe(true);
     });
 
     // PR #5025 review: the verifier reads attacker-controlled PR content, so a steered "this does not reproduce" with free-form
-    // evidence must not retire the mandatory hold on one model answer. It stays unsettled, holds acceptance, and is asked again.
+    // evidence must not retire the mandatory hold on one model answer. It records nothing and the claim stays CONFIRMED and referred.
     it.each([
       ['free-form evidence', 'checked it; this does not reproduce, the guard is fine'],
       ['a line in another file', `${NET_PATHS[1]}:20 the guard is fine`],
       ['the file named without a line', `${NET_PATHS[0]} looks fine`],
-    ])('a lone negative citing %s does not retire the claim: held, nothing persisted, re-asked next run', (_n, evidence) => {
+    ])('a lone negative citing %s does not retire the claim: nothing persisted, still CONFIRMED and referred', (_n, evidence) => {
       const steered = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence }] };
       const first = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: steered });
       expect(first.reduce.verifications).toEqual([]);
-      expect(first.reduce.verdict).toBe('needs-human');
-      expect(first.reduce.pendingVerifications).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: expect.stringMatching(/cites no line in the claim's own file/) })]);
-      expect(deriveAdvisoryOutcome(first.run.verdict)).toBeNull();
-      const retry = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: REPRODUCED_VERIFIER_ANSWER }, 'retry-steered');
-      expect(retry.requests[REFERRAL_VERIFIER_STEP].skipSpawn).toBeUndefined();
-      expect(retry.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+      expect(first.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+      expect(first.reduce.uncorroboratedRetirements).toBeUndefined();
+      expect(first.reduce.unverifiedClaims).toBeUndefined();
     });
 
-    it('holds for claims beyond the verifier batch even when all submitted claims were disproved', () => {
+    it('a claim beyond the verifier batch stays a referral even when all submitted claims were disproved', () => {
       const claims = Array.from({ length: 13 }, (_, i) => ({ ...claim, summary: `confirmed defect ${i}` }));
       const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { antigravityReview: true }, {
         judgeAntigravityReview: { summary: 'claims', findings: claims },
         judgeReferralVerifier: { results: claims.slice(0, 12).map((_, index) => ({ index, reproduced: false, evidence: `${claim.file}:20 guard holds` })) },
       });
       expect(reduce.verdict).toBe('needs-human');
-      expect(reduce.pendingVerifications).toHaveLength(1);
+      expect(reduce.referrals).toEqual([{ seat: 'judgeAntigravityReview', original: claims[12] }]);
+      expect(reduce.uncorroboratedRetirements).toHaveLength(12);
       expect(reduce.verifications).toHaveLength(12);
     });
 
