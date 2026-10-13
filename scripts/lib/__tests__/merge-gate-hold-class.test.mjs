@@ -18,7 +18,9 @@ const log4965 = `2026-10-12T09:49:30.3934630Z #4965: HOLD
 2026-10-12T09:49:30.3956372Z   pass              red-main-freeze        no freeze (ops/red-main-freeze:red-main-freeze.json + ci.yml@main)
 2026-10-12T09:49:30.3959386Z   hold              ledger                 labels: labels hold
 2026-10-12T09:49:30.3959878Z merge-gate: HOLD — held`;
-const log5008 = `#5008: HOLD
+// Positive fixture: producer-format green main-CI diagnostic plus the incident table.
+const log5008 = `main CI (ci.yml@main): green
+#5008: HOLD
   pass              candidate-label        ready-to-merge present
   hold              red-main-freeze        main is RED (freeze: manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12))
   pass              ledger                 labels: labels clear (ledger not consulted)
@@ -48,9 +50,9 @@ describe('hold classification', () => {
     expect(classify(verdict().results, { prLabels: [{ name: 'ready-to-merge' }] }).excused).toBe(false);
   });
   it.each([['labels: labels hold', true], ['ledger unavailable', false]])('ledger authority %s', (reason, excused) => expect(classify([{ id: 'ledger', status: 'hold', reason }]).excused).toBe(excused));
-  it.each([[{ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }, true], [{ frozen: true }, false], [{ error: 'unreadable' }, false], [{ frozen: false, publishedAt: '2026-10-12T10:00:00Z' }, false]])('stale shared freeze %j', (freeze, excused) => expect(classify(verdict(log5008).results, { freeze, verdictCompletedAt: '2026-10-12T11:56:08Z' })).toMatchObject({ excused, kind: excused ? 'stale-freeze' : 'real' }));
+  it.each([[{ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }, true], [{ frozen: true }, false], [{ error: 'unreadable' }, false], [{ frozen: false, publishedAt: '2026-10-12T10:00:00Z' }, false]])('stale shared freeze %j', (freeze, excused) => expect(classify(verdict(log5008).results, { freeze, mainCiGreen: true, verdictCompletedAt: '2026-10-12T11:56:08Z' })).toMatchObject({ excused, kind: excused ? 'stale-freeze' : 'real' }));
   it('main CI red is real; combined candidacy + stale freeze is identified', () => {
-    const extra = { freeze: { frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }, verdictCompletedAt: '2026-10-12T11:56:08Z' };
+    const extra = { freeze: { frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }, mainCiGreen: true, verdictCompletedAt: '2026-10-12T11:56:08Z' };
     expect(classify([{ id: 'red-main-freeze', status: 'hold', reason: 'main is RED' }], extra).excused).toBe(false);
     expect(classify([...verdict().results.filter(r => r.id !== 'red-main-freeze'), ...verdict(log5008).results.filter(r => r.status === 'hold')], extra).kind).toBe('candidacy+stale-freeze');
   });
@@ -219,6 +221,51 @@ describe('fresh review CI merge-gate holds', () => {
     expect(gate({ readMergeGateVerdict, readFreeze: () => { throw Error('offline'); } })).toMatchObject({
       allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }],
     });
+  });
+  it.each([
+    'main CI (ci.yml@main): RED since bbbbbbbbb',
+    'main CI (ci.yml@main): UNREADABLE — unavailable',
+    '',
+    'main CI (ci.yml@main): green\nmain CI (ci.yml@main): RED since bbbbbbbbb',
+    'main CI (ci.yml@main): green\nmerge-gate: HOLD — held',
+  ])('does not let a cleared manual freeze hide absent or red main-CI evidence: %s', diagnostic => {
+    const log = log5008.replace('main CI (ci.yml@main): green', diagnostic);
+    expect(gate({ readMergeGateVerdict: () => ({ ...verdict(log), num: 4965 }),
+      readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }) }))
+      .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
+  });
+  it('does not borrow a later invocation main-CI diagnostic after the footer', () => {
+    const log = `${log5008.replace('main CI (ci.yml@main): green\n', '')}\nmain CI (ci.yml@main): green`;
+    expect(gate({ readMergeGateVerdict: () => ({ ...verdict(log), num: 4965 }),
+      readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }) }).allowed).toBe(false);
+  });
+  it.each([
+    'main is RED (freeze: main CI red since bbbbbbbbb)',
+    'main is RED (freeze: automatic red-main freeze: main CI red)',
+    'main is RED (freeze: unknown origin mentioning manual freeze: later)',
+  ])('keeps %s red after a newer manual freeze was cleared', reason => {
+    const log = log5008.replace(/main is RED.*\n/, `${reason}\n`);
+    const readFreeze = vi.fn(() => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }));
+    expect(gate({ readMergeGateVerdict: () => ({ ...verdict(log), num: 4965 }), readFreeze }))
+      .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
+    expect(readFreeze).not.toHaveBeenCalled();
+  });
+  it.each([
+    'merge-gate: HOLD — workflow self-check failed — fail closed: cannot compare workflow with main; held',
+    'merge-gate: HOLD — main went RED during this run; held',
+    'merge-gate: HOLD — held; unexpected failure',
+    'merge-gate: PASS — held',
+    '',
+    '#5009: HOLD\n  hold candidate-label not a candidate\nmerge-gate: HOLD — workflow self-check failed — fail closed: unavailable; held',
+    'merge-gate: HOLD — held\nmerge-gate: HOLD — workflow self-check failed — fail closed: unavailable; held',
+  ])('keeps job-level failure or incomplete evidence red: %s', footer => {
+    const log = candidacy.replace('merge-gate: HOLD — held', footer);
+    expect(gate({ readMergeGateVerdict: () => verdict(log) }))
+      .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
+    expect(plan({ readVerdict: () => verdict(log) }).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
+    expect(defaultReadHeadCheckState({ repoSlug: repo, prNumber: 4965, sha,
+      runGh: () => JSON.stringify(row), getRequiredChecks: () => ({ checks: ['merge-gate'] }),
+      readPrLabels: () => [], readMergeGateVerdict: () => verdict(log), mergeGateSetting: { value: 'on' } }).state).toBe('red');
   });
   it('does not excuse a legacy merge-gate status', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
