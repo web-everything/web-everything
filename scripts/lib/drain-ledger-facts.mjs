@@ -78,23 +78,25 @@ export function drainLedgerReadStore(repo, env = process.env) {
   return VERDICT_LEDGER_STORES.includes(store) ? 'git' : store;
 }
 
-/** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. A failed
- *  read throws from the reader, so the recorder writes nothing: an empty snapshot would re-append every hold. */
+/** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. Keyed by the
+ *  exact repo text the writes use (the git path and the store read are case-sensitive). A failed read throws from the
+ *  reader: releases then write nothing, and `recordDrainHold` still records its hold (F4). */
 export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore } = {}) {
   const snapshot = new Map();
+  const exact = repo => String(repo ?? '').trim();
   for (const repo of repos) {
-    const key = slug(repo);
+    const key = exact(repo);
     if (!key || snapshot.has(key)) continue;
     try {
       // Home keeps the whole-file read (the recorders filter by slug); the store read filters by the exact repo text.
-      const store = drainLedgerReadStore(repo, env);
-      const read = store === 'home' ? { status: 'ok', rows: readHome(repo) } : await readStore(String(repo).trim(), { store, env });
+      const store = drainLedgerReadStore(key, env);
+      const read = store === 'home' ? { status: 'ok', rows: readHome(key) } : await readStore(key, { store, env });
       snapshot.set(key, read?.status === 'ok' && Array.isArray(read.rows) ? { rows: read.rows }
         : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
     } catch (error) { snapshot.set(key, { error: String(error?.message ?? error).split('\n')[0] }); }
   }
   return repo => {
-    const entry = snapshot.get(slug(repo));
+    const entry = snapshot.get(exact(repo));
     if (!entry) throw new Error(`ledger not read for ${repo}`);
     if (entry.error) throw new Error(`ledger unreadable for ${repo}: ${entry.error}`);
     return entry.rows;

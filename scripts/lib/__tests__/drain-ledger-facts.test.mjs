@@ -156,17 +156,18 @@ describe('drain ledger facts — the recorders read the store their writes land 
     expect(result).toMatchObject({ ok: true, appended: { released: 1 } });
     expect(s.git.at(-1)).toMatchObject({ type: 'release', reasonCode: 'review' });
   });
-  it('an unreadable store or an unread repo writes nothing; repos are read once per slug', async () => {
+  it('an unreadable store writes no release or exemption, but still records a hold (F4); repos are read once by exact name', async () => {
     const calls = [], writes = [];
-    const read = await readDrainLedgerSnapshot([repo, 'O/R', 'x/y', null], { env: dual,
+    const read = await readDrainLedgerSnapshot([repo, ` ${repo} `, 'O/R', 'x/y', null], { env: dual,
       readStore: async r => { calls.push(r); return r === 'x/y' ? { status: 'unreadable', reason: 'no-board', error: 'none' } : { status: 'ok', rows: [] }; } });
-    expect(calls).toEqual([repo, 'x/y']);
+    expect(calls).toEqual([repo, 'O/R', 'x/y']);
     expect(read('O/R')).toEqual([]);
     const append = row => { writes.push(row); return { ok: true }; };
-    expect(recordDrainHold({ repo: 'x/y', pr: 1, reason: 'review', read, append }).ok).toBe(false);
-    expect(recordDrainHold({ repo: 'z/w', pr: 1, reason: 'review', read, append }).ok).toBe(false);
     expect(recordDrainLedgerFacts({ verdicts: [{ ...v, repo: 'x/y' }], read, append }).ok).toBe(false);
     expect(writes).toEqual([]);
+    expect(recordDrainHold({ repo: 'x/y', pr: 1, reason: 'review', read, append })).toMatchObject({ ok: true, appended: true });
+    expect(recordDrainHold({ repo: 'z/w', pr: 1, reason: 'review', read, append })).toMatchObject({ ok: true, appended: true });
+    expect(writes.map(r => [r.type, r.repo])).toEqual([['hold', 'x/y'], ['hold', 'z/w']]);
   });
 });
 

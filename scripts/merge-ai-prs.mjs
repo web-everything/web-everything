@@ -3073,7 +3073,10 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
-    const prior = readEvents(repo).filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
+    // An unreadable ledger still records the hold (F4: a hold is never dropped; a duplicate hold is harmless).
+    let events;
+    try { events = readEvents(repo); } catch { events = []; }
+    const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
     if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({
       type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
