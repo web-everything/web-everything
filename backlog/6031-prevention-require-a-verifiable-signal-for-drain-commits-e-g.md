@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lib/renamed-pr-refresh.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/lib/__tests__/renamed-pr-refresh.test.mjs"]
+
 dateOpened: "2026-10-13"
 tags: []
 ---
@@ -41,3 +41,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Findings (standalone worker, 2026-10-13)
+
+The build-dispatch daemon held #6031 with:
+
+> worker-declined: **could-not-prepare** — the unresolved choice is the drain’s trust anchor: an explicitly authorized signing key, or a drain receipt bound to the commit SHA and verified against protected server-side state. Choosing that policy is outside this preparation mandate. Evidence: - 'we:scripts/lib/queue-branch-numbering.mjs:40' reads commit subjects only. - 'we:scripts/lane-drain.mjs:1193' creates numbering commits without explicitly requiring signing or a receipt. - The named 'we:scripts/lib/renamed-pr-refresh.mjs' and matching test are absent from this checkout, though present in historical commit '3…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
