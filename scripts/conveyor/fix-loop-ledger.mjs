@@ -1,4 +1,4 @@
-/** Append-only evidence of repair sessions that have not moved a PR head. */
+/** Append-only repair sessions and launcher outcomes: card 5947 (live #5045, 2026-10-13). */
 import { appendFileSync, mkdirSync, openSync, fstatSync, readSync, closeSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -42,7 +42,10 @@ export function fixLoopConfig(env = process.env, { readPlatform = readPlatformPr
 export const isStubSession = (session) => typeof session === 'string' && /^stub-/.test(session);
 function validRow(row) {
   return !isStubSession(row?.session) && row?.v === 1 && typeof row.repo === 'string' && Number.isInteger(row.pr) && row.pr > 0
-    && ['ci-heal', 'fix', 'rearm', 'park'].includes(row.kind)
+    && ['ci-heal', 'fix', 'rearm', 'park', 'outcome'].includes(row.kind)
+    && (row.kind !== 'outcome' || (typeof row.session === 'string' && row.session.trim().length > 0
+      && ['pushed', 'no-change', 'failed'].includes(row.outcome) && typeof row.infra === 'boolean'
+      && (row.reason === undefined || typeof row.reason === 'string')))
     && (!['rearm', 'park'].includes(row.kind) || typeof row.reason === 'string') && /^[a-f\d]{40}$/i.test(row.head ?? '')
     && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at));
 }
@@ -55,25 +58,46 @@ function windowRows(rows, now, config) {
 export function fixLoopSessionRows({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig() }) {
   return windowRows(rows, now, config).filter(row => row.repo === repo && row.pr === pr && row.head === head);
 }
+/** PURE. Pair each session with its first outcome before the next attempt of that name.
+ * Card 5947 (live #5045, 2026-10-13): shared log positions cannot identify infrastructure refusals. */
+export function ledgerInfraRows({ rows, repo, pr, head }) {
+  const matches = (rows ?? []).filter(row => validRow(row) && row.repo === repo && row.pr === pr && row.head === head)
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  const sessions = matches.filter(isSession);
+  return sessions.filter((session, i) => {
+    if (typeof session.session !== 'string' || !session.session.trim()) return false;
+    const next = sessions.slice(i + 1).find(row => row.session === session.session);
+    const outcome = matches.find(row => row.kind === 'outcome' && row.session === session.session
+      && Date.parse(row.at) >= Date.parse(session.at) && (!next || Date.parse(row.at) < Date.parse(next.at)));
+    return outcome?.infra === true;
+  });
+}
 export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0 }) {
   const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
+  infraFailures = Math.max(Number.isFinite(infraFailures) ? infraFailures : 0,
+    ledgerInfraRows({ rows, repo, pr, head }).length);
   infraFailures = Number.isFinite(infraFailures) ? Math.max(0, Math.min(matches.length, Math.floor(infraFailures))) : 0;
   const count = matches.length - infraFailures;
   return { count, rawCount: matches.length, infraFailures, held: config.hold && count >= config.maxSessions,
     since: matches[0]?.at ?? null, sessions: matches.map(row => row.session).filter(session => typeof session === 'string') };
 }
 
-/** PRs #4992/#4993/#4965, 2026-10-12: failures before an agent runs are infrastructure, never repair evidence. */
+/** PRs #4992/#4993/#4965, 2026-10-12: failures before an agent runs are infrastructure, never repair evidence.
+ * Card 5947 (live #5045, 2026-10-13) also classifies an absent CI failure. */
 export const FIX_RUN_INFRA_PATTERNS = Object.freeze([
-  /^no-finding:/i, /^fix-run:/i, /^error:/i, /missing required flag/i, /has no fix launcher/i,
+  /^no-finding:/i, /^no-ci-failure:/i, /^fix-run:/i, /^error:/i, /missing required flag/i, /has no fix launcher/i,
   /launch did not complete/i, /lane-pool/i, /Operation not permitted/i, /EPERM/i, /EACCES/i,
   /read-only file system/i, /index\.lock/i, /\.git\b/i, /sandbox/i, /could not (commit|push|stage)/i,
 ]);
+/** PURE. Only failed launcher infrastructure outcomes are discounted, including card 5947 (live #5045, 2026-10-13). */
+export function isInfraFixRunOutcome(outcome, reason) {
+  return outcome === 'failed' && FIX_RUN_INFRA_PATTERNS.some(pattern => pattern.test(String(reason ?? '')));
+}
 export function classifyFixRunOutcome(line) {
   const match = /^fix-run: PR #(\d+) (failed|no-change|pushed) \((.*)\); claim/.exec(line);
   if (!match) return null;
   const [, pr, outcome, reason] = match;
-  return { pr: Number(pr), outcome, reason, infra: outcome === 'failed' && FIX_RUN_INFRA_PATTERNS.some(pattern => pattern.test(reason)) };
+  return { pr: Number(pr), outcome, reason, infra: isInfraFixRunOutcome(outcome, reason) };
 }
 export function infraFailureCount({ logText, pr, sessions }) {
   if (!(sessions > 0)) return 0;
@@ -81,7 +105,7 @@ export function infraFailureCount({ logText, pr, sessions }) {
     .slice(-Math.floor(sessions)).filter(row => row.infra).length;
 }
 /** Control rows persist across the counting window: each head gets only one Claude re-arm.
- * Exact infra rows come from ordered log evidence; aggregate-only callers conservatively discount the newest rows. */
+ * Card 5947 (live #5045, 2026-10-13): ledger outcomes join caller evidence; aggregate-only callers discount the newest rows. */
 export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
@@ -93,7 +117,10 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
   const rawCount = controls.filter(isSession).length;
   if (rawCount >= config.maxSessions + 2) return { action: 'park', reason: 'raw per-head repair session ceiling reached' };
   const matches = windowRows(rows, now, config).filter(identity);
-  const state = fixLoopState({ rows, repo, pr, head, now, config, infraFailures });
+  const ledgerInfra = ledgerInfraRows({ rows: controls, repo, pr, head });
+  if (infraRows !== null || ledgerInfra.length) infraRows = [...new Set([...(infraRows ?? []), ...ledgerInfra])];
+  const state = fixLoopState({ rows, repo, pr, head, now, config,
+    infraFailures: Math.max(infraFailures, infraRows?.filter(row => matches.includes(row)).length ?? 0) });
   const counted = infraRows ? matches.filter(row => !infraRows.includes(row)) : matches.slice(0, matches.length - state.infraFailures);
   const until = new Date(Math.max(Date.parse(counted.at(-1)?.at ?? rearm?.at ?? new Date(now).toISOString()),
     rearm ? Date.parse(rearm.at) : 0)

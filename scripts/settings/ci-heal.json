@@ -1,0 +1,4 @@
+{
+  "$comment": "ciHeal.staleBaseRefreshFirst tries a cheap refresh from main before a fixer when known test failures qualify. Unknown evidence leaves the repair with ci-heal. Trusted PR comments allow one attempt per base, including failed attempts and the commit refreshed onto. Cascade: standard off -> platform preference -> this file -> env WE_CI_HEAL_STALE_BASE_REFRESH_FIRST=on|off. See scripts/conveyor/stale-base-refresh.mjs. Card 272 part 2 (live #5045, 2026-10-13).",
+  "ciHeal": { "staleBaseRefreshFirst": "on" }
+}

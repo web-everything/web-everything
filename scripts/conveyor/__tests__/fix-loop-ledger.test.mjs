@@ -2,7 +2,7 @@ import { afterEach, expect, it } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { fixLoopConfig, fixLoopState, fixLoopBreaches, readFixLoopRows, appendFixLoopRow,
+import { ledgerInfraRows, fixLoopConfig, fixLoopState, fixLoopBreaches, readFixLoopRows, appendFixLoopRow,
   fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition } from '../fix-loop-ledger.mjs';
 const now = Date.parse('2026-10-05T12:00:00Z'), head = 'a'.repeat(40);
 const row = (extra = {}) => ({ v: 1, at: new Date(now).toISOString(), repo: 'we', pr: 3990, head, kind: 'ci-heal', ...extra });
@@ -154,7 +154,7 @@ it('accepts control rows and legacy sessions but never counts controls as breach
 });
 it('classifies every infrastructure pattern and never discounts pushed or no-change', () => {
   expect(Object.isFrozen(FIX_RUN_INFRA_PATTERNS)).toBe(true);
-  for (const reason of ['no-finding: missing', 'fix-run: refusal', 'error: broken', 'missing required flag',
+  for (const reason of ['no-finding: missing', 'no-ci-failure: missing', 'fix-run: refusal', 'error: broken', 'missing required flag',
     'has no fix launcher', 'launch did not complete', 'lane-pool', 'Operation not permitted', 'EPERM',
     'EACCES', 'read-only file system', 'index.lock', '.git permission', 'sandbox', 'could not commit', 'could not push', 'could not stage']) {
     for (const outcome of ['failed', 'no-change', 'pushed']) {
@@ -173,4 +173,42 @@ it('uses exact infra positions for build triggers and parking, and retries an un
   expect(fixLoopDisposition({ ...args, rows: [infra, ...recent], infraFailures: 1, infraRows: [infra] }).action).toBe('hold');
   expect(fixLoopDisposition({ ...args, rows: [...before, rearm, infra, row({ build })],
     infraFailures: 1, infraRows: [infra] }).action).toBe('park');
+});
+
+// card 5947 (live #5045, 2026-10-13): outcomes pair by identity and attempt, never shared-log position.
+it('validates outcome rows without counting them as sessions', () => {
+  const env = { WE_FIX_LOOP_LEDGER: join(temp(), 'ledger') };
+  const outcome = { repo: 'we', pr: 3990, head, kind: 'outcome', session: 's', outcome: 'failed', infra: true };
+  appendFixLoopRow(outcome, { env, now });
+  expect(readFixLoopRows({ env })).toEqual([row(outcome)]);
+  expect(state(readFixLoopRows({ env })).rawCount).toBe(0);
+  for (const extra of [{ session: '' }, { session: null }, { outcome: 'bad' }, { infra: 'true' }, { infra: undefined }])
+    expect(() => appendFixLoopRow({ ...outcome, ...extra }, { env, now })).toThrow(/Invalid/);
+});
+it('pairs the first outcome per attempt across heads and a reused session name', () => {
+  const at = n => new Date(now - 10000 + n * 1000).toISOString();
+  const s1 = row({ session: 's', at: at(1) }), s2 = row({ session: 's', at: at(4) });
+  const other = row({ session: 's', head: 'b'.repeat(40), at: at(2) });
+  const outcome = (n, extra = {}) => row({ kind: 'outcome', session: 's', outcome: 'failed', infra: true, at: at(n), ...extra });
+  const rows = [outcome(6), s2, other, outcome(3, { head: other.head }), outcome(2, { infra: false }), s1, outcome(3)];
+  expect(ledgerInfraRows({ rows, repo: 'we', pr: 3990, head })).toEqual([s2]);
+  expect(ledgerInfraRows({ rows, repo: 'we', pr: 3990, head: other.head })).toEqual([other]);
+  expect(state(rows)).toMatchObject({ rawCount: 2, infraFailures: 1, count: 1 });
+});
+it.each([true, false])('discounts only infrastructure outcomes (infra=%s)', infra => {
+  const rows = Array.from({ length: 3 }, (_, i) => [
+    row({ session: 's', at: new Date(now - (6 - i * 2) * 1000).toISOString() }),
+    row({ kind: 'outcome', session: 's', outcome: infra ? 'failed' : 'no-change', infra,
+      at: new Date(now - (5 - i * 2) * 1000).toISOString() }),
+  ]).flat();
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now, config }).action).toBe(infra ? 'dispatch' : 'hold');
+  expect(state(rows).count).toBe(infra ? 0 : 3);
+});
+
+it('unions caller and ledger infra positions without double counting', () => {
+  const sessions = Array.from({ length: 3 }, (_, i) => row({ session: `s${i}`, at: new Date(now - 10000 + i * 1000).toISOString() }));
+  const outcome = row({ kind: 'outcome', session: 's0', outcome: 'failed', infra: true, at: new Date(now - 5000).toISOString() });
+  const args = { rows: [...sessions, outcome], repo: 'we', pr: 3990, head, now, config, infraFailures: 2 };
+  expect(fixLoopDisposition({ ...args, infraRows: [sessions[0], sessions[1]] }).action).toBe('dispatch');
+  expect(state(args.rows, { infraFailures: 2 })).toMatchObject({ infraFailures: 2, count: 1 });
 });

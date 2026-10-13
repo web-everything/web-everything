@@ -84,14 +84,21 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
 
 /**
  * Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping.
+ * Carry the repair kind to the launcher: card 5947 (live #5045, 2026-10-13).
  * ONLY a Codex decision replaces the sink's provider and heal router. EVERY Claude outcome (fix.executor=claude,
  * provider-routing, takeover, main-fix, stronger-model, launcher unavailable) leaves both in place, so it launches
  * exactly as before this routing existed: `routeDispatchProvider` (model/effort table, registry providers, probation
  * worker, injected `spawnAgent`) and `routeAvailableCiHeal` (including the native-Claude quota-hold refusal).
  */
 export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, writePrompt, removePrompt,
-  profileFor, stampExecutor = stampFixExecutor }) {
+  profileFor, stampExecutor = stampFixExecutor, staleBaseGate }) {
   return async (planned, options = {}) => {
+    if (staleBaseGate) {
+      let gate = null;
+      try { gate = await staleBaseGate({ planned, repo: options.repo ?? planned.repo ?? 'we', root: options.root }); }
+      catch (e) { console.error(`reconcile-fix-dispatch: PR #${planned.pr} stale-base gate failed open: ${String(e?.message ?? e)}`); }
+      if (gate?.held) return { held: true, reason: gate.reason };
+    }
     const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
     const codex = decision.executor === 'codex';
     const sinks = createSinks({ ...options, ...(codex ? { provider: (request) => {
@@ -101,7 +108,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         owner: request.claimOwner, lockRoot: request.claimRoot, decision });
       const promptFile = writePrompt(request.sessionSlug, request.prompt);
       try {
-        const handle = launchCodex({ ...request, cwd: options.root, promptFile, ref: planned.laneRef,
+        const handle = launchCodex({ ...request, repairKind: 'ci-heal', cwd: options.root, promptFile, ref: planned.laneRef,
           mergeOnto: mergeOntoFor(planned),
           repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
           scope: planned.scope.join(','), policyRoute: { provider: 'codex' } });
