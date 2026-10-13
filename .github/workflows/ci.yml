@@ -324,6 +324,12 @@ jobs:
         working-directory: web-everything
         run: npm run check:standards
 
+      # Operator rule 2026-10-13: never commit a host-local home path. Ratchet against
+      # scripts/settings/host-path-baseline.json (may only shrink). Runs on card-only PRs too.
+      - name: Host-local path ratchet
+        working-directory: web-everything
+        run: node scripts/lint-host-paths.mjs
+
   # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
   # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
   # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
