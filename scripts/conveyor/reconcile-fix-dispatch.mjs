@@ -1871,7 +1871,9 @@ export function runReconcileFixDispatch({
   const observedHeads = new Map();
   const headFor = e => {
     const pr = Number(e.pr);
-    const sha = e.claim?.meta?.headSha || e.headRefOid || holderEntries.get(pr)?.headRefOid;
+    // Claim metadata records the acquisition head; heartbeats do not track fixer pushes.
+    // Only current PR observations can release a file hold. Missing heads fail closed below.
+    const sha = e.headRefOid || holderEntries.get(pr)?.headRefOid;
     if (sha) return sha;
     if (!observedHeads.has(pr)) observedHeads.set(pr, readPrHeads(root, [pr]).get(pr) ?? null);
     return observedHeads.get(pr);

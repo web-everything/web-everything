@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -11,6 +11,51 @@ const policy = (overrides = {}) => policyApi.resolveFixScopePolicy({ env: {}, pl
 const entry = (pr, extra = {}) => ({ pr, scope: [F], ...extra });
 const claim = (pr, extra = {}) => ({ heartbeatAt: new Date(NOW).toISOString(), meta: { pr, scope: [F], ...extra } });
 const gate = (planned, claims = [], overrides = {}, options = {}) => filterFixesByInFlightScope(planned, [], claims, { now: NOW, maxWaitMinutes: null, rebaseExempt: null, policy: policy({ overlapGranularity: 'file', ...overrides }), ...options });
+
+describe('live region head freshness', () => {
+  // Exercise the production closure: unit dispatch deliberately disables region IO.
+  const source = readFileSync(new URL('../reconcile-fix-dispatch.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('  const observedHeads = new Map();');
+  const end = source.indexOf('\n  };', source.indexOf('  const regionOverlap =', start)) + '\n  };'.length;
+  const makeOverlap = new Function('holderEntries', 'readPrHeads', 'regionReader', 'scopePolicy', 'regionOverlapDecision', 'root', `${source.slice(start, end)}\nreturn regionOverlap;`);
+  const run = ({ holderHead, candidateHead = 'C', observedHead = null }) => {
+    const heads = [], reads = [], merges = [];
+    const holderEntries = new Map([[1, { headRefOid: holderHead }]]);
+    const regionReader = {
+      hunksFor: sha => {
+        heads.push(sha);
+        const line = sha === 'A' ? 10 : 100;
+        return sha ? new Map([['scripts/merge-ai-prs.mjs', [[line, line]]]]) : null;
+      },
+      mergeConflicts: (a, b) => { merges.push([a, b]); return a && b ? b !== 'A' : null; },
+    };
+    const regionOverlap = makeOverlap(holderEntries, (_root, prs) => {
+      reads.push(...prs); return new Map(prs.map(pr => [pr, observedHead]));
+    }, regionReader, policy(), policyApi.regionOverlapDecision, '/unused');
+    const out = gate([entry(2, { headRefOid: candidateHead, claim: claim(2, { headSha: 'A' }) })],
+      [claim(1, { headSha: 'A' })], { overlapGranularity: 'region', priorityBypass: false }, { holderEntries, regionOverlap });
+    return { out, heads, reads, merges };
+  };
+  it('uses the current holder and candidate heads instead of their acquisition heads', () => {
+    const { out, heads, merges } = run({ holderHead: 'B' });
+    expect(out.planned).toEqual([]);
+    expect(heads).toEqual(['C', 'B']);
+    expect(merges).toEqual([['C', 'B']]);
+  });
+  it('reads the current holder head when only a claim head is available', () => {
+    const { out, heads, reads } = run({ observedHead: 'B' });
+    expect(out.planned).toEqual([]);
+    expect(heads).toEqual(['C', 'B']);
+    expect(reads).toEqual([1]);
+  });
+  it('retains the file hold when current head observation fails', () => {
+    const { out, heads, reads } = run({});
+    expect(out.planned).toEqual([]);
+    expect(out.scopeDecisions[0]).toMatchObject({ failedClosed: true });
+    expect(heads).toEqual(['C', null]);
+    expect(reads).toEqual([1]);
+  });
+});
 
 describe('defaults and cascade', () => {
   it('exports and resolves standard defaults', () => {
