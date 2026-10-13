@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import * as drain from '../merge-ai-prs.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
@@ -16,11 +17,14 @@ const mergeCatch = source.slice(catchStart, catchEnd);
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
+const openPrPageFixture = ${openPrPageFixture};
 const prs = JSON.parse(fs.readFileSync(process.env.ISOLATION_FIXTURE, 'utf8'));
 const landed = n => fs.existsSync(process.env.ISOLATION_FIXTURE + '.merged-' + n);
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
+// The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs); the shared fixture serves them.
+if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => !landed(p.number)), a.find(v => v.startsWith('query=')) || ''));
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);

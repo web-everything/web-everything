@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const NOW = Date.now();
@@ -16,13 +17,15 @@ const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
 
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 const F = process.env.MQ_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
-const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
+if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => !landed(p.number)), a.find(v => v.startsWith('query=')) || ''));
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
@@ -185,16 +188,21 @@ const PA = 'plateauapp/plateau-app';
 const fakeGitCouple = fakeGit.replace('git@github.com:fixture/drain-mq.git', `git@github.com:${LOCAL}.git`);
 const fakeGhCouple = `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 const F = process.env.MQ_FIXTURE;
 const db = JSON.parse(fs.readFileSync(F, 'utf8'));
 const ri = a.indexOf('--repo');
-const slugOf = () => (ri >= 0 ? a[ri + 1] : db.local);
+const slugOf = () => (ri >= 0 ? a[ri + 1] : process.env.GH_REPO || db.local);
 const prsOf = (slug) => db.repos[slug] || [];
 const mark = (slug, n) => F + '.merged-' + slug.replace(/\\//g, '_') + '-' + n;
-const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') { const s = slugOf(); out(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number)))); }
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const s = slugOf();
+  out(openPrPageFixture(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number))), a.find(v => v.startsWith('query=')) || ''));
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const s = slugOf(); const p = prsOf(s).find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
