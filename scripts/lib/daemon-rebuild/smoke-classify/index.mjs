@@ -5,11 +5,12 @@
 
 import { authBroken } from './auth-broken.mjs';
 import { envTimeout } from './env-timeout.mjs';
+import { envUnavailable } from './env-unavailable.mjs';
 import { transient } from './transient.mjs';
 
 /** Ordered: first match wins; each is an ENVIRONMENT fault — no reject record,
  *  no fallback/control smokes, hold on last-good. `transient` matches every non-`code` verdict, so it is last. */
-export const SMOKE_ENVIRONMENT_VERDICTS = Object.freeze([authBroken, envTimeout, transient]);
+export const SMOKE_ENVIRONMENT_VERDICTS = Object.freeze([authBroken, envTimeout, envUnavailable, transient]);
 
 export {
   SMOKE_LOAD_DIFFERENTIAL_ENV, ENV_LOAD_RETRY_BASE_ENV, ENV_LOAD_RETRY_MAX_ENV, DEFAULT_ENV_LOAD_RETRY_BASE_MS,

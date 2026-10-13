@@ -249,7 +249,7 @@ describe('load-aware smoke budgets', () => {
     expect(resolveSmokeBudgets({}, host(load))).toEqual({
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
-      ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 120_000,
+      ghApiMs: 30_000, ghPrListMs: 30_000, ghEnvProbeMs: 60_000, reconcileMs: 120_000,
       dispatchDryRunMs: 300_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
@@ -688,7 +688,7 @@ describe('runLiveSmokeWithRetry — retries a transient verdict, never a code on
       return '';
     });
     const sleep = vi.fn(async () => {});
-    const result = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild, sleep, retries: 2, backoffMs: 10 });
+    const result = await runLiveSmokeWithRetry({ root: '/x', env: { WE_SMOKE_GH_ENV_PROBE: '0' }, runChild, sleep, retries: 2, backoffMs: 10 });
     expect(result.verdict).toBe('transient');
     expect(result.attempts).toBe(3); // 1 initial + 2 retries
     expect(sleep).toHaveBeenCalledTimes(2); // sleeps between attempts, never after the last
@@ -1705,5 +1705,249 @@ describe('lane-pool probes under a busy pool are SKIPPED (recorded), never allow
     expect(busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: 1_000, capMs: 30_000, ctx: idle })).toBeNull();
     // A genuine all-held pool on an idle host still fails the smoke.
     expect(busyPoolSkip({ what: 'lane-pool acquire', detail: 'x failed: no free lane in pool "w" (9 all held/dirty)', elapsedMs: 30_404, capMs: 30_000, ctx: idle })).toBeNull();
+  });
+});
+
+// Live 2026-10-12 13:10 ET: tree read failure + dispatch kill during GitHub's 502/504 outage.
+import { SMOKE_ENVIRONMENT_VERDICTS } from '../daemon-rebuild/smoke-classify/index.mjs';
+import * as liveSmoke from '../daemon-live-smoke.mjs';
+import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
+import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
+
+const probeFields = 'number,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files';
+function githubOutageHost({ probeError = 'HTTP 502: Bad Gateway', recover = false, codeRow = false, dispatchTimeout = true } = {}) {
+  let t = 0;
+  let attempt = 0;
+  const probes = [];
+  const runChild = vi.fn(async (cmd, args, opts) => {
+    if (cmd === 'gh' && args.includes(probeFields)) {
+      probes.push({ args, opts });
+      if (probeError) throw new Error(probeError);
+      return '[]';
+    }
+    if (cmd === 'node' && args[1] === 'list') { attempt++; return '[]'; }
+    const failing = !recover || attempt === 1;
+    if (cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs' && failing && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)) {
+      throw new Error('exited 1: ✗ reconcile pass could not read state: Command failed: gh pr list …');
+    }
+    if (cmd === 'node' && args[0] === '--input-type=module') {
+      if (String(args[2]).includes('daemon-boot-smoke:entry-boot')) return '{"ok":true}';
+      if (failing && dispatchTimeout) {
+        if (codeRow) throw new Error('threw: SyntaxError: Unexpected token');
+        t += 330749;
+        throw new Error('timed out after 330457ms (process group killed)');
+      }
+      return '[{"kind":"stub","ok":true}]';
+    }
+    if (args[1] === 'acquire') return '{"lane":1}';
+    return '';
+  });
+  return { runChild, clock: () => t, probes };
+}
+const githubSmokeEnv = { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9' };
+async function replayGithubOutage(host, options = {}) {
+  const sleep = vi.fn(async () => {});
+  const log = { error: vi.fn() };
+  const result = await runLiveSmokeWithRetry({ root: '/x', env: githubSmokeEnv, ...host,
+    refreshAuth: async ({ env }) => ({ env: { ...env, GH_TOKEN: 'probe-marker' }, refresh: null }),
+    sleep, log, retries: 2, backoffMs: 10, ...options });
+  return { result, sleep, log };
+}
+
+describe('GitHub API outage — gate-owned confirmation, never tree-text laundering', () => {
+  it('budget refusals alone never confirm an outage', async () => {
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 0, now: () => 0, runChild: base.runChild });
+    const { result } = await replayGithubOutage({ runChild, clock: () => 0 });
+    expect(result.verdict).toBe('code');
+    expect(result.githubEnv).toBeUndefined();
+    expect(base.runChild).not.toHaveBeenCalled();
+  });
+  it.each(['ok', 'code', 'malformed'])('partially booted outage retry preserves valid boot output (%s)', async (bootOutput) => {
+    let t = 0;
+    let attempt = 0;
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+      runChild: async (cmd, args, opts) => {
+        if (cmd === 'node' && args[1] === 'list') attempt++;
+        if (attempt === 2 && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+          t += 105000;
+          throw new Error('could not read state: Command failed: gh pr list');
+        }
+        if (attempt === 2 && args[0] === '--input-type=module'
+          && String(args[2]).includes('daemon-boot-smoke:entry-boot')) {
+          t += opts.timeoutMs;
+          return bootOutput === 'ok' ? '{"ok":true}' : bootOutput === 'code'
+            ? '{"ok":false,"error":"SyntaxError"}' : 'invalid JSON';
+        }
+        return base.runChild(cmd, args, opts);
+      } });
+    const { result } = await replayGithubOutage({ runChild, clock: () => t }, {
+      sleep: async (ms) => { t += ms; },
+    });
+    expect(result.attempts).toBe(2);
+    expect(result.githubEnv.confirmed).toBe(true);
+    const boot = result.smoke.results.find((r) => r.name === 'daemon-entries-boot');
+    expect(boot.detail).toContain('skipped: rebuild smoke budget exhausted');
+    expect(result.verdict).toBe(bootOutput === 'ok' ? 'env-unavailable' : 'code');
+  });
+  it.each([false, true])('budget-exhausted outage retry preserves the hold unless a code row failed (code=%s)', async (codeRow) => {
+    let t = 0;
+    let attempt = 0;
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+      runChild: async (cmd, args, opts) => {
+        if (cmd === 'node' && args[1] === 'list') attempt++;
+        if (attempt === 2 && cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+          t += opts.timeoutMs;
+          throw new Error(codeRow && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)
+            ? 'exited 1: SyntaxError: Unexpected token'
+            : `timed out after ${opts.timeoutMs}ms (process group killed)`);
+        }
+        return base.runChild(cmd, args, opts);
+      } });
+    const { result } = await replayGithubOutage({ runChild, clock: () => t }, {
+      sleep: async (ms) => { t += ms; },
+    });
+    expect(result.attempts).toBe(2);
+    expect(result.githubEnv.confirmed).toBe(true);
+    expect(result.smoke.results.filter((r) => !r.ok).map((r) => r.detail).join('\n'))
+      .toContain('skipped: rebuild smoke budget exhausted');
+    expect(result.verdict).toBe(codeRow ? 'code' : 'env-unavailable');
+  });
+  it('replays the live shape with exponential whole-smoke retries and one log per probe', async () => {
+    const host = githubOutageHost();
+    const { result, sleep, log } = await replayGithubOutage(host);
+    expect(result.verdict).toBe('env-unavailable');
+    expect(result.githubEnv.confirmed).toBe(true);
+    expect(result.attempts).toBe(3);
+    expect(sleep.mock.calls).toEqual([[10], [20]]);
+    const entries = log.error.mock.calls.map(([line]) => JSON.parse(line.split('smoke-env-github ')[1]));
+    expect(entries.map((e) => e.action)).toEqual(['retry', 'retry', 'hold-env-unavailable']);
+    expect(entries.map((e) => e.backoffMs)).toEqual([10, 20, 0]);
+    expect(host.probes).toHaveLength(Object.keys(CONSTELLATION_REPOS).length * 3);
+    for (const { args, opts } of host.probes) {
+      expect(args).toEqual(['pr', 'list', '--state', 'open', '--limit', '200', '--repo', expect.any(String), '--json', probeFields]);
+      expect(opts).toMatchObject({ env: { GH_TOKEN: 'probe-marker' }, timeoutMs: 60000 });
+    }
+  });
+  it('accepts only the external probe timeout as availability evidence', async () => {
+    const { result } = await replayGithubOutage(githubOutageHost({ probeError: 'gh pr list failed: timed out after 60000ms (process group killed)' }));
+    expect(result.verdict).toBe('env-unavailable');
+  });
+  it('still rejects a persistent tree failure when every probe succeeds', async () => {
+    const host = githubOutageHost({ probeError: null });
+    const { result, sleep } = await replayGithubOutage(host);
+    expect(result.verdict).toBe('code');
+    expect(result.githubEnv.confirmed).toBe(false);
+    expect(result.githubEnv.attempts).toHaveLength(3);
+    expect(sleep.mock.calls).toEqual([[10], [20]]);
+  });
+  it('passes when the second whole smoke recovers', async () => {
+    const { result } = await replayGithubOutage(githubOutageHost({ recover: true }));
+    expect(result.verdict).toBe('pass');
+    expect(result.attempts).toBe(2);
+  });
+  it('never probes when a code-shaped row accompanies the read failure', async () => {
+    const host = githubOutageHost({ codeRow: true });
+    const { result } = await replayGithubOutage(host);
+    expect(result.verdict).toBe('code');
+    expect(host.probes).toEqual([]);
+  });
+  it('policy off restores the previous code verdict without probing', async () => {
+    const host = githubOutageHost();
+    const { result } = await replayGithubOutage(host, { env: { ...githubSmokeEnv, WE_SMOKE_GH_ENV_PROBE: '0' } });
+    expect(result.verdict).toBe('code');
+    expect(host.probes).toEqual([]);
+  });
+  it('holds without retry when the deadline cannot fit backoff plus reconcile', async () => {
+    const host = githubOutageHost();
+    host.runChild.deadline = 330749 + 120000 + 9;
+    const { result, sleep } = await replayGithubOutage(host);
+    expect(result.verdict).toBe('env-unavailable');
+    expect(result.attempts).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+  it('registers before transient and holds without the overlay suspect ladder', async () => {
+    const names = SMOKE_ENVIRONMENT_VERDICTS.map((c) => c.name);
+    expect(names).toContain('env-unavailable');
+    expect(names.indexOf('env-unavailable')).toBeLessThan(names.indexOf('transient'));
+    expect(names.at(-1)).toBe('transient');
+    const classifier = SMOKE_ENVIRONMENT_VERDICTS.find((c) => c.matches('env-unavailable'));
+    const failedA = [{ name: 'reconcile-dry-run', detail: 'HTTP 502 ghp_secret' }];
+    const hold = vi.fn();
+    const alert = vi.fn();
+    const result = await classifier.run({ a: { smokeResult: { githubEnv: { attempts: [{ attempt: 1, probe: { detail: 'HTTP 502 ghp_secret' } }] } } },
+      failedA, hold, alert, plan: {}, prepAlerts: [], alertsList: [] });
+    expect(hold).toHaveBeenCalledWith('smoke-env-unavailable', failedA);
+    expect(alert).toHaveBeenCalledWith('smoke-env-unavailable', expect.objectContaining({ failed: 'reconcile-dry-run' }));
+    expect(JSON.stringify(alert.mock.calls)).not.toContain('ghp_secret');
+    expect(result).toMatchObject({ moved: false, reason: 'smoke-env-unavailable' });
+  });
+  it('gateMergedCommit rolls back with no reject record', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'gate-github-outage-'));
+    try {
+      const host = githubOutageHost({ dispatchTimeout: false });
+      host.runChild.deadline = 0; // no real sleeps; confirmed outage still holds
+      const env = { ...githubSmokeEnv, WE_DAEMON_SMOKE_STATE_DIR: stateDir };
+      const run = vi.fn(() => ({ status: 0, stdout: '' }));
+      const result = await gateMergedCommit({ root: '/x', preMergeSha: 'pre', mergedIdentitySha: 'candidate', env,
+        runChild: host.runChild, run, log: { error: vi.fn() } });
+      expect(result).toMatchObject({ adopt: false, reason: 'smoke-env-unavailable' });
+      expect(run).toHaveBeenCalledWith(['reset', '--hard', 'pre'], expect.any(Object));
+      expect(readRejectedSha('/x', env)).toBeNull();
+    } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('GitHub environment probe boundaries — pure helpers and injected external IO', () => {
+  it('signatures only invite probing; measured timeouts and eligible transient rows may accompany them', () => {
+    const read = { ok: false, mayBeTransient: false, detail: 'Command failed: gh pr list' };
+    expect(Object.isFrozen(liveSmoke.GITHUB_READ_FAILURE_SIGNATURES)).toBe(true);
+    expect(liveSmoke.GITHUB_PROBE_PR_LIST_FIELDS).toBe(probeFields);
+    expect(liveSmoke.isGithubReadFailureRow({ ...read, ok: true })).toBe(false);
+    expect(liveSmoke.isGithubEnvCandidateSet([])).toBe(false);
+    expect(liveSmoke.isGithubEnvCandidateSet([read, { ok: false, detail: 'ECONNRESET' }])).toBe(true);
+    expect(liveSmoke.isGithubEnvCandidateSet([read, { ok: false, mayBeTransient: false, detail: 'ECONNRESET' }])).toBe(false);
+    const timeout = { ok: false, mayBeTransient: false, detail: 'dispatch failed: timed out after 60000ms (process group killed)', ms: 1 };
+    expect(liveSmoke.isGithubEnvCandidateSet([read, timeout])).toBe(false);
+    expect(liveSmoke.isGithubEnvCandidateSet([read, { ...timeout, ms: 60000 }])).toBe(true);
+    expect(liveSmoke.isGithubEnvCandidateSet([read, { ok: false, detail: 'AssertionError: expected true' }])).toBe(false);
+  });
+  it.each([
+    ['HTTP 504: Gateway Timeout', true], ['Service Unavailable', true], ['HTTP 429', true],
+    ['rate limit exceeded', true], ['Something went wrong while executing your query', true],
+    ['dial tcp: i/o timeout', true], ['ECONNRESET', true], ['HTTP 401: Bad credentials', false],
+    ['HTTP 401: Bad credentials; HTTP 502', false], ['HTTP 403: forbidden', false],
+    ['spawn gh ENOENT', false], ['no free lane', false], ['assertion failed', false],
+  ])('classifies only the probe’s own availability error: %s', async (stderr, unavailable) => {
+    const result = await liveSmoke.probeGithubApiAvailability({ env: {}, repos: ['trusted/repo'],
+      runChild: async () => { throw Object.assign(new Error('exited 1'), { stderr }); } });
+    expect(result).toMatchObject({ ok: false, unavailable, repos: [{ repo: 'trusted/repo', ok: false, unavailable }] });
+    expect(result.detail).toContain(stderr);
+  });
+  it('retains per-repo results when one constellation owner is unavailable', async () => {
+    const result = await liveSmoke.probeGithubApiAvailability({ env: {}, repos: ['a/r', 'b/r'],
+      runChild: async (cmd, args) => { if (args.includes('b/r')) throw new Error('HTTP 502'); return '[]'; } });
+    expect(result).toMatchObject({ ok: false, unavailable: true,
+      repos: [{ repo: 'a/r', ok: true, unavailable: false }, { repo: 'b/r', ok: false, unavailable: true }] });
+  });
+  it('resolves policy provenance and widens the new budget', () => {
+    expect(liveSmoke.resolveSmokeGithubEnvProbe({})).toEqual({ enabled: true, source: 'standard' });
+    expect(liveSmoke.resolveSmokeGithubEnvProbe({ WE_SMOKE_GH_ENV_PROBE: '0' })).toEqual({ enabled: false, source: 'env' });
+    expect(liveSmoke.resolveSmokeGithubEnvProbe({ WE_SMOKE_GH_ENV_PROBE: '1' })).toEqual({ enabled: true, source: 'env' });
+    expect(widenSmokeBudgetsEnv({ WE_SMOKE_LOAD_SCALE: '0' }, 2).WE_SMOKE_GH_ENV_PROBE_MS).toBe('120000');
+  });
+  it('keeps GitHub retries separate from the ordinary transient cap', async () => {
+    const runChild = withNewCheckDefaults(async (cmd, args) => {
+      if (cmd === 'gh' && args[0] === 'api') throw new Error('rate limit exceeded');
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return '{"lane":1}';
+      return '';
+    });
+    const { result, sleep } = await replayGithubOutage({ runChild, clock: () => 0 });
+    expect(result.verdict).toBe('transient');
+    expect(result.attempts).toBe(5);
+    expect(sleep.mock.calls).toEqual([[10], [20], [10], [10]]);
   });
 });
