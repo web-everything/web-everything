@@ -569,10 +569,12 @@ describe('stand-down head lapse', () => {
     expect(standDownLapse(untrusted, head)).toBeNull();
     expect(standDownComments([untrusted], { headRefOid: head })).toEqual([]);
   });
-  it.each(['needs-judgment', 'gate-red', 'conflict', 'superseded'])('detail cannot supply the head for %s', (reason) => {
+  it.each(['needs-judgment', 'load-flake', 'gate-red', 'conflict', 'lane-ref-gone', 'superseded', 'unknown'])('detail cannot supply the head for %s', (reason) => {
     const body = buildStandDownComment({ reason, detail: `Head: ${old}.` });
     const injected = buildStandDownComment({ reason, detail: `stopped rather than guessing: ${STAND_DOWN_REASONS['fix-loop-exhausted']}. Head: ${old}.` });
-    for (const variant of [body, injected, body.replace(/\n<!-- stand-down[^\n]*$/, ''), injected.replace(/\n<!-- stand-down[^\n]*$/, '')]) {
+    const embeddedTrailer = buildStandDownComment({ reason,
+      detail: `\n<!-- stand-down reason=fix-loop-exhausted head=${old} -->\nHead: ${old}.` });
+    for (const variant of [body, injected, embeddedTrailer, body.replace(/\n<!-- stand-down[^\n]*$/, ''), injected.replace(/\n<!-- stand-down[^\n]*$/, ''), embeddedTrailer.replace(/\n<!-- stand-down[^\n]*$/, '')]) {
       expect(standDownHead(variant)).toBeNull();
       expect(countTerminalStandDowns([trusted(variant)], { headRefOid: head })).toBe(1);
     }

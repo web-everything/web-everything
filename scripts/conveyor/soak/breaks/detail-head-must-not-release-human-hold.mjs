@@ -7,7 +7,7 @@ export default {
   id: 'detail-head-must-not-release-human-hold',
   title: 'detail-supplied head cannot release a needs-judgment hold',
   card: 'PR #5155',
-  fixedBy: { sha: 'uncommitted', where: 'lane/standdown-lapse', paths: ['scripts/conveyor/stand-down.mjs'] },
+  fixedBy: { sha: '40c10b172327b7b03cd69736dc99ff58b61daa69', where: 'lane/standdown-lapse', paths: ['scripts/conveyor/stand-down.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/conveyor/stand-down.mjs'), 'utf8').includes('const legacyFixLoop =');
   },
