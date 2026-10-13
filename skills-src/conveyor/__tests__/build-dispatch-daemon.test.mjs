@@ -2411,20 +2411,23 @@ describe('automatic item preparation', () => {
     expect(effects.dispatch).not.toHaveBeenCalled();
   });
   it('unknown dispatch failure releases its claim, holds across restart and files a prevention card', async () => {
-    const effects = fixture({ fail: true });
-    const path = join(lockRoot, 'failures.json');
-    const fileCard = vi.fn(() => ({ ok: true }));
-    effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard });
-    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
-    effects.listHolds = () => effects.listPrepareFailures().filter(f => f.held).map(f => ({ num: f.num, reason: 'prepare-unstamped' }));
-    const tick = await runBuildDispatchTick({ live: true, effects });
-    expect(tick.prepare.failures).toHaveLength(2);
-    const retry = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
-    expect(retry.prepare.planned).toEqual([]);
-    expect(effects.dispatch).toHaveBeenCalledTimes(2);
-    expect(fileCard).toHaveBeenCalledTimes(1);
-    expect(effects.listPrepareClaims()).toEqual([]);
-    expect(tick.nextBookkeeping.prepareGuards).toEqual([]);
+    vi.stubEnv('WE_PREPARE_RETRY_UNSTAMPED_ONCE', '0');
+    try {
+      const effects = fixture({ fail: true });
+      const path = join(lockRoot, 'failures.json');
+      const fileCard = vi.fn(() => ({ ok: true }));
+      effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard });
+      effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+      effects.listHolds = () => effects.listPrepareFailures().filter(f => f.held).map(f => ({ num: f.num, reason: 'prepare-unstamped' }));
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.failures).toHaveLength(2);
+      const retry = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
+      expect(retry.prepare.planned).toEqual([]);
+      expect(effects.dispatch).toHaveBeenCalledTimes(2);
+      expect(fileCard).toHaveBeenCalledTimes(1);
+      expect(effects.listPrepareClaims()).toEqual([]);
+      expect(tick.nextBookkeeping.prepareGuards).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
   });
   it.each(['lane cap reached', 'not planned this tick', 'frozen', 'kill switch engaged'])('a planner refusal (%s) neither holds nor files a card and retries next tick', async (reason) => {
     const effects = fixture();

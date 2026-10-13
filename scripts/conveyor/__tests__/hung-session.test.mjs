@@ -363,6 +363,42 @@ describe('readTranscriptTailActivity — the shared IO primitive, injected IO (m
   });
 });
 
+// Stable names are the explicit manifest consumed by hung-session-mutation-check.mjs (#4492).
+describe('Parsed timestamp fallback', () => {
+  const mtimeMs = 12345;
+  const undated = [{ kind: 'assistant' }, { kind: 'assistant', ts: null },
+    { kind: 'assistant', ts: '' }, { kind: 'assistant', ts: 'not-a-timestamp' }];
+  const mixed = [undated[0], { ts: '2026-09-27T20:44:34.000Z' }, undated[1],
+    { ts: '2026-09-27T21:44:34.000Z' }, undated[2], undated[3]];
+  const cases = [
+    ...['omitted', 'null', 'empty', 'invalid'].map((name, index) => ({ name, entries: [undated[index]], expected: mtimeMs, statCalls: 1 })),
+    { name: 'stat-error', entries: undated, statError: true, statCalls: 1 },
+    { name: 'mixed-forward', entries: mixed, expected: Date.parse('2026-09-27T21:44:34.000Z'), statCalls: 0 },
+    { name: 'mixed-reverse', entries: [...mixed].reverse(), expected: Date.parse('2026-09-27T21:44:34.000Z'), statCalls: 0 },
+  ];
+  it.each(cases.map((fixture) => [fixture.name, fixture]))('%s', (_, { entries, expected, statError, statCalls }) => {
+    const statFn = vi.fn(() => {
+      if (statError) throw new Error('ENOENT');
+      return { mtimeMs };
+    });
+    const summarizeEntryFn = vi.fn((line) => JSON.parse(line));
+    const result = readTranscriptTailActivity({ cwd: '/fixture', sessionId: 'parsed' }, {
+      tailLines: 15, maxBytes: 400_000, fieldMax: 200,
+      resolveTranscript: () => '/fixture/transcript.jsonl',
+      tailLinesFn: () => ({ lines: entries.map((entry) => JSON.stringify(entry)) }),
+      summarizeEntryFn, statFn,
+    });
+    expect(summarizeEntryFn).toHaveBeenCalledTimes(entries.length);
+    if (statError) expect(result).toBeNull();
+    else {
+      expect(result.lastActivityMs).toBe(expected);
+      expect(result.entries).toEqual(entries);
+      expect(result.hadUnparseableLine).toBe(false);
+    }
+    expect(statFn).toHaveBeenCalledTimes(statCalls);
+  });
+});
+
 // ── IDLE-TURN-ENDED BACKSTOP — #4075/xg7m2wq, live incident PR #2724, 2026-09-26 ───────────────────────────────
 describe('classifyIdleFinished — PURE core', () => {
   const NOW = 1_000_000_000;

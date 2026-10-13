@@ -301,7 +301,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     const net = computeNetDiffChangedFiles({ exec, rev: 'lane/child', baseRev: 'feedface', fetchExtraRefs: ['lane/child'] });
     expect(net.changedFiles).not.toContain('scripts/lib/gate-config.mjs'); // SIZE de-inflated (the ancestor edit is out)
     expect(net.humanBasisFiles).toContain('scripts/lib/gate-config.mjs'); // but the human gate still sees it
-    const score = scoreEscalation({ changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles });
+    const score = scoreEscalation({ humanSurfaces: 'broad', changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles });
     expect(score.humanRequired).toBe(true); // THE FIX: a policy-core edit forces review:human even from an ancestor
   });
 
@@ -317,7 +317,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     expect(net.changedFiles).toEqual(['scripts/lib/gate-config.mjs']); // fell back to cumulative — NOT an empty under-score
     expect(net.humanBasisFiles).toEqual(['scripts/lib/gate-config.mjs']);
     expect(calls.some((c) => c.key === 'git diff --numstat cafebabecafe origin/lane/child')).toBe(false); // own-delta never attempted
-    expect(scoreEscalation({ changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles }).humanRequired).toBe(true);
+    expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles }).humanRequired).toBe(true);
   });
 
   it('#2390-review-fix — a base that is NOT an ancestor of head is REJECTED (merge-base --is-ancestor non-zero): fall back to the cumulative origin/main basis rather than trust an unrelated-tree base', () => {
@@ -328,7 +328,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     const net = computeNetDiffChangedFiles({ exec, rev: 'lane/child', baseRev: 'deadbeefdead', fetchExtraRefs: ['lane/child'] });
     expect(net.changedFiles).toEqual(['backlog/x.md', 'scripts/lib/gate-config.mjs']); // cumulative — a bad base never de-inflates
     expect(calls.some((c) => c.key === 'git diff --numstat deadbeefdead origin/lane/child')).toBe(false); // own-delta never attempted
-    expect(scoreEscalation({ changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles }).humanRequired).toBe(true);
+    expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: net.changedFiles, diffLines: net.diffLines, humanBasisFiles: net.humanBasisFiles }).humanRequired).toBe(true);
   });
 
   // ── #2404 — twin of #2373: a FRESH base against an UN-REBASED head over-reports (PR #364 repro: a 2-file
@@ -407,7 +407,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     const basis = resolveNetDiffBasis({ exec, rev: 'deadbeef' });
     expect(basis.basisKind).toBe('ancestry');
     expect(basis.humanBasis.changedFiles).toContain('docs/agent/platform-decisions.md');
-    const score = scoreEscalation({ changedFiles: basis.humanBasis.changedFiles, diffLines: basis.humanBasis.diffLines, humanBasisFiles: basis.humanBasis.changedFiles });
+    const score = scoreEscalation({ humanSurfaces: 'broad', changedFiles: basis.humanBasis.changedFiles, diffLines: basis.humanBasis.diffLines, humanBasisFiles: basis.humanBasis.changedFiles });
     expect(score.humanRequired).toBe(true);
     expect(score.reasons.some((r) => r.startsWith('statute ('))).toBe(true);
   });
@@ -419,7 +419,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
       'git log --numstat --diff-merges=first-parent --pretty=format: origin/main..deadbeef --': { stdout: '5\t1\tscripts/lib/gate-config.mjs\n' },
     });
     const basis = resolveNetDiffBasis({ exec, rev: 'deadbeef' });
-    expect(scoreEscalation({ changedFiles: basis.humanBasis.changedFiles, humanBasisFiles: basis.humanBasis.changedFiles }).humanRequired).toBe(true);
+    expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: basis.humanBasis.changedFiles, humanBasisFiles: basis.humanBasis.changedFiles }).humanRequired).toBe(true);
   });
 
   it("#3343 — when the ancestry probe cannot answer either, the legacy base-TIP fallback is kept AND SAID: `basisKind:'base-tip'`, `basisNarrowed:false` — no longer byte-identical to a narrowed basis", () => {

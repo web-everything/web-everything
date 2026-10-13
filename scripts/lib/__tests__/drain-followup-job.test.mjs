@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DRAIN_FOLLOWUP_ENTRY, DRAIN_FOLLOWUP_KIND, assertLinkedWorktree, buildFollowupInput, defineDrainFollowupKind,
-  followupNeeded, followupSteps, makeFollowupWorktreePreparer,
+  fetchRemoteTip, followupNeeded, followupSteps, makeFollowupWorktreePreparer, resetToRemoteTip,
 } from '../drain-followup-job.mjs';
 import { createJobStore, enqueueJob, reattachTick } from '../daemon-jobs-runtime.mjs';
 import { kindRegistry } from '../daemon-jobs.mjs';
@@ -181,6 +181,45 @@ describe('followupSteps', () => {
   it('refuses to run in a primary clone (the daemon clone is never reset)', () => {
     const { deps } = fakes();
     expect(() => followupSteps({ ...deps, cwd: clone })[0].run({ input })).toThrow(/not a linked worktree/);
+  });
+});
+
+describe('fetchRemoteTip — a lost ref-lock race is retried, not a failed step', () => {
+  const lockRace = () => Object.assign(new Error("Command failed: git fetch origin main --quiet\nerror: cannot lock ref 'refs/remotes/origin/main': is at 2d1a6333 but expected 176afcf9\n"), { stderr: '' });
+  const flaky = (failures, err = lockRace) => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push(args[0]); if (args[0] === 'fetch' && failures-- > 0) throw err(); return ''; };
+    return { exec, calls };
+  };
+
+  it('retries the fetch after "cannot lock ref" and then succeeds (red main @ cd8d6e3bd)', () => {
+    const { exec, calls } = flaky(2);
+    const waits = [];
+    fetchRemoteTip({ exec, cwd: '/x', sleep: (ms) => waits.push(ms) });
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(3);
+    expect(waits).toHaveLength(2);
+  });
+
+  it('gives up after the attempt cap and rethrows the lock error', () => {
+    const { exec, calls } = flaky(99);
+    expect(() => fetchRemoteTip({ exec, cwd: '/x', attempts: 3, sleep: () => {} })).toThrow(/cannot lock ref/);
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(3);
+  });
+
+  it('does NOT retry any other fetch failure (auth, network) — it throws at once', () => {
+    const { exec, calls } = flaky(99, () => new Error('fatal: could not read from remote repository'));
+    expect(() => fetchRemoteTip({ exec, cwd: '/x', sleep: () => {} })).toThrow(/could not read/);
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(1);
+  });
+
+  it('resetToRemoteTip survives the race inside a real linked worktree', () => {
+    makeFollowupWorktreePreparer({ repoDir: clone, worktreeDir: worktree })();
+    let lost = 1;
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch' && lost-- > 0) throw lockRace();
+      return execFileSync(cmd, args, opts);
+    };
+    expect(resetToRemoteTip({ exec, cwd: worktree, sleep: () => {} })).toMatch(/^[0-9a-f]{40}$/);
   });
 });
 

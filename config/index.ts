@@ -27,6 +27,8 @@ export {
   type CrossProviderFallbackPolicy,
   type CrossProviderFallbackFlavorName,
   type CrossProviderFallbackValue,
+  type BacklogIdNumberingSetting,
+  type BacklogIdReachSetting,
 } from './defineConfig';
 
 export { type DimensionResolver } from './resolverContract';
@@ -34,6 +36,7 @@ export { type DimensionResolver } from './resolverContract';
 export {
   PLATFORM_AUTO_DEFINE_FLAVOR,
   PLATFORM_FLAVOR_DEFAULTS,
+  PLATFORM_BACKLOG_ID_BUILT_VALUES,
   PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS,
   type AutoDefineOverrides,
 } from './platformDefaults';
