@@ -56,14 +56,16 @@ describe('repair language is a subset of the built-in families', () => {
     expect(validRepairPatterns(['^' + purpose + '$'])).toBe(false);
   });
 
-  it('bounds count and length independently of the accepted literal grammar', () => {
+  it.each([1, 2])('bounds count and length with %i end markers independently of the accepted literal grammar', (endMarkers) => {
     const patterns = Array.from({ length: MAX_REPAIR_PATTERNS }, (_, i) => '^revert-red-' + i + '$');
     expect(validRepairPatterns(patterns)).toBe(true);
     expect(validRepairPatterns([...patterns, '^revert-red-99$'])).toBe(false);
     const literal = '^revert-red-' + '1'.repeat(MAX_REPAIR_PATTERN_LENGTH - 13) + '$';
     expect(literal.length).toBe(MAX_REPAIR_PATTERN_LENGTH);
     expect(validRepairPatterns([literal])).toBe(true);
-    expect(validRepairPatterns([literal.replace('$', '1$')])).toBe(false);
+    const oversized = (literal + '$'.repeat(endMarkers - 1)).replaceAll('$', '1$');
+    expect(oversized).toBe(literal.slice(0, -1) + '1$'.repeat(endMarkers));
+    expect(validRepairPatterns([oversized])).toBe(false);
   });
 
   it('skips oversized values even when a built-in family would match', () => {
