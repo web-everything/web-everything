@@ -4010,16 +4010,17 @@ describe('#5649 — approval rows at the label home', () => {
     }
   });
 
-  it('every approval kind, with and without a delegation, either clears with its approval row or is refused before any write', () => {
-    const delegation = JSON.stringify({ by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' });
+  it('every approval kind, with and without a delegation, clears and stores exactly that kind and delegation (the schema accepts all six)', () => {
+    const delegation = { by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' };
     for (const kind of ['clear-human', 'clear-operator', 'judge']) {
-      for (const extra of [[], [`--delegation-json=${delegation}`]]) {
+      for (const withDelegation of [false, true]) {
         rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
         const p = stubProvider(['review:human']);
-        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...extra]);
-        const types = rows().map((x) => x.type ?? 'verdict');
-        if (r.exitCode === 0) expect(types).toEqual(['verdict', 'approval']);
-        else { expect(types).toEqual([]); expect(p.calls).toEqual([]); }
+        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...(withDelegation ? [`--delegation-json=${JSON.stringify(delegation)}`] : [])]);
+        expect(r.exitCode, `${kind} ${withDelegation}`).toBe(0);
+        const all = rows();
+        expect(all.map((x) => x.type ?? 'verdict')).toEqual(['verdict', 'approval']);
+        expect(all[1]).toMatchObject({ approval: kind, delegation: withDelegation ? delegation : null });
       }
     }
   });

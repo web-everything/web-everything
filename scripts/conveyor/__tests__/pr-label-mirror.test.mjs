@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -234,6 +234,37 @@ describe('#5649 runMirrorApply', () => {
     const out = await runMirrorApply(w.opts);
     expect(w.log).toEqual([]);
     expect(out.failures[0].reason).toContain('ledger-unreadable');
+  });
+
+  it('a fresh ledger read that fails just before the append writes nothing for that PR and reports it', async () => {
+    const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+    let reads = 0;
+    const good = w.opts.readEvents;
+    w.opts.readEvents = async (...a) => { reads += 1; return reads === 1 ? good(...a) : { status: 'unreadable', reason: 'store-read-failed', error: 'x', store: { name: 'home' } }; };
+    const out = await runMirrorApply(w.opts);
+    expect(w.log).toEqual([]);
+    expect(out.failures).toEqual([{ pr: 7, reason: 'ledger-unreadable: store-read-failed' }]);
+  });
+
+  it('an unknown mirror login refuses to write at all, and a PR whose facts are unreadable is never a candidate', async () => {
+    const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+    await expect(runMirrorApply({ ...w.opts, selfLogin: '' })).rejects.toThrow(/own login is unknown/);
+    await expect(runMirrorApply({ ...w.opts, selfLogin: async () => '' })).rejects.toThrow(/own login is unknown/);
+    const timelines = [];
+    const out = await runMirrorApply({ ...w.opts, buildRows: (o) => buildDerivedRows({ ...o, readFacts: () => null }), readTimeline: async (a) => { timelines.push(a); return { status: 'ok', items: [] }; } });
+    expect(timelines).toEqual([]);
+    expect(out.unreadable).toBe(1);
+    expect(w.log).toEqual([]);
+  });
+
+  it('--store reaches the append: the default append passes the named store through', async () => {
+    const seen = [];
+    const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+    delete w.opts.appendRow;
+    const mod = await import('../../lib/verdict-ledger.mjs');
+    const spy = vi.spyOn(mod, 'appendVerdictAsync').mockImplementation(async (row, opts) => { seen.push([row.type, opts]); w.rows.push(row); return { ok: true, errors: [] }; });
+    try { await runMirrorApply({ ...w.opts, store: 'dual' }); } finally { spy.mockRestore(); }
+    expect(seen).toEqual([['label-input', { store: 'dual' }]]);
   });
 
   it('a PR list that hit --limit is an error, never a partial apply', async () => {
