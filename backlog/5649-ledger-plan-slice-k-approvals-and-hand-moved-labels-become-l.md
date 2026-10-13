@@ -9,7 +9,7 @@ blockedBy: ["5355"]
 scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
 dateOpened: "2026-10-09"
 preparedDate: "2026-10-12"
-preparedAgainstSha: "8be74a8b3950de7e4d59cde169abd608dbbc7a50"
+preparedAgainstSha: "981be0907d1b19ab314fc31fcf8fbdce969926d4"
 tags: []
 ---
 
@@ -30,7 +30,7 @@ What exists already (do not rebuild): the v2 event types `approval` and `label-i
 ## MVP
 
 Musts only:
-1. `clear-human` appends an `approval` row (kind `clear-human`, or `judge` plus an optional validated delegation) next to the verdict row; failure is fatal and the label is not swapped.
+1. `clear-human` appends an `approval` row (kind `clear-human`, or `judge` plus an optional validated delegation) next to the verdict row; a refused approval append sets `clearingLedgerMiss`, so the label is not swapped.
 2. The mirror appends `label-input` rows for hand-moved hold labels, idempotently, ignoring its own writes.
 3. The mirror `--apply` re-adds a derived-but-missing `review:human` (add only), after appending the audit label-input row for the removal. If the PR's current verdict is not `human`, the derive wants no `review:human` and the mirror correctly does nothing (a test pins this).
 
@@ -54,7 +54,7 @@ In we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs:
 - `a truncated or unreadable timeline plans no write and no row`.
 - `a PR whose current verdict is not human gets no review:human add even after a hand removal`.
 - `clear-human: verdict lands, approval append fails -> swap refused; the retry succeeds`.
-The new mirror entry point is `runMirrorApply`, an export that does not exist today; each mirror test's RED reason is the missing write path, asserted by first running the same fixture through the report-mode export. `accepted and changes append no approval row` and the report-mode zero-writes test are guards that pass today and are labelled as such.
+The mirror's own identity (`gh api user` login) is an injected dependency of `runMirrorApply` (a `selfLogin` option, default read from `gh api user`), so the own-write test passes a fixed login. The new mirror entry point is `runMirrorApply`, an export that does not exist today; each mirror test's RED reason is the missing write path, asserted by first running the same fixture through the report-mode export. `accepted and changes append no approval row` and the report-mode zero-writes test are guards that pass today and are labelled as such.
 
 ## Proof plan
 
@@ -83,9 +83,11 @@ Live, on a real repo with a throwaway PR parked `review:human` by a real verdict
 
 - 2026-10-12 refresh: re-checked against main (003fe20, 1518 commits after the prior stamp). Premise still holds: no non-test writer for `approval`/`label-input`; the mirror is still report-only (77 lines). Only we:scripts/review-set-label.mjs moved (~+300 lines), so its cites were re-pointed (verdict append + F4 block now :1581-1613); we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/ cites re-verified. Design, MVP and tests unchanged.
 
+- 2026-10-12 re-stamp (main 981be09): the stamp's `preparedAgainstSha` was stale. Re-verified: no non-test writer for `approval`/`label-input` exists (only we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/label-input.mjs mention them); the mirror is still 77 lines, report-only; the verdict append + F4 block sit at we:scripts/review-set-label.mjs:1581-1617; `APPROVAL_KINDS` at we:scripts/lib/verdict-ledger.mjs:551, `delegationOrNull` at :567, `buildLedgerEvent` at :642; `HOLD_LABELS` at we:scripts/lib/pr-state/holds/label-input.mjs:4; human gate at we:scripts/lib/pr-state.mjs:108. Design, MVP and tests unchanged.
+
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/__tests__/review-set-label.test.mjs we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs` fails before this lands (the new approval and label-input cases are RED) and passes after; `node we:scripts/conveyor/pr-label-mirror.mjs --json` without `--apply` still makes zero writes.
+- [A1] **Executable** — `npx vitest run we:scripts/__tests__/review-set-label.test.mjs we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs` fails before this lands (the new approval and label-input cases are RED, except the two labelled guards, which pass today) and passes after; `node we:scripts/conveyor/pr-label-mirror.mjs --json` without `--apply` still makes zero writes.
 
 ## Non-goals
 
