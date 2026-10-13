@@ -1,6 +1,12 @@
 {
-  "$comment": "Repo override (card xk8ab41). review.nativeGithubReview off|mirror|authoritative: our review verdict also posts as a real GitHub pull-request review from the reviewer App (accepted -> APPROVE, changes -> REQUEST_CHANGES, human-review advisory -> COMMENT, never APPROVE), pinned to the reviewed head and idempotent per (PR, head, verdict); it posts nothing unless the live token is the configured reviewer App and not the PR author (fail closed). off = nothing posted. mirror = posted in addition to the labels; no gate changes; each mirror logs one 'native-review:' comparison line (stderr and the conveyor native-review.log) next to the label verdict. authoritative = reserved, behaves like mirror until the operator's ruleset step makes GitHub's required approval the gate. Cascade: standard off -> platform preference (review.nativeGithubReview in scripts/lib/delivery-platform-preferences.json) -> this file -> env WE_REVIEW_NATIVE_GITHUB_REVIEW; the comparison line names the source layer. See scripts/lib/native-github-review.mjs.",
+  "$comment": "Repo override (card xk8ab41). review.nativeGithubReview.mode off|mirror|authoritative (a bare string is also read as the mode): our review verdict also posts as a real GitHub pull-request review from the reviewer App (accepted -> APPROVE, changes -> REQUEST_CHANGES, human-review advisory -> COMMENT, never APPROVE), pinned to the reviewed head and idempotent per (PR, head, verdict); it posts nothing unless the live token is the configured reviewer App and not the PR author (fail closed). off = nothing posted. mirror = posted in addition to the labels; no gate changes; each mirror logs one 'native-review:' comparison line (stderr and the conveyor native-review.log) next to the label verdict. authoritative = reserved, behaves like mirror until the operator's ruleset step makes GitHub's required approval the gate. Mode cascade: standard off -> platform preference (review.nativeGithubReview in scripts/lib/delivery-platform-preferences.json) -> this file -> env WE_REVIEW_NATIVE_GITHUB_REVIEW; the comparison line names the source layer. review.nativeGithubReview.promotion {minMirroredVerdicts, maxMismatches} (operator decision 2026-10-13: measure the trial by count): the bar the mirror trial must clear; cascade per leaf standard {50, 0} -> platform preference -> this file. Read-only: `node scripts/lib/native-github-review.mjs readiness` prints 'N of 50 mirrored verdicts, M mismatches, ready yes/no' with each leaf's source; nothing ever switches the mode to authoritative automatically. See scripts/lib/native-github-review.mjs.",
   "review": {
-    "nativeGithubReview": "mirror"
+    "nativeGithubReview": {
+      "mode": "mirror",
+      "promotion": {
+        "minMirroredVerdicts": 50,
+        "maxMismatches": 0
+      }
+    }
   }
 }

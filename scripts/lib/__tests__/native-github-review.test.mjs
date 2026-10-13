@@ -4,6 +4,7 @@ import {
   parseNativeReviewMode, resolveNativeReviewMode, loadNativeReviewMode, planNativeReview,
   normaliseLogin, checkReviewerIdentity, findExistingNativeReview, ownStandingChangeRequests,
   nativeReviewBody, formatComparisonLine, mirrorNativeReview,
+  STANDARD_PROMOTION, resolvePromotionCriteria, loadPromotionCriteria, parseComparisonLine, summarizeReadiness, formatReadinessLine,
 } from '../native-github-review.mjs';
 
 const head = 'a'.repeat(40);
@@ -207,5 +208,43 @@ describe('synchronous mirror shell', () => {
     fixture();
     fixture({}, { postError: new Error('failed') });
     expect(stdout).not.toHaveBeenCalled();
+  });
+});
+
+describe('promotion bar and readiness (count, not days; operator 2026-10-13)', () => {
+  const line = (pr, outcome, { label = 'accepted', native = 'APPROVE', h = head, reason = '' } = {}) => formatComparisonLine({
+    repo: 'o/r', pr, head: h, labelVerdict: label, event: native, outcome, reason, mode: 'mirror', source: 'tool' });
+  it('the bar defaults to 50 mirrored / 0 mismatches and resolves per leaf with sources', () => {
+    expect(STANDARD_PROMOTION).toEqual({ minMirroredVerdicts: 50, maxMismatches: 0 });
+    const c = resolvePromotionCriteria({ platform: { nativeGithubReview: { promotion: { minMirroredVerdicts: 20 } } }, tool: { nativeGithubReview: { promotion: { maxMismatches: 1, minMirroredVerdicts: 0 } } } });
+    expect(c).toMatchObject({ minMirroredVerdicts: 20, maxMismatches: 1, sources: { minMirroredVerdicts: 'platform', maxMismatches: 'tool' } });
+    expect(c.invalid).toEqual(['tool.promotion.minMirroredVerdicts=0']);
+  });
+  it('the declared repo file sets the bar and the mode in one object block', () => {
+    expect(loadPromotionCriteria({ env: {}, readPlatform: () => undefined })).toMatchObject({ minMirroredVerdicts: 50, maxMismatches: 0, sources: { minMirroredVerdicts: 'tool' } });
+    expect(resolveNativeReviewMode({ tool: { nativeGithubReview: { mode: 'mirror' } } })).toMatchObject({ mode: 'mirror', source: 'tool' });
+  });
+  it('parses a comparison line, reason with spaces included', () => {
+    expect(parseComparisonLine(line(7, 'skipped', { reason: 'token-is-not-reviewer (viewer=x)' }))).toMatchObject({ pr: '7', outcome: 'skipped', agree: 'no', reason: 'token-is-not-reviewer (viewer=x)' });
+    expect(parseComparisonLine('unrelated')).toBeNull();
+  });
+  it('counts the latest line per (PR, head, verdict); neutral skips count as neither', () => {
+    const lines = [
+      line(1, 'failed', { reason: 'boom' }), line(1, 'posted'), // retry posted: mirrored, no mismatch
+      line(2, 'posted'), line(2, 'already-posted'), // repeat: counted once
+      line(3, 'posted', { label: 'changes', native: 'REQUEST_CHANGES' }),
+      line(4, 'skipped', { reason: 'reviewer-role-unconfigured' }), line(5, 'skipped', { reason: 'head-moved (live=abc)' }),
+      line(6, 'skipped', { reason: 'token-is-not-reviewer (viewer=web-everything[bot])' }), // fell back: mismatch
+      line(8, 'not-applicable', { label: 'clear-human', native: null }), 'noise',
+    ];
+    expect(summarizeReadiness(lines)).toEqual({ mirrored: 3, mismatches: 1, ready: false, min: 50, maxMismatches: 0 });
+  });
+  it('ready only at the bar with no excess mismatches, and the line says so without switching anything', () => {
+    const many = Array.from({ length: 50 }, (_, i) => line(100 + i, 'posted'));
+    const s = summarizeReadiness(many);
+    expect(s.ready).toBe(true);
+    expect(formatReadinessLine(s)).toMatch(/^native-review readiness: 50 of 50 mirrored verdicts, 0 mismatches against our label verdict \(max 0\), ready yes/);
+    expect(summarizeReadiness([...many, line(999, 'failed', { reason: 'x' })]).ready).toBe(false);
+    expect(summarizeReadiness(many.slice(1)).ready).toBe(false);
   });
 });

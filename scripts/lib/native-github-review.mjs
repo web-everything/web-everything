@@ -14,11 +14,12 @@
  *   throws or writes stdout. All writes require a live, open PR at the reviewed SHA, proven
  *   reviewer identity (distinct from worker and author), and readable review history.
  */
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { readSettings } from './settings-files.mjs';
-import { platformPreference } from './policy-cascade.mjs';
+import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { readDeliveryIdentity, LEGACY_BOT_LOGINS } from './github-app-identity.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -40,7 +41,9 @@ export function resolveNativeReviewMode({ platform = null, tool = null, env = {}
   let mode = STANDARD_NATIVE_REVIEW_MODE;
   let source = 'standard';
   const invalid = [];
-  const layers = [['platform', platform?.nativeGithubReview], ['tool', tool?.nativeGithubReview], ['env', env?.[NATIVE_REVIEW_ENV]]];
+  // The block is `{mode, promotion}`; a bare string is the mode (the first shape this setting shipped with).
+  const modeOf = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v.mode : v);
+  const layers = [['platform', modeOf(platform?.nativeGithubReview)], ['tool', modeOf(tool?.nativeGithubReview)], ['env', env?.[NATIVE_REVIEW_ENV]]];
   for (const [name, raw] of layers) {
     if (raw == null || (typeof raw === 'string' && raw.trim() === '')) continue;
     const parsed = parseNativeReviewMode(raw);
@@ -59,6 +62,93 @@ export function loadNativeReviewMode({ env = process.env, readTool = () => readS
   try { tool = readTool(); } catch { /* Unset layer. */ }
   try { return resolveNativeReviewMode({ platform, tool, env }); }
   catch { return { mode: STANDARD_NATIVE_REVIEW_MODE, source: 'standard', invalid: [] }; }
+}
+
+// ── review.nativeGithubReview.promotion (operator decision 2026-10-13 ~13:55 ET: measure the trial by COUNT) ──────
+// `{ minMirroredVerdicts, maxMismatches }` — the bar the mirror trial must clear before the operator MAY switch the mode
+// to `authoritative` together with the ruleset change. READ-ONLY: nothing here ever changes the mode; reaching the bar
+// only prints `ready=yes`. Cascade per leaf: standard {50, 0} → platform preference (`review.nativeGithubReview.promotion`)
+// → tool (`we:scripts/settings/native-github-review.json`). Each leaf answers only with a valid integer
+// (minMirroredVerdicts ≥ 1, maxMismatches ≥ 0); an invalid one is named in `invalid` and the lower layer stands.
+export const STANDARD_PROMOTION = Object.freeze({ minMirroredVerdicts: 50, maxMismatches: 0 });
+const PROMOTION_MIN = Object.freeze({ minMirroredVerdicts: 1, maxMismatches: 0 });
+
+/** Resolve the promotion bar per leaf, with each leaf's source layer. Pure. */
+export function resolvePromotionCriteria({ platform = null, tool = null } = {}) {
+  const criteria = { ...STANDARD_PROMOTION };
+  const sources = { minMirroredVerdicts: 'standard', maxMismatches: 'standard' };
+  const invalid = [];
+  for (const [name, block] of [['platform', platform?.nativeGithubReview?.promotion], ['tool', tool?.nativeGithubReview?.promotion]]) {
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) continue;
+    for (const leaf of Object.keys(STANDARD_PROMOTION)) {
+      const v = block[leaf];
+      if (v === undefined || v === null) continue;
+      if (!Number.isInteger(v) || v < PROMOTION_MIN[leaf]) { invalid.push(`${name}.promotion.${leaf}=${JSON.stringify(v)}`); continue; }
+      criteria[leaf] = v;
+      sources[leaf] = name;
+    }
+  }
+  return { ...criteria, sources, invalid };
+}
+
+/** Read the promotion bar (never throws). */
+export function loadPromotionCriteria({ env = process.env, readTool = () => readSettings()?.review, readPlatform = () => platformPreference('review', { env }) } = {}) {
+  let platform = null;
+  let tool = null;
+  try { platform = readPlatform(); } catch { /* Unset layer. */ }
+  try { tool = readTool(); } catch { /* Unset layer. */ }
+  const c = resolvePromotionCriteria({ platform, tool });
+  logCascadeSources('review.nativeGithubReview.promotion', { value: { minMirroredVerdicts: c.minMirroredVerdicts, maxMismatches: c.maxMismatches }, sources: c.sources, invalid: c.invalid }, { env });
+  return c;
+}
+
+/** Skips that say nothing about agreement: the mirror never got to compare (no reviewer yet, the head moved on, closed PR). */
+export const NEUTRAL_SKIP_REASONS = Object.freeze(['reviewer-role-unconfigured', 'head-moved', 'pr-not-open', 'under-test']);
+
+/** One `native-review:` line → its fields, or null. Pure. */
+export function parseComparisonLine(line) {
+  const m = /^native-review: (.*)$/.exec(String(line ?? '').trim());
+  if (!m) return null;
+  const fields = {};
+  const [head, reason] = m[1].split(/ reason=/, 2);
+  for (const part of head.split(' ')) { const i = part.indexOf('='); if (i > 0) fields[part.slice(0, i)] = part.slice(i + 1); }
+  if (reason !== undefined) fields.reason = reason;
+  return fields.repo && fields.pr && fields.label ? fields : null;
+}
+
+/**
+ * Count the trial. Pure. The LATEST line per (repo, PR, head, label verdict) wins, so a retry that posted clears an
+ * earlier failure and a repeat does not count twice. Mirrored = `posted` or `already-posted`. Mismatch = a planned
+ * native review that did not land (`agree=no`), except a neutral skip ({@link NEUTRAL_SKIP_REASONS}), which counts as
+ * neither. `ready` is a report, never an action.
+ */
+export function summarizeReadiness(lines, criteria = STANDARD_PROMOTION) {
+  const latest = new Map();
+  for (const raw of lines ?? []) {
+    const f = parseComparisonLine(raw);
+    if (!f) continue;
+    latest.set(`${f.repo}#${f.pr}@${f.head}:${f.label}`, f);
+  }
+  let mirrored = 0;
+  let mismatches = 0;
+  for (const f of latest.values()) {
+    if (f.outcome === 'posted' || f.outcome === 'already-posted') mirrored++;
+    else if (f.agree === 'no' && !NEUTRAL_SKIP_REASONS.some((r) => String(f.reason ?? '').startsWith(r))) mismatches++;
+  }
+  const ready = mirrored >= criteria.minMirroredVerdicts && mismatches <= criteria.maxMismatches;
+  return { mirrored, mismatches, ready, min: criteria.minMirroredVerdicts, maxMismatches: criteria.maxMismatches };
+}
+
+/** The readiness line. Pure. */
+export function formatReadinessLine(s, criteria) {
+  const src = criteria?.sources ? ` (bar: min ${criteria.sources.minMirroredVerdicts}, max ${criteria.sources.maxMismatches})` : '';
+  return `native-review readiness: ${s.mirrored} of ${s.min} mirrored verdicts, ${s.mismatches} mismatches against our label verdict `
+    + `(max ${s.maxMismatches}), ready ${s.ready ? 'yes' : 'no'}${src} — switching to authoritative stays the operator's call, with the ruleset change`;
+}
+
+/** The comparison log's path (shared by the writer and the readiness reader). */
+export function nativeReviewLogPath(env = process.env) {
+  return env.WE_NATIVE_REVIEW_LOG || join(homedir(), '.claude', 'conveyor', 'native-review.log');
 }
 
 /** Map a reviewed, pinned verdict to a native review and any hold cleanup. Pure. */
@@ -152,7 +242,7 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     try {
       if (appendLog) appendLog(result.line);
       else if (!underTest) {
-        const path = env.WE_NATIVE_REVIEW_LOG || join(homedir(), '.claude', 'conveyor', 'native-review.log');
+        const path = nativeReviewLogPath(env);
         mkdirSync(dirname(path), { recursive: true });
         appendFileSync(path, result.line + '\n');
       }
@@ -216,4 +306,15 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     try { return finish('failed', failureReason(error)); }
     catch { return { outcome: 'failed', event, reason: 'unexpected-error', line: '' }; }
   }
+}
+
+// ── READ-ONLY CLI: `node scripts/lib/native-github-review.mjs readiness [--log=<path>]` ─────────────────────────────
+// Prints one readiness line. Never changes the mode, a setting or a ruleset. Exit 0 whatever the answer.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1] && process.argv[2] === 'readiness') {
+  const logArg = process.argv.find((a) => a.startsWith('--log='));
+  const path = logArg ? logArg.slice('--log='.length) : nativeReviewLogPath();
+  let text = '';
+  try { text = readFileSync(path, 'utf8'); } catch { text = ''; }
+  const criteria = loadPromotionCriteria({ env: { ...process.env, WE_POLICY_CASCADE_LOG: '0' } });
+  process.stdout.write(`${formatReadinessLine(summarizeReadiness(text.split(/\r?\n/), criteria), criteria)}\n`);
 }
