@@ -13,8 +13,9 @@
  * byte-identical to *"a fixer died"*. Any reconciler reading that PR re-dispatches the refusal forever, burning
  * tokens to re-ask a question nobody is there to answer. This marker is the one bit that tells them apart.
  *
+ * Head-bound holds lapse on a new push by default; unbound holds remain terminal.
  * TERMINAL FOR THE RECONCILER, NOT FOR A PERSON. `planReconcile` treats a PR carrying this marker as terminal
- * with no decay and no clock: it will not dispatch a fixer at this PR again, however long it waits. The
+ * on the recorded head (or indefinitely without one): it will not dispatch a fixer there again. The
  * intended exit is a HUMAN — who reads the escalation, makes the judgment, and clears the marker (or takes the
  * PR over via `/finish`). That asymmetry is deliberate and it is stated in the comment body itself, because a
  * marker that quietly buries a PR forever would be a worse defect than the one it fixes.
@@ -34,7 +35,9 @@
  * that label back to decide anything; the comment stays the one durable record. And a concurrent-author stop is
  * no longer a stand-down at all — see {@link CONCURRENT_AUTHOR_PAUSE_MARKER}.)
  */
-import { resolve } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -145,9 +148,65 @@ export const CONCURRENT_AUTHOR_PAUSE_MARKER = '⏸ conveyor fix — paused for a
 const PAUSE_TRAILER_RE = /<!--\s*fix-pause\b([^>]*)-->/;
 
 /** Machine-readable trailer {@link buildStandDownComment} ends every stand-down with:
- *  `<!-- stand-down reason=<reason> -->`. Anchored to the END of the body, so a `--detail` (free text, written
+ *  `<!-- stand-down reason=<reason> head=<sha> -->` (head optional). Anchored to the END of the body, so a `--detail` (free text, written
  *  earlier in the body) can never supply it. */
-const STAND_DOWN_TRAILER_RE = /<!--\s*stand-down reason=([a-z-]+)\s*-->\s*$/;
+const STAND_DOWN_TRAILER_RE = /<!--\s*stand-down reason=([a-z-]+)(?: head=([0-9a-f]{7,40}))?\s*-->\s*$/i;
+
+export const STAND_DOWN_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'stand-down.json');
+const onOff = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
+
+/** env override > platform setting > built-in on. */
+export function resolveStandDownLapseOnNewHead({ env = process.env, file = STAND_DOWN_SETTINGS_FILE } = {}) {
+  const fromEnv = onOff(env?.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD);
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try {
+    const value = onOff(JSON.parse(readFileSync(file, 'utf8'))?.standDown?.lapseOnNewHead);
+    if (value) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: 'on', source: 'default' };
+}
+
+/** Read only the machine trailer or the legacy ci-heal Head sentence. */
+export function standDownHead(body) {
+  if (typeof body !== 'string') return null;
+  return STAND_DOWN_TRAILER_RE.exec(body)?.[2] ?? /\bHead: ([0-9a-f]{40})\b/.exec(body)?.[1] ?? null;
+}
+
+/** A trusted head-bound hold lapses when a different safe head arrives. */
+export function standDownLapse(comment, headRefOid, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value } = {}) {
+  const body = typeof comment === 'string' ? comment : comment?.body;
+  if (lapseOnNewHead !== 'on' || typeof body !== 'string'
+    || !body.trimStart().startsWith(STAND_DOWN_MARKER) || !isTrustedMarkerAuthor(comment)) return null;
+  const reason = STAND_DOWN_TRAILER_RE.exec(body)?.[1]?.toLowerCase() ?? null;
+  const fromHead = standDownHead(body);
+  if (reason === 'superseded' || !fromHead || !isSafeGitSha(headRefOid)
+    || sameCommit(fromHead.toLowerCase(), headRefOid.toLowerCase())) return null;
+  return { fromHead, toHead: headRefOid, reason };
+}
+
+const loggedLapses = new Set();
+function logStandDownLapse({ pr, fromHead, toHead }) {
+  const key = `${pr}:${fromHead}:${toHead}`;
+  if (loggedLapses.has(key)) return;
+  loggedLapses.add(key);
+  console.error(`stand-down: PR #${pr} stand-down for head ${fromHead.slice(0, 7)} lapsed — head moved to ${toHead.slice(0, 7)} (standDown.lapseOnNewHead=on)`);
+}
+
+/** Annotate the snapshot; the durable comment thread is unchanged. */
+export function annotateLapsedStandDowns(pr, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, onLapse = logStandDownLapse } = {}) {
+  if (!Array.isArray(pr?.comments)) return pr;
+  const standDownLapses = [];
+  const comments = pr.comments.map((c) => {
+    if (c?.standDownLapsed) return c;
+    const lapse = standDownLapse(c, pr.headRefOid, { lapseOnNewHead });
+    if (!lapse) return c;
+    standDownLapses.push(lapse);
+    onLapse({ pr: pr.number, ...lapse });
+    const { fromHead, toHead } = lapse;
+    return { ...c, standDownLapsed: { fromHead, toHead } };
+  });
+  return standDownLapses.length ? { ...pr, comments, standDownLapses } : pr;
+}
 
 /**
  * The last moment a TRAILER-LESS stand-down may be read by the legacy prose rule below. Every stand-down built
@@ -411,10 +470,11 @@ export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
  * @param {Array<{body?:string, createdAt?:string, author?:{login?:string}}|string>|null|undefined} comments
  * @returns {Array<{body: string, createdAt: ?string}>}
  */
-export function standDownComments(comments) {
+export function standDownComments(comments, { headRefOid = null, lapseOnNewHead } = {}) {
   if (!Array.isArray(comments)) return [];
   const out = [];
   for (const c of comments) {
+    if (c?.standDownLapsed || (headRefOid && standDownLapse(c, headRefOid, { lapseOnNewHead }))) continue;
     const body = typeof c === 'string' ? c : c?.body;
     // fix procedure — a concurrent-author stand-down is a re-armable pause, never a terminal stand-down.
     if (typeof body === 'string' && body.trimStart().startsWith(STAND_DOWN_MARKER) && isTrustedMarkerAuthor(c)
@@ -433,8 +493,8 @@ export function standDownComments(comments) {
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @returns {number} the number of conveyor stand-down comments on the PR (0 for a non-array / empty input)
  */
-export function countStandDownComments(comments, { headRefOid = null, isSuperseded } = {}) {
-  return standDownComments(comments).length + (loadFlakeHoldState({ comments, headRefOid, isSuperseded }).live ? 1 : 0);
+export function countStandDownComments(comments, { headRefOid = null, isSuperseded, lapseOnNewHead } = {}) {
+  return standDownComments(comments, { headRefOid, lapseOnNewHead }).length + (loadFlakeHoldState({ comments, headRefOid, isSuperseded }).live ? 1 : 0);
 }
 
 /**
@@ -549,12 +609,12 @@ export function isStandDownSuperseded(comments, index) {
  * @param {Array<{body?:string, viewerDidAuthor?:boolean}|string>|null|undefined} comments
  * @returns {number}
  */
-export function countTerminalStandDowns(comments) {
+export function countTerminalStandDowns(comments, options = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
-    if (!standDownComments([c]).length) continue;
+    if (!standDownComments([c], options).length) continue;
     if (!isTrustedMarkerAuthor(c)) continue; // #3383 — a forged stand-down from an untrusted login is never terminal.
     if (isConcurrentAuthorStandDown(c)) continue; // fix procedure — reclassified as a re-armable pause.
     if (!isStandDownSuperseded(comments, i)) n += 1;
@@ -591,7 +651,7 @@ export function standDownReason(body) {
  * @param {{ actor?:string, reason?:string, detail?:string }} o
  * @returns {string}
  */
-export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '' } = {}) {
+export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null } = {}) {
   const why = STAND_DOWN_REASONS[reason] || 'the fix agent could not complete the repair safely';
   return [
     STAND_DOWN_MARKER,
@@ -605,7 +665,8 @@ export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '
     '**A human is the intended next step.** The automatic fix loop will NOT try this PR again while this comment ' +
       'stands — re-running it would only re-ask the same question. Take it over with `/finish`, or delete this ' +
       'comment once the blocker is resolved to hand the PR back to the loop.',
-    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'} -->`,
+    ...(isSafeGitSha(head) ? ['This hold is for this head only and lapses automatically on a new push.'] : []),
+    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'}${isSafeGitSha(head) ? ` head=${head}` : ''} -->`,
   ].join('\n');
 }
 
@@ -652,7 +713,7 @@ if (IS_CLI) {
       alt: typeof flags.alt === 'string' ? flags.alt : (parseAltBranch(detail)?.branch ?? null),
       altSha: typeof flags['alt-sha'] === 'string' ? flags['alt-sha'] : (parseAltBranch(detail)?.sha ?? null),
     })
-    : buildStandDownComment({ actor, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail });
+    : buildStandDownComment({ actor, head: isSafeGitSha(flags.head) ? flags.head : undefined, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail });
   const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []; // a missing --repo derives from cwd.
   const gh = (args) => execFileSync('gh', args, { /* #74c write-only call: stdout is never read, so it is not captured (nothing to overflow or truncate) */ stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   try {

@@ -10,6 +10,7 @@
  * the safe process reader (no 1 MiB default buffer). A failed read NEVER yields an empty or partial thread:
  * the PR is left out of this tick's snapshot, so nothing is decided (or posted) on a view that may miss grants.
  */
+import { annotateLapsedStandDowns } from './stand-down.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs'; // the leaf — parked-pr-conflict-watch would close an import cycle via rearm-review
 
@@ -23,25 +24,25 @@ export function readCompletePrComments(number, { repo = null, exec = execRead } 
 
 /**
  * Replace each possibly-truncated `comments` array with the complete thread. PRs whose read fails are dropped
- * (fail closed) and reported through `onError`.
+ * (fail closed) and reported through `onError`. Annotate head-bound lapses on every returned PR.
  * @param {Array<object>} prs
- * @param {{repo?:string|null, readComments?:Function, onError?:Function}} [o]
+ * @param {{repo?:string|null, readComments?:Function, annotate?:Function, onError?:Function}} [o]
  */
 export function enrichPrsWithCompleteComments(prs, {
-  repo = null, readComments = readCompletePrComments,
+  repo = null, readComments = readCompletePrComments, annotate = annotateLapsedStandDowns,
   onError = (pr, e) => console.error(`pr-comments-complete: PR #${pr?.number} comments unreadable, skipped this tick: ${String(e?.message ?? e).split('\n')[0]}`),
 } = {}) {
   if (!Array.isArray(prs)) return prs;
   const out = [];
   for (const pr of prs) {
-    if (!Array.isArray(pr?.comments) || pr.comments.length < LIST_COMMENTS_PAGE_SIZE) { out.push(pr); continue; }
+    if (!Array.isArray(pr?.comments) || pr.comments.length < LIST_COMMENTS_PAGE_SIZE) { out.push(annotate(pr)); continue; }
     try {
       const comments = readComments(pr.number, { repo });
       if (!Array.isArray(comments)) throw new Error('comments read returned no array');
       // `commentsComplete`: this reader proved the thread complete, whatever its length (a complete thread can be
       // exactly the page size). The planner trusts this mark, never the length, before counting markers off it
       // (`takeover-budget.mjs#threadMayBeTruncated`).
-      out.push({ ...pr, comments, commentsComplete: true });
+      out.push(annotate({ ...pr, comments, commentsComplete: true }));
     } catch (e) { onError(pr, e); }
   }
   return out;

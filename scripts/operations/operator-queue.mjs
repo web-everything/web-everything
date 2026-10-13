@@ -276,7 +276,7 @@ export function stuckInspectedRow(repo, pr) {
  * @returns {{repo:string, number:number, title:string, standDownAt: ?string, reason: ?string, alsoReviewHuman: boolean}|null}
  */
 export function standDownRow(repo, pr) {
-  const matches = standDownComments(pr.comments);
+  const matches = standDownComments(pr.comments, { headRefOid: pr.headRefOid });
   if (!matches.length) return null;
   const latest = matches
     .map((c, index) => ({ ...c, time: Date.parse(c.createdAt) || 0, index }))
@@ -580,9 +580,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       // YOU above. `standDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        if (standDownComments(pr.comments).length === 0) continue;
+        if (standDownComments(pr.comments, { headRefOid: pr.headRefOid }).length === 0) continue;
         const comments = [...pr.comments].sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
-        const latestIndex = comments.findLastIndex((comment) => standDownComments([comment]).length > 0);
+        const latestIndex = comments.findLastIndex((comment) => standDownComments([comment], { headRefOid: pr.headRefOid }).length > 0);
         const answered = standDownAnswers?.operatorAnswerForStandDown(comments, latestIndex);
         if (answered) {
           (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,

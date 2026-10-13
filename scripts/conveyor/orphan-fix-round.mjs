@@ -38,6 +38,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { annotateLapsedStandDowns } from './stand-down.mjs';
 import { countUnresolvedStandDowns } from './reconcile-core.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
@@ -87,7 +88,7 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const lastRoundMs = Math.max(...roundEvents.map(atMs));
   const ctx = { verdictAt: new Date(vAt).toISOString(), roundAt: new Date(lastRoundMs).toISOString() };
   if (nowMs - lastRoundMs < graceMs) return { ...none(`last fix-round event ${ctx.roundAt} is inside the ${Math.round(graceMs / 60000)}-min grace`), ...ctx };
-  if (countUnresolvedStandDowns(pr?.comments) > 0) return { ...none('stood down — the stand-down answer owns it'), ...ctx };
+  if (countUnresolvedStandDowns(annotateLapsedStandDowns(pr)?.comments) > 0) return { ...none('stood down — the stand-down answer owns it'), ...ctx };
   if (labels.includes('review:human')) return { ...none('review:human — a person owns it'), ...ctx };
   const reviewed = verdictReviewedHead(verdict.body);
   const head = String(pr?.headRefOid ?? '').toLowerCase();

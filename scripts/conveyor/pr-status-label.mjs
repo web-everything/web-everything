@@ -98,7 +98,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const escalated = list.some((r) => (r.kind === 'cap-exhausted' && ESCALATED.has(r.takeover))
     || r.kind === 'ruling-dispute' || r.takeoverNotConverging === true);
   if (escalated || rs === 'needs-human') return 'escalated';
-  const stands = standDownComments(comments);
+  const stands = standDownComments(comments, { headRefOid: pr?.headRefOid });
   if (stands.length) {
     const latestAt = Math.max(...stands.map((c) => Number.isFinite(timeOf(c)) ? timeOf(c) : -Infinity));
     const answered = Number.isFinite(latestAt) && comments.some((c) => isHumanComment(c) && timeOf(c) > latestAt);

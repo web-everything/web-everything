@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { enrichPrsWithCompleteComments, readCompletePrComments, LIST_COMMENTS_PAGE_SIZE } from '../pr-comments-complete.mjs';
 import { countGrantedRoundExtensions, buildRoundExtensionComment } from '../round-extension-mark.mjs';
+import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+import { standDownOf } from '../health-smells/stood-down-prs.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -50,4 +52,20 @@ describe('complete PR comments', () => {
     expect(seen[0]).toBeGreaterThanOrEqual(1024 * 1024);
     expect(() => readCompletePrComments(7, { repo, exec: () => { throw new Error('ENOBUFS'); } })).toThrow();
   });
+});
+
+
+it('annotates short and complete threads through the injected reader', () => {
+  const seen = [];
+  const annotate = (pr) => { seen.push(pr.number); return { ...pr, annotated: true }; };
+  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => [] });
+  expect(seen).toEqual([1, 2]);
+  expect(out.every((pr) => pr.annotated)).toBe(true);
+});
+it('lapses a #5045 short thread before the reconciler reads it', () => {
+  const body = '🛑 conveyor fix — stood down, human judgment needed\nHead: 27dfad20a631ff4a3ea0d60fe8da01f6e18fe07d.\n<!-- stand-down reason=fix-loop-exhausted -->';
+  const [pr] = enrichPrsWithCompleteComments([{ number: 5045, headRefOid: '922a19a18cd6f25f6838b98b79127277247bd5bc', comments: [{ body, author: { login: 'web-everything' } }] }]);
+  expect(pr.comments[0].standDownLapsed?.toHead).toBe(pr.headRefOid);
+  expect(countUnresolvedStandDowns(pr.comments)).toBe(0);
+  expect(standDownOf({ ...pr, labels: ['review-status:stood-down'] })).toBeNull();
 });

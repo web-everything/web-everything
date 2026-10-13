@@ -15,11 +15,12 @@
  *   nothing invokes is the #3095 defect arriving by a different door, and prose is exactly where that rot is
  *   invisible.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import {
+  standDownHead, standDownLapse, annotateLapsedStandDowns, resolveStandDownLapseOnNewHead,
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
   standDownComments, standDownReason, WATCHER_STAND_DOWN_ACTOR, countTerminalStandDowns,
   SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded, isSelfAuthored, AUTOMATION_LOGINS,
@@ -535,4 +536,72 @@ it('builds a durable stand-down for an exhausted CI-heal loop', () => {
   expect(body.startsWith(STAND_DOWN_MARKER)).toBe(true);
   expect(body).toContain(STAND_DOWN_REASONS['fix-loop-exhausted']);
   expect(body).toContain('<!-- stand-down reason=fix-loop-exhausted -->');
+});
+
+
+describe('stand-down head lapse', () => {
+  const old = '27dfad20a631ff4a3ea0d60fe8da01f6e18fe07d';
+  const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+  const trusted = (body) => ({ body, author: { login: 'web-everything' } });
+  const legacy = trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', detail: `Head: ${old}.` }));
+  it('lapses the #5045 legacy head only when it moves', () => {
+    expect(standDownHead(legacy.body)).toBe(old);
+    expect(standDownLapse(legacy, head)).toEqual({ fromHead: old, toHead: head, reason: 'fix-loop-exhausted' });
+    expect(standDownLapse(legacy, old)).toBeNull();
+    expect(standDownLapse(legacy, old.slice(0, 7))).toBeNull();
+    expect(countTerminalStandDowns([legacy], { headRefOid: old })).toBe(1);
+    expect(countStandDownComments([legacy], { headRefOid: head })).toBe(0);
+  });
+  it('round-trips head trailers and retains concurrent-author reason parsing', () => {
+    const body = buildStandDownComment({ reason: 'fix-loop-exhausted', head: old, detail: `Head: ${head}.` });
+    expect(body.split('\n').at(-1)).toBe(`<!-- stand-down reason=fix-loop-exhausted head=${old} -->`);
+    expect(body).toContain('lapses automatically on a new push');
+    expect(standDownHead(body)).toBe(old);
+    expect(standDownLapse(trusted(body), head)?.reason).toBe('fix-loop-exhausted');
+    expect(standDownComments([trusted(buildStandDownComment({ reason: 'concurrent-author', head: old }))])).toEqual([]);
+  });
+  it('fails closed for missing heads, supersede claims, unsafe heads and untrusted authors', () => {
+    expect(standDownLapse(trusted(buildStandDownComment({ reason: 'superseded', head: old })), head)).toBeNull();
+    expect(standDownLapse(trusted(buildStandDownComment({ reason: 'gate-red' })), head)).toBeNull();
+    expect(standDownLapse(legacy, 'invalid')).toBeNull();
+    const untrusted = { ...legacy, author: { login: 'stranger' } };
+    expect(standDownLapse(untrusted, head)).toBeNull();
+    expect(standDownComments([untrusted], { headRefOid: head })).toEqual([]);
+  });
+  it('resolves settings and built-in fallback, with env winning', () => {
+    expect(resolveStandDownLapseOnNewHead({ env: {} })).toEqual({ value: 'on', source: 'settings' });
+    expect(resolveStandDownLapseOnNewHead({ env: {}, file: '/no-such-stand-down-setting' })).toEqual({ value: 'on', source: 'default' });
+    expect(resolveStandDownLapseOnNewHead({ env: { WE_STAND_DOWN_LAPSE_ON_NEW_HEAD: 'invalid' } })).toEqual({ value: 'on', source: 'settings' });
+  });
+  it('uses the actual env override and logs each distinct lapse once', () => {
+    const previous = process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD = 'off';
+      expect(standDownLapse(legacy, head)).toBeNull();
+      process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD = 'on';
+      const pr = { number: 504500, headRefOid: head, comments: [legacy, legacy] };
+      annotateLapsedStandDowns(pr);
+      annotateLapsedStandDowns(pr);
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) delete process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD;
+      else process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD = previous;
+      log.mockRestore();
+    }
+  });
+  it('honours env override and annotation without mutating the snapshot', () => {
+    expect(resolveStandDownLapseOnNewHead({ env: { WE_STAND_DOWN_LAPSE_ON_NEW_HEAD: 'off' } })).toEqual({ value: 'off', source: 'env' });
+    expect(standDownLapse(legacy, head, { lapseOnNewHead: 'off' })).toBeNull();
+    const pr = { number: 5045, headRefOid: head, comments: [legacy] };
+    const lapses = [];
+    const result = annotateLapsedStandDowns(pr, { onLapse: (l) => lapses.push(l) });
+    expect(result.comments[0].standDownLapsed).toEqual({ fromHead: old, toHead: head });
+    expect(result.standDownLapses).toEqual([{ fromHead: old, toHead: head, reason: 'fix-loop-exhausted' }]);
+    expect(lapses[0].pr).toBe(5045);
+    expect(standDownComments(result.comments)).toEqual([]);
+    expect(countTerminalStandDowns(result.comments)).toBe(0);
+    expect(legacy.standDownLapsed).toBeUndefined();
+    expect(annotateLapsedStandDowns(pr, { lapseOnNewHead: 'off' })).toBe(pr);
+  });
 });
