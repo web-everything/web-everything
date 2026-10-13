@@ -2688,6 +2688,9 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.spawns).toHaveLength(1);
     expect(quiet.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(quiet.pending, quiet)).toBeNull();
+    // no advisory note is posted on a non-`review:human` PR, so the human's own question names the retired claim
+    expect(quiet.pending.asks).toContain('retired on one verifier answer');
+    expect(quiet.pending.asks).toContain('the PR description this does not reproduce');
   });
 
   // PR #5025 review: a steered verifier's lone "does not reproduce" (free-form evidence, no line in the claim's own file) must not

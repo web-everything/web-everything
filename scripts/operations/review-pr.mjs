@@ -2019,8 +2019,10 @@ export function planRecordDecision(view) {
     throw new Error('Tool-bearing verification required before recording acceptance; retry the unresolved claims.');
   }
   // PR #5025 review — a claim retired on ONE verifier answer leaves the accept to a human. `humanRequired` is what addresses the
-  // confirm to a human, so an accept on a run whose confirm was the agent's (any mechanical accept path) is refused.
-  if (to === 'accepted' && verdict.uncorroboratedRetirements?.length && verdict.humanRequired !== true) {
+  // confirm to a human, so an accept over an accept-shaped verdict on an agent-addressed confirm is refused (defence in depth:
+  // `reduce` already addresses those to a human). A `changes` verdict is exempt: its only mechanical accept, round-cards, is
+  // refused by `roundCardsRefusal`, and an operator's explicit override of a `changes` verdict stays theirs to make.
+  if (to === 'accepted' && verdict.uncorroboratedRetirements?.length && verdict.humanRequired !== true && verdict.verdict !== 'changes') {
     throw new Error('A claim on this head was retired on one verifier answer; only a human-addressed confirm may record acceptance.');
   }
   if (verdict.pendingReferrals?.length || (to === 'accepted' && verdict.blockedReferrals?.length)) {
@@ -3241,7 +3243,9 @@ export function reviewPrOperation({
           + `(${perLens || 'no lens verdicts recorded'}); ${citationNote}`
           + `\`derivePanelVerdict\` reduced them to \`${v.verdict}\``
           + `${v.pendingVerifications?.length ? ` (${v.pendingVerifications.length} claim(s) awaiting tool-bearing verification)`
-            : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) retired on one verifier answer: a human confirms the accept)`
+            // The held run is often NOT a `review:human` PR, so no advisory note is posted: the question itself names each claim.
+            : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) retired on one verifier answer: a human confirms the accept — `
+              + `${v.uncorroboratedRetirements.map((r) => foldUntrusted(String(r?.reason ?? 'no reason recorded')).replace(/\s+/g, ' ').slice(0, 300)).join('; ')})`
               : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
           + `Record which verdict? (${CONFIRM_OPTIONS.join(' | ')}; \`abstain\` writes nothing)`;
       },

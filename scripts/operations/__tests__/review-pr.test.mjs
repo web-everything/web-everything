@@ -4534,6 +4534,8 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       // and a changes answer is never refused for it: the fixer bounce still works
       expect(() => planRecordDecision({ ...view, findings: { ...view.findings, confirm: 'changes' }, verdict: { ...reduce, verdict: 'changes', humanRequired: false } }))
         .not.toThrow(/one verifier answer/);
+      // an operator's explicit accept over a `changes` verdict stays theirs (round-cards is refused upstream, by `roundCardsRefusal`)
+      expect(() => planRecordDecision({ ...view, verdict: { ...reduce, verdict: 'changes', humanRequired: false } })).not.toThrow(/one verifier answer/);
     });
 
     // Self-review of the repair: the loop also accepts a `prevention-outstanding` run by itself (it files the guard, then accepts).
