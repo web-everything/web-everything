@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { withPathLock } from '../readiness/with-lock.mjs';
 
 export const STANDARD_BATCHING_SETTINGS = Object.freeze({
   enabled: false,
@@ -15,6 +16,7 @@ export const STANDARD_BATCHING_SETTINGS = Object.freeze({
   failureThreshold: 3,
   failureWindowMinutes: 120,
   strictModeMinutes: 60,
+  isolateTimeoutMinutes: 60,
   cancelIntermediateRuns: 'auto',
   rulesetId: 24883772,
 });
@@ -27,11 +29,13 @@ const ENV_KEYS = Object.freeze({
   failureThreshold: 'WE_MQ_BATCHING_FAILURE_THRESHOLD',
   failureWindowMinutes: 'WE_MQ_BATCHING_FAILURE_WINDOW_MINUTES',
   strictModeMinutes: 'WE_MQ_BATCHING_STRICT_MODE_MINUTES',
+  isolateTimeoutMinutes: 'WE_MQ_BATCHING_ISOLATE_TIMEOUT_MINUTES',
   cancelIntermediateRuns: 'WE_MQ_BATCHING_CANCEL_INTERMEDIATE_RUNS',
   rulesetId: 'WE_MQ_BATCHING_RULESET_ID',
 });
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
+const ADMISSION_GRACE_MS = 5 * MINUTE_MS;
 const active = (g) => g.status === 'forming' || g.status === 'queued';
 
 /** Settings IO only: a missing/unreadable platform file contributes no overrides. */
@@ -115,6 +119,19 @@ export function initialBatchingState() {
   return { groups: [], isolate: [], failures: [], culprits: [], strictUntilMs: null };
 }
 
+// Per-member deadlines cannot be extended by later failures. Old persisted states
+// get one bounded recovery window on their first read after upgrading.
+function expireIsolation(state, nowMs, settings, closed = new Set(), merged = new Set()) {
+  if (!state.isolate.length && !state.isolateSinceMs) return;
+  state.isolateSinceMs ??= {};
+  for (const num of state.isolate) state.isolateSinceMs[num] ??= nowMs;
+  state.isolate = state.isolate.filter(num => !closed.has(num) && !merged.has(num)
+    && nowMs - state.isolateSinceMs[num] < (settings.isolateTimeoutMinutes ?? 60) * MINUTE_MS);
+  for (const num of Object.keys(state.isolateSinceMs)) {
+    if (!state.isolate.includes(Number(num))) delete state.isolateSinceMs[num];
+  }
+}
+
 /** PURE: strict overrides isolation until its injected deadline passes. */
 export function currentMode(state, nowMs, settings) {
   if (!settings.enabled) return 'off';
@@ -133,7 +150,7 @@ function openGroup(state, num, nowMs, mode, size) {
   let id = base;
   let suffix = 1;
   while (state.groups.some(g => g.id === id)) id = `${base}-${suffix++}`;
-  const g = { id, prs: [num], openedAtMs: nowMs, closedAtMs: null, mode, status: 'forming' };
+  const g = { id, prs: [num], openedAtMs: nowMs, closedAtMs: null, mode, status: 'forming', pendingUntilMs: { [num]: nowMs + ADMISSION_GRACE_MS } };
   if (size === 1) closeGroup(g, nowMs);
   state.groups.push(g);
   return g;
@@ -147,6 +164,7 @@ function openGroup(state, num, nowMs, mode, size) {
  */
 export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
   const state = structuredClone(input);
+  if (settings.enabled) expireIsolation(state, nowMs, settings);
   const mode = currentMode(state, nowMs, settings);
   const result = (admit, groupId = null, reason = null) => ({ admit, mode, groupId, reason, state });
   if (mode === 'off') return result(true);
@@ -164,6 +182,8 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
     if (mode === 'grouped' && g.mode === 'grouped' && g.prs.length < settings.groupSize
       && nowMs - g.openedAtMs <= settings.groupFormMinutes * MINUTE_MS) {
       g.prs.push(num);
+      g.pendingUntilMs ??= {};
+      g.pendingUntilMs[num] = nowMs + ADMISSION_GRACE_MS;
       if (g.prs.length === settings.groupSize) closeGroup(g, nowMs);
       return result(true, g.id);
     }
@@ -180,7 +200,7 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
  * @param {{state:BatchingState,inQueue:Set<number>,merged:Set<number>,nowMs:number,settings:object}} input
  * @returns {{state:BatchingState,events:object[]}}
  */
-export function observeQueue({ state: input, inQueue, merged, nowMs, settings }) {
+export function observeQueue({ state: input, inQueue, merged, closed = new Set(), nowMs, settings }) {
   const state = structuredClone(input);
   const events = [];
   if (state.strictUntilMs !== null && state.strictUntilMs <= nowMs) {
@@ -189,7 +209,7 @@ export function observeQueue({ state: input, inQueue, merged, nowMs, settings })
   }
   const cutoff = nowMs - settings.failureWindowMinutes * MINUTE_MS;
   state.failures = state.failures.filter(f => f.atMs >= cutoff);
-  state.isolate = state.isolate.filter(n => !merged.has(n));
+  expireIsolation(state, nowMs, settings, closed, merged);
   for (const g of state.groups) {
     if (g.status === 'done') continue;
     if (g.prs.every(n => merged.has(n))) {
@@ -202,16 +222,19 @@ export function observeQueue({ state: input, inQueue, merged, nowMs, settings })
     // ejected. An admitted PR whose enqueue never happened (refused, crashed) just leaves the group and is
     // re-admitted on a later pass — it is not a group failure.
     g.seen = [...new Set([...(g.seen ?? []), ...g.prs.filter(n => inQueue.has(n) || merged.has(n))])];
-    g.prs = g.prs.filter(n => g.seen.includes(n));
+    g.prs = g.prs.filter(n => g.seen.includes(n) || (!closed.has(n) && g.pendingUntilMs?.[n] > nowMs));
     if (!g.prs.length) { g.status = 'done'; g.closedAtMs = nowMs; continue; }
     if (g.prs.every(n => merged.has(n))) { g.status = 'done'; g.closedAtMs = nowMs; continue; }
-    const ejected = g.prs.filter(n => !inQueue.has(n) && !merged.has(n));
+    const ejected = g.prs.filter(n => g.seen.includes(n) && !inQueue.has(n) && !merged.has(n));
     if (!ejected.length) continue;
     g.status = 'failed';
+    g.failedAtMs = nowMs;
     state.failures.push({ atMs: nowMs, groupId: g.id, prs: [...g.prs] });
     if (g.mode === 'grouped' && g.prs.length > 1) {
-      const nums = g.prs.filter(n => !merged.has(n));
+      const nums = g.prs.filter(n => !merged.has(n) && !closed.has(n));
       state.isolate = [...new Set([...state.isolate, ...nums])];
+      state.isolateSinceMs ??= {};
+      for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
       events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) }, { type: 'isolate', nums });
     } else {
       for (const num of ejected) {
@@ -225,7 +248,11 @@ export function observeQueue({ state: input, inQueue, merged, nowMs, settings })
       events.push({ type: 'strict-on', untilMs: state.strictUntilMs });
     }
   }
-  state.groups = state.groups.filter(g => g.status !== 'done' || (g.closedAtMs ?? g.openedAtMs) >= nowMs - DAY_MS);
+  expireIsolation(state, nowMs, settings, closed, merged);
+  state.groups = state.groups.filter(g => g.status === 'failed'
+    ? (g.failedAtMs ?? g.closedAtMs ?? g.openedAtMs) >= cutoff
+    : g.status !== 'done' || (g.closedAtMs ?? g.openedAtMs) >= nowMs - DAY_MS);
+  state.culprits = state.culprits.filter(c => c.atMs >= cutoff);
   return { state, events };
 }
 
@@ -233,7 +260,7 @@ export function observeQueue({ state: input, inQueue, merged, nowMs, settings })
  * No GitHub calls or cancellations occur here. ALLGREEN is preserved by auto mode.
  * @returns {Array<{id:number,num:number,reason:string}>}
  */
-export function intermediateRunsToCancel({ groups, runs, groupingStrategy, settings }) {
+export function intermediateRunsToCancel({ nativeGroups = [], runs, groupingStrategy, settings }) {
   if (settings.cancelIntermediateRuns !== 'on'
     && !(settings.cancelIntermediateRuns === 'auto' && groupingStrategy === 'HEADGREEN')) return [];
   const queueRuns = runs.filter(r => r.event === 'merge_group').map(r => ({
@@ -241,9 +268,12 @@ export function intermediateRunsToCancel({ groups, runs, groupingStrategy, setti
     num: Number(/^gh-readonly-queue\/main\/pr-(\d+)-/.exec(r.head_branch ?? '')?.[1]),
   }));
   const selected = new Map();
-  for (const g of groups) {
-    if (!active(g) || g.mode !== 'grouped' || g.prs.length < 2) continue;
-    const last = g.prs.at(-1);
+  // Admission counters and queue positions do not prove native group boundaries.
+  // Callers must provide authoritative membership and tip; today's queue reader
+  // cannot do so, therefore the production shell conservatively keeps all runs.
+  for (const g of nativeGroups) {
+    if (g.prs.length < 2 || !g.prs.includes(g.tip)) continue;
+    const last = g.tip;
     if (!queueRuns.some(r => r.num === last)) continue;
     for (const { run, num } of queueRuns) {
       if (run.status !== 'completed' && num !== last && g.prs.includes(num)) {
@@ -295,6 +325,7 @@ export function readGroupingStrategy({ repo, rulesetId, exec = execFileSync }) {
 export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = batchingStatePath(),
   log = line => process.stderr.write(`${line}\n`), settings = resolveBatchingSettings(), dryRun = false,
   readFile = readFileSync, writeFile = writeFileSync, rename = renameSync, mkdir = mkdirSync, nowMs = Date.now,
+  withLock = withPathLock,
 } = {}) {
   let previewState;
   const say = line => { try { typeof log === 'function' ? log(line) : log.write(`${line}\n`); } catch { /* logging must not stop the drain */ } };
@@ -315,13 +346,22 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
     writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`);
     rename(tmp, statePath);
   };
-  return {
+  // Coordination is local to one host. Reclaim proven dead owners, never a
+  // live/unknown holder merely because time passed: an expired writer can resume.
+  // Contention is bounded by the primitive's 5s timeout and retries next pass.
+  const transaction = fn => dryRun || !settings.enabled ? fn() : withLock(statePath, fn, { leaseMinutes: Infinity });
+  const api = {
     /** Record that `num` really entered GitHub's queue (enqueue succeeded), so a fast ejection counts. */
     confirm(num) {
       if (!settings.enabled) return;
       try {
         const state = load();
-        for (const g of state.groups) if (g.prs.includes(num) && g.status !== 'done') g.seen = [...new Set([...(g.seen ?? []), num])];
+        if (!state.groups.some(g => active(g) && g.prs.includes(num))) {
+          // An enqueue can finish after its reservation grace expired. Keep a
+          // singleton record so even that late confirmation remains observable.
+          openGroup(state, num, nowMs(), currentMode(state, nowMs(), settings), 1);
+        }
+        for (const g of state.groups) if (g.prs.includes(num) && active(g)) g.seen = [...new Set([...(g.seen ?? []), num])];
         persist(state);
       } catch (e) { warn(e); }
     },
@@ -349,13 +389,16 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
         if (facts.error) throw new Error(facts.error);
         const state = load();
         const merged = new Set(mergedNums);
-        const missing = new Set(state.groups.filter(g => g.status !== 'done').flatMap(g => g.prs).filter(n => !facts.inQueue.has(n) && !merged.has(n)));
+        const closed = new Set();
+        expireIsolation(state, nowMs(), settings);
+        const missing = new Set([...state.groups.filter(active).flatMap(g => g.prs), ...state.isolate].filter(n => !facts.inQueue.has(n) && !merged.has(n)));
         for (const num of missing) {
-          const pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state'], ioOptions));
+          const pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft'], ioOptions));
           if (!['MERGED', 'OPEN', 'CLOSED'].includes(pr.state)) throw new Error(`unknown state for #${num}`);
           if (pr.state === 'MERGED') merged.add(num);
+          if (pr.state === 'CLOSED' || pr.isDraft) closed.add(num);
         }
-        const result = observeQueue({ state, inQueue: facts.inQueue, merged, nowMs: nowMs(), settings });
+        const result = observeQueue({ state, inQueue: facts.inQueue, merged, closed, nowMs: nowMs(), settings });
         persist(result.state);
         summary.events = result.events;
         for (const event of result.events) {
@@ -392,6 +435,14 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
       return summary;
     },
   };
+  return Object.fromEntries(Object.entries(api).map(([name, fn]) => [name, (...args) => {
+    try { return transaction(() => fn(...args)); }
+    catch (e) {
+      warn(e);
+      if (name === 'gate') return { admit: false, reason: errorText(e), error: errorText(e) };
+      if (name === 'observe') return { events: [], dequeued: [], cancelled: [], error: errorText(e) };
+    }
+  }]));
 }
 
 // Replay: pure discrete-event simulation driven only by measured arrival timestamps.

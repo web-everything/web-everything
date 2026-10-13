@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import {
   STANDARD_BATCHING_SETTINGS, resolveBatchingSettings, formatBatchingSettings,
@@ -13,6 +15,42 @@ const empty = () => ({ groups: [], isolate: [], failures: [], culprits: [], stri
 const group = (overrides = {}) => ({ id: 'g1', prs: [1, 2], openedAtMs: 0, closedAtMs: 0, mode: 'grouped', status: 'queued', ...overrides });
 const admit = (state, num, nowMs = 0, opts = {}) => admitEnqueue({ state, num, nowMs, settings: settings(), inQueue: new Set(), ...opts });
 const observe = (state, opts = {}) => observeQueue({ state, inQueue: new Set(), merged: new Set(), nowMs: minute, settings: settings(), ...opts });
+
+describe('recovery liveness and bounds regressions', () => {
+  it.each(['before', 'during'])('releases closed isolation members %s admission', (when) => {
+    const failed = observe({ ...empty(), groups: [group({ seen: [1, 2] })] }).state;
+    const state = when === 'during' ? admit(failed, 1, minute).state : failed;
+    const result = observe(state, { closed: new Set([1, 2]) });
+    expect(result.state.isolate).toEqual([]);
+    expect(admit(result.state, 4, minute).admit).toBe(true);
+  });
+  it.each(['merged', 'closed', 'singleton', 'expiry'])('every recovery member exits through %s', exit => {
+    let state = observe({ ...empty(), groups: [group({ seen: [1, 2] })] }).state;
+    for (const num of [1, 2]) {
+      if (exit === 'singleton') {
+        state = admit(state, num, minute).state;
+        state.groups.find(g => g.mode === 'isolate' && g.prs.includes(num)).seen = [num];
+      }
+      state = observe(state, {
+        merged: new Set(exit === 'merged' ? [num] : []),
+        closed: new Set(exit === 'closed' ? [num] : []),
+        nowMs: exit === 'expiry' ? 62 * minute : minute,
+      }).state;
+    }
+    expect(state.isolate).toEqual([]);
+    expect(admit(state, 4, 62 * minute).admit).toBe(true);
+  });
+  it('prunes failed history after the failure window', () => {
+    const state = { ...empty(), groups: Array.from({ length: 100 }, (_, i) => group({ id: `old-${i}`, status: 'failed' })) };
+    expect(observe(state, { nowMs: 121 * minute }).state.groups).toEqual([]);
+  });
+  it('does not infer native group tips from admission order, queue positions, or split refs', () => {
+    const runs = [1, 2, 3].map(id => ({ id, event: 'merge_group', status: 'in_progress', head_branch: `gh-readonly-queue/main/pr-${id}-abc` }));
+    for (const entries of [[3, 1, 2], [1, 2, 3]]) {
+      expect(intermediateRunsToCancel({ groups: [group({ prs: [1, 2, 3] })], entries: entries.map((num, position) => ({ num, position })), runs, groupingStrategy: 'HEADGREEN', settings: settings() })).toEqual([]);
+    }
+  });
+});
 function freeze(value) {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
@@ -44,6 +82,7 @@ describe('batching settings', () => {
     ['groupSize', 'GROUP_SIZE', 1, 0], ['groupFormMinutes', 'GROUP_FORM_MINUTES', 0, -1],
     ['maxGroupsInFlight', 'MAX_GROUPS_IN_FLIGHT', 1, 0], ['failureThreshold', 'FAILURE_THRESHOLD', 1, 0],
     ['failureWindowMinutes', 'FAILURE_WINDOW_MINUTES', 1, 0], ['strictModeMinutes', 'STRICT_MODE_MINUTES', 1, 0],
+    ['isolateTimeoutMinutes', 'ISOLATE_TIMEOUT_MINUTES', 1, 0],
     ['rulesetId', 'RULESET_ID', 42, 1.5], ['cancelIntermediateRuns', 'CANCEL_INTERMEDIATE_RUNS', 'on', 'yes'],
   ])('validates %s for numeric/string env and typed repo values', (key, suffix, valid, invalid) => {
     expect(resolveBatchingSettings({ env: { [`WE_MQ_BATCHING_${suffix}`]: String(valid) }, settings: {}, platform: {} })[key]).toBe(valid);
@@ -124,12 +163,12 @@ describe('pure admission', () => {
 });
 
 describe('pure observation', () => {
-  it('drops an admitted PR whose enqueue never happened without failure or isolation, completing an empty group', () => {
+  it('drops an abandoned admission after its grace without failure or isolation, completing an empty group', () => {
     const admitted = admit(empty(), 1);
     expect(admitted.admit).toBe(true);
     expect(admitted.state.groups[0].seen ?? []).toEqual([]);
-    const result = observe(freeze(admitted.state));
-    expect(result.state.groups[0]).toMatchObject({ prs: [], seen: [], status: 'done', closedAtMs: minute });
+    const result = observe(freeze(admitted.state), { nowMs: 6 * minute });
+    expect(result.state.groups[0]).toMatchObject({ prs: [], seen: [], status: 'done', closedAtMs: 6 * minute });
     expect(result.state.failures).toEqual([]);
     expect(result.state.isolate).toEqual([]);
     expect(result.state.culprits).toEqual([]);
@@ -196,14 +235,14 @@ describe('pure observation', () => {
     expect(next.events.some(e => e.type === 'strict-on')).toBe(false);
     expect(next.state.strictUntilMs).toBe(61 * minute);
   });
-  it('expires strict once, prunes old failures/done groups, and retains active/failed groups', () => {
+  it('expires strict once, prunes old terminal groups, and retains active groups', () => {
     const nowMs = 25 * 60 * minute;
     const state = { ...empty(), strictUntilMs: nowMs, failures: [{ atMs: nowMs - 121 * minute }, { atMs: nowMs - 120 * minute }], groups: [group({ status: 'done' }), group({ id: 'recent', status: 'done', closedAtMs: nowMs }), group({ id: 'active', prs: [3] }), group({ id: 'failed', status: 'failed' })] };
     const result = observe(freeze(state), { nowMs, inQueue: new Set([3]) });
     expect(result.events).toEqual([{ type: 'strict-off' }]);
     expect(result.state.strictUntilMs).toBeNull();
     expect(result.state.failures).toHaveLength(1);
-    expect(result.state.groups.map(g => g.id)).toEqual(['recent', 'active', 'failed']);
+    expect(result.state.groups.map(g => g.id)).toEqual(['recent', 'active']);
     expect(observe(result.state, { nowMs, inQueue: new Set([3]) }).events).toEqual([]);
   });
 });
@@ -217,7 +256,7 @@ describe('intermediate cancellation selection', () => {
     { id: 14, event: 'merge_group', status: 'in_progress', head_branch: 'gh-readonly-queue/other/pr-2-jkl' },
     { id: 15, event: 'merge_group', status: 'in_progress', head_branch: 'gh-readonly-queue/main/pr-10-jkl' },
   ];
-  const select = (opts = {}) => intermediateRunsToCancel({ groups: [group({ prs: [1, 2, 3] })], runs, groupingStrategy: 'HEADGREEN', settings: settings(), ...opts });
+  const select = (opts = {}) => intermediateRunsToCancel({ nativeGroups: [{ prs: [1, 2, 3], tip: 3 }], runs, groupingStrategy: 'HEADGREEN', settings: settings(), ...opts });
   it('auto cancels only non-last running merge_group refs under HEADGREEN', () => {
     expect(select()).toEqual([{ id: 10, num: 1, reason: 'headgreen-intermediate' }]);
     expect(select({ groupingStrategy: 'ALLGREEN' })).toEqual([]);
@@ -225,12 +264,12 @@ describe('intermediate cancellation selection', () => {
     expect(select({ settings: settings({ cancelIntermediateRuns: 'off' }) })).toEqual([]);
     expect(select({ groupingStrategy: 'ALLGREEN', settings: settings({ cancelIntermediateRuns: 'on' }) })).toHaveLength(1);
   });
-  it('requires the last branch run and an active grouped stack', () => {
+  it('requires the native tip run and proven native membership', () => {
     expect(select({ runs: runs.filter(r => r.id !== 12) })).toEqual([]);
-    expect(select({ groups: [group({ mode: 'isolate' })] })).toEqual([]);
-    expect(select({ groups: [group({ status: 'failed' })] })).toEqual([]);
-    expect(select({ groups: [group({ status: 'done' })] })).toEqual([]);
-    expect(select({ groups: [group({ status: 'forming', prs: [1, 2, 3] })] })).toHaveLength(1);
+    expect(select({ nativeGroups: [] })).toEqual([]);
+    expect(select({ nativeGroups: [{ prs: [1, 2], tip: 3 }] })).toEqual([]);
+    expect(select({ nativeGroups: [{ prs: [1, 2], tip: 2 }, { prs: [3], tip: 3 }] })).toHaveLength(1);
+    expect(select({ nativeGroups: [{ prs: [3, 1, 2], tip: 2 }] }).map(r => r.id)).toEqual([10, 12]);
   });
 });
 
@@ -254,12 +293,130 @@ function ioHarness({ state = empty(), queue = [], dryRun = false, failQueue = fa
     if (args.includes('POST')) return '';
     throw new Error(`unexpected ${args.join(' ')}`);
   };
-  const shell = createAdaptiveBatching({ repo: 'owner/repo', exec, statePath: 'test-state.json', settings: resolveBatchingSettings({ env: {}, settings: { mergeQueueBatching: { enabled: true } }, platform: {} }), dryRun,
+  const shell = createAdaptiveBatching({ repo: 'owner/repo', exec, statePath: 'test-state.json', withLock: (_path, fn) => fn(), settings: resolveBatchingSettings({ env: {}, settings: { mergeQueueBatching: { enabled: true } }, platform: {} }), dryRun,
     nowMs: () => minute, readFile: () => JSON.stringify(stored), writeFile: (path, value) => { writes.push(path); stored = JSON.parse(value); }, rename: (from, to) => renames.push([from, to]), mkdir: () => {}, log: line => logs.push(line) });
   return { shell, exec, calls, logs, writes, renames, state: () => stored };
 }
 
 describe('batching IO shell and drain hook', () => {
+  it('preserves admission between gate and confirm, and expires abandoned reservations', () => {
+    const h = ioHarness();
+    const gate = h.shell.gate(1);
+    expect(h.shell.observe({}).events).toEqual([]);
+    expect(h.state().groups.find(g => g.id === gate.groupId).prs).toEqual([1]);
+    h.shell.confirm(1);
+    expect(h.shell.observe({}).events).toEqual([{ type: 'culprit', num: 1 }]);
+    const abandoned = admit(empty(), 2).state;
+    const expired = observe(abandoned, { nowMs: 6 * minute });
+    expect(expired.state.groups[0].status).toBe('done');
+    expect(expired.state.failures).toEqual([]);
+    expect(admit(expired.state, 3, 6 * minute).admit).toBe(true);
+  });
+  it('restores tracking when confirmation arrives after reservation expiry', () => {
+    const h = ioHarness({ state: { ...empty(), groups: [group({ status: 'done', prs: [1] })] } });
+    h.shell.confirm(1);
+    expect(h.state().groups.filter(g => g.status === 'queued')).toHaveLength(1);
+    expect(h.shell.observe({}).events).toEqual([{ type: 'culprit', num: 1 }]);
+  });
+  it('defers contention without writing unlocked and retries after release', () => {
+    let locked = true, writes = 0;
+    const h = ioHarness();
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', exec: h.exec, settings: settings(), statePath: 'fixture.json',
+      readFile: () => JSON.stringify(empty()), writeFile: () => { writes++; }, mkdir: () => {}, rename: () => {}, log: () => {},
+      withLock: (_path, fn, opts) => {
+        expect(opts.leaseMinutes).toBe(Infinity);
+        if (locked) throw Object.assign(new Error('held by another process'), { code: 'ELOCKTIMEOUT' });
+        return fn();
+      },
+    });
+    expect(shell.gate(1).admit).toBe(false);
+    expect(shell.observe({}).error).toBeTruthy();
+    shell.confirm(1);
+    expect(writes).toBe(0);
+    locked = false;
+    expect(shell.gate(1).admit).toBe(true);
+    expect(writes).toBe(1);
+  });
+  it.each(['CLOSED', 'DRAFT'])('cleans up %s members through the real observation facade', terminal => {
+    let stored = { ...empty(), groups: [group({ seen: [1, 2] })] };
+    const h = ioHarness();
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', statePath: 'fixture.json', settings: settings(),
+      withLock: (_path, fn) => fn(), mkdir: () => {}, rename: () => {}, nowMs: () => minute,
+      readFile: () => JSON.stringify(stored), writeFile: (_path, text) => { stored = JSON.parse(text); }, log: () => {},
+      exec: (cmd, args) => args[0] === 'pr' ? JSON.stringify({ state: terminal === 'CLOSED' ? 'CLOSED' : 'OPEN', isDraft: terminal === 'DRAFT' }) : h.exec(cmd, args),
+    });
+    expect(shell.observe({}).error).toBeUndefined();
+    expect(stored.isolate).toEqual([]);
+    expect(shell.gate(4).admit).toBe(true);
+  });
+  it('does not look up terminal failed history on every pass', () => {
+    const h = ioHarness({ state: { ...empty(), groups: Array.from({ length: 100 }, (_, i) => group({ id: `failed-${i}`, prs: [100 + i], status: 'failed' })) } });
+    expect(h.shell.observe({}).error).toBeUndefined();
+    expect(h.calls.filter(c => c[1] === 'pr')).toEqual([]);
+  });
+  it.each(['gate', 'observe'])('preserves overlapping admission and %s transactions across processes', async operation => {
+    const root = mkdtempSync(join(tmpdir(), 'batching-race-'));
+    const statePath = join(root, 'state.json');
+    const moduleUrl = new URL('../merge-queue-adaptive-batching.mjs', import.meta.url).href;
+    const children = [];
+    const waitFor = async file => {
+      const until = Date.now() + 5000;
+      while (!existsSync(file)) {
+        if (Date.now() > until) throw new Error(`worker did not reach ${file}`);
+        await new Promise(r => setTimeout(r, 10));
+      }
+    };
+    const launch = (first, op) => {
+      const source = `
+        import { createAdaptiveBatching, STANDARD_BATCHING_SETTINGS } from ${JSON.stringify(moduleUrl)};
+        import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(join(root, first ? 'first-started' : 'second-started'))}, 'started');
+        const shell = createAdaptiveBatching({ repo: 'owner/repo', statePath: ${JSON.stringify(statePath)},
+          settings: { ...STANDARD_BATCHING_SETTINGS, enabled: true, cancelIntermediateRuns: 'off' }, log: () => {},
+          exec: (_cmd, args) => args.includes('graphql') ? JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: ${first ? '[1]' : '[1, 2]'}.map(number => ({ pullRequest: { id: 'pr-' + number, number } })) } } } } }) : '{}',
+          readFile: (path, encoding) => {
+            const text = readFileSync(path, encoding);
+            if (${first}) {
+              writeFileSync(${JSON.stringify(join(root, 'loaded'))}, 'loaded');
+              const deadline = Date.now() + 5000;
+              while (!existsSync(${JSON.stringify(join(root, 'release'))})) {
+                if (Date.now() > deadline) throw new Error('barrier timed out');
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+              }
+            }
+            return text;
+          }
+        });
+        const result = ${op === 'gate' ? `shell.gate(${first ? 2 : 3})` : 'shell.observe({})'};
+        if (result.error) throw new Error(result.error);
+      `;
+      const child = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+      children.push(child);
+      let errors = '';
+      child.stderr.on('data', data => { errors += data; });
+      return new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('exit', code => code === 0 ? resolve() : reject(new Error(errors)));
+      });
+    };
+    try {
+      writeFileSync(statePath, JSON.stringify({ ...empty(), groups: [group({ status: 'forming', prs: [1], seen: [1], openedAtMs: Date.now() })] }));
+      const first = launch(true, 'gate');
+      await waitFor(join(root, 'loaded'));
+      const second = launch(false, operation);
+      await waitFor(join(root, 'second-started'));
+      // Give the second writer time to read the stale snapshot if locking regresses.
+      await new Promise(r => setTimeout(r, 100));
+      writeFileSync(join(root, 'release'), 'release');
+      await Promise.all([first, second]);
+      const stored = JSON.parse(readFileSync(statePath, 'utf8'));
+      expect(stored.groups.flatMap(g => g.prs)).toEqual(operation === 'gate' ? [1, 2, 3] : [1, 2]);
+      if (operation === 'observe') expect(stored.groups[0].seen).toEqual([1, 2]);
+    } finally {
+      for (const child of children) if (child.exitCode === null) child.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
   it('confirm persists seen so an ejection before the first observe still counts', () => {
     const h = ioHarness();
     const admitted = h.shell.gate(1);
@@ -334,17 +491,17 @@ describe('batching IO shell and drain hook', () => {
     expect(h.calls.some(c => c.some(a => a.includes('dequeuePullRequest')) || c.includes('POST'))).toBe(false);
     expect(h.writes).toEqual([]);
     const cancel = ioHarness({ dryRun: true, state: { ...empty(), groups: [group()] }, queue: [1, 2], runs: [1, 2].map(id => ({ id, event: 'merge_group', status: 'in_progress', head_branch: `gh-readonly-queue/main/pr-${id}-abc` })) });
-    expect(cancel.shell.observe({}).cancelled).toEqual([1]);
+    expect(cancel.shell.observe({}).cancelled).toEqual([]);
     expect(cancel.calls.some(c => c.includes('POST'))).toBe(false);
   });
-  it('dequeues using PR IDs, cancels intermediates, and leaves ALLGREEN runs intact', () => {
+  it('dequeues using PR IDs and keeps tips when native boundaries are unknown under either policy', () => {
     const h = ioHarness({ state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue: [2] });
     h.shell.observe({});
     expect(h.calls.some(c => c.includes('id=pr-2') && c.some(a => a.includes('dequeuePullRequest')))).toBe(true);
     const runs = [1, 2].map(id => ({ id, event: 'merge_group', status: 'in_progress', head_branch: `gh-readonly-queue/main/pr-${id}-abc` }));
     const cancel = ioHarness({ state: { ...empty(), groups: [group()] }, queue: [1, 2], runs });
-    expect(cancel.shell.observe({}).cancelled).toEqual([1]);
-    expect(cancel.calls.some(c => c.includes('POST'))).toBe(true);
+    expect(cancel.shell.observe({}).cancelled).toEqual([]);
+    expect(cancel.calls.some(c => c.includes('POST'))).toBe(false);
     expect(ioHarness({ state: { ...empty(), groups: [group()] }, queue: [1, 2], runs, strategy: 'ALLGREEN' }).shell.observe({}).cancelled).toEqual([]);
   });
   it('does not call batching in direct mode and observes after obsolete cancellation in queue mode', () => {
