@@ -157,16 +157,30 @@ export function resolveMergeGateHoldSetting({ key = defaultKey, platform = {}, r
   if (!config) return { value: 'off', source: 'unreadable', why: 'unknown mergeGate setting' };
   const { envKey } = config;
   if (readErrors.length) return { value: 'off', source: 'unreadable', why: readErrors.join('; ') };
+  const { ignored, ...result } = resolveHumanGateRemovalSetting({ platform, repo, env, blockName: 'mergeGate', key, envKey });
+  return result;
+}
+
+/** Shared fail-closed cascade for switches that remove a human/merge hold. */
+export function resolveHumanGateRemovalSetting({ platform = {}, repo = {}, env = {}, blockName, key, envKey, errors = [] }) {
   let result = { value: 'on', source: 'standard' };
+  const ignored = [...errors];
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   for (const [source, doc] of [['platform', platform], ['repo', repo], ['env', env]]) {
-    const block = doc?.mergeGate;
-    if (source !== 'env' && block !== undefined && (!block || typeof block !== 'object' || Array.isArray(block))) return { value: 'off', source, why: 'invalid mergeGate settings block' };
+    const block = doc?.[blockName];
+    if (source !== 'env' && (!object(doc) || (block !== undefined && !object(block)))) {
+      ignored.push({ source, reason: `invalid ${blockName} settings block` });
+      continue;
+    }
     const value = source === 'env' ? doc?.[envKey] : block?.[key];
     if (value === undefined) continue;
-    if (!['on', 'off'].includes(value)) return { value: 'off', source, why: `invalid ${source} mergeGate.${key}: expected on|off` };
+    if (!['on', 'off'].includes(value)) {
+      ignored.push({ source, reason: `invalid ${source} ${blockName}.${key}: expected on|off` });
+      continue;
+    }
     result = { value, source };
   }
-  return result;
+  return ignored.length ? { value: 'off', source: ignored[0].source, why: ignored[0].reason, ignored } : { ...result, ignored };
 }
 const loggedSettings = new Set();
 /** Read declared feature settings and platform preferences; log the effective source once per process. */

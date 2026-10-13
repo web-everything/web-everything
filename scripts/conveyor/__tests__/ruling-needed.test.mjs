@@ -6,7 +6,7 @@ import { notifyReferralHold } from '../review-referral-hold.mjs';
 import { RULING_NEEDED_LABEL } from '../../lib/ruling-ledger.mjs';
 import { H1, H2, repo, record, recordComment, BLOCK, SUMMARY } from './ruling-fixtures.mjs';
 
-const parked = (extra = {}) => ({ number: 3794, title: 'policy pointers', headRefOid: H1, labels: [{ name: 'review:human' }],
+const parked = (extra = {}) => ({ number: 3794, state: 'OPEN', title: 'policy pointers', headRefOid: H1, labels: [{ name: 'review:human' }],
   comments: [recordComment(record({ head: H1, runId: 'run-1' }), 5)], ...extra });
 
 describe('advisory:ruling-needed label', () => {
@@ -36,7 +36,7 @@ describe('advisory:ruling-needed label', () => {
     const provider = { currentRepo: () => repo,
       ensureLabel: (r, name) => calls.push(['ensure', name]),
       setLabels: (r, num, spec) => { calls.push(['set', num, spec]); if (num === 2) throw new Error('boom'); } };
-    const out = sweepRulingNeededLabels({ repo, provider, listPrs: () => [parked(), parked({ number: 2 })] });
+    const out = sweepRulingNeededLabels({ repo, provider, readPr: ({ number }) => parked({ number }), listPrs: () => [parked(), parked({ number: 2 })] });
     expect(calls[0]).toEqual(['ensure', RULING_NEEDED_LABEL]);
     expect(calls[1]).toEqual(['set', 3794, { add: RULING_NEEDED_LABEL }]);
     expect(out.map(r => [r.num, r.action, !!r.error])).toEqual([[3794, 'add', false], [2, 'add', true]]);
@@ -44,7 +44,7 @@ describe('advisory:ruling-needed label', () => {
   });
   it('dry-run writes nothing', () => {
     const provider = { currentRepo: vi.fn(), ensureLabel: vi.fn(), setLabels: vi.fn() };
-    sweepRulingNeededLabels({ repo, provider, dryRun: true, listPrs: () => [parked()] });
+    sweepRulingNeededLabels({ repo, provider, readPr: () => parked(), dryRun: true, listPrs: () => [parked()] });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
 });
