@@ -19,6 +19,8 @@
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
+import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
+import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,10 +43,40 @@ const parseSwitch = (raw) => {
 };
 
 /** `{ recheckNotCiBreak }` in force. Env beats the file; missing or malformed = off (today). */
-export function resolveCiHealVerdictSettings(env = process.env, { path = ciHealVerdictSettingsPath(), read = readFileSync } = {}) {
+export function resolveCiHealVerdictSettings(env = process.env, options = {}) {
+  const { path = ciHealVerdictSettingsPath(), read = readFileSync } = options;
   let file = {};
   try { file = JSON.parse(read(path, 'utf8'))?.ciHealVerdict ?? {}; } catch { file = {}; }
-  return { recheckNotCiBreak: parseSwitch(env?.[CI_HEAL_VERDICT_ENV]) ?? parseSwitch(file.recheckNotCiBreak) ?? false };
+  const resolved = resolveVoidNeedsHumanWhenCiGreen(env, options);
+  return {
+    recheckNotCiBreak: parseSwitch(env?.[CI_HEAL_VERDICT_ENV]) ?? parseSwitch(file.recheckNotCiBreak) ?? false,
+    voidNeedsHumanWhenCiGreen: resolved.value, voidNeedsHumanSource: resolved.source,
+    voidNeedsHumanIgnored: resolved.ignored,
+  };
+}
+
+/** Standard → platform preferences → repo → env. Any invalid layer disables retirement. */
+export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
+  path = ciHealVerdictSettingsPath(), platformPath = PLATFORM_PREFERENCES_PATH, read = readFileSync,
+} = {}) {
+  const documents = {}, errors = [];
+  for (const [layer, filePath] of [['platform', platformPath], ['repo', path]]) {
+    try { documents[layer] = JSON.parse(read(filePath, 'utf8')); }
+    catch (error) {
+      // Only the optional platform file may be absent. A missing declared repo file is an error.
+      if (layer !== 'platform' || error?.code !== 'ENOENT') errors.push({ source: layer, reason: String(error?.message ?? error).split('\n')[0] });
+    }
+  }
+  const result = resolveHumanGateRemovalSetting({ ...documents, env, errors,
+    blockName: 'ciHealVerdict', key: 'voidNeedsHumanWhenCiGreen', envKey: 'WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN' });
+  return { value: result.value === 'on', source: result.source, ignored: result.ignored };
+}
+
+/** No known required set means no evidence that CI is green. Pure. */
+export function ciGreenForEscalation({ rollup, requiredChecks }) {
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
+  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
+  return !red.length && !pending.length && !missing.length;
 }
 
 const sameSha = (a, b) => {
