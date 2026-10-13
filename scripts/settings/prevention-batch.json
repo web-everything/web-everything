@@ -1,0 +1,8 @@
+{
+  "prevention": {
+    "$comment": "batchFiling enables rolling prevention PRs; false restores one PR per card. batchWindowMinutes is the positive integer age in minutes at which a batch seals; batchMaxCards is the positive integer count that seals it early. Cascade per key: standard prevention block in card-batch-policy.json \u2192 platform prevention in delivery-platform-preferences.json (missing means no preference) \u2192 repo prevention in declared settings \u2192 env WE_PREVENTION_BATCH_FILING (0/1/true/false), WE_PREVENTION_BATCH_WINDOW_MINUTES, WE_PREVENTION_BATCH_MAX_CARDS. Invalid values are ignored and logged with their layer. Set batchWindowMinutes to 30 to seal every half hour. Operator defaults: enabled, 60 minutes, 10 cards.",
+    "batchFiling": true,
+    "batchWindowMinutes": 60,
+    "batchMaxCards": 10
+  }
+}

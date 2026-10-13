@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { cardIdOf, decideBatchFiling, fileIntoBatch, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
 import { AI_TRAILER } from '../card-batch-io.mjs';
 import { sealDueBatches } from '../card-batch-seal-io.mjs';
-import { effectiveCardBatchPolicy, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
+import { effectiveCardBatchPolicy, resolvePreventionBatchSettings, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { withNarrowClone } from './helpers/real-repo.mjs';
 
@@ -162,5 +162,27 @@ describe('closing a batch at N cards or T minutes', () => {
     expect(await sealDueBatches({ now: 1000, stateDir: dir, policy, spawn })).toEqual([]);
     const path = batch(dir, 3, 0);
     expect(await sealDueBatches({ now: 1000, stateDir: dir, policy, spawn })).toEqual([path]);
+  });
+});
+
+
+describe('prevention batching is independent of filing', () => {
+  it.each([true, false])('prevention.batchFiling=%s overrides the opposite cards switch', async (enabled) => {
+    const admit = vi.fn(async () => ({ action: 'admit', batchRef: 'lane/card-batch-prevention-1' }));
+    const log = vi.fn();
+    const result = await fileIntoBatch({ laneDir: '/unused', cardPath: 'backlog/x123456-card.md', kind: 'prevention' }, {
+      settings: settingsWith({ batchFiling: !enabled }),
+      preventionSettings: resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention,
+        repo: { batchFiling: enabled, batchWindowMinutes: 30, batchMaxCards: 4 } }),
+      admit, launch: vi.fn(), stateDir: tempDir(), baseSha: 'a'.repeat(40), log,
+    });
+    expect(result.batched).toBe(enabled);
+    expect(log.mock.calls[0][0]).toContain('prevention-batch settings: prevention.batchFiling=');
+    if (enabled) expect(admit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'prevention' }),
+      expect.objectContaining({ policy: expect.objectContaining({ prevention: expect.objectContaining({ enabled: true, maxAgeMinutes: 30, maxCards: 4 }) }) }));
+    else {
+      expect(result.reason).toBe('prevention.batchFiling is off (repo)');
+      expect(admit).not.toHaveBeenCalled();
+    }
   });
 });
