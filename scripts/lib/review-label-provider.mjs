@@ -41,6 +41,16 @@ import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from './gh-throttle.mjs';
+import { REVIEW_LABELS } from './review-escalation.mjs';
+
+/**
+ * Finish the labels after a caller has proven and durably recorded an acceptance carry.
+ * The caller owns the proof, record and retry boundary; the accepted-label write stays in this port.
+ */
+export function finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels }) {
+  const accepted = currentLabels.some((label) => (typeof label === 'string' ? label : label?.name) === REVIEW_LABELS.accepted);
+  provider.setLabels(repo, pr, { add: accepted ? undefined : REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending] });
+}
 
 // GitHub rejects longer label descriptions with HTTP 422:
 // "description is too long (maximum is 100 characters)".

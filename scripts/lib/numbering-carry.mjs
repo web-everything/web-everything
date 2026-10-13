@@ -10,6 +10,7 @@
  *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
  */
 import { execFileSync } from 'node:child_process';
+import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import {
   REVIEW_LABELS, buildStaleAcceptHealComment, buildReviewedShaMarker, buildReviewedDiffMarker,
@@ -278,7 +279,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
-    try { provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending] }); }
+    try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: state.labels }); }
     catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
     settledRestamps.add(key);
     return { action: 'restamped', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true,
@@ -297,8 +298,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
     headDiffText, proofReason: proof.reason, writer });
   try { provider.postComment(repo, pr, body); }
   catch (e) { return { action: 'error', reason: errorReason(e) }; }
-  const hasAccepted = state.labels.some((l) => (typeof l === 'string' ? l : l?.name) === REVIEW_LABELS.accepted);
-  try { provider.setLabels(repo, pr, { add: hasAccepted ? undefined : REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending] }); }
+  try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: state.labels }); }
   catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
   settledRestamps.add(key);
   return { action: 'restamped', ...carried, reason: proof.reason };

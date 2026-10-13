@@ -4,12 +4,19 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { checkReviewLabelSingleHomeCode } from '../review-skill-guard.mjs';
 import {
   MAX_NUMBERING_COMMITS, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo,
 } from '../numbering-carry.mjs';
 
 const subject = 'drain: JIT-number xf74q20→#6053, xztd0mv→#6054 at land (#2288)';
+it('keeps numbering acceptance writes in the shared review-label provider', () => {
+  const files = ['scripts/lib/numbering-carry.mjs', 'scripts/lib/review-label-provider.mjs'].map((file) => ({
+    file, content: readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'),
+  }));
+  expect(checkReviewLabelSingleHomeCode(files).errors).toEqual([]);
+});
 const map = new Map([['xf74q20', '6053'], ['xztd0mv', '6054']]);
 const rewrite = (text, pairs = map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => pairs.get(hash) ?? hash);
 const stamp = (text, hash) => text.replace(/^---\n/, `---\nbornAs: ${hash}\n`);
@@ -314,14 +321,14 @@ describe('numbering acceptance restamp', () => {
     expect(run(opts)).toEqual({ action: 'error', reason: 'offline', commentPosted: true });
     expect(run(opts).action).toBe('error');
   });
-  it('finishes only the labels on the next pass when the record was posted but the label write failed', () => {
+  it.each([false, true])('finishes only the labels after a recorded re-stamp (accepted already present: %s)', (accepted) => {
     const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
     const calls = [];
-    const r = run({ state: { labels: ['review:pending'], headRefOid: TO, comments: [...liveComments(), { author: { login: 'chalbert' }, body }] },
+    const r = run({ state: { labels: ['review:pending', ...(accepted ? [{ name: 'review:accepted' }] : [])], headRefOid: TO, comments: [...liveComments(), { author: { login: 'chalbert' }, body }] },
       prove: () => { throw Error('no proof is owed for a recorded re-stamp'); },
       provider: { postComment: () => calls.push('comment'), setLabels: (_r, _n, spec) => calls.push(spec) } });
     expect(r).toMatchObject({ action: 'restamped', labelsOnly: true, from: FROM, to: TO, actor: 'chalbert' });
-    expect(calls).toEqual([{ add: 'review:accepted', remove: ['review:pending'] }]);
+    expect(calls).toEqual([{ add: accepted ? undefined : 'review:accepted', remove: ['review:pending'] }]);
   });
   it('an ordinary accept already bound to the head is not a candidate', () => {
     expect(planNumberingRestamp({ ...facts(), comments: [accept(TO)] })).toMatchObject({ candidate: false, reason: 'already bound' });
