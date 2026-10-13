@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, relative, isAbsolute } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
@@ -12,6 +12,22 @@ const SETTING = 'scripts/settings/merge-queue-numbering.json';
 const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
 const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?\n/).filter(Boolean);
 const cardId = (path) => idFromName(basename(path, '.md'));
+const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
+/** Identity allowlist comes only from already accepted main, never from the PR. */
+export function trustedDrainAuthors({ cwd = process.cwd(), exec = execFileSync } = {}) {
+  try {
+    const history = exec('git', ['log', '--max-count=100', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
+    return new Set(lines(history).flatMap(line => {
+      const [name, email, subject] = line.split('\0');
+      return name && email && jitSubject.test(subject ?? '') ? [`${name}\0${email}`] : [];
+    }));
+  } catch { return new Set(); }
+}
+
+export function trustedDrainSubject(commit, authors) {
+  return commit && authors?.has(`${commit.author?.name}\0${commit.author?.email}`)
+    && jitSubject.test(commit.subject ?? '') ? commit.subject : null;
+}
 export const hashBacklogFiles = (files) => lines(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
 export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'merge_group';
 /** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
@@ -37,10 +53,15 @@ export function mainAcceptsBranchNumbering({ cwd = process.cwd(), exec = execFil
  */
 export function drainNumberedPairs({ cwd, exec = execFileSync, base = 'origin/main' }) {
   try {
-    const subjects = exec('git', ['log', '--topo-order', '--reverse', '--format=%s', `${base}..HEAD`], { cwd, encoding: 'utf8', stdio: 'pipe' });
+    const authors = trustedDrainAuthors({ cwd, exec });
+    const subjects = exec('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', `${base}..HEAD`], { cwd, encoding: 'utf8', stdio: 'pipe' });
     let pairs = new Set();
-    for (const subject of lines(subjects)) {
-      const match = subject.match(/^drain: JIT-number (.+) at land \(#2288\)$/);
+    for (const line of lines(subjects)) {
+      const [name, email, text = ''] = line.split('\0');
+      // Only a drain commit by an author accepted `main` already trusts can ASSIGN a pair. A heal subject only
+      // moves a pair that assignment already produced, so it can never exempt a number the drain did not hand out.
+      const subject = trustedDrainSubject({ author: { name, email }, subject: text }, authors);
+      const match = subject?.match(/^drain: JIT-number (.+) at land \(#2288\)$/);
       if (match) {
         for (const assignment of match[1].split(', ')) {
           const pair = assignment.match(/^(x[0-9a-z]{6})→#(\d+)$/);
@@ -48,8 +69,8 @@ export function drainNumberedPairs({ cwd, exec = execFileSync, base = 'origin/ma
         }
         continue;
       }
-      const heal = subject.match(/^backlog: heal new-item id collision\(s\) (?:pre-check|on land) \((.+)\) \(#(?:2222|2071)\)$/)
-        || subject.match(/^drain: rebase .+, renumber (#\d+→#\d+(?:\/#\d+→#\d+)*)$/);
+      const heal = text.match(/^backlog: heal new-item id collision\(s\) (?:pre-check|on land) \((.+)\) \(#(?:2222|2071)\)$/)
+        || text.match(/^drain: rebase .+, renumber (#\d+→#\d+(?:\/#\d+→#\d+)*)$/);
       if (!heal) continue;
       const moves = new Map();
       for (const move of heal[1].split(/, |\//)) {
@@ -147,6 +168,34 @@ export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs =
   return reservationPlan(files, readReservations(fs, statePath), () => undefined).minNext;
 }
 
+/** Reject both a symlinked card and a symlinked parent before any PR-content IO. */
+export function assertWorktreeCard(worktree, path, fs = nodeFs) {
+  if (!/^backlog\/[^/]+\.md$/.test(path) || path.includes('\0')) throw new Error('unsafe backlog card path');
+  if (fs.lstatSync(join(worktree, 'backlog')).isSymbolicLink() || fs.lstatSync(join(worktree, path)).isSymbolicLink()) throw new Error(`symlinked backlog card refused: ${path}`);
+  assertWorktreeFile(worktree, path, fs);
+}
+
+function assertWorktreeFile(worktree, path, fs) {
+  const parts = path.split('/');
+  if (parts.some(p => !p || p === '.' || p === '..' || p.includes('\0')) || path.startsWith('/')) throw new Error('unsafe tracked path');
+  for (let i = 1; i <= parts.length; i++) {
+    const target = join(worktree, ...parts.slice(0, i));
+    let stat = fs.lstatSync(target);
+    if (stat.isSymbolicLink()) {
+      // WE tracks convenience directory links (.claude/skills and agent-memory).
+      // Only those directory links may survive; their full resolved target is confined.
+      const directoryLink = ['.claude/skills', '.claude/agent-memory'].includes(parts.slice(0, i).join('/'));
+      if (!directoryLink) throw new Error(`symlinked tracked path refused: ${path}`);
+      const rel = relative(fs.realpathSync(worktree), fs.realpathSync(target));
+      if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new Error(`symlinked path escapes worktree: ${path}`);
+      stat = fs.statSync(target);
+      if (!stat.isDirectory()) throw new Error(`symlinked non-directory refused: ${path}`);
+      if (i === parts.length) continue;
+    }
+    if (i === parts.length ? !stat.isFile() : !stat.isDirectory()) throw new Error(`non-regular tracked path refused: ${path}`);
+  }
+}
+
 /** Recover stranded main hashes even when this pass enqueued or merged nothing. */
 export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs,
   statePath = numberingStatePath(), lock = withNumberingLock, number = numberPendingHashes, log = process.stderr } = {}) {
@@ -206,6 +255,10 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
       const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
       const files = tracked();
+      for (const path of files) assertWorktreeCard(worktree, path, fs);
+      // Numbering also rewrites references in docs, memory, flows and soak files.
+      // Validate the entire tracked tree, including ledger parents, before calling it.
+      for (const path of lines(git(['ls-files'], worktree))) assertWorktreeFile(worktree, path, fs);
       if (!hashBacklogFiles(files).length) return { action: 'final' };
       const outcome = lock(() => {
         pinned();

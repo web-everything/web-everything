@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import * as realFs from 'node:fs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
-import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
+import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 
 describe('queue branch numbering', () => {
   it('probes main for the branch-numbering CI contract and fails closed', () => {
@@ -19,11 +20,11 @@ describe('queue branch numbering', () => {
       'prefix drain: JIT-number xabc123→#9999 at land (#2288)',
       'drain: JIT-number xabc123→#9999 at land (#2288) suffix',
       'drain: JIT-number invalid→#5988, xabc123→#bad at land (#2288)',
-    ].join('\n'));
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n'));
     expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xabc123→5986', 'xdef456→5987', 'xghi789→42']));
-    expect(exec).toHaveBeenCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%s', 'origin/main..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(exec).toHaveBeenCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', 'origin/main..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
     drainNumberedPairs({ cwd: '/clone', exec, base: 'custom-base' });
-    expect(exec).toHaveBeenLastCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%s', 'custom-base..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(exec).toHaveBeenLastCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', 'custom-base..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
     expect(drainNumberedPairs({ cwd: '/clone', exec: () => { throw new Error('missing ref'); } })).toEqual(new Set());
   });
   it('carries a drain pair through later collision-heal renumbers, parents first (PR #5042)', () => {
@@ -32,14 +33,14 @@ describe('queue branch numbering', () => {
       'backlog: heal new-item id collision(s) pre-check (#5979→#5321, #7000→#7001) (#2222)',
       'backlog: heal new-item id collision(s) on land (#5321→#6010) (#2071)',
       'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json, renumber #5980→#6020/#5981→#6021',
-    ].join('\n');
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
     expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaxezem→6010', 'xdef456→6020', 'xghi789→6021']));
   });
   it('applies the moves of one heal commit together, so a swap does not chain', () => {
     const exec = () => [
       'drain: JIT-number xaaaaaa→#10, xbbbbbb→#11 at land (#2288)',
       'backlog: heal new-item id collision(s) pre-check (#10→#11, #11→#10) (#2222)',
-    ].join('\n');
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
     expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaaaaaa→11', 'xbbbbbb→10']));
   });
   it('never lets a heal subject exempt a number the drain did not assign', () => {
@@ -49,13 +50,23 @@ describe('queue branch numbering', () => {
       'backlog: heal new-item id collision(s) pre-check (#1→#2) (#2222) suffix',
       'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json',
       'backlog: heal new-item id collision(s) pre-check (#5979→#5321) (#2222)',
-    ].join('\n');
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
     const pairs = drainNumberedPairs({ cwd: '/clone', exec });
     expect(pairs).toEqual(new Set(['xaxezem→5321']));
     const items = [{ id: '5321-healed', num: '5321', bornAs: 'xaxezem' }, { id: '4001-picked', num: '4001' }];
     const errors = handNumberedNewItems(exemptDrainNumberedItems(items, { drainNumbered: pairs }), []);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain('4001-picked');
+  });
+  it('does not let an untrusted author assign a pair, nor a heal of it carry one', () => {
+    const exec = vi.fn((_cmd, args) => args.includes('--grep=^drain: JIT-number ')
+      ? 'Trusted\0drain@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)'
+      : [
+        'Trusted\0drain@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)',
+        'Forger\0forger@example.test\0backlog: heal new-item id collision(s) pre-check (#20→#21) (#2222)',
+      ].join('\n'));
+    expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaaaaaa→10']));
   });
   it('refuses hash cards in merge groups even when drain numbering is off', () => {
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
@@ -127,12 +138,32 @@ describe('queue branch numbering', () => {
       if (args[0] === 'rev-parse') return 'new';
       return '';
     });
-    const fs = { symlinkSync: vi.fn(), mkdtempSync: vi.fn(() => '/tmp/fake'), rmSync: vi.fn(), readFileSync: vi.fn(() => state), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };
+    const fs = { lstatSync: vi.fn(path => ({ isSymbolicLink: () => false, isFile: () => path.endsWith('.md'), isDirectory: () => !path.endsWith('.md') })), symlinkSync: vi.fn(), mkdtempSync: vi.fn(() => '/tmp/fake'), rmSync: vi.fn(), readFileSync: vi.fn(() => state), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };
     const number = vi.fn(() => { numbered = true; return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true }; });
     const lock = vi.fn((fn) => ({ ran: true, result: fn() }));
     const args = { c: { repo: 'r', num: 4, headRef: 'topic' }, traceHeadSha: 'old', cwd: '/clone', statePath: '/state/reservations.json', exec, fs, number, lock, isOpen: () => true };
     return { args, exec, fs, number, lock };
   }
+  it.each(['card', 'parent'])('refuses a symlinked backlog %s before numbering or writing outside the worktree', kind => {
+    const x = setup();
+    x.fs.lstatSync = vi.fn(path => ({ isSymbolicLink: () => kind === 'card' ? path.endsWith('.md') : path.endsWith('/backlog'), isFile: () => path.endsWith('.md'), isDirectory: () => !path.endsWith('.md') }));
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('symlink') });
+    expect(x.number).not.toHaveBeenCalled();
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
+  });
+  it('does not exempt a forged-author numbering commit', () => {
+    const exec = vi.fn((_cmd, args) => args.includes('--format=%s') ? 'drain: JIT-number xabc123→#5986 at land (#2288)\n' : args.at(-1) === 'origin/main'
+      ? 'Trusted\0drain@example.test\0drain: JIT-number xdef456→#42 at land (#2288)\n'
+      : 'Attacker\0attacker@example.test\0drain: JIT-number xabc123→#5986 at land (#2288)\n');
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set());
+    expect(handNumberedNewItems(exemptDrainNumberedItems([{ id: '5986-picked', num: '5986', bornAs: 'xabc123' }], { drainNumbered: pairs }), [])).toHaveLength(1);
+  });
+  it('bounds the trusted identity read to recent drain subjects', () => {
+    const exec = vi.fn(() => 'Trusted\0drain@example.test\0drain: JIT-number xabc123→#42 at land (#2288)\n');
+    expect(trustedDrainAuthors({ cwd: '/clone', exec })).toEqual(new Set(['Trusted\0drain@example.test']));
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['--max-count=100', '--grep=^drain: JIT-number ']), expect.objectContaining({ timeout: 60000, maxBuffer: 4 * 1024 * 1024 }));
+  });
   it('returns final without locking or pushing when nothing needs doing', () => {
     const x = setup({ pending: false });
     expect(prepareBranchBeforeEnqueue(x.args)).toEqual({ action: 'final' });
@@ -219,12 +250,39 @@ describe('queue branch numbering', () => {
 });
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
 import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
+
+it('rejects a real external card symlink and leaves the target unchanged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-symlink-'));
+  try {
+    const tree = join(root, 'tree'); mkdirSync(join(tree, 'backlog'), { recursive: true });
+    const outside = join(root, 'outside.md'); const text = '---\nstatus: open\n---\n';
+    writeFileSync(outside, text); symlinkSync(outside, join(tree, 'backlog/xabc123-card.md'));
+    expect(() => assertWorktreeCard(tree, 'backlog/xabc123-card.md')).toThrow(/symlink/);
+    expect(readFileSync(outside, 'utf8')).toBe(text);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it.each([false, true])('permits confined convenience links and refuses escaping links (external=%s)', external => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-directory-link-'));
+  try {
+    const tree = join(root, 'tree');
+    mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(tree, '.claude'));
+    mkdirSync(join(tree, 'skills-src')); mkdirSync(join(root, 'outside'));
+    writeFileSync(join(tree, 'backlog/041-card.md'), '---\nstatus: resolved\n---\n');
+    symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
+    const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
+      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills' : 'backlog/041-card.md') : '');
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => root }, number: () => { throw new Error('unexpected numbering'); } });
+    expect(out).toMatchObject(external ? { action: 'skip', reason: expect.stringContaining('escapes worktree') } : { action: 'final' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 it('retains reservations when the pass cannot prove a PR closed', () => {
   expect(openReservationPr({ prsByRepo: new Map([['r', []]]), contextComplete: true }, 'r', 1)).toBe(false);

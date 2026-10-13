@@ -158,6 +158,18 @@ export function withCodeQLSection(prompt, planned, repo = 'we') {
   return `${prompt}\n\n${codeqlBriefSection(planned.codeql, { repo: slug, pr: planned.pr })}\n`;
 }
 
+/** PR #5082 — another failing check (a required one, or the drain's CodeQL) keeps this heal, but `test` failed only on numbers the drain assigned. */
+export function withOwedMainRuleSection(prompt, planned) {
+  const rule = planned?.owedMainRule;
+  if (!rule) return prompt;
+  const nums = (Array.isArray(rule.nums) ? rule.nums : []).filter(Number.isSafeInteger).map(n => `#${n}`).join(', ') || 'the drain-assigned numbers';
+  // A CodeQL heal may have no other failing required check: name the alert as the work, so the two sections agree.
+  const scope = planned.reason === 'codeql'
+    ? 'Repair the CodeQL alert above (and any other failing check); the red `test` check is not yours to fix.'
+    : 'Repair only the other failing required checks.';
+  return `${prompt}\n\n## Leave the drain-assigned card numbers alone\n\nThe \`test\` check's hand-picked-NNN errors (${nums}) are numbers the drain itself assigned at land. They clear once main accepts drain-numbered cards. Do NOT rename, renumber or re-key those backlog cards, and do not set WE_SKIP_HAND_NUMBERED_GATE. ${scope}\n`;
+}
+
 /** Read current holds once at the CI-heal boundary. A read error is a visible refusal. */
 export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = readHealQuotaScores, now = Date.now() } = {}) {
   try {
@@ -277,12 +289,15 @@ export async function dispatchCiHeal(planned, {
       console.error(`ci-heal-pr-dispatch: PR #${planned.pr} stronger-model rung (claude) model=${stronger.policyRoute.model} effort=${stronger.policyRoute.effort} (source ${stronger.source})`);
     }
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
+    const briefOnly = reason === 'codeql' || !!planned.owedMainRule;
     const out = await sinks[DISPATCH_EFFECT]({
-      launchKind: 'ci-heal', prompt: withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
+      launchKind: 'ci-heal', prompt: withOwedMainRuleSection(withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), planned), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
-      // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry.
-      pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' ? null : (route?.probationWorker ?? null),
-      routing: stronger ? { policyRoute: stronger.policyRoute } : route,
+      // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry; so does
+      // a heal that must keep drain-assigned card numbers (PR #5082).
+      // The sink falls back to `routing.probationWorker` when this is null, so a suppressed pick is cleared on both.
+      pr: planned.pr, reason, repo, probationWorker: briefOnly ? null : (route?.probationWorker ?? null),
+      routing: stronger ? { policyRoute: stronger.policyRoute } : (briefOnly && route ? { ...route, probationWorker: null } : route),
     });
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim
@@ -558,6 +573,7 @@ export async function runReconcileCiHealDispatch({
       itemNum: unit?.itemNum ?? null, pr: entry.prNumber, laneRef: entry.headRefName,
       scope: Array.isArray(unit?.scope) ? unit.scope : [], reason: entry.reason === 'codeql' ? 'codeql' : 'red-ci',
       ...(entry.reason === 'codeql' && entry.codeql ? { codeql: entry.codeql } : {}), // card x8cnbii — the alert for the brief
+      ...(entry.owedMainRule ? { owedMainRule: entry.owedMainRule } : {}), // PR #5082 — drain numbers the healer must keep
       // #x0jphk5 — carried through so `dispatchCiHeal` can key its `(repo, pr, headRefOid)` claim; dropped
       // before this slice, even though `reconcile-core.mjs`'s own `base` object already carries it on every
       // entry (see this function's own docblock — "a CI-heal entry carries neither on `reconcile-core.mjs`'s

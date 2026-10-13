@@ -48,6 +48,7 @@
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
@@ -1362,6 +1363,7 @@ export function runReconcilePass({
   // mechanical round's head needs (we:scripts/conveyor/mechanical-round-cap.mjs). Injectable.
   loadMechanicalRoundsSetting = resolveMechanicalRoundsSetting,
   enrichMechanicalRound = enrichPrsWithMechanicalRound,
+  enrichOwedMainRule = enrichPrsWithOwedMainRule,
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1422,6 +1424,7 @@ export function runReconcilePass({
   const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
+  if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
   // The git evidence is read in THIS checkout, so only for the repo it is a clone of (WE); elsewhere no PR carries
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
