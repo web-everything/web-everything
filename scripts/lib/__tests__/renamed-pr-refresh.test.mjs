@@ -7,7 +7,9 @@ import {
   planRenamedPrRefresh, runRenamedPrRefresh, readOwedMainRule, enrichPrsWithOwedMainRule,
   resolveRefreshSettings, logRefreshSettings,
 } from '../renamed-pr-refresh.mjs';
-import { planReconcile, REFUSAL_KINDS } from '../../conveyor/reconcile-core.mjs';
+import { planReconcile, REFUSAL_KINDS, CI_HEAL_ROUND_CAP } from '../../conveyor/reconcile-core.mjs';
+import { buildCiHealComment } from '../../conveyor/ci-heal-mark.mjs';
+import { buildCiHealEscalationComment } from '../../conveyor/ci-heal-escalation-mark.mjs';
 import { withOwedMainRuleSection } from '../../operations/ci-heal-pr-dispatch.mjs';
 
 const error = 'Backlog item "5994-diagnose-unknown-prepare-result-failure-97b1d8c1d2e808d2" carries a hand-picked NNN id (#5994) that is not on origin/main — new items must be hash-keyed (xNNNNNN); the drain assigns the real number at land (#2288). Rename it with a hash id, or set WE_SKIP_HAND_NUMBERED_GATE=1 if this is the sanctioned collision-heal renumbering path (#2548).';
@@ -197,6 +199,26 @@ describe('reconcile ownership', () => {
       const result = planReconcile({ prs: [owedPr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks: ['test'], now: Date.parse('2026-10-12T23:00:00Z') });
       expect(result.refusals).toEqual([expect.objectContaining({ kind: 'owed-main-rule' })]);
     }
+  });
+  // Red-team break on 97f4877fd: the drain enforces CodeQL though branch protection does not require it.
+  const codeqlRed = { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' };
+  const codeqlFailure = { checkRunId: 7, headSha: 'abc123', alerts: [{ rule: 'js/sql-injection', path: 'scripts/x.mjs', line: 3, message: 'new alert' }] };
+  const reconcileCodeql = (over = {}) => planReconcile({ prs: [owedPr({ statusCheckRollup: [...pr().statusCheckRollup, codeqlRed], codeqlFailure, ...over })], agents: [], durableCounts: {}, requiredChecks: ['test'], now: Date.parse('2026-10-12T23:00:00Z') });
+  it('keeps the CodeQL ci-heal the drain enforces, told to leave the drain numbers alone', () => {
+    const result = reconcileCodeql();
+    expect(result.refusals.some(r => r.kind === 'owed-main-rule')).toBe(false);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', reason: 'codeql', codeql: codeqlFailure, owedMainRule: { check: 'test', nums: [5994] } })]);
+    expect(result.dispatch[0].why).toMatch(/must be left alone/);
+  });
+  it('keeps the CodeQL heal under its own escalation and cap', () => {
+    const author = { login: 'web-everything' };
+    const escalated = reconcileCodeql({ comments: [{ body: buildCiHealEscalationComment({ headSha: 'abc123', outcome: 'needs-human', reason: 'cannot fix' }), author }] });
+    expect(escalated.dispatch).toEqual([]);
+    expect(escalated.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated' })]);
+    const spent = Array.from({ length: CI_HEAL_ROUND_CAP }, () => ({ body: buildCiHealComment({ reason: 'codeql' }), author }));
+    const capped = reconcileCodeql({ comments: spent });
+    expect(capped.dispatch).toEqual([]);
+    expect(capped.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted' })]);
   });
 });
 

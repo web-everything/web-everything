@@ -2643,7 +2643,8 @@ export function planReconcile({
       }
     }
 
-    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+    // `hold` (PR #5082): the drain-number hold's facts, so a CodeQL heal planned under it keeps those numbers.
+    const planCodeqlHeal = (hold = {}) => {
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null,
         recheck: verdictSettings.recheckNotCiBreak, voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen });
       const healBudget = healBudgetFor(pr);
@@ -2664,10 +2665,14 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
-          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+          ...base, ...withPhase, ...hold, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
+          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`
+            + (hold.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${hold.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
         });
       }
+    };
+    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+      planCodeqlHeal();
       continue;
     }
 
@@ -2676,8 +2681,10 @@ export function planReconcile({
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
       const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
       // When another check keeps the ci-heal, the healer is told to leave `test`'s drain-assigned numbers alone.
-      const owedMainRuleFact = owedMainRuleHold && !onlyTestRed ? { owedMainRule: { check: 'test', nums: [...(pr.owedMainRule.nums ?? [])] } } : {};
+      const owedMainRuleFact = owedMainRuleHold ? { owedMainRule: { check: 'test', nums: [...(pr.owedMainRule.nums ?? [])] } } : {};
       if (owedMainRuleHold && onlyTestRed) {
+        // The drain also enforces CodeQL (not a required check): a failed CodeQL keeps its own heal under the hold.
+        if (pr?.codeqlFailure) { planCodeqlHeal(owedMainRuleFact); continue; }
         refuse('owed-main-rule', { ...withPhase, why: `the required check failed only on the hand-picked-NNN rule for card number(s) the drain itself assigned (${(pr.owedMainRule.nums ?? []).map(n => `#${n}`).join(', ')}); owed a refresh once main accepts drain-numbered cards (drain-branch-numbering-ci-v1), never a ci-heal that would revert the number` });
         continue;
       }
