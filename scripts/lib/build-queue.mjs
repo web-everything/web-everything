@@ -19,8 +19,49 @@
  */
 
 import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES, PRIORITY_SETTINGS_OFF } from './delivery-priority.mjs';
-import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { platformPreference, logCascadeSources, resolveCascade, cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
+
+const BUILD_PRIORITY_ID = /^(\d+|x[0-9a-z]{6,})$/;
+function normalizeBuildPriority(value) {
+  if (!Array.isArray(value) || !value.every(id => typeof id === 'string' && BUILD_PRIORITY_ID.test(id.trim()))) return null;
+  return [...new Set(value.map(id => id.trim()))];
+}
+const BUILD_PRIORITY_VALID = { priority: value => normalizeBuildPriority(value) !== null };
+function buildPriorityLayer(layer) {
+  if (layer?.priority === undefined) return undefined;
+  // Arrays are cascade leaves. Malformed objects must also be rejected as a whole, not merged as nested leaves.
+  return { priority: normalizeBuildPriority(layer.priority) };
+}
+function buildPriorityEnv(env) {
+  const raw = env?.WE_BUILD_PRIORITY;
+  return { priority: raw === undefined ? undefined
+    : typeof raw === 'string' ? normalizeBuildPriority(raw.trim() ? raw.split(',') : []) : null };
+}
+function buildPriorityResult(resolved) {
+  return { ids: normalizeBuildPriority(resolved.value.priority) ?? [], source: resolved.sources.priority };
+}
+
+/** PURE: ordered operator ids, standard → platform build block → tool build block → env. */
+export function resolveBuildPriority({ platform, tool, env } = {}) {
+  return buildPriorityResult(resolveCascade({
+    standard: { priority: [] }, platform: buildPriorityLayer(platform), tool: buildPriorityLayer(tool),
+    envValues: buildPriorityEnv(env), valid: BUILD_PRIORITY_VALID,
+  }));
+}
+
+/** IO: resolve build.priority through the shared cascade and log its source. Never throws. */
+export function readBuildPrioritySettings({ env = process.env, read = readSettings } = {}) {
+  let tool;
+  try { tool = read()?.build; } catch { /* unreadable tool settings leave the lower layers intact */ }
+  try {
+    return buildPriorityResult(cascadePolicy('build', buildPriorityLayer(tool), {
+      standard: { priority: [] },
+      platform: buildPriorityLayer(platformPreference('build', { env })) ?? {},
+      envValues: buildPriorityEnv(env), valid: BUILD_PRIORITY_VALID, env,
+    }));
+  } catch { return { ids: [], source: 'standard' }; }
+}
 
 /** PURE policy cascade: standard defaults → platform preference → tool override → environment. */
 export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) {
@@ -267,21 +308,32 @@ function tierRank(item) {
  * effective WSJF score, aging folded in), `unblocks` (dependents freed), and `rank` (the LexoRank override).
  * Exposed so a display surface (the console queue view #2529) and the builder (#2530) can show/act on WHY an
  * item ranks where it does WITHOUT recomputing the engine's math (one source of truth). {@link orderQueue}
- * is this mapped back to bare items. Enforce sort keys, in order: delivery class (P0 first, #4355) →
+ * is this mapped back to bare items. buildPriority lifts listed cards (including descendants) in list order,
+ * after P0 in enforce mode, before the remaining keys in every mode. Empty lists preserve existing order.
+ * Enforce sort keys after that prefix, in order: delivery class (P0 first, #4355) →
  * operator request first (unless requestsFirstInClass=false; Q2 amendment 2026-10-09) → tier (pinned
  * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
  * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
  * `opts.priority` omitted or mode `off` → every row P3, priorityScore 0, legacy order.
- * Mode `shadow` computes real classes, scores and reasons but retains the legacy keys only:
+ * Mode `shadow` computes real classes, scores and reasons but retains the legacy keys after buildPriority:
  * tier → effectiveScore → rank → dateOpened → num. Only `enforce` applies class-first ordering.
  */
-export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority } = {}) {
+export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority, buildPriority = [] } = {}) {
   const byId = indexItems(items);
   const prioritySettings = resolvePrioritySettings(priority);
+  const priorityIds = new Map(buildPriority.map((id, i) => [id, i]).reverse());
+  const ancestors = new Map();
+  for (const item of items) {
+    for (const alias of [...buildPriorityAliases(item), item.id].filter(x => x != null)) ancestors.set(String(alias), item);
+  }
   const ready = items
     .filter((it) => isReady(it, byId))
     .map((it) => {
       const unblocks = unblocksCount(it, items);
+      const placement = buildPriorityPlacement(it, priorityIds, ancestors);
+      const delivery = cardPriority(it, unblocks, prioritySettings, now);
+      if (placement.buildPriorityIndex !== null) delivery.priorityReasons.push(
+        `build.priority #${placement.buildPriorityIndex + 1}${placement.buildPriorityVia === null ? '' : ` (via ${placement.buildPriorityVia})`}`);
       return {
         item: it,
         // the build-queue tier STRING (the "why"), not the numeric order key. Normalize an unknown/typo'd
@@ -290,7 +342,8 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         tierOrder: tierRank(it),
         score: effectiveScore(it, config, now, { unblocks }),
         unblocks,
-        ...cardPriority(it, unblocks, prioritySettings, now),
+        ...delivery,
+        ...placement,
         buildQueued: isBuildQueued(it), // the human's explicit clear-for-build (the manual gate #2530)
         rank: it.rank ?? '',
         opened: item_dateKey(it),
@@ -299,8 +352,35 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         num: numOr(Number(it.num), Infinity),
       };
     });
-  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : compareLegacyOrder);
+  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : (a, b) => compareBuildPriority(a, b) || compareLegacyOrder(a, b));
   return ready;
+}
+
+const normalizePriorityNum = value => String(value).replace(/^0+(?=\d)/, '');
+function buildPriorityAliases(item) {
+  const stem = String(item.id ?? '').split('-')[0];
+  return [item.num == null ? null : normalizePriorityNum(item.num), item.bornAs,
+    /^x[0-9a-z]{6,}$/.test(stem) ? stem : null].filter(x => x != null);
+}
+function buildPriorityPlacement(item, ids, ancestors) {
+  let buildPriorityIndex = null;
+  let buildPriorityVia = null;
+  const seen = new Set();
+  for (let current = item, depth = 0; current && depth <= 20 && !seen.has(current); depth++) {
+    seen.add(current);
+    for (const alias of buildPriorityAliases(current)) {
+      const index = ids.get(alias);
+      if (index !== undefined && (buildPriorityIndex === null || index < buildPriorityIndex)) {
+        buildPriorityIndex = index;
+        buildPriorityVia = current === item ? null : alias;
+      }
+    }
+    current = ancestors.get(String(current.parent)) ?? ancestors.get(normalizePriorityNum(current.parent));
+  }
+  return { buildPriorityIndex, buildPriorityVia };
+}
+function compareBuildPriority(a, b) {
+  return (a.buildPriorityIndex ?? Infinity) - (b.buildPriorityIndex ?? Infinity) || 0;
 }
 
 function compareLegacyTail(a, b) {
@@ -312,7 +392,9 @@ function compareLegacyOrder(a, b) {
 }
 
 function compareClassOrder(requestsFirstInClass) {
-  return (a, b) => PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
+  return (a, b) => Number(b.priorityClass === 'P0') - Number(a.priorityClass === 'P0') ||
+    compareBuildPriority(a, b) ||
+    PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
     (requestsFirstInClass ? Number(b.operatorRequest === true) - Number(a.operatorRequest === true) : 0) ||
     a.tierOrder - b.tierOrder || b.priorityScore - a.priorityScore || compareLegacyTail(a, b);
 }

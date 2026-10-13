@@ -103,6 +103,7 @@ export function shapeQueue(buildQueue, clearedNums = null) {
   return rows.map((r) => ({
     num: r?.num != null ? String(r.num) : null,
     rank: r?.rank ?? null,
+    ...(Number.isFinite(r?.buildPriority) ? { buildPriority: r.buildPriority } : {}),
     // Card 80 — the build-queue tier (`pinned` first), read by the prepare-ahead window. Omitted when absent.
     ...(r?.tier != null ? { tier: r.tier } : {}),
     // The delivery class (P0-P4), read by the prepare-ahead window so a build-now (P1) card is prepared first.
