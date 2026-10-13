@@ -26,12 +26,16 @@
  * If `merge-tree` reports ANY conflict beyond the manifest, this returns `{ action: 'skip' }` — a real
  * conflict needs a human; the lander never force-resolves code.
  *
+ * Repo-root fix-evidence markdown files are transient like the manifest: fixer agents share these
+ * scratch paths, so drop them from the rebuilt tree and accept conflicts confined to either kind.
+ *
  * The orchestrator takes an injected `run(cmd, args, opts) -> { status, stdout, stderr }` so it is
  * unit-testable without a real repo (see `scripts/lib/__tests__/rebase-drop-manifest.test.mjs`).
  */
 
 import { gitRun as gitRunner, ensureFullHistory } from './git-run.mjs';
 import { applyCollisionHealToIndex } from './nnn-collision-heal.mjs';
+import { isFixEvidencePath, isDrainTransientPath } from './transient-paths.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
 
 export const LANE_MANIFEST = '.lane-manifest.json';
@@ -70,8 +74,7 @@ export function manifestConflictDisposition(parsed, manifest = LANE_MANIFEST) {
   if (parsed.clean) return 'clean';
   const paths = parsed.conflictPaths || [];
   if (paths.length === 0) return 'clean'; // exit≠0 but no parseable conflict paths → treat as no-op
-  const nonManifest = paths.filter((p) => p !== manifest);
-  if (paths.includes(manifest) && nonManifest.length === 0) return 'manifest-only';
+  if (paths.every((p) => isDrainTransientPath(p, manifest))) return 'manifest-only';
   return 'real';
 }
 
@@ -203,6 +206,12 @@ export function rebaseDropManifest({
   if (read.status !== 0) return { action: 'error', reason: `read-tree failed (${(read.stderr || '').split('\n')[0]})` };
   // Drop the manifest if present (--ignore-unmatch: a clean merge with no manifest in the tree is fine).
   run('git', ['rm', '--cached', '--ignore-unmatch', manifest], { env, cwd });
+  const rootEntries = run('git', ['ls-tree', '--name-only', parsed.tree], { env, cwd });
+  const droppedEvidence = rootEntries.status === 0
+    ? String(rootEntries.stdout || '').split('\n').filter(isFixEvidencePath) : [];
+  if (droppedEvidence.length) {
+    run('git', ['rm', '--cached', '--ignore-unmatch', '--', ...droppedEvidence], { env, cwd });
+  }
   // #2276 — in the SAME rebuilt tip, renumber a colliding new backlog item against `<base>` (reusing #2222's
   // apply-to-index), so a rebuild that already runs to shed the manifest also clears an `ids must be unique`
   // dup. `parsed.tree` (the merged tree) already seeds this index, so the heal reads/stages against it. A heal
@@ -233,7 +242,7 @@ export function rebaseDropManifest({
     // Guard: only claim 'current' if we can actually resolve the tip's commit sha; otherwise fall through to
     // the normal rebuild rather than return a bogus result.
     if (curCommit) {
-      return { action: 'current', reason: 'tip already up-to-date on base and manifest-free — no rebuild needed', base, laneRef, newCommit: curCommit };
+      return { action: 'current', reason: 'tip already up-to-date on base and manifest-free — no rebuild needed', base, laneRef, newCommit: curCommit, droppedEvidence };
     }
   }
 
@@ -251,7 +260,8 @@ export function rebaseDropManifest({
   }
 
   const healTag = healed.length ? `, renumber ${healed.map((r) => `#${r.oldNum}→#${r.newNum}`).join('/')}` : '';
-  const msg = message || `drain: rebase ${laneRef} onto ${base}, drop transient ${manifest}${healTag}`;
+  const evidenceTag = droppedEvidence.length ? `, drop fix evidence ${droppedEvidence.join(', ')}` : '';
+  const msg = message || `drain: rebase ${laneRef} onto ${base}, drop transient ${manifest}${evidenceTag}${healTag}`;
   const ct = run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
   const newCommit = String(ct.stdout || '').trim();
   if (ct.status !== 0 || !newCommit) return { action: 'error', reason: `commit-tree failed (${(ct.stderr || '').split('\n')[0]})` };
@@ -266,5 +276,5 @@ export function rebaseDropManifest({
   const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${(push.stderr || '').split('\n')[0]})` };
 
-  return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', healed, base, laneRef };
+  return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef };
 }

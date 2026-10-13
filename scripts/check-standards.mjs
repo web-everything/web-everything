@@ -120,6 +120,7 @@ import {
 import { TRUST_CHAIN, POLICY_SPEC_BASENAMES } from './lib/gate-config.mjs';
 // #2892 — the leash-pin rule asserts against the REAL rubric, not a copy of its predicate.
 import { scoreEscalation } from './lib/review-escalation.mjs';
+import { committedFixEvidenceFindings } from './lib/transient-paths.mjs';
 import { localChangedSet } from './lib/verify-lane-gate.mjs';
 import { scanDiffBranchCoverage } from './lib/diff-branch-coverage.mjs';
 import { isHash } from './backlog/id.mjs';
@@ -779,6 +780,14 @@ if (!LOCAL_MODE) {
     for (const msg of born.errors) err(msg);
     for (const msg of born.warnings) warn(msg);
   }
+  const { isMergeGroupCiRun, resolveQueueNumbering, mergeGroupHashRefusals, exemptDrainNumberedItems, drainNumberedPairs } = await import('./lib/queue-branch-numbering.mjs');
+  const setting = resolveQueueNumbering();
+  for (const message of setting.invalid) warn(message);
+  if (isMergeGroupCiRun()) {
+    try {
+      for (const m of mergeGroupHashRefusals({ files: readdirSync(join(ROOT, 'backlog')).map((f) => `backlog/${f}`) })) err(m);
+    } catch (e) { err(`Cannot inspect merge group backlog for non-numeric ids: ${e.message}`); }
+  }
   // #2319 — hash-on-main invariant: a backlog file on origin/main with a non-numeric leading id means a land route
   // bypassed JIT numbering (#2288) and stranded a hash. Read the MAIN tree (not the working tree) so in-lane
   // pre-land hashes on a lane/* branch don't false-trip. Fail-SOFT: origin/main unresolvable (fresh/offline
@@ -813,7 +822,7 @@ if (!LOCAL_MODE) {
     // because pr-land.mjs's runHeal() self-check runs on a locally-renumbered, not-yet-pushed tree that this
     // gate cannot distinguish from a real mistake — the heal IS the sanctioned numbering path.
     if (!process.env.WE_SKIP_HAND_NUMBERED_GATE) {
-      for (const msg of handNumberedNewItems(backlog, mainBacklog)) err(msg);
+      for (const msg of handNumberedNewItems(exemptDrainNumberedItems(backlog, { drainNumbered: drainNumberedPairs({ cwd: ROOT }) }), mainBacklog)) err(msg);
     }
   } catch { /* origin/main not resolvable here — the drain's post-land assert still guards the land path */ }
 }
@@ -1032,6 +1041,9 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   }) });
   if (!scopeChanges) throw new Error('Cannot enforce backlog scope guards: unable to read the diff against origin/main. Fetch the base history and retry.');
+  for (const path of committedFixEvidenceFindings(scopeChanges)) {
+    err(`"${path}" is a fix-evidence scratch file and must never be committed — it is shared by every fixer and conflicts every other PR that carries it. Post evidence as a PR comment (gh pr comment --body-file <file outside the repo>) and \`git rm --cached ${path}\`.`);
+  }
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
     f.startsWith('backlog/') && f.endsWith('.md') && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
@@ -2834,20 +2846,25 @@ mark("16. A DECLARED module contract must cover every specifier the module impor
 }
 
 mark("17b. `--all` inside a git hook (#3196)");
-// ── 17c. Leash pin (#2892 — enforces #2840 trigger 3; guards #2838's flip-edit safeguard) ──────
-// No declarative-leash (`POLICY_SPEC`) file may be dropped from the human gate — checked against the roster AND
-// against the real `scoreEscalation`, so neither a reclassification nor a rubric edit can quietly hand the
-// contract (and with it the shadow→enforce flip) to an agent panel. Pure rule + its rationale live in
-// check-standards-rules.mjs (`checkLeashPin`); this only wires the real roster, rubric and filesystem in.
+// ── 17c. Leash pin: broad restore path and active-set escalation ──────
+// The broad preset must human-gate every pinned leash home. Under the active category set each home
+// must still escalate, even when narrow routes it to AI review. The shared roster stays unchanged.
 // #4167 — every finding `checkLeashPin` can produce is unconditionally `global: true` (its own
 // `descriptor()` helper always sets it), so `--local` always demotes it; skip the whole check.
 if (!LOCAL_MODE) {
   const pin = checkLeashPin({
     specBasenames: POLICY_SPEC_BASENAMES,
     roster: TRUST_CHAIN,
-    isHumanGated: (path, hunks) => scoreEscalation({ changedFiles: [path], diffHunks: hunks }).humanRequired,
+    isHumanGated: (path, hunks) => scoreEscalation({ changedFiles: [path], diffHunks: hunks, humanSurfaces: 'broad' }).humanRequired,
     homeExists: (rel) => existsSync(join(ROOT, rel)),
   });
+  for (const entry of TRUST_CHAIN.filter(e => POLICY_SPEC_BASENAMES.has(e.file))) {
+    for (const home of entry.homes ?? [entry.file]) {
+      if (!scoreEscalation({ changedFiles: [home] }).escalate) {
+        err(`leash pin: active human surfaces no longer escalate ${home}`, { kind: 'leash-pin', fix: 'model', file: 'scripts/lib/review-escalation.mjs', global: true });
+      }
+    }
+  }
   for (const e of pin.errors) err(e.message, e.descriptor);
   for (const w of pin.warnings) warn(w.message, w.descriptor);
 }

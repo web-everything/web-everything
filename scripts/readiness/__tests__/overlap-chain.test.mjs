@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  DEFAULT_DEPTH_CAP, createStackPlan, planNextItem, recheckAtPush, applyRebase, recordPushed, dropItem, overlapsInFlight,
+  DEFAULT_DEPTH_CAP, createStackPlan, planNextItem, recheckAtPush, applyRebase, recordPushed, dropItem, firstScopeOverlap, overlapsInFlight,
 } from '../overlap-chain.mjs';
 
 const push = (plan, id, files = [], tips = { we: { sha: `sha-${id}`, ref: `lane/x-${id}` } }) =>
@@ -305,7 +305,46 @@ describe('plan round-trips through JSON (the CLI persists it between seams)', ()
   });
 });
 
+describe('firstScopeOverlap — drain-transient paths never claim dispatch scope', () => {
+  it.each(['.fix-evidence.md', '.fix-4965-evidence.md', '.fix-evidence-4965.md', '.lane-manifest.json'])(
+    'ignores repo-root %s in old PR diffs and stale claims', (path) => {
+      expect(firstScopeOverlap([`we:${path}`, 'we:a.mjs'], [`we:${path}`, 'we:b.mjs'])).toBeNull();
+    },
+  );
+
+  it('still reports a real shared file after ignoring transient entries', () => {
+    expect(firstScopeOverlap(
+      ['we:.fix-evidence.md', 'we:scripts/x.mjs'],
+      ['we:.fix-evidence.md', 'we:scripts/x.mjs'],
+    )).toBe('we:scripts/x.mjs');
+  });
+
+  it('keeps nested evidence paths in scope', () => {
+    expect(firstScopeOverlap(['we:docs/.fix-evidence.md'], ['we:docs/.fix-evidence.md']))
+      .toBe('we:docs/.fix-evidence.md');
+  });
+
+  it('filters transient object entries on either side before directory-prefix comparisons', () => {
+    const transient = { repo: 'we', path: '.fix-evidence.md' };
+    const descendant = 'we:.fix-evidence.md/child';
+    expect(firstScopeOverlap([transient], [descendant])).toBeNull();
+    expect(firstScopeOverlap([descendant], [transient])).toBeNull();
+  });
+
+  it('preserves existing repo-root entry behavior', () => {
+    expect(firstScopeOverlap(['we:'], ['we:scripts/x.mjs'])).toBeNull();
+    expect(firstScopeOverlap(['we:.'], ['we:scripts/x.mjs'])).toBeNull();
+    expect(firstScopeOverlap(['we:.'], ['we:.'])).toBe('we:.');
+  });
+});
+
 describe('overlapsInFlight (#4295) — the shared build/fix dispatch overlap predicate', () => {
+  it('does not block unrelated fixes behind PR #5038 on stale evidence scope', () => {
+    expect(overlapsInFlight(
+      ['we:.fix-evidence.md', 'we:a.mjs'],
+      [{ id: 'fix PR #5038', scope: ['we:.fix-evidence.md', 'we:c.mjs'] }],
+    )).toBeNull();
+  });
   it('hits on an equal path and names the in-flight item', () => {
     expect(overlapsInFlight(['we:a/x.mjs'], [{ id: 7, scope: ['we:a/x.mjs'] }])).toEqual({ hit: 'we:a/x.mjs', with: 7 });
   });

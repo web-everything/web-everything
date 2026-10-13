@@ -33,6 +33,8 @@ import {
 import { emptyBaselineState, recordBaseline, getBaseline, diffBaseline } from './review-baseline-state.mjs';
 import { extractManifestFromBody } from '../readiness/lane-manifest.mjs';
 import { classifyPr, buildDrainVerdicts, drainGateInputs, isCodeQLFailed } from '../merge-ai-prs.mjs';
+import { formatPrResult } from './merge-gate-verdict.mjs';
+export { formatPrResult } from './merge-gate-verdict.mjs';
 import { DRAIN_GATES } from './merge-gate-inventory.mjs';
 import { placementOf, PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
@@ -375,13 +377,6 @@ export function groupMembership({ headRef = '', headSha = '', entries = [], comm
   const nums = [...new Set([...groupPrNumbers({ headRef, headSha, entries, commitSubjects: subjects }), ...extra])].sort((a, b) => a - b);
   if (!nums.length) reasons.push('no PR could be identified');
   return { nums, complete: reasons.length === 0, reasons };
-}
-
-/** Human-readable check summary. */
-export function formatPrResult(p) {
-  const lines = [`#${p.num}: ${p.ok ? 'PASS' : 'HOLD'}`];
-  for (const x of p.results) lines.push(`  ${x.status.padEnd(17)} ${x.id.padEnd(22)} ${x.reason}`);
-  return lines.join('\n');
 }
 
 // ── mergeGate.mode: shadow | enforce ───────────────────────────────────────────────────────────────────────────

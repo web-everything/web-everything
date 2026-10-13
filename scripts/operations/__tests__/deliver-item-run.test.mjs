@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
 import { createFileRunStore, newRunRecord } from '../run-store.mjs';
 import {
   parseDeliverItemRunArgv, selectDeliveryAgentProvider, runDeliverItemCli,
@@ -83,6 +84,45 @@ describe('selectDeliveryAgentProvider', () => {
 
 describe('runDeliverItemCli (injected `deliver` fake — no real process spawn)', () => {
   const baseArgv = ['--num=42', '--lane=3', '--session=conveyor-42'];
+
+  it('leaves unpinned Codex effort to the build task route', async () => {
+    const spawn = vi.fn();
+    await runDeliverItemCli([...baseArgv, '--provider=codex'], {
+      selectProvider: () => ({ name: 'codex', provider: { vendor: 'codex', spawn } }),
+      deliver: async (launch, provider) => { await provider.spawn({}); return { result: 'done' }; },
+      write: () => {}, writeErr: () => {},
+    });
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ taskKind: 'build' }));
+    expect(spawn.mock.calls[0][0].effort).toBeUndefined();
+    expect(spawn.mock.calls[0][0].model).toBeUndefined();
+  });
+
+  it('preserves an explicit new catalogue model and effort without the old policy catalogue rejecting it', async () => {
+    const spawn = vi.fn();
+    const result = await runDeliverItemCli([...baseArgv, '--provider=codex', '--model=gpt-6.1-sol', '--effort=high'], {
+      selectProvider: () => ({ name: 'codex', provider: { vendor: 'codex', spawn } }),
+      deliver: async (_launch, provider) => { await provider.spawn({}); return { result: 'done' }; },
+      write: () => {}, writeErr: () => {},
+    });
+    expect(result.code).toBe(0);
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ taskKind: 'build', model: 'gpt-6.1-sol', effort: 'high' }));
+  });
+
+  it.each([undefined, 'high'])('only forwards an actually configured Codex effort (%s)', async effort => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.criticalWorkGate.kinds = [];
+    policy.operations.build = { provider: 'codex', model: 'astra', fallback: [], ...(effort ? { effort } : {}) };
+    const spawn = vi.fn();
+    const result = await runDeliverItemCli(baseArgv, {
+      readPolicy: () => policy,
+      selectProvider: () => ({ name: 'codex', provider: { vendor: 'codex', spawn } }),
+      deliver: async (_launch, provider) => { await provider.spawn({}); return { result: 'done' }; },
+      write: () => {}, writeErr: () => {},
+    });
+    expect(result.code).toBe(0);
+    expect(spawn.mock.calls[0][0].effort).toBe(effort);
+    expect(spawn.mock.calls[0][0].model).toBe('gpt-6-astra');
+  });
 
   it('#4357 prints the refusal reason supplied by delivery', async () => {
     const write = vi.fn();
