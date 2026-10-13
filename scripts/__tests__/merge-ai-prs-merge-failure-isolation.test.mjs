@@ -55,7 +55,7 @@ function runCli({ failAll = false, watch = false } = {}) {
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
       commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
-      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0 }],
+      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     // Keep the real lock implementation, but isolate its os.homedir()-based state from the resident drain.
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.ISOLATION_HOME; syncBuiltinESMExports();");
