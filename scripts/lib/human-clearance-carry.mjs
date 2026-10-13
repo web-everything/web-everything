@@ -215,7 +215,9 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
     const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
     if (!pre.carry) {
-      if (!enabled) return { ...pre, applicable: true };
+      // Only a PROVEN fingerprint mismatch (both sides read) earns the git proof: absent or unread fingerprints keep
+      // refusing before git is touched, as they always did.
+      if (!enabled || !clearance.diff || !liveCarryFingerprints(evidence.headDiff).diff) return { ...pre, applicable: true };
       const proof = proveNumbering({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
       if (proof.ok) return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
         fingerprint: liveCarryFingerprints(evidence.headDiff).diff || 'unscored', actor: clearance.actor,
