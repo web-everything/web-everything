@@ -4,7 +4,7 @@ size: 5
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd"]
-scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs"]
+scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 humanGate: { kind: review, what: "Operator confirms the replacement invariant in epic xdlnylv's decision note (every card on main has a ledger number assigned atomically at land; nothing on main references an unassigned id in a user-visible place), which supersedes the file-name half of #5057. Remove this gate once confirmed." }
 dateOpened: "2026-10-13"
 tags: [backlog, drain, merge-queue, numbering, ledger]

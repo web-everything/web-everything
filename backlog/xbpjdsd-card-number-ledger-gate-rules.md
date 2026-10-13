@@ -4,7 +4,7 @@ size: 3
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82"]
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/lib/duplicate-bornas-added.mjs"]
+scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/lib/duplicate-bornas-added.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/lib/__tests__/duplicate-bornas-added.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, gate]
 ---

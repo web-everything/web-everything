@@ -4,7 +4,7 @@ size: 3
 parent: "xdlnylv"
 status: open
 blockedBy: ["xk60q6s"]
-scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog/id.mjs", "we:docs/agent/backlog-workflow.md"]
+scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog/id.mjs", "we:docs/agent/backlog-workflow.md", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/backlog/__tests__/id.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, cleanup]
 ---

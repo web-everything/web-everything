@@ -1,6 +1,5 @@
 ---
 kind: epic
-size: 21
 status: open
 scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lane-drain.mjs", "we:scripts/check-standards.mjs", "we:scripts/check-standards-rules.mjs", "we:src/_data/backlog.js", "we:scripts/backlog.mjs"]
 dateOpened: "2026-10-13"

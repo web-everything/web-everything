@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
-scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-number-ledger.json", "we:scripts/backlog/seed-card-number-ledger.mjs"]
+scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-number-ledger.json", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
