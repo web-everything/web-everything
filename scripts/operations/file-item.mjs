@@ -56,11 +56,36 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
 import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from './scaffold.mjs';
+import { setFrontmatterField } from '../backlog/frontmatter.mjs';
+import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
+
+/** Validate before either filing effect; ordinary scaffold output stays byte-identical. */
+export function planFileItem(read, input) {
+  const verdict = planScaffold(read, input);
+  if (input.priority && !/^P[0-4]$/.test(input.priority)) throw new Error('file-item: priority must be P0..P4');
+  if (input.priority) verdict.content = setFrontmatterField(verdict.content, 'priority', input.priority);
+  if (!input.operatorTask) return verdict;
+  // The digest supplies the complete authored body, replacing the scaffold's unfinished agreement.
+  verdict.content = verdict.content.slice(0, verdict.content.indexOf('\n# '))
+    + `\n# ${input.title}\n\n${input.digest || ''}\n`;
+  verdict.content = setFrontmatterField(verdict.content, 'operatorTask', 'true');
+  const policy = read.operatorTask;
+  if (!policy) throw new Error('file-item: operatorTask requires the resolved build policy');
+  if (!policy.enabled) return verdict;
+  if (input.priority && Number(input.priority[1]) < Number(policy.maxPriority[1])) throw new Error('file-item: priority exceeds operatorTask.maxPriority');
+  const ready = validatePrepareCard(verdict.content, { operatorTask: true });
+  if (!ready.ok) throw new Error(`file-item: missing or incomplete sections: ${ready.missing.join(', ')}`);
+  if (!/^[a-f0-9]{40,64}$/.test(read.originMainSha ?? '')) throw new Error('file-item: cannot stamp without origin/main tip');
+  verdict.content = setFrontmatterField(verdict.content, 'preparedDate', JSON.stringify(read.today));
+  verdict.content = setFrontmatterField(verdict.content, 'preparedAgainstSha', JSON.stringify(read.originMainSha));
+  return verdict;
+}
 
 export const FILE_ITEM_OP = 'file-item';
 
@@ -125,6 +150,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
   return op(FILE_ITEM_OP, {
     input: {
       title: 'string',
+      ...OPERATOR_TASK_INPUT,
       kind: { type: 'string', required: false, default: '' },
       type: { type: 'string', required: false, default: '' },
       workItem: { type: 'string', required: false, default: '' },
@@ -135,6 +161,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       blockedBy: { type: 'string', required: false, default: '' },
       scope: { type: 'string', required: false, default: '' },
       session: { type: 'string', required: false, default: '' },
+      priority: { type: 'string', required: false, default: '' },
       // Opt OUT of the auto-clear, not opt in — the default behaviour is the whole point of this operation
       // over bare `scaffold`; a caller who wants scaffold-only behaviour passes `--queue=false` (or calls
       // `scaffold` directly, which this operation intentionally leaves reachable).
@@ -146,19 +173,23 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: [],
-      fn: () => shapeScaffoldRead(readScaffoldContext()),
+      reads: ['input.operatorTask'],
+      fn: (view) => {
+        const raw = readScaffoldContext();
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask,
+          originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
+      },
     }),
 
-    // THE SCAFFOLD VERDICT, unchanged from `scaffold.mjs#planScaffold` — same allocation, same refusals,
+    // THE SCAFFOLD VERDICT, extended only by operator filing admission — same allocation, same refusals,
     // same rendered content. This is the operation's `verdictFrom` target, so a caller reading `run.verdict`
     // sees exactly what a `scaffold` caller would (num/id/rel/abs/kind/status/content/digestFilled).
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'input.priority', 'findings.read',
       ],
-      fn: (view) => planScaffold(view.findings.read, view.input),
+      fn: (view) => planFileItem(view.findings.read, view.input),
     }),
 
     // THE QUEUEING DECISION, kept OFF the verdict deliberately: `verdictFrom: 'plan'` means every existing

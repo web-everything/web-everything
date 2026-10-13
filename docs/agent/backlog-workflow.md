@@ -1222,3 +1222,46 @@ Two parallel lane sessions can allocate the **same** backlog `NNN` for a *new* i
 - `relatedReport` must exist on disk; `relatedProject` must resolve in `projects.json`; `crossRef` needs both `url` and `label`.
 - `reports/` is **not** in the 11ty build, so `relatedReport` shows as a path label, not a link. Real site links go via `crossRef` / `relatedProject`.
 - `npm run check:standards` validates all of the above — it reads `backlog/*.md` through `src/_data/backlog.js`, the same loader the site uses.
+
+## Complete operator task briefs
+
+File an authored task through `we:scripts/operations/run.mjs file-item` with
+`--operatorTask --priority=P0` and the complete body in `--digest`. The body replaces
+scaffold placeholders and must contain nonempty Design, MVP, Done when (or Acceptance),
+Edge cases, Test plan, and Proof plan sections without TODO/TBD placeholders. Pass a
+nonempty `--scope` of `we:`-qualified paths. Filing uses the prepare pass's shared
+section validator, with these additional operator completeness requirements; refusal
+lists missing sections before any write or queue effect. A passing brief gets
+`operatorTask: true`, an ET `preparedDate`, and the local `origin/main` tip as
+`preparedAgainstSha`. A missing origin/main reference refuses stamping.
+
+`--priority=P0|P1|P2|P3|P4` writes the existing `priority` field. P0 precedes
+`build.priority` in every queue mode and takes the next available slot; blockedBy,
+scope holds, sizing, clearance, and stamp staleness still apply.
+
+`we:scripts/settings/operator-task.json` owns `build.operatorTask`:
+`{ enabled: true, maxPriority: "P0", postBuild: { edgeLoad: true, liveProof: true, report: true } }`. Valid leaves cascade independently from
+standard defaults to platform build preferences to tool settings; policy logs identify
+each leaf's source. `maxPriority` is the highest allowed class (P0 permits P0–P4;
+P1 permits P1–P4). Disabled filing retains the brief and operator marker but adds no
+prepare stamp. Disabled build admission holds previously stamped operator cards for
+prepare too. A real `prepare-stamp` clears the operator filing marker, replacing its
+fast-path admission so the card can build after preparation while disabled.
+
+### Operator card post-build steps
+
+`we:scripts/operations/run.mjs file-item` accepts `--edgeClone=review|fix|control|drain|health-watch`,
+`--liveProof-command='<shell command>'`, `--liveProof-expect='<substring or /regex/flags>'`, and `--report`.
+These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge
+adoption, capture the command's exit status/output and expectation match, then post a report of at most eight
+lines with `<!-- operator-task-report -->`. A failed or pending adoption/proof is reported honestly.
+Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
+an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
+the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
+requests it. Cards without enabled post-build steps retain their existing brief and provider route.
+
+The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent
+route: the minimal v2 worker finishes before its wrapper opens the PR and cannot perform these steps.
+`--operatorTask --kind=investigation` remains an investigation routed to the existing investigation brief,
+which writes findings in the card and requires a PR. A no-PR report-file/comment workflow is not supported:
+there is no comment target on such a card. Do not assume that dispatch kind provides that different outcome.

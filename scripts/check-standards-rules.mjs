@@ -13,6 +13,7 @@
  * feed (#095/#196/#197) and the human output are unchanged.
  */
 
+import { validateOperatorTask } from './backlog/operator-task.mjs';
 import { createRequire } from 'node:module';
 import { normalizeRelatedReport } from './lib/related-report.cjs';
 
@@ -371,6 +372,7 @@ export function validateBacklogItem(item, ctx) {
   const err = (m, descriptor) => errors.push({ message: m, descriptor });
   const warn = (m, descriptor) => warnings.push({ message: m, descriptor });
 
+  for (const message of validateOperatorTask(item)) err(`Backlog item "${item.id}": ${message}`);
   const backlogFile = item.id ? `backlog/${item.id}.md` : undefined;
   for (const f of ['id', 'title', 'kind', 'status', 'summary', 'dateOpened']) {
     if (item[f] === undefined || item[f] === null || item[f] === '')

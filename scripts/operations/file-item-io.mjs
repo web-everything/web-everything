@@ -27,11 +27,34 @@ import {
   readQueueFile, writeQueueFile, addToQueue, queueHas, resolveQueuePath,
 } from '../conveyor/queue-store.mjs';
 import { FILE_ITEM_QUEUE_EFFECT } from './file-item.mjs';
+import { readGit } from '../lib/proc-read.mjs';
+import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
+import { localDateString } from '../lib/local-date.mjs';
 
 export { REPO_ROOT };
 
-/** The reader `file-item`'s `read` step is injected with. IDENTICAL to `scaffold`'s own — no new fact needed. */
-export const createFileItemReader = createScaffoldReader;
+/** Scaffold facts plus the operator admission policy and origin/main preparation baseline. */
+export function createFileItemReader({ root = REPO_ROOT,
+  today = () => localDateString(new Date(), 'America/Toronto'),
+  readPolicy = readOperatorTaskSettings,
+  readTip = () => readGit(['rev-parse', 'origin/main'], { cwd: root }).trim(),
+  ...opts } = {}) {
+  const read = createScaffoldReader({ root, today, ...opts });
+  return () => {
+    let originMainSha;
+    let tipRead = false;
+    return {
+      ...read(), operatorTask: readPolicy(),
+      get originMainSha() {
+        if (!tipRead) {
+          tipRead = true;
+          try { originMainSha = readTip(); } catch { /* only operator stamping needs a reachable main tip */ }
+        }
+        return originMainSha;
+      },
+    };
+  };
+}
 
 /**
  * BUILD THE SINK MAP for `file-item`'s two effects: `scaffold`'s own write (reused verbatim from
