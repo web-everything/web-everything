@@ -3,10 +3,12 @@ bornAs: xtw16qn
 kind: story
 size: 5
 priority: high
-status: open
+status: resolved
 scope: ["we:agent-memory-src/story-preparation-checklist.md", "we:skills-src/conveyor/prepare-decision-agent-brief.md", "we:scripts/conveyor/run-rating.mjs", "we:scripts/conveyor/__tests__/run-rating.test.mjs", "we:docs/agent/backlog-workflow.md"]
 scopeRationale: "we:scripts/conveyor/run-scorecard-store.mjs is cited only as a no-change reference (it already passes unknown extra fields through, so Could A needs no schema migration), and we:skills-src/conveyor/prepare-item-agent-brief.md is Could C — a deferred follow-up, not built by this card's MVP. Neither file is edited here."
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-13"
+dateResolved: "2026-10-13"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "176afcf9341f8b320ac537e242891761687cb30f"
 tags: []
@@ -250,3 +252,16 @@ Each is a future backlog item, filed by the eventual BUILDER (not by this prepar
     instead the over-claim "any prepare pass can apply it immediately" was softened. Kept as Could C.
   - NOT-AN-ISSUE: `:1134/:1164` are the lint's comment lines directly above `:1139/:1167` (close enough); the
     "existing 1-re-review cap" wording is evidence prose in the Design, not a claim any Must depends on.
+- **2026-10-13 build (agent):** Must 1 (checklist items 11–13 + item-10/heading/How-to-apply/description edits),
+  Must 2 (`we:docs/agent/backlog-workflow.md` "13-item" + list), Could A (`reviewRounds`/`scopeGrowthCount` in
+  `toScorecardRow`, 2 unit tests, 137/137 green) and Could B (decision-brief step-5 paragraph) built. Probes:
+  bold `11.`/`12.`/`13.` item lines in the checklist 0 → 3; "10-item" → "13-item"; item-10 stamp sentence now
+  carries "within item 13's round cap". Could C (`we:skills-src/conveyor/prepare-item-agent-brief.md`) is outside
+  this card's `scope:` → filed as `we:backlog/xj0j0lg`.
+- **2026-10-13 pre-PR `/converge` round 1 (5-lens panel, care elevated):** 0 refuted. Fixed in the lane — item 13
+  over-claimed that run rating "records" the counts (nothing produces them: reworded, producer filed as
+  `we:backlog/xxgbekk`); item 13 had no path for a BLOCKER still open after round 2 (now: no stamp, no third round,
+  escalate); item 13 / the workflow paragraph said "MVP-Must blocker" while item 12 also counts real harm (aligned
+  to "BLOCKER"); `toScorecardRow` copied the two fields unvalidated (now non-negative integer or null, tested);
+  `we:backlog/xj0j0lg` A1 grep could miss on a re-wrap (now keys on the checklist file name). Round 2 re-judge and
+  receipt not run (advise-mode gate; stated in the PR body).

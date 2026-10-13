@@ -163,6 +163,11 @@ spawned subagent's final report to its spawner automatically; read the verdict o
   only dismissed-with-reason findings). If a fork is genuinely un-preparable (the decision is too vague to
   research honestly, or turns on human judgment no research resolves), escalate per *Escalations* rather than
   stamp a false "ready".
+- **Classify each finding and cap the rounds.** Apply `we:agent-memory-src/story-preparation-checklist.md` items
+  11–13 here too: each finding is BLOCKER (breaks a stated must, or real harm) / SCOPE-GROWTH (valid but beyond
+  the minimum — file it as an already-designed follow-up) / NOT-AN-ISSUE (dismissed with a reason); an
+  unclassifiable finding counts as BLOCKER; at most 2 review rounds, then stamp if no BLOCKER remains
+  (a BLOCKER still open after round 2 means no stamp: escalate per *Escalations*, no third round).
 
 ### 6. Commit on the lane's current branch + publish HEAD to the `lane/...` ref + open the PR
 
