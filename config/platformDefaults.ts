@@ -105,6 +105,22 @@ export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1
 export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
   store: 'dual' as 'home' | 'dual' | 'git',
   readStore: 'git' as string,
+  /**
+   * READ-ONLY promotion evidence; never flips mergeGate.reviewAuthority. Switching remains the operator's call.
+   * Mirrored in scripts/lib/ledger-promotion-readiness.mjs.
+   */
+  promotion: {
+    /** Trailing ET calendar-day window to read. */
+    windowDays: 7,
+    /** Minimum distinct ET days with at least one shadow run. */
+    minShadowDays: 7,
+    /** Minimum distinct repo#PR comparisons in that window. */
+    minComparedPRs: 100,
+    /** Minimum agree/(agree + disagree + unreadable) percent; transients excluded. */
+    minAgreementPct: 99,
+    /** Maximum rows where ledger clears while the drain holds; all count as unsafe. */
+    maxUnsafeDisagreements: 0,
+  },
 } as const;
 
 /**
