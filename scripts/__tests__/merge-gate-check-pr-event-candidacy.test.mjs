@@ -35,7 +35,9 @@ it('prints a parseable PASS for #5011 candidacy alone, with merge-group and off 
     expect(out.ok).toBe(ok);
     const printed = formatPrResult(out);
     expect(printed).toContain(`#5011: ${ok ? 'PASS' : 'HOLD'}`);
-    expect(parsePrResultTable(printed, 5011)).toMatchObject({ ok, results: out.results });
+    // The parser requires the job's known table-only HOLD footer (formatPrResult prints only the table).
+    const log = ok ? printed : `${printed}\nmerge-gate: HOLD — held`;
+    expect(parsePrResultTable(log, 5011)).toMatchObject({ ok, results: out.results });
   }
 });
 it('preserves the real workflow-edit human-only hold on a PR event', () => {

@@ -10,7 +10,9 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  *     its newest advisory covers the live head and accepts. The comment is the source of truth; the label is a
  *     derived view of it. Any disagreement between the two is reported in NOT READY as the reason, never resolved
  *     silently in either direction;
- *   - CI is green, the PR is not conflicting, and GitHub reports it MERGEABLE;
+ *   - CI is green, except a single failed merge-gate whose own live-head verdict blocks ONLY on human
+ *     review holds; unreadable verdicts, fail-closed rules and other holds still block. The PR is not
+ *     conflicting, and GitHub reports it MERGEABLE;
  *   - (card x1b8hlo) the post-accept red team has no CONFIRMED break on the live head that `redTeam.confirmedBreaks`
  *     sends back to the fixer (`we:scripts/lib/red-team-gate.mjs#redTeamQueueReason`).
  *
@@ -51,6 +53,11 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
 import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+// Partial CLI copies may lack the verdict reader. Keep their queue runnable, but never excuse a check.
+let humanReviewOnlyHold, parsePrResultTable;
+let mergeGateVerdictImportError;
+try { ({ humanReviewOnlyHold, parsePrResultTable } = await import('../lib/merge-gate-verdict.mjs')); }
+catch (error) { mergeGateVerdictImportError = String(error?.message ?? error).split('\n')[0]; }
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -128,7 +135,7 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  * @returns {{ready: boolean, reasons: string[], transient: boolean}} `transient` is true when the ONLY thing
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
-export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS } = {}) {
+export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
   const reasons = [];
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
@@ -182,10 +189,29 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS } = 
 
   const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
   const pending = checks.filter((check) => check.status !== 'COMPLETED');
-  const failing = checks.filter((check) => check.status === 'COMPLETED'
+  let failing = checks.filter((check) => check.status === 'COMPLETED'
     && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
+  const mergeGateFailures = failing.filter((check) => check.name === 'merge-gate');
+  let humanHolds;
+  let verdictReason;
+  if (mergeGateFailures.length === 1 && mergeGateVerdict) {
+    if (mergeGateVerdictImportError || mergeGateVerdict.error || !Array.isArray(mergeGateVerdict.results)) {
+      verdictReason = `merge-gate verdict unreadable: ${mergeGateVerdictImportError || mergeGateVerdict.error || 'missing results'}`;
+    } else if (!head || String(mergeGateVerdict.headSha ?? '').toLowerCase() !== head) {
+      verdictReason = `merge-gate verdict is for ${String(mergeGateVerdict.headSha ?? '').slice(0, 9)}, head is ${head.slice(0, 9)}`;
+    } else {
+      const { only, holds, others } = humanReviewOnlyHold(mergeGateVerdict.results);
+      if (only) {
+        failing = failing.filter((check) => check !== mergeGateFailures[0]);
+        humanHolds = holds;
+      } else {
+        verdictReason = `merge-gate holds beyond human review: ${others.map(({ id, status }) => `${id}(${status})`).join(', ') || 'no human review hold'}`;
+      }
+    }
+  }
   const names = (entries) => entries.map((check) => check.name || check.context || 'unnamed check').join(', ');
   if (failing.length) reasons.push(`CI failing: ${names(failing)}`);
+  if (verdictReason) reasons.push(verdictReason);
   if (pending.length) reasons.push(`CI pending: ${names(pending)}`);
   if (hasLabel(pr, 'ci:failed')) reasons.push('ci:failed label');
 
@@ -194,7 +220,31 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS } = 
   }
   const mergeabilityUnknown = pr.mergeable !== 'MERGEABLE' && pr.mergeable !== 'CONFLICTING';
   const transient = mergeabilityUnknown && reasons.length === 0;
-  return { ready: reasons.length === 0 && !mergeabilityUnknown, reasons, transient };
+  // Read logs only when this single check is all that stands between the PR and the operator.
+  const needsMergeGateVerdict = !mergeGateVerdict && mergeGateFailures.length === 1
+    && failing.length === 1 && reasons.length === 1 && reasons[0] === 'CI failing: merge-gate';
+  return { ready: reasons.length === 0 && !mergeabilityUnknown, reasons, transient,
+    ...(humanHolds ? { humanHolds } : {}),
+    ...(needsMergeGateVerdict ? { needsMergeGateVerdict: true, mergeGateCheck: mergeGateFailures[0] } : {}),
+  };
+}
+
+/** Bind a job's own verdict to its head; missing or unreadable evidence never excuses CI. */
+export function readMergeGateVerdict({ repo, check, number, exec = execFileSync }) {
+  try {
+    if (mergeGateVerdictImportError) return { error: mergeGateVerdictImportError };
+    const id = check?.detailsUrl?.match(/\/actions\/runs\/\d+\/job\/(\d+)/)?.[1];
+    if (!id) return { error: 'merge-gate check URL has no job id' };
+    const endpoint = `repos/${repo}/actions/jobs/${id}`;
+    const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 };
+    const job = JSON.parse(exec('gh', ['api', endpoint], options));
+    if (typeof job?.head_sha !== 'string' || !job.head_sha) return { error: 'job has no head_sha' };
+    const log = exec('gh', ['api', `${endpoint}/logs`], options);
+    const parsed = parsePrResultTable(log, number);
+    return parsed.error ? parsed : { headSha: job.head_sha, ...parsed };
+  } catch (error) {
+    return { error: String(error?.message ?? error).split('\n')[0] };
+  }
 }
 
 /**
@@ -501,17 +551,22 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
         let pr = listed;
         let result = evaluatePr(pr, { redTeamSetting });
+        let mergeGateVerdict;
+        if (result.needsMergeGateVerdict) {
+          mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });
+          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict });
+        }
         // Only a PR that would otherwise be ready is worth re-polling — one with a real failure is not-ready
         // whatever GitHub says about mergeability.
         if (result.transient) {
           pr = { ...pr, mergeable: pollMergeable({
             repo, number: pr.number, sleep, attempts: pollAttempts, delayMs: pollDelayMs,
           }) };
-          result = evaluatePr(pr, { redTeamSetting });
+          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict });
         }
         const row = { repo, number: pr.number, title: pr.title };
         if (result.ready) {
-          report.ready.push(row);
+          report.ready.push({ ...row, ...(result.humanHolds ? { humanHolds: result.humanHolds } : {}) });
           readyNumbersThisRepo.add(pr.number);
         } else if (result.transient) report.pending.push(row);
         else report.notReady.push({ ...row, reasons: result.reasons });
@@ -566,7 +621,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     }
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
-    printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n'));
+    printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
+      + (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : '')).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')
