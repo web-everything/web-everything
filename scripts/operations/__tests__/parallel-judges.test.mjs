@@ -82,6 +82,8 @@ const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 function scriptedJudge({ fail = null } = {}) {
   const calls = [];
   const make = () => async (request, opts) => {
+    // #4815 — like the real adapter, a request carrying its own answer (`skipSpawn`) spawns nothing and is not a seat.
+    if (request?.skipSpawn?.answer != null) return judgeOutcome(request.skipSpawn.answer);
     const call = { lens: request.lens, tools: Array.isArray(request.allowedTools) && request.allowedTools.length > 0, cwd: opts?.cwd ?? null, start: Date.now(), end: null };
     calls.push(call);
     await sleep(delayFor(request.lens));
@@ -132,7 +134,7 @@ describe('review.parallelSeats — concurrency and an identical record', () => {
     const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
     expect(wall).toBeLessThan(sum * 0.75);
     // The run record's own step timings show the overlap too.
-    const seats = run.stepTimings.filter((t) => t.step.startsWith('judge'));
+    const seats = run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
     expect(seats).toHaveLength(4);
     expect(Math.max(...seats.map((t) => Date.parse(t.startedAt)))).toBeLessThan(Math.min(...seats.map((t) => Date.parse(t.finishedAt))));
   });
@@ -144,7 +146,7 @@ describe('review.parallelSeats — concurrency and an identical record', () => {
     expect(substance(par.run)).toEqual(substance(seq.run));
     expect(par.run.verdict.verdict ?? par.run.verdict).toEqual(seq.run.verdict.verdict ?? seq.run.verdict);
     // Sequential seats never overlap; that is the cost this setting removes.
-    const s = seq.run.stepTimings.filter((t) => t.step.startsWith('judge'));
+    const s = seq.run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
     for (let i = 1; i < s.length; i += 1) expect(Date.parse(s[i].startedAt)).toBeGreaterThanOrEqual(Date.parse(s[i - 1].finishedAt));
   });
 });

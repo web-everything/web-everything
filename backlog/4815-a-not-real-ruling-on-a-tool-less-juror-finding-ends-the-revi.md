@@ -2,9 +2,11 @@
 bornAs: xfkqowg
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "ad738c104da6afa71d0dc164ea132e46f3b83225"
 tags: []
@@ -29,6 +31,8 @@ Old premise: the core lacked cross-run `not-real` carry, an operator ruling path
 Re-stamped 2026-10-10 against `main` @ 512c6aaa5 (stale-stamp refresh: `we:scripts/operations/review-pr.mjs` changed again — #4763 roster/seat work, juror seats concurrent). Premise re-checked: still **not delivered** (`requiresMandatoryReferral` verdict+impact only, `we:scripts/lib/jury-core.mjs:2788`; no seat `tools` field; no verifier step). Only that file's line citations moved (seat constants now 435/544/619/631, `ADVISORY_SEAT_STEPS` 638, panel `allowedTools` 1436, reduce call 2747-2748, advisory judge steps ~2519-2600); the operator-ruling test citation now points at `we:scripts/operations/__tests__/record-referral-ruling.test.mjs:49`. Design, MVP and goal unchanged.
 
 Re-stamped 2026-10-12 against `main` @ ad738c104 (stale-stamp refresh). Premise re-checked: still **not delivered** (`requiresMandatoryReferral` verdict+impact only, `we:scripts/lib/jury-core.mjs:2788`; reduce call `we:scripts/operations/review-pr.mjs:2748`; no seat `tools` field). Since 512c6aaa5 only `we:scripts/operations/__tests__/review-pr.test.mjs` changed among scope files (7-line edit); every cited `file:line` still holds. Design, MVP and goal unchanged.
+
+**Built 2026-10-12** (the confirmation turn). Seat capability is declared as `tools` on the four advisory seat constants (`judgeAdvisory` false, `judgeCorrectnessAdvisory` true, `judgeAntigravityReview` false, `judgeAgyCorrectness` true; panel jurors pass `tools: true` at the reduce call site). A new `judgeReferralVerifier` judge step (declared only when a seated advisory seat is not tool-bearing, right before `reduce`) asks one read-only Codex turn to reproduce each CONFIRMED broken claim a tool-less seat made; with no claim, or an unreadable PR head, its request carries `skipSpawn` and `createDefaultJudge` answers it without spawning. `reduce` keeps a claim CONFIRMED (and referred) only when it was reproduced, or is already reproduced/referred on this head; any other claim becomes a `PLAUSIBLE` advisory note that keeps the original assertion and the reason. Outcomes persist as a `verified` list on the head's referral record (`reproduced` marks a live referral; `not-reproduced` retires it via `activeReferrals`, in a chunk of its own, so a re-run on the same head neither re-verifies nor re-asks and a new head verifies afresh). A failed verifier — including an answer, true or false, with no evidence — is never persisted (it is retried) and never clears a durable referral. Pure core in `we:scripts/lib/jury-core.mjs` (`verificationCandidates`, `settleVerification`, `applyVerification`, `verificationsToPersist`). Red→green: the replay in `we:scripts/operations/__tests__/review-pr-io.test.mjs` ("synthetic #3432-shaped replay") failed on pre-change `main` (the unreproduced claim became a referral, no verifier turn) and passes now: one verifier turn, one retired record, one advisory, then no new turn, no new referral. Historical #3432 artifacts stay a follow-up.
 
 The incident counts (51 records on #3432) are reported context; the root-cause section below is the orchestrator's decode and is not re-verified here.
 
@@ -78,6 +82,8 @@ The three scoped suites pass with the new red→green cases: a tool-less juror's
 - Capture historical #3432 artifacts and reconcile reported run/comment counts with persisted snapshots.
 - Giving read-only tools to every reviewer (operator: later option).
 - Finding-identity redesign (key includes summary text, `we:scripts/lib/jury-core.mjs:2797`); needs separate evidence.
+- Retire a claim on a verifier's "not reproduced" only with a second independent signal (a steered verifier must not silently drop a real hold): #xztd0mv.
+- Hold auto-land while a run carries unverified tool-less CONFIRMED claims: #xf74q20.
 - Verify whether duplicate dispatch after a completed advisory still occurs once false referrals stop (`we:scripts/conveyor/reconcile-core.mjs`); file only if reproduced.
 
 ## Root cause found (orchestrator, 2026-10-02 ~7:30 AM ET)
