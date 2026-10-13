@@ -102,6 +102,55 @@ function world({ labels = [], verdict = 'human', timeline = { status: 'ok', item
 }
 
 describe('#5649 runMirrorApply', () => {
+  it('a clearance persisted inside appendRow wins over the delayed historical addition, including retries', async () => {
+    const w = world({ labels: ['review:human'], timeline: { status: 'ok', items: [tl('review:human', 'added', 'operator')] } });
+    const append = w.opts.appendRow;
+    w.opts.appendRow = async (row) => {
+      w.rows.push({ type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'clear-human', at: '2026-10-12T12:00:00.100Z', reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) });
+      w.rows.push(buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' }));
+      w.labels = ['review:accepted'];
+      return append(row);
+    };
+    await runMirrorApply(w.opts);
+    const state = () => derivePrState(w.rows, { ...FACTS, repo: REPO, pr: 7, now: Date.parse('2026-10-12T13:00:00Z') }, {});
+    expect(state().holds.map(h => h.code)).not.toContain('label-input:review:human');
+    await runMirrorApply(w.opts);
+    expect(state().labels).not.toContain('review:human');
+  });
+
+  it('preserves a new hold after the clearance removal in the same second', async () => {
+    const w = world({ verdict: null, labels: ['review:human'], timeline: { status: 'ok', items: [
+      tl('review:human', 'removed', 'mirror-bot-login', '2026-10-12T12:00:00Z'),
+      tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'),
+    ] } });
+    w.rows.push({ type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'clear-human', at: '2026-10-12T12:00:00.100Z', reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) });
+    w.rows.push(buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' }));
+    const out = await runMirrorApply(w.opts);
+    expect(out.rowsAppended).toHaveLength(1);
+    const state = derivePrState(w.rows, { ...FACTS, repo: REPO, pr: 7, now: Date.parse('2026-10-12T13:00:00Z') }, {});
+    expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+  });
+
+  it('a same-second clear during the facts read also wins over an older timeline observation', async () => {
+    const w = world({ labels: ['review:human'], timeline: { status: 'ok', items: [tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z')] } });
+    w.opts.readFacts = () => {
+      w.rows.push(buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' }));
+      return FACTS;
+    };
+    await runMirrorApply(w.opts);
+    expect(derivePrState(w.rows, { ...FACTS, repo: REPO, pr: 7 }, {}).holds.map(h => h.code)).not.toContain('label-input:review:human');
+  });
+
+  it('preserves removal then readdition when the clearance also arrives during the timeline read', async () => {
+    const w = world({ labels: ['review:human'] });
+    w.opts.readTimeline = async () => {
+      w.rows.push(buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' }));
+      return { status: 'ok', items: [tl('review:human', 'removed', 'mirror-bot-login', '2026-10-12T12:00:00Z'), tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z')] };
+    };
+    await runMirrorApply(w.opts);
+    expect(derivePrState(w.rows, { ...FACTS, repo: REPO, pr: 7 }, {}).holds.map(h => h.code)).toContain('label-input:review:human');
+  });
+
   it('does not append a stale hand-added hold after clear-human completes during the timeline read', async () => {
     const w = world({ labels: ['review:human'] });
     w.opts.readTimeline = async () => {
@@ -339,9 +388,11 @@ describe('#5649 planLabelInputRows', () => {
   it('ignores historical additions cleared by an approval even while live labels lag, but preserves newer holds and audit removals', () => {
     const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z', source: 'review-set-label', approval: 'clear-human' });
     const opts = { ...base, events: [approval], liveLabels: ['review:human'], now: Date.parse('2026-10-12T13:00:00Z') };
-    for (const time of ['2026-10-12T11:00:00Z', '2026-10-12T12:00:00Z']) {
+    for (const time of ['2026-10-12T11:00:00Z']) {
       expect(planLabelInputRows({ ...opts, items: [tl('review:human', 'added', 'operator', time)] })).toEqual([]);
     }
+    // Same-second timestamps cannot prove whether this addition preceded the clearance: retain the hold.
+    expect(planLabelInputRows({ ...opts, items: [tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...opts, items: [tl('review:human', 'added', 'operator', '2026-10-12T12:00:01Z')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...opts, events: [{ ...approval, pr: 8 }], items: [tl('review:human', 'added', 'operator')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...opts, events: [{ ...approval, delegation: { by: 'judge', scope: 'review', expires: '2026-10-12T12:30:00Z' } }], items: [tl('review:human', 'added', 'operator')] })).toHaveLength(1);
@@ -356,6 +407,20 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', null, undefined, null)] })[0].sender).toBe('unknown');
     expect(planLabelInputRows({ ...base, liveLabels: [], items: [tl('review:human', 'removed', 'ci[bot]', undefined, 'Bot')] })).toEqual([]);
     expect(planLabelInputRows({ ...base, liveLabels: [], items: [tl('review:human', 'removed', null, undefined, null)] })).toEqual([]);
+  });
+  it('distinct same-second timeline IDs survive deduplication and a retry retains the original baseline', () => {
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' });
+    const first = { ...tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'), id: 'event-one' };
+    const opts = { ...base, liveLabels: ['review:human'], items: [first] };
+    const [old] = planLabelInputRows(opts);
+    expect(planLabelInputRows({ ...opts, events: [approval, old] })).toEqual([]);
+    const next = { ...first, id: 'event-two' };
+    const [newHold] = planLabelInputRows({ ...opts, items: [first, next], events: [approval, old] });
+    expect(newHold.timelineId).toBe('event-two');
+    const state = derivePrState([approval, old, newHold], { ...FACTS, repo: REPO, pr: 7, now: Date.parse('2026-10-12T13:00:00Z') }, {});
+    expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+    const { timelineId: _id, clearanceBaseline: _baseline, ...legacy } = old;
+    expect(planLabelInputRows({ ...opts, items: [first, next], events: [approval, legacy] })).toHaveLength(1);
   });
   it('labels outside the closed hold set are ignored, and a hostile login is stored folded', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['bug'], items: [tl('bug', 'added', 'op')] })).toEqual([]);

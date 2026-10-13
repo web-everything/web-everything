@@ -17,7 +17,7 @@
  */
 import { pathToFileURL } from 'node:url';
 import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
-import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears } from '../lib/verdict-ledger.mjs';
+import { readLedgerEventsFromStore, appendVerdictAsync, buildLedgerEvent, EVENT_TYPES, verdictClears, ledgerEventId } from '../lib/verdict-ledger.mjs';
 import { HOLD_LABELS } from '../lib/pr-state/holds/label-input.mjs';
 import { approvalValid, acceptanceCovers } from '../lib/pr-state/holds/verdict.mjs';
 import { readPrFacts } from '../lib/pr-state-io.mjs';
@@ -95,7 +95,7 @@ export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TI
   try {
     if (!REPO_RE.test(String(repo)) || !Number.isInteger(Number(pr))) return { status: 'unreadable', reason: 'bad-target' };
     const [owner, name] = repo.split('/');
-    const actor = 'createdAt actor { __typename login } label { name }';
+    const actor = 'id createdAt actor { __typename login } label { name }';
     const items = [];
     let before = null;
     for (let page = 0; page < maxPages; page += 1) {
@@ -107,7 +107,7 @@ export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TI
       // `last` pages arrive newest first; prepend each older page without reversing its connection order.
       // Equal createdAt values must retain that order across page boundaries as well as within a page.
       items.unshift(...tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))
-        .map((n) => ({ label: String(n.label.name), change: n.__typename === 'LabeledEvent' ? 'added' : 'removed',
+        .map((n) => ({ ...(n.id ? { id: String(n.id) } : {}), label: String(n.label.name), change: n.__typename === 'LabeledEvent' ? 'added' : 'removed',
           actor: n.actor?.login ? String(n.actor.login) : null, actorType: n.actor?.__typename ? String(n.actor.__typename) : null, createdAt: String(n.createdAt) })));
       if (tl.pageInfo?.hasPreviousPage === false) return { status: 'ok', items };
       if (tl.pageInfo?.hasPreviousPage !== true || !tl.pageInfo.startCursor) return { status: 'unreadable', reason: 'bad-page-info' };
@@ -135,12 +135,17 @@ const sameTime = (a, b) => Number.isFinite(Date.parse(a)) && Date.parse(a) === D
  * PURE. Which timeline changes become `label-input` rows for ONE PR. Per hold label only the LATEST change counts,
  * and only while it still matches the live labels (an `added` row for a label that is no longer there would re-hold a
  * PR that was cleared since). A change by the mirror's own login is never recorded; a bot or missing actor is
- * hand-made for `added` (tighten) and NOT for `removed`. Rows already in `events` (repo + pr + label + change + time)
- * are dropped.
+ * hand-made for `added` (tighten) and NOT for `removed`. GitHub event IDs deduplicate production rows;
+ * idless fixtures fall back to label + change + time + clearance baseline.
  */
-export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], selfLogin, events = [], now = Date.now(), headSha } = {}) {
+export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], selfLogin, events = [], observedEvents = events, now = Date.now(), headSha } = {}) {
   const self = String(selfLogin ?? '').toLowerCase();
   const live = new Set(liveLabels);
+  const clearances = events.filter(e => e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
+    && (e.type === EVENT_TYPES.APPROVAL || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict))));
+  // Capture causality before reading the timeline, not from the later idempotency refresh: a clear
+  // landing during that refresh must also beat a historical addition in the same second.
+  const observedIds = new Set(observedEvents.map(ledgerEventId));
   const latest = new Map();
   items.map((it, i) => ({ it, i })).sort((a, b) => Date.parse(a.it.createdAt) - Date.parse(b.it.createdAt) || a.i - b.i)
     .forEach(({ it }) => { if (HOLD_LABELS.includes(it.label)) latest.set(it.label, it); });
@@ -149,17 +154,27 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     if ((it.change === 'added') !== live.has(it.label)) continue; // the PR has moved on since this change
     if (it.actor && it.actor.toLowerCase() === self) continue;     // the mirror's own (or its account's) write
     if (it.change === 'removed' && (!it.actor || isBot(it))) continue;
+    const second = value => Math.floor(Date.parse(value) / 1000);
+    const clearanceBaseline = clearances.filter(e => observedIds.has(ledgerEventId(e))
+      || second(it.createdAt) > second(e.at)
+      // A same-second removal followed by this addition is evidence for a reapplication during
+      // the observation window. Preserve that hold conservatively; timestamps cannot link an
+      // arbitrary removal to a particular concurrent clearance within the same second.
+      || items.slice(0, items.indexOf(it)).some(previous => previous.label === it.label && previous.change === 'removed'
+        && second(previous.createdAt) === second(e.at) && second(it.createdAt) === second(e.at))).map(ledgerEventId);
     // A delayed observation must not move an old addition after its clearing ceremony in append order.
     // This also covers the interval between clear-human's approval append and its live label swap.
-    if (it.change === 'added' && events.some((e) => e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
-      && Date.parse(e.at) >= Date.parse(it.createdAt)
+    // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
+    // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
+    if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
       && (approvalValid(e, now) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
         && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
-      && e.label === it.label && e.change === it.change && sameTime(e.at, it.createdAt));
+      && e.label === it.label && e.change === it.change && (it.id && e.timelineId ? it.id === e.timelineId
+        : !it.id && sameTime(e.at, it.createdAt) && JSON.stringify(e.clearanceBaseline) === JSON.stringify(clearanceBaseline)));
     if (dup) continue;
     rows.push(buildLedgerEvent({ type: EVENT_TYPES.LABEL_INPUT, repo, pr, at: it.createdAt, source: 'pr-label-mirror',
-      label: it.label, sender: foldSender(it.actor), change: it.change }));
+      label: it.label, sender: foldSender(it.actor), change: it.change, clearanceBaseline, timelineId: it.id }));
   }
   return rows;
 }
@@ -215,10 +230,10 @@ export async function runMirrorApply({
     } catch (e) { fail(`labels-unreadable: ${firstLine(e)}`); continue; }
     try { facts = await readFacts(p.number, { repo }); } catch (e) { fail(`facts-unreadable: ${firstLine(e)}`); continue; }
     if (!facts || !facts.head?.sha || (facts.probeErrors ?? []).length) { fail('facts-unreadable: missing head or failed probe'); continue; }
-    const fresh = await readEvents(repo, { store }); // best-effort idempotency: a fresh read just before the append (not atomic)
+    const fresh = await readEvents(repo, { store }); // idempotency refresh; baseline starts before the timeline read
     if (fresh.status !== 'ok') { fail(`ledger-unreadable: ${fresh.reason}`); continue; }
     let toAppend;
-    try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(current), selfLogin: self, events: fresh.rows, headSha: facts.head.sha, now: facts.now ?? Date.now() }); } catch (e) {
+    try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(current), selfLogin: self, events: fresh.rows, observedEvents: events, headSha: facts.head.sha, now: facts.now ?? Date.now() }); } catch (e) {
       fail(`bad-label-input-row: ${firstLine(e)}`); continue;
     }
     let ok = true;
