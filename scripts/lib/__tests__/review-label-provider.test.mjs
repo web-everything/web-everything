@@ -15,7 +15,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { URL } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
 
 describe('label provider import boundary', () => {
@@ -29,7 +30,8 @@ describe('label provider import boundary', () => {
       }
       return result;
     }`;
-    const providerUrl = new URL('../review-label-provider.mjs', import.meta.url).href;
+    // Not `new URL(rel, import.meta.url)`: the test environment shadows `URL` with a localhost-based one.
+    const providerUrl = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../review-label-provider.mjs')).href;
     const script = `import { register } from 'node:module';
       register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(loader)}`)}, import.meta.url);
       await import(${JSON.stringify(providerUrl)});`;
