@@ -398,7 +398,8 @@ describe('pr-merge-gate — scanTestTampering ignores skip/only markers in strin
     expect(skipped(scan(['  `; fit("x"); `']))).toHaveLength(1);
     // a backtick inside a quote/comment before the executable marker: the pre-check runs before any stripping
     expect(skipped(scan(["  '`'; it.skip('x', () => {});"]))).toHaveLength(1);
-    expect(skipped(scan(["  // `\n"]))).toHaveLength(0);
+    // a mid-template line (no backtick) with interpolation is scanned raw too
+    expect(skipped(scan(["  text ${'a'} ${it.skip('x', () => {})} 'b'"]))).toHaveLength(1);
     // the exact partial-hunk fixture: context lines are not counted as added
     const partial = [
       'diff --git a/scripts/__tests__/template-boundaries.test.mjs b/scripts/__tests__/template-boundaries.test.mjs',

@@ -114,14 +114,16 @@ export function isJsTestPath(path) {
  * A per-added-line scan cannot know the lexical context the line starts in, so it fails closed to the ORIGINAL
  * line (scanned raw) whenever it cannot be sure: any backtick (a closer of a template opened on an earlier
  * line, or interpolation), an unterminated quote, a `/` that is not `//` or `/*` (a possible regex literal or
- * division), or an unclosed block comment. Block comments / escaped-newline quoted strings that span lines remain
- * a documented residual limitation.
+ * division), an unclosed block comment, a block-comment closer (`*` + `/`) with no opener on the line, or a `${`
+ * (interpolation inside a template body). `scanTestTampering` also scans the line after a backslash-continued
+ * line raw. Still a documented residual (card N1): a line that starts mid-block-comment, mid-template or
+ * mid-continued-string whose opener is NOT visible on this line or the previous added line.
  * @param {string} line
  * @returns {string}
  */
 export function stripStringsAndComments(line) {
   const s = String(line ?? '');
-  if (s.includes('`')) return s;
+  if (s.includes('`') || s.includes('${')) return s;
   // A `*/` with no `/*` before it closes a block comment opened on an earlier line: the line starts INSIDE a
   // comment, so an apostrophe in that tail could pair with a later quote and swallow the real code after `*/`.
   const closer = s.indexOf('*/');
