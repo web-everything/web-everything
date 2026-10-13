@@ -1,37 +1,78 @@
 ---
 bornAs: x4bppjr
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/heavy-repair-priority.mjs"]
+scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/heavy-repair-priority.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs"]
 dateOpened: "2026-10-12"
+preparedDate: "2026-10-13"
+preparedAgainstSha: "56873c6a20e5c00a824706df1a9bda7975cbb326"
 tags: []
 ---
 
 # Red-main repair patterns resolve host-wide, not per caller
 
-Held finding 231 (2026-10-11, operator approved #4814 with this follow-up). we:scripts/readiness/heavy-admission.mjs (~:240) declares priority.mode / priority.repairPatterns as per-caller leaves, so any process can mark itself P0 (even .* validates). Fix: resolve them once host-wide (same single source as the cap, #4799), reject patterns broader than the main-fix/revert-red shapes and log rejected ones; tests assert the "yielding to red-main repair waiter" log line and the 150 ms classification deadline.
+Held finding 231 (2026-10-11, operator approved #4814 with this follow-up). Shared-pool callers can currently override repair priority through checkout settings or environment. Resolve priority from the same host platform source as capacity, reject patterns that can classify ordinary identities as repairs, and retain bounded classification and observable yielding.
 
-## Acceptance
+## Progress
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- Original premise/scope: two source files, size 1, per-caller priority leaves near line 240; arbitrary `.*` accepted; a reference to #4799 described the host-cap precedent. The per-caller defect remains at we:scripts/readiness/heavy-admission.mjs:240. The current #4799 card concerns CI-heal review labels, so that historical number is not evidence for capacity resolution.
+- Corrected premise: the host resolver already exists at we:scripts/readiness/heavy-admission.mjs:291–369, including shared/private pool handling, a fixed real-user platform source, cache and last-good reads. Only priority remains incorrectly exempt alongside `onTimeout`. No new host configuration store or daemon is needed; “once host-wide” means one authoritative source, not one cross-process singleton or instantaneous reload.
+- Regex validation at we:scripts/readiness/heavy-repair-priority.mjs:74–83 limits resources and syntax but accepts broad expressions. Existing classification already has a 150 ms deadline at we:scripts/readiness/heavy-repair-priority.mjs:125, and yielding already logs at we:scripts/readiness/heavy-admission.mjs:1191–1195. These need regression coverage, not a new scheduling policy.
+- Corrected scope adds existing we:scripts/readiness/__tests__/heavy-admission.test.mjs (priority tests start at line 1742, permissive override assertions at 1837–1851) and planned we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs for focused grammar/deadline tests. Current timing coverage at we:scripts/readiness/__tests__/heavy-admission.test.mjs:1820–1827 allows 1500 ms and does not directly prove the 150 ms deadline.
+- Size changes from 1 to 3: estimated changed lines are 30–50 in we:scripts/readiness/heavy-admission.mjs, 50–80 in we:scripts/readiness/heavy-repair-priority.mjs, 100–140 in we:scripts/readiness/__tests__/heavy-admission.test.mjs, and 80–120 in planned we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs (260–390 total). This is a story, so no `estimatedLoc` is added. Preparation is based on source inspection; execution proof remains below. Runner owns checks, review and stamping.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+## Design
 
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+1. In we:scripts/readiness/heavy-admission.mjs, remove both priority leaves from `PER_CALLER_LEAVES`. Shared pools resolve standard → platform only; local tool/env values populate the existing ignored diagnostics. Keep `onTimeout` per caller. Preserve the existing private-pool override exception, shared-pool alias detection, source reporting, ten-second cache and last-good read behavior.
+2. In we:scripts/readiness/heavy-repair-priority.mjs, retain the existing resource checks and add a conservative, provable repair-language restriction. Accept the exact built-in expressions and fully anchored literal repair identities that themselves match a built-in repair shape. An array can select built-in families or specific repair identities; an empty array still disables matches. Reject other regex syntax rather than attempting general regex-language containment. A literal means only slug letters, digits and hyphens between `^` and `$`; do not accept lookarounds, alternative branches, arbitrary wildcard suffixes or unanchored prefixes. This provides narrower operator selections without allowing broader identities.
+3. Reject an invalid array as a whole, preserve the previous valid policy layer (or standard), and expose the offending layer/value through existing invalid-policy diagnostics and `formatAdmissionPolicy`. Direct classifier calls retain validation and safe standard fallback. Malformed input never grants ordinary work P0. Reuse bounded one-line formatting for rejected text if needed to prevent multiline diagnostic injection.
+4. Keep the four identity fields, standard main-fix/revert-red forms and optional lane-holder suffixes, P0 ordering across both slot kinds, FCFS within class, and non-preemption. Keep 50 ms per match and 150 ms across the entire classification; test deadline exhaustion deterministically with a controlled clock/VM seam rather than a strict wall-time assertion on a busy host.
+
+## MVP
+
+**Must:** Shared-host callers with conflicting environment or checkout preferences resolve identical priority settings and sources from the platform policy; host mode `off` cannot be locally changed to `enforce`.
+
+**Must:** Broad, malformed, overlong or otherwise unsupported repair patterns are rejected and diagnosed; ordinary identities remain P3 after rejection. The standard repair shapes and supported narrower selections still classify correctly. Source, docs, config and data jobs use the same identity-based rule; payload type grants no exemption.
+
+**Must:** Retain private-pool isolation, existing capacity rules and bounded classification. A normal waiter demonstrably emits `yielding to red-main repair waiter` once while yielding to a live repair waiter.
+
+**Could:** More expressive provably narrow regex syntax can be added separately with a containment proof. It is not needed to close this defect.
+
+## Done when
+
+- [A1] New regression assertions fail on the old implementation for shared-pool priority overrides and broad-pattern acceptance, and pass after the change. Run through we:scripts/readiness/heavy-admission.mjs with arguments `run -- npx vitest run`, targeting we:scripts/readiness/__tests__/heavy-admission.test.mjs and we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs.
+- [A2] Captured policy diagnostics identify ignored caller overrides and rejected platform patterns; captured admission logs contain the exact yielding phrase, and deterministic assertions demonstrate no match starts after the classification deadline.
+- [A3] The runner executes `npm run check:standards` through the host heavy-run queue before stamping.
+
+## Test plan
+
+- Extend we:scripts/readiness/__tests__/heavy-admission.test.mjs: two callers of the same shared pool with contradictory mode/pattern env and tool settings; shared pool named directly and through an alias; valid platform mode/pattern precedence; private-pool overrides remain isolated; invalid platform array falls back and appears in formatted diagnostics. Update old assertions that explicitly allow shared-pool overrides and unrelated custom slugs.
+- Extend the existing temporary-lock-root admission harness in we:scripts/readiness/__tests__/heavy-admission.test.mjs: seed a live P0 marker, poll an ordinary waiter, capture exactly one yielding log, release the repair marker, and verify ordinary admission resumes. Preserve tests for P0 FCFS, both slot kinds and running-holder non-preemption.
+- Add we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs: all built-in families and holder suffixes; anchored literal subsets; empty array; ordinary main-fix-like words; `.*`, `^main-fix-.*$`, alternatives escaping the repair family, malformed regex, mixed valid/invalid arrays, count/length caps and oversized identity strings. Test all four identity fields and direct classifier fallback.
+- Preserve low-level catastrophic-regex timeout coverage by exercising `repairPatternMatches` directly: rejected broad patterns should no longer reach it through a valid policy. Use controlled time to assert a deadline exactly 150 ms from classification start, remaining-budget clipping, and no further VM execution at exhaustion; retain a child-process watchdog as a coarse hang guard, not proof of exact timing.
+
+## Proof plan
+
+Before implementation, add the focused regression assertions and record their expected failures through the host queue, distinguishing failures from admission timeout or harness errors. After implementation, rerun the same queued tests and retain assertion output plus captured policy/yield logs. Use temporary private state and injected platform fixtures; do not edit the operator's host preferences or contend with real repair markers. Verify source labels and settings from two simulated shared callers agree, broad patterns are diagnosed, ordinary identities stay P3, and valid repair identities retain P0. Run the queued standards gate and inspect the final diff for only the declared touch set. Unit probes establish resolver and scheduling behavior; they do not claim that already-running processes instantly reload policy.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- Authenticate repair ownership or redesign marker trust; the existing identity fields remain caller-provided evidence, so this does not prevent deliberate impersonation of a valid repair slug.
+- Change queue capacity, timeout escapes, priority classes, preemption, host policy storage or cache lifetime.
+- Add an HTTP receive/write endpoint; body-size, rate-limit and CSRF requirements do not apply.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — reject unsupported regex languages and retain length/count/value caps; sanitize diagnostic rendering.
+2. **Truncated reads** — retain the existing last-good policy and retry behavior; no partial JSON becomes policy.
+3. **Shared state files** — reuse host source resolution and temporary test roots; no new writers or marker schema.
+4. **Fail closed** — rejected overrides cannot broaden P0; preserve the prior valid policy/default repair shapes, and timeout means no match.
+5. **Identity scoping** — inspect the existing four identity fields, not command contents or changed-file extensions; private pools retain their isolation exception.
+6. **State over time** — preserve cache expiration and last-good fallback; existing processes/markers are not retroactively reclassified by this change.
+7. **Who wrote it** — platform settings govern shared priority; local preferences are ignored with provenance. Valid-slug impersonation remains explicitly outside this card.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Follow-ups
+
+- If operators need richer narrow expressions, extend the accepted grammar with tests proving containment in the standard repair language; do not restore arbitrary regex admission.
+- If authenticated repair ownership is required, separately bind classification and waiter markers to authoritative incident/lease evidence. This requires a trust-model decision and is not silently introduced here.
