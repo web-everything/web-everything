@@ -588,6 +588,8 @@ Write the commit message to a file and `commit -F` it — a heredoc runs backtic
 subshell (`bad substitution`); a message file has no such footgun. Pushing to `lane/*` is allowed by the
 single-branch guard; pushing to `main` is not.
 
+Write the evidence file OUTSIDE the lane (e.g. `"$TMPDIR/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
+
 **Post the before/after proof as a PR comment before re-arming.** A reviewer must be able to SEE that the fix
 works, not just infer it from a green gate: post a comment carrying the trimmed red output (step 2) followed by
 the trimmed green output (step 4) — or, if reproduction was genuinely impossible, the explicit statement of why

@@ -106,6 +106,12 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it.each([[[]], [['--task-kind=takeover', '--model=x', '--effort=high']]])('forwards fix task routing and explicit pins %j', async flags => {
+    const m = mk(['aaa', 'bbb']);
+    await runFixCli([...argv, ...flags], m.io);
+    expect(m.spawn.mock.calls[0][0]).toMatchObject(flags.length
+      ? { taskKind: 'takeover', model: 'x', effort: 'high' } : { taskKind: 'fix' });
+  });
   it('captures JSONL through the real provider spawn seam even when the provider returns nothing', async () => {
     const m = mk(['aaa', 'aaa']);
     m.spawn.mockImplementation(async (_request, io) => { await io.spawnAgent([], {}); });

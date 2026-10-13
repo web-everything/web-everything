@@ -43,7 +43,7 @@ function realDiff(before, after, { noprefix = false } = {}) {
 
 const lines = (...xs) => xs.join('\n') + '\n';
 const indexDiffSectionText = (diff, path) => fileHunksResolver(diff)(path);
-const HUMAN = (changedFiles, diffHunks) => scoreEscalation({ changedFiles, diffHunks });
+const HUMAN = (changedFiles, diffHunks) => scoreEscalation({ changedFiles, diffHunks, humanSurfaces: 'broad' });
 
 // ── trigger 1: statute-anchor edit ──────────────────────────────────────────────────────────────────────
 describe('trigger 1 — statute-anchor edit: rule text, not the whole document', () => {
@@ -387,7 +387,7 @@ describe('the first seeded @invariant markers (this PR)', () => {
 
   it('the rubric\'s humanRequired derivation is marked: editing it forces a human even though the file is committee-cleared derivation code', () => {
     const rel = 'scripts/lib/review-escalation.mjs';
-    const diff = editThrough(rel, 'const humanRequired = gateBasis.some((f) => isPrincipleSurface(f, fileHunksOf(f)));', 'const humanRequired = false;');
+    const diff = editThrough(rel, 'let humanForced = !!(leashFiles.length || statuteFiles.length || markedFiles.length);', 'let humanForced = false;');
     const s = HUMAN([rel], diff);
     expect(s.humanRequired).toBe(true);
     expect(s.signals.markedInvariant).toEqual([rel]);

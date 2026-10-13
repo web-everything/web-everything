@@ -821,7 +821,7 @@ describe('scoreEscalation — an un-narrowed basis is visible, and never relaxes
   });
 
   it('NEGATIVE DIRECTION — an un-narrowed basis does NOT suppress the statute gate: a real statute edit still earns review:human', () => {
-    const v = scoreEscalation({ changedFiles: statute, humanBasisFiles: statute, basisNarrowed: false });
+    const v = scoreEscalation({ humanSurfaces: 'broad', changedFiles: statute, humanBasisFiles: statute, basisNarrowed: false });
     expect(v.humanRequired).toBe(true);
     expect(v.reasons.some((r) => r.startsWith('statute ('))).toBe(true);
     expect(v.careLevel).toBe('high');
@@ -829,7 +829,7 @@ describe('scoreEscalation — an un-narrowed basis is visible, and never relaxes
 
   it('NEGATIVE DIRECTION — nor does it suppress the declarative-leash (gate-self) half of the gate', () => {
     const leash = ['scripts/lib/gate-config.mjs'];
-    const v = scoreEscalation({ changedFiles: leash, humanBasisFiles: leash, basisNarrowed: false });
+    const v = scoreEscalation({ humanSurfaces: 'broad', changedFiles: leash, humanBasisFiles: leash, basisNarrowed: false });
     expect(v.humanRequired).toBe(true);
   });
 
