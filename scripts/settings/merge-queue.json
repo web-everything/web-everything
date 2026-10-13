@@ -1,4 +1,5 @@
 {
+  "$comment": "mergeQueue.refreshOnUnsatisfiedWorkflows (on|off): when GitHub's merge queue refuses a green PR because required workflows are not satisfied (runs older than the ruleset), the drain refreshes the PR onto main once per head so fresh runs count, then enqueues it. off leaves the PR failing to enqueue. Env override: WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS. mergeQueue.refreshOnStaleMergeGate (on|off, standard on): refresh a ready PR once per head when its only red required check is a head-bound merge-gate HOLD whose holds are now satisfied; enqueue only on a later green pass. Env override: WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE.",
   "mergeDelivery": {
     "strategy": "github-merge-queue",
     "batchSize": 5,
@@ -6,6 +7,8 @@
     "mergeMethod": "merge"
   },
   "mergeQueue": {
+    "refreshOnUnsatisfiedWorkflows": "on",
+    "refreshOnStaleMergeGate": "on",
     "enabled": true,
     "batchSize": 1,
     "classOrder": ["main-fix", "normal"],

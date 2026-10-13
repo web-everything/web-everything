@@ -110,6 +110,14 @@ describe('merge-ai-prs — AI detection', () => {
     expect(isDrainBookkeepingCommit({ ...truncated, messageBody: `${truncated.messageBody}\n\nand an authored note` })).toBe(false);
   });
 
+  it.each([
+    ['drain: mark card 5974 resolved on land (#2748)', '', true],
+    ['drain: mark card 5974 resolved on land (#2748)', 'also fixed a bug', false],
+    ['drain: mark card abc resolved on land (#2748)', '', false],
+  ])('classifies the #2779 resolve subject %s with body %j as bookkeeping: %s', (messageHeadline, messageBody, expected) => {
+    expect(isDrainBookkeepingCommit({ messageHeadline, messageBody, authors: drainAuthor })).toBe(expected);
+  });
+
   it('a free-form `drain: `-headlined commit is NOT bookkeeping — authored content cannot hide behind the prefix', () => {
     const humanDrainPrefixed = { messageHeadline: 'drain: manually patch the flaky soak test', messageBody: 'Rewrote the retry loop.', authors: human };
     const attacker = { messageHeadline: 'drain: totally not malicious, please ignore', messageBody: '', authors: [{ name: 'x', email: 'attacker@evil.com' }] };

@@ -119,7 +119,7 @@ export function parseFixRunArgv(argv = []) {
     pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
-    mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', effort: opt('effort'), model: opt('model'),
+    mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', taskKind: opt('task-kind') ?? 'fix', effort: opt('effort'), model: opt('model'),
   };
 }
 
@@ -639,6 +639,7 @@ export async function runFixCli(argv = [], {
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
     const spawned = await provider.spawn({
+      taskKind: launch.taskKind,
       sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
     }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {

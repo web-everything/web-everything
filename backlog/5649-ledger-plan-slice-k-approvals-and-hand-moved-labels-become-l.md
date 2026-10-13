@@ -8,8 +8,8 @@ status: open
 blockedBy: ["5355"]
 scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
 dateOpened: "2026-10-09"
-preparedDate: "2026-10-10"
-preparedAgainstSha: "ab01c2a20c0bf8446f55fa079c48e68a8d000bed"
+preparedDate: "2026-10-12"
+preparedAgainstSha: "981be0907d1b19ab314fc31fcf8fbdce969926d4"
 tags: []
 ---
 
@@ -19,9 +19,9 @@ Slice K of the verdict-ledger plan (#3007), D5 ruling. Clearing ceremonies in we
 
 ## Design
 
-What exists already (do not rebuild): the v2 event types `approval` and `label-input` with their schemas (we:scripts/lib/verdict-ledger.mjs:539-553, payloads at :596-612), and the derive side that reads them (`approvalValid`/`approvalLiftsAfter`, we:scripts/lib/pr-state/holds/verdict.mjs:12-24; the `label-input` hold, we:scripts/lib/pr-state/holds/label-input.mjs:12-23; human-gate use at we:scripts/lib/pr-state.mjs:57,108). What is missing is the two WRITERS: no non-test code under we:scripts builds either event today.
+What exists already (do not rebuild): the v2 event types `approval` and `label-input` with their schemas (we:scripts/lib/verdict-ledger.mjs:539-553, payloads at :596-612), and the derive side that reads them (`approvalValid`/`approvalLiftsAfter`, we:scripts/lib/pr-state/holds/verdict.mjs:11-19; the `label-input` hold, we:scripts/lib/pr-state/holds/label-input.mjs:12-23; human-gate use at we:scripts/lib/pr-state.mjs:108). What is missing is the two WRITERS: no non-test code under we:scripts builds either event today.
 
-**Part 1 — approval rows at the label home.** In `runReviewLabelCli`, right after the verdict append (we:scripts/review-set-label.mjs:1368-1395), when `to` is `clear-human` (only then; an ordinary `accepted` is a verdict, not an approval), append `buildLedgerEvent({type:'approval', approval:'clear-human', delegation:null, …})` with the same repo/pr/at/source/declaredActor/session/channel as the verdict row, through the same store path `appendVerdict` uses (it takes any row validated by `validateLedgerEvent`). The judge route already calls `clear-human` with the judge as actor (#5072 rule 3), so the row carries `approval:'judge'` when the caller passes a new `--approval-kind=judge` (closed set `APPROVAL_KINDS`, default `clear-human`) and an optional `--delegation-json` object `{by, scope, expires}` checked by the existing `delegationOrNull` shape (we:scripts/lib/verdict-ledger.mjs:567-573). That object IS the judge block: K introduces no second shape; the judge runner passing it is #5072's own work. The `clear-human` verdict row already clears on its own (`CLEAR_HUMAN` is clearing), so the approval row is the audit record and the lift for a hand-added `label-input` hold on a stale head, not what stops the mirror re-adding `review:human`. F4 is extended anyway: a refused approval append for `clear-human` blocks the swap (reusing `clearingLedgerMiss`), so a clearance never lands without its audit row. The two appends are not atomic: if the verdict lands and the approval append fails, the swap is refused and the retry appends a second clearing verdict row, which is harmless (clearing is idempotent); a test pins that the retry succeeds.
+**Part 1 — approval rows at the label home.** In `runReviewLabelCli`, right after the verdict append (we:scripts/review-set-label.mjs:1581-1617, the verdict append plus the `clearingLedgerMiss` F4 block), when `to` is `clear-human` (only then; an ordinary `accepted` is a verdict, not an approval), append `buildLedgerEvent({type:'approval', approval:'clear-human', delegation:null, …})` with the same repo/pr/at/source/declaredActor/session/channel as the verdict row, through the same store path `appendVerdict` uses (it takes any row validated by `validateLedgerEvent`). The judge route already calls `clear-human` with the judge as actor (#5072 rule 3), so the row carries `approval:'judge'` when the caller passes a new `--approval-kind=judge` (closed set `APPROVAL_KINDS`, default `clear-human`) and an optional `--delegation-json` object `{by, scope, expires}` checked by the existing `delegationOrNull` shape (we:scripts/lib/verdict-ledger.mjs:567-572). That object IS the judge block: K introduces no second shape; the judge runner passing it is #5072's own work. The `clear-human` verdict row already clears on its own (`CLEAR_HUMAN` is clearing), so the approval row is the audit record and the lift for a hand-added `label-input` hold on a stale head, not what stops the mirror re-adding `review:human`. F4 is extended anyway: a refused approval append for `clear-human` blocks the swap (reusing `clearingLedgerMiss`), so a clearance never lands without its audit row. The two appends are not atomic: if the verdict lands and the approval append fails, the swap is refused and the retry appends a second clearing verdict row, which is harmless (clearing is idempotent); a test pins that the retry succeeds.
 
 **Part 2 — label-input rows from the mirror.** we:scripts/conveyor/pr-label-mirror.mjs gains, per open PR, a read of the PR's `LabeledEvent`/`UnlabeledEvent` timeline items for the four `HOLD_LABELS` (we:scripts/lib/pr-state/holds/label-input.mjs:4), with actor login and `createdAt` (the GraphQL shape at we:scripts/lib/pr-state-io.mjs:98, extended with `UnlabeledEvent` and `actor { login }`). The mirror runs this timeline read only for PRs where the derive wants `review:human` and the PR lacks it, or the PR carries a hand-added hold label (no extra per-PR cost elsewhere), with its own GraphQL query in we:scripts/conveyor/pr-label-mirror.mjs including `pageInfo { hasPreviousPage }` (we:scripts/lib/pr-state-io.mjs is not touched). Any change whose actor login differs from the login `gh api user` returns for the mirror's own run, and that is not already ledgered (best-effort idempotency key: repo + pr + label + change + timeline `createdAt`, checked against a fresh ledger read; no locked check-and-append exists, so two concurrent passes may append a duplicate, which is harmless to the derive) becomes a `label-input` row `{label, sender: actor login, change}`. Only `added` rows can hold (the reader ignores `removed`: tighten-only); a hand REMOVAL of `review:human` is recorded as `change:'removed'` for the audit trail and changes nothing in the derive.
 
@@ -30,7 +30,7 @@ What exists already (do not rebuild): the v2 event types `approval` and `label-i
 ## MVP
 
 Musts only:
-1. `clear-human` appends an `approval` row (kind `clear-human`, or `judge` plus an optional validated delegation) next to the verdict row; failure is fatal and the label is not swapped.
+1. `clear-human` appends an `approval` row (kind `clear-human`, or `judge` plus an optional validated delegation) next to the verdict row; a refused approval append sets `clearingLedgerMiss`, so the label is not swapped.
 2. The mirror appends `label-input` rows for hand-moved hold labels, idempotently, ignoring its own writes.
 3. The mirror `--apply` re-adds a derived-but-missing `review:human` (add only), after appending the audit label-input row for the removal. If the PR's current verdict is not `human`, the derive wants no `review:human` and the mirror correctly does nothing (a test pins this).
 
@@ -54,7 +54,7 @@ In we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs:
 - `a truncated or unreadable timeline plans no write and no row`.
 - `a PR whose current verdict is not human gets no review:human add even after a hand removal`.
 - `clear-human: verdict lands, approval append fails -> swap refused; the retry succeeds`.
-The new mirror entry point is `runMirrorApply`, an export that does not exist today; each mirror test's RED reason is the missing write path, asserted by first running the same fixture through the report-mode export. `accepted and changes append no approval row` and the report-mode zero-writes test are guards that pass today and are labelled as such.
+The mirror's own identity (`gh api user` login) is an injected dependency of `runMirrorApply` (a `selfLogin` option, default read from `gh api user`), so the own-write test passes a fixed login. The new mirror entry point is `runMirrorApply`, an export that does not exist today; each mirror test's RED reason is the missing write path, asserted by first running the same fixture through the report-mode export. `accepted and changes append no approval row` and the report-mode zero-writes test are guards that pass today and are labelled as such.
 
 ## Proof plan
 
@@ -81,9 +81,13 @@ Live, on a real repo with a throwaway PR parked `review:human` by a real verdict
 
 - 2026-10-10 prepare pass: premise holds on `main` (ab01c2a). No commit delivers a writer for `approval` or `label-input` events; the mirror is still G1 report-only (77 lines, zero writes). Corrected a stale premise: #5072 and #5074 are still open, so K reuses the `{by,scope,expires}` delegation object already in the schema (we:scripts/lib/verdict-ledger.mjs:567) instead of waiting on a judge block. Scope and size 2 unchanged.
 
+- 2026-10-12 refresh: re-checked against main (003fe20, 1518 commits after the prior stamp). Premise still holds: no non-test writer for `approval`/`label-input`; the mirror is still report-only (77 lines). Only we:scripts/review-set-label.mjs moved (~+300 lines), so its cites were re-pointed (verdict append + F4 block now :1581-1613); we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/ cites re-verified. Design, MVP and tests unchanged.
+
+- 2026-10-12 re-stamp (main 981be09): the stamp's `preparedAgainstSha` was stale. Re-verified: no non-test writer for `approval`/`label-input` exists (only we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/label-input.mjs mention them); the mirror is still 77 lines, report-only; the verdict append + F4 block sit at we:scripts/review-set-label.mjs:1581-1617; `APPROVAL_KINDS` at we:scripts/lib/verdict-ledger.mjs:551, `delegationOrNull` at :567, `buildLedgerEvent` at :642; `HOLD_LABELS` at we:scripts/lib/pr-state/holds/label-input.mjs:4; human gate at we:scripts/lib/pr-state.mjs:108. Design, MVP and tests unchanged.
+
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/__tests__/review-set-label.test.mjs we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs` fails before this lands (the new approval and label-input cases are RED) and passes after; `node we:scripts/conveyor/pr-label-mirror.mjs --json` without `--apply` still makes zero writes.
+- [A1] **Executable** — `npx vitest run we:scripts/__tests__/review-set-label.test.mjs we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs` fails before this lands (the new approval and label-input cases are RED, except the two labelled guards, which pass today) and passes after; `node we:scripts/conveyor/pr-label-mirror.mjs --json` without `--apply` still makes zero writes.
 
 ## Non-goals
 
