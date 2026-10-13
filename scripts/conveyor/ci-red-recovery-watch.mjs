@@ -1004,7 +1004,7 @@ export function restackStackedPr(d, {
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
  *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   now?:number}} [o]
+ *   maxRetriesPerPr?:number, now?:number}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1018,7 +1018,7 @@ export function sweepMissingRunRecovery({
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
-  maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, now = Date.now(),
+  maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
 } = {}) {
   // #2793 — `mergeable` added so {@link buildMissingRunCandidates} can exclude a real merge conflict (never a
   // "missing run", a conflicting PR can produce no `pull_request` run at all — see that function's own docblock).
@@ -1030,13 +1030,20 @@ export function sweepMissingRunRecovery({
   // The daemon's App token cannot read protection (403 → null), which would blind the partial-rollup check
   // (draft #3850: `test` never reported beside green siblings). Fall back to the repo's DECLARED required set —
   // used ONLY for that check, never to widen the all-absent test (PR #2740 review).
-  let stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
+  const stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
+  let defaultBasePartialContexts = stalledPartialContexts;
   // live #5060 (2026-10-13): include ruleset-only merge-gate in the partial-rollup test.
   try {
     const attributed = readAttributedRequiredChecks({ repo, branch: defaultBranch });
-    if (Array.isArray(attributed)) stalledPartialContexts = [...new Set([...(stalledPartialContexts ?? []), ...attributed])];
+    if (Array.isArray(attributed)) defaultBasePartialContexts = [...new Set([...(stalledPartialContexts ?? []), ...attributed])];
   } catch { /* An unavailable attributed read preserves the existing set. */ }
-  const rawCandidates = buildMissingRunCandidates(prs, { requiredContexts: requiredContexts ?? null, stalledPartialContexts });
+  // Ruleset-only workflows may target only the default base (merge-gate targets main).
+  // Keep the classic/declared population for stacks and unreadable bases; never restack a healthy chain
+  // merely because a check that cannot run on its base is absent. The all-absent test is unchanged.
+  const rawCandidates = (Array.isArray(prs) ? prs : []).flatMap(pr => buildMissingRunCandidates([pr], {
+    requiredContexts: requiredContexts ?? null,
+    stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
+  }));
   if (rawCandidates.length && mainRuns === null) {
     try { mainRuns = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }); }
     catch { mainRuns = []; }
@@ -1052,10 +1059,21 @@ export function sweepMissingRunRecovery({
     const comments = readComments(c.prNumber, { repo });
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
+      // A push changes the SHA; neither that nor a new green main may reset this PR-wide budget.
+      // Reuse trusted-marker/refusal handling, without head or main-green scoping.
+      triggerAttemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
     };
   });
   const plan = planMissingRunRecoveries({
     candidates, now, thresholdMs, maxRetriesPerSha,
+  });
+  const attemptsByPr = new Map(candidates.map(c => [c.prNumber, c.triggerAttemptsForPr]));
+  plan.dispatch = plan.dispatch.filter(d => {
+    const attempts = attemptsByPr.get(d.prNumber) ?? 0;
+    if (attempts < maxRetriesPerPr) return true;
+    plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,
+      why: `PR #${d.prNumber} already had ${attempts} missing-run trigger attempt(s) across all head SHAs (cap ${maxRetriesPerPr}) — needs human/ci-heal inspection` });
+    return false;
   });
 
   const applied = [];
