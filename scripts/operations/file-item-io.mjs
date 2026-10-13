@@ -27,7 +27,7 @@ import {
   readQueueFile, writeQueueFile, addToQueue, queueHas, resolveQueuePath,
 } from '../conveyor/queue-store.mjs';
 import { FILE_ITEM_QUEUE_EFFECT } from './file-item.mjs';
-import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
@@ -37,7 +37,7 @@ export { REPO_ROOT };
 export function createFileItemReader({ root = REPO_ROOT,
   today = () => localDateString(new Date(), 'America/Toronto'),
   readPolicy = readOperatorTaskSettings,
-  readTip = () => execFileSync('git', ['rev-parse', 'origin/main'], { cwd: root, encoding: 'utf8' }).trim(),
+  readTip = () => readGit(['rev-parse', 'origin/main'], { cwd: root }).trim(),
   ...opts } = {}) {
   const read = createScaffoldReader({ root, today, ...opts });
   return () => {
