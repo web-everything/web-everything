@@ -55,7 +55,7 @@ describe('live region head freshness', () => {
 
 describe('defaults and cascade', () => {
   it('exports and resolves standard defaults', () => {
-    expect(policy().value).toEqual({ holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20, priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: ['fast-track', 'priority:urgent'] });
+    expect(policy().value).toEqual({ holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20, priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: ['fast-track', 'priority:urgent'], waitForLandingHolder: { enabled: true, holderStates: ['review:accepted', 'in-merge-queue'] } });
     expect(policy().value).toEqual(policyApi.FIX_SCOPE_DEFAULTS);
   });
   it('resolves each env override', () => {
@@ -92,7 +92,7 @@ describe('region', () => {
   it.each([[100, false, false], [40, false, true], [100, true, true], [100, null, true]])('decides regions %s conflict %s', (line, conflict, overlap) => {
     const regionOverlap = () => policyApi.regionOverlapDecision({ file: 'x.js', hunksA: new Map([['x.js', [[1, 1]]]]), hunksB: new Map([['x.js', [[line, line]]]]), margin: 20, mergeConflict: conflict });
     const out = gate([entry(2)], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap });
-    expect(out.planned.length).toBe(overlap ? 0 : 1); expect(out.scopeDecisions[0].rule).toBe('overlapGranularity');
+    expect(out.planned.length).toBe(overlap ? 0 : 1); expect(out.scopeDecisions[0].rule).toBe(conflict === true ? 'waitForLandingHolder' : 'overlapGranularity');
   });
   it('fails closed on unreadable or absent hunks', () => { expect(policyApi.regionOverlapDecision({ file: 'x', hunksA: null, hunksB: new Map(), mergeConflict: false })).toMatchObject({ overlap: true, failedClosed: true }); });
   it('fails closed without a reader and for build claims', () => {
@@ -200,5 +200,107 @@ describe('planner label forwarding', () => {
     const out = planFixesFromReconcile([{ kind: 'fix', prNumber: 2, headRefName: 'feature', files: ['x.js'], labels: ['fast-track'] }], () => null, () => [], () => [], 'we', () => ['x.js'], () => [], { includeLabels: true });
     expect(out.planned[0].labels).toEqual(['fast-track']);
     expect(gate(out.planned.map(e => ({ ...e, scope: [F], overlapScope: [F] })), [claim(1)]).planned).toHaveLength(1);
+  });
+});
+
+describe('landing holder policy', () => {
+  it('cascades nested leaves and validates their shapes', () => {
+    const p = policy({ waitForLandingHolder: { holderStates: ['review:accepted'] } });
+    expect(p.value.waitForLandingHolder).toEqual({ enabled: true, holderStates: ['review:accepted'] });
+    expect(p.sources).toMatchObject({ 'waitForLandingHolder.enabled': 'standard', 'waitForLandingHolder.holderStates': 'tool' });
+    for (const bad of [{ enabled: 'yes', holderStates: [] }, { enabled: ['x'] }, { holderStates: true }]) {
+      const resolved = policy({ waitForLandingHolder: bad });
+      expect(resolved.value.waitForLandingHolder).toEqual(policyApi.FIX_SCOPE_DEFAULTS.waitForLandingHolder);
+      expect(resolved.invalid.length).toBeGreaterThan(0);
+      for (const leaf of Object.keys(bad)) expect(resolved.sources['waitForLandingHolder.' + leaf]).toBe('standard');
+    }
+  });
+  it('decides legacy, unreadable, landing and ordinary holders', () => {
+    const decide = state => policyApi.landingHolderDecision({ state, setting: policy().value.waitForLandingHolder });
+    expect(policyApi.landingHolderDecision({ state: null, setting: { enabled: false } })).toEqual({ hold: true, why: 'trial merge conflicts' });
+    expect(decide(null)).toMatchObject({ hold: true, failedClosed: true });
+    for (const labels of [['review:accepted'], [{ name: 'review:accepted' }]]) {
+      expect(decide({ labels })).toMatchObject({ hold: true, landing: true });
+      expect(decide({ labels }).why).toContain('holder is landing (review:accepted)');
+    }
+    expect(decide({ labels: [], inMergeQueue: true })).toMatchObject({ hold: true, landing: true, why: expect.stringContaining('in-merge-queue') });
+    expect(decide({ labels: ['review:pending'] })).toMatchObject({ hold: false });
+  });
+  it('marks trial merge conflicts explicitly', () => {
+    expect(policyApi.regionOverlapDecision({ file: 'x', hunksA: new Map([['x', [[1, 1]]]]), hunksB: new Map([['x', [[1, 1]]]]), mergeConflict: true }))
+      .toEqual({ overlap: true, conflict: true, why: 'trial merge conflicts' });
+  });
+});
+describe('holder state reader', () => {
+  const page = (nodes, hasNextPage = false, endCursor = null) => JSON.stringify({ data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor } } } } });
+  const node = (number, labels = [], isInMergeQueue = false) => ({ number, headRefOid: 'head' + number, isInMergeQueue, labels: { nodes: labels.map(name => ({ name })) } });
+  it('parses and lazily caches paginated states for the selected repository', () => {
+    const first = page([node(1, ['review:accepted'])], true, 'next');
+    expect(policyApi.parseHolderStates(first).get(1)).toEqual({ labels: ['review:accepted'], inMergeQueue: false, headRefOid: 'head1' });
+    const calls = [];
+    const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: (cmd, args) => {
+      calls.push([cmd, args]); return calls.length === 1 ? first : page([node(2, [], true), node(3, ['review:pending'])]);
+    } });
+    expect(calls).toEqual([]);
+    expect(reader.stateFor(2)).toEqual({ labels: [], inMergeQueue: true, headRefOid: 'head2' });
+    expect(reader.landingPrs(['review:accepted', 'in-merge-queue'])).toEqual([1, 2]);
+    expect(reader.stateFor(99)).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(calls[0][0]).toBe('gh');
+    expect(calls[0][1]).toEqual(expect.arrayContaining(['api', 'graphql', 'owner=owner', 'name=project']));
+    expect(calls[1][1]).toContain('cursor=next');
+  });
+  it('fails closed and caches subprocess or malformed response failures', () => {
+    for (const exec of [() => { throw Error('offline'); }, () => '{}']) {
+      const reader = policyApi.createHolderStateReader({ exec });
+      expect(reader.stateFor(1)).toBeNull(); expect(reader.landingPrs(['review:accepted'])).toEqual([]);
+    }
+  });
+  it('caps pagination at five pages and fails closed on an incomplete snapshot', () => {
+    let calls = 0;
+    const reader = policyApi.createHolderStateReader({ exec: () => { calls++; return page([node(calls)], true, 'next' + calls); } });
+    expect(reader.stateFor(1)).toBeNull(); expect(reader.landingPrs(['review:accepted'])).toEqual([]);
+    expect(calls).toBe(5);
+  });
+});
+describe('wait only for a landing holder', () => {
+  const conflict = () => ({ overlap: true, why: 'trial merge conflicts', conflict: true });
+  const run = (state, overrides = {}, options = {}, claims = [claim(1)]) => gate([entry(2)], claims,
+    { overlapGranularity: 'region', ...overrides }, { regionOverlap: conflict, holderState: () => state, ...options });
+  it('admits a waiter past a holder not near landing and names each setting leaf', () => {
+    const out = run({ labels: ['review:pending'] });
+    expect(out.planned.map(e => e.pr)).toEqual([2]);
+    expect(out.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'admitted', why: expect.stringContaining('not near landing') });
+    expect(out.scopeDecisions[0].setting).toBe('fixScope.waitForLandingHolder.enabled=true (standard), fixScope.waitForLandingHolder.holderStates=["review:accepted","in-merge-queue"] (standard)');
+  });
+  it('holds a waiter behind an accepted holder', () => {
+    const out = run({ labels: ['review:accepted'] });
+    expect(out.planned).toEqual([]);
+    expect(out.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'blocked', why: expect.stringContaining('holder is landing (review:accepted)') });
+  });
+  it('retains the hold on unreadable state', () => {
+    expect(run(null).scopeDecisions[0]).toMatchObject({ decision: 'blocked', rule: 'waitForLandingHolder', failedClosed: true });
+  });
+  it('restores legacy holds when disabled', () => {
+    const out = run({ labels: ['review:pending'] }, { waitForLandingHolder: { enabled: false } });
+    expect(out.planned).toEqual([]);
+    expect(out.scopeDecisions[0]).toMatchObject({ rule: 'overlapGranularity', why: 'trial merge conflicts' });
+  });
+  it('holds behind a queued PR even without a fixer and preserves refusal text', () => {
+    const out = run({ inMergeQueue: true }, {}, { landingHolders: [{ pr: 1, scope: [F] }] }, []);
+    expect(out.planned).toEqual([]);
+    expect(out.refusals[0].why).toContain('waiting 2nd behind #1');
+  });
+  it('does not hold or emit a decision for a margin-only landing holder', () => {
+    const out = run({ inMergeQueue: true }, {}, { landingHolders: [{ pr: 1, scope: [F] }], regionOverlap: () => ({ overlap: true, why: 'changed regions intersect within margin' }) }, []);
+    expect(out.planned.map(e => e.pr)).toEqual([2]); expect(out.scopeDecisions).toEqual([]);
+  });
+  it('ignores landing holders in file mode', () => {
+    expect(run({ inMergeQueue: true }, { overlapGranularity: 'file' }, { landingHolders: [{ pr: 1, scope: [F] }] }, []).planned).toHaveLength(1);
+  });
+  it('deduplicates claims and exempts self and stack ancestors', () => {
+    const landingHolders = [{ pr: 1, scope: [F] }, { pr: 2, scope: [F] }];
+    expect(run({ inMergeQueue: true }, {}, { landingHolders }).scopeDecisions).toHaveLength(1);
+    expect(run({ inMergeQueue: true }, {}, { landingHolders, stackAbove: new Map([[2, new Set([1])]]) }).planned).toHaveLength(1);
   });
 });
