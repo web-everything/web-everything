@@ -47,3 +47,4 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5006 (finding 1: `we:backlog/5937-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md:19` — Add a check:standards rule that rejects open cards containing literal 'TODO:' placeholders in Acceptance or Edge cases once a card is claimed or moved to in-progress.)
+- Also raised by web-everything/web-everything#5219 (finding 1: `we:backlog/5754-per-item-task-core-exclusion-timeout-outcomes-effect-declara.md` — Add a preparation gate requiring each behavioral risk to reference a repository-qualified test file, named planned case, and observable assertion; review the mapping for semantic completeness.) · key `approval-prevention-key:web-everything/web-everything#5219@be5c1542b4a22b9cc962ce65227c69e1e3c5333f`
