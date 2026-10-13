@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /** Tracked-text host path ratchet, with injectable IO and an explicit baseline writer. */
-import { execFileSync } from 'node:child_process';
 import { lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findHostPaths, scanHostPaths } from './lib/host-path-scan.mjs';
+import { readGit } from './lib/proc-read.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const baselinePath = 'scripts/settings/host-path-baseline.json';
 const decoder = new TextDecoder('utf-8', { fatal: true });
-const listTrackedFiles = root => execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
+const listTrackedFiles = root => readGit(['ls-files', '-z'], { cwd: root }).split('\0').filter(Boolean);
 
 /** Symlinks are references, not committed file contents. */
 function readTrackedFile(path) {
