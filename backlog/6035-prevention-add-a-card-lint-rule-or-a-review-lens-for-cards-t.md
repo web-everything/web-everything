@@ -1,0 +1,43 @@
+---
+bornAs: xh31o4o
+kind: story
+size: 3
+parent: "4075"
+status: open
+scope: ["we:backlog/5963-automatic-referral-ruling-policy-never-overrides-an-operator.md"]
+dateOpened: "2026-10-13"
+tags: []
+---
+
+# Prevention — Add a card-lint rule (or a review lens) for cards that change an operation's result shape. It wou… (from web-everything/web-everything#5151 review)
+
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:backlog/5963-automatic-referral-ruling-policy-never-overrides-an-operator.md` — Add a card-lint rule (or a review lens) for cards that change an operation's result shape. It would require a Test plan line for each in-repo caller of that operation.
+2. `we:backlog/5963-automatic-referral-ruling-policy-never-overrides-an-operator.md` — In the Test plan, require a named rebased or diverged-head case that asserts refusal rather than protection.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5151@1c80d88dc17d4141e22595a7cd1aa5ed57d3166e
+
+## Acceptance
+
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.

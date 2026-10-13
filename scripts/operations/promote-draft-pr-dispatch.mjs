@@ -56,6 +56,7 @@
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
@@ -106,7 +107,7 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
 export function defaultReadHeadCheckState({
   repoSlug, sha, prNumber, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
   readPrLabels = defaultReadPrLabels, readMergeGateVerdict = defaultReadMergeGateVerdict,
-  readFreeze = readSharedFreeze, mergeGateSetting,
+  readFreeze = readSharedFreeze, mergeGateSetting, forPromotion = false, absentNotApplicable,
 } = {}) {
   const requiredChecks = getRequiredChecks({ repo: repoSlug }).checks;
   const raw = runGh(checksArgv({ repo: repoSlug, sha }), {
@@ -125,7 +126,11 @@ export function defaultReadHeadCheckState({
       }
     }
   } catch { /* Preserve red on unreadable labels, settings or job evidence. */ }
-  return reduceCheckState(rows, requiredChecks);
+  // Promotion-only absence policy: live #5060 (2026-10-13).
+  const promotionChecks = forPromotion
+    ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
+    : requiredChecks;
+  return reduceCheckState(rows, promotionChecks);
 }
 
 function validatePrLabels(labels) {

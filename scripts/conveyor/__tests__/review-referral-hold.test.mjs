@@ -460,6 +460,21 @@ describe('block-ruled referrals route to a fix, not the same-head pause', () => 
       blockRuledReferrals: [expect.objectContaining({ key, finding: expect.objectContaining({ summary: 'broken case' }) })] }));
     expect(out.dispatch.some(d => d.kind === 'review')).toBe(false);
   });
+  it('all referrals ruled block on a review:pending head: a fix is dispatched, not a review', () => {
+    const p = pr({ labels: [{ name: 'review:pending' }], comments: [comment(renderReferralRecord(ruledRecord()), at - 120_000)] });
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => reviewedOnce });
+    expect(enriched.blockRuledReferrals).toHaveLength(1);
+    const out = plan(p);
+    expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', mode: 'block-ruled-referral', prNumber: 3481,
+      blockRuledReferrals: [expect.objectContaining({ key, finding: expect.objectContaining({ summary: 'broken case' }) })] }));
+    expect(out.dispatch.some(d => d.kind === 'review')).toBe(false);
+  });
+  it('unruled referrals on a review:pending head still dispatch no fix', () => {
+    const p = pr({ labels: [{ name: 'review:pending' }], comments: [comment(renderReferralRecord(record()), at - 120_000)] });
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => reviewedOnce });
+    expect(enriched.blockRuledReferrals).toEqual([]);
+    expect(plan(p).dispatch.some(d => d.kind === 'fix')).toBe(false);
+  });
   it('unruled referrals are still paused (no fix)', () => {
     const p = pr({ comments: [comment(renderReferralRecord(record()), at - 120_000)] });
     const [enriched] = enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => reviewedOnce });
