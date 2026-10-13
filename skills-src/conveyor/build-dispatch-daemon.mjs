@@ -679,9 +679,28 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     && planBuildDispatch({ ...dispatchInputs, candidates: [c], policy: { ...policy,
       maxConcurrentBuilds: Number.MAX_SAFE_INTEGER, maxConcurrentExternalBuilds: Number.MAX_SAFE_INTEGER,
       maxOpenItems: Number.MAX_SAFE_INTEGER } }).dispatch.length > 0);
+  // Conveyor queue rows carry admission metadata, not the card's grouping frontmatter. Read once
+  // for both build and prepare, reusing this round's routing backlog snapshot in the CLI.
+  let groupRowsByNum = new Map((admission.queue ?? []).map(r => [normNum(r.num), r]));
+  let groupingCardsLoaded = true;
+  try {
+    const cards = await effects.loadGroupingCards?.();
+    if (cards !== undefined) {
+      const cardsByNum = new Map(cards.map(card => [normNum(card.num), card]));
+      groupRowsByNum = new Map((admission.queue ?? []).map(row => {
+        const card = cardsByNum.get(normNum(row.num));
+        const fields = Object.fromEntries(['kind', 'size', 'estimatedLoc', 'parent', 'tags', 'locus', 'blockedBy']
+          .map(key => [key, card?.[key]]));
+        return [normNum(row.num), { ...row, ...fields }];
+      }));
+    }
+  } catch (e) {
+    groupingCardsLoaded = false;
+    console.error(`build-dispatch-daemon: grouping card load failed; grouping disabled for this tick: ${String(e?.message || e).split('\n')[0]}`);
+  }
   const groupedPlan = planBuildGroups({ picks: plan.dispatch, pool: safePool,
-    rowsByNum: new Map((admission.queue ?? []).map(r => [normNum(r.num), r])),
-    settings: groupingSettings, exclude: groupDropped });
+    rowsByNum: groupRowsByNum,
+    settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings && groupingCardsLoaded }, exclude: groupDropped });
 
   const dispatched = [];
   const failures = [...groupFailures];
@@ -1086,11 +1105,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(h => !['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
   const prepareGroupPlan = planBuildGroups({
     picks: prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num))),
-    pool: (admission.queue ?? []).filter(r => needsPrepare.has(normNum(r.num))
+    pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
-    rowsByNum: new Map((admission.queue ?? []).map(r => [normNum(r.num), r])),
+    rowsByNum: groupRowsByNum,
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
-      && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
+      && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
   });
   prepare.groups = prepareGroupPlan.groups;
   if (prepareEnabled && !prepare.freezeHeld) {
@@ -1373,13 +1392,16 @@ export async function loadRouteInputs(root = REPO_ROOT) {
 }
 
 export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInputs = () => loadRouteInputs() } = {}) {
-  let inputs;
-  return async (num, scope) => {
-    if (inputs === undefined) {
-      try { inputs = await loadInputs(); } catch { inputs = null; }
-    }
+  let inputsPromise;
+  const getInputs = () => inputsPromise ??= Promise.resolve().then(loadInputs);
+  const predictor = async (num, scope) => {
+    let inputs;
+    try { inputs = await getInputs(); } catch { inputs = null; }
     return inputs ? predict(num, scope, inputs) : predict(num, scope);
   };
+  // Keep the rejection for grouping to fail closed rather than retrying the failed shared load.
+  predictor.loadGroupingCards = async () => (await getInputs()).loadItems();
+  return predictor;
 }
 
 // #4351's own build-dispatch follow-up (guided by #4309 spend accounting) — this was the top GraphQL spender in the fleet (121
@@ -2259,6 +2281,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
 export function cliEffects() {
   let prepareReader;
   return {
+    loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
     completePrepareFailures,
     releaseDuePrepareRetries: () => {
       let checkedCount = false;
@@ -2490,6 +2513,7 @@ async function dryRun(flags) {
   effects.planTick = createRoundPlanTick(round);
   const predictRoute = createRoundRoutePredictor();
   effects.predictRoute = predictRoute;
+  effects.loadGroupingCards = predictRoute.loadGroupingCards;
   const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords());
   const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
   effects.listRunStoreInFlight = () => runStoreRows;
@@ -2638,6 +2662,7 @@ async function live(flags) {
     const round = startPlanningRound();
     effects.planTick = createRoundPlanTick(round);
     effects.predictRoute = createRoundRoutePredictor();
+    effects.loadGroupingCards = effects.predictRoute.loadGroupingCards;
     try {
       const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords()); // #5322 — one read for the three readers below
       const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));

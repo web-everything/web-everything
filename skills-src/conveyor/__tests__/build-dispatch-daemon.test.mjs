@@ -43,6 +43,7 @@ import {
   cliRouteHeldItems, cliSpawnHoldLand, cliStampPrepare, cliReadStampFailure, STAMP_RECOVERY_LEASE_MINUTES, cliPrepareFailureEvidence,
   // xovjhwh — the shared attribution derivation `runBuildDispatchTick` and `dryRun` both call
   deriveDispatchedByBuilder,
+  createRoundRoutePredictor,
   // card 80 + hold visibility
   planConfigFrom, holdText, buildPriorityLog,
   // card xwn53th — tick-overrun speedups
@@ -3276,6 +3277,57 @@ describe('grouped BUILD daemon ticks', () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-')); log = vi.spyOn(console, 'error').mockImplementation(() => {}); });
   afterEach(() => { vi.unstubAllEnvs(); log.mockRestore(); rmSync(root, { recursive: true, force: true }); });
 
+  it('groups minimal conveyor queue rows from card frontmatter, loading once per tick', async () => {
+    const queue = rows.map(({ num, scope }) => ({ num, scope, preparedDate: '2026-10-13' }));
+    const effects = fixture({ queue });
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    const tick = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(tick.grouping.groups).toEqual([expect.objectContaining({ lead: '7101', members: ['7102', '7103', '7104'] })]);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ groupMembers: ['7102', '7103', '7104'] }));
+    expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+    await runBuildDispatchTick({ policy, effects });
+    expect(effects.loadGroupingCards).toHaveBeenCalledTimes(2);
+  });
+
+  it('disables build and prepare grouping on a loader failure and logs one line without failing the tick', async () => {
+    const effects = fixture(); // Even eligible queue metadata must not allow grouping after a failed read.
+    effects.loadGroupingCards = vi.fn(async () => { throw new Error('backlog unreadable\nextra detail'); });
+    const tick = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(tick.grouping.groups).toEqual([]);
+    expect(tick.prepare.groups).toEqual([]);
+    expect(tick.dispatched).toHaveLength(1);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+    expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.filter(([s]) => s.includes('grouping card load failed'))).toEqual([
+      ['build-dispatch-daemon: grouping card load failed; grouping disabled for this tick: backlog unreadable'],
+    ]);
+  });
+
+  it('shares route inputs with grouping without reloading cards', async () => {
+    const cards = rows.map(r => ({ ...r, kind: 'story', size: 1 }));
+    const inputs = { loadItems: () => cards };
+    const loadInputs = vi.fn(async () => inputs);
+    const effects = fixture({ queue: rows.map(({ num, scope }) => ({ num, scope, preparedDate: '2026-10-13' })) });
+    const predictor = createRoundRoutePredictor({ loadInputs, predict: vi.fn(() => ({ executor: 'claude' })) });
+    effects.predictRoute = predictor;
+    effects.loadGroupingCards = predictor.loadGroupingCards;
+    const tick = await runBuildDispatchTick({ policy, effects });
+    expect(tick.grouping.groups).toHaveLength(1);
+    expect(loadInputs).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes grouping fields from cards while preserving queue scope and num', async () => {
+    const queue = rows.map(r => ({ ...r, kind: 'epic', size: 100, estimatedLoc: 1000,
+      parent: 'stale', tags: ['stale'], locus: 'stale', blockedBy: rows.map(x => x.num) }));
+    const effects = fixture({ queue });
+    effects.loadGroupingCards = () => rows.map(r => ({ ...r, kind: 'story', scope: [] }));
+    const tick = await runBuildDispatchTick({ policy, effects });
+    expect(tick.grouping.groups).toHaveLength(1);
+    // Card blocker edges also win over queue rows that claim there are no blockers.
+    effects.loadGroupingCards = () => rows.map(r => ({ ...r, blockedBy: rows.filter(x => x.num !== r.num).map(x => x.num) }));
+    expect((await runBuildDispatchTick({ policy, effects })).grouping.groups).toEqual([]);
+  });
+
   it.each([1, 100])('cap one launches four related cards as one build, persists member claims, and logs every tick including dry-run (WIP=%s)', async maxOpenItems => {
     const effects = fixture();
     const capPolicy = { ...policy, maxOpenItems };
@@ -3427,6 +3479,27 @@ describe('grouped PREPARE daemon ticks', () => {
   }
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+  it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
+    const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));
+    const effects = fixture({ queue, spawns: [queue[0]] });
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204'] })]);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
+    expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps per-card prepare dispatch available when grouping cards cannot load', async () => {
+    const effects = fixture({ queue: rows.slice(0, 4) });
+    effects.loadGroupingCards = vi.fn(() => { throw new Error('backlog unavailable'); });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toEqual([]);
+    expect(tick.prepare.launched).toHaveLength(1);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(1);
+    expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
 
   it('groups needs-prepare and prepare-stale queue cards into one prepare, claiming every member with its stamp', async () => {
     const effects = fixture({ queue: rows.slice(0, 4) });
