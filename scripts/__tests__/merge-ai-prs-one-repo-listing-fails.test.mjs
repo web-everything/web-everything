@@ -20,6 +20,17 @@ if (a[0] === 'pr' && a[1] === 'list') {
   if (bad.includes('*') || bad.includes(repo)) { process.stderr.write("GraphQL: Could not resolve to a Repository with the name '" + repo + "'.\\n"); process.exit(1); }
   process.stdout.write('[]'); process.exit(0);
 }
+// The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs): the repo is in the query text.
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const q = (a.find((x) => x.startsWith('query=')) || '');
+  const m = q.match(/owner:"([^"]+)",name:"([^"]+)"/);
+  const r = m ? m[1] + '/' + m[2] : '';
+  const bad = (process.env.GH_FAIL_REPOS || '').split(',').filter(Boolean);
+  if (bad.includes('*') || bad.includes(r)) { process.stderr.write("GraphQL: Could not resolve to a Repository with the name '" + r + "'.\\n"); process.exit(1); }
+  if ((process.env.GH_504_REPOS || '').split(',').includes(r)) { process.stderr.write('HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)\\n'); process.exit(1); }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }));
+  process.exit(0);
+}
 process.stdout.write('[]');
 `;
 
@@ -46,9 +57,9 @@ describe('merge-ai-prs CLI - one failing repo does not kill the pass', () => {
     try { rmSync(shimDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
-  const runCli = (failRepos) => spawnSync('node', [script, '--repos=web-everything/web-everything,frontier-ui/frontierui,plateauapp/plateau-app', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
+  const runCli = (failRepos, gw504Repos = '') => spawnSync('node', [script, '--repos=web-everything/web-everything,frontier-ui/frontierui,plateauapp/plateau-app', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
     cwd: repoDir, encoding: 'utf8',
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_FAIL_REPOS: failRepos },
+    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_FAIL_REPOS: failRepos, GH_504_REPOS: gw504Repos },
   });
 
   it('frontier-ui failing is reported as failed and the pass still completes', () => {
@@ -58,6 +69,14 @@ describe('merge-ai-prs CLI - one failing repo does not kill the pass', () => {
     expect(payload.failedRepos).toEqual([expect.objectContaining({ repo: 'frontier-ui/frontierui' })]);
     expect(payload.repos).toContain('plateauapp/plateau-app');
     expect(r.stderr).toMatch(/frontier-ui\/frontierui FAILED to list/);
+  });
+
+  it('a 504 on one repo\'s page is a loud, retryable UNREADABLE repo, never 0 candidates', () => {
+    const r = runCli('', 'web-everything/web-everything');
+    expect(r.status, r.stderr).toBe(0);
+    const payload = JSON.parse(r.stdout.trim());
+    expect(payload.failedRepos).toEqual([expect.objectContaining({ repo: 'web-everything/web-everything', kind: 'unreadable', retryable: true })]);
+    expect(r.stderr).toMatch(/DRAIN LISTING UNREADABLE.*web-everything\/web-everything.*UNKNOWN \(not 0\)/);
   });
 
   it('every repo failing is still the exit-4 hard-fail', () => {
