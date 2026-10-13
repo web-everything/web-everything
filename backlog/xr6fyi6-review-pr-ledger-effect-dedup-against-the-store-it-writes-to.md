@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs"]
+scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
