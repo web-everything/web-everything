@@ -150,6 +150,26 @@ describe('reconcile ownership', () => {
     expect(current.refusals).toEqual([expect.objectContaining({ kind: 'owed-main-rule' })]);
     expect(reconcile(owedPr({ owedMainRule: { head: 'old', owed: true } })).dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
   });
+  // PR #5082 red team: the hold proves only the `test` job; any other failing required check keeps ci-heal.
+  const otherRed = { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'FAILURE' };
+  it.each([
+    { name: 'a second required check', requiredChecks: ['test', 'soak-replay-gate'], extra: [otherRed] },
+    { name: 'a check under the default required set', requiredChecks: null, extra: [otherRed] },
+    { name: 'a red check listed before test', requiredChecks: ['soak-replay-gate', 'test'], extra: [otherRed], first: true },
+  ])('keeps ci-heal when $name also fails', ({ requiredChecks, extra, first }) => {
+    const rollup = first ? [...extra, ...pr().statusCheckRollup] : [...pr().statusCheckRollup, ...extra];
+    const result = planReconcile({ prs: [owedPr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks, now: Date.parse('2026-10-12T23:00:00Z') });
+    expect(result.refusals.some(r => r.kind === 'owed-main-rule')).toBe(false);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: expect.arrayContaining(['test', 'soak-replay-gate']) })]);
+  });
+  it('still holds when only test fails, and a non-required red does not lift the hold', () => {
+    const nonRequired = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' };
+    const rerun = { ...pr().statusCheckRollup[0] };
+    for (const rollup of [[...pr().statusCheckRollup, rerun], [...pr().statusCheckRollup, nonRequired]]) {
+      const result = planReconcile({ prs: [owedPr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks: ['test'], now: Date.parse('2026-10-12T23:00:00Z') });
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'owed-main-rule' })]);
+    }
+  });
 });
 
 describe('conflict refresh IO boundaries', () => {

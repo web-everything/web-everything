@@ -2672,7 +2672,9 @@ export function planReconcile({
     }
 
     if (ciRepairOwed) {
-      if (pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? '')) {
+      // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
+      const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
+      if (pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && onlyTestRed && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? '')) {
         refuse('owed-main-rule', { ...withPhase, why: `the required check failed only on the hand-picked-NNN rule for card number(s) the drain itself assigned (${(pr.owedMainRule.nums ?? []).map(n => `#${n}`).join(', ')}); owed a refresh once main accepts drain-numbered cards (drain-branch-numbering-ci-v1), never a ci-heal that would revert the number` });
         continue;
       }
