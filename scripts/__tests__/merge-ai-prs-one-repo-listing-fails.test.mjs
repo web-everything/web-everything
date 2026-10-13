@@ -9,10 +9,12 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { partitionListings } from '../merge-ai-prs.mjs';
 
 const FAKE_GH = `#!/usr/bin/env node
 const a = process.argv.slice(2);
+const openPrPageFixture = ${openPrPageFixture};
 const repo = a.includes('--repo') ? a[a.indexOf('--repo') + 1] : '';
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') {
@@ -28,7 +30,7 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   const bad = (process.env.GH_FAIL_REPOS || '').split(',').filter(Boolean);
   if (bad.includes('*') || bad.includes(r)) { process.stderr.write("GraphQL: Could not resolve to a Repository with the name '" + r + "'.\\n"); process.exit(1); }
   if ((process.env.GH_504_REPOS || '').split(',').includes(r)) { process.stderr.write('HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)\\n'); process.exit(1); }
-  process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }));
+  process.stdout.write(JSON.stringify(openPrPageFixture([], q)));
   process.exit(0);
 }
 process.stdout.write('[]');
