@@ -52,6 +52,13 @@ describe('#5193 review clearance', () => {
       expect(decideStaleGateRerun({ ...facts, ...patch }).rerun).toBe(false);
     }
   });
+  it('#5193 after the AI re-accept: re-runs a human-only HOLD the live human clearance covers, with a backoff', () => {
+    const facts = { setting: on, labels: ['review:accepted'], record: { ...record, at: '2026-10-13T16:00:00Z' }, row, verdict, rows, head };
+    expect(decideStaleGateRerun({ ...facts, humanClearedSha: head, now: Date.parse('2026-10-13T19:50:00Z') })).toMatchObject({ rerun: true, jobId: 115424411010 });
+    expect(decideStaleGateRerun({ ...facts, humanClearedSha: head, now: Date.parse('2026-10-13T17:00:00Z') }).rerun).toBe(false);
+    expect(decideStaleGateRerun({ ...facts, humanClearedSha: null, now: Date.parse('2026-10-13T19:50:00Z') }).rerun).toBe(false);
+    expect(decideStaleGateRerun({ ...facts, humanClearedSha: 'a'.repeat(40), now: Date.parse('2026-10-13T19:50:00Z') }).rerun).toBe(false);
+  });
   it('does not rerun while any merge-gate job is in flight', () => {
     const latest = { ...row, id: 115424411010 };
     expect(decideStaleGateRerun({ setting: on, labels: ['review:accepted'], record, row: latest, verdict, rows: [{ name: 'merge-gate', status: 'IN_PROGRESS', id: 115424411009 }, latest] }).rerun).toBe(false);
@@ -161,7 +168,7 @@ describe('sweep (fix daemon tick)', () => {
   it('pays only the view and comment reads for a review:pending PR with no no-push re-arm', () => {
     const { calls, runGh } = fakeGh(['review:pending'], [acceptance]);
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
-    expect(guard.sweep([{ prNumber: 9, labels: ['review:pending'] }])).toEqual([]);
+    expect(guard.sweep([{ prNumber: 9, labels: ['review:pending'] }])).toEqual([expect.objectContaining({ pr: 9, restored: false, rerun: false })]);
     expect(calls).toHaveLength(2);
   });
   it('reads every page of comments, reviews and events', () => {

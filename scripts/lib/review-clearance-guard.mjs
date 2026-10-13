@@ -5,6 +5,7 @@ import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewCle
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -50,7 +51,10 @@ export function failingCiChecks({ rows, verdictFor = () => ({ error: 'unreadable
   return { failing: checks, excluded };
 }
 
-export function decideStaleGateRerun({ setting, labels, record, row, verdict, rows } = {}) {
+/** A human-only HOLD that the live human clearance now covers is re-run at most once per this interval (backoff). */
+export const HUMAN_ONLY_RERUN_BACKOFF_MS = 30 * 60_000;
+
+export function decideStaleGateRerun({ setting, labels, record, row, verdict, rows, humanClearedSha = null, head = null, now = Date.now() } = {}) {
   const no = why => ({ rerun: false, why });
   if (!enabled(setting)) return no('stale gate rerun off');
   const ls = names(labels);
@@ -61,10 +65,18 @@ export function decideStaleGateRerun({ setting, labels, record, row, verdict, ro
   if (!latest || latest !== row || String(latest.status).toLowerCase() !== 'completed' || !failing(latest)) return no('no latest completed failed merge-gate');
   if (classifyGateFailure({ name: row.name, verdict }).kind !== 'review-hold') return no('gate is not a review-only hold');
   const completed = Date.parse(verdict?.completed_at ?? row.completedAt ?? row.completed_at);
-  if (!Number.isFinite(completed) || !(Date.parse(record?.at) > completed)) return no('clearance is not newer than the failed job');
+  if (!Number.isFinite(completed)) return no('failed job completion time unreadable');
   const jobId = jobIdOf(row);
   if (!Number.isSafeInteger(jobId) || jobId <= 0) return no('job id unreadable');
-  return { rerun: true, jobId, why: 'review-only merge-gate predates live clearance' };
+  if (Date.parse(record?.at) > completed) return { rerun: true, jobId, why: 'review-only merge-gate predates live clearance' };
+  // #5193: a clearance can be current while the job still HOLDs human-only (the CI reader lagged the clearance, e.g. a
+  // same-sha plain accept shadowed it). When the live human clearance names this head, re-run with a backoff so the
+  // gate turns green once CI reads the clearance, without a re-run every tick.
+  const humanOnly = verdict.results.some(r => r.status === 'hold' && r.id === 'review-acceptance' && String(r.reason ?? '').startsWith('human-only:'));
+  if (humanOnly && /^[0-9a-f]{40}$/.test(humanClearedSha ?? '') && humanClearedSha === head && now - completed >= HUMAN_ONLY_RERUN_BACKOFF_MS) {
+    return { rerun: true, jobId, why: `human-only hold, but the live human clearance covers ${head.slice(0, 9)}; re-run after a ${HUMAN_ONLY_RERUN_BACKOFF_MS / 60_000}-minute backoff` };
+  }
+  return no('clearance is not newer than the failed job');
 }
 
 export function decideRearmGuard({ setting, labels, record, prHead, refHead } = {}) {
@@ -163,7 +175,8 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
     };
     const row = collapseRollupToLatestPerName(facts.rows).find(r => r.name === 'merge-gate');
     const rerun = decideStaleGateRerun({ setting: setting('rerunStaleGateOnClearance'), labels: facts.labels,
-      record: latestAcceptRecord(facts.comments), row, rows: facts.rows, verdict: row && failing(row) ? verdictFor(row) : null });
+      record: latestAcceptRecord(facts.comments), row, rows: facts.rows, verdict: row && failing(row) ? verdictFor(row) : null,
+      humanClearedSha: parseLatestHumanClearedSha(facts.comments ?? []), head: facts.prHead });
     if (rerun.rerun && !reruns.has(rerun.jobId)) {
       mutate(['api', '-X', 'POST', `repos/${repo}/actions/jobs/${rerun.jobId}/rerun`]);
       reruns.add(rerun.jobId);
@@ -194,7 +207,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
       const results = [];
       try {
         const eligible = [...new Map((rows ?? []).map(row => [row.prNumber ?? row.pr ?? row.number, names(row.labels)]))]
-          .filter(([pr, ls]) => pr && ls.includes('review:pending') && !ls.includes('review:human') && !ls.includes('review:changes'));
+          .filter(([pr, ls]) => pr && (ls.includes('review:pending') || ls.includes('review:accepted')) && !ls.includes('review:human') && !ls.includes('review:changes'));
         // Rotate so a long review:pending list is covered over successive ticks, `max` view reads per tick.
         const start = eligible.length ? sweepOffset % eligible.length : 0;
         const batch = [...eligible.slice(start), ...eligible.slice(0, start)].slice(0, max);
@@ -202,7 +215,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
         for (const [pr] of batch) {
           try {
             const facts = readPrClearanceFacts({ repo, pr, runGh, full: 'if-restore' });
-            if (facts.events) results.push({ pr, ...apply(pr, facts) });
+            if (facts.prHead && Array.isArray(facts.comments)) results.push({ pr, ...apply(pr, facts) });
           } catch (e) { log(`review-clearance: PR #${pr} sweep error: ${e.message}`); }
         }
       } catch { /* Best effort sweep. */ }
