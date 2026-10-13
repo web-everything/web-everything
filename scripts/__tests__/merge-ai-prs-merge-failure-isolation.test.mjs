@@ -21,6 +21,16 @@ const landed = n => fs.existsSync(process.env.ISOLATION_FIXTURE + '.merged-' + n
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
+// The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs); serve one complete page.
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const open = prs.filter(p => !landed(p.number));
+  out({ data: { repository: { pullRequests: { totalCount: open.length, pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: open.map(p => ({ number: p.number, title: p.title, url: '', isDraft: false, createdAt: '2026-09-30T00:00:00Z',
+      updatedAt: '2026-09-30T00:00:00Z', headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName,
+      isCrossRepository: false, mergeable: p.mergeable, mergeStateStatus: p.mergeStateStatus, reviewDecision: '',
+      labels: { nodes: p.labels },
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: p.statusCheckRollup.map(c => ({ __typename: 'CheckRun', ...c })) } } } }] } })) } } } });
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
