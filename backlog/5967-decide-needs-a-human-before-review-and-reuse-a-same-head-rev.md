@@ -58,7 +58,7 @@ Add pure `decideAdvisoryReuse({ advisories, headSha, earnedShape, setting })`: r
 
 ## Preparation review checks
 
-Before implementation, cross-check every design seam against a production caller that supplies its required inputs, including the default job dispatch branch. Parser fixtures must come from the real advisory renderer, and every scoped test file must be explicitly selected by A1. Each acceptance criterion and edge case above must map to a named test; isolated helper tests do not prove production wiring. The reusable prepare-lens/lint prevention work is tracked in [x5967pv](x5967pv-prevention-check-prepare-wiring-renderer-fixtures-and-test-selection.md); the two label regression preventions are Must tests in this card.
+Before implementation, cross-check every design seam against a production caller that supplies its required inputs, including the default job dispatch branch. Parser fixtures must come from the real advisory renderer, and every scoped test file must be explicitly selected by A1. Each acceptance criterion and edge case above must map to a named test; isolated helper tests do not prove production wiring. The reusable prepare-lens/lint prevention work is tracked in [6042](6042-prevention-check-prepare-wiring-renderer-fixtures-and-test-selection.md); the two label regression preventions are Must tests in this card.
 
 ## MVP
 
