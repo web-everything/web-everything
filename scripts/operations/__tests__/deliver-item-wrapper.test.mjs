@@ -262,6 +262,20 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
   const REQ = { sessionId: 'claude-uuid', prompt: 'BUILD IT', lane: 9, sessionSlug: 'sess-9', item: '3580', attemptTag: 'b' };
 
+  it.each([
+    [{}, 'gpt-6.1-sol', 'medium'],
+    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'medium'],
+    [{ taskKind: 'takeover' }, 'gpt-6-astra', 'high'],
+    [{ taskKind: 'trivial', model: 'x', effort: 'max' }, 'x', 'max'],
+  ])('routes the actual spawn and scorecard %j', async (request, model, effort) => {
+    const o = io();
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, ...request }, o);
+    const argv = o.spawnAgent.mock.calls[0][0];
+    expect(argv[argv.indexOf('-m') + 1]).toBe(model);
+    expect(argv).toContain(`model_reasoning_effort=${effort}`);
+    expect(o.recordScorecard).toHaveBeenCalledWith(expect.objectContaining({ model, effort }));
+  });
+
   it('spawns `codex exec` in the RESOLVED lane clone, not wherever the wrapper process happens to sit', async () => {
     const o = io();
     await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
@@ -970,7 +984,7 @@ describe('delegation marker on a non-Claude build PR (#3903, #3690)', () => {
 
   it('a Codex build names codex + its real model, and derives taskType from the scope (docs-only → doc-fix)', () => {
     const codex = DELIVERY_AGENT_PROVIDERS.codex;
-    expect(delegationForBuild(codex, 'we:docs/a.md,we:README.md')).toEqual({ provider: 'codex', model: CODEX_DELIVERY_MODEL, taskType: 'doc-fix' });
+    expect(delegationForBuild(codex, 'we:docs/a.md,we:README.md')).toEqual({ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'doc-fix' });
     // a non-doc build has no narrower delegation task type than `other`
     expect(delegationForBuild(codex, 'we:scripts/foo.mjs').taskType).toBe('other');
     expect(delegationForBuild(codex, '').taskType).toBe('other');

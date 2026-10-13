@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readBackoffSettings, backoffVerdict, evidenceReasonCode, BACKOFF_REASON_CODES, isCloneWideReasonCode } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+import { readPreparePolicy } from './prepare-policy-settings.mjs';
 import { classifyPrepareReport, needsYouReason } from './prepare-outcome.mjs';
 
 export const INFRA_RETRY_BUDGET = 2;
@@ -64,6 +65,44 @@ export function preparedReportRoute(evidence = {}) {
 const LANE_BUSY_EXHAUSTED = 'needs-you: prepare lane-busy - every lane stayed leased for the whole retry window; clear it with a reviewed prepare release once a lane is free';
 /** The hold reason of an infra-transient card whose whole retry budget was spent: surfaced, never silently held. */
 const INFRA_EXHAUSTED = `needs-you: prepare infra-transient - the ${INFRA_RETRY_BUDGET} retries for temporary infrastructure failures were spent; clear it with a reviewed prepare release once the infrastructure is healthy`;
+const unstampedReason = evidence => {
+  for (const candidate of [evidence?.error, evidence?.reason, 'missing terminal evidence']) {
+    const text = redactSpawnText(String(candidate ?? ''));
+    const brace = text.indexOf('{');
+    let reason = text.split(/\r?\n/)[0];
+    if (brace !== -1) {
+      const prefix = text.slice(0, brace).trim().replace(/:$/, '').trim();
+      // Dumps can be truncated: extract the first value of each field without parsing JSON.
+      const summary = ['stopped', 'outcome', 'reason', 'detail'].flatMap(field => {
+        const match = text.match(new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`));
+        return match ? [`${field}=${field === 'detail' ? match[1].slice(0, 120) : match[1]}`] : [];
+      });
+      reason = summary.length ? `${prefix} (${summary.join('; ')})` : prefix;
+    }
+    reason = reason.replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
+      // Like needsYouReason: worker prose must not activate the hold router's other routes.
+      .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue')
+      .replace(/already done on main/gi, 'done elsewhere').replace(/^\s*worker-declined/i, 'declined')
+      .trim().slice(0, 200);
+    if (reason && reason !== '{') return reason;
+  }
+};
+/** One unfinished re-dispatch per card, shared by new failures and legacy-ledger recovery. */
+function decideUnstampedRetry(state, failure, now) {
+  const first = Object.values(state.failures).find(f =>
+    f !== failure && String(f.num) === String(failure.num) && f.unstampedRetry && !f.completed);
+  const reason = unstampedReason(failure.evidence);
+  if (!first && !failure.unstampedRetry) {
+    Object.assign(failure, { retry: true, held: false, unstampedRetry: true,
+      unstampedRetryAt: new Date(now).toISOString(), unstampedReason: reason });
+    console.error(`prepare-failure-policy: #${failure.num} prepare ended unstamped (${reason}) — re-dispatching once (prepare.retryUnstampedOnce)`);
+  } else {
+    const firstReason = unstampedReason({ error: (first ?? failure).unstampedReason ?? (first ?? failure).evidence?.error ?? (first ?? failure).evidence?.reason });
+    Object.assign(failure, { retry: false, held: true,
+      holdReason: `needs-you: prepare ended unstamped twice - ${firstReason.slice(0, 120)} / ${reason.slice(0, 120)}` });
+    console.error(`prepare-failure-policy: #${failure.num} prepare ended unstamped again (${reason}) — parked needs-you`);
+  }
+}
 /** How many unfinished, not-yet-re-armed failures of `cause` this card has, counting the one being recorded. */
 const backoffAttempts = (state, num, cause, except = null) => Object.values(state.failures)
   .filter(f => f.num === num && f.cause === cause && f !== except && !f.completed && !f.rearmedAt && !f.budgetResetAt).length + 1;
@@ -90,7 +129,7 @@ export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   if (evidence.stoppedBeforeCompletion === true) return 'agent-stopped-early';
   // Items 95/96: a known-transient dispatch failure (launch not confirmed, checkout behind origin, ...) is retried
   // with bounded backoff instead of held forever. Unrecognised text — or ANY other stage, e.g. a stamp-stage
-  // `Command failed: git ...` — stays `unknown` (held + a diagnose card).
+  // `Command failed: git ...` — stays `unknown` (one optional retry, then needs-you, plus a diagnose card).
   if (stage === DISPATCH_TRANSIENT_STAGE && evidenceReasonCode(evidence)) return 'dispatch-transient';
   return 'unknown';
 }
@@ -147,7 +186,7 @@ const redactEvidence = evidence => Object.fromEntries(Object.entries(evidence ??
   .map(([k, v]) => [k, typeof v === 'string' ? redactSpawnText(v) : v]));
 /** Singleton daemon owns this ledger. Persist intent before spawning so a crash cannot double-file. */
 export async function recordPrepareFailure({ num, attempt, stage, evidence = {} }, {
-  path = failureStatePath(), fileCard, now = Date.now(), settings = readBackoffSettings(),
+  path = failureStatePath(), fileCard, now = Date.now(), settings = readBackoffSettings(), preparePolicy = readPreparePolicy(),
 } = {}) {
   // builder-starved — a clone-wide dispatch refusal (the daemon's clone is behind origin/main) is not this card's
   // failure: never persisted, never held, never charged. The next tick after the clone's self-sync retries it.
@@ -180,6 +219,7 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
     Object.assign(failure, { reasonCode: 'lane-busy', attempts, ...backoffVerdict({ attempts, now, settings }) });
     if (failure.exhausted) failure.holdReason = LANE_BUSY_EXHAUSTED;
   }
+  if (cause === 'unknown' && preparePolicy.retryUnstampedOnce) decideUnstampedRetry(state, failure, now);
   state.failures[key] = failure;
   if (cause === 'unknown') {
     const signature = evidence.causeKey || `${stage}:${String(evidence.terminal ?? evidence.error ?? evidence.reason ?? 'missing terminal evidence').replace(/#?\d+/g, 'N')}`;
@@ -223,7 +263,7 @@ export function completePrepareFailures(num, path = failureStatePath()) {
  *   names the newest origin/main commit that changed the card's file AFTER `sinceIso` (null when none); it releases
  *   a held `needs-you` record (step e). Omitted, needs-you holds are left alone.
  */
-export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings(), cardChange = null } = {}) {
+export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings(), cardChange = null, preparePolicy = readPreparePolicy() } = {}) {
   const state = readFailureState(path);
   const touched = new Set();
   // builder-starved (2026-10-07) — SELF-HEAL held dispatch failures the CURRENT policy would never have held:
@@ -261,7 +301,11 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
     const healedAt = new Date(now).toISOString();
     if (cause === 'infra-transient') {
       const used = Object.values(state.failures).filter(o => o.num === f.num && o !== f && o.cause === 'infra-transient').length;
-      if (used >= INFRA_RETRY_BUDGET) continue;
+      if (used >= INFRA_RETRY_BUDGET) {
+        Object.assign(f, { cause, healedFrom: f.cause, healedAt, retry: false, holdReason: INFRA_EXHAUSTED });
+        healed = true;
+        continue;
+      }
       Object.assign(f, { cause, healedFrom: f.cause, held: false, retry: true, healedAt });
       touched.add(f.num); healed = true;
     } else if (cause === 'lane-busy') {
@@ -297,6 +341,15 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
       if (!change?.commit || !(Date.parse(change.at) > Date.parse(since))) continue;
       Object.assign(f, { held: false, retry: true, releasedAt: new Date(now).toISOString(), releasedBy: { cardChange: change.commit, at: change.at } });
       touched.add(f.num);
+    }
+  }
+  // (f) Older unknown failures had neither a retry nor a visible operator hold.
+  if (preparePolicy.retryUnstampedOnce) {
+    for (const f of Object.values(state.failures)) {
+      if (!f.held || f.completed || f.cause !== 'unknown' || f.holdReason) continue;
+      decideUnstampedRetry(state, f, now);
+      if (f.retry) touched.add(f.num);
+      healed = true;
     }
   }
   for (const f of Object.values(state.failures)) {

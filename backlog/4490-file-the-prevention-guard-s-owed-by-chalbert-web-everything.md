@@ -3,9 +3,11 @@ bornAs: xt4jynt
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/check-standards.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/lib/git-grep-gate.mjs", "we:scripts/lib/__tests__/git-grep-gate.test.mjs", "we:scripts/__tests__/citation-check.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-09-29"
+dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "d94901c295a89f3bc92cc2377a7211bc9cf1f3c0"
 tags: []

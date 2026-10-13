@@ -436,25 +436,25 @@ describe('scoreEscalation', () => {
   });
   it('humanRequired for the DECLARATIVE LEASH or STATUTE, but NOT for the ENGINE lander (#2445 two-tier flip)', () => {
     // a declarative-leash file (the roster) → escalate AND humanRequired (#2771/#2785)
-    const policy = scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs'] });
+    const policy = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/gate-config.mjs'] });
     expect(policy.escalate).toBe(true);
     expect(policy.humanRequired).toBe(true);
     expect(policy.reasons.join(' ')).toMatch(/gate-self/);
     // the statute layer → escalate AND humanRequired (#2412)
-    const statute = scoreEscalation({ changedFiles: ['docs/agent/platform-decisions.md'] });
+    const statute = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['docs/agent/platform-decisions.md'] });
     expect(statute.escalate).toBe(true);
     expect(statute.humanRequired).toBe(true);
     expect(statute.reasons.join(' ')).toMatch(/statute/);
     // the ENGINE lander → escalates but agent-reviewable (NOT humanRequired) — the flip
-    const lander = scoreEscalation({ changedFiles: ['scripts/merge-ai-prs.mjs'] });
+    const lander = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/merge-ai-prs.mjs'] });
     expect(lander.escalate).toBe(true);
     expect(lander.humanRequired).toBe(false);
     // other blast-radius → escalates but agent-reviewable (NOT humanRequired)
-    const other = scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] });
+    const other = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/pr-land.mjs'] });
     expect(other.escalate).toBe(true);
     expect(other.humanRequired).toBe(false);
     // a plain leaf → neither
-    expect(scoreEscalation({ changedFiles: ['backlog/x.md'] }).humanRequired).toBe(false);
+    expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['backlog/x.md'] }).humanRequired).toBe(false);
   });
 });
 
@@ -517,11 +517,11 @@ describe('#3317 — the escalation basis is cumulative (merge-base…head) for e
 
   describe('#3317 — the human gate keeps its #2390-review-fix guarantee, and gains the union', () => {
     it('#3317 — an ancestor\'s declarative-leash edit still forces a human (unchanged)', () => {
-      const r = scoreEscalation({ changedFiles: ['backlog/leaf.md'], humanBasisFiles: ['scripts/lib/gate-config.mjs'] });
+      const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['backlog/leaf.md'], humanBasisFiles: ['scripts/lib/gate-config.mjs'] });
       expect(r.humanRequired).toBe(true);
     });
     it('#3317 — and an own-delta-only statute edit now does too: the union can only ADD to the gate', () => {
-      const r = scoreEscalation({ changedFiles: ['docs/agent/platform-decisions.md'], humanBasisFiles: ['backlog/leaf.md'] });
+      const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['docs/agent/platform-decisions.md'], humanBasisFiles: ['backlog/leaf.md'] });
       expect(r.humanRequired).toBe(true);
       expect(r.reasons.join(' ')).toMatch(/statute/);
     });
@@ -1987,7 +1987,7 @@ describe('scoreEscalation carries the advisory careLevel (#2567 — additive)', 
     expect(scoreEscalation({ changedFiles: ['scripts/pr-land.mjs'] }).careLevel).toBe(CARE_LEVELS.ELEVATED);
   });
   it('a declarative-leash (humanRequired) PR → high', () => {
-    expect(scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs'] }).careLevel).toBe(CARE_LEVELS.HIGH);
+    expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/gate-config.mjs'] }).careLevel).toBe(CARE_LEVELS.HIGH);
   });
   it('#2771/#2785 — a derivation-CODE PR drops from high to elevated (committee rigor, not a human)', () => {
     const r = scoreEscalation({ changedFiles: ['scripts/lib/review-core.mjs'] });
@@ -2110,20 +2110,20 @@ describe('the #2771/#2785 tier table — real repo paths, pinned route', () => {
   ];
   for (const [what, changedFiles, humanRequired, label] of TABLE) {
     it(`${what} ⇒ humanRequired=${humanRequired}, label=${label}`, () => {
-      const r = scoreEscalation({ changedFiles });
+      const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles });
       expect(r.humanRequired).toBe(humanRequired);
       expect(producerReviewLabel(r)).toBe(label);
     });
   }
 
   it('an 800-line ORDINARY PR is still not a human problem — size never routes (#2563/#2567)', () => {
-    const r = scoreEscalation({ changedFiles: ['demos/spa.html', 'src/app.ts'], diffLines: 800 });
+    const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['demos/spa.html', 'src/app.ts'], diffLines: 800 });
     expect(r.humanRequired).toBe(false);
     expect(producerReviewLabel(r)).toBe(REVIEW_LABELS.pending);   // escalates on size, but to the committee
     expect(r.careLevel).toBe(CARE_LEVELS.LOW);                    // …as advisory care, per #2567
   });
   it('a 5-line THRESHOLD change is a human problem, however small (#2771 — the spec has no small edit)', () => {
-    const r = scoreEscalation({ changedFiles: ['scripts/lib/review-policy.contract.json'], diffLines: 5 });
+    const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/review-policy.contract.json'], diffLines: 5 });
     expect(r.humanRequired).toBe(true);
     expect(producerReviewLabel(r)).toBe(REVIEW_LABELS.human);
   });
@@ -2143,15 +2143,15 @@ describe('the #2771/#2785 tier table — real repo paths, pinned route', () => {
     const humanRows = [['scripts/lib/gate-config.mjs'], ['docs/agent/platform-decisions.md']];
     const agentRows = [['scripts/lib/review-escalation.mjs'], ['scripts/merge-ai-prs.mjs'], ['scripts/pr-land.mjs']];
     for (const changedFiles of [...humanRows, ...agentRows]) {
-      const { reasons } = scoreEscalation({ changedFiles, diffLines: 900, dismissedFindings: 2, crossRepo: true });
+      const { reasons } = scoreEscalation({ humanSurfaces: 'broad', changedFiles, diffLines: 900, dismissedFindings: 2, crossRepo: true });
       expect(reasons.length).toBeGreaterThan(0);
       for (const reason of reasons) expect(() => deriveReviewDisposition({ reason })).not.toThrow();
     }
     // A derivation-code-only PR converges AND auto-lands (the narrowing, at the disposition layer too)…
-    expect(deriveReviewDisposition({ reasons: scoreEscalation({ changedFiles: ['scripts/lib/review-core.mjs'] }).reasons }))
+    expect(deriveReviewDisposition({ reasons: scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/review-core.mjs'] }).reasons }))
       .toEqual({ mode: REVIEW_DISPOSITIONS.CONVERGE, autoLand: true });
     // …while the leash converges but a human still gates the merge.
-    expect(deriveReviewDisposition({ reasons: scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs'] }).reasons }))
+    expect(deriveReviewDisposition({ reasons: scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/gate-config.mjs'] }).reasons }))
       .toEqual({ mode: REVIEW_DISPOSITIONS.CONVERGE, autoLand: false });
   });
 
@@ -2164,14 +2164,14 @@ describe('the #2771/#2785 tier table — real repo paths, pinned route', () => {
     // The narrowing moved ONLY the first term (whole policy tier → its declarative-leash half). The statute term
     // is `statuteFiles.length > 0`, exactly as on main, so this row must match main's behaviour byte for byte.
     for (const s of ['docs/agent/platform-decisions.md', 'docs/agent/2026-06-example-statute.md']) {
-      const r = scoreEscalation({ changedFiles: [s] });
+      const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [s] });
       expect(r.humanRequired).toBe(true);
       expect(producerReviewLabel(r)).toBe(REVIEW_LABELS.human);
       expect(r.reasons.join(' ')).toMatch(/statute \(/);
       // …and it survives every other signal, including a derivation-code file riding along.
-      expect(scoreEscalation({ changedFiles: [s, 'scripts/lib/review-escalation.mjs'], diffLines: 900 }).humanRequired).toBe(true);
+      expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: [s, 'scripts/lib/review-escalation.mjs'], diffLines: 900 }).humanRequired).toBe(true);
       // …and on the cumulative human basis (#2390), where the own-delta hides it.
-      expect(scoreEscalation({ changedFiles: ['demos/spa.html'], humanBasisFiles: ['demos/spa.html', s] }).humanRequired).toBe(true);
+      expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['demos/spa.html'], humanBasisFiles: ['demos/spa.html', s] }).humanRequired).toBe(true);
     }
   });
 });
@@ -2867,5 +2867,62 @@ describe('deviation disclosure (#4502)', () => {
   it('deviation: the delivery-agent brief tells workers to put Deviation: on the first line', () => {
     const brief = readFileSyncDev(resolveDev(process.cwd(), 'skills-src/conveyor/delivery-agent-brief.md'), 'utf8');
     expect(brief).toContain('`Deviation: <what and why>`');
+  });
+});
+
+describe('configurable human surfaces (2026-10-12)', () => {
+  const fixtures = [
+    ['gate-self', 'scripts/lib/gate-config.mjs', ''],
+    ['statute', 'docs/agent/platform-decisions.md', '@@ -1,2 +1,2 @@\n ### Rule {#rule}\n-must hold\n+may hold'],
+    ['marked-invariant', 'src/example.js', '@@ -1,2 +1,2 @@\n // @invariant stable\n-const value = true;\n+const value = false;'],
+  ];
+  it.each(fixtures)('demotes %s to AI review by default and restores broad', (category, file, hunk) => {
+    const diffHunks = `diff --git a/${file} b/${file}\n${hunk}\n`;
+    const score = scoreEscalation({ changedFiles: [file], diffHunks });
+    expect(score.humanRequired).toBe(false);
+    expect(score.escalate).toBe(true);
+    expect(score.signals.blastRadius).toContain(file);
+    expect(score.signals.humanSurfacesDemoted[category]).toContain(file);
+    expect(score.humanSurfaces.preset).toBe('narrow');
+    expect(score.reasons.some(r => /^(gate-self|statute|principle-surface) \(/.test(r))).toBe(false);
+    expect(scoreEscalation({ changedFiles: [file], diffHunks, humanSurfaces: 'broad' }).humanRequired).toBe(true);
+  });
+  it.each([['.github/workflows/x.yml', 'workflow-edit'], ['scripts/lib/gh-app-shim.mjs', 'identity'], ['.env', 'secrets'], ['scripts/settings/human-review-surfaces.json', 'human-surface-setting']])('holds %s', (file, kind) => {
+    const score = scoreEscalation({ changedFiles: [file] });
+    expect(score.humanRequired).toBe(true);
+    expect(score.signals.permissionChange).toContain(file);
+    expect(score.reasons.find(r => r.startsWith('permission-change ('))).toContain(`${file}: ${kind}`);
+  });
+  it('keeps identity tests agent reviewable and floors settings', () => {
+    expect(scoreEscalation({ changedFiles: ['scripts/lib/__tests__/github-app-identity.test.mjs'] }).humanRequired).toBe(false);
+    expect(scoreEscalation({ changedFiles: ['scripts/settings/human-review-surfaces.json'], humanSurfaces: ['workflow'] }).humanRequired).toBe(true);
+  });
+  it('parks a narrow leash edit as pending', () => {
+    const score = scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs'] });
+    expect(decideReviewGate(score)).toMatchObject({ action: 'park', applyLabel: 'review:pending' });
+  });
+});
+
+
+describe('human surface settings use their own diff section', () => {
+  const pref = 'scripts/lib/delivery-platform-preferences.json';
+  const other = 'scripts/example.mjs';
+  const diff = (file, body) => `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n${body}\n`;
+  it('does not borrow a setting mention from another file; missing own hunks fail closed', () => {
+    const unrelated = diff(other, '+humanReviewSurfaces = "broad"');
+    const score = (diffHunks) => scoreEscalation({ changedFiles: [pref, other], diffHunks, humanSurfaces: ['workflow'] });
+    expect(score(diff(pref, '+"other": true') + unrelated).humanRequired).toBe(false);
+    expect(score(unrelated).humanRequired).toBe(true);
+    expect(score(diff(pref, '+"humanReviewSurfaces": "narrow"')).humanRequired).toBe(true);
+  });
+  it('keeps deviation disclosure human even with only the workflow category', () => {
+    expect(scoreEscalation({ humanSurfaces: ['workflow'], deviation: 'operator must decide' })).toMatchObject({ humanRequired: true, signals: { deviation: 'operator must decide' } });
+  });
+  it('activates an individual principle category without restoring the others', () => {
+    const score = scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs', 'docs/agent/platform-decisions.md'], humanSurfaces: ['statute'] });
+    expect(score.humanRequired).toBe(true);
+    expect(score.signals.statute).toEqual(['docs/agent/platform-decisions.md']);
+    expect(score.signals.humanSurfacesDemoted).toEqual({ 'gate-self': ['scripts/lib/gate-config.mjs'] });
+    expect(score.signals.gateSelf).toBeUndefined();
   });
 });
