@@ -149,13 +149,13 @@ export async function admitCard(input, {
     if (!isAbsolute(target) && !/^[\w+.-]+:\/\//.test(target) && !/^[^/]+:/.test(target)) target = resolve(repoDir, target);
     if (target.startsWith('-')) throw new TypeError('remote url must not start with "-"');
     git(['init', '--bare', '-q', scratch]);
-    git(['fetch', '--no-tags', repoDir, input.baseSha]);
-    const baseSha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
+    git(['fetch', '--no-tags', repoDir, `+${input.baseSha}:refs/card-batch/base`]);
+    const baseSha = git(['rev-parse', 'refs/card-batch/base^{commit}']).trim();
     const advertised = git(['ls-remote', '--refs', target, ref]).trim();
     let remoteHead = null;
     if (advertised) {
-      git(['fetch', '--no-tags', target, ref]);
-      remoteHead = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
+      git(['fetch', '--no-tags', target, `+${ref}:refs/card-batch/remote`]);
+      remoteHead = git(['rev-parse', 'refs/card-batch/remote^{commit}']).trim();
     }
     let state = recorded?.batchRef ? { ...recorded, lease: auditLease } : {
       batchRef: ref.slice('refs/heads/'.length), seq, headSha: baseSha,

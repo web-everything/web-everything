@@ -23,7 +23,9 @@
  *   2. `run.mjs file-item`, IN that lane — writes the card, exactly as the synchronous path used to.
  *   3. A new card with no lane-local dedupe mentions joins the rolling prevention batch via
  *      `fileIntoBatch`. Admission skips commit/verify/open-pr here: the existing batch seal job publishes
- *      the held draft and makes it ready at the count/window limit. Refusal or error falls through.
+ *      the held draft and makes it ready at the count/window limit. Refusal or error fails closed:
+ *      persist to the pending spool, drained before each filing or via --drain-pending. Only an explicit
+ *      policy opt-out permits the per-card path.
  *   4. `git add` + `git commit` the one new card file, in the lane.
  *   5. `run.mjs verify --mode=run` — the lane's own gate, run for REAL. This process has no foreground-turn
  *      timeout to respect (unlike a dispatched agent's Bash tool) — `we:scripts/verify-lane.mjs`'s
@@ -77,16 +79,19 @@
  * Usage:
  *   node scripts/operations/land-prevention-card.mjs --title=<t> --kind=<k> --size=<n> --digest=<d> \
  *     --scope=<s> [--parent=<NNN>] --queue=<true|false> --session=<slug>
+ *   node scripts/operations/land-prevention-card.mjs --drain-pending
+ *   node scripts/operations/land-prevention-card.mjs --fold-open-singles [--json]
  */
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
+import { cardBatchStateDir } from './card-batch-io.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
@@ -211,6 +216,10 @@ export function parseLandPreventionCardArgv(argv = []) {
     if (eq === -1) flags[a.slice(2)] = 'true';
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
+  if (flags['drain-pending'] === 'true' || flags['fold-open-singles'] === 'true') {
+    return { drainPending: flags['drain-pending'] === 'true', foldOpenSingles: flags['fold-open-singles'] === 'true',
+      json: flags.json === 'true', session: flags.session || `prevention-recovery-${process.pid}` };
+  }
   const missing = REQUIRED_FLAGS.filter((name) => !String(flags[name] ?? '').trim());
   if (missing.length) {
     throw new TypeError(
@@ -331,6 +340,104 @@ export function buildPrMentionComment({ card, lines }) {
     + `filing a new card. Carry them onto the card when it lands.\n\n${lines.join('\n')}\n`;
 }
 
+const defaultExec = (cmd, args, opts = {}) => String(execFileSync(cmd, args, {
+  encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...opts,
+}));
+const errorReason = (error) => String(error?.message || error).split('\n')[0];
+const pendingPreventionDir = () => join(cardBatchStateDir(), 'pending-prevention');
+
+function spoolPrevention(entry, pendingDir) {
+  mkdirSync(pendingDir, { recursive: true });
+  const temporary = join(pendingDir, `.${entry.cardId}-${process.pid}-${Date.now()}.tmp`);
+  try {
+    writeFileSync(temporary, JSON.stringify(entry), 'utf8');
+    renameSync(temporary, join(pendingDir, `${entry.cardId}.json`));
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+// Restoring the prior working-tree bytes keeps recovery content out of the run's own commit.
+async function withRecoveryCard(lane, rel, content, admit) {
+  if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(rel)) throw new Error('invalid pending card path');
+  const path = join(lane, rel);
+  const previous = existsSync(path) ? readFileSync(path) : null;
+  mkdirSync(join(lane, 'backlog'), { recursive: true });
+  try {
+    writeFileSync(path, content);
+    return await admit();
+  } finally {
+    if (previous !== null) writeFileSync(path, previous);
+    else rmSync(path, { force: true });
+  }
+}
+
+/** Best-effort recovery: failed entries remain durable and cannot block the new filing. */
+export async function drainPendingPrevention({ lane }, {
+  pendingDir = pendingPreventionDir(), exec = defaultExec, batch = fileIntoBatch,
+  write = (line) => process.stdout.write(line), batchOptions = {},
+} = {}) {
+  let entries;
+  try { entries = readdirSync(pendingDir).filter(name => name.endsWith('.json')).sort(); }
+  catch (error) {
+    if (error.code !== 'ENOENT') write(`land-prevention-card: pending spool read failed — ${errorReason(error)}\n`);
+    return;
+  }
+  for (const name of entries) {
+    const path = join(pendingDir, name);
+    try {
+      const entry = JSON.parse(readFileSync(path, 'utf8'));
+      if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(entry.rel)) throw new Error('invalid pending card path');
+      if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
+        rmSync(path);
+        continue;
+      }
+      const result = await withRecoveryCard(lane, entry.rel, entry.content, () => batch({
+        laneDir: lane, cardPath: entry.rel, kind: 'prevention', actor: 'mechanical',
+        idemKey: entry.idemKey, source: entry.source,
+      }, batchOptions));
+      if (result.batched) {
+        rmSync(path);
+        write(`land-prevention-card: batched ${entry.rel} into ${result.batchRef} (from the pending spool)\n`);
+      }
+    } catch (error) { write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`); }
+  }
+}
+
+/** Fold only open, single-added-card prevention heads; their PR metadata remains untouched. */
+export async function foldOpenSingles({ lane }, {
+  exec = defaultExec, batch = fileIntoBatch, write = (line) => process.stdout.write(line), batchOptions = {},
+} = {}) {
+  const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug,
+    '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,files'], {}));
+  const summary = { folded: [], notFolded: [] };
+  for (const pr of prs.filter(pr => /^lane\/.+-prevention-card$/.test(pr.headRefName))) {
+    let reason;
+    const rel = pr.files?.[0]?.path;
+    try {
+      if (pr.files?.length !== 1 || !/^backlog\/x[a-z0-9]{6}-[^/]+\.md$/.test(rel ?? '')) {
+        throw new Error('not exactly one added backlog card');
+      }
+      if (!/^[a-f0-9]{40}$/.test(pr.headRefOid)) throw new Error('invalid PR head');
+      exec('git', ['-C', lane, 'fetch', '--no-tags', '-q', 'origin', pr.headRefOid], {});
+      const changes = String(exec('git', ['-C', lane, 'diff', '--name-status', `origin/main...${pr.headRefOid}`], {})).trim();
+      if (changes !== `A\t${rel}`) throw new Error('not exactly one added backlog card');
+      const content = exec('git', ['-C', lane, 'show', `${pr.headRefOid}:${rel}`], {});
+      const result = await withRecoveryCard(lane, rel, content, () => batch({
+        laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey: `prevention:${cardIdOf(rel)}`,
+        source: { repo: CONSTELLATION_REPOS.we.slug, pr: pr.number, head: pr.headRefOid, note: `folded from #${pr.number}` },
+      }, batchOptions));
+      if (result.batched) {
+        summary.folded.push(pr.number);
+        write(`land-prevention-card: folded #${pr.number} ${rel} into ${result.batchRef}\n`);
+        continue;
+      }
+      reason = result.reason;
+    } catch (error) { reason = errorReason(error); }
+    summary.notFolded.push({ pr: pr.number, reason });
+    write(`land-prevention-card: not folded #${pr.number} — ${reason}\n`);
+  }
+  return summary;
+}
+
 /**
  * THE ORCHESTRATION, INJECTABLE FOR TESTS. `exec` has the SAME `(cmd, args, opts) => string` shape as
  * `execFileSync` (throttled or not) elsewhere in this repo — a test hands it a scripted stub, never a real
@@ -358,7 +465,8 @@ export function buildPrMentionComment({ card, lines }) {
  *   url:(string|null), reason:(string|null)}>}
  */
 export async function landPreventionCard(input, {
-  exec = (cmd, args, opts = {}) => String(execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...opts })),
+  exec = defaultExec,
+  pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
   mkTmp = () => mkdtempSync(join(tmpdir(), 'land-prevention-card-')),
   writeFile = writeFileSync,
@@ -382,7 +490,7 @@ export async function landPreventionCard(input, {
   // leaks the lane" gap: `mkTmp()`/`writeFile()` (and any other step that is not its own already-labelled failure
   // mode below) must still release the lane and return a clean failure, never propagate an unhandled rejection.
   try {
-    const generic = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(input.title);
+    const generic = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(input.title ?? '');
     if (generic) input = { ...input, title: preventionCardTitle({ repo: generic[1], pr: generic[2], digest: input.digest }) };
     let acquired;
     try {
@@ -404,6 +512,13 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
+    await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
+    if (input.foldOpenSingles) {
+      const summary = await foldOpenSingles({ lane }, { exec, batch, write });
+      return { ok: true, step: 'folded', ...summary };
+    }
+    if (input.drainPending) return { ok: true, step: 'drained', pr: null };
+
 
     // DEDUPE BEFORE FILING. A failure here never blocks the filing: it files exactly as before.
     let plan = null;
@@ -472,30 +587,27 @@ export async function landPreventionCard(input, {
     }
 
     if (rel && mentioned.length === 0) {
+      const cardId = cardIdOf(rel) ?? num ?? input.session;
+      const idemKey = `prevention:${cardId}`;
+      const source = { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
+        note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title };
+      let result;
       try {
         const preventionSettings = loadBatchSettings();
-        const minutes = preventionSettings.batchLeaseWaitMinutes;
-        // A detached job can wait through the seal job's verification lease. Keep other callers' defaults.
-        const retries = Math.ceil(minutes * 60 / 30);
-        const result = await batch({
-          laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical',
-          idemKey: `prevention:${cardIdOf(rel) ?? num ?? input.session}`,
-          // The batch PR lives where the card lives (web-everything), whatever repo the source PR was in.
-          source: { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
-            note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title },
-        }, { preventionSettings, retries, pause: () => wait(30_000) });
-        if (result.batched) {
-          const { batchRef } = result;
-          write(`land-prevention-card: batched ${rel} into ${batchRef}\n`);
-          return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef };
-        }
-        if (result.reason === 'coordinator refused: lease-held') {
-          write(`land-prevention-card: batch lease still held after ${minutes} min; opening the card's own PR\n`);
-        } else {
-          write(`land-prevention-card: not batched — ${result.reason}; opening the card's own PR\n`);
-        }
-      } catch (error) {
-        write(`land-prevention-card: batch failed — ${String(error?.message || error).split('\n')[0]}; opening the card's own PR\n`);
+        const retries = Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30);
+        result = await batch({ laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey, source },
+          { preventionSettings, retries, pause: () => wait(30_000) });
+      } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
+      if (result?.batched) {
+        write(`land-prevention-card: batched ${rel} into ${result.batchRef}\n`);
+        return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef: result.batchRef };
+      }
+      if (result?.disabled !== true) {
+        const reason = result?.reason ?? 'admission returned no result';
+        spoolPrevention({ cardId, rel, content: readFile(join(lane, rel)), idemKey, source, num,
+          title: input.title, spooledAt: new Date().toISOString(), reason }, pendingDir);
+        write(`land-prevention-card: held ${rel} for the next batch window — ${reason}\n`);
+        return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
       }
     }
 
@@ -550,6 +662,9 @@ export async function landPreventionCard(input, {
     if (submit?.outcome !== 'opened') {
       return fail('open-pr', submit?.reason ?? 'PR was not opened', { num, rel, pr: submit?.pr, url: submit?.url });
     }
+    try {
+      exec('gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
+    } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
     return {
       ok: true, step: 'done', num, rel, pr: submit.pr ?? null, url: submit.url ?? null, reason: null,
@@ -622,6 +737,7 @@ export async function runLandPreventionCardCli(argv = [], {
   write = (line) => process.stdout.write(line),
   writeErr = (line) => process.stderr.write(line),
   retract = (r) => postLandingRetraction(r, { write: writeErr }),
+  ...deps
 } = {}) {
   let input;
   try {
@@ -631,7 +747,7 @@ export async function runLandPreventionCardCli(argv = [], {
     return { code: 1, result: null };
   }
   write(`land-prevention-card: starting (session ${input.session}) — pid ${process.pid}\n`);
-  const result = await land(input, { write });
+  const result = await land(input, { ...deps, write });
   if (!result.ok) {
     writeErr(`land-prevention-card: did not land — ${result.step}: ${result.reason}\n`);
     // The approval that spawned this job already posted its filing marker; retract it so the guard is retried on
@@ -645,7 +761,8 @@ export async function runLandPreventionCardCli(argv = [], {
     }
     return { code: 1, result };
   }
-  write(`land-prevention-card: done — PR #${result.pr}\n`);
+  if (input.json) write(`${JSON.stringify(result.folded ? { folded: result.folded, notFolded: result.notFolded } : result)}\n`);
+  else write(`land-prevention-card: done — ${result.step}${result.pr ? ` PR #${result.pr}` : ''}\n`);
   return { code: 0, result };
 }
 

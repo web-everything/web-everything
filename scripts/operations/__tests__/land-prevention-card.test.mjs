@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import {
   landPreventionCard as realLandPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
   boundCardText, boundLandPreventionCardInput, CARD_TEXT_CAPS, buildLandingRetractionComment, postLandingRetraction,
-  runCardDedupe,
+  runCardDedupe, foldOpenSingles,
 } from '../land-prevention-card.mjs';
 import {
   hasApprovalPreventionMarkerForHead, buildApprovalPreventionMarker, buildApprovalPreventionJobMarker,
@@ -30,7 +30,8 @@ import { resolvePreventionBatchSettings } from '../../lib/card-batch-settings.mj
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 
 const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
-  batch: async () => ({ batched: false, reason: 'per-card test' }), ...deps,
+  pendingDir: '/tmp/no-prevention-spool-for-unit-tests',
+  batch: async () => ({ batched: false, disabled: true, reason: 'per-card test' }), ...deps,
 });
 
 const INPUT = {
@@ -70,7 +71,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
   it('two unnumbered (hash-id) cards open on DISTINCT branch refs', async () => {
     const refFor = async (rel, session) => {
       const fileOk = JSON.stringify({ verdict: { num: null, rel } });
-      const { exec, calls } = scriptedExec([ACQUIRE_OK, fileOk, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([ACQUIRE_OK, fileOk, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const result = await landPreventionCard({ ...INPUT, session }, {
         exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
       });
@@ -90,7 +91,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
   });
 
   it('lands the card: reaches an opened, labelled PR, and releases the lane', async () => {
-    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
     const written = [];
     const result = await landPreventionCard(INPUT, {
       exec, write: () => {}, mkTmp: () => '/tmp/land-prevention-card-x', rmTmp: () => {}, writeFile: (p, c) => written.push({ p, c }),
@@ -128,7 +129,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     expect(calls[5].args).toContain('--requireVerified=true');
     expect(calls[5].args.some((a) => a.startsWith('--ref=lane/9001-'))).toBe(true);
     // release — the pool slot is freed once the content is pushed, by lane NUMBER.
-    expect(calls[6].args).toEqual(expect.arrayContaining(['release', '--lane=7', '--session=prevention-card-test']));
+    expect(calls[7].args).toEqual(expect.arrayContaining(['release', '--lane=7', '--session=prevention-card-test']));
     expect(written.some((w) => w.p.endsWith('commit-msg.txt') && w.c.includes('Co-Authored-By'))).toBe(true);
     expect(written.some((w) => w.p.endsWith('pr-body.md') && w.c.includes(INPUT.digest))).toBe(true);
   });
@@ -220,7 +221,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     };
 
     it('success: exactly one scratch dir, gone after the job returns', async () => {
-      const { exec } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const { made, mkTmp } = realScratch();
       const result = await landPreventionCard(INPUT, { exec, write: () => {}, mkTmp });
       expect(result.ok).toBe(true);
@@ -267,7 +268,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   it('a duplicate becomes an "Also raised by" line on the open card: no file-item, the edit lands through the same gate + PR', async () => {
     const acquire = setup();
     try {
-      const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const written = [];
       const batch = vi.fn();
       const result = await landPreventionCard(input(), {
@@ -295,7 +296,7 @@ describe('landPreventionCard — dedupe before filing', () => {
       mixed.digest = mixed.digest.replace('\n\nIdempotency key',
         '\n\n2. `we:scripts/other-check.mjs:10` — Reject malformed flags before dispatch.\n\nIdempotency key');
       mixed.scope += ',we:scripts/other-check.mjs';
-      const { exec, calls } = scriptedExec([acquire, 'mention-added', FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([acquire, 'mention-added', FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const batch = vi.fn(async () => ({ batched: true, batchRef: 'should-not-be-used' }));
       const result = await landPreventionCard(mixed, {
         exec, batch, dedupe, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {},
@@ -312,7 +313,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   it('a different target file is filed as today, and the open card is untouched', async () => {
     const acquire = setup();
     try {
-      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const result = await landPreventionCard(input('scripts/other-check.mjs'), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe });
       expect(result).toMatchObject({ ok: true, num: 9001 });
       expect(calls[1].args).toContain('file-item');
@@ -323,7 +324,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   it('a claimed (status active) card is never touched: the finding is filed instead', async () => {
     const acquire = setup('active');
     try {
-      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const result = await landPreventionCard(input(), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe });
       expect(result).toMatchObject({ ok: true, num: 9001 });
       expect(calls[1].args).toContain('file-item');
@@ -334,7 +335,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   it('a card claimed between the plan and the write is re-checked on the lane copy: filed, not mentioned', async () => {
     const acquire = setup();
     try {
-      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const racing = (i, o) => { const plan = dedupe(i, o); writeFileSync(join(lane, REL), cardText('active')); return plan; };
       const result = await landPreventionCard(input(), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe: racing });
       expect(result).toMatchObject({ ok: true, num: 9001 });
@@ -346,7 +347,7 @@ describe('landPreventionCard — dedupe before filing', () => {
   });
 
   it('a dedupe that throws files exactly as before', async () => {
-    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
     const result = await landPreventionCard(INPUT, { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe: () => { throw new Error('boom'); } });
     expect(result).toMatchObject({ ok: true, num: 9001 });
     expect(calls[1].args).toContain('file-item');
@@ -606,7 +607,7 @@ describe('postLandingRetraction — a failed job retracts its own marker on the 
 
 
 describe('prevention batch landing', () => {
-  const deps = { dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
+  const deps = { pendingDir: '/tmp/no-prevention-spool-for-unit-tests', dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
     loadPreventionBatchSettings: () => resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention }) };
   it.each([null, { repo: 'o/r', pr: '42', headSha: 'abc' }])('hands a new hash card to the batch and releases without publishing (%j)', async (retract) => {
     const rel = 'backlog/x123456-prevention.md';
@@ -647,41 +648,136 @@ describe('prevention batch landing', () => {
     expect(sleep.mock.calls).toEqual([[30_000], [30_000]]);
     expect(calls).toHaveLength(3);
   });
-  it('opens one fallback PR when the lease wait budget is exhausted', async () => {
-    const preventionSettings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention,
+  it('prevention results distinguish policy opt-out and include git stderr on admission errors', async () => {
+    const options = { preventionSettings: deps.loadPreventionBatchSettings(), baseSha: 'a'.repeat(40),
+      stateDir: '/tmp/unused-batch-state', log: () => {}, launch: () => {}, retries: 0 };
+    const card = { laneDir: '/unused', cardPath: 'backlog/x123456-prevention.md', kind: 'prevention' };
+    expect(await fileIntoBatch({ ...card, batch: false }, options)).toMatchObject({ disabled: true, batched: false });
+    const error = Object.assign(new Error('git step failed'), { stderr: Buffer.from('fatal: missing base\nmore details') });
+    expect(await fileIntoBatch(card, { ...options, admit: async () => { throw error; } }))
+      .toMatchObject({ retryable: true, reason: 'admission failed: git step failed — fatal: missing base' });
+  });
+  it('exhausted lease wait holds the card after the configured retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));
+    const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention,
       repo: { batchLeaseWaitMinutes: 1 } });
-    const sleep = vi.fn(async () => {});
     const admit = vi.fn(async () => ({ action: 'refuse', reason: 'lease-held' }));
-    const batch = vi.fn((input, options) => {
-      expect(options).toMatchObject({ pause: expect.any(Function), retries: expect.any(Number) });
-      return fileIntoBatch(input, { ...options, admit,
-        baseSha: 'a'.repeat(40), stateDir: '/tmp/unused-batch-state', launch: () => {}, log: () => {} });
-    });
-    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
-    const write = vi.fn();
-    expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, sleep,
-      loadPreventionBatchSettings: () => preventionSettings, write })).toMatchObject({ ok: true, step: 'done', pr: 5555 });
-    expect(batch).toHaveBeenCalledTimes(1);
-    expect(admit).toHaveBeenCalledTimes(3);
-    expect(sleep.mock.calls).toEqual([[30_000], [30_000]]);
-    expect(write).toHaveBeenCalledWith("land-prevention-card: batch lease still held after 1 min; opening the card's own PR\n");
-    expect(calls.filter(({ args }) => args.includes('open-pr'))).toHaveLength(1);
+    const sleep = vi.fn(async () => {});
+    const batch = (input, options) => fileIntoBatch(input, { ...options, admit,
+      baseSha: 'a'.repeat(40), stateDir: '/tmp/unused-batch-state', log: () => {} });
+    try {
+      const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'released']);
+      expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, sleep, pendingDir: dir,
+        readFile: () => 'card bytes', loadPreventionBatchSettings: () => settings, write: () => {} }))
+        .toMatchObject({ step: 'held', reason: 'coordinator refused: lease-held' });
+      expect(admit).toHaveBeenCalledTimes(3);
+      expect(sleep.mock.calls).toEqual([[30_000], [30_000]]);
+      expect(calls).toHaveLength(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each([false, true])('falls back on refusal or throw (throw=%s)', async (throws) => {
-    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
-    const batch = vi.fn(async () => { if (throws) throw new Error('batch unavailable'); return { batched: false, reason: 'batch unavailable' }; });
-    const write = vi.fn();
-    expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, write })).toMatchObject({ ok: true, step: 'done', pr: 5555 });
-    expect(batch).toHaveBeenCalledTimes(1);
-    for (const op of ['commit', 'verify', 'open-pr', 'release']) expect(calls.some(({ args }) => args.includes(op))).toBe(true);
-    expect(write.mock.calls.flat().join('')).toContain('batch unavailable');
+  it('CLI recovery modes need no filing flags and print the fold JSON summary', async () => {
+    const land = vi.fn(async () => ({ ok: true, step: 'folded', folded: [1], notFolded: [{ pr: 2, reason: 'multiple files' }] }));
+    const lines = [];
+    expect(parseLandPreventionCardArgv(['--drain-pending'])).toMatchObject({ drainPending: true });
+    expect((await runLandPreventionCardCli(['--fold-open-singles', '--json'], { land, write: line => lines.push(line) })).code).toBe(0);
+    expect(land.mock.calls[0][0]).toMatchObject({ foldOpenSingles: true });
+    expect(JSON.parse(lines.at(-1))).toEqual({ folded: [1], notFolded: [{ pr: 2, reason: 'multiple files' }] });
   });
-  it('CLI treats batched as success without retracting the filing marker', async () => {
+  it.each(['coordinator refused: lease-held', 'admission failed: git unavailable', 'throw'])('holds and spools on %s without publishing', async (reason) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));
+    try {
+      const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'released']);
+      const batch = vi.fn(async () => {
+        if (reason === 'throw') throw new Error('git unavailable');
+        return { batched: false, retryable: true, reason };
+      });
+      const result = await realLandPreventionCard(INPUT, { ...deps, exec, batch, pendingDir: dir,
+        readFile: () => 'card bytes', write: () => {} });
+      expect(result).toMatchObject({ ok: true, step: 'held', pr: null });
+      expect(JSON.parse(readFileSync(join(dir, '9001.json'), 'utf8'))).toMatchObject({
+        cardId: '9001', rel: 'backlog/9001-file-the-prevention.md', content: 'card bytes', idemKey: 'prevention:9001',
+      });
+      expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('policy disable opens a labelled single PR', async () => {
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
+    const result = await realLandPreventionCard(INPUT, { ...deps, exec,
+      batch: async () => ({ batched: false, disabled: true, reason: 'policy off' }), write: () => {} });
+    expect(result.step).toBe('done');
+    expect(calls[6]).toMatchObject({ cmd: 'gh', args: ['pr', 'edit', '5555', '--repo', 'web-everything/web-everything', '--add-label', 'review:pending'] });
+  });
+  it('drains a pending entry before its own filing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));
+    const lane = join(dir, 'lane');
+    mkdirSync(join(lane, 'backlog'), { recursive: true });
+    const rel = 'backlog/x123456-pending.md';
+    writeFileSync(join(dir, 'x123456.json'), JSON.stringify({ cardId: 'x123456', rel, content: 'pending bytes', idemKey: 'prevention:x123456', source: { repo: 'web-everything/web-everything' } }));
+    try {
+      const { exec } = scriptedExec([JSON.stringify({ lane: 7, path: lane }), () => '', FILE_ITEM_OK, 'released']);
+      const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
+      const write = vi.fn();
+      const result = await realLandPreventionCard(INPUT, { ...deps, exec, batch, write, pendingDir: dir, writeFile: writeFileSync });
+      expect(result.step).toBe('batched');
+      expect(batch.mock.calls[0][0]).toMatchObject({ cardPath: rel, idemKey: 'prevention:x123456' });
+      expect(existsSync(join(dir, 'x123456.json'))).toBe(false);
+      expect(write.mock.calls.flat().join('')).toContain('from the pending spool');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['refused', 'landed', 'lookup-error'])('drain-only mode releases its lane and handles a %s entry safely', async (state) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));
+    const lane = join(dir, 'lane');
+    mkdirSync(join(lane, 'backlog'), { recursive: true });
+    const rel = 'backlog/x123456-pending.md';
+    const spool = join(dir, 'x123456.json');
+    writeFileSync(spool, JSON.stringify({ cardId: 'x123456', rel, content: 'pending bytes', idemKey: 'prevention:x123456', source: {} }));
+    const batch = vi.fn(async () => ({ batched: false, retryable: true, reason: 'lease-held' }));
+    const probe = state === 'lookup-error' ? new Error('missing origin/main') : () => state === 'landed' ? '100644 blob abc card' : '';
+    const { exec, calls } = scriptedExec([JSON.stringify({ lane: 7, path: lane }), probe, 'released']);
+    try {
+      const result = await runLandPreventionCardCli(['--drain-pending'], {
+        exec, pendingDir: dir, batch, write: () => {}, writeErr: () => {},
+      });
+      expect(result).toMatchObject({ code: 0, result: { step: 'drained' } });
+      expect(existsSync(spool)).toBe(state !== 'landed');
+      expect(existsSync(join(lane, rel))).toBe(false);
+      expect(batch).toHaveBeenCalledTimes(state === 'refused' ? 1 : 0);
+      expect(calls.at(-1).args).toContain('release');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fold mode admits only a single added card and never mutates the old PR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fold-prevention-test-'));
+    mkdirSync(join(dir, 'backlog'));
+    const rel = 'backlog/x123456-prevention.md';
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (args.includes('list')) return JSON.stringify([
+        { number: 1, headRefName: 'lane/x123456-prevention-card', headRefOid: 'a'.repeat(40), files: [{ path: rel }] },
+        { number: 2, headRefName: 'lane/x654321-prevention-card', headRefOid: 'b'.repeat(40), files: [{ path: rel }, { path: 'other.md' }] },
+      ]);
+      if (args.includes('diff')) return `A\t${rel}\n`;
+      if (args.includes('show')) return 'card bytes';
+      return '';
+    };
+    const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
+    try {
+      const result = await foldOpenSingles({ lane: dir }, { exec, batch, write: () => {} });
+      expect(result.folded).toEqual([1]);
+      expect(result.notFolded).toEqual([{ pr: 2, reason: 'not exactly one added backlog card' }]);
+      expect(batch.mock.calls[0][0]).toMatchObject({ idemKey: 'prevention:x123456',
+        source: { pr: 1, head: 'a'.repeat(40), note: 'folded from #1' } });
+      expect(existsSync(join(dir, rel))).toBe(false);
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(calls.some(call => call.includes('close') || call.includes('edit'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['batched', 'held'])('CLI treats %s as success without retracting the filing marker', async (step) => {
     const retract = vi.fn();
     const { code } = await runLandPreventionCardCli(
       ['--title=t', '--kind=story', '--size=3', '--digest=d', '--scope=we:a.mjs', '--queue=true', '--session=s',
         '--retract-repo=o/r', '--retract-pr=7', '--retract-head=abc'],
-      { land: async () => ({ ok: true, step: 'batched', pr: null, batchRef: 'lane/card-batch-prevention-1' }),
+      { land: async () => ({ ok: true, step, pr: null, batchRef: 'lane/card-batch-prevention-1' }),
         retract, write: () => {}, writeErr: () => {} });
     expect(code).toBe(0);
     expect(retract).not.toHaveBeenCalled();

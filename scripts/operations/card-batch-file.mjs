@@ -16,7 +16,9 @@
  *   - `cards.batchFiling` is off (settings cascade: `we:scripts/lib/card-batch-settings.mjs`);
  *   - the card's priority is high/urgent and the policy's `highPriorityBypass` is on;
  *   - the coordinator refuses (lease held, head mismatch, ineligible change, duplicate card…) or throws.
- * So a card is never lost: every non-admission falls back to the path that already works.
+ * Prevention results additionally expose `disabled:true` for policy opt-outs / non-card paths,
+ * or `retryable:true` for coordinator refusals / errors: prevention callers spool the latter.
+ * Ordinary filing callers retain their existing result shape and fallback behavior.
  *
  * CLI (for agents filing through the `file-item` skill):
  *   node scripts/operations/card-batch-file.mjs --lane=<lane> --card=backlog/<id>-<slug>.md \
@@ -84,9 +86,9 @@ export async function fileIntoBatch({
   log(kind === 'prevention' ? formatPreventionBatchSettings(preventionSettings) : formatCardBatchSettings(settings));
   const policy = effectiveCardBatchPolicy(settings, preventionSettings);
   const decision = decideBatchFiling({ batch, actor, priority, settings, preventionSettings, policy, kind });
-  if (!decision.batch) return { batched: false, reason: decision.reason };
+  if (!decision.batch) return { batched: false, reason: decision.reason, ...(kind === 'prevention' ? { disabled: true } : {}) };
   const cardId = cardIdOf(cardPath);
-  if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}` };
+  if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {
@@ -99,18 +101,18 @@ export async function fileIntoBatch({
     };
     // Concurrent filers serialize on the coordinator's lease. An admission or body refresh holds it for seconds,
     // so a contended filer tries again a bounded number of times. A long hold (a seal running verify) outlasts
-    // these attempts, and the card then takes its own PR, so it is never lost.
+    // these attempts, and the caller decides how to retain the refused card (prevention filers spool it).
     let result = await admit(input, { stateDir, policy });
     for (let attempt = 1; attempt <= retries && result.action === 'refuse' && RETRYABLE.has(result.reason); attempt += 1) {
       await pause(2_000 * attempt);
       result = await admit(input, { stateDir, policy });
     }
-    if (result.action === 'refuse') return { batched: false, reason: `coordinator refused: ${result.reason}` };
+    if (result.action === 'refuse') return { batched: false, reason: `coordinator refused: ${result.reason}`, ...(kind === 'prevention' ? { retryable: true } : {}) };
     const statePath = join(stateDir, `${repo.replaceAll('/', '-')}-${kind}.json`);
     launch(statePath);
     return { batched: true, batchRef: result.batchRef, member: result.member, statePath, deduped: result.action === 'dedupe' };
   } catch (error) {
-    return { batched: false, reason: `admission failed: ${String(error?.message || error).split('\n')[0]}` };
+    return { batched: false, ...(kind === 'prevention' ? { retryable: true } : {}), reason: `admission failed: ${String(error?.message || error).split('\n')[0]}${String(error?.stderr ?? '').trim() ? ` — ${String(error.stderr).trim().split('\n')[0]}` : ''}` };
   }
 }
 
