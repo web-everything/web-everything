@@ -972,28 +972,28 @@ export function createReviewPrSinks({
           }
         }
         // #4815 — what the confirmation turn concluded this run, keyed like a referral. A `reproduced` claim is already in
-        // `additions` (it stayed CONFIRMED), so it only needs its mark; a `not-reproduced` one is NOT a referral any more and is
-        // recorded in a chunk of its own whose only finding is retired (`activeReferrals`), so a re-run on this head never
-        // verifies it again and no later head carries it forward as a live referral. An unreadable entry is skipped, never fatal.
+        // `additions` (it stayed CONFIRMED), so it only needs its mark. A `not-reproduced` claim is also recorded as a live
+        // referral: the verifier's disagreement is evidence, and the independent mandatory reviewer must rule on it.
+        // A same-head run reuses that outcome and ruling attempt. An unreadable entry is skipped, never fatal.
         const verifiedByKey = new Map();
         for (const v of Array.isArray(payload.verifications) ? payload.verifications : []) {
           try {
             if (typeof v?.seat !== 'string' || !v.seat || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome) || !requiresMandatoryReferral(v.original)) continue;
             // PR #5025 review: a retiring record is written only for a reason that itself cites a line in the claim's own file — the
-            // same check `settleVerification` made, re-made here on the text this sink stores, so no payload can retire without it.
+            // same check `settleVerification` made, re-made here on the text this sink stores. It grants no retirement authority.
             if (v.outcome === 'not-reproduced' && !verifierEvidenceCitesClaim(v.original, v.reason)) continue;
             verifiedByKey.set(referralFindingKey(v.seat, v.original), v);
           } catch { /* a malformed outcome is skipped; the claim is verified again next run */ }
         }
         const recordedKeys = new Set(existing.flatMap(r => r.referrals.map(f => f.key)));
-        const retiredAdditions = new Map();
+        const disputedAdditions = new Map();
         for (const [key, v] of verifiedByKey) {
           if (v.outcome !== 'not-reproduced' || recordedKeys.has(key) || additions.has(key)) continue;
           const original = boundedReferral(v.original, sourceByOriginal.get(JSON.stringify(v.original)) ?? prUrl);
-          retiredAdditions.set(key, { key, seat: v.seat, original, finding: normalizeFinding(original),
+          disputedAdditions.set(key, { key, seat: v.seat, original, finding: normalizeFinding(original),
             reason: foldVerifyReason(v.reason, 'not reproduced on the PR head') });
         }
-        if (additions.size || retiredAdditions.size) {
+        if (additions.size || disputedAdditions.size) {
           const chunks = [];
           const body = state.body ?? '';
           // Only the author identity is consumed by v1 readers. Do not duplicate a large PR
@@ -1020,7 +1020,7 @@ export function createReviewPrSinks({
             head: read.netBasis.rev, repo: read.repo, pr: read.pr,
           };
           const live = [], superseded = [];
-          const retired = [...retiredAdditions.values()].map(({ reason, ...referral }) => ({ referral, by: null,
+          const disputed = [...disputedAdditions.values()].map(({ reason, ...referral }) => ({ referral, by: null,
             verified: { key: referral.key, outcome: 'not-reproduced', reason } }));
           for (const referral of additions.values()) {
             const by = env.WE_REFERRAL_ADVISORY_SUPERSEDE === '0' ? null : findSupersedingNotReal(referral, supersessionContext);
@@ -1028,8 +1028,8 @@ export function createReviewPrSinks({
             (by ? superseded : live).push({ referral, by, verified });
             if (by) out(`referral superseded: ${referral.seat} ${referral.finding.file ?? ''}${referral.finding.line == null ? '' : `:${referral.finding.line}`} — mandatory not-real ruling ${by.rulingId ?? 'operator'} stands`);
           }
-          // Keep retired obligations in their own chunks so they never spend an automated attempt.
-          for (const group of [live, superseded, retired]) {
+          // Keep disputed claims separate for audit; they spend the same independent ruling attempt as other live referrals.
+          for (const group of [live, superseded, disputed]) {
             if (!group.length) continue;
             let record = newRecord();
             for (const { referral, by, verified } of group) {
@@ -1044,7 +1044,7 @@ export function createReviewPrSinks({
               }
               const single = append(record);
               if (renderReferralRecord(single).length > commentBudget - 2000) {
-                // A retired (not-reproduced) claim too large to record parks too (PR #5025 review): its record is what holds the accept
+                // A disputed (not-reproduced) claim too large to record parks too (PR #5025 review): its record is what holds the accept
                 // for a human on later runs of this head, so skipping it would let a quiet re-run reduce to a clean accept.
                 overflow(`finding key sha256:${referralHash(referral.key)} from ${sourceByKey.get(referral.key) ?? prUrl} exceeds ${commentBudget} characters with its v1 identity intact; requires manual review`);
                 continue;

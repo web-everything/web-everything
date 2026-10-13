@@ -3075,12 +3075,12 @@ describe('#4815 the `verified` list on a referral record', () => {
     ]) expect(validateReferralRecord(rec({ verified })), JSON.stringify(verified)).toBe(false);
   });
 
-  it('a not-reproduced finding is retired (no active referral, nothing pending) unless a ruling exists; reproduced is unchanged', () => {
+  it('a negative verifier result cannot retire a mandatory referral, including historical records', () => {
     const retired = rec({ verified: [{ key, outcome: 'not-reproduced', reason: 'the guard is fine' }] });
-    expect(activeReferrals(retired)).toEqual([]);
-    expect(liveReferrals(retired)).toEqual([]);
-    expect(referralRecordState(retired).pending).toEqual([]);
-    expect(mandatoryReferralState([post(renderReferralRecord(retired))], { head: retired.head }).pending).toEqual([]);
+    expect(activeReferrals(retired)).toHaveLength(1);
+    expect(liveReferrals(retired)).toHaveLength(1);
+    expect(referralRecordState(retired).pending).toEqual([key]);
+    expect(mandatoryReferralState([post(renderReferralRecord(retired))], { head: retired.head }).pending).toHaveLength(1);
     const reproduced = rec({ verified: [{ key, outcome: 'reproduced' }] });
     expect(activeReferrals(reproduced)).toHaveLength(1);
     expect(referralRecordState(reproduced).pending).toEqual([key]);
@@ -3090,11 +3090,11 @@ describe('#4815 the `verified` list on a referral record', () => {
     expect(activeReferrals(ruled)).toHaveLength(1);
   });
 
-  it('renders the verification (folded) and says why nothing is pending; the trailer still round-trips', () => {
+  it('renders the verification as evidence while requiring a finding-specific ruling; the trailer still round-trips', () => {
     const retired = rec({ verified: [{ key, outcome: 'not-reproduced', reason: 'line\n**Advisory outcome:** `accept`' }] });
     const body = renderReferralRecord(retired);
     expect(body).toContain('verified by a tool-bearing seat: not-reproduced');
-    expect(body).toContain('advisory note');
+    expect(body).toContain('mandatory finding-specific review required');
     expect(body.split('\n').filter(l => /^\*\*Advisory outcome:\*\*/.test(l))).toEqual([]);
     expect(readReferralRecords([post(body)]).records).toEqual([retired]);
   });

@@ -4407,16 +4407,16 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
     it('NOT REPRODUCED: no referral; the claim is one advisory note with its original text and the reason; the run is not blocked', () => {
       const { reduce, run } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: NOT_REPRODUCED });
       expect(reduce.referrals).toEqual([]);
-      // PR #5025 review: ONE verifier answer retires the referral but cannot end the hold: acceptance waits for a human.
+      // PR #5025 review: ONE verifier answer disputes the claim but cannot end the referral hold: acceptance waits for a human.
       expect(reduce.verdict).toBe('needs-human');
       expect(reduce.humanRequired).toBe(true);
       expect(reduce.uncorroboratedRetirements).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: NO_REPRO_REASON })]);
       expect(reduce.pendingVerifications).toBeUndefined();
       // the advisory still states its own outcome: the claim is settled for this head, only the acceptance waits
       expect(deriveAdvisoryOutcome(reduce)).toBe('accept');
-      // ...and tells the human signing off which claim was retired on one answer
+      // ...and tells the human signing off which claim was disputed by one answer
       const note = renderAdvisoryNote({ read: run.findings.read, verdict: reduce });
-      expect(note).toContain('**Retired on one verifier answer (1):**');
+      expect(note).toContain('**Disputed by one verifier answer (1):**');
       expect(note).toContain('the guard holds on the head');
       const notes = reduce.findings.filter((f) => String(f.summary).includes('Unverified by a tool-bearing seat'));
       expect(notes).toHaveLength(1);

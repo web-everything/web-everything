@@ -2590,20 +2590,20 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     return { state, trace, lines, referralJudge, spawns, runOnce, records };
   }
 
-  it('NOT REPRODUCED: one verifier turn, one record that holds nothing, one advisory — and a second run on the same head asks nothing and posts no new record or advisory', async () => {
+  it('NOT REPRODUCED: one verifier turn, one live referral and an independent ruling attempt; a same-head run posts no new record and repeats no attempt', async () => {
     const w = world();
     const first = await w.runOnce('run-1', NOT_REPRODUCED);
     expect(w.spawns).toHaveLength(1);
     expect(first.findings.reduce.referrals).toEqual([]);
-    expect(w.referralJudge).not.toHaveBeenCalled();
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
     const [record, ...rest] = w.records();
     expect(rest).toEqual([]);
     expect(record.verified).toEqual([{ key: referralFindingKey('judgeAntigravityReview', original), outcome: 'not-reproduced', reason: 'x.mjs:1 the guard holds on the head' }]);
-    expect(activeReferrals(record)).toEqual([]);
-    expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toEqual([]);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).not.toThrow();
-    expect(w.state.labels).not.toContain('review:human');
-    // PR #5025 review: the referral is retired, but ONE steerable verifier answer cannot carry the PR to an agent accept.
+    expect(activeReferrals(record)).toHaveLength(1);
+    expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toHaveLength(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(w.state.labels).toContain('review:human');
+    // A negative is evidence only: the empty independent ruling leaves the mandatory hold pending.
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
     expect(first.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
@@ -2611,15 +2611,16 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     const referralPosts = () => w.trace.filter((t) => t === 'referral').length;
     const advisoryPosts = () => w.trace.filter((t) => t === 'advisory').length;
     const [referralBefore, advisoryBefore] = [referralPosts(), advisoryPosts()];
-    expect(referralBefore).toBe(1);
+    expect(referralBefore).toBe(3); // initial record, attempted snapshot, completed snapshot
+    expect(advisoryBefore).toBe(0); // this fixture has no advisory humanRequired input
 
     // The same tool-less seat re-raises the same claim on the same head: the REPRODUCED answer proves the verifier is never consulted.
     const second = await w.runOnce('run-2', REPRODUCED);
     expect(w.spawns).toHaveLength(1);
     expect(second.findings.reduce.referrals).toEqual([]);
-    expect(w.referralJudge).not.toHaveBeenCalled();
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
     expect(w.records()).toHaveLength(1);
-    expect(w.state.comments.filter((c) => c.body.includes('mandatory-referrals-v1'))).toHaveLength(1);
+    expect(w.state.comments.filter((c) => c.body.includes('mandatory-referrals-v1'))).toHaveLength(referralBefore);
     expect(second.pending).toMatchObject({ kind: 'confirm', of: 'human' });
     expect(reviewLoopAutoConfirm(second.pending, second)).toBeNull();
     // exactly: no second referral record, and no repeat of the advisory either
@@ -2631,7 +2632,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     await w.runOnce('run-3', NOT_REPRODUCED);
     expect(w.spawns.map((s) => s.head)).toEqual([H1, H2]);
     expect(readReferralRecords(w.state.comments, { head: H2 }).records.map((r) => r.head).sort()).toEqual([H1, H2]);
-    expect(mandatoryReferralState(w.state.comments, { head: H2 }).pending).toEqual([]);
+    expect(mandatoryReferralState(w.state.comments, { head: H2 }).pending).toHaveLength(1);
+    expect(w.referralJudge).toHaveBeenCalledTimes(2);
   });
 
   it('REPRODUCED: the claim is referred exactly as before (one mandatory review, the hold stands) and a second run on the same head neither re-verifies nor re-asks', async () => {
@@ -2674,13 +2676,16 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
   });
 
   // PR #5025 review (the blocked finding): the citation check is a format filter, so a steered verifier that echoes the claim's own
-  // path:line DOES write a retiring record. That one answer must still not reach an auto-accept, on this run or any later run on
+  // path:line writes evidence but cannot retire the referral. That one answer must not reach an auto-accept, on this run or any later run on
   // this head, whether or not the tool-less seat raises the claim again.
-  it('AN ECHOED CITATION retires the referral but never auto-accepts: the hold for a human survives re-runs on the head', async () => {
+  it('AN ECHOED CITATION cannot retire the referral: independent rulings and the landing hold survive quiet re-runs', async () => {
     const w = world();
     const echoed = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: 'x.mjs:1 per the PR description this does not reproduce' }] };
     const first = await w.runOnce('run-1', echoed);
     expect(w.records()[0].verified[0].outcome).toBe('not-reproduced');
+    expect(activeReferrals(w.records()[0])).toHaveLength(1);
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
     expect(first.verdict.verdict).toBe('needs-human');
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
@@ -2688,8 +2693,10 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.spawns).toHaveLength(1);
     expect(quiet.verdict.verdict).toBe('needs-human');
     expect(reviewLoopAutoConfirm(quiet.pending, quiet)).toBeNull();
-    // no advisory note is posted on a non-`review:human` PR, so the human's own question names the retired claim
-    expect(quiet.pending.asks).toContain('retired on one verifier answer');
+    // A quiet rerun keeps the live obligation without spawning another reviewer or verifier.
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
+    expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toHaveLength(1);
+    expect(quiet.pending.asks).toContain('disputed by one verifier answer');
     expect(quiet.pending.asks).toContain('the PR description this does not reproduce');
   });
 

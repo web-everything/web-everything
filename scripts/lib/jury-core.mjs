@@ -2872,8 +2872,8 @@ export function verificationCandidates({ seats, known = new Map() }) {
  *
  * THIS IS A FORMAT FILTER, NOT A SECOND SIGNAL. It turns away a lazy or free-form "does not reproduce", and makes every recorded
  * negative point at a line a reader can check. It does not prove the cited line supports the answer: the claim's own path and
- * line are in the verifier's input, so a steered verifier can echo them. So a negative that passes it retires the referral but
- * NOT the hold: `uncorroboratedRetirements` keeps the accept for a human. Corroboration by an independent seat is #xztd0mv. PURE.
+ * line are in the verifier's input, so a steered verifier can echo them. A negative that passes it is recorded as evidence;
+ * `activeReferrals` keeps the mandatory referral live for an independent finding-specific ruling. PURE.
  */
 export function verifierEvidenceCitesClaim(original, evidence) {
   const file = exactCitedPath(original?.file);
@@ -2889,7 +2889,7 @@ export function verifierEvidenceCitesClaim(original, evidence) {
  * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
  * evidence-free or explicitly inconclusive (reproduced=null, or dropped by a provider that strips nulls) answer is `failed`,
  * never persisted, and so is a `false` whose evidence cites no line in the claim's own file. A `not-reproduced` is still ONE
- * steerable answer: it retires the referral, and `uncorroboratedRetirements` holds the accept for a human. PURE.
+ * steerable answer: it does not retire the referral, and `uncorroboratedRetirements` also holds acceptance for a human. PURE.
  */
 export function settleVerification(candidates, answer) {
   const settled = new Map();
@@ -2920,10 +2920,10 @@ export function settleVerification(candidates, answer) {
     // on the next run instead of being retired, and the review reducer holds acceptance while verification is unfinished.
     else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
       settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
-    // A `false` RETIRES a mandatory hold, and the verifier reads attacker-controlled PR content (PR #5025 review). It is recorded
+    // The verifier reads attacker-controlled PR content (PR #5025 review). A negative is recorded
     // only when its stored reason cites a line in the claim's own file; free-form evidence stays held and is asked again. That is
-    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: ONE answer retires the referral (the operator's ruling
-    // for #4815) but never the hold, which waits for a human (`uncorroboratedRetirements`); a second independent seat is #xztd0mv.
+    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: ONE answer never retires a mandatory referral.
+    // The existing independent ruling process must settle it; `uncorroboratedRetirements` also holds acceptance for a human.
     // A `true` keeps the hold, so it needs no citation.
     } else if (!r.reproduced && !verifierEvidenceCitesClaim(c.original, r.evidence)) {
       settled.set(c.key, { outcome: 'failed',
@@ -2975,10 +2975,10 @@ export function verificationsToPersist(candidates, settled) {
 }
 
 /**
- * The claims retired on ONE verifier answer on this head (PR #5025 review): `not-reproduced` this run (`settled`) or recorded
+ * The claims disputed by ONE verifier answer on this head (PR #5025 review): `not-reproduced` this run (`settled`) or recorded
  * earlier on this head (`known`, whether or not a seat raises the claim again: a quiet re-run is not a second signal). That one
- * answer comes from a model reading attacker-controlled PR content, and the citation check is only a format filter, so it retires
- * the REFERRAL (no ruling loop) but never the hold: the review reducer turns an otherwise clean accept into `needs-human` while
+ * answer comes from a model reading attacker-controlled PR content, and the citation check is only a format filter. The referral
+ * stays live for an independent ruling; additionally, the review reducer turns an otherwise clean accept into `needs-human` while
  * this list is non-empty. A second independent seat that could lift it is #xztd0mv. `reasons` is `key → the verifier's reason as
  * stored on the head's record`, so a later run shows the human what was actually answered. `[{ seat?, key, reason }]`, once per
  * key, every reason folded (`foldVerifyReason`). PURE.
@@ -3028,9 +3028,9 @@ export const REFERRAL_SUPERSEDE_REASON = 'superseded: the mandatory owner alread
 export const REFERRAL_CARRY_REASON = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
 export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 // A drop only retires a finding nobody has ruled on: a finding with a ruling (a `block` above all) keeps counting.
-// The same holds for a finding a tool-bearing verifier could not reproduce (#4815): it is retired to an advisory note.
-export const activeReferrals = (record) => record.referrals.filter(f => (!(record.dropped ?? []).some(d => d.key === f.key)
-  && !(record.verified ?? []).some(v => v.key === f.key && v.outcome === 'not-reproduced'))
+// Verification is evidence, never retirement authority: even a cited negative can echo untrusted PR content.
+// Keep both new and historical negative records live until the existing independent ruling process settles them.
+export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
 // `withdrawn` is the set of carried keys whose carry no longer stands at read time (`referralRecordState` holds them
@@ -3266,7 +3266,7 @@ export function validateReferralRecord(r) {
         || !['block', 'card', 'not-real'].includes(c.result)
         || (c.result === 'card' ? !CARD_REF_RE.test(c.card ?? '') : c.card !== undefined)))) return false;
     // #4815 — what a tool-bearing verifier concluded about a tool-less seat's claim on THIS head. A `not-reproduced`
-    // entry retires the finding to an advisory note (see `activeReferrals`) and must say why; `reproduced` is a plain mark.
+    // entry records a disagreement and must say why; neither outcome retires the finding (`activeReferrals`).
     if (r.verified !== undefined && (!Array.isArray(r.verified)
       || new Set(r.verified.map(v => v?.key)).size !== r.verified.length
       || r.verified.some(v => !v || !keys.has(v.key) || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome)
@@ -3443,7 +3443,7 @@ export function renderReferralRecord(record) {
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
     + (record.verified ?? []).map(v => `\n- ${v.key}: verified by a tool-bearing seat: ${v.outcome}${v.reason ? ` (${foldUntrusted(v.reason)})` : ''}`).join('')
-    + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : activeReferrals(record).length || !(record.verified ?? []).some(v => v.outcome === 'not-reproduced') ? 'finding-specific rulings recorded' : 'no active referral: the claim was not reproduced by a tool-bearing seat and stays an advisory note')}. Rulings: ${JSON.stringify(record.rulings)}\n`
+    + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
     + `<!-- ${REFERRAL_RECORD_MARKER}: ${encodeURIComponent(JSON.stringify(record))} -->`;
 }

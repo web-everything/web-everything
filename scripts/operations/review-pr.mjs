@@ -2019,12 +2019,12 @@ export function planRecordDecision(view) {
   if (to === 'accepted' && verdict.pendingVerifications?.length) {
     throw new Error('Tool-bearing verification required before recording acceptance; retry the unresolved claims.');
   }
-  // PR #5025 review — a claim retired on ONE verifier answer leaves the accept to a human. `humanRequired` is what addresses the
+  // PR #5025 review — a claim disputed by ONE verifier answer leaves the accept to a human. `humanRequired` is what addresses the
   // confirm to a human, so an accept over an accept-shaped verdict on an agent-addressed confirm is refused (defence in depth:
   // `reduce` already addresses those to a human). A `changes` verdict is exempt: its only mechanical accept, round-cards, is
   // refused by `roundCardsRefusal`, and an operator's explicit override of a `changes` verdict stays theirs to make.
   if (to === 'accepted' && verdict.uncorroboratedRetirements?.length && verdict.humanRequired !== true && verdict.verdict !== 'changes') {
-    throw new Error('A claim on this head was retired on one verifier answer; only a human-addressed confirm may record acceptance.');
+    throw new Error('A claim on this head was disputed by one verifier answer; only a human-addressed confirm may record acceptance.');
   }
   if (verdict.pendingReferrals?.length || (to === 'accepted' && verdict.blockedReferrals?.length)) {
     throw new Error('Mandatory finding-specific ruling required before recording acceptance; resume the referral review.');
@@ -2171,7 +2171,7 @@ const ADVISORY_PENDING_REFERRAL_OUTCOME = 'pending-referral';
 const RETIREMENT_REASONS_SHOWN = 5;
 
 /**
- * The reasons of the claims retired on one verifier answer, each folded to one safe line (`foldVerifyReason`: no newline, backtick,
+ * The reasons of the claims disputed by one verifier answer, each folded to one safe line (`foldVerifyReason`: no newline, backtick,
  * control or invisible character, capped) — the human-facing list shared by the confirm question and the advisory note. PURE.
  */
 export function listRetirementReasons(retirements) {
@@ -2297,10 +2297,10 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     ...renderAwaitingRulingSection(v),
     body,
     ...renderDeferredAdvisorySection({ read, verdict: v }),
-    // PR #5025 review — the human signing off is told which claims were retired on one verifier answer, not only that it accepts.
+    // PR #5025 review — the human signing off is told which claims were disputed by one verifier answer, not only that it accepts.
     ...(Array.isArray(v.uncorroboratedRetirements) && v.uncorroboratedRetirements.length
-      ? ['', `**Retired on one verifier answer (${v.uncorroboratedRetirements.length}):** a tool-bearing seat answered "not reproduced" `
-        + 'and nothing corroborated it, so these are no longer referrals but still need your look before you accept:',
+      ? ['', `**Disputed by one verifier answer (${v.uncorroboratedRetirements.length}):** a tool-bearing seat answered "not reproduced" `
+        + 'and nothing corroborated it; these remain referrals until an independent finding-specific ruling settles them:',
       ...listRetirementReasons(v.uncorroboratedRetirements).map((line) => `- ${line}`)]
       : []),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
@@ -3025,7 +3025,7 @@ export function reviewPrOperation({
             && settledClaims.get(key)?.outcome !== 'not-reproduced')
           .map(({ seat, key, reason }) => ({ seat, key, reason }));
         // PR #5025 review — a definitive negative is still ONE answer from a model that read attacker-controlled PR content, and its
-        // citation check is only a format filter. It retires the referral (above) but not the hold: an otherwise clean accept becomes
+        // citation check is only a format filter. The referral stays live for an independent ruling; an otherwise clean accept becomes
         // `needs-human`, so the loop never auto-confirms it and a human accepts. Read from the head's records directly, so a later run
         // on this head holds too, even with no tool-less seat re-raising the claim. A real blocker still reduces to `changes`.
         const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
@@ -3259,7 +3259,7 @@ export function reviewPrOperation({
           + `\`derivePanelVerdict\` reduced them to \`${v.verdict}\``
           + `${v.pendingVerifications?.length ? ` (${v.pendingVerifications.length} claim(s) awaiting tool-bearing verification)`
             // The held run is often NOT a `review:human` PR, so no advisory note is posted: the question itself names each claim.
-            : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) retired on one verifier answer: a human confirms the accept — `
+            : v.acceptHeld ? ` (${v.uncorroboratedRetirements.length} claim(s) disputed by one verifier answer: a human confirms the accept — `
               + `${listRetirementReasons(v.uncorroboratedRetirements).join('; ')})`
               : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
           + `Record which verdict? (${CONFIRM_OPTIONS.join(' | ')}; \`abstain\` writes nothing)`;
