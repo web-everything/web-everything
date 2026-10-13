@@ -2046,7 +2046,19 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       checks.push(...batch);
       if (batch.length < 100) break;
     }
-    const failed = checks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
+    let effectiveChecks = checks;
+    try {
+      const { excuseMergeGateRows, loadMergeGateHoldSetting, readMergeGateVerdict } = await import('../../scripts/lib/merge-gate-hold-class.mjs');
+      const { readSharedFreeze } = await import('../../scripts/lib/red-main-freeze-shared.mjs');
+      // REST numeric ids let the shared classifier select the latest run without normalization.
+      effectiveChecks = (io.excuseMergeGateRows ?? excuseMergeGateRows)(checks, {
+        prNumber: pr.number, headSha: p.head.sha, labels: p.labels,
+        setting: io.mergeGateSetting ?? loadMergeGateHoldSetting(),
+        readVerdict: args => (io.readMergeGateVerdict ?? readMergeGateVerdict)({ ...args, repo }),
+        freeze: () => (io.readFreeze ?? readSharedFreeze)(),
+      }).rows;
+    } catch { /* Unreadable excusal evidence keeps the original check failures. */ }
+    const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
     let firstError = annotations.find(a => a.annotation_level === 'failure')?.message

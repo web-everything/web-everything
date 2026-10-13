@@ -4,10 +4,12 @@ kind: story
 size: 2
 priority: high
 parent: "3007"
-status: open
+status: resolved
 blockedBy: ["5355"]
 scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
 dateOpened: "2026-10-09"
+dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "981be0907d1b19ab314fc31fcf8fbdce969926d4"
 tags: []
@@ -84,6 +86,8 @@ Live, on a real repo with a throwaway PR parked `review:human` by a real verdict
 - 2026-10-12 refresh: re-checked against main (003fe20, 1518 commits after the prior stamp). Premise still holds: no non-test writer for `approval`/`label-input`; the mirror is still report-only (77 lines). Only we:scripts/review-set-label.mjs moved (~+300 lines), so its cites were re-pointed (verdict append + F4 block now :1581-1613); we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/ cites re-verified. Design, MVP and tests unchanged.
 
 - 2026-10-12 re-stamp (main 981be09): the stamp's `preparedAgainstSha` was stale. Re-verified: no non-test writer for `approval`/`label-input` exists (only we:scripts/lib/verdict-ledger.mjs and we:scripts/lib/pr-state/holds/label-input.mjs mention them); the mirror is still 77 lines, report-only; the verdict append + F4 block sit at we:scripts/review-set-label.mjs:1581-1617; `APPROVAL_KINDS` at we:scripts/lib/verdict-ledger.mjs:551, `delegationOrNull` at :567, `buildLedgerEvent` at :642; `HOLD_LABELS` at we:scripts/lib/pr-state/holds/label-input.mjs:4; human gate at we:scripts/lib/pr-state.mjs:108. Design, MVP and tests unchanged.
+
+- 2026-10-12 built: `clear-human` now appends an `approval` row (with `--approval-kind` / `--delegation-json`, validated before any write) and a refused or thrown approval append blocks the swap; the mirror gained `--apply` (`runMirrorApply`): timeline read, `label-input` rows (latest change per label, only while it matches the live labels, own login skipped), then an add-only restore of `review:human`. Not run live: the throwaway-PR proof in the Proof plan needs a real PR mutation, so it is left to the operator (commands in the PR body).
 
 ## Acceptance
 
