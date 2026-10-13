@@ -2,9 +2,11 @@
 bornAs: x4n3jex
 kind: story
 size: 1
-status: open
+status: resolved
 scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/__tests__/pr-merge-gate.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-13"
+dateResolved: "2026-10-13"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "0fd881016a3dbb1da6fc90f2cb5ef7d342af7af5"
 tags: []
@@ -94,3 +96,5 @@ For the review regression, require Test plan 11 to pass with the helper enabled 
 
 - 2026-10-13 prepare: premise live on main (no string stripping in `scanTestTampering`, `we:scripts/lib/pr-merge-gate.mjs:149`). Scope corrected from `we:scripts/merge-ai-prs.mjs` (only the caller, `:5485`) to `we:scripts/lib/pr-merge-gate.mjs` + its test. Size 1 unchanged (one helper + one call site + tests).
 - 2026-10-13 review repair (#5129): replaced per-line template stripping with an unconditional backtick raw pre-check; narrowed A3/N1 claims, accepted template-fixture false positives, and planned `closingMultilineTemplateDoesNotHideSkip` plus mutation proof (case 11). This prepare repair changes the plan; it does not implement the helper.
+- 2026-10-13 build: added `stripStringsAndComments` + `isJsTestPath` in `we:scripts/lib/pr-merge-gate.mjs`, wired into the skip/only count (JS/TS paths only); Test plan 1-11 added to `we:scripts/__tests__/pr-merge-gate.test.mjs`. Live-shape probe: main `tampered:true` → lane `tampered:false`.
+- 2026-10-13 converge: panel rounds hardened the helper with extra raw-fallback guards (`*/` closer without opener, `${` interpolation, line after a backslash-continued line) and narrowed A4's stripped set to plain `.js .mjs .cjs .ts .mts .cts` — `.jsx`/`.tsx` are scanned raw because JSX text apostrophes are not string delimiters (tests 9b-9d). Mid-template / mid-block-comment lines with no visible opener stay the accepted N1 residual.
