@@ -21,13 +21,21 @@
  *   a clone refresh or a pass: both use the same clone). Before its next pass it awaits `idle()`. So a fast drain and
  *   a full pass never run at the same time in one clone.
  *
- * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15}` → platform
+ * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number,
+ *   catchUp: { enabled: boolean, intervalMinutes: number } }`, resolved through the shared
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
  *   debounceSeconds: wait this long after the PR's LAST eligible event before running (check suites finish in a
  *   burst, and GitHub's mergeable state lags the last check by a few seconds).
+ *
+ *   catchUp: when both enabled flags are true, list ready PRs on start and every intervalMinutes (1–240),
+ *   oldest-ready first, capped by mergeDelivery.batchSize minus queued PRs; use the same fast-drain path. WHY: an
+ *   event only wakes a PR that changes AFTER the feed started; a PR that was already ready never gets one and waits
+ *   on full passes that end before reaching it ("ready-not-reached", live #5025 2026-10-13). Log lines start
+ *   `enqueue-on-event: catch-up`. `tick()` runs it when due; `catchUp()` runs ONLY it, for a daemon whose passes
+ *   run back to back (no post-pass sleep window) to call right before each pass.
  *
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
@@ -37,24 +45,27 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15 });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10 }) });
 /** A fast drain that runs longer than this is stopped (SIGTERM); the PR rides the next full pass. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const validInterval = (v) => Number.isFinite(v) && v >= 1 && v <= 240;
 const VALID = {
+  catchUp: (v) => typeof v === 'boolean' || validInterval(v),
   enabled: (v) => typeof v === 'boolean',
   debounceSeconds: (v) => Number.isFinite(v) && v >= 0 && v <= 600,
 };
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -71,11 +82,27 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   const out = {
     enabled: v.enabled === true,
     debounceSeconds: VALID.debounceSeconds(v.debounceSeconds) ? v.debounceSeconds : ENQUEUE_ON_EVENT_DEFAULTS.debounceSeconds,
-    sources: c.sources || {},
+    catchUp: {},
+    sources: { ...(c.sources || {}) },
     invalid: [...(c.invalid || []), ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
   };
+  for (const leaf of ['enabled', 'intervalMinutes']) {
+    const path = `catchUp.${leaf}`;
+    const value = v.catchUp?.[leaf];
+    const valid = leaf === 'enabled' ? typeof value === 'boolean' : validInterval(value);
+    out.catchUp[leaf] = valid ? value : ENQUEUE_ON_EVENT_DEFAULTS.catchUp[leaf];
+    if (!valid) {
+      if (value !== undefined) out.invalid.push(`${path}=${JSON.stringify(value)}`);
+      out.sources[path] = 'standard';
+    } else out.sources[path] ||= 'standard';
+  }
+  // The cascade rejects values outside the union before the per-leaf type check can see them.
+  for (const invalid of c.invalid || []) {
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes)=.*)$/.exec(invalid);
+    if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
+  }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -117,7 +144,7 @@ export function notePending(pending, marked, { localSlug, now }) {
     if (!k || !local || k.repo !== local) continue;
     const key = `${k.repo}#${k.num}`;
     const prev = next.get(key);
-    next.set(key, { ...k, firstAt: prev?.firstAt ?? now, lastAt: now, causes: [...new Set([...(prev?.causes || []), String(m.cause).replace(/@\d+.*$/, '')])].slice(-3) });
+    next.set(key, { ...k, ...(prev?.catchUp ? { catchUp: true } : {}), firstAt: prev?.firstAt ?? now, lastAt: now, causes: [...new Set([...(prev?.causes || []), String(m.cause).replace(/@\d+.*$/, '')])].slice(-3) });
   }
   return next;
 }
@@ -136,6 +163,7 @@ export function fastDrainArgs({ scriptRoot, num }) {
 export function summarizeFastDrain(json, num) {
   if (!isObj(json)) return 'no JSON result';
   if (json.skipped === 'drain-in-progress') return `no-op (${json.detail || 'lease held'})`;
+  if (json.ok === false) return `refused: ${json.reason}${json.detail ? ': ' + String(json.detail).slice(0, 200) : ''}`;
   const hit = (list) => (Array.isArray(list) ? list.find((x) => Number(x?.num) === Number(num)) : null);
   const failed = hit(json.failed);
   if (failed) return `failed: ${String(failed.detail || failed.reason || failed.error || '').slice(0, 200)}`;
@@ -179,6 +207,91 @@ export function readPrForWake({ repo, num, env = process.env, execFileImpl = exe
   });
 }
 
+export const CATCH_UP_QUERY = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
+  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number isDraft isInMergeQueue}}
+  mergeQueue(branch:"main"){entries(first:100){totalCount}}}}`;
+
+/**
+ * When each PR got `ready-to-merge`: one aliased query, one `pullRequest(number:)` per PR. PURE. Asked per PR on
+ * purpose: nested inside the `pullRequests` list, GitHub returned an even shorter label-event page (live
+ * 2026-10-13: #5217 got 7 of 45 events). Either way the timeline can lag by an hour or more (live: every page
+ * ended ~2h before the read), so a PR labeled after that lag reads `readyAt: null`. That PR became ready MOST
+ * recently, which is why null sorts last in {@link planCatchUp}: the order stays oldest-ready first.
+ */
+export function readyAtQuery(nums) {
+  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}}}`;
+  return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${nums.map(one).join(' ')}}}`;
+}
+
+/** The latest `ready-to-merge` LabeledEvent time (epoch ms) in a `timelineItems` block, or null. PURE. */
+function latestReadyAt(timelineItems) {
+  const dates = (timelineItems?.nodes || []).filter((e) => e?.label?.name === READY_LABEL)
+    .map((e) => Date.parse(e.createdAt)).filter(Number.isFinite);
+  return dates.length ? Math.max(...dates) : null;
+}
+
+function ghGraphql({ query, owner, name, env, execFileImpl }) {
+  return new Promise((resolve) => {
+    const fail = (error) => resolve({ ok: false, error: String(error?.message || error).split('\n')[0] });
+    try {
+      execFileImpl('gh', ['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`],
+        { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
+          if (err) { fail(err); return; }
+          try {
+            const json = JSON.parse(String(stdout));
+            if (Array.isArray(json.errors) && json.errors.length) { fail(json.errors[0]?.message || JSON.stringify(json.errors[0])); return; }
+            if (!isObj(json.data?.repository)) { fail('no repository in the GraphQL answer'); return; }
+            resolve({ ok: true, repository: json.data.repository });
+          } catch (e) { fail(e); }
+        });
+    } catch (e) { fail(e); }
+  });
+}
+
+/**
+ * IO: the open ready-to-merge PRs of `repo` and the merge queue's size, through the GraphQL repository connection
+ * (never the issue-search budget `gh pr list --label` uses). Then, for the PRs that are neither drafts nor queued,
+ * when each got its label (`readyAt`, null when unreadable: such PRs sort last). Never rejects.
+ * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
+ */
+export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile }) {
+  const [owner, name] = String(repo ?? '').split('/');
+  if (!owner || !name) return { ok: false, error: `not an owner/name repo: ${JSON.stringify(repo)}` };
+  const list = await ghGraphql({ query: CATCH_UP_QUERY, owner, name, env, execFileImpl });
+  if (!list.ok) return list;
+  const nodes = list.repository.pullRequests?.nodes;
+  if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
+  const prs = nodes.map((pr) => ({ num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null }));
+  const open = prs.filter((p) => !p.isDraft && !p.inQueue);
+  if (open.length) {
+    const times = await ghGraphql({ query: readyAtQuery(open.map((p) => p.num)), owner, name, env, execFileImpl });
+    if (times.ok) for (const p of open) p.readyAt = latestReadyAt(times.repository[`p${p.num}`]?.timelineItems);
+  }
+  return { ok: true, prs, queued: list.repository.mergeQueue?.entries?.totalCount ?? 0 };
+}
+
+/** IO: the same merge-delivery policy used by the drain. */
+export function readQueueCapacity() {
+  try {
+    const policy = loadMergeDeliveryPolicy({ toolSettings: readDeclaredSettings().settings });
+    return { capacity: policy.batchSize, source: `mergeDelivery.batchSize (${policy.sources.batchSize})` };
+  } catch { return { capacity: 1, source: 'fallback 1 (policy unreadable)' }; }
+}
+
+/** PURE: oldest-ready candidates that fit the current queue, leaving eligibility to the drain. */
+export function planCatchUp({ prs, queued, capacity, pendingNums = [] }) {
+  const pending = new Set(pendingNums);
+  const skipped = []; const candidates = [];
+  for (const pr of prs) {
+    const reason = pr.isDraft ? 'draft' : pr.inQueue ? 'already queued' : pending.has(pr.num) ? 'already pending' : null;
+    if (reason) skipped.push({ num: pr.num, reason });
+    else candidates.push({ num: pr.num, readyAt: pr.readyAt });
+  }
+  candidates.sort((a, b) => (a.readyAt ?? Infinity) - (b.readyAt ?? Infinity) || a.num - b.num);
+  const room = Math.max(0, capacity - queued);
+  return { run: candidates.slice(0, room), later: candidates.slice(room).map((p) => p.num), skipped };
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderrTail = '';
@@ -204,19 +317,22 @@ const lastJsonLine = (s) => {
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readCandidates?:Function, readCapacity?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
 export function createEnqueueOnEvent({
   cwd, localSlug, scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = () => readQueueCapacity(),
   timeoutMs = FAST_DRAIN_TIMEOUT_MS, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
   let pending = new Map();
-  let running = null; // the in-flight tick's promise
+  let running = null; // the serialized tick/catch-up promise
+  let runningCatchUpOnly = false;
   let child = null;   // the in-flight fast drain (so the daemon can stop it when it exits)
   let lastLine = null;
+  let lastCatchUpAt = null;
   let setting = ENQUEUE_ON_EVENT_DEFAULTS;
   const readSetting = () => {
     try { setting = resolveSetting(); } catch (e) { setting = { ...ENQUEUE_ON_EVENT_DEFAULTS, line: `enqueue-on-event: setting unreadable (${String(e?.message || e).split('\n')[0]}) — off` }; }
@@ -225,45 +341,77 @@ export function createEnqueueOnEvent({
   };
   readSetting();
 
-  async function runDue() {
+  const catchUpDue = (s, t) => s.enabled && s.catchUp?.enabled &&
+    (lastCatchUpAt === null || t - lastCatchUpAt >= s.catchUp.intervalMinutes * 60_000);
+
+  async function runDue({ catchUpOnly = false } = {}) {
     const s = readSetting();
     if (!s.enabled) { pending = new Map(); return []; }
+    if (catchUpDue(s, now()) && allowed()) {
+      lastCatchUpAt = now();
+      const result = await readCandidates({ repo: localSlug });
+      if (!result.ok) log(`enqueue-on-event: catch-up could not list ready PRs (${result.error}) — retrying in ${s.catchUp.intervalMinutes} min`);
+      else {
+        const { capacity, source } = await readCapacity();
+        const plan = planCatchUp({ ...result, capacity, pendingNums: [...pending.values()].map((p) => p.num) });
+        const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
+        log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (oldest ready first)` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
+        pending = new Map(pending);
+        for (const { num, readyAt } of plan.run) pending.set(`${localSlug}#${num}`, {
+          repo: localSlug, num, firstAt: readyAt ?? now(), lastAt: now() - s.debounceSeconds * 1000,
+          causes: ['catch-up'], catchUp: true,
+        });
+      }
+    }
     const ran = [];
     for (;;) {
       if (!allowed()) break;
-      const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds });
+      const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds }).filter((p) => !catchUpOnly || p.catchUp);
       if (!p) break;
       const key = `${p.repo}#${p.num}`;
       const taken = pending.get(key);
+      const prefix = `enqueue-on-event: ${p.catchUp ? 'catch-up ' : ''}#${p.num}`;
+      const metadata = p.catchUp ? { catchUp: true } : {};
       pending = new Map(pending); pending.delete(key);
       let pr = null;
       try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
       const w = wakeWorthy(pr);
-      if (!w.wake) { log(`enqueue-on-event: #${p.num} ${taken.causes.join(', ')} — not woken: ${w.reason}`); ran.push({ num: p.num, code: null, what: `not woken: ${w.reason}` }); continue; }
+      if (!w.wake) { log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`); ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}` }); continue; }
       if (!allowed()) { pending = new Map(pending).set(key, taken); break; } // the window closed during the read
       const startedAt = now();
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
-      log(`enqueue-on-event: #${p.num} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
+      log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild: (c) => { child = c; } });
       child = null;
       const what = r.error ? `could not run (${r.error})` : summarizeFastDrain(lastJsonLine(r.stdout), p.num);
-      log(`enqueue-on-event: #${p.num} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what}`);
-      ran.push({ num: p.num, code: r.code, what });
+      log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what}`);
+      ran.push({ ...metadata, num: p.num, code: r.code, what });
     }
     return ran;
+  }
+
+  function startRun(options, previous = null) {
+    const promise = (previous ? previous.then(() => runDue(options), () => runDue(options)) : runDue(options))
+      .finally(() => { if (running === promise) running = null; });
+    running = promise;
+    runningCatchUpOnly = options.catchUpOnly === true;
+    return promise;
   }
 
   return {
     /** Fold one `consumer.pollOnce()` result in. */
     notePoll(r) { if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked, { localSlug, now: now() }); },
     /** Run every due PR now (one at a time) if enabled and allowed; a no-op while a tick is already running. */
-    tick() { if (!running) running = runDue().finally(() => { running = null; }); return running; },
+    tick() { return running && !runningCatchUpOnly ? running : startRun({}, running); },
+    /** Serialize a catch-up-only opportunity after any in-flight run. */
+    catchUp() { return startRun({ catchUpOnly: true }, running); },
     /** Resolves when no fast drain is in flight (call before a full pass or a clone refresh). */
     idle() { return running ? running.then(() => undefined, () => undefined) : Promise.resolve(); },
     /** Stop the in-flight fast drain (the daemon calls this on its own exit, like it stops its pass child). */
     kill() { if (child) { try { child.kill('SIGTERM'); } catch { /* gone */ } } },
     pending: () => [...pending.values()],
     setting: () => setting,
+    lastCatchUpAt: () => lastCatchUpAt,
   };
 }
 
