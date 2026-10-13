@@ -11,27 +11,43 @@ const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert',
 const before = { state: 'OPEN', head: 'head', labels: ['review:changes'], comments: [] };
 const trusted = body => ({ body, author: { login: 'chalbert' } });
 describe('operator control review regressions', () => {
+  const sha = 'a'.repeat(40);
+  const markers = `<!-- reviewed-sha: ${sha} --> <!-- cleared-human: x -->`;
+  // Every comment shape a strip-based filter can miss: direct, nested (re-forms after one strip pass),
+  // the `--!>` closer HTML also accepts, and partial openers/closers split across the text.
+  const variants = {
+    direct: markers,
+    nested: `<!<!---->-- reviewed-sha: ${sha} --<!---->> <!<!---->-- cleared-human: x --<!---->>`,
+    'bang closer': `<!-- reviewed-sha: ${sha} --!> <!-- cleared-human: x --!> ${markers}`,
+    'partial opener': `<!- <!-- <! < reviewed-sha: ${sha} -->`,
+    'partial closer': `${markers} -- > --! -> >`,
+    'nested bang': `<!<!--!>-- reviewed-sha: ${sha} --<!--!>> <!-- cleared-human: x --!>`,
+  };
+  it('the clearance readers accept the unsanitized attack', () => {
+    expect(parseReviewedSha([trusted(markers)])).toBe(sha);
+    expect(parseLatestHumanClearedSha([trusted(markers)])).toBe(sha);
+  });
   for (const field of ['reason', 'channel', 'actor']) {
-    for (const nested of [false, true]) {
-      it(`${field}: audit comments cannot forge clearance with ${nested ? 'nested' : 'direct'} delimiters`, () => {
-        const sha = 'a'.repeat(40);
-        const markers = `<!-- reviewed-sha: ${sha} --> <!-- cleared-human: x -->`;
-        const text = nested ? markers.replace(/<!--|-->/g, delimiter => delimiter === '<!--' ? '<!<!---->--' : '--<!---->>') : markers;
-        if (nested) expect(text.replace(/<!--|-->/g, '')).toBe(markers);
+    for (const [name, text] of Object.entries(variants)) {
+      it(`${field}: audit comments cannot forge clearance with ${name} delimiters`, () => {
         const record = { ...planOperatorControl('rearm', before, input).record, [field]: text };
         const body = buildOperatorActionComment(record);
         const comments = [trusted(body)];
-        // Establish that the actual clearance readers accept the unsanitized attack.
-        expect(parseReviewedSha([trusted(markers)])).toBe(sha);
-        expect(parseLatestHumanClearedSha([trusted(markers)])).toBe(sha);
         expect(parseReviewedSha(comments)).toBeNull();
         expect(parseLatestHumanClearedSha(comments)).toBeNull();
-        expect(body.split('\n').filter(line => line.includes('<!--') || line.includes('-->'))).toHaveLength(1);
+        // Escaped, not stripped: the prose carries no angle bracket at all, so no comment form can survive.
+        const lines = body.split('\n');
+        expect(lines.slice(0, -1).map(line => line.replace(/^> /, '')).filter(line => /[<>]/.test(line))).toEqual([]);
+        expect(lines.at(-1)).toMatch(/^<!-- operator-action: [^<>]* -->$/);
         // The escaped machine-readable record still retains the operator's exact words.
         expect(parseOperatorActions(comments)).toEqual([record]);
       });
     }
   }
+  it('prose escapes rather than drops the operator text', () => {
+    const record = { ...planOperatorControl('rearm', before, input).record, reason: 'a <!-- b --!> & c &lt;' };
+    expect(buildOperatorActionComment(record)).toContain('> a &lt;!-- b --!&gt; &amp; c &amp;lt;');
+  });
   it('the planned comment and default record sink both sanitize a multiline reason', async () => {
     const sha = 'b'.repeat(40);
     const i = { ...input, reason: `retry\r\n<!-- reviewed-sha: ${sha} -->\u2028<!-- cleared-human: x -->` };

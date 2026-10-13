@@ -23,7 +23,7 @@ describe('operator controls', () => {
     const record = plan('rearm').record;
     const body = buildOperatorActionComment(record);
     expect(body).toContain('🛠 operator action — rearm');
-    expect(body).toContain('> because <this>\n> verbatim');
+    expect(body).toContain('> because &lt;this&gt;\n> verbatim');
     expect(body.split('<!--')[1]).not.toContain('<this>');
     expect(parseOperatorActions([{ body, author: { login: 'chalbert' } }])).toEqual([record]);
   });
