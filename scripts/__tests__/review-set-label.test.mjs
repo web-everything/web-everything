@@ -4000,6 +4000,16 @@ describe('#5649 — approval rows at the label home', () => {
     }
   });
 
+  it('the approval flags are refused on any target but clear-human, before any write', () => {
+    for (const flag of ['--approval-kind=judge', '--delegation-json={"by":"a","scope":"b","expires":"2099-01-01T00:00:00Z"}']) {
+      const p = stubProvider(['review:pending']);
+      const r = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op', '--reason=because', flag]);
+      expect(r.exitCode).not.toBe(0);
+      expect(p.calls).toEqual([]);
+      expect(readdirSync(ledgerDir)).toEqual([]);
+    }
+  });
+
   it('a refused approval append blocks the swap', () => {
     const p = stubProvider(['review:human']);
     const { exitCode, payload } = run(p, CLEAR, { appendApproval: () => ({ ok: false, errors: ['boom'] }) });

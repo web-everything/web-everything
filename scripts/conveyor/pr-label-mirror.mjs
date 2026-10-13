@@ -142,9 +142,11 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
 
 const liveNames = (pr) => (pr?.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
-async function defaultAddLabel(repo, pr, label) {
-  const { createGhProvider } = await import('../lib/review-label-provider.mjs');
-  createGhProvider().setLabels(repo, pr, { add: label, remove: [] });
+/** The production label add: ONE label, `review:human` only, with an empty remove list. Exported so a test can pin the exact `setLabels` call. */
+export async function addApplyLabel(repo, pr, label, { provider } = {}) {
+  if (label !== APPLY_ADD_LABEL) throw new Error(`pr-label-mirror: --apply may add only ${APPLY_ADD_LABEL}, refused ${JSON.stringify(label)}`);
+  const gh = provider ?? (await import('../lib/review-label-provider.mjs')).createGhProvider();
+  gh.setLabels(repo, pr, { add: label, remove: [] });
 }
 
 /**
@@ -157,7 +159,7 @@ async function defaultAddLabel(repo, pr, label) {
 export async function runMirrorApply({
   repo = DEFAULT_REPO, store, limit = 200, listPrs = readOpenPrs, readEvents = readLedgerEventsFromStore, buildRows = buildDerivedRows,
   readTimeline = readLabelTimeline, selfLogin = readSelfLogin, appendRow = (row) => appendVerdictAsync(row, store ? { store } : {}),
-  addLabel = defaultAddLabel,
+  addLabel = addApplyLabel,
 } = {}) {
   const prs = await listPrs({ repo, limit });
   // A full page may be a truncated list: an apply pass over part of the open PRs would call the rest "no change".
@@ -179,7 +181,7 @@ export async function runMirrorApply({
     const fail = (reason) => out.failures.push({ pr: p.number, reason });
     const tl = await readTimeline({ repo, pr: p.number });
     if (tl?.status !== 'ok') { fail(`timeline-unreadable: ${tl?.reason ?? 'unknown'}`); continue; }
-    const fresh = await readEvents(repo, { store }); // compare-and-set: re-read just before the append
+    const fresh = await readEvents(repo, { store }); // best-effort idempotency: a fresh read just before the append (not atomic)
     if (fresh.status !== 'ok') { fail(`ledger-unreadable: ${fresh.reason}`); continue; }
     let toAppend;
     try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(p), selfLogin: self, events: fresh.rows }); } catch (e) {
@@ -194,6 +196,12 @@ export async function runMirrorApply({
       out.rowsAppended.push({ pr: p.number, label: row.label, change: row.change, sender: row.sender, at: row.at });
     }
     if (!ok || !wantsAdd.get(p.number) || liveNames(p).includes(APPLY_ADD_LABEL)) continue;
+    // The add was planned from the snapshot taken at the start of the pass: a `clear-human` that landed since must win.
+    // Re-derive this one PR from a fresh ledger read and add only if `review:human` is still wanted.
+    const latest = await readEvents(repo, { store });
+    const again = latest.status === 'ok' ? buildRows({ repo, prs: [p], events: latest.rows, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) })[0] : null;
+    if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
+    if (!again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
     try { await addLabel(repo, p.number, APPLY_ADD_LABEL); out.writes += 1; out.labelsAdded.push({ pr: p.number, label: APPLY_ADD_LABEL }); } catch (e) {
       fail(`label-add-failed: ${String(e?.message ?? e).split('\n')[0].slice(0, 200)}`);
     }
@@ -201,17 +209,17 @@ export async function runMirrorApply({
   return out;
 }
 
-async function main(argv) {
+export async function main(argv, { report = runMirrorReport, apply = runMirrorApply, write = (text) => writeAllSync(1, text) } = {}) {
   const flags = Object.fromEntries(argv.filter((a) => a.startsWith('--')).map((a) => { const i = a.indexOf('='); return i < 0 ? [a.slice(2), true] : [a.slice(2, i), a.slice(i + 1)]; }));
   const repo = typeof flags.repo === 'string' && flags.repo ? flags.repo : DEFAULT_REPO;
   if (!REPO_RE.test(repo)) { process.stderr.write('pr-label-mirror: --repo must be <owner/name>\n'); return 2; }
   const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
   let plan;
-  try { plan = await (flags.apply ? runMirrorApply : runMirrorReport)({ repo, store: flags.store, limit }); } catch (e) {
+  try { plan = await (flags.apply ? apply : report)({ repo, store: flags.store, limit }); } catch (e) {
     process.stderr.write(`pr-label-mirror: ${String(e?.message ?? e).split('\n')[0]}\n`);
     return 2;
   }
-  writeAllSync(1, flags.json ? `${JSON.stringify({ repo, ...plan }, null, 2)}\n` : `${renderPlan(plan, { repo })}\n`);
+  write(flags.json ? `${JSON.stringify({ repo, ...plan }, null, 2)}\n` : `${renderPlan(plan, { repo })}\n`);
   return plan.failures?.length ? 1 : 0;
 }
 

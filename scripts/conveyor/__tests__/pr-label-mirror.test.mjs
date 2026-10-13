@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline } from '../pr-label-mirror.mjs';
+import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main } from '../pr-label-mirror.mjs';
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
@@ -136,7 +136,7 @@ describe('#5649 runMirrorApply', () => {
     expect(second.rowsAppended).toEqual([]);
   });
 
-  it('report mode (no --apply) makes zero gh writes and appends zero rows', async () => {
+  it('report mode (no --apply) makes zero gh writes and appends zero rows (guard: passes today)', async () => {
     const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
     const plan = await runMirrorReport(w.opts);
     expect(plan.writes).toBe(0);
@@ -144,13 +144,31 @@ describe('#5649 runMirrorApply', () => {
     expect(w.rows).toHaveLength(1);
   });
 
-  it('--apply never removes a label', async () => {
+  it('--apply never removes a label: the production add is one review:human with an empty remove list', async () => {
     const calls = [];
     const w = world({ labels: ['bug', 'review:pending'], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
-    w.opts.addLabel = async (...a) => { calls.push(a); };
+    w.opts.addLabel = (repo, pr, label) => addApplyLabel(repo, pr, label, { provider: { setLabels: (...a) => calls.push(a) } });
     const out = await runMirrorApply(w.opts);
-    expect(out.counts.remove).toBeGreaterThanOrEqual(0);
-    expect(calls).toEqual([[REPO, 7, 'review:human']]); // one add, no remove argument exists
+    expect(out.labelsAdded).toEqual([{ pr: 7, label: 'review:human' }]);
+    expect(calls).toEqual([[REPO, 7, { add: 'review:human', remove: [] }]]);
+  });
+
+  it('--apply adds only review:human: any other label is refused by the production add', async () => {
+    const calls = [];
+    for (const label of ['advisory:ruling-needed', 'review:accepted', 'ready-to-merge', '--remove-label']) {
+      await expect(addApplyLabel(REPO, 7, label, { provider: { setLabels: (...a) => calls.push(a) } })).rejects.toThrow(/may add only/);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('a clear-human that lands between the plan and the add wins: the add is re-derived and skipped', async () => {
+    const w = world({ labels: [], timeline: { status: 'ok', items: [tl('review:human', 'removed', 'operator')] } });
+    const append = w.opts.appendRow;
+    w.opts.appendRow = async (row) => { const r = await append(row); w.rows.push({ type: 'verdict', ...buildVerdictRecord({ repo: REPO, pr: 7, verdict: 'accepted', at: '2026-10-12T12:00:00.000Z', reason: 'cleared', headSha: HEAD, declaredActor: 'op', session: 's', channel: 'chat', source: 'review-set-label' }) }); return r; };
+    const out = await runMirrorApply(w.opts);
+    expect(w.log).toEqual(['append:review:human:removed']);
+    expect(out.labelsAdded).toEqual([]);
+    expect(out.failures).toEqual([]);
   });
 
   it('a truncated or unreadable timeline plans no write and no row', async () => {
@@ -210,5 +228,18 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['bug'], items: [tl('bug', 'added', 'op')] })).toEqual([]);
     const [r] = planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'x\ny`rm -rf`')] });
     expect(r.sender).not.toMatch(/[\n`]/);
+  });
+});
+
+describe('#5649 CLI exit code', () => {
+  it('a failure in an apply pass is a non-zero exit; a clean pass is zero; report mode never applies', async () => {
+    const out = [];
+    const write = (t) => out.push(t);
+    expect(await main(['--apply', '--json'], { apply: async () => ({ mode: 'apply', writes: 0, failures: [{ pr: 7, reason: 'append-refused: x' }] }), write })).toBe(1);
+    expect(await main(['--apply'], { apply: async () => ({ mode: 'apply', writes: 1, failures: [], counts: { add: 0, remove: 0 }, changes: [], total: 0, inSync: 0, unreadable: 0 }), write })).toBe(0);
+    let applied = false;
+    expect(await main([], { report: async () => ({ mode: 'report', writes: 0, counts: { add: 0, remove: 0 }, changes: [], total: 0, inSync: 0, unreadable: 0 }), apply: async () => { applied = true; return {}; }, write })).toBe(0);
+    expect(applied).toBe(false);
+    expect(await main(['--apply'], { apply: async () => { throw new Error('boom'); }, write })).toBe(2);
   });
 });
