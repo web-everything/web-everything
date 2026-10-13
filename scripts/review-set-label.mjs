@@ -107,7 +107,9 @@ import {
 // sink, the loop console, the conveyor's rearm) reaches the ledger by reaching THIS, and none of them needs
 // its own writer. NOTHING MERGES ON IT YET — the drain still reads labels; `we:scripts/review-ledger-check.mjs`
 // reports any ledger/label disagreement, and that evidence is what decides whether Phase 2 is safe.
-import { buildVerdictRecord, appendVerdict, verdictForLabelTarget, verdictClears } from './lib/verdict-ledger.mjs';
+import {
+  buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES,
+} from './lib/verdict-ledger.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
@@ -948,8 +950,11 @@ export function runReviewLabelCli({
   // #4708 — the referral gate's read seams (`readRuns`, `readNetDiff`), injected only by tests; production reads the
   // local run store and git, exactly as `assertMandatoryReferralsCleared` defaults.
   referralOptions = {},
+  // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
+  // append), production writes through the same `appendVerdict` the verdict row uses.
+  appendApproval = appendVerdict,
 } = {}) {
-  // Shadows the module-level `fail` so EVERY refusal inside this function — there are seventeen — goes to the
+  // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
   // module-level one stays for the CLI bootstrap below, which owns fd 1 for real.
   const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
@@ -1044,6 +1049,33 @@ export function runReviewLabelCli({
         + 'clearance; it is posted verbatim in the durable comment (#2895)',
       );
     }
+  }
+  // #5649 — the `approval` row's two optional inputs, parsed and the row's shape checked BEFORE any write. A closed
+  // set for the kind and a JSON-parsed object for the delegation: a malformed value is a refusal, never a silent
+  // `null`. For `clear-human` the dry build below always runs (not only when a flag is given), so a kind/delegation
+  // combination the schema rejects can never be discovered AFTER the clearing verdict row is already appended.
+  const approvalKindFlag = argv.find((a) => a.startsWith('--approval-kind='));
+  const delegationFlag = argv.find((a) => a.startsWith('--delegation-json='));
+  const approvalKind = approvalKindFlag ? approvalKindFlag.slice('--approval-kind='.length).trim() : 'clear-human';
+  let approvalDelegation = null;
+  if ((approvalKindFlag || delegationFlag) && to !== 'clear-human') {
+    fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
+  }
+  if (to === 'clear-human') {
+    if (!APPROVAL_KINDS.includes(approvalKind)) {
+      fail(`invalid --approval-kind — expected one of ${APPROVAL_KINDS.join(', ')}; nothing was changed`);
+    }
+    if (delegationFlag) {
+      try { approvalDelegation = JSON.parse(delegationFlag.slice('--delegation-json='.length)); } catch {
+        fail('--delegation-json is not valid JSON; nothing was changed');
+      }
+      if (approvalDelegation == null) fail('--delegation-json must be an object {by, scope, expires (ISO time)}; nothing was changed');
+    }
+    // The shape check IS the schema: a placeholder repo/pr/time stand in for the real ones only to run `buildLedgerEvent`.
+    try {
+      buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
+        approval: approvalKind, delegation: approvalDelegation });
+    } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
   }
   // A BOUNCE WITH NO FINDINGS IS UNACTIONABLE, so it is refused (#xd6moh1). `review:changes` tells the author
   // to fix something; the findings are the only place that says WHAT. Without them the PR is parked behind a
@@ -1607,6 +1639,30 @@ export function runReviewLabelCli({
       // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
       // a holding target still swaps (the hold must apply even when the ledger is down).
       clearingLedgerMiss = verdictClears(ledgerVerdict);
+    } else if (to === 'clear-human') {
+      // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
+      // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
+      // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
+      // harmless (clearing is idempotent).
+      let approval;
+      try {
+        approval = appendApproval(buildLedgerEvent({
+          type: EVENT_TYPES.APPROVAL,
+          repo,
+          pr: Number(pr),
+          at: appended.record?.at ?? new Date().toISOString(),
+          approval: approvalKind,
+          delegation: approvalDelegation,
+          declaredActor: actor,
+          session: clearerId,
+          channel: normalizeChannel(channelArg),
+          source: 'review-set-label',
+        }));
+      } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
+      if (!approval?.ok) {
+        process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
+        clearingLedgerMiss = true;
+      }
     }
   } catch (e) {
     process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
