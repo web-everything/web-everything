@@ -3042,10 +3042,10 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     });
     it('a later run shows the reason stored on the head\'s record, and every reason is one safe line (no escape, invisible or newline)', () => {
       const known = new Map([['k-before', 'not-reproduced'], ['k-gone', 'not-reproduced']]);
-      const reasons = new Map([['k-before', 'x.mjs:1 stored answer'], ['k-gone', 'x.mjs:2 \u001b[2K\u001b[1Ahidden​‮text\nnext']]);
+      const reasons = new Map([['k-before', 'x.mjs:1 stored answer'], ['k-gone', 'x.mjs:2 \u001b[2K\u001b[1Ahidden\u200b‮text\nnext']]);
       const got = uncorroboratedRetirements({ downgraded: [{ seat: 's', key: 'k-before', reason: 'generic' }], known, reasons });
       expect(got.map((r) => r.reason)).toEqual(['x.mjs:1 stored answer', expect.stringContaining('hidden')]);
-      expect(got[1].reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f​‮]/);
+      expect(got[1].reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u200b‮]/);
       expect(knownVerificationReasons([{ head: 'h', key: 'k', outcome: 'not-reproduced', reason: 'r' }, { head: 'o', key: 'k2', outcome: 'not-reproduced', reason: 'x' },
         { head: 'h', key: 'k3', outcome: 'reproduced', reason: 'y' }], 'h')).toEqual(new Map([['k', 'r']]));
     });

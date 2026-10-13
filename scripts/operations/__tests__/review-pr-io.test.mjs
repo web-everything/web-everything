@@ -2611,7 +2611,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     const referralPosts = () => w.trace.filter((t) => t === 'referral').length;
     const advisoryPosts = () => w.trace.filter((t) => t === 'advisory').length;
     const [referralBefore, advisoryBefore] = [referralPosts(), advisoryPosts()];
-    expect(referralBefore).toBe(3); // initial record, attempted snapshot, completed snapshot
+    // initial record, attempted snapshot; the empty ruling answer leaves the completed snapshot byte-identical to the attempted one, so it is never reposted (xuxcsw6)
+    expect(referralBefore).toBe(2);
     expect(advisoryBefore).toBe(0); // this fixture has no advisory humanRequired input
 
     // The same tool-less seat re-raises the same claim on the same head: the REPRODUCED answer proves the verifier is never consulted.
