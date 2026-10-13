@@ -138,11 +138,13 @@ export function enrichPrsWithOwedMainRule(prs, { repo, read = readOwedMainRule, 
   if (repoKeyForSlug(repo) !== 'we') return prs;
   // Refresh owns repair only while waiting for the old main rule. Once main accepts,
   // ci-heal/rebase must remain available even if refreshing returns current or fails.
-  const waitingForMain = enabled(settings.refreshWhenMainAcceptsDrainNumbers) && !(typeof mainAccepts === 'function' ? mainAccepts() : mainAccepts);
+  // Read lazily, once, and only for a PR that actually needs it: a pass with no red lane PR must not shell out to git.
+  let accepts;
+  const waitingForMain = () => !(accepts ??= { value: typeof mainAccepts === 'function' ? mainAccepts() : mainAccepts }).value;
   for (const pr of prs) {
     delete pr.owedMainRule;
     if (!redTest(pr) || !eligible(pr) || !enabled(settings.refreshWhenMainAcceptsDrainNumbers)) continue;
-    try { pr.owedMainRule = { ...read(pr, { slug: CONSTELLATION_REPOS.we.slug }), head: pr.headRefOid, ownsRepair: waitingForMain && pr.mergeStateStatus !== 'DIRTY' }; }
+    try { pr.owedMainRule = { ...read(pr, { slug: CONSTELLATION_REPOS.we.slug }), head: pr.headRefOid, ownsRepair: pr.mergeStateStatus !== 'DIRTY' && waitingForMain() }; }
     catch (e) { pr.owedMainRule = { head: pr.headRefOid, owed: false, nums: [], reason: `unreadable: ${e.message}` }; }
   }
   return prs;

@@ -81,20 +81,20 @@ describe('IO replay', () => {
     expect(readOwedMainRule(pr(), { slug: 'we/we', exec, cache, authors }).owed).toBe(true);
     expect(exec).toHaveBeenCalledTimes(2);
     const other = vi.fn(() => '##[error]vitest failed');
-    expect(readOwedMainRule(pr({ headRefOid: 'other' }), { slug: 'we/we', exec: other, cache }).owed).toBe(false);
+    expect(readOwedMainRule(pr({ headRefOid: 'other' }), { slug: 'we/we', exec: other, cache, authors }).owed).toBe(false);
     expect(other).toHaveBeenCalledTimes(1);
   }));
   it('does not cache read failures', () => temporary(root => {
     const broken = vi.fn(() => { throw new Error('offline'); });
-    for (let i = 0; i < 2; i++) expect(readOwedMainRule(pr(), { slug: 'we/we', exec: broken, cache: join(root, 'state.json') }).reason).toMatch(/^unreadable:/);
+    for (let i = 0; i < 2; i++) expect(readOwedMainRule(pr(), { slug: 'we/we', exec: broken, authors, cache: join(root, 'state.json') }).reason).toMatch(/^unreadable:/);
     expect(broken).toHaveBeenCalledTimes(2);
   }));
   it('enriches only WE red test PRs', () => {
     const read = vi.fn(() => ({ owed: true, nums: [5994], reason: 'assigned' }));
     const rows = [pr(), pr({ statusCheckRollup: [] })];
-    enrichPrsWithOwedMainRule(rows, { repo: 'web-everything/web-everything', read });
+    enrichPrsWithOwedMainRule(rows, { repo: 'web-everything/web-everything', read, mainAccepts: () => false });
     expect(rows[0].owedMainRule).toMatchObject({ head: 'abc123', owed: true }); expect(rows[1].owedMainRule).toBeUndefined();
-    enrichPrsWithOwedMainRule([pr()], { repo: 'frontierui/frontierui', read }); expect(read).toHaveBeenCalledTimes(1);
+    enrichPrsWithOwedMainRule([pr()], { repo: 'frontierui/frontierui', read, mainAccepts: () => false }); expect(read).toHaveBeenCalledTimes(1);
   });
   it.each([false, true])('replays twice with main contract=%s', mainAccepts => temporary(async root => {
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));

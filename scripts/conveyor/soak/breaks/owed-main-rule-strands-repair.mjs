@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { enrichPrsWithOwedMainRule } from '../../../lib/renamed-pr-refresh.mjs';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { planReconcile } from '../../reconcile-core.mjs';
 
 export default {
@@ -18,7 +19,7 @@ export default {
           headRefOid: 'abc123', isCrossRepository: variant === 'fork', labels: [], comments: [],
           mergeStateStatus: variant === 'conflict' ? 'DIRTY' : 'CLEAN',
           statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
-        enrichPrsWithOwedMainRule([pr], { repo: 'web-everything/web-everything',
+        enrichPrsWithOwedMainRule([pr], { repo: CONSTELLATION_REPOS.we.slug,
           settings: { refreshWhenMainAcceptsDrainNumbers: variant !== 'disabled' },
           mainAccepts: () => variant === 'current' || variant === 'conflict',
           read: () => ({ owed: true, nums: [5994] }) });
