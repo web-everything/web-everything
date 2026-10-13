@@ -497,3 +497,22 @@ describe('fresh complete review-hold decisions (#5955)', () => {
   });
 
 });
+
+
+describe('#5045 pending with a stale accept', () => {
+  const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
+  for (const current of [false, true]) it(current ? 'flags same-head acceptance' : 'posts evidence and removes only stale accepted', () => {
+    const p = provider({ readPrState: () => ({ labels: ['review:pending', 'review:accepted'], headRefOid: head, comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${current ? head : '9db3d19825465e7da28c4e179833e2c799bb94e4'} -->` }] }) });
+    const results = sweepFixture({ listPrs: () => [pr(5045, ['review:pending', 'review:accepted'])], provider: p, repo: 'o/n' });
+    const r = results.find((r) => r.num === 5045 && (r.healed || r.flagged));
+    if (current) {
+      expect(r.flagReason).toBe('accept-current');
+      expect(p.calls.set).toEqual([]);
+    } else {
+      expect(r.healed).toEqual(['review:accepted']);
+      expect(r.commentPosted).toBe(true);
+      expect(p.calls.set[0].spec).toEqual({ remove: ['review:accepted'] });
+      expect(p.calls.postComment[0].body).toContain('review:pending');
+    }
+  });
+});

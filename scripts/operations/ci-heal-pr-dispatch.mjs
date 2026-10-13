@@ -521,7 +521,7 @@ export async function runReconcileCiHealDispatch({
       try {
         if (disposition.action === 'park') {
           await postParkComment({ repoSlug: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber,
-            body: buildStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
+            body: buildStandDownComment({ head: entry.headRefOid, actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
               detail: `${counts}; ${disposition.reason}. Head: ${entry.headRefOid}.` }) });
           await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'park', reason: disposition.reason });
         }

@@ -23,6 +23,8 @@
  *      describe — live on PR #2578 (`advisory:accepted` stamped 13:29:54Z while `review:human`, `review:human`
  *      cleared 13:38:11Z, the advisory label never removed). `planReviewHoldCleanup` drops it.
  *
+ * Pending+accepted also heals when the trusted accept names an older head; pending stays.
+ *
  * A THIRD, HEALED — NOT MERELY DROPPED (#2766/#2767, 2026-09-26). `review:accepted` + `review:human` co-present
  * is not a stray LEFTOVER a blind label removal can safely clean up — `decideParkToHuman`'s own write-time fix
  * (`we:scripts/lib/review-escalation.mjs`) stops FUTURE occurrences, but an already-contradictory PR needs its
@@ -45,8 +47,7 @@
  * only a PR's `labels` and is fully unit-testable with no `gh`; {@link sweepReviewHoldLabels} is the IO shell,
  * with the PR list and the label provider injectable so the whole pass is testable without a real `gh` call too.
  *
- * WHAT IT NEVER DOES: add a label (the heal path's own `decideParkToHuman` decision never needs to — `human`
- * is ALREADY live on every PR this sweep heals, by construction of the pair it heals), or touch anything but
+ * WHAT IT NEVER DOES: add a label (each healed pair already carries its operative hold), or touch anything but
  * the removals named above. It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
  * human/independent-agent act, never a sweep's), and it never adds `review:pending`/`review:changes` — a stray
  * label is dropped, never replaced with a guess at what it should have said instead.
@@ -54,6 +55,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
   REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
@@ -178,6 +180,7 @@ export function sweepReviewHoldLabels({
       const heal = decideContradictoryVerdictHeal({
         currentLabels: state.labels,
         humanClearedSha: parseLatestHumanClearedSha(state.comments),
+        acceptedSha: latestAcceptRecord(state.comments)?.sha ?? null,
         headSha: state.headRefOid,
         fetchOk: true,
       });
