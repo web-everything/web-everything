@@ -2980,7 +2980,10 @@ export function planReconcile({
     // head (that pause is right), so the fix that CHANGES the head must go out with the blocked findings in its
     // brief. Live 2026-10-06, #4017: three `block` rulings, the pause refused every tick, no push could ever come.
     // Unruled referrals never reach here (`blockRuledReferrals` is empty while any is pending).
-    if (phase === 'needs-human' && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
+    // Live 2026-10-12, #5009: a carried operator block survived on the new head, but verdict write-back was
+    // refused (0 juror findings), leaving the label stuck `review:pending`. The current-head block ruling
+    // owes a fix regardless of which review label landed.
+    if ((phase === 'needs-human' || phase === 'needs-review') && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
       // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
       // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see
