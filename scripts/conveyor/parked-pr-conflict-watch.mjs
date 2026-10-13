@@ -31,10 +31,9 @@
  * not one: it still applies the informative label + one-time alert (below, unchanged), AND it hands the PR to
  * the SAME bounce+fix-dispatch pipeline `we:scripts/conveyor/reconcile-fix-dispatch.mjs` already runs for an
  * ordinary reviewer finding — via `we:scripts/conveyor/reconcile-finding.mjs` ({@link postConflictFinding}) —
- * UNLESS the conflict sits in a declarative-leash/statute-tier file ({@link isStatuteTierConflict}), in which
- * case it routes straight to a human via `we:scripts/conveyor/stand-down.mjs --reason=conflict`
- * ({@link postConflictStandDown}) with no dispatch attempt at all. This file itself still never resolves a
- * conflict or writes a fix — it only decides which of the two existing downstream pipelines a fresh conflict
+ * Same-line statute conflicts go to a fixer first (live #5017 (2026-10-13)). The declared
+ * `conflictWatch.sameLineConflict=stand-down` setting retains the earlier direct stand-down route.
+ * This file itself still never resolves a conflict or writes a fix — it only decides which of the two existing downstream pipelines a fresh conflict
  * reaches.
  *
  * RESOLVED CONFLICTS OWE A FRESH REVIEW. Once GitHub confirms `mergeable: MERGEABLE` on a previously
@@ -170,6 +169,7 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // module's `CONFLICT_LABEL`/`CONFLICT_LABEL_META` (`reconcile-fix-dispatch.mjs`) needs no edit either. See that
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
+import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
 
@@ -651,7 +651,7 @@ export function hasRecentConflictStandDownComment(comments, { now = Date.now(), 
  * @param {{num:number|string, headRefName?:string}} pr
  * @returns {string}
  */
-export function buildConflictComment(pr, { isStatuteTier = false, deferredToDrain = false, appendOnlyStatute = false, reviewHumanFixable = false } = {}) {
+export function buildConflictComment(pr, { isStatuteTier = false, deferredToDrain = false, appendOnlyStatute = false, reviewHumanFixable = false, sameLineFixer = false } = {}) {
   const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
   // Precedence mirrors the IO shell's routing EXACTLY (PR #2531 review, extended by #xu2krte Fork 2): stand-down
   // (`isStatuteTier`) wins, then an append-only statute conflict, then the review-human statute-amendment
@@ -661,7 +661,10 @@ export function buildConflictComment(pr, { isStatuteTier = false, deferredToDrai
   // stand-down wins first, append-only next, so the comment can never claim two outcomes at once.
   const appendOnly = appendOnlyStatute && !isStatuteTier;
   const reviewHumanAmendment = reviewHumanFixable && !isStatuteTier && !appendOnly;
-  const nextStep = isStatuteTier
+  const nextStep = sameLineFixer
+    ? 'A fix agent is being dispatched to resolve this same-line statute conflict, keeping both sides’ intent. ' +
+      'It stands down only if it cannot resolve the conflict safely. A fresh independent review is still owed.'
+    : isStatuteTier
     ? 'Left as a **judgment call for a human or `/finish`**, not auto-resolved: the conflicting hunk touches a ' +
       "declarative-leash/statute-tier file, so choosing which side's edit wins is drafting principle content, " +
       'not ordinary code — exactly the judgment this repo reserves for a person (`#xu2krte` Fork 2).'
@@ -1004,11 +1007,15 @@ export function isWatcherMarkerAlreadySuperseded(comments) {
  * @param {{num?:number|string}} [pr]
  * @returns {string}
  */
-export function buildSupersedeStandDownComment(pr) {
+export function buildSupersedeStandDownComment(pr, { sameLineConflict = false } = {}) {
   return [
     SUPERSEDE_STAND_DOWN_MARKER,
     '',
-    'An earlier sweep of the parked-PR conflict watch stood this PR down because its statute-tier conflict was ' +
+    sameLineConflict
+      ? 'The earlier watcher stand-down is superseded: this same-line statute conflict now goes to a fixer first ' +
+        '(live #5017 (2026-10-13)). It must preserve both sides’ intent, provide before/after evidence, and stand ' +
+        'down if it cannot resolve the conflict safely. A fresh independent review is still owed.'
+      : 'An earlier sweep of the parked-PR conflict watch stood this PR down because its statute-tier conflict was ' +
       'not append-only. Under the narrower `#xu2krte` Fork 2 rule, a `review:human` PR (a human reviews the ' +
       'result regardless) whose conflicting statute hunk does NOT overlap what `main` independently changed since ' +
       'the merge base is now routed to a fix agent instead: `review:human` is never cleared or downgraded, and a ' +
@@ -1026,8 +1033,8 @@ export function buildSupersedeStandDownComment(pr) {
  * this file posts through — no new `gh` call site.
  * @param {{pr:object, repo:string|null, provider:object}} o
  */
-export function defaultPostSupersedeComment({ pr, repo, provider }) {
-  provider.postComment(repo, pr?.number, buildSupersedeStandDownComment(pr));
+export function defaultPostSupersedeComment({ pr, repo, provider, sameLineConflict = false }) {
+  provider.postComment(repo, pr?.number, buildSupersedeStandDownComment(pr, { sameLineConflict }));
 }
 
 /**
@@ -1177,7 +1184,7 @@ export { defaultListPrComments };
  * @param {{num:number|string, headRefName?:string}} pr
  * @returns {string}
  */
-export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false } = {}) {
+export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false } = {}) {
   const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
   // #3383-append-only-statute — an EXPLICIT, narrower instruction for the one case this file's classifier proves
   // mechanical: both sides only ADDED a new `### ` section at the same spot in a statute doc. Stated as its own
@@ -1224,9 +1231,19 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
       "GitHub reports `mergeable: CONFLICTING`. This is the WHOLE finding; there is no separate reviewer comment " +
       'to read on this PR for it.',
     '',
-    '**Resolving the conflict IS the task.** Rebase or merge `main` into this branch, resolve every conflicted ' +
+    sameLineConflict
+      ? '**Resolving the conflict IS the task.** Merge `main` into this branch (no rebase, no force-push), then return it to independent review.'
+      : '**Resolving the conflict IS the task.** Rebase or merge `main` into this branch, resolve every conflicted ' +
       "hunk by reading BOTH sides' intent (this diff's own and whatever landed on `main` since), push the " +
       'resolution, and let the normal fix-agent flow (this bounce) carry it back to independent review.',
+    ...(sameLineConflict ? [
+      '',
+      '**Genuine same-line conflict with `main` in a statute/leash-tier file.** Resolve each conflicting hunk ' +
+        "by keeping BOTH sides' intent: main's newer rule text plus this PR's addition. Make no unrelated edits. " +
+        'If a hunk is a true either/or choice of rule text you cannot reconcile safely, stand down ' +
+        `with \`node scripts/conveyor/stand-down.mjs ${pr?.num ?? pr?.number ?? '?'} --reason=conflict\`, ` +
+        'naming the hunk rather than guessing. Post before/after of each resolved hunk as evidence.',
+    ] : []),
     ...appendOnlyInstruction,
     ...reviewHumanInstruction,
     '',
@@ -1355,9 +1372,9 @@ export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null
  * path (`we:scripts/review-set-label.mjs#bodyFileRoots`) and removed afterward either way.
  * @param {{pr:object, repo:string|null, exec?:Function}} o
  */
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
-  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync }), 'utf8');
+  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict }), 'utf8');
   try {
     const argv = [
       join(REPO_ROOT, 'scripts', 'conveyor', 'reconcile-finding.mjs'), String(pr?.number),
@@ -1408,7 +1425,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
  * `#xu2krte`'s Fork 2/4 addition: on `newlyDetected`, ALSO route the PR to exactly one of
  * {@link defaultPostConflictFinding} (dispatchable — becomes a `review:changes` bounce the existing
  * fix-dispatch pipeline picks up) or {@link defaultPostConflictStandDown} ({@link isStatuteTierConflict} —
- * straight to a human, no dispatch attempt). Best-effort like every other write here: a failure is reported on
+ * direct stand-down only when the declared same-line policy selects it). A failure is reported on
  * the entry, never thrown, and never stops the sweep from checking the rest of the PRs.
  * On `newlyResolved`, a remaining `review:changes` bounce goes to {@link defaultPostConflictRearm} — UNLESS
  * (#4118 finding (c)) a fix-agent session is still LIVE on this exact PR (`deriveReviewStatus`, name-based —
@@ -1425,6 +1442,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
  */
 export function watchParkedPrConflicts({
   repo = null, listPrs = defaultListParkedPrs, provider = createGhProvider(), dryRun = false,
+  sameLineConflict = loadSameLineConflictSetting().value,
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
   postRearm = defaultPostConflictRearm,
   postSupersedeComment = defaultPostSupersedeComment,
@@ -1505,7 +1523,10 @@ export function watchParkedPrConflicts({
     const idleConflictBounce = parked && !queued && !plan.add && plan.remove.length === 0
       && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human) && hasReviewLabel(pr?.labels, CONFLICT_LABEL)
       && !hasReviewLabel(pr?.labels, REVIEW_LABELS.changes);
-    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce) continue;
+    // Recover live #5017 (2026-10-13), including an existing review:changes bounce.
+    const sameLineRecovery = sameLineConflict === 'fixer' && isConflicting && !plan.add && !plan.remove.length
+      && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
+    if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
@@ -1556,13 +1577,37 @@ export function watchParkedPrConflicts({
         results.push(entry);
       }
     };
+    let recoveryComments = null;
+    if (sameLineRecovery) {
+      try {
+        recoveryComments = listPrComments({ number: pr?.number, repo });
+        if (!Array.isArray(recoveryComments)) continue;
+        if (findWatcherStandDownComment(recoveryComments)) {
+          if (isWatcherMarkerAlreadySuperseded(recoveryComments)) continue;
+          if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+          if (!dryRun) {
+            postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+            postSupersedeComment({ pr, repo: resolvedRepo, provider, sameLineConflict: true });
+          }
+          entry.supersededStandDown = true;
+          entry.routedTo = 'reconcile-finding (same-line conflict → fixer, marker superseded)';
+          results.push(entry);
+          continue;
+        }
+      } catch (e) {
+        entry.error = String(e?.message ?? e).split('\n')[0];
+        results.push(entry);
+        continue;
+      }
+      if (!graceDue && !idleConflictBounce) continue;
+    }
     if (idleConflictBounce && !recheckCandidate && !graceDue) {
       // Same lazy-read discipline as `recheckCandidate` just below — this narrow, otherwise-invisible
       // population costs nothing extra on every OTHER tick.
       // Same fail-closed read as the review:human route below: an unreadable thread (throw / non-array) hides the
       // spent round cap and the once-per-round finding, so re-asserting off `[]` would bypass both. Retry next sweep.
       let comments = null;
-      try { const listed = listPrComments({ number: pr?.number, repo }); if (Array.isArray(listed)) comments = listed; } catch { comments = null; }
+      try { const listed = recoveryComments ?? listPrComments({ number: pr?.number, repo }); if (Array.isArray(listed)) comments = listed; } catch { comments = null; }
       if (comments) reassertIdleConflict(comments, null);
       continue;
     }
@@ -1625,8 +1670,16 @@ export function watchParkedPrConflicts({
         }
         const resync = gitClean;
         if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && !operatorAnswered && !gitClean) {
-          // Still a genuine judgment call — the earlier stand-down stands; never re-post, never duplicate the marker.
-          entry.routedTo = 'stand-down (unchanged)';
+          if (sameLineConflict === 'fixer') {
+            if (!dryRun) {
+              postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+              postSupersedeComment({ pr, repo: resolvedRepo, provider, sameLineConflict: true });
+            }
+            entry.supersededStandDown = true;
+            entry.routedTo = 'reconcile-finding (same-line conflict → fixer, marker superseded)';
+          } else {
+            entry.routedTo = 'stand-down (unchanged)';
+          }
           results.push(entry);
           continue;
         }
@@ -1754,7 +1807,24 @@ export function watchParkedPrConflicts({
           priorWatcherStandDown = Boolean(findWatcherStandDownComment(threadComments)) && !isWatcherMarkerAlreadySuperseded(threadComments);
         } catch { priorWatcherStandDown = false; }
 
-        if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable) {
+        if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && sameLineConflict === 'fixer') {
+          let comments = [];
+          let commentsRead = false;
+          try {
+            comments = listPrComments({ number: pr?.number, repo: resolvedRepo });
+            commentsRead = true;
+          } catch { /* retry next sweep without posting an unverified duplicate */ }
+          let sinceMs = -Infinity;
+          if (Array.isArray(comments) && comments.length) {
+            let removedAt = null;
+            try { removedAt = labelRemovedAtMs({ pr, repo: resolvedRepo }); } catch { /* unknown boundary */ }
+            sinceMs = Number.isFinite(removedAt) ? removedAt : -Infinity;
+          }
+          if (!dryRun && commentsRead && !hasRecentConflictFindingComment(comments, { now, sinceMs })) {
+            postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+          }
+          entry.routedTo = 'reconcile-finding (same-line conflict → fixer)';
+        } else if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable) {
           // #3383 fix — this is NO LONGER assumed to have already reached a human at detection: the fresh path
           // only stands down IMMEDIATELY when the conflict is ALREADY statute-tier at that moment; a queued,
           // non-statute-tier conflict is deferred to the drain instead (`routedTo: 'deferred-to-drain'`) and can
@@ -1994,7 +2064,8 @@ export function watchParkedPrConflicts({
         if (!hasRecentConflictAlertComment(existingComments, markerScope)) {
           provider.postComment(resolvedRepo, pr?.number,
             buildConflictComment(pr, {
-              isStatuteTier: standDown, deferredToDrain: queued, appendOnlyStatute,
+              isStatuteTier: standDown && sameLineConflict !== 'fixer',
+              sameLineFixer: standDown && sameLineConflict === 'fixer', deferredToDrain: queued, appendOnlyStatute,
               reviewHumanFixable: isStatuteTier && reviewHumanFixable,
             }));
           entry.commented = true;
@@ -2012,7 +2083,10 @@ export function watchParkedPrConflicts({
         // null forever on the next sweep (already labelled → skipped) with the routing decision never made or
         // never retried. Leaving the label unapplied on a throw here means the WHOLE branch — alert-dedup
         // included — retries cleanly on the next sweep instead.
-        if (standDown) {
+        if (standDown && sameLineConflict === 'fixer') {
+          if (!hasRecentConflictFindingComment(existingComments, markerScope)) postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+          entry.routedTo = 'reconcile-finding (same-line conflict → fixer)';
+        } else if (standDown) {
           if (!hasRecentConflictStandDownComment(existingComments, markerScope)) postStandDown({ pr, repo: resolvedRepo });
           entry.routedTo = 'stand-down';
         } else if (isStatuteTier && appendOnlyStatute) {
