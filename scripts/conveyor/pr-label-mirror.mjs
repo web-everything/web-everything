@@ -79,7 +79,7 @@ export async function runMirrorReport({ repo = DEFAULT_REPO, store, limit = 200,
 
 const GRAPHQL_PAGE = 100;
 /** First line of an error, capped: a hostile or huge message cannot flood a failure entry. */
-const firstLine = (e, max = 200) => firstLine(e).slice(0, max);
+const firstLine = (e, max = 200) => String(e?.message ?? e).split('\n')[0].slice(0, max);
 /** At most this many pages (newest first) per PR; past it the PR is `unreadable`, never partially applied. */
 const TIMELINE_MAX_PAGES = 5;
 
