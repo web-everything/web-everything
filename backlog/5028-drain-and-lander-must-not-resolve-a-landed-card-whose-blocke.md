@@ -3,7 +3,7 @@ bornAs: xnaqr9r
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/__tests__/lane-drain.test.mjs"]
+scope: ["we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/backlog-stranded-sweep.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "5d0359792f9aa88bb3558a4e667b57dfebcb1068"
@@ -65,18 +65,19 @@ Out of MVP (see Follow-ups): auto-resolving the card when its last blocker resol
 In we:scripts/__tests__/lane-drain.test.mjs (pure helper tests plus a throwaway-git-repo case for `resolveLandedItem`, with the resolve step observable so "no resolve commit" is asserted):
 
 - `blocker open → refuses` — the #3834 / card 4374 shape: card `open`, `blockedBy: ["4300"]`, blocker `status: open`. Asserts `flipped:false, reason:'blockers-open', blockedBy:['4300']`, no resolve call, no commit. RED before the fix: the function calls resolve and returns `flipped:true`.
-- `mixed blockers` — one resolved, one open: refuses and names only the open one.
-- `unknown blocker counts as open` — a blocker id with no file, and a blocker file with no frontmatter/status: both refuse.
-- `unparseable blockedBy` — `blockedBy: nonsense`: refuses.
-- `hash spelling` — an `x…` blocker still `open` refuses; the same blocker once `resolved` allows.
-- `no regression` — no `blockedBy`, `blockedBy: []`, and all blockers `resolved` each still flip and commit, called as the drain calls it (`sync:true`) and as the lander calls it (`sync:false, publish:false`).
-- `non-source card` — a docs-only card with an open blocker refuses identically.
-- `already resolved wins` — a card already `resolved` with an open blocker stays `alreadyResolved:true`.
-- Lander wiring test beside we:scripts/__tests__/merge-ai-prs-stranded-sweep-wiring.test.mjs: a `blockers-open` result lands in `skippedBlocked`, not `failedResolve`, and the message names the blockers. Sweep test in we:scripts/__tests__/backlog-stranded-sweep.test.mjs: the `applied` entry carries `blockedBy`.
-- `trailing comment / padded id` — `["2989"]   # note` and `"0043"` parse and look up correctly; bare prose refuses.
-- Drain caller: a source-scrape assertion that the `blockers-open` branch continues to finalizeLand and bypasses reopen-on-fail (matches the existing scrape style at we:scripts/__tests__/lane-drain.test.mjs:377-409).
+- Red today: `mixed blockers` — one resolved, one open: refuses and names only the open one.
+- Red today: `unknown blocker counts as open` — a blocker id with no file, and a blocker file with no frontmatter/status: both refuse.
+- Red today: `unparseable blockedBy` — `blockedBy: nonsense`: refuses.
+- Red today: `hash spelling` — an `x…` blocker still `open` refuses (the resolved-allows half is GREEN today, mutation proof: make the helper treat every blocker as open and it fails).
+- GREEN today (preservation; mutation proof: make the guard refuse everything and it fails): `no regression` — no `blockedBy`, `blockedBy: []`, and all blockers `resolved` each still flip and commit, called as the drain calls it (`sync:true`) and as the lander calls it (`sync:false, publish:false`).
+- Red today: `non-source card` — a docs-only card with an open blocker refuses identically.
+- GREEN today (preservation; mutation proof: move the guard above the already-resolved return and it fails): `already resolved wins` — a card already `resolved` with an open blocker stays `alreadyResolved:true`.
+- Red today: lander wiring test in we:scripts/__tests__/merge-ai-prs.test.mjs (`bucketFlip` does not exist yet): a `blockers-open` result lands in `skippedBlocked`, not `failedResolve`, and the message names the blockers. Sweep test in we:scripts/__tests__/backlog-stranded-sweep.test.mjs: the `applied` entry carries `blockedBy`.
+- Red today: `trailing comment / padded id` — `["2989"]   # note` and `"0043"` parse and look up correctly; bare prose refuses.
+- Red today: drain caller — a source-scrape assertion that the `blockers-open` branch continues to finalizeLand and bypasses reopen-on-fail (matches the existing scrape style at we:scripts/__tests__/lane-drain.test.mjs:377-409).
 - Labels: "blocker open", "mixed", "unknown", "unparseable", "hash spelling (open)", the lander bucket and the sweep `blockedBy` test are RED before the fix; "no regression", "already resolved wins" and "non-source" are guards (green before and after, by design). The lander test calls a small extracted pure `bucketFlip(flip)` rather than scraping source; `skippedBlocked` stays out of the `.failed` check in `queueFollowUpsClean` (we:scripts/merge-ai-prs.mjs:6893) and the sweep reports blocked skips separately from failures.
-- The existing drain commit-message source-scrape tests stay green (commit template untouched).
+- GREEN today (preservation; mutation proof: reintroduce a bare `drain: resolve #N` template and it fails): the existing drain commit-message source-scrape tests stay green (commit template untouched).
+- Sweep: Red today — a test in we:scripts/__tests__/backlog-stranded-sweep.test.mjs that `applied[]` carries `blockedBy` and `reason: 'blockers-open'`.
 
 ## Proof plan
 
