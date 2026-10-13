@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isTerminalStatus } from './lib/backlog-status.cjs';
 /**
  * lane-pool.mjs — provision & refresh the persistent lane-clone pool for the #1933 clone-based
  * parallel batch orchestrator (slice 2).
@@ -1690,7 +1691,7 @@ function deadLeasePlan(repo, nowMs, ttlMs) {
     const path = backlogListing.find((p) => new RegExp(`^backlog/0*${num}-`).test(p));
     if (!path) return false;
     const body = tryGit(['show', `origin/${repo.branch}:${path}`], repo.referencePath);
-    return body != null && readField(body, 'status') === 'resolved';
+    return body != null && isTerminalStatus(readField(body, 'status'));
   };
   const signalsFor = (c) => {
     // #3283 — A TERMINAL SIGNAL ABOUT THE ITEM IS NECESSARY BUT NOT SUFFICIENT. "This lane's item is finished"
