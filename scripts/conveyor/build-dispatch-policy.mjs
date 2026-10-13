@@ -358,8 +358,8 @@ const BUILD_BOUND_REASONS = new Set([
 const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps lane-/.test(String(reason));
 
 /**
- * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (highest delivery
- * class first, then queue order; pinned first only when either row has no class, preserving legacy queues;
+ * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (
+ * P0 first, then finite buildPriority ascending, then class and queue order; pinned first only when either row has no class, preserving legacy queues;
  * missing or unknown classes count as P3), keeping only items
  * that are launching now or held for a reason that
  * clears on its own (see {@link BUILD_BOUND_REASONS}). A prepare is spent only on these, so a card is prepared
@@ -370,7 +370,7 @@ const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps l
  * never takes a window slot: the window is the next `window` cards that CAN move. Before, two failure-held cards
  * at the head of the pinned tier filled half of the 4-slot window every tick, and with the other two starved
  * behind them nothing was ever prepared, so nothing ever became build-ready.
- * @param {{queue?:Array<{num:*, tier?:string|null, priorityClass?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number, skip?:Iterable<*>}} o
+ * @param {{queue?:Array<{num:*, tier?:string|null, priorityClass?:string|null, buildPriority?:number}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number, skip?:Iterable<*>}} o
  * @returns {Set<string>|null} the in-window nums (normalized), or `null` when the window is off (not a finite number ≥ 0)
  */
 export function prepareAheadNums({ queue = [], launch = [], held = [], window = Infinity, skip = [] } = {}) {
@@ -381,9 +381,9 @@ export function prepareAheadNums({ queue = [], launch = [], held = [], window = 
   const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
     .map((r, i) => {
       const classIndex = ['P0', 'P1', 'P2', 'P3', 'P4'].indexOf(r.priorityClass);
-      return { num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, hasClass: !!r.priorityClass, pinned: r.tier === 'pinned', i };
+      return { buildPriority: Number.isFinite(r.buildPriority) ? r.buildPriority : Infinity, num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, hasClass: !!r.priorityClass, pinned: r.tier === 'pinned', i };
     })
-    .sort((a, b) => (a.priority - b.priority) || ((!a.hasClass || !b.hasClass) ? b.pinned - a.pinned : 0) || (a.i - b.i));
+    .sort((a, b) => Number(b.priority === 0) - Number(a.priority === 0) || (a.buildPriority - b.buildPriority) || (a.priority - b.priority) || ((!a.hasClass || !b.hasClass) ? b.pinned - a.pinned : 0) || (a.i - b.i));
   const out = new Set();
   for (const r of rows) {
     if (out.size >= window) break;

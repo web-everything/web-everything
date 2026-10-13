@@ -1,13 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, statSync, utimesSync, existsSync } from 'node:fs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { buildQueueCacheFile } from '../build-queue-cache.mjs';
 import { SETTINGS_DIR, readSettings } from '../settings-files.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from '../../conveyor/delivery-priority-shadow.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { orderQueueDetailed, DEFAULT_CONFIG, buildQueuePriorityFacts, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from '../build-queue.mjs';
+import { resolveBuildPriority, readBuildPrioritySettings, orderQueueDetailed, DEFAULT_CONFIG, buildQueuePriorityFacts, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from '../build-queue.mjs';
 
 const item = (num, over = {}) => ({ num: String(num), id: `${num}-x`, status: 'open', dateOpened: '2026-07-16', ...over });
 const NOW = Date.parse('2026-07-16T12:00:00Z');
@@ -416,4 +417,113 @@ describe('#4355 build-queue --json cache is invalidated by every input the clear
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+
+describe('build.priority operator list', () => {
+  it('resolves valid layers, trims and deduplicates, and lets empty env clear', () => {
+    const platform = { priority: ['1'] };
+    const tool = { priority: [' 2 ', '2', 'xxanl0v'] };
+    expect(resolveBuildPriority()).toEqual({ ids: [], source: 'standard' });
+    expect(resolveBuildPriority({ platform })).toEqual({ ids: ['1'], source: 'platform' });
+    expect(resolveBuildPriority({ platform, tool })).toEqual({ ids: ['2', 'xxanl0v'], source: 'tool' });
+    expect(resolveBuildPriority({ platform, tool, env: { WE_BUILD_PRIORITY: '3, 4,3' } })).toEqual({ ids: ['3', '4'], source: 'env' });
+    expect(resolveBuildPriority({ platform, tool, env: { WE_BUILD_PRIORITY: '  ' } })).toEqual({ ids: [], source: 'env' });
+  });
+  it.each([null, 7, '2', [''], ['bad'], ['1', 2], { nested: ['2'] }].map(value => [value]))('ignores an invalid tool list %j', (priority) => {
+    expect(resolveBuildPriority({ platform: { priority: ['1'] }, tool: { priority } })).toEqual({ ids: ['1'], source: 'platform' });
+  });
+  it('ignores invalid env and tolerates an unreadable tool setting', () => {
+    expect(resolveBuildPriority({ tool: { priority: ['2'] }, env: { WE_BUILD_PRIORITY: 'bad' } })).toEqual({ ids: ['2'], source: 'tool' });
+    expect(readBuildPrioritySettings({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-test' }, read: () => { throw Error('unreadable'); } })).toEqual({ ids: [], source: 'standard' });
+  });
+  it('logs canonical values once and names rejected layers through the shared cascade', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-priority-'));
+    const path = join(dir, 'platform.json');
+    writeFileSync(path, JSON.stringify({ build: { priority: ['7'] } }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    resetCascadeLogForTest();
+    try {
+      const env = { WE_POLICY_CASCADE_LOG: '1', WE_PLATFORM_PREFERENCES_FILE: path };
+      expect(readBuildPrioritySettings({ env, read: () => ({ build: { priority: ['bad'] } }) }))
+        .toEqual({ ids: ['7'], source: 'platform' });
+      expect(log.mock.calls[0][0]).toContain('ignored invalid: tool.priority=');
+      log.mockClear();
+      resetCascadeLogForTest();
+      for (const value of ['8, 9,8', '8,9']) {
+        expect(readBuildPrioritySettings({ env: { ...env, WE_BUILD_PRIORITY: value }, read: () => ({}) }))
+          .toEqual({ ids: ['8', '9'], source: 'env' });
+      }
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toBe('policy-cascade · build: priority=["8","9"] (env)');
+    } finally {
+      log.mockRestore();
+      resetCascadeLogForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it.each(['enforce', 'shadow', 'off'])('lifts newer listed cards in list order in %s', (mode) => {
+    const items = [item(1, { dateOpened: '2020-01-01', queuedAt: queuedAgo(100), priority: 'high' }), item(2), item(3)];
+    const rows = orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { priority: { ...ON, mode }, buildPriority: ['3', '2'] });
+    expect(rows.map(r => r.item.num)).toEqual(['3', '2', '1']);
+    expect(rows[0]).toMatchObject({ buildPriorityIndex: 0, buildPriorityVia: null });
+    expect(rows[0].priorityReasons).toContain('build.priority #1');
+    expect(orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { priority: { ...ON, mode }, buildPriority: [] }))
+      .toEqual(orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { priority: { ...ON, mode } }));
+  });
+  it('lifts descendants and uses the earliest direct or ancestor entry', () => {
+    const items = [item(1), item(10, { status: 'resolved' }), item(11, { parent: '10' }), item(12, { parent: '11' })];
+    const rows = orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { buildPriority: ['12', '10'] });
+    expect(rows.map(r => r.item.num)).toEqual(['12', '11', '1']);
+    expect(rows[0]).toMatchObject({ buildPriorityIndex: 0, buildPriorityVia: null });
+    expect(rows[1]).toMatchObject({ buildPriorityIndex: 1, buildPriorityVia: '10' });
+    expect(rows[1].priorityReasons).toContain('build.priority #2 (via 10)');
+    const inherited = orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { buildPriority: ['10', '12'] });
+    expect(inherited.find(r => r.item.num === '12')).toMatchObject({ buildPriorityIndex: 0, buildPriorityVia: '10' });
+  });
+  it('matches normalized nums, bornAs, and x-id stems, including parent aliases', () => {
+    const items = [item(1), item('0002'), item(3, { bornAs: 'xxanl0v', status: 'resolved' }),
+      item(null, { id: 'xpj9fhk-title', num: null }), item(5, { parent: 'xxanl0v' })];
+    expect(orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { buildPriority: ['xxanl0v', 'xpj9fhk', '2'] }).map(r => r.item.num))
+      .toEqual(['5', null, '0002', '1']);
+    expect(orderQueueDetailed([item(3, { bornAs: 'xxanl0v' }), item(1)], DEFAULT_CONFIG, NOW, { buildPriority: ['xxanl0v'] })[0].buildPriorityVia).toBeNull();
+  });
+  it('keeps blocked listed cards out and terminates parent cycles at depth 20', () => {
+    const items = [item(1), item(2, { blockedBy: ['1'] }), item(3, { parent: '4' }), item(4, { parent: '3' })];
+    expect(orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { buildPriority: ['2', '4'] }).map(r => r.item.num)).toEqual(['3', '4', '1']);
+    const chain = Array.from({ length: 22 }, (_, i) => item(i + 1, { parent: String(i + 2) }));
+    expect(orderQueueDetailed(chain, DEFAULT_CONFIG, NOW, { buildPriority: ['22'] }).find(r => r.item.num === '1').buildPriorityIndex).toBeNull();
+  });
+  it('keeps P0 ahead of listed rows in the enforce comparator', () => {
+    const rows = orderQueueDetailed([item(1), item(2)], DEFAULT_CONFIG, NOW, { priority: ON, buildPriority: ['2'] });
+    const p0 = { ...rows[1], priorityClass: 'P0' };
+    expect(classOrder([rows[0], p0])[0]).toBe(p0);
+  });
+});
+
+
+it('build-queue --next carries operator metadata and invalidates cached order when the list changes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'build-priority-cli-'));
+  try {
+    const dir = join(root, 'backlog');
+    mkdirSync(dir);
+    const base = { kind: 'story', size: 2, status: 'open', dateOpened: '2026-01-01', tags: [] };
+    card(dir, '9101-old.md', base);
+    card(dir, '9102-new.md', { ...base, dateOpened: '2026-09-01' });
+    const queueFile = join(root, 'queue.json');
+    writeFileSync(queueFile, JSON.stringify([{ num: '9101' }, { num: '9102' }]));
+    const env = { ...process.env, CONVEYOR_QUEUE_FILE: queueFile, WE_BUILD_QUEUE_CACHE: '1', WE_BUILD_QUEUE_PRIORITY_MODE: 'off' };
+    const run = priority => JSON.parse(execFileSync(process.execPath,
+      [BACKLOG_CLI, 'build-queue', '--next', '--json', `--backlog-dir=${dir}`],
+      { env: { ...env, WE_BUILD_PRIORITY: priority }, encoding: 'utf8' }));
+    expect(run('9102')).toMatchObject({
+      buildPriority: { ids: ['9102'], source: 'env' },
+      next: { num: '9102', buildPriority: 0, priorityReasons: expect.arrayContaining(['build.priority #1']) },
+    });
+    expect(run('9101')).toMatchObject({ next: { num: '9101', buildPriority: 0 } });
+    expect(run('')).toMatchObject({ buildPriority: { ids: [], source: 'env' }, next: { num: '9101', buildPriority: null } });
+  } finally {
+    rmSync(buildQueueCacheFile(join(root, 'backlog')), { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
