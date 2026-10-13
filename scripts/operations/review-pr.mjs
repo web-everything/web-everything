@@ -2359,6 +2359,11 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
  *   binding reads this off `REVIEW_PR_ANTIGRAVITY_REVIEW=1` (`antigravityReviewFromEnv`), a SEPARATE env var
  *   from both Codex seats' own, so all three optional seats are toggled independently.
  * @returns {object} the frozen declaration from `op()`.
+ *
+ * @verdicts-partial the operation is not a verdict reducer. Its only verdict references are the accept-hold in the
+ *   finalize step (#4815): a clean `accept` or `prevention-outstanding` panel verdict that rests on a lone-answer
+ *   retirement is held, and an `accept` becomes `needs-human`. `changes` is not named because the hold never touches
+ *   it. Every other verdict passes through unchanged, so a verdict added to the enum needs no branch here.
  */
 export function reviewPrOperation({
   readPr, codexAdvisory = false, correctnessAdvisory = false, antigravityReview = false,
