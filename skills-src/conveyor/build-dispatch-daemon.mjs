@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
@@ -2045,7 +2046,19 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       checks.push(...batch);
       if (batch.length < 100) break;
     }
-    const failed = checks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
+    let effectiveChecks = checks;
+    try {
+      const { excuseMergeGateRows, loadMergeGateHoldSetting, readMergeGateVerdict } = await import('../../scripts/lib/merge-gate-hold-class.mjs');
+      const { readSharedFreeze } = await import('../../scripts/lib/red-main-freeze-shared.mjs');
+      // REST numeric ids let the shared classifier select the latest run without normalization.
+      effectiveChecks = (io.excuseMergeGateRows ?? excuseMergeGateRows)(checks, {
+        prNumber: pr.number, headSha: p.head.sha, labels: p.labels,
+        setting: io.mergeGateSetting ?? loadMergeGateHoldSetting(),
+        readVerdict: args => (io.readMergeGateVerdict ?? readMergeGateVerdict)({ ...args, repo }),
+        freeze: () => (io.readFreeze ?? readSharedFreeze)(),
+      }).rows;
+    } catch { /* Unreadable excusal evidence keeps the original check failures. */ }
+    const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
     let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
@@ -2430,7 +2443,9 @@ async function live(flags) {
   const effects = cliEffects();
   const prepareEnabled = !flags['no-prepare'];
   let bookkeeping = {};
+  let lastBuildPriority;
   const rawTickOnce = async () => {
+    const buildPriority = readBuildPrioritySettings();
     const timer = createPhaseTimer();
     // #5322 — start the lane-pool read now (it overlaps the reads below), and read route inputs once per round.
     const round = startPlanningRound();
@@ -2446,6 +2461,16 @@ async function live(flags) {
       effects.listPrepareInFlight = () => prepareRows;
       const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
       bookkeeping = r.nextBookkeeping;
+      const priorityKey = JSON.stringify(buildPriority);
+      // The tick's launches, named so the log shows whether they follow the list (a descendant of a listed epic
+      // ranks by that epic's position, so the list alone cannot say which launch is "listed").
+      const launches = [...(r.dispatched ?? []).map(d => `build #${normNum(d.num)}`),
+        ...(r.prepare?.launched ?? []).map(p => `prepare #${normNum(p.num)}`)];
+      if (buildPriority.ids.length && (priorityKey !== lastBuildPriority || launches.length)) {
+        const head = buildPriority.ids.slice(0, 5).join(',') + (buildPriority.ids.length > 5 ? ',…' : '');
+        console.error(`build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}`);
+      }
+      lastBuildPriority = priorityKey;
       return r;
     } finally { await round.end(); }
   };

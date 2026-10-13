@@ -28,6 +28,7 @@ import {
 } from '../review-set-label.mjs';
 // #3334, routes 2 and 3 — asserted through the OTHER two sanctioned paths' own entry points, because a shared
 // core one caller forgets to ask is the defect this item closes.
+import { appendVerdict } from '../lib/verdict-ledger.mjs';
 import { buildDelegationMarker } from '../lib/delegation-marker.mjs';
 import { RULING_NEEDED_LABEL } from '../lib/ruling-ledger.mjs';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
@@ -3917,5 +3918,145 @@ describe('xe8y12n missing-only rearm boundary', () => {
   });
   it('ordinary rearm still refuses absence', () => {
     expect(decideSetLabel({ to: 'rearm', currentLabels: [] }).allowed).toBe(false);
+  });
+});
+
+/** #5649 part 1 — `clear-human` writes an `approval` ledger row beside its clearing verdict; nothing else does. */
+describe('#5649 — approval rows at the label home', () => {
+  const CFG = {
+    defaultActor: 'test',
+    usage: 'usage: test',
+    buildComment: () => '# verdict body',
+    successResult: (o) => ({ ok: true, ...o }),
+    refusalResult: ({ decision }) => ({ error: decision.reason }),
+    allowClearHuman: true,
+  };
+  const saved = {};
+  let ledgerDir;
+  beforeEach(() => {
+    ledgerDir = mkdtempSync(join(tmpdir(), 'rsl-5649-'));
+    for (const k of ['WE_VERDICT_LEDGER_DIR', 'WE_VERDICT_LEDGER_STORE', 'WE_VERDICT_LEDGER_BOARD']) saved[k] = process.env[k];
+    process.env.WE_VERDICT_LEDGER_DIR = ledgerDir;
+    delete process.env.WE_VERDICT_LEDGER_STORE;
+    delete process.env.WE_VERDICT_LEDGER_BOARD;
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(ledgerDir, { recursive: true, force: true });
+    rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
+  });
+  const stubProvider = (labels) => {
+    const calls = [];
+    return {
+      calls, name: 'stub', currentRepo: () => 'o/n',
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
+      readLabels: () => labels.map((name) => ({ name })),
+      setLabels: () => { calls.push('setLabels'); },
+      postComment: () => { calls.push('postComment'); },
+    };
+  };
+  function run(provider, argv, extra = {}) {
+    const chunks = [];
+    const realExit = process.exit.bind(process);
+    const realErr = process.stderr.write.bind(process.stderr);
+    process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
+    process.stderr.write = () => true;
+    let exitCode = 0;
+    try { runReviewLabelCli({ ...CFG, ...extra, emit: (l) => chunks.push(String(l)), provider, argv, verdictBody: 'prose verdict' }); }
+    catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
+    finally { process.exit = realExit; process.stderr.write = realErr; }
+    return { exitCode, payload: JSON.parse(chunks.join('') || '{}') };
+  }
+  const CLEAR = ['77', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=operator said clear it'];
+  const rows = () => readdirSync(ledgerDir).filter((f) => f.endsWith('.jsonl')).flatMap((f) =>
+    readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse));
+  const sink = () => { const seen = []; return { seen, fn: (row) => { seen.push(row); return appendVerdict(row); } }; };
+
+  it('clear-human appends an approval row after the verdict row', () => {
+    const s = sink();
+    const { exitCode } = run(stubProvider(['review:human']), CLEAR, { appendApproval: s.fn });
+    expect(exitCode).toBe(0);
+    expect(s.seen).toHaveLength(1);
+    expect(s.seen[0]).toMatchObject({ type: 'approval', approval: 'clear-human', delegation: null, pr: 77, repo: 'o/n', source: 'review-set-label' });
+    const types = rows().map((r) => r.type ?? 'verdict');
+    expect(types).toEqual(['verdict', 'approval']);
+    expect(rows()[1].actor.declared).toBe('op');
+    expect(rows()[1].actor.session).toBe(rows()[0].actor.session);
+  });
+
+  it('--approval-kind=judge with a valid delegation is stored; a malformed delegation is refused before any write', () => {
+    const delegation = { by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' };
+    const s = sink();
+    const ok = run(stubProvider(['review:human']), [...CLEAR, '--approval-kind=judge', `--delegation-json=${JSON.stringify(delegation)}`], { appendApproval: s.fn });
+    expect(ok.exitCode).toBe(0);
+    expect(s.seen[0]).toMatchObject({ approval: 'judge', delegation });
+    for (const bad of ['--delegation-json={not json', '--delegation-json={"by":"x"}', '--delegation-json=null', '--approval-kind=--evil', '--approval-kind=root']) {
+      rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
+      const p = stubProvider(['review:human']);
+      const r = run(p, [...CLEAR, bad]);
+      expect(r.exitCode).not.toBe(0);
+      expect(p.calls).toEqual([]);
+      expect(readdirSync(ledgerDir)).toEqual([]);
+    }
+  });
+
+  it('the approval flags are refused on any target but clear-human, before any write', () => {
+    for (const flag of ['--approval-kind=judge', '--delegation-json={"by":"a","scope":"b","expires":"2099-01-01T00:00:00Z"}']) {
+      const p = stubProvider(['review:pending']);
+      const r = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op', '--reason=because', flag]);
+      expect(r.exitCode).not.toBe(0);
+      expect(p.calls).toEqual([]);
+      expect(readdirSync(ledgerDir)).toEqual([]);
+    }
+  });
+
+  it('every approval kind, with and without a delegation, clears and stores exactly that kind and delegation (the schema accepts all six)', () => {
+    const delegation = { by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' };
+    for (const kind of ['clear-human', 'clear-operator', 'judge']) {
+      for (const withDelegation of [false, true]) {
+        rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
+        const p = stubProvider(['review:human']);
+        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...(withDelegation ? [`--delegation-json=${JSON.stringify(delegation)}`] : [])]);
+        expect(r.exitCode, `${kind} ${withDelegation}`).toBe(0);
+        const all = rows();
+        expect(all.map((x) => x.type ?? 'verdict')).toEqual(['verdict', 'approval']);
+        expect(all[1]).toMatchObject({ approval: kind, delegation: withDelegation ? delegation : null });
+      }
+    }
+  });
+
+  it('a refused approval append blocks the swap', () => {
+    const p = stubProvider(['review:human']);
+    const { exitCode, payload } = run(p, CLEAR, { appendApproval: () => ({ ok: false, errors: ['boom'] }) });
+    expect(exitCode).toBe(1);
+    expect(payload.error).toMatch(/F4/);
+    expect(p.calls).toEqual([]);
+  });
+
+  it('a throwing approval append also blocks the swap', () => {
+    const p = stubProvider(['review:human']);
+    const { exitCode } = run(p, CLEAR, { appendApproval: () => { throw new Error('disk gone'); } });
+    expect(exitCode).toBe(1);
+    expect(p.calls).toEqual([]);
+  });
+
+  it('clear-human: verdict lands, approval append fails -> swap refused; the retry succeeds', () => {
+    const p = stubProvider(['review:human']);
+    const first = run(p, CLEAR, { appendApproval: () => ({ ok: false, errors: ['boom'] }) });
+    expect(first.exitCode).toBe(1);
+    expect(rows().map((r) => r.type ?? 'verdict')).toEqual(['verdict']);
+    const retry = run(p, CLEAR);
+    expect(retry.exitCode).toBe(0);
+    expect(p.calls).toContain('setLabels');
+    expect(rows().map((r) => r.type ?? 'verdict')).toEqual(['verdict', 'verdict', 'approval']);
+  });
+
+  it('accepted and changes append no approval row (guard: passes today)', () => {
+    for (const to of ['accepted', 'changes']) {
+      const s = sink();
+      const r = run(stubProvider(['review:pending']), ['77', '--repo=o/n', `--to=${to}`, '--actor=op', '--reason=because'], { appendApproval: s.fn });
+      expect(r.exitCode).toBe(0);
+      expect(s.seen).toEqual([]);
+    }
   });
 });
