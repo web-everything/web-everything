@@ -375,6 +375,15 @@ describe('pr-merge-gate — scanTestTampering ignores skip/only markers in strin
     expect(skipped(scan(["  /* don't */ it.skip('x')"]))).toHaveLength(1);
     expect(skipped(scan(["  it.skip('x') // don't"]))).toHaveLength(1);
   });
+  it('9b: a line that closes a block comment opened earlier is scanned raw (apostrophe in the comment tail)', () => {
+    expect(skipped(scan(["  can't */ it.skip('x') // it's"]))).toHaveLength(1);
+    expect(stripStringsAndComments("a */ b 'c'")).toBe("a */ b 'c'");
+  });
+  it('9c: the line after a backslash-continued line is scanned raw (escaped-newline string continuation)', () => {
+    expect(skipped(scan(["  const a = 'x\\", "  '; it.skip('y', () => {}); const b = 'z\\", "  ';"]))).toHaveLength(1);
+    // an even run of backslashes is an escaped backslash, not a continuation: the next line is stripped as usual
+    expect(scan(['  const a = "x\\\\"', '  "it.skip(\'x\')"']).tampered).toBe(false);
+  });
   it('10: a marker-free mid-line string stays clean', () => {
     expect(scan(["  const note = 'todo: drop the it.skip before merge';"]).tampered).toBe(false);
   });

@@ -122,6 +122,10 @@ export function isJsTestPath(path) {
 export function stripStringsAndComments(line) {
   const s = String(line ?? '');
   if (s.includes('`')) return s;
+  // A `*/` with no `/*` before it closes a block comment opened on an earlier line: the line starts INSIDE a
+  // comment, so an apostrophe in that tail could pair with a later quote and swallow the real code after `*/`.
+  const closer = s.indexOf('*/');
+  if (closer !== -1 && (s.indexOf('/*') === -1 || s.indexOf('/*') > closer)) return s;
   let out = '';
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
@@ -189,7 +193,13 @@ export function scanTestTampering({ diffText = '' } = {}) {
       continue; // a delete has no surviving markers/cases to also flag
     }
     const jsFile = isJsTestPath(f.path); // non-JS files under __tests__/ are scanned raw (#5945 A4)
-    const skipAdds = f.added.filter((l) => SKIP_FOCUS_MARKER_RE.test(jsFile ? stripStringsAndComments(l) : l)).length;
+    // A line ending in an odd run of backslashes continues a quoted string onto the next added line, which then
+    // starts INSIDE that string — so the line after one is scanned raw. (A continuation whose opener is an
+    // unchanged context line outside the hunk's added lines is the documented residual, N1.)
+    const skipAdds = f.added.filter((l, i) => {
+      const continued = i > 0 && /(?<!\\)(?:\\\\)*\\$/.test(f.added[i - 1]);
+      return SKIP_FOCUS_MARKER_RE.test(jsFile && !continued ? stripStringsAndComments(l) : l);
+    }).length;
     if (skipAdds) findings.push({ path: f.path, kind: 'test-skipped', detail: `${skipAdds} skip/only marker(s) added` });
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
