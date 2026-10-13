@@ -32,7 +32,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -138,12 +138,42 @@ export function summarizeFastDrain(json, num) {
   if (json.skipped === 'drain-in-progress') return `no-op (${json.detail || 'lease held'})`;
   const hit = (list) => (Array.isArray(list) ? list.find((x) => Number(x?.num) === Number(num)) : null);
   const failed = hit(json.failed);
-  if (failed) return `failed: ${String(failed.reason || failed.error || '').slice(0, 200)}`;
+  if (failed) return `failed: ${String(failed.detail || failed.reason || failed.error || '').slice(0, 200)}`;
   const skip = hit(json.skipReasons) || hit(json.skipped);
   if (skip) return `skipped: ${String(skip.reason || skip.kind || '').slice(0, 200)}`;
   if (hit(json.merged) || hit(json.toMerge)) return 'passed every drain gate — enqueued';
   if (!json.considered) return 'not listed (not ready-to-merge, closed, or already queued)';
   return 'no verdict for the PR';
+}
+
+/**
+ * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
+ * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
+ * or still have checks running; a later event wakes them again). The drain still re-reads everything live and decides.
+ * A PR that could not be read is woken (the drain decides). PURE.
+ * @param {{state?:string, isDraft?:boolean, labels?:Array<{name:string}>, statusCheckRollup?:Array<object>}|null} pr
+ * @returns {{wake:boolean, reason:string}}
+ */
+export function wakeWorthy(pr) {
+  if (!isObj(pr)) return { wake: true, reason: 'PR unread — the drain decides' };
+  if (pr.state && pr.state !== 'OPEN') return { wake: false, reason: `PR is ${String(pr.state).toLowerCase()}` };
+  if (pr.isDraft) return { wake: false, reason: 'draft' };
+  const labels = (Array.isArray(pr.labels) ? pr.labels : []).map((l) => l?.name);
+  if (!labels.includes(READY_LABEL)) return { wake: false, reason: `no ${READY_LABEL} label yet` };
+  const running = (Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [])
+    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : c?.status && c.status !== 'COMPLETED'));
+  if (running.length) return { wake: false, reason: `${running.length} check(s) still running (${running.slice(0, 3).map((c) => c.name || c.context).join(', ')})` };
+  return { wake: true, reason: 'ready-to-merge, every check finished' };
+}
+
+/** Default PR read for {@link wakeWorthy}: one `gh pr view`. Resolves null on any failure. */
+export function readPrForWake({ repo, num, env = process.env, execFileImpl = execFile }) {
+  return new Promise((res) => {
+    execFileImpl('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft,labels,statusCheckRollup'], { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
+      if (err) { res(null); return; }
+      try { res(JSON.parse(String(stdout || 'null'))); } catch { res(null); }
+    });
+  });
 }
 
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
@@ -171,14 +201,14 @@ const lastJsonLine = (s) => {
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
 export function createEnqueueOnEvent({
   cwd, localSlug, scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
-  timeoutMs = FAST_DRAIN_TIMEOUT_MS,
+  timeoutMs = FAST_DRAIN_TIMEOUT_MS, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
   let pending = new Map();
   let running = null; // the in-flight tick's promise
@@ -203,6 +233,11 @@ export function createEnqueueOnEvent({
       const key = `${p.repo}#${p.num}`;
       const taken = pending.get(key);
       pending = new Map(pending); pending.delete(key);
+      let pr = null;
+      try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
+      const w = wakeWorthy(pr);
+      if (!w.wake) { log(`enqueue-on-event: #${p.num} ${taken.causes.join(', ')} — not woken: ${w.reason}`); ran.push({ num: p.num, code: null, what: `not woken: ${w.reason}` }); continue; }
+      if (!allowed()) { pending = new Map(pending).set(key, taken); break; } // the window closed during the read
       const startedAt = now();
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
       log(`enqueue-on-event: #${p.num} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
@@ -242,8 +277,8 @@ async function main(argv) {
   const { consumer, reason } = createFeedConsumerFromEnv({ role: 'enqueue-on-event-watch', log: { error: (m) => console.error(m) } });
   if (!consumer) { console.error(`enqueue-on-event: ${reason}`); process.exitCode = 1; return; }
   const cwd = process.cwd();
-  const h = createEnqueueOnEvent({ cwd, localSlug: localRepoSlug({ cwd }), log: (m) => console.error(`${new Date().toISOString()} ${m}`) });
   const end = Date.now() + minutes * 60_000;
+  const h = createEnqueueOnEvent({ cwd, localSlug: localRepoSlug({ cwd }), allowed: () => Date.now() < end, log: (m) => console.error(`${new Date().toISOString()} ${m}`) });
   while (Date.now() < end) {
     const r = await consumer.pollOnce();
     const eligible = (r.marked || []).filter((m) => isEligibleCause(m.cause));

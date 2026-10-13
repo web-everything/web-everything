@@ -8,12 +8,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
-  fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent,
+  fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
 const mark = (num = 42, cause = GREEN) => ({ key: `${REPO}#${num}`, cause });
+const READY_PR = { state: 'OPEN', isDraft: false, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
 
 function resolveSetting(tool = {}, extra = {}) {
   return resolveEnqueueOnEventSetting({
@@ -49,6 +50,7 @@ function setup(extra = {}) {
     cwd: '/clone', localSlug: REPO, scriptRoot: () => '/code', env: {},
     now: () => time, spawnImpl, log: (line) => lines.push(line),
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
+    readPr: async () => READY_PR,
     ...extra,
   });
   return { handle, calls, lines, children, advance: (ms) => { time += ms; } };
@@ -236,6 +238,7 @@ describe('createEnqueueOnEvent', () => {
     const first = handle.tick();
     const second = handle.tick();
     expect(second).toBe(first);
+    await new Promise((r) => { setImmediate(r); }); // the wake read resolves before the spawn
     expect(calls).toHaveLength(1);
     let idleResolved = false;
     const idle = handle.idle().then(() => { idleResolved = true; });
@@ -268,5 +271,27 @@ describe('createEnqueueOnEvent', () => {
     }]);
     expect(lines.some((line) => line.includes('#42') && line.includes('could not run'))).toBe(true);
     expect(handle.pending()).toEqual([]);
+  });
+});
+
+describe('wakeWorthy — a wake filter, never the gate', () => {
+  it('wakes only an open, non-draft ready-to-merge PR whose checks all finished; an unread PR is woken', () => {
+    expect(wakeWorthy(READY_PR).wake).toBe(true);
+    expect(wakeWorthy(null).wake).toBe(true);
+    expect(wakeWorthy({ ...READY_PR, state: 'MERGED' }).wake).toBe(false);
+    expect(wakeWorthy({ ...READY_PR, isDraft: true }).wake).toBe(false);
+    expect(wakeWorthy({ ...READY_PR, labels: [{ name: 'review:pending' }] }).reason).toMatch(/no ready-to-merge/);
+    expect(wakeWorthy({ ...READY_PR, statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS' }] }).reason).toMatch(/still running \(test\)/);
+    expect(wakeWorthy({ ...READY_PR, statusCheckRollup: [{ __typename: 'StatusContext', context: 'ci', state: 'PENDING' }] }).wake).toBe(false);
+  });
+
+  it('skips the fast drain for a PR the filter does not wake, and logs why', async () => {
+    const { handle, calls, lines, advance } = setup({ readPr: async () => ({ ...READY_PR, labels: [] }) });
+    handle.notePoll({ ok: true, marked: [mark(42)] });
+    advance(15_000);
+    await handle.tick();
+    expect(calls).toHaveLength(0);
+    expect(handle.pending()).toEqual([]);
+    expect(lines.some((l) => l.includes('#42') && l.includes('not woken'))).toBe(true);
   });
 });
