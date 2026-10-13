@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { execFileSync } from 'node:child_process';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve } from 'node:path';
@@ -116,6 +118,10 @@ import { gapSweepStatusOperation, GAP_SWEEP_STATUS_OP } from './gap-sweep-status
 import { createGapSweepSinks } from './gap-sweep-status-io.mjs';
 import { clearStuckSessionOperation, CLEAR_STUCK_SESSION_OP } from './clear-stuck-session.mjs';
 // The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
+import { whyOperation, WHY_OP } from './operator-why.mjs';
+import { createWhyReader } from './operator-why-io.mjs';
+import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './operator-controls.mjs';
+import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
 import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
@@ -156,7 +162,18 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * validation — `--help` prints `[--tier=A|B, default A] …` because the declaration says so. The same
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
+
 export const OPERATIONS = Object.freeze({
+  ...Object.fromEntries(CONTROL_OPS.map(name => [name, ({ preview = false } = {}) => {
+    const readContext = createOperatorControlsReader(preview ? {
+      runGh: args => execFileSync('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 }),
+      readComments: (repo, pr) => readCompletePrComments(pr, { repo, exec: execFileSync }),
+    } : {});
+    return { declaration: operatorControlOperation(name, { readContext }), sinks: createOperatorControlsSinks({ readContext }), finish: finishOperatorControl };
+  }])),
+  [WHY_OP]: () => ({ declaration: whyOperation({ readWhy: createWhyReader() }), sinks: {},
+    finish: ({ run, code, lines, json }) => ({ code, lines: !json && run?.verdict?.screen ? run.verdict.screen.split('\n') : lines }),
+  }),
   [HEALTH_RESPOND_OP]: () => ({ declaration: healthRespondOperation({ readDecisions: readLatestDecisions }), sinks: {} }),
   // #xqa9ttq — `codexAdvisory` reads `REVIEW_PR_CODEX_ADVISORY=1` off the environment (`codexAdvisoryFromEnv`,
   // `we:scripts/operations/review-pr.mjs`), OFF by default — see that flag's own docs for why it is an env
@@ -647,7 +664,7 @@ if (IS_CLI) {
     const resumeId = name === REVIEW_PR_OP ? rest.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     let securitySeat = true;
     if (resumeId) { try { securitySeat = securitySeatFromRun(createFileRunStore().read(resumeId)); } catch { securitySeat = true; } }
-    resolved = resolveOperation(name, { json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
+    resolved = resolveOperation(name, { preview: rest.includes('--preview') || rest.includes('--preview=true'), json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);
@@ -662,15 +679,17 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP].includes(name) });
+      zeroWrites: (CONTROL_OPS.includes(name) && (rest.includes('--preview') || rest.includes('--preview=true'))) || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
   }
   // Only runner-activity promises bounded CLI persistence, including --resume and call logging.
   // These queries need no persisted cursor or call log, including when their evidence stores are read-only.
-  const cliStores = name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+  const controlPreview = CONTROL_OPS.includes(name) && (rest.includes('--preview') || rest.includes('--preview=true'));
+  const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
+    : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
+    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

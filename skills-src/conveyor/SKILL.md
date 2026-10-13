@@ -124,6 +124,8 @@ never the review label, #2666).
 
 ---
 
+Manual intervention without a worker: `run.mjs why --pr=N|--item=X` then the op it suggests (see docs/agent/operator-ops.md).
+
 ## 1. Start / configure (a short conversation, then the loop)
 
 Confirm three settings with the operator, then start ticking. Each has a default — a bare `/conveyor N` sets
