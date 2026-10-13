@@ -12,9 +12,12 @@ import { planReconcile, REFUSAL_KINDS } from '../../conveyor/reconcile-core.mjs'
 const error = 'Backlog item "5994-diagnose-unknown-prepare-result-failure-97b1d8c1d2e808d2" carries a hand-picked NNN id (#5994) that is not on origin/main — new items must be hash-keyed (xNNNNNN); the drain assigns the real number at land (#2288). Rename it with a hash id, or set WE_SKIP_HAND_NUMBERED_GATE=1 if this is the sanctioned collision-heal renumbering path (#2548).';
 const tail = `2026-10-12T22:28:54.0617823Z \x1b[31m error\x1b[0m ${error}\n2026-10-12T22:28:54.0617839Z \n2026-10-12T22:28:54.0618663Z \x1b[31m1 error(s)\x1b[0m, 6093 warning(s) \x1b[2m(checked 81 blocks, ...)\x1b[0m\n2026-10-12T22:28:54.0628539Z ##[error]Process completed with exit code 1.`;
 const subject = 'drain: JIT-number xyxojh9→#5994 at land (#2288)';
+const author = { name: 'Trusted', email: 'drain@example.test' };
+const authors = new Set([`${author.name}\0${author.email}`]);
+const commit = subject => ({ subject, author });
 const pr = (over = {}) => ({ number: 5050, state: 'OPEN', headRefName: 'lane/example', headRefOid: 'abc123', labels: [], comments: [], mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/1/job/42' }], ...over });
 const settings = resolveRefreshSettings({ env: {}, read: () => ({}) });
-const owedPr = (over = {}) => pr({ owedMainRule: { head: 'abc123', owed: true, nums: [5994] }, ...over });
+const owedPr = (over = {}) => pr({ owedMainRule: { head: 'abc123', owed: true, ownsRepair: true, nums: [5994] }, ...over });
 const plan = (over = {}) => planRenamedPrRefresh({ prs: [owedPr()], mainAccepts: true, settings, state: {}, evidenceVerdicts: {}, ...over });
 const temporary = async (fn) => { const root = mkdtempSync(join(tmpdir(), 'renamed-refresh-')); try { return await fn(root); } finally { rmSync(root, { recursive: true, force: true }); } };
 
@@ -26,12 +29,13 @@ describe('hand-picked failure proof', () => {
   it('refuses a vitest workflow error', () => expect(parseHandPickedOnlyFailure(`${tail}\n##[error]AssertionError: expected 1 to be 2`).only).toBe(false));
   it('refuses empty or summary-less logs', () => { expect(parseHandPickedOnlyFailure('').only).toBe(false); expect(parseHandPickedOnlyFailure(` error ${error}`).only).toBe(false); });
   it('requires a drain assignment for every number', () => {
-    expect(classifyOwedMainRule({ logText: tail, commitSubjects: [subject] })).toMatchObject({ owed: true, nums: [5994] });
-    expect(classifyOwedMainRule({ logText: tail, commitSubjects: [] }).owed).toBe(false);
-    expect(drainAssignedNumbers(['drain: JIT-number xyxojh9→#5994, xabcdef→#5995 at land (#2288)', 'unrelated #5996'])).toEqual(new Set([5994, 5995]));
+    expect(classifyOwedMainRule({ logText: tail, commits: [commit(subject)], authors })).toMatchObject({ owed: true, nums: [5994] });
+    expect(classifyOwedMainRule({ logText: tail, commits: [], authors }).owed).toBe(false);
+    expect(classifyOwedMainRule({ logText: tail, commits: [{ subject, author: { name: 'Attacker', email: 'attacker@example.test' } }], authors }).owed).toBe(false);
+    expect(drainAssignedNumbers([commit('drain: JIT-number xyxojh9→#5994, xabcdef→#5995 at land (#2288)'), commit('unrelated #5996')], authors)).toEqual(new Set([5994, 5995]));
   });
   it('extracts drain assignments while skipping duplicate-drop clauses', () => {
-    expect(drainAssignedNumbers(['drain: JIT-number x49hott→#5985, xz73kbf duplicate dropped (already 5937-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md) at land (#2288)'])).toEqual(new Set([5985]));
+    expect(drainAssignedNumbers([commit('drain: JIT-number x49hott→#5985, xz73kbf duplicate dropped (already 5937-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md) at land (#2288)')], authors)).toEqual(new Set([5985]));
   });
   it('ignores collision-heal subjects', () => {
     expect(drainAssignedNumbers(['backlog: heal new-item id collision(s) pre-check (#5976→#5321) (#2222)'])).toEqual(new Set());
@@ -63,11 +67,18 @@ describe('settings and planning', () => {
 });
 
 describe('IO replay', () => {
-  const exec = vi.fn((_cmd, args) => args.includes('--paginate') ? `${subject}\n` : tail);
+  it('reclassifies a changed test job on the same head', () => temporary(root => {
+    const exec = vi.fn((_cmd, args) => args.includes('--paginate') ? JSON.stringify(commit(subject)) : args.some(a => a.includes('/43/')) ? '##[error]vitest failed' : tail);
+    const opts = { slug: 'we/we', exec, authors, cache: join(root, 'state.json') };
+    expect(readOwedMainRule(pr(), opts).owed).toBe(true);
+    const changed = pr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE', detailsUrl: 'https://github.com/we/we/actions/runs/1/job/43' }] });
+    expect(readOwedMainRule(changed, opts).reason).toBe('no standards error lines');
+  }));
+  const exec = vi.fn((_cmd, args) => args.includes('--paginate') ? JSON.stringify(commit(subject)) : tail);
   it('caches a verdict durably and only reads commits after a matching log', () => temporary(root => {
     const cache = join(root, 'state.json'); exec.mockClear();
-    expect(readOwedMainRule(pr(), { slug: 'we/we', exec, cache }).owed).toBe(true);
-    expect(readOwedMainRule(pr(), { slug: 'we/we', exec, cache }).owed).toBe(true);
+    expect(readOwedMainRule(pr(), { slug: 'we/we', exec, cache, authors }).owed).toBe(true);
+    expect(readOwedMainRule(pr(), { slug: 'we/we', exec, cache, authors }).owed).toBe(true);
     expect(exec).toHaveBeenCalledTimes(2);
     const other = vi.fn(() => '##[error]vitest failed');
     expect(readOwedMainRule(pr({ headRefOid: 'other' }), { slug: 'we/we', exec: other, cache }).owed).toBe(false);
@@ -89,7 +100,7 @@ describe('IO replay', () => {
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
     const accepts = vi.fn(() => mainAccepts);
     const logs = []; const run = vi.fn((_cmd, args) => ({ status: 0, stdout: args[0] === 'rev-parse' ? 'abc123' : 'tree\n' }));
-    const opts = { prs: [pr()], slug: 'web-everything/web-everything', root, statePath: join(root, 'state.json'), settings, exec, run, refresh, mainAccepts: accepts, log: line => logs.push(line) };
+    const opts = { prs: [pr()], slug: 'web-everything/web-everything', root, statePath: join(root, 'state.json'), settings, exec, authors, run, refresh, mainAccepts: accepts, log: line => logs.push(line) };
     const first = await runRenamedPrRefresh(opts); await runRenamedPrRefresh(opts);
     expect(accepts).toHaveBeenCalledWith({ cwd: root });
     expect(refresh).toHaveBeenCalledTimes(mainAccepts ? 1 : 0);
@@ -101,7 +112,7 @@ describe('IO replay', () => {
     const run = vi.fn((_cmd, args) => ({ status: 0, stdout: args[0] === 'rev-parse' ? 'abc123' : 'tree\n' }));
     const logs = [];
     const statePath = join(root, 'state.json');
-    const opts = { prs: [pr()], slug: 'web-everything/web-everything', root, statePath, settings, exec, run, refresh, mainAccepts: () => true, log: line => logs.push(line) };
+    const opts = { prs: [pr()], slug: 'web-everything/web-everything', root, statePath, settings, exec, authors, run, refresh, mainAccepts: () => true, log: line => logs.push(line) };
 
     expect((await runRenamedPrRefresh(opts)).refreshed).toEqual([]);
     expect(refresh).toHaveBeenCalledTimes(1);
@@ -118,6 +129,19 @@ describe('IO replay', () => {
 });
 
 describe('reconcile ownership', () => {
+  it.each([
+    { settings: { refreshWhenMainAcceptsDrainNumbers: false } },
+    { over: { headRefName: 'feature/example' } },
+    { over: { isCrossRepository: true } },
+    { mainAccepts: true },
+    { over: { mergeStateStatus: 'DIRTY' } },
+  ])('retains repair ownership for excluded or no-progress paths %j', options => {
+    const rows = [pr(options.over)];
+    enrichPrsWithOwedMainRule(rows, { repo: 'web-everything/web-everything', settings, mainAccepts: () => false, read: () => ({ owed: true, nums: [5994] }), ...options, mainAccepts: () => options.mainAccepts ?? false });
+    const result = planReconcile({ prs: rows, agents: [], durableCounts: {}, requiredChecks: ['test'], now: Date.parse('2026-10-12T23:00:00Z') });
+    expect(result.refusals.some(r => r.kind === 'owed-main-rule')).toBe(false);
+    expect(result.dispatch.length).toBeGreaterThan(0);
+  });
   it('refuses ci-heal only for evidence on the current head', () => {
     const reconcile = p => planReconcile({ prs: [p], agents: [], durableCounts: {}, requiredChecks: ['test'], now: Date.parse('2026-10-12T23:00:00Z') });
     expect(REFUSAL_KINDS).toContain('owed-main-rule');

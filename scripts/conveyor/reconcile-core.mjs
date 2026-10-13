@@ -2654,7 +2654,7 @@ export function planReconcile({
     }
 
     if (ciRepairOwed) {
-      if (pr?.owedMainRule?.owed && pr.owedMainRule.head === pr?.headRefOid) {
+      if (pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? '')) {
         refuse('owed-main-rule', { ...withPhase, why: `the required check failed only on the hand-picked-NNN rule for card number(s) the drain itself assigned (${(pr.owedMainRule.nums ?? []).map(n => `#${n}`).join(', ')}); owed a refresh once main accepts drain-numbered cards (drain-branch-numbering-ci-v1), never a ci-heal that would revert the number` });
         continue;
       }

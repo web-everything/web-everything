@@ -9,7 +9,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 import { readSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering } from './queue-branch-numbering.mjs';
+import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, trustedDrainAuthors, trustedDrainSubject } from './queue-branch-numbering.mjs';
 import { parseMergeTree } from './rebase-drop-manifest.mjs';
 // The watcher imports reconcile-pass, which imports this module. Load it only when refreshing.
 async function refreshOntoMain(...args) {
@@ -68,19 +68,21 @@ export function parseHandPickedOnlyFailure(logText) {
   return { only: true, nums: [...new Set(nums)], reason: 'only the hand-picked-NNN rule failed' };
 }
 
-export function drainAssignedNumbers(commitSubjects) {
+export function drainAssignedNumbers(commits, authors = new Set()) {
   const nums = new Set();
-  for (const subject of Array.isArray(commitSubjects) ? commitSubjects : String(commitSubjects ?? '').split(/\r?\n/)) {
+  for (const commit of Array.isArray(commits) ? commits : []) {
+    const subject = trustedDrainSubject(commit, authors);
+    if (!subject) continue;
     const match = subject.match(/^drain: JIT-number (.*) at land \(#2288\)$/);
     if (match) for (const assignment of match[1].matchAll(/x[0-9a-z]{6}→#(\d+)/g)) nums.add(Number(assignment[1]));
   }
   return nums;
 }
 
-export function classifyOwedMainRule({ logText, commitSubjects }) {
+export function classifyOwedMainRule({ logText, commits, authors }) {
   const { only, nums, reason } = parseHandPickedOnlyFailure(logText);
   if (!only) return { owed: false, nums, reason };
-  const assigned = drainAssignedNumbers(commitSubjects);
+  const assigned = drainAssignedNumbers(commits, authors);
   return nums.every(n => assigned.has(n))
     ? { owed: true, nums, reason: 'hand-picked rule rejects only drain-assigned numbers' }
     : { owed: false, nums, reason: 'hand-picked number was not assigned by the drain' };
@@ -110,32 +112,37 @@ function record(path, section, key, value) {
   writeJsonAtomic(path, state);
 }
 
-export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache = stateFile() } = {}) {
+export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache = stateFile(), authors = trustedDrainAuthors() } = {}) {
   try {
     const check = redTest(pr);
     if (!check) return { owed: false, nums: [], reason: 'required test is not red' };
     if (!slug || !pr.headRefOid) throw new Error('missing repo or head');
-    const key = `${slug}#${pr.number}@${pr.headRefOid}`;
-    const cached = readState(cache).verdicts?.[key];
-    if (cached) return cached;
     const job = check.detailsUrl?.match(/\/job\/(\d+)(?:[/?#]|$)/)?.[1];
     if (!job) throw new Error('required test has no job id');
+    const key = `${slug}#${pr.number}@${pr.headRefOid}/job/${job}/authors/${JSON.stringify([...authors].sort())}`;
+    const cached = readState(cache).verdicts?.[key];
+    if (cached) return cached;
     const options = { encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
     const logText = String(exec('gh', ['api', `repos/${slug}/actions/jobs/${job}/logs`], options));
     const parsed = parseHandPickedOnlyFailure(logText);
     // Project each commit to its subject in jq: a commit BODY must never masquerade as a drain commit.
-    const commitSubjects = parsed.only ? String(exec('gh', ['api', `repos/${slug}/pulls/${pr.number}/commits`, '--paginate', '--jq', '.[].commit.message | split("\\n")[0]'], options)).split(/\r?\n/) : [];
-    const verdict = classifyOwedMainRule({ logText, commitSubjects });
+    const commits = parsed.only ? String(exec('gh', ['api', `repos/${slug}/pulls/${pr.number}/commits`, '--paginate', '--jq', '.[] | {subject: (.commit.message | split("\\n")[0]), author: .commit.author} | @json'], options)).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
+    const verdict = classifyOwedMainRule({ logText, commits, authors });
     record(cache, 'verdicts', key, verdict);
     return verdict;
   } catch (e) { return { owed: false, nums: [], reason: `unreadable: ${e.message}` }; }
 }
 
 /** Mutates the supplied PR facts, like the reconcile enrichers; no IO for sibling repos or green checks. */
-export function enrichPrsWithOwedMainRule(prs, { repo, read = readOwedMainRule } = {}) {
+export function enrichPrsWithOwedMainRule(prs, { repo, read = readOwedMainRule, settings = resolveRefreshSettings(), mainAccepts = mainAcceptsBranchNumbering } = {}) {
   if (repoKeyForSlug(repo) !== 'we') return prs;
-  for (const pr of prs) if (redTest(pr)) {
-    try { pr.owedMainRule = { ...read(pr, { slug: CONSTELLATION_REPOS.we.slug }), head: pr.headRefOid }; }
+  // Refresh owns repair only while waiting for the old main rule. Once main accepts,
+  // ci-heal/rebase must remain available even if refreshing returns current or fails.
+  const waitingForMain = enabled(settings.refreshWhenMainAcceptsDrainNumbers) && !(typeof mainAccepts === 'function' ? mainAccepts() : mainAccepts);
+  for (const pr of prs) {
+    delete pr.owedMainRule;
+    if (!redTest(pr) || !eligible(pr) || !enabled(settings.refreshWhenMainAcceptsDrainNumbers)) continue;
+    try { pr.owedMainRule = { ...read(pr, { slug: CONSTELLATION_REPOS.we.slug }), head: pr.headRefOid, ownsRepair: waitingForMain && pr.mergeStateStatus !== 'DIRTY' }; }
     catch (e) { pr.owedMainRule = { head: pr.headRefOid, owed: false, nums: [], reason: `unreadable: ${e.message}` }; }
   }
   return prs;
@@ -160,14 +167,14 @@ export function planRenamedPrRefresh({ prs, mainAccepts, settings, state = {}, e
 /** run follows the house subprocess contract: (command, argv, options) → {status, stdout, stderr}. */
 export async function runRenamedPrRefresh({ prs, slug, root = process.cwd(), settings = resolveRefreshSettings(),
   exec = execFileSyncThrottled, run = spawnSync, refresh = refreshOntoMain, mainAccepts = mainAcceptsBranchNumbering,
-  statePath, log = process.stderr, dryRun = false } = {}) {
+  statePath, log = process.stderr, dryRun = false, authors = trustedDrainAuthors({ cwd: root }) } = {}) {
   const result = { refreshed: [], waiting: [], owedMainRule: [], evidenceOnly: [], errors: [] };
   // Diagnostics must never make this best-effort pass throw (including a broken output pipe).
   const say = message => { try { emit(log, message); } catch { /* caller owns logging */ } };
   const fail = (num, error) => { const reason = String(error?.message ?? error); result.errors.push({ num, reason }); say(`renamed-pr-refresh: ${num ? `#${num} ` : ''}${reason}`); };
   try {
     statePath ??= stateFile();
-    const enriched = prs.map(pr => redTest(pr) ? { ...pr, owedMainRule: { ...readOwedMainRule(pr, { slug, exec, cache: statePath }), head: pr.headRefOid } } : pr);
+    const enriched = prs.map(pr => redTest(pr) && eligible(pr) && enabled(settings.refreshWhenMainAcceptsDrainNumbers) ? { ...pr, owedMainRule: { ...readOwedMainRule(pr, { slug, exec, cache: statePath, authors }), head: pr.headRefOid } } : { ...pr, owedMainRule: undefined });
     for (const pr of enriched) if (pr.owedMainRule?.reason?.startsWith('unreadable:')) fail(pr.number, pr.owedMainRule.reason);
     const state = readState(statePath), evidenceVerdicts = {};
     const lanes = enriched.filter(eligible);
