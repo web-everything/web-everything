@@ -91,7 +91,8 @@ describe('light paging', () => {
       expect(argv).toHaveLength(4);
       expect(argv[3]).toMatch(/^query=query\{/);
       expect(argv[3]).not.toMatch(/comments|body|files\(/);
-      expect(options).toEqual(opts);
+      // GH_REPO lets the per-owner App token shim route `gh api graphql` (no --repo flag) to the right owner.
+      expect(options).toEqual({ ...opts, env: expect.objectContaining({ GH_REPO: repo }) });
     }
     expect(exec.mock.calls[1][1][3]).toContain('after:"a"');
   });
@@ -127,7 +128,12 @@ describe('light paging', () => {
     expect(listOpenPrsLightPaged({ repo, exec, pageSize: 2, maxRows: 2, execOpts: { timeout: 123 } }))
       .toMatchObject({ truncated: true, pages: 1 });
     expect(exec).toHaveBeenCalledTimes(1);
-    expect(exec.mock.calls[0][2]).toEqual({ ...opts, timeout: 123 });
+    expect(exec.mock.calls[0][2]).toEqual({ ...opts, timeout: 123, env: expect.objectContaining({ GH_REPO: repo }) });
+  });
+  it('names the target repo in GH_REPO on top of a caller env', () => {
+    const exec = vi.fn(() => page([node(1)]));
+    listOpenPrsLightPaged({ repo, exec, pageSize: 2, execOpts: { env: { KEEP: '1' } } });
+    expect(exec.mock.calls[0][2].env).toEqual({ KEEP: '1', GH_REPO: repo });
   });
   it('returns a parsed deferral immediately, including after a successful page', () => {
     const deferred = { outcome: 'deferred-low-budget', message: 'later' };

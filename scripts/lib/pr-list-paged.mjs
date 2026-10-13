@@ -119,7 +119,10 @@ export function heavyIsFresh(cached, row, { nowMs, maxAgeMs }) {
 function readPage({ repo, exec, query, page, pageRetries, execOpts }) {
   for (let attempt = 0; ; attempt++) {
     try {
-      const text = exec('gh', ['api', 'graphql', '-f', `query=${query}`], execOptions(execOpts));
+      // `gh api graphql` has no --repo flag, so the per-owner App token shim cannot see the target owner from argv.
+      // GH_REPO names it (live 2026-10-13: without it frontier-ui/plateau-app pages got "Could not resolve to a Repository").
+      const text = exec('gh', ['api', 'graphql', '-f', `query=${query}`],
+        execOptions({ ...execOpts, env: { ...(execOpts.env || process.env), GH_REPO: repo } }));
       if (isGhDeferred(text)) return { deferred: isObj(text) && !Buffer.isBuffer(text) ? text : JSON.parse(String(text)) };
       return { ...parseOpenPrPage(text), bytes: Buffer.byteLength(String(text)) };
     } catch (cause) {
