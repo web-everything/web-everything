@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xhxg1h6-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md:16` — Have the filer fuzzy-match owed-guard file:line and text against open backlog cards that share the same parent and scope, and link or skip when one exists. Dedupe within a verdict too.
+1. `we:backlog/6011-prevention-make-humanreviewonlyhold-take-the-row-reason-and.md:16` — Have the filer fuzzy-match owed-guard file:line and text against open backlog cards that share the same parent and scope, and link or skip when one exists. Dedupe within a verdict too.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5036@0edf894179985a791e44b7bac7c79e618c72be4c
 
