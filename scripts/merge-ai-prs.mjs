@@ -120,6 +120,7 @@
 // `hasLabel` are imported normally (this file's OWN code below still calls both directly); the other three
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
+import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -4950,6 +4951,13 @@ async function runCli() {
   // #2421 (generalizes #2216) — total ci-lifecycle relabel first, per swept repo.
   const __gateReadsT0 = __t.mark();
   for (const repo of REPOS) reconciledLabels.push(...reconcileCiLifecycleLabels(repo, openPrContext));
+  try {
+    const settings = resolveRefreshSettings(), log = AS_JSON ? { write() {} } : process.stderr;
+    logRefreshSettings(settings, log);
+    const repo = REPOS.find(isLocalRepo);
+    if (REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: openPrContext.prsByRepo.get(repo) || [], slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
+  } catch (e) { if (!AS_JSON) process.stderr.write(`renamed-pr-refresh: ${e.message}\n`); }
+
   // #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach→couple-join sequence is now `prepareDrainVerdicts`, the
   // SAME wiring the test suite drives, so a future edit that drops `truncated`/`contextComplete` from the couple
   // gate (or builds carrier health from the narrowed listings) breaks a test instead of silently regressing. The
