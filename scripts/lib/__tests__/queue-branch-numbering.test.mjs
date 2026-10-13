@@ -113,8 +113,9 @@ describe('queue branch numbering', () => {
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
     expect(x.number).toHaveBeenCalledWith('/tmp/fake/tree', { minNext: 41 });
     expect(x.lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
-    expect(x.exec).toHaveBeenCalledWith('git', ['push', 'origin', 'HEAD:refs/heads/topic'], expect.any(Object));
+    expect(x.exec).toHaveBeenCalledWith('git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/topic'], expect.any(Object));
     expect(x.fs.writeFileSync).toHaveBeenCalled();
+    for (const [, , options] of x.exec.mock.calls) expect(options.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
   });
   it('reports an already successful push when worktree cleanup fails', () => {
     const x = setup();
@@ -157,6 +158,22 @@ describe('queue branch numbering', () => {
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', resolved: ['041'] });
     expect(x.args.resolveItem).toHaveBeenCalledWith('/tmp/fake/tree', '041', { sync: false, publish: false });
   });
+  it('uses the trusted transition and commits only the card path', () => {
+    const x = setup();
+    x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
+    x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: open\n---\n' : '{"reservations":[]}');
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', resolved: ['041'] });
+    expect(x.exec).toHaveBeenCalledWith('git', ['commit', '-m', 'drain: mark card 041 resolved on land (#2748)', '--', 'backlog/041-foo.md'], expect.any(Object));
+    expect(x.fs.writeFileSync).toHaveBeenCalledWith('/tmp/fake/tree/backlog/041-foo.md', expect.stringContaining('status: resolved'));
+    expect(x.exec.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true);
+  });
+  it('refuses a transition rejected by the trusted resolver without pushing', () => {
+    const x = setup();
+    x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
+    x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: blocked\n---\n' : '{"reservations":[]}');
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('only an in-flight item') });
+    expect(x.exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]))).toBe(false);
+  });
   it('refuses unresolved cards and failed numbering without pushing', () => {
     const x = setup();
     x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
@@ -183,12 +200,12 @@ describe('queue branch numbering', () => {
 });
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
-import { openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
+import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
 
 it('retains reservations when the pass cannot prove a PR closed', () => {
   expect(openReservationPr({ prsByRepo: new Map([['r', []]]), contextComplete: true }, 'r', 1)).toBe(false);
@@ -206,8 +223,7 @@ it('reports stranded queue hashes with a read-only probe', () => {
   const result = probeQueuedLand('/clone', { exec, log: { write } });
   expect(result.files).toEqual(['backlog/xabc123-bad.md']);
   expect(result.warning).toContain('not pushed; the merge_group gate should have refused it');
-  expect(exec).toHaveBeenCalledTimes(1);
-  expect(exec.mock.calls[0][1][0]).toBe('ls-tree');
+  expect(exec.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'ls-tree']);
   expect(write).toHaveBeenCalledWith(expect.stringContaining('WARNING'));
 });
 
@@ -228,12 +244,24 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     git('checkout', '-qb', 'topic');
     writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n');
     git('add', '.'); git('commit', '-qm', 'branch card'); git('push', '-q', 'origin', 'topic');
-    const old = git('rev-parse', 'HEAD');
-    const c = { repo: 'test/repo', num: 1, headRef: 'topic' };
+    let old = git('rev-parse', 'HEAD');
+    mkdirSync(join(cwd, '.githooks'));
+    mkdirSync(join(cwd, 'scripts'));
+    const sentinel = join(root, 'executed-untrusted-code');
+    for (const hook of ['pre-commit', 'pre-push']) writeFileSync(join(cwd, '.githooks', hook), `#!/bin/sh\ntouch '${sentinel}'\n`, { mode: 0o755 });
+    writeFileSync(join(cwd, 'scripts/backlog.mjs'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(sentinel)}, 'executed');`);
+    git('add', '.'); git('commit', '-qm', 'untrusted branch code'); git('push', '-q', 'origin', 'topic');
+    git('config', 'core.hooksPath', '.githooks');
+    const c = { repo: 'test/repo', num: 1, headRef: 'topic', hasManifest: true, item: 'xabc123' };
+    old = git('rev-parse', 'HEAD');
     const statePath = join(root, 'state.json');
     const lock = (fn, options) => withNumberingLock(fn, { ...options, lockRoot: join(root, 'locks') });
+    const envBefore = { ...process.env };
     const result = prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: old, statePath, lock });
+    expect(process.env).toEqual(envBefore);
     expect(result, result.reason).toMatchObject({ action: 'numbered', assigned: [{ hash: 'xabc123', nnn: '011' }] });
+    expect(existsSync(sentinel)).toBe(false);
+    expect(git('show', `${result.newHead}:backlog/011-foo.md`)).toContain('status: resolved');
     expect(git('ls-remote', 'origin', 'refs/heads/main').split(/\s/)[0]).toBe(main);
     expect(git('ls-remote', 'origin', 'refs/heads/topic').split(/\s/)[0]).toBe(result.newHead);
     git('merge-base', '--is-ancestor', old, result.newHead);
@@ -283,3 +311,73 @@ describe('sweepQueuedHashCards', () => {
     expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], errors: [{ num: null, reason: 'queue unavailable' }] });
   });
 });
+
+it('restores existing and absent hook configuration even on failure', () => {
+  const keys = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+  const original = keys.map((k) => process.env[k]);
+  try {
+    process.env.GIT_CONFIG_COUNT = '2';
+    delete process.env.GIT_CONFIG_KEY_0;
+    process.env.GIT_CONFIG_VALUE_0 = 'prior';
+    expect(() => withHooksDisabled(() => {
+      expect(keys.map((k) => process.env[k])).toEqual(['1', 'core.hooksPath', '/dev/null']);
+      throw new Error('failure');
+    })).toThrow('failure');
+    expect(keys.map((k) => process.env[k])).toEqual(['2', undefined, 'prior']);
+    expect(withHooksDisabled(() => 42)).toBe(42);
+    expect(keys.map((k) => process.env[k])).toEqual(['2', undefined, 'prior']);
+  } finally { keys.forEach((k, i) => original[i] === undefined ? delete process.env[k] : process.env[k] = original[i]); }
+});
+
+it('fallback allocation retains queue reservations above main', () => {
+  const exec = vi.fn(() => 'backlog/100-main.md');
+  const fs = { readFileSync: () => JSON.stringify({ reservations: [{ repo: null, num: 9, headRef: 'topic', nnns: [101], at: 'now' }] }) };
+  expect(fallbackMinNext({ cwd: '/clone', exec, fs, statePath: '/state' })).toBe(102);
+});
+
+it('probes on every live queue pass and repairs when inline numbering will not run', () => {
+  const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+  expect(source).toContain('if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());');
+  expect(source).toContain('if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain(');
+  expect(source).toContain('queuedHashOnMain ? { minNext: fallbackMinNext(');
+});
+
+it('repairs fresh remote main under the lock above reservations, leaving the checkout alone', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-repair-'));
+  const cwd = join(root, 'clone'), origin = join(root, 'origin.git');
+  const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+  try {
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
+    execFileSync('git', ['clone', '-q', origin, cwd], { stdio: 'pipe' });
+    git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@test');
+    git('config', 'commit.gpgsign', 'false'); git('config', 'core.hooksPath', '/dev/null');
+    mkdirSync(join(cwd, 'backlog'));
+    writeFileSync(join(cwd, 'backlog/100-main.md'), '---\nstatus: resolved\n---\n');
+    git('add', '.'); git('commit', '-qm', 'seed'); git('push', '-q', 'origin', 'main');
+    const stale = git('rev-parse', 'HEAD');
+    writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n');
+    git('add', '.'); git('commit', '-qm', 'human land'); git('push', '-q', 'origin', 'main');
+    const landed = git('rev-parse', 'HEAD');
+    git('checkout', '--detach', stale);
+    git('update-ref', 'refs/remotes/origin/main', stale);
+    const statePath = join(root, 'reservations.json');
+    writeFileSync(statePath, JSON.stringify({ reservations: [{ repo: null, num: 9, headRef: 'queued', nnns: [101], at: 'now' }] }));
+    const log = { write: vi.fn() };
+    const lock = vi.fn((fn) => ({ ran: true, result: fn() }));
+    const exec = vi.fn(execFileSync);
+    const refused = repairHashOnMain({ cwd, statePath, exec, log, lock: () => ({ ran: false }) });
+    expect(refused.pushed).not.toBe(true);
+    expect(git('ls-remote', 'origin', 'refs/heads/main').split(/\s/)[0]).toBe(landed);
+    const out = repairHashOnMain({ cwd, statePath, exec, log, lock });
+    expect(out).toMatchObject({ committed: true, pushed: true, assigned: [{ hash: 'xabc123', nnn: '102' }] });
+    expect(lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
+    const push = exec.mock.calls.find(([, args]) => args[0] === 'push');
+    expect(push[1]).toEqual(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main']);
+    expect(push[2].env).toMatchObject({ MAIN_PUSH_OK: '1', GIT_CONFIG_VALUE_0: '/dev/null' });
+    git('fetch', 'origin');
+    expect(git('ls-tree', '-r', '--name-only', 'origin/main')).toContain('backlog/102-foo.md');
+    expect(git('rev-parse', 'HEAD')).toBe(stale);
+    expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
+    expect(log.write).toHaveBeenCalledWith('  ⚠ FALLBACK: hash card(s) backlog/xabc123-foo.md on main — numbered and pushed to main so the queue is not blocked\n');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 30_000);

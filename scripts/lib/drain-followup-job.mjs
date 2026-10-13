@@ -31,6 +31,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathS
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { fallbackMinNext } from './queue-branch-numbering.mjs';
 import { defineJobKind, kindRegistry } from './daemon-jobs.mjs';
 import { createJobStore, enqueueJob, reattachTick } from './daemon-jobs-runtime.mjs';
 import { daemonJobsDir, daemonJobsRoot } from '../operations/run-store.mjs';
@@ -150,7 +151,7 @@ function underNumberingLock(withNumberingLock, label, fn) {
  */
 export function followupSteps(deps) {
   const {
-    cwd, exec = execFileSync, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
+    cwd, exec = execFileSync, minNext = fallbackMinNext, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
     regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, log = process.stderr, now = () => new Date().toISOString(),
   } = deps;
   return [
@@ -164,7 +165,7 @@ export function followupSteps(deps) {
           if (!files.split(/\r?\n/).some((file) => /^backlog\/x[0-9a-z]{6}-[^/]*\.md$/.test(file))) return { skipped: 'numbering and resolve happen on the PR branch before enqueue' };
           log.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
         }
-        const n = numberPendingHashes(cwd);
+        const n = numberPendingHashes(cwd, input.numberingOnBranch ? { minNext: minNext({ cwd, exec }) } : {});
         heartbeat();
         const plan = planResolveOnLand({ landedItems: input.landedItems, assigned: n.assigned, carriers: input.carriers, openHeadRefs: input.openHeadRefs });
         const resolved = [];

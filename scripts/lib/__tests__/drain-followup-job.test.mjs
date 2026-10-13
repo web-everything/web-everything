@@ -151,10 +151,14 @@ describe('followupSteps', () => {
       return '';
     });
     const log = { write: vi.fn() };
-    const out = followupSteps({ ...deps, exec, log })[0].run({ input: { ...input, numberingOnBranch: true } });
+    const minNext = vi.fn(() => 102);
+    const number = vi.fn(deps.numberPendingHashes);
+    const out = followupSteps({ ...deps, exec, log, minNext, numberPendingHashes: number })[0].run({ input: { ...input, numberingOnBranch: true } });
     expect(exec).toHaveBeenCalledWith('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], expect.any(Object));
     expect(exec.mock.calls.findIndex(([, args]) => args[0] === 'fetch')).toBeLessThan(exec.mock.calls.findIndex(([, args]) => args[0] === 'ls-tree'));
     expect(calls.number).toBe(hasHash ? 1 : 0);
+    expect(minNext).toHaveBeenCalledTimes(hasHash ? 1 : 0);
+    if (hasHash) expect(number).toHaveBeenCalledWith(worktree, { minNext: 102 });
     expect(calls.push).toEqual(hasHash ? [true] : []);
     if (hasHash) {
       expect(out.numbering.pushed).toBe(true);
@@ -341,7 +345,9 @@ describe('a real detached drain-followup job across a daemon restart', () => {
     const first = await reattachTick({ store: storeA, kinds: kinds(), ...tickOpts });
     expect(first.actions).toEqual([expect.objectContaining({ id: 'fu-1', action: 'launch', attempt: 1 })]);
     // The child dies mid-job (step 2), after step 1 checkpointed — daemon A is gone too.
-    await waitFor(() => existsSync(effects) && readFileSync(effects, 'utf8').includes('crash-in-regen'));
+    await waitFor(() => existsSync(effects) && readFileSync(effects, 'utf8').includes('crash-in-regen')).catch((e) => {
+      throw new Error(`${e.message}\n${readFileSync(join(jobsDir, 'fu-1.log'), 'utf8')}`);
+    });
     await sleep(300);
     expect(storeA.read('fu-1').job).toMatchObject({ status: 'running', checkpoint: { step: 1 } });
 

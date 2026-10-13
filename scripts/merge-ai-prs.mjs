@@ -169,7 +169,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -6603,14 +6603,15 @@ async function runCli() {
   // these buckets, and every bucket reaches the operator (stderr) AND `--json`. A withheld item that appears in
   // none of them is the silent skip this whole item was filed against.
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
-  if (landedLocalAny && numberingOnBranch && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
+  if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
   const queuedHashOnMain = !!numbered.files?.length;
+  if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
   if (landedLocal && !DRY_RUN && (!numberingOnBranch || queuedHashOnMain)) {
     if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
     // the TTL-bounded numbering mutex so a concurrent drain/land never mints the same NNN off the same base.
     const numLock = withNumberingLock(() => {
-      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd()));
+      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), queuedHashOnMain ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
       const __resolveOnLandT0 = __t.mark(); // x2e120n — everything from here through the resolve loop below
       // #2899 A5 — RESOLVE-ON-LAND for the LABEL lander. This drain single-sourced lane-drain's NUMBERING but
       // never its RESOLVING, so it assigned the NNN and left `status:` untouched — delivered work kept ranking
