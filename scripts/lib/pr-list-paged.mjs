@@ -5,7 +5,7 @@
  * WHY: live 2026-10-12/13, the single heavy `gh pr list` request for ~45 PRs repeatedly returned HTTP 504 Gateway
  *   Timeout. The CI-red recovery watch, drain and smoke reconcile could not read the shared snapshot. Keep
  *   comments/body/files out of the bulk query; hydrate them with `gh pr view` only when the cached copy is stale.
- *   A failed page never publishes a partial list. Wiring into pr-snapshot.mjs is a separate change.
+ *   A failed page never publishes a partial list. The shared snapshot and drain candidate listing use this reader.
  *
  * SETTINGS: `prListPaging` in scripts/settings/pr-list-paging.json. `pageSize` (20, range 1–100) bounds each page;
  *   `pageRetries` (1, range 0–3) retries only shared gh transient server/JSON failures; `heavyMaxAgeSeconds`
@@ -178,4 +178,44 @@ export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.
     return { ...row, ...Object.fromEntries(fields.map(field => [field, entry[field]])) };
   });
   return { rows: hydrated, cache: nextCache, fetched, reused };
+}
+
+
+/** SYNC: page the live set, then hydrate selected rows; unreadable never means partial or empty. */
+export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, needsHeavy = () => true,
+  cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {} }) {
+  const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize,
+    pageRetries: paging.pageRetries, maxRows, execOpts });
+  if (light.deferred) throw new PrListUnreadableError({ repo, stage: 'page', page: 1,
+    cause: new Error('gh deferred the page (low budget)') });
+  const working = { ...cache };
+  const byNumber = new Map(light.rows.map(row => [row.number, row]));
+  const maxAgeMs = paging.heavyMaxAgeSeconds * 1000;
+  const hasFields = entry => !!entry && heavyFields.every(field => Object.hasOwn(entry, field));
+  for (const row of seed) {
+    const live = byNumber.get(row.number);
+    if (!live || row.updatedAt !== live.updatedAt || row.headRefOid !== live.headRefOid || !hasFields(row)
+      || (hasFields(working[row.number]) && heavyIsFresh(working[row.number], live, { nowMs, maxAgeMs }))) continue;
+    working[row.number] = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: nowMs,
+      ...Object.fromEntries(heavyFields.map(field => [field, row[field]])) };
+  }
+  const need = light.rows.filter(needsHeavy);
+  let rows = light.rows, hydrated = 0, reused = 0;
+  if (heavyFields.length && need.length) {
+    // A prior body-only pass cannot supply files; preserve untouched entries for other open rows.
+    for (const row of need) {
+      if (!hasFields(working[row.number])) delete working[row.number];
+    }
+    const result = hydrateHeavyFields({ repo, rows: need, exec, cache: working, nowMs, maxAgeMs,
+      fields: heavyFields, execOpts });
+    const heavyByNumber = new Map(result.rows.map(row => [row.number, row]));
+    rows = light.rows.map(row => heavyByNumber.get(row.number) || row);
+    Object.assign(working, result.cache);
+    hydrated = result.fetched;
+    reused = result.reused;
+  }
+  const nextCache = Object.fromEntries(light.rows.filter(row => working[row.number])
+    .map(row => [row.number, working[row.number]]));
+  return { rows, truncated: light.truncated, totalCount: light.totalCount, pages: light.pages,
+    ms: light.ms, hydrated, reused, cache: nextCache };
 }

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh,
-  listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
+  listOpenPrsLightPaged, listOpenPrsPagedHydrated, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
 
@@ -203,5 +203,105 @@ describe('paging policy', () => {
       .toMatchObject(PR_LIST_PAGING_DEFAULTS);
     expect(resolvePrListPaging({ file: { prListPaging: { pageSize: 100, pageRetries: 0, heavyMaxAgeSeconds: 86400 } }, env }))
       .toMatchObject({ pageSize: 100, pageRetries: 0, heavyMaxAgeSeconds: 86400 });
+  });
+});
+
+
+describe('paged hydrated listing', () => {
+  const paging = { pageSize: 1, pageRetries: 1, heavyMaxAgeSeconds: 1 };
+  const list = (exec, extra = {}) => listOpenPrsPagedHydrated({ repo, exec, paging,
+    heavyFields: ['body', 'files'], nowMs: 10000, ...extra });
+
+  it('throws on a repeatedly failing second page without hydrating partial rows', () => {
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], true, 'a'))
+      .mockImplementation(() => { throw failure(timeout); });
+    let error;
+    try { list(exec); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(PrListUnreadableError);
+    expect(error).toMatchObject({ unreadable: true, stage: 'page', page: 2 });
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(exec.mock.calls.every(([, argv]) => argv[0] === 'api')).toBe(true);
+  });
+
+  it('retries page 2 once and returns all ordered rows and metadata', () => {
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], true, 'a', 2))
+      .mockImplementationOnce(() => { throw failure(timeout); })
+      .mockReturnValueOnce(page([node(2)], false, null, 2));
+    const result = list(exec, { heavyFields: [] });
+    expect(result).toMatchObject({ rows: [row(1), row(2)], pages: 2, totalCount: 2,
+      truncated: false, hydrated: 0, reused: 0, cache: {} });
+    expect(result.ms).toBeGreaterThanOrEqual(0);
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
+
+  it('hydrates selected rows only and keeps untouched open cache entries', () => {
+    const cache = { 2: cached(row(2), { body: 'untouched' }), 99: cached(row(99)) };
+    delete cache[2].files;
+    const before = structuredClone(cache);
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]))
+      .mockReturnValueOnce(JSON.stringify(heavy));
+    const result = list(exec, { cache, needsHeavy: r => r.number === 1, execOpts: { timeout: 123 } });
+    expect(result.rows).toEqual([{ ...row(1), body: heavy.body, files: heavy.files }, row(2)]);
+    expect(result).toMatchObject({ hydrated: 1, reused: 0 });
+    expect(exec.mock.calls[1]).toEqual(['gh', ['pr', 'view', '1', '--repo', repo, '--json', 'body,files'],
+      { ...opts, timeout: 123 }]);
+    expect(Object.keys(result.cache)).toEqual(['1', '2']);
+    expect(result.cache[2]).toEqual(cache[2]);
+    expect(cache).toEqual(before);
+  });
+
+  it('reuses matching snapshot seeds without view calls', () => {
+    const seed = [{ ...row(1), ...heavy }, { ...row(2), ...heavy }];
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]));
+    const result = list(exec, { seed });
+    expect(result).toMatchObject({ hydrated: 0, reused: 2 });
+    expect(result.cache[1]).toEqual({ updatedAt: row(1).updatedAt, headRefOid: row(1).headRefOid,
+      fetchedAtMs: 10000, body: heavy.body, files: heavy.files });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { headRefOid: 'old' }, { updatedAt: 'old' }, { files: undefined },
+  ])('hydrates a mismatched or incomplete seed (%j)', extra => {
+    const seedRow = { ...row(1), ...heavy, ...extra };
+    if (extra.files === undefined && Object.hasOwn(extra, 'files')) delete seedRow.files;
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)]))
+      .mockReturnValueOnce(JSON.stringify(heavy));
+    expect(list(exec, { seed: [seedRow] })).toMatchObject({ hydrated: 1, reused: 0 });
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('prefers a fresh cache over seeds and replaces stale or incomplete entries', () => {
+    const seed = [{ ...row(1), ...heavy }];
+    for (const entry of [cached(row(1), { fetchedAtMs: 8000 }), cached(row(1), { headRefOid: 'old' }),
+      { updatedAt: row(1).updatedAt, headRefOid: row(1).headRefOid, fetchedAtMs: 9500 }]) {
+      const exec = vi.fn().mockReturnValueOnce(page([node(1)]));
+      expect(list(exec, { cache: { 1: entry }, seed }).rows[0].body).toBe(heavy.body);
+      expect(exec).toHaveBeenCalledTimes(1);
+    }
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)]));
+    expect(list(exec, { cache: { 1: cached(row(1), { body: 'cached' }) }, seed }).rows[0].body).toBe('cached');
+  });
+
+  it('throws unreadable on a deferred page, including after partial progress', () => {
+    const deferred = JSON.stringify({ outcome: 'deferred-low-budget' });
+    for (const exec of [vi.fn().mockReturnValueOnce(deferred),
+      vi.fn().mockReturnValueOnce(page([node(1)], true, 'a')).mockReturnValueOnce(deferred)]) {
+      expect(() => list(exec)).toThrow(PrListUnreadableError);
+      exec.mockReset().mockReturnValueOnce(deferred);
+      expect(() => list(exec)).toThrow('gh deferred the page (low budget)');
+    }
+  });
+
+  it('throws unreadable if heavy hydration fails without mutating caller cache', () => {
+    const cache = { 99: cached(row(99)) };
+    const before = structuredClone(cache);
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]))
+      .mockReturnValueOnce(JSON.stringify(heavy)).mockImplementation(() => { throw failure(timeout); });
+    let error;
+    try { list(exec, { cache }); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(PrListUnreadableError);
+    expect(error).toMatchObject({ unreadable: true, stage: 'hydrate', number: 2 });
+    expect(cache).toEqual(before);
   });
 });
