@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildStandDownComment } from '../stand-down.mjs';
 import { standDownRow } from '../../operations/operator-queue.mjs';
@@ -8,6 +10,9 @@ import { planOrphanFixRound, CHANGES_VERDICT_PREFIX } from '../orphan-fix-round.
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { standDownOf } from '../health-smells/stood-down-prs.mjs';
 
+// Built from the path, not `new URL(rel, import.meta.url)`: under the happy-dom test environment the global `URL`
+// can resolve against an http origin, and a child `node` process only loads file: URLs.
+const STAND_DOWN_URL = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../stand-down.mjs')).href;
 const old = 'a'.repeat(40);
 const head = 'b'.repeat(40);
 const c = (body, hour = 10) => ({ body, author: { login: 'web-everything' }, createdAt: `2026-10-12T${hour}:00:00Z` });
@@ -53,7 +58,7 @@ describe('head-aware stand-down consumers', () => {
         return real(...args);
       };
       syncBuiltinESMExports();
-      const { standDownComments } = await import(${JSON.stringify(new URL('../stand-down.mjs', import.meta.url).href)});
+      const { standDownComments } = await import(${JSON.stringify(STAND_DOWN_URL)});
       delete process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD;
       standDownComments(${JSON.stringify([hold, hold, hold])}, { headRefOid: ${JSON.stringify(head)} });
       console.log(reads);

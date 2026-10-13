@@ -1071,6 +1071,7 @@
   "scripts/conveyor/soak/breaks/daemon-entry-boot-crash.soak.test.mjs": 0.06,
   "scripts/conveyor/soak/breaks/daemon-overlay-lock-wait.soak.test.mjs": 8.55,
   "scripts/conveyor/soak/breaks/daemon-version-switch-mid-tick.soak.test.mjs": 0.18,
+  "scripts/conveyor/soak/breaks/detail-head-must-not-release-human-hold.soak.test.mjs": 1.0,
   "scripts/conveyor/soak/breaks/dispatch-trust-grant-blocked-by-cli-lock.soak.test.mjs": 1.07,
   "scripts/conveyor/soak/breaks/drain-app-token-pinned-to-one-org.soak.test.mjs": 20.42,
   "scripts/conveyor/soak/breaks/fix-daemon-lock-wait.soak.test.mjs": 21.07,
