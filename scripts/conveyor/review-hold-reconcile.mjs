@@ -47,14 +47,19 @@
  * only a PR's `labels` and is fully unit-testable with no `gh`; {@link sweepReviewHoldLabels} is the IO shell,
  * with the PR list and the label provider injectable so the whole pass is testable without a real `gh` call too.
  *
- * WHAT IT NEVER DOES: add a label (each healed pair already carries its operative hold), or touch anything but
- * the removals named above. It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
+ * The one label-add exception: a numbering-only head move proven by scripts/lib/numbering-carry.mjs carries
+ * the existing acceptance, adding review:accepted and removing review:pending before the stale-accept heal.
+ * WHAT IT NEVER DOES: add any other label, or touch anything but the removals named above.
+ * It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
  * human/independent-agent act, never a sweep's), and it never adds `review:pending`/`review:changes` — a stray
  * label is dropped, never replaced with a guess at what it should have said instead.
  */
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, restampAfterNumbering } from '../lib/numbering-carry.mjs';
+import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
@@ -63,12 +68,12 @@ import {
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
+import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
-import { sweepAcceptCarry } from './accept-carry-sweep.mjs';
+import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
 function labelNames(labels) {
@@ -139,6 +144,7 @@ export function needsReviewHoldCleanup(pr) {
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
+  numberingRestamp = restampAfterNumbering, exec = execFileSync,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
@@ -148,8 +154,55 @@ export function sweepReviewHoldLabels({
     if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
     return resolvedRepo;
   };
+  const restamped = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
-    if (!needsReviewHoldCleanup(pr)) continue;
+    const names = labelNames(pr.labels);
+    if (!names.includes(REVIEW_LABELS.pending)
+      || [REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l))) continue;
+    // Cheap pre-filter on the listing so the live re-read is spent only on a possible numbering carry: a complete listed
+    // thread with no accept on another head (or an accept already bound here by something other than a numbering
+    // re-stamp) cannot be one. A capped (possibly truncated) listing is re-read live.
+    const listed = Array.isArray(pr.comments) ? pr.comments : null;
+    if (listed && listed.length < LIST_COMMENTS_CAP) {
+      const rec = latestAcceptRecord(listed);
+      const head = String(pr.headRefOid || '').toLowerCase();
+      if (!rec || (rec.sha === head && !String(listed[rec.index]?.body || '').includes(`<!-- ${NUMBERING_RESTAMP_MARKER}:`))) continue;
+    }
+    try {
+      const slug = repoOf();
+      if (numberingRestampSettled(slug, pr.number, pr.headRefOid)) continue;
+      const metadata = provider.readPrState(slug, pr.number);
+      const state = { ...metadata, comments: readComments(pr.number, { repo: slug }) };
+      if (state.state !== 'OPEN') throw new Error('PR is not open');
+      if (!Array.isArray(state.labels) || state.labels.some((l) =>
+        typeof (l?.name ?? l) !== 'string' || !(l?.name ?? l).trim())) throw new Error('unusable labels');
+      if (typeof state.headRefOid !== 'string' || !state.headRefOid.trim()) throw new Error('missing head');
+      if (!Array.isArray(state.comments)) throw new Error('comments read returned no array');
+      if (state.number != null && state.number !== pr.number) throw new Error('PR number mismatch');
+      let reviews;
+      try { reviews = provider.readPrReviews(slug, pr.number); } catch { reviews = null; }
+      let origin = '';
+      try { origin = String(exec('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' })).trim(); } catch { /* other checkout */ }
+      const originSlug = origin.replace(/^.*github\.com[:/]/i, '').replace(/\.git$/i, '').replace(/\/$/, '');
+      const cwd = originSlug.toLowerCase() === slug.toLowerCase() ? undefined : defaultCloneDirFor(slug);
+      if (cwd === null) {
+        results.push({ num: pr.number, numberingRestamp: 'retry', detail: 'no checkout for repository' });
+        continue;
+      }
+      const readNetDiff = (sha) => readNetDiffAtHead({
+        exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
+      });
+      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd, readNetDiff, exec });
+      if (r) {
+        results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });
+        if (r.action === 'restamped' || (dryRun && r.action === 'would-restamp')) restamped.add(pr.number);
+      }
+    } catch (e) {
+      results.push({ num: pr.number, numberingRestamp: 'error', detail: String(e?.message ?? e).split('\n')[0] });
+    }
+  }
+  for (const pr of Array.isArray(prs) ? prs : []) {
+    if (restamped.has(pr.number) || !needsReviewHoldCleanup(pr)) continue;
     let state;
     try {
       const metadata = provider.readPrState(repoOf(), pr.number);
@@ -260,6 +313,9 @@ if (IS_CLI) {
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
+        if (r.numberingRestamp) {
+          writeLineSync(2, `  📌 PR #${r.num}: numbering re-stamp ${r.numberingRestamp} — ${r.detail ?? ''}`);
+        }
         if (r.skipped) writeLineSync(2, `  ⚠ PR #${r.num}: ${r.skipped}`);
         if (r.remove?.length) {
           const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
