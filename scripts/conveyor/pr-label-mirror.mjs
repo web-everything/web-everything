@@ -62,18 +62,24 @@ export function renderPlan(plan, { repo = DEFAULT_REPO } = {}) {
   return lines.join('\n');
 }
 
+/** One place for the derive call, so the report, the apply pass and its re-derive can never differ on the non-default-repo facts rule. */
+const deriveRowsFor = (buildRows, { repo, prs, events }) =>
+  buildRows({ repo, prs, events, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) });
+
 /** Read-only run: list PRs, read the ledger, derive, plan. Every input is injectable; none of them writes. */
 export async function runMirrorReport({ repo = DEFAULT_REPO, store, limit = 200, listPrs = readOpenPrs, readEvents = readLedgerEventsFromStore, buildRows = buildDerivedRows } = {}) {
   const prs = await listPrs({ repo, limit });
   const ledger = await readEvents(repo, { store });
   const events = ledger.status === 'ok' ? ledger.rows : null;
-  const rows = buildRows({ repo, prs, events, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) });
+  const rows = deriveRowsFor(buildRows, { repo, prs, events });
   return { ...planMirror(rows), store: ledger.store, ...(ledger.status === 'ok' ? {} : { ledgerUnreadable: { reason: ledger.reason, error: ledger.error } }) };
 }
 
 // ---- APPLY MODE (slice K, #5649) -------------------------------------------------------------------------
 
 const GRAPHQL_PAGE = 100;
+/** At most this many pages (newest first) per PR; past it the PR is `unreadable`, never partially applied. */
+const TIMELINE_MAX_PAGES = 5;
 
 /**
  * Read one PR's label add/remove timeline. Fails closed: a read error, a missing PR, or earlier pages left unread
@@ -81,21 +87,27 @@ const GRAPHQL_PAGE = 100;
  * @returns {Promise<{status:'ok', items:Array<{label:string, change:'added'|'removed', actor:string|null, actorType:string|null, createdAt:string}>}
  *   | {status:'unreadable', reason:string}>}
  */
-export async function readLabelTimeline({ repo, pr, read = readGh } = {}) {
+export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TIMELINE_MAX_PAGES } = {}) {
   try {
     if (!REPO_RE.test(String(repo)) || !Number.isInteger(Number(pr))) return { status: 'unreadable', reason: 'bad-target' };
     const [owner, name] = repo.split('/');
     const actor = 'createdAt actor { __typename login } label { name }';
-    const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr)}) {
-      timelineItems(last:${GRAPHQL_PAGE},itemTypes:[LABELED_EVENT,UNLABELED_EVENT]) { pageInfo { hasPreviousPage }
+    const items = [];
+    let before = null;
+    for (let page = 0; page < maxPages; page += 1) {
+      const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr)}) {
+      timelineItems(last:${GRAPHQL_PAGE},${before ? `before:${JSON.stringify(before)},` : ''}itemTypes:[LABELED_EVENT,UNLABELED_EVENT]) { pageInfo { hasPreviousPage startCursor }
         nodes { __typename ... on LabeledEvent { ${actor} } ... on UnlabeledEvent { ${actor} } } } } } }`;
-    const tl = JSON.parse(String(read(['api', 'graphql', '-f', `query=${query}`]))).data?.repository?.pullRequest?.timelineItems;
-    if (!tl || !Array.isArray(tl.nodes)) return { status: 'unreadable', reason: 'no-timeline' };
-    if (tl.pageInfo?.hasPreviousPage !== false) return { status: 'unreadable', reason: 'truncated-timeline' };
-    const items = tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))
-      .map((n) => ({ label: String(n.label.name), change: n.__typename === 'LabeledEvent' ? 'added' : 'removed',
-        actor: n.actor?.login ? String(n.actor.login) : null, actorType: n.actor?.__typename ? String(n.actor.__typename) : null, createdAt: String(n.createdAt) }));
-    return { status: 'ok', items };
+      const tl = JSON.parse(String(read(['api', 'graphql', '-f', `query=${query}`]))).data?.repository?.pullRequest?.timelineItems;
+      if (!tl || !Array.isArray(tl.nodes)) return { status: 'unreadable', reason: 'no-timeline' };
+      items.push(...tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))
+        .map((n) => ({ label: String(n.label.name), change: n.__typename === 'LabeledEvent' ? 'added' : 'removed',
+          actor: n.actor?.login ? String(n.actor.login) : null, actorType: n.actor?.__typename ? String(n.actor.__typename) : null, createdAt: String(n.createdAt) })));
+      if (tl.pageInfo?.hasPreviousPage === false) return { status: 'ok', items };
+      if (tl.pageInfo?.hasPreviousPage !== true || !tl.pageInfo.startCursor) return { status: 'unreadable', reason: 'bad-page-info' };
+      before = String(tl.pageInfo.startCursor);
+    }
+    return { status: 'unreadable', reason: 'truncated-timeline' }; // earlier pages remain unread: never "no changes"
   } catch (e) {
     return { status: 'unreadable', reason: `timeline-read-failed: ${String(e?.message ?? e).split('\n')[0].slice(0, 200)}` };
   }
@@ -166,7 +178,7 @@ export async function runMirrorApply({
   if (prs.length >= limit) throw new Error(`pr-label-mirror: the open-PR list hit --limit=${limit}; raise it, refusing to apply on a possibly truncated list`);
   const ledger = await readEvents(repo, { store });
   const events = ledger.status === 'ok' ? ledger.rows : null;
-  const rows = buildRows({ repo, prs, events, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) });
+  const rows = deriveRowsFor(buildRows, { repo, prs, events });
   const plan = planMirror(rows);
   const out = { ...plan, mode: 'apply', writes: 0, store: ledger.store, rowsAppended: [], labelsAdded: [], failures: [],
     ...(ledger.status === 'ok' ? {} : { ledgerUnreadable: { reason: ledger.reason, error: ledger.error } }) };
@@ -199,7 +211,7 @@ export async function runMirrorApply({
     // The add was planned from the snapshot taken at the start of the pass: a `clear-human` that landed since must win.
     // Re-derive this one PR from a fresh ledger read and add only if `review:human` is still wanted.
     const latest = await readEvents(repo, { store });
-    const again = latest.status === 'ok' ? buildRows({ repo, prs: [p], events: latest.rows, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) })[0] : null;
+    const again = latest.status === 'ok' ? deriveRowsFor(buildRows, { repo, prs: [p], events: latest.rows })[0] : null;
     if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
     if (!again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
     try { await addLabel(repo, p.number, APPLY_ADD_LABEL); out.writes += 1; out.labelsAdded.push({ pr: p.number, label: APPLY_ADD_LABEL }); } catch (e) {

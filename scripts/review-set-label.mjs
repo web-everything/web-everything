@@ -1050,28 +1050,32 @@ export function runReviewLabelCli({
       );
     }
   }
-  // #5649 — the `approval` row's two optional inputs, parsed and checked BEFORE any write. A closed set for the kind
-  // and a JSON-parsed object for the delegation: a malformed value is a refusal, never a silent `null`.
+  // #5649 — the `approval` row's two optional inputs, parsed and the row's shape checked BEFORE any write. A closed
+  // set for the kind and a JSON-parsed object for the delegation: a malformed value is a refusal, never a silent
+  // `null`. For `clear-human` the dry build below always runs (not only when a flag is given), so a kind/delegation
+  // combination the schema rejects can never be discovered AFTER the clearing verdict row is already appended.
   const approvalKindFlag = argv.find((a) => a.startsWith('--approval-kind='));
   const delegationFlag = argv.find((a) => a.startsWith('--delegation-json='));
   const approvalKind = approvalKindFlag ? approvalKindFlag.slice('--approval-kind='.length).trim() : 'clear-human';
   let approvalDelegation = null;
-  if (approvalKindFlag || delegationFlag) {
-    if (to !== 'clear-human') fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
+  if ((approvalKindFlag || delegationFlag) && to !== 'clear-human') {
+    fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
+  }
+  if (to === 'clear-human') {
     if (!APPROVAL_KINDS.includes(approvalKind)) {
       fail(`invalid --approval-kind — expected one of ${APPROVAL_KINDS.join(', ')}; nothing was changed`);
     }
-  }
-  if (delegationFlag) {
-    try { approvalDelegation = JSON.parse(delegationFlag.slice('--delegation-json='.length)); } catch {
-      fail('--delegation-json is not valid JSON; nothing was changed');
+    if (delegationFlag) {
+      try { approvalDelegation = JSON.parse(delegationFlag.slice('--delegation-json='.length)); } catch {
+        fail('--delegation-json is not valid JSON; nothing was changed');
+      }
+      if (approvalDelegation == null) fail('--delegation-json must be an object {by, scope, expires (ISO time)}; nothing was changed');
     }
-    // Shape check through the schema itself (`{by, scope, expires}`), so this flag never invents a second shape.
+    // The shape check IS the schema: a placeholder repo/pr/time stand in for the real ones only to run `buildLedgerEvent`.
     try {
       buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
         approval: approvalKind, delegation: approvalDelegation });
-    } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)}; nothing was changed'); }
-    if (approvalDelegation == null) fail('--delegation-json must be an object {by, scope, expires (ISO time)}; nothing was changed');
+    } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
   }
   // A BOUNCE WITH NO FINDINGS IS UNACTIONABLE, so it is refused (#xd6moh1). `review:changes` tells the author
   // to fix something; the findings are the only place that says WHAT. Without them the PR is parked behind a

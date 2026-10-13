@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main } from '../pr-label-mirror.mjs';
+import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main, readSelfLogin } from '../pr-label-mirror.mjs';
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
@@ -178,8 +178,40 @@ describe('#5649 runMirrorApply', () => {
       expect(w.log).toEqual([]);
       expect(out.failures).toEqual([{ pr: 7, reason: expect.stringContaining(reason) }]);
     }
-    const read = () => JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { pageInfo: { hasPreviousPage: true }, nodes: [] } } } } });
-    expect(await readLabelTimeline({ repo: REPO, pr: 7, read: (a) => { expect(a.join(' ')).toContain('hasPreviousPage'); return read(); } })).toMatchObject({ status: 'unreadable', reason: 'truncated-timeline' });
+  });
+
+  it('readLabelTimeline: maps Labeled/Unlabeled to added/removed with actor and type, and pages back with before cursors', async () => {
+    const node = (t, label, login, createdAt, type = 'User') => ({ __typename: t, createdAt, actor: login ? { __typename: type, login } : null, label: { name: label } });
+    const pages = [
+      { pageInfo: { hasPreviousPage: true, startCursor: 'CUR1' }, nodes: [node('UnlabeledEvent', 'review:human', 'operator', '2026-10-12T11:00:00Z')] },
+      { pageInfo: { hasPreviousPage: false, startCursor: 'CUR0' }, nodes: [node('LabeledEvent', 'review:human', 'ci', '2026-10-12T09:00:00Z', 'Bot'), node('LabeledEvent', 'bug', null, '2026-10-12T09:30:00Z')] },
+    ];
+    const queries = [];
+    const read = (args) => { queries.push(args.join(' ')); return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: pages[queries.length - 1] } } } }); };
+    const r = await readLabelTimeline({ repo: REPO, pr: 7, read });
+    expect(r.status).toBe('ok');
+    expect(r.items).toEqual([
+      { label: 'review:human', change: 'removed', actor: 'operator', actorType: 'User', createdAt: '2026-10-12T11:00:00Z' },
+      { label: 'review:human', change: 'added', actor: 'ci', actorType: 'Bot', createdAt: '2026-10-12T09:00:00Z' },
+      { label: 'bug', change: 'added', actor: null, actorType: null, createdAt: '2026-10-12T09:30:00Z' },
+    ]);
+    expect(queries[0]).not.toContain('before:');
+    expect(queries[1]).toContain('before:"CUR1"');
+  });
+
+  it('readLabelTimeline: more pages than the cap, a missing cursor, or a bad payload is unreadable, never "no changes"', async () => {
+    const more = () => JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { pageInfo: { hasPreviousPage: true, startCursor: 'C' }, nodes: [] } } } } });
+    expect(await readLabelTimeline({ repo: REPO, pr: 7, read: more, maxPages: 2 })).toEqual({ status: 'unreadable', reason: 'truncated-timeline' });
+    const noCursor = () => JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { pageInfo: { hasPreviousPage: true }, nodes: [] } } } } });
+    expect(await readLabelTimeline({ repo: REPO, pr: 7, read: noCursor })).toMatchObject({ status: 'unreadable', reason: 'bad-page-info' });
+    expect(await readLabelTimeline({ repo: REPO, pr: 7, read: () => '{"data":{"repository":{"pullRequest":null}}}' })).toMatchObject({ status: 'unreadable' });
+    expect(await readLabelTimeline({ repo: REPO, pr: 7, read: () => { throw new Error('gh down'); } })).toMatchObject({ status: 'unreadable', reason: expect.stringContaining('gh down') });
+    expect(await readLabelTimeline({ repo: 'bad repo', pr: 7, read: more })).toMatchObject({ status: 'unreadable', reason: 'bad-target' });
+  });
+
+  it('readSelfLogin reads the gh api user login and refuses an empty one', () => {
+    expect(readSelfLogin({ read: (a) => { expect(a).toEqual(['api', 'user', '--jq', '.login']); return 'mirror-bot-login\n'; } })).toBe('mirror-bot-login');
+    expect(() => readSelfLogin({ read: () => '\n' })).toThrow(/no login/);
   });
 
   it('a PR whose current verdict is not human gets no review:human add even after a hand removal', async () => {
@@ -217,6 +249,13 @@ describe('#5649 planLabelInputRows', () => {
     const items = [tl('review:human', 'added', 'op', '2026-10-12T09:00:00Z'), tl('review:human', 'removed', 'op', '2026-10-12T09:30:00Z')];
     expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toEqual([]); // stale: label is back, last change was a removal
     expect(planLabelInputRows({ ...base, items, liveLabels: [] })).toHaveLength(1);
+  });
+  it('a row already in the ledger (same repo, pr, label, change, time) is dropped even while the label is still absent', () => {
+    const items = [tl('review:human', 'removed', 'operator', '2026-10-12T11:00:00Z')];
+    const [row] = planLabelInputRows({ ...base, liveLabels: [], items });
+    expect(row).toMatchObject({ type: 'label-input', label: 'review:human', change: 'removed', sender: 'operator', at: '2026-10-12T11:00:00Z' });
+    expect(planLabelInputRows({ ...base, liveLabels: [], items, events: [row] })).toEqual([]);
+    expect(planLabelInputRows({ ...base, liveLabels: [], items, events: [{ ...row, pr: 8 }] })).toHaveLength(1); // another PR's row never suppresses it
   });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);

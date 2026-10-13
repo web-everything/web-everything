@@ -4010,6 +4010,20 @@ describe('#5649 — approval rows at the label home', () => {
     }
   });
 
+  it('every approval kind, with and without a delegation, either clears with its approval row or is refused before any write', () => {
+    const delegation = JSON.stringify({ by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' });
+    for (const kind of ['clear-human', 'clear-operator', 'judge']) {
+      for (const extra of [[], [`--delegation-json=${delegation}`]]) {
+        rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
+        const p = stubProvider(['review:human']);
+        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...extra]);
+        const types = rows().map((x) => x.type ?? 'verdict');
+        if (r.exitCode === 0) expect(types).toEqual(['verdict', 'approval']);
+        else { expect(types).toEqual([]); expect(p.calls).toEqual([]); }
+      }
+    }
+  });
+
   it('a refused approval append blocks the swap', () => {
     const p = stubProvider(['review:human']);
     const { exitCode, payload } = run(p, CLEAR, { appendApproval: () => ({ ok: false, errors: ['boom'] }) });
