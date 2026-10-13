@@ -2,9 +2,10 @@
 bornAs: xhkx845
 kind: story
 size: 3
-status: open
+status: active
 scope: ["we:scripts/lib/pr-snapshot.mjs", "we:scripts/lib/__tests__/pr-snapshot.test.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/__tests__/ruling-needed.test.mjs", "we:scripts/conveyor/__tests__/ruling-needed-sweep.test.mjs", "we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/__tests__/referral-auto-block.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-13"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "4ac28cbadea0a2519698e37b9930486872e71d83"
 tags: []
@@ -15,6 +16,16 @@ tags: []
 Held finding 216 (2026-10-10). Shared PR listings are discovery evidence, not authority for comment-dependent writes. Preserve the shared cache, but make the review-hold sweep and its ruling-label/auto-block passes re-read live PR state and the complete comment thread before deciding mutations. A trusted clearance or operator ruling after comment 100 must affect the decision.
 
 ## Progress
+
+- Completed implementation and queued verification: all six specified suites, including the unchanged pagination suite, passed (151 tests). Final overlap regression plus stronger late operator-ruling and exact-100-thread fixtures passed in the two affected suites (97 tests), bringing covered tests to 152. All forge/subprocess IO in the new proofs is injected; no real PR was mutated.
+- Observed call traces match the proof: cleanup reads state then the complete thread before comment/label writes; ruling labels read metadata and paginated comments before ensure/set; composition reads pending state, records the auto-block, then reads ruled state before removing the ruling label. Dry-run performs both reads without writes. Failed reads isolate the PR and retry on the next tick; snapshot objects stay unchanged.
+- Final review also fixed overlapping cleanup/heal removal filtering: a successfully removed pending label is not removed again during healing; dry-run reports the same plan.
+- The delivery brief reserves gate commands and commits for the wrapper, so check:standards was not run by this agent. Remaining work outside this item is the documented fleet-consumer inventory and operational measurement of the extra reads; no fleet-wide safety claim is made.
+
+- Red proof: the queued pre-change run failed all five new behavioral assertions (late trusted clearance, stale advisory labels, late ruling-label referral, late ruling cancellation, late auto-block referral); 58 existing tests passed. Failures showed incorrect writes or missed work, not import errors.
+- Implemented independent fresh metadata/complete-thread boundaries in all three mutation loops, strict required-field checks, per-PR failure diagnostics, and fresh ruling-label reads after auto-block. Preserved cache projection and existing verdict/trust policy. The initial queued implementation run passed all six suites (106 tests); expanded edge-case and composed-pass proofs are complete.
+
+- Implementation sanity read (2026-10-13): the three mutation loops still use snapshot authority as described; the spec remains coherent and buildable. Added behavioral regressions before implementation for a trusted clearance at comment 120, stale advisory labels, late referrals and a late ruling.
 
 - Original premise/scope: the shared snapshot itself truncates comments and review-hold reconciliation decides directly from that cut snapshot; two source files, no tests, size 1. Historical incidents #4708, #4826 and #4938 motivated the card.
 - Corrected premise: the cap is inherited from GitHub CLI list/view comment connections, not an explicit slice in the cache. we:scripts/lib/pr-snapshot.mjs:40 includes comments and we:scripts/lib/pr-snapshot.mjs:95 fetches the list unchanged. we:scripts/conveyor/pr-comments-complete.mjs:4 documents the 100-comment list cap; its complete reader is at we:scripts/conveyor/pr-comments-complete.mjs:19, not under the library directory.
