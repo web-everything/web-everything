@@ -35,6 +35,11 @@ const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
 const fields = ji >= 0 ? String(a[ji + 1] || '') : '';
 function out(o) { process.stdout.write(JSON.stringify(o)); process.exit(0); }
+// The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
+function headOf(pr) {
+  const tip = (pr._commits || [])[(pr._commits || []).length - 1];
+  return pr._headRefOid || (tip && tip.oid) || ('0'.repeat(40) + pr.number).slice(-40);
+}
 // Record every 'pr comment' the drain posts (only when a log path is set — dry-run runs never reach here, so the
 // default JSON-reading tests are unaffected). Used by the finding-1 non-dry-run test to prove which park kinds
 // get a durable skip/park comment.
@@ -62,7 +67,19 @@ if (a[0] === 'pr' && a[1] === 'merge') {
   if (pr && pr._mergeFailButLands) { fs.writeFileSync(process.env.GATE_FIXTURE + '.merged-' + pr.number, ''); process.stderr.write('forced post-merge gh failure\\n'); process.exit(1); }
   if (pr && pr._mergeFail) { process.stderr.write('forced merge failure\\n'); process.exit(1); }
 }
-if (a[0] === 'pr' && a[1] === 'list') out(fx.prs);
+// xec3amn — a real listing answers the requested files and head on every row; the drain's default-on workflow-edit
+// gate reads both from the listing, so a row missing them would model a malformed listing and defer every PR.
+// The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
+// tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
+if (a[0] === 'pr' && a[1] === 'list') out(fx.prs.map((pr) => {
+  const row = { ...pr };
+  const tip = (pr._commits || [])[(pr._commits || []).length - 1];
+  // These unrelated gate scenarios use known modifications; unknown/rename metadata
+  // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
+  if (fields.split(',').includes('files') && !('files' in row)) row.files = (pr._files || []).map((f) => ({ changeType: 'MODIFIED', ...f }));
+  if (fields.split(',').includes('headRefOid') && !row.headRefOid) row.headRefOid = (tip && tip.oid) || headOf(pr);
+  return row;
+}));
 if (a[0] === 'pr' && a[1] === 'view') {
   const pr = fx.prs.find((p) => String(p.number) === String(a[2])) || {};
   const fieldList = fields.split(',');
@@ -102,8 +119,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
     if (pr._clearedBy) cs.push({ body: '✅ review — \`review:human\` cleared via the sanctioned path\\n\\nCleared by ' + pr._clearedBy + ' via \`review-set-label.mjs --to=clear-human\` (#2895).' });
     // xvzc4v4 advisory fix — with no explicit _headRefOid the live head IS the tip commit (as on real GitHub);
     // a fixture sets _headRefOid to something else to model a push landing after the pass-start commits read.
-    const tip = (pr._commits || [])[(pr._commits || []).length - 1];
-    resp.headRefOid = pr._headRefOid || (tip && tip.oid) || '';
+    resp.headRefOid = headOf(pr);
     resp.comments = cs;
   }
   if (fieldList.includes('state')) resp.state = (pr._state === 'MERGED' || fs.existsSync(process.env.GATE_FIXTURE + '.merged-' + pr.number)) ? 'MERGED' : 'OPEN';
@@ -153,12 +169,16 @@ afterAll(() => {
 const HERMETIC_FREEZE_ENV = { WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only' };
 
 /** Run the REAL entrypoint against a canned fixture, return its parsed --json result. */
-function runDrain(fixture, args) {
+// The narrow human-review default demotes gate-self edits to AI care; tests that prove the entrypoint's human park
+// over a gate-config.mjs fixture opt into the broad surface set, as pr-land.test.mjs does for its restore path.
+const BROAD_HUMAN_SURFACES_ENV = { WE_HUMAN_REVIEW_SURFACES: 'broad' };
+
+function runDrain(fixture, args, extraEnv = {}) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
   writeFileSync(fxPath, JSON.stringify(fixture));
   const stdout = execFileSync('node', [SCRIPT, ...args, '--dry-run', '--this-repo', '--json'], {
     cwd: workDir,                                   // a clean dir — no park-state, no real repo
-    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -170,14 +190,14 @@ function runDrain(fixture, args) {
  *  lease bypassed (`--no-drain-lease`, the documented tests/break-glass escape) and every `gh pr comment`
  *  recorded. Returns `{ result, comments }`. Used only by the finding-1 test — a merge never happens because the
  *  fixtures are all held/parked (empty `toMerge`), so the cascade is a no-op and nothing touches the real tree. */
-function runDrainLive(fixture, args) {
+function runDrainLive(fixture, args, extraEnv = {}) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
   const logPath = join(workDir, `comments-${fixture._id}.log`);
   writeFileSync(fxPath, JSON.stringify(fixture));
   writeFileSync(logPath, '');
   const stdout = execFileSync('node', [SCRIPT, ...args, '--no-drain-lease', '--this-repo', '--json'], {
     cwd: workDir,
-    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -214,13 +234,13 @@ describe('the real drain entrypoint consults the gate before merging', () => {
           labels: [{ name: 'ready-to-merge' }, { name: 'review:human' }], _commits: AI_COMMIT, _files: [{ path: 'backlog/y.md', additions: 2, deletions: 0 }] },
       ],
     };
-    const r = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    const r = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels'], BROAD_HUMAN_SURFACES_ENV);
 
     // the clean leaf PR is landable — the entrypoint would merge it
     expect(nums(r.toMerge)).toContain(101);
 
-    // the gate-self PR must be PARKED as human-required, and must NOT be in the merge set — the core proof
-    // that the REAL entrypoint refuses to auto-merge an edit to its own gate
+    // under the broad surface set the gate-self PR must be PARKED as human-required, and must NOT be in the merge
+    // set — the proof that the REAL entrypoint refuses to auto-merge an edit to its own gate
     expect(nums(r.toMerge)).not.toContain(102);
     expect(nums(r.merged)).not.toContain(102);
     const p102 = r.parked.find((p) => Number(p.num) === 102);
@@ -239,6 +259,12 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     const p103 = r.parked.find((p) => Number(p.num) === 103);
     expect(p103).toBeTruthy();
     expect(p103.humanRequired).toBe(true);
+
+    // Under the narrow default (no opt-in) the gate-self edit still never lands — it parks for AI care, not a human.
+    const narrow = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    expect(nums(narrow.toMerge)).not.toContain(102);
+    expect(nums(narrow.merged)).not.toContain(102);
+    expect(narrow.parked.find((p) => Number(p.num) === 102)?.humanRequired).toBe(false);
   });
 
   // #2502 — the tip commit's head SHA, threaded onto every emitted result-bucket entry (not just `toMerge`),
@@ -631,7 +657,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
           labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], ...stale },
       ],
     };
-    const { result, comments } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    const { result, comments } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels'], BROAD_HUMAN_SURFACES_ENV);
 
     // Both are held and re-parked HUMAN — the notice changes no merge decision (#2285 INVARIANT 2 intact).
     expect(nums(result.toMerge)).toEqual([]);

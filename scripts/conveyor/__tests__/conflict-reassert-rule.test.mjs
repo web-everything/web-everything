@@ -133,13 +133,34 @@ describe('PR #4481 captured conflict replay', () => {
     expect(results[0].routedTo).toMatch(/cap-exhausted/);
   });
   it('keeps a live watcher stand-down on the statute recheck path', () => {
-    const { results, findings } = replay({ listPrComments: () => [...fixture.comments, {
+    const { results, findings } = replay({ sameLineConflict: 'stand-down', listPrComments: () => [...fixture.comments, {
       body: `${STAND_DOWN_MARKER}\n\n**Who:** ${WATCHER_STAND_DOWN_ACTOR}`,
       author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(),
     }] });
     expect(results).toHaveLength(1);
     expect(results[0].routedTo).toBe('stand-down (unchanged)');
     expect(results[0].routedTo).not.toMatch(/xkugvzd/);
+    expect(findings).toEqual([]);
+  });
+  it('posts the finding then supersedes a live watcher stand-down with the fixer policy', () => {
+    const calls = [];
+    const { results, findings } = replay({
+      sameLineConflict: 'fixer',
+      listPrComments: () => [...fixture.comments, {
+        body: `${STAND_DOWN_MARKER}\n\n**Who:** ${WATCHER_STAND_DOWN_ACTOR}`,
+        author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(),
+      }],
+      postFinding: (call) => calls.push(['finding', call]),
+      postSupersedeComment: (call) => calls.push(['supersede', call]),
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0].num).toBe(4481);
+    expect(results[0].routedTo).toBe('reconcile-finding (same-line conflict → fixer, marker superseded)');
+    expect(results[0].supersededStandDown).toBe(true);
+    expect(calls).toEqual([
+      ['finding', { pr: fixture.pr, repo: 'web-everything/web-everything', sameLineConflict: true }],
+      ['supersede', { pr: fixture.pr, repo: 'web-everything/web-everything', provider: expect.any(Object), sameLineConflict: true }],
+    ]);
     expect(findings).toEqual([]);
   });
   it("never re-asserts over a fix agent's own judgment stand-down", () => {

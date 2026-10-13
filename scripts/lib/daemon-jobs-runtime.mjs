@@ -52,6 +52,39 @@ export function hostName() {
   return hostname().replace(/[\s:]/g, '-') || 'localhost';
 }
 
+let cachedLocalHostAliases;
+
+/** Names of this machine as sanitized handle parts. Default discovery is cached once per process. */
+export function localHostAliases({ host = hostName(), platform = process.platform, execFn = execFileSync } = {}) {
+  const useCache = arguments[0] === undefined || Object.keys(arguments[0]).length === 0;
+  if (useCache && cachedLocalHostAliases) return cachedLocalHostAliases;
+  const aliases = new Set();
+  const add = (name) => {
+    const sanitized = name.replace(/[\s:]/g, '-');
+    if (sanitized) aliases.add(sanitized);
+  };
+  const addLocal = (name) => {
+    if (!name) return;
+    add(name);
+    add(`${name}.local`);
+  };
+  add(host);
+  addLocal(host.split('.')[0]);
+  if (platform === 'darwin') {
+    for (const key of ['LocalHostName', 'ComputerName']) {
+      try {
+        const name = execFn('scutil', ['--get', key], {
+          timeout: PS_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        if (key === 'LocalHostName') addLocal(name);
+        else add(name);
+      } catch { /* An unavailable macOS name does not prevent probing known local names. */ }
+    }
+  }
+  if (useCache) cachedLocalHostAliases = aliases;
+  return aliases;
+}
+
 /**
  * A process's start time, as `ps -o lstart=` prints it, or `null` when the pid does not exist. Bounded.
  * @param {number} pid
@@ -71,14 +104,18 @@ export function readProcStart(pid, { execFn = execFileSync } = {}) {
 }
 
 /**
- * Handle liveness: `'alive'` only when the pid exists on THIS host with the recorded start time.
+ * Handle liveness: identity is proven by pid + start time. The host check only prevents probing a
+ * different machine's pid here; an old name of THIS machine is still this machine.
+ * `'alive'` only when the local pid exists with the recorded start time.
  * @param {string} handle
  * @returns {'alive'|'dead'|'foreign'}
  */
-export function probeHandle(handle, { host = hostName(), readStart = readProcStart } = {}) {
+export function probeHandle(handle, { host = hostName(), aliases = null, readStart = readProcStart } = {}) {
   const h = parseJobHandle(handle);
   if (!h) return 'dead';
-  if (h.host !== host) return 'foreign';
+  const hostArgGiven = arguments[1]?.host !== undefined;
+  const local = aliases ?? (hostArgGiven ? new Set([host]) : localHostAliases());
+  if (h.host !== host && !local.has(h.host)) return 'foreign';
   const start = readStart(h.pid);
   return start && start === h.procStart ? 'alive' : 'dead';
 }

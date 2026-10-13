@@ -129,6 +129,7 @@ import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER } from './ci-heal-mark.mjs';
+import { ciGreenForEscalation, resolveCiHealVerdictSettings } from './ci-heal-verdict-recheck.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -1887,6 +1888,7 @@ export function planReconcile({
   // `ciHealCap` still wins (source `caller`).
   ciHealBudget = resolveCiHealBudget({ env: globalThis.process?.env ?? {} }),
   ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
+  verdictSettings = resolveCiHealVerdictSettings(),
   codeqlOwnBudget = resolveCodeqlOwnBudget(process.env), // #4453 — a CodeQL hold is charged only CodeQL heals
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
   cardBatchExtract = CARD_BATCH_EXTRACT_WIRED,
@@ -1960,6 +1962,21 @@ export function planReconcile({
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
     const mainFixPriority = isMainFixPriority(prNumber);
+
+    // This note is independent of phase and does not alter this tick's dispatch/refusal decisions.
+    if (verdictSettings.voidNeedsHumanWhenCiGreen
+        && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN'
+        && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
+        && !pr.codeqlFailure
+        && ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })
+        && latestCiHealEscalationForHead(pr.comments, pr.headRefOid, {
+          baseHead: pr.escalationBaseHead ?? null, recheck: verdictSettings.recheckNotCiBreak,
+          voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen,
+        })?.outcome === 'needs-human') {
+      notes.push({ kind: 'ci-heal-escalation-moot', prNumber, headSha: pr.headRefOid, outcome: 'needs-human',
+        text: 'Every required CI check on this head is green; the needs-human escalation is moot.' });
+    }
+
 
     if (missingReviewLabel(pr) === true) notes.push({ kind: 'review-label-missing', prNumber, repo, text: 'open agent PR has no review:* label' });
 
@@ -2626,7 +2643,8 @@ export function planReconcile({
     }
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null,
+        recheck: verdictSettings.recheckNotCiBreak, voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen });
       const healBudget = healBudgetFor(pr);
       const healAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
@@ -2762,7 +2780,8 @@ export function planReconcile({
       // tick plans a fresh heal with no human intervention required. Checked BEFORE the `ci-heal` cap below
       // (and skips it entirely) for the same reason `owed-ci-rerun` is: an escalation is a DIFFERENT, more
       // definitive stop than "one more round against the attempt cap".
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null,
+        recheck: verdictSettings.recheckNotCiBreak, voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen });
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
         // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
@@ -2961,7 +2980,10 @@ export function planReconcile({
     // head (that pause is right), so the fix that CHANGES the head must go out with the blocked findings in its
     // brief. Live 2026-10-06, #4017: three `block` rulings, the pause refused every tick, no push could ever come.
     // Unruled referrals never reach here (`blockRuledReferrals` is empty while any is pending).
-    if (phase === 'needs-human' && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
+    // Live 2026-10-12, #5009: a carried operator block survived on the new head, but verdict write-back was
+    // refused (0 juror findings), leaving the label stuck `review:pending`. The current-head block ruling
+    // owes a fix regardless of which review label landed.
+    if ((phase === 'needs-human' || phase === 'needs-review') && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
       // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
       // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see

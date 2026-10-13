@@ -449,6 +449,8 @@ node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
 
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
+Write the evidence file OUTSIDE the lane (e.g. `"$TMPDIR/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
+
 Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch, BEFORE
 step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the harness
 pushes it to update the existing PR's head — this **updates the PR**, it does not

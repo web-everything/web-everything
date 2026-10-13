@@ -43,7 +43,7 @@ import {
   // xovjhwh — the shared attribution derivation `runBuildDispatchTick` and `dryRun` both call
   deriveDispatchedByBuilder,
   // card 80 + hold visibility
-  planConfigFrom, holdText,
+  planConfigFrom, holdText, buildPriorityLog,
   // card xwn53th — tick-overrun speedups
   CLEAN_VERDICT_MEMO_ENV, BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS, clearPrepareEvidenceCache,
   EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
@@ -59,6 +59,47 @@ import {
 import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-policy.mjs';
 import { createFileRunStore, newRunRecord } from '../../../scripts/operations/run-store.mjs';
 import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
+
+describe('build.priority tick log', () => {
+  const priority = { ids: ['5754', '5762', '5745', '5749', '5757', '5759'], source: 'tool' };
+  const prefix = 'build-dispatch-daemon: build.priority (tool): 6 ids [5754,5762,5745,5749,5757,…]';
+  it('logs the initial list and suppresses an unchanged idle tick', () => {
+    const first = buildPriorityLog(priority, {});
+    expect(first).toEqual({ key: JSON.stringify(priority), line: prefix });
+    expect(buildPriorityLog(priority, {}, first.key).line).toBeNull();
+  });
+  it('logs both launch kinds even when the list has not changed, normalizing numbers', () => {
+    expect(buildPriorityLog(priority, {
+      dispatched: [{ num: '#5754' }, { num: 5762 }], prepare: { launched: [{ num: '#5745' }] },
+    }, JSON.stringify(priority)).line).toBe(`${prefix} · this tick: build #5754, build #5762, prepare #5745`);
+  });
+  it('logs prepare-only and build-only ticks with missing optional result fields', () => {
+    expect(buildPriorityLog(priority, { prepare: { launched: [{ num: '5754' }] } }, JSON.stringify(priority)).line)
+      .toBe(`${prefix} · this tick: prepare #5754`);
+    expect(buildPriorityLog(priority, { dispatched: [{ num: '5754' }] }, JSON.stringify(priority)).line)
+      .toBe(`${prefix} · this tick: build #5754`);
+  });
+  it('logs changes of ids or source and does not truncate short lists', () => {
+    expect(buildPriorityLog({ ids: ['5762'], source: 'env' }, {}, JSON.stringify(priority)).line)
+      .toBe('build-dispatch-daemon: build.priority (env): 1 ids [5762]');
+    expect(buildPriorityLog({ ...priority, source: 'env' }, {}, JSON.stringify(priority)).line)
+      .toContain('build.priority (env)');
+  });
+  it('suppresses empty lists even on launch and remembers the cleared state', () => {
+    const cleared = { ids: [], source: 'env' };
+    expect(buildPriorityLog(cleared, { dispatched: [{ num: 5754 }] }, JSON.stringify(priority)))
+      .toEqual({ key: JSON.stringify(cleared), line: null });
+    expect(buildPriorityLog(priority, {}, JSON.stringify(cleared)).line).toBe(prefix);
+  });
+  it('wires the formatter, conditional stderr emission and key update into live ticks', () => {
+    // live() owns a process lease and heartbeat; pin its adapter without starting the daemon.
+    const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'build-dispatch-daemon.mjs'), 'utf8');
+    const live = source.slice(source.indexOf('async function live(flags) {'));
+    expect(live).toContain('const priorityLog = buildPriorityLog(buildPriority, r, lastBuildPriority);');
+    expect(live).toContain('if (priorityLog.line !== null) console.error(priorityLog.line);');
+    expect(live).toContain('lastBuildPriority = priorityLog.key;');
+  });
+});
 
 // Real git blob IDs keep the module memo faithful across independent fixture readers.
 function prepareGitFixture(cards, prs = []) {
@@ -344,6 +385,9 @@ describe('runBuildDispatchTick', () => {
     // Process A: first tick dispatches #3827; #2662 is held on the hot file within the same tick.
     const a = await runBuildDispatchTick({ live: true, effects: effectsFor({ lockRoot, pid: 1001, dispatches }) });
     expect(a.dispatched.map((d) => d.num)).toEqual(['3827']);
+    const priority = { ids: ['3827'], source: 'tool' };
+    expect(buildPriorityLog(priority, a, JSON.stringify(priority)).line)
+      .toBe('build-dispatch-daemon: build.priority (tool): 1 ids [3827] · this tick: build #3827');
     expect(a.plan.hold).toEqual([expect.objectContaining({ num: '2662', rule: 'hot-file' })]);
     // Restart: a NEW process with EMPTY bookkeeping (the tick core's guards are gone) ticks again.
     const b = await runBuildDispatchTick({ bookkeeping: {}, live: true, effects: effectsFor({ lockRoot, pid: 2002, dispatches }) });
@@ -1620,6 +1664,9 @@ describe('automatic item preparation', () => {
     const result = await runBuildDispatchTick({ live: true, bookkeeping: { tick: 7 }, effects });
     expect(result.dispatched.map(r => r.num)).toEqual(['4503']);
     expect(result.prepare.launched).toHaveLength(2);
+    const priority = { ids: ['4503'], source: 'tool' };
+    expect(buildPriorityLog(priority, result, JSON.stringify(priority)).line)
+      .toBe('build-dispatch-daemon: build.priority (tool): 1 ids [4503] · this tick: build #4503, prepare #4501, prepare #4502');
     expect(effects.planTick).toHaveBeenCalledTimes(1);
     expect(effects.dispatch).toHaveBeenCalledTimes(3);
     for (const [args] of effects.dispatch.mock.calls) {
@@ -2411,20 +2458,23 @@ describe('automatic item preparation', () => {
     expect(effects.dispatch).not.toHaveBeenCalled();
   });
   it('unknown dispatch failure releases its claim, holds across restart and files a prevention card', async () => {
-    const effects = fixture({ fail: true });
-    const path = join(lockRoot, 'failures.json');
-    const fileCard = vi.fn(() => ({ ok: true }));
-    effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard });
-    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
-    effects.listHolds = () => effects.listPrepareFailures().filter(f => f.held).map(f => ({ num: f.num, reason: 'prepare-unstamped' }));
-    const tick = await runBuildDispatchTick({ live: true, effects });
-    expect(tick.prepare.failures).toHaveLength(2);
-    const retry = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
-    expect(retry.prepare.planned).toEqual([]);
-    expect(effects.dispatch).toHaveBeenCalledTimes(2);
-    expect(fileCard).toHaveBeenCalledTimes(1);
-    expect(effects.listPrepareClaims()).toEqual([]);
-    expect(tick.nextBookkeeping.prepareGuards).toEqual([]);
+    vi.stubEnv('WE_PREPARE_RETRY_UNSTAMPED_ONCE', '0');
+    try {
+      const effects = fixture({ fail: true });
+      const path = join(lockRoot, 'failures.json');
+      const fileCard = vi.fn(() => ({ ok: true }));
+      effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard });
+      effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+      effects.listHolds = () => effects.listPrepareFailures().filter(f => f.held).map(f => ({ num: f.num, reason: 'prepare-unstamped' }));
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.failures).toHaveLength(2);
+      const retry = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
+      expect(retry.prepare.planned).toEqual([]);
+      expect(effects.dispatch).toHaveBeenCalledTimes(2);
+      expect(fileCard).toHaveBeenCalledTimes(1);
+      expect(effects.listPrepareClaims()).toEqual([]);
+      expect(tick.nextBookkeeping.prepareGuards).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
   });
   it.each(['lane cap reached', 'not planned this tick', 'frozen', 'kill switch engaged'])('a planner refusal (%s) neither holds nor files a card and retries next tick', async (reason) => {
     const effects = fixture();

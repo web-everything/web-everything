@@ -74,7 +74,7 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAt: iso(age),
       commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
-      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0 }],
+      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const settings = join(dir, 'merge-queue.json');
     writeFileSync(settings, JSON.stringify({
@@ -249,7 +249,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
-      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0 }], ...extra,
+      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }], ...extra,
     });
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify({ local: LOCAL, repos: {

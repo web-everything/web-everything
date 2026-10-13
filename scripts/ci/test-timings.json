@@ -1123,6 +1123,7 @@
   "scripts/conveyor/soak/breaks/stalled-label-freezes-whole-build-queue.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.soak.test.mjs": 72.44,
   "scripts/conveyor/soak/breaks/sticky-smoke-rejection.soak.test.mjs": 320.09,
+  "scripts/conveyor/soak/breaks/superseded-watcher-conflict-retry.soak.test.mjs": 1.0,
   "scripts/conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.soak.test.mjs": 3.93,
   "scripts/conveyor/soak/breaks/too-large-pr-diff-scope-read.soak.test.mjs": 61.08,
   "scripts/conveyor/soak/breaks/unprepared-card-dispatched-as-build.soak.test.mjs": 0.01,

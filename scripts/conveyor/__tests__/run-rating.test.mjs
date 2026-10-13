@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { scrubReasons } from '../../lib/secret-scrub.mjs';
-import { readLegacySources } from '../run-scorecard-store.mjs';
+import { readLegacySources, validateScorecard } from '../run-scorecard-store.mjs';
 import {
   RUBRIC_VERSION, GUARD_BLOCKS_TARGET, BASELINE_WALL_MS_BY_KIND, REFERENCE_STORY_SIZE,
   isSyntheticModel, extractTurns, sessionNameFromLines, computeWallMs, sessionTimeBounds, pairToolEvents,
@@ -1076,6 +1076,28 @@ describe('toScorecardRow — prepared tagging', () => {
     mkdirSync(join(root, 'backlog'), { recursive: true });
     const rating = { kind: 'fix', item: null, sessionName: 's', model: 'm', grade: 'B', guardBlocks: 0, errors: 0, repeatedCalls: 0, testReruns: 0, outcome: 'accepted', rawOutcome: 'accepted', tokens: null, costUsd: null, cacheHitRatio: null, shares: null, dataQuality: 'transcript' };
     expect(toScorecardRow(rating, { repoRoot: root }).prepared).toBe(false);
+  });
+});
+
+describe('toScorecardRow — prepare-pass review measurements', () => {
+  const base = { kind: 'prepare', item: 9020, sessionName: 's', model: 'm', grade: 'A', guardBlocks: 0, errors: 0, repeatedCalls: 0, testReruns: 0, outcome: 'accepted', rawOutcome: 'accepted', tokens: null, costUsd: null, cacheHitRatio: null, shares: null, dataQuality: 'transcript' };
+  it('passes reviewRounds / scopeGrowthCount through as extra fields and the row still validates', () => {
+    const row = toScorecardRow({ ...base, reviewRounds: 2, scopeGrowthCount: 1 }, { preparedForItem: () => true });
+    expect(row).toMatchObject({ reviewRounds: 2, scopeGrowthCount: 1 });
+    expect(validateScorecard(row).ok).toBe(true);
+  });
+  it('drops malformed values (string, object, negative, NaN, fractional) to null instead of storing them', () => {
+    for (const bad of ['2', { n: 2 }, -1, NaN, 1.5, Infinity]) {
+      const row = toScorecardRow({ ...base, reviewRounds: bad, scopeGrowthCount: bad }, { preparedForItem: () => true });
+      expect(row.reviewRounds).toBeNull();
+      expect(row.scopeGrowthCount).toBeNull();
+    }
+    expect(toScorecardRow({ ...base, reviewRounds: 0, scopeGrowthCount: 0 }, { preparedForItem: () => true })).toMatchObject({ reviewRounds: 0, scopeGrowthCount: 0 });
+  });
+  it('defaults both to null (never 0 — "not reported" is not "zero rounds") when absent', () => {
+    const row = toScorecardRow(base, { preparedForItem: () => true });
+    expect(row.reviewRounds).toBeNull();
+    expect(row.scopeGrowthCount).toBeNull();
   });
 });
 

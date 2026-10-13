@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
@@ -2045,7 +2046,19 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       checks.push(...batch);
       if (batch.length < 100) break;
     }
-    const failed = checks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
+    let effectiveChecks = checks;
+    try {
+      const { excuseMergeGateRows, loadMergeGateHoldSetting, readMergeGateVerdict } = await import('../../scripts/lib/merge-gate-hold-class.mjs');
+      const { readSharedFreeze } = await import('../../scripts/lib/red-main-freeze-shared.mjs');
+      // REST numeric ids let the shared classifier select the latest run without normalization.
+      effectiveChecks = (io.excuseMergeGateRows ?? excuseMergeGateRows)(checks, {
+        prNumber: pr.number, headSha: p.head.sha, labels: p.labels,
+        setting: io.mergeGateSetting ?? loadMergeGateHoldSetting(),
+        readVerdict: args => (io.readMergeGateVerdict ?? readMergeGateVerdict)({ ...args, repo }),
+        freeze: () => (io.readFreeze ?? readSharedFreeze)(),
+      }).rows;
+    } catch { /* Unreadable excusal evidence keeps the original check failures. */ }
+    const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
     let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
@@ -2412,6 +2425,17 @@ export function holdText(h) {
   return h ? `held [${h.stage}] ${h.reason}${h.detail ? ` — ${h.detail}` : ''}` : 'not a candidate';
 }
 
+/** PURE: priority visibility for a completed tick; key advances even when the line is suppressed. */
+export function buildPriorityLog(buildPriority, result, previousKey) {
+  const key = JSON.stringify(buildPriority);
+  // Descendants rank by their listed epic, so name actual launches as well as the configured ids.
+  const launches = [...(result.dispatched ?? []).map(d => `build #${normNum(d.num)}`),
+    ...(result.prepare?.launched ?? []).map(p => `prepare #${normNum(p.num)}`)];
+  if (!buildPriority.ids.length || (key === previousKey && !launches.length)) return { key, line: null };
+  const head = buildPriority.ids.slice(0, 5).join(',') + (buildPriority.ids.length > 5 ? ',…' : '');
+  return { key, line: `build-dispatch-daemon: build.priority (${buildPriority.source}): ${buildPriority.ids.length} ids [${head}]${launches.length ? ` · this tick: ${launches.join(', ')}` : ''}` };
+}
+
 async function live(flags) {
   if (flags['self-sync'] !== undefined && flags['self-sync'] !== true) {
     console.error('build-dispatch-daemon: --self-sync takes no value'); process.exit(1);
@@ -2430,7 +2454,9 @@ async function live(flags) {
   const effects = cliEffects();
   const prepareEnabled = !flags['no-prepare'];
   let bookkeeping = {};
+  let lastBuildPriority;
   const rawTickOnce = async () => {
+    const buildPriority = readBuildPrioritySettings();
     const timer = createPhaseTimer();
     // #5322 — start the lane-pool read now (it overlaps the reads below), and read route inputs once per round.
     const round = startPlanningRound();
@@ -2446,6 +2472,9 @@ async function live(flags) {
       effects.listPrepareInFlight = () => prepareRows;
       const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
       bookkeeping = r.nextBookkeeping;
+      const priorityLog = buildPriorityLog(buildPriority, r, lastBuildPriority);
+      if (priorityLog.line !== null) console.error(priorityLog.line);
+      lastBuildPriority = priorityLog.key;
       return r;
     } finally { await round.end(); }
   };
