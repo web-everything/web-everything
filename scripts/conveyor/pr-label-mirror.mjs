@@ -78,6 +78,8 @@ export async function runMirrorReport({ repo = DEFAULT_REPO, store, limit = 200,
 // ---- APPLY MODE (slice K, #5649) -------------------------------------------------------------------------
 
 const GRAPHQL_PAGE = 100;
+/** First line of an error, capped: a hostile or huge message cannot flood a failure entry. */
+const firstLine = (e, max = 200) => firstLine(e).slice(0, max);
 /** At most this many pages (newest first) per PR; past it the PR is `unreadable`, never partially applied. */
 const TIMELINE_MAX_PAGES = 5;
 
@@ -109,7 +111,7 @@ export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TI
     }
     return { status: 'unreadable', reason: 'truncated-timeline' }; // earlier pages remain unread: never "no changes"
   } catch (e) {
-    return { status: 'unreadable', reason: `timeline-read-failed: ${String(e?.message ?? e).split('\n')[0].slice(0, 200)}` };
+    return { status: 'unreadable', reason: `timeline-read-failed: ${firstLine(e)}` };
   }
 }
 
@@ -197,12 +199,12 @@ export async function runMirrorApply({
     if (fresh.status !== 'ok') { fail(`ledger-unreadable: ${fresh.reason}`); continue; }
     let toAppend;
     try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(p), selfLogin: self, events: fresh.rows }); } catch (e) {
-      fail(`bad-label-input-row: ${String(e?.message ?? e).split('\n')[0].slice(0, 200)}`); continue;
+      fail(`bad-label-input-row: ${firstLine(e)}`); continue;
     }
     let ok = true;
     for (const row of toAppend) {
       let res;
-      try { res = await appendRow(row); } catch (e) { res = { ok: false, errors: [String(e?.message ?? e).split('\n')[0]] }; }
+      try { res = await appendRow(row); } catch (e) { res = { ok: false, errors: [firstLine(e)] }; }
       if (!res?.ok) { fail(`append-refused: ${(res?.errors ?? []).join('; ') || 'unknown'}`); ok = false; break; }
       out.writes += 1;
       out.rowsAppended.push({ pr: p.number, label: row.label, change: row.change, sender: row.sender, at: row.at });
@@ -215,7 +217,7 @@ export async function runMirrorApply({
     if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
     if (!again.families.some((f) => f.missing.includes(APPLY_ADD_LABEL))) continue;
     try { await addLabel(repo, p.number, APPLY_ADD_LABEL); out.writes += 1; out.labelsAdded.push({ pr: p.number, label: APPLY_ADD_LABEL }); } catch (e) {
-      fail(`label-add-failed: ${String(e?.message ?? e).split('\n')[0].slice(0, 200)}`);
+      fail(`label-add-failed: ${firstLine(e)}`);
     }
   }
   return out;
@@ -223,12 +225,14 @@ export async function runMirrorApply({
 
 export async function main(argv, { report = runMirrorReport, apply = runMirrorApply, write = (text) => writeAllSync(1, text) } = {}) {
   const flags = Object.fromEntries(argv.filter((a) => a.startsWith('--')).map((a) => { const i = a.indexOf('='); return i < 0 ? [a.slice(2), true] : [a.slice(2, i), a.slice(i + 1)]; }));
+  // Write mode is exactly `--apply`: a value (`--apply=false`, `--apply=0`) is refused, never read as "on".
+  if (flags.apply !== undefined && flags.apply !== true) { process.stderr.write('pr-label-mirror: --apply takes no value\n'); return 2; }
   const repo = typeof flags.repo === 'string' && flags.repo ? flags.repo : DEFAULT_REPO;
   if (!REPO_RE.test(repo)) { process.stderr.write('pr-label-mirror: --repo must be <owner/name>\n'); return 2; }
   const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
   let plan;
   try { plan = await (flags.apply ? apply : report)({ repo, store: flags.store, limit }); } catch (e) {
-    process.stderr.write(`pr-label-mirror: ${String(e?.message ?? e).split('\n')[0]}\n`);
+    process.stderr.write(`pr-label-mirror: ${firstLine(e)}\n`);
     return 2;
   }
   write(flags.json ? `${JSON.stringify({ repo, ...plan }, null, 2)}\n` : `${renderPlan(plan, { repo })}\n`);

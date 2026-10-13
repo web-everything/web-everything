@@ -954,7 +954,7 @@ export function runReviewLabelCli({
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
 } = {}) {
-  // Shadows the module-level `fail` so EVERY refusal inside this function — there are seventeen — goes to the
+  // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
   // module-level one stays for the CLI bootstrap below, which owns fd 1 for real.
   const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };

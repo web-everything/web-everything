@@ -47,7 +47,9 @@ describe('runMirrorReport (fixture dry run)', () => {
 describe('report only', () => {
   it('no write call outside the --apply branch: the report entry point and its helpers hold no label write', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pr-label-mirror.mjs'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
-    const reportPart = src.slice(0, src.indexOf('// ---- APPLY MODE'));
+    const cut = src.indexOf('// ---- APPLY MODE');
+    expect(cut).toBeGreaterThan(0); // the marker this guard slices on must exist
+    const reportPart = src.slice(0, cut);
     for (const bad of ['setLabels', 'ensureLabel', 'createGhProvider', '--add-label', '--remove-label', 'pr edit', 'pr comment', 'writeRun', 'execFileSync', 'addLabel']) {
       expect(reportPart).not.toContain(bad);
     }
@@ -311,5 +313,10 @@ describe('#5649 CLI exit code', () => {
     expect(await main([], { report: async () => ({ mode: 'report', writes: 0, counts: { add: 0, remove: 0 }, changes: [], total: 0, inSync: 0, unreadable: 0 }), apply: async () => { applied = true; return {}; }, write })).toBe(0);
     expect(applied).toBe(false);
     expect(await main(['--apply'], { apply: async () => { throw new Error('boom'); }, write })).toBe(2);
+    for (const bad of ['--apply=false', '--apply=0', '--apply=']) {
+      applied = false;
+      expect(await main([bad], { apply: async () => { applied = true; return {}; }, report: async () => { applied = true; return {}; }, write })).toBe(2);
+      expect(applied).toBe(false);
+    }
   });
 });
