@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import {
+  resolvePreventionBatchSettings, loadPreventionBatchSettings, formatPreventionBatchSettings,
   effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, resolveCardBatchSettings,
 } from '../card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../card-batch-policy.mjs';
@@ -47,9 +48,61 @@ describe('cards.* batch settings cascade', () => {
     expect(settings.invalid).toEqual(['repo.batchFiling', 'repo.batchMaxCards', 'env.batchMaxMinutes']);
   });
 
-  it('the effective policy overlays only the filing kind', () => {
-    const policy = effectiveCardBatchPolicy(resolveCardBatchSettings({ standard, repo: { batchMaxCards: 2, batchFiling: false } }));
+  it('the effective policy preserves standard prevention when explicitly supplied', () => {
+    const policy = effectiveCardBatchPolicy(resolveCardBatchSettings({ standard, repo: { batchMaxCards: 2, batchFiling: false } }),
+      resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention }));
     expect(policy.filing).toEqual({ enabled: false, maxCards: 2, maxAgeMinutes: 60, highPriorityBypass: true });
     expect(policy.prevention).toEqual(loadCardBatchPolicy().prevention);
+  });
+});
+
+
+describe('prevention.* batch settings cascade', () => {
+  const standard = loadCardBatchPolicy().prevention;
+  it('uses standard defaults without optional preferences', () => {
+    const settings = loadPreventionBatchSettings({ env: {}, repo: {}, read: () => { throw new Error('missing'); } });
+    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10,
+      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard' }, invalid: [] });
+  });
+  it.each(['platform', 'repo', 'env'])('%s wins for each key', (layer) => {
+    const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3 } };
+    if (layer !== 'platform') layers.repo = { batchFiling: true, batchWindowMinutes: 40, batchMaxCards: 4 };
+    if (layer === 'env') layers.env = { WE_PREVENTION_BATCH_FILING: 'false', WE_PREVENTION_BATCH_WINDOW_MINUTES: '50', WE_PREVENTION_BATCH_MAX_CARDS: '5' };
+    const settings = resolvePreventionBatchSettings(layers);
+    const n = { platform: 3, repo: 4, env: 5 }[layer];
+    expect(settings).toMatchObject({ batchFiling: layer === 'repo', batchWindowMinutes: n * 10, batchMaxCards: n,
+      sources: { batchFiling: layer, batchWindowMinutes: layer, batchMaxCards: layer } });
+  });
+  it.each([['0', false], ['1', true], ['true', true], ['false', false]])('parses boolean env %s', (raw, value) => {
+    expect(resolvePreventionBatchSettings({ standard, env: { WE_PREVENTION_BATCH_FILING: raw } })).toMatchObject({
+      batchFiling: value, sources: { batchFiling: 'env' } });
+  });
+  it('ignores and reports invalid values at every layer', () => {
+    const settings = resolvePreventionBatchSettings({ standard,
+      platform: { batchFiling: 'yes', batchWindowMinutes: 0, batchMaxCards: 3 },
+      repo: { batchWindowMinutes: 30, batchMaxCards: -1 },
+      env: { WE_PREVENTION_BATCH_FILING: 'yes', WE_PREVENTION_BATCH_WINDOW_MINUTES: '1.5', WE_PREVENTION_BATCH_MAX_CARDS: '0' } });
+    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 30, batchMaxCards: 3 });
+    expect(settings.invalid).toEqual(['platform.batchFiling', 'platform.batchWindowMinutes', 'repo.batchMaxCards',
+      'env.batchFiling', 'env.batchWindowMinutes', 'env.batchMaxCards']);
+    expect(formatPreventionBatchSettings(settings)).toContain('ignored invalid: platform.batchFiling');
+  });
+  it('reads the platform prevention block', () => {
+    expect(loadPreventionBatchSettings({ env: {}, repo: {}, read: () => JSON.stringify({ prevention: { batchWindowMinutes: 25 } }) }))
+      .toMatchObject({ batchWindowMinutes: 25, sources: { batchWindowMinutes: 'platform' } });
+  });
+  it('ships the operator window in declared repo settings and logs the sources', () => {
+    const settings = loadPreventionBatchSettings({ env: {}, read: () => '{}' });
+    expect(settings).toMatchObject({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 10,
+      sources: { batchFiling: 'repo', batchWindowMinutes: 'repo', batchMaxCards: 'repo' } });
+    expect(formatPreventionBatchSettings(settings)).toBe('prevention-batch settings: prevention.batchFiling=true (repo), prevention.batchWindowMinutes=60 (repo), prevention.batchMaxCards=10 (repo)');
+    expect(effectiveCardBatchPolicy().prevention.maxAgeMinutes).toBe(60);
+  });
+  it('overlays prevention independently of filing and retains bypass policy', () => {
+    const filing = resolveCardBatchSettings({ standard: loadCardBatchPolicy().filing });
+    const prevention = resolvePreventionBatchSettings({ standard, repo: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 4 } });
+    const policy = effectiveCardBatchPolicy(filing, prevention);
+    expect(policy.filing).toEqual(loadCardBatchPolicy().filing);
+    expect(policy.prevention).toEqual({ enabled: false, maxAgeMinutes: 30, maxCards: 4, highPriorityBypass: true });
   });
 });

@@ -1145,6 +1145,7 @@
   "scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.soak.test.mjs": 72.44,
   "scripts/conveyor/soak/breaks/sticky-smoke-rejection.soak.test.mjs": 320.09,
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 10.14,
+  "scripts/conveyor/soak/breaks/superseded-watcher-conflict-retry.soak.test.mjs": 1.0,
   "scripts/conveyor/soak/breaks/takeover-void-cancels-later-retry.soak.test.mjs": 0.46,
   "scripts/conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.soak.test.mjs": 3.93,
   "scripts/conveyor/soak/breaks/too-large-pr-diff-scope-read.soak.test.mjs": 61.08,

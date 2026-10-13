@@ -21,17 +21,20 @@
  * writer:
  *   1. `lane-pool.mjs acquire` — a REAL, writable lane clone (never the daemon clone that spawned this).
  *   2. `run.mjs file-item`, IN that lane — writes the card, exactly as the synchronous path used to.
- *   3. `git add` + `git commit` the one new card file, in the lane.
- *   4. `run.mjs verify --mode=run` — the lane's own gate, run for REAL. This process has no foreground-turn
+ *   3. A new card with no lane-local dedupe mentions joins the rolling prevention batch via
+ *      `fileIntoBatch`. Admission skips commit/verify/open-pr here: the existing batch seal job publishes
+ *      the held draft and makes it ready at the count/window limit. Refusal or error falls through.
+ *   4. `git add` + `git commit` the one new card file, in the lane.
+ *   5. `run.mjs verify --mode=run` — the lane's own gate, run for REAL. This process has no foreground-turn
  *      timeout to respect (unlike a dispatched agent's Bash tool) — `we:scripts/verify-lane.mjs`'s
  *      request/poll dance exists ONLY for that constraint, so a detached background process calls the home
  *      directly through `mode=run` and simply waits.
- *   5. `run.mjs open-pr --mode=label-on-green` — opens the PR, waits for the required check, labels it
+ *   6. `run.mjs open-pr --mode=label-on-green` — opens the PR, waits for the required check, labels it
  *      `ready-to-merge` on green. The resident drain daemon lands it; this process never merges.
- *   6. `lane-pool.mjs release` — the lane clone itself is no longer needed once its content is pushed to the
+ *   7. `lane-pool.mjs release` — the lane clone itself is no longer needed once its content is pushed to the
  *      `lane/*` ref (`pr-land`, underneath `open-pr`, publishes HEAD there) — releasing frees the pool slot.
  *
- * EVERY OPERATION CALL (2, 4, 5) RUNS THE ACQUIRED LANE'S OWN `run.mjs`, NEVER THIS SCRIPT'S OWN
+ * EVERY OPERATION CALL (2, 5, 6) RUNS THE ACQUIRED LANE'S OWN `run.mjs`, NEVER THIS SCRIPT'S OWN
  * (codex plan review, 2026-09-28 — a real, live-caught defect in this file's first cut): `file-item`'s IO shell
  * (`scaffold-io.mjs#REPO_ROOT`) and its siblings resolve their own repo root by SCRIPT LOCATION, never by
  * `cwd`. Running THIS script's own `run.mjs` with `cwd: lane` would still have written the card into THIS
@@ -82,6 +85,7 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -359,6 +363,7 @@ export async function landPreventionCard(input, {
   readFile = (p) => readFileSync(p, 'utf8'),
   rmTmp = (dir) => rmSync(dir, { recursive: true, force: true }),
   dedupe = runCardDedupe,
+  batch = fileIntoBatch,
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -460,6 +465,26 @@ export async function landPreventionCard(input, {
       // Every finding is already recorded (on an open PR's card, or verbatim on the card from a retried filing).
       write('land-prevention-card: every finding is already on an open card — nothing to file or land\n');
       return { ok: true, step: 'mentioned', num: null, rel: null, pr: null, url: null, reason: null, mentions: recorded.length };
+    }
+
+    if (rel && mentioned.length === 0) {
+      try {
+        const result = await batch({
+          laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical',
+          idemKey: `prevention:${cardIdOf(rel) ?? num ?? input.session}`,
+          // The batch PR lives where the card lives (web-everything), whatever repo the source PR was in.
+          source: { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
+            note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title },
+        });
+        if (result.batched) {
+          const { batchRef } = result;
+          write(`land-prevention-card: batched ${rel} into ${batchRef}\n`);
+          return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef };
+        }
+        write(`land-prevention-card: not batched — ${result.reason}; opening the card's own PR\n`);
+      } catch (error) {
+        write(`land-prevention-card: batch failed — ${String(error?.message || error).split('\n')[0]}; opening the card's own PR\n`);
+      }
     }
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.map((m) => m.card.rel)].filter(Boolean).join(', ')}…\n`);
