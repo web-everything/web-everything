@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { loadSameLineConflictSetting, resolveSameLineConflictSetting } from '../conflict-watch-same-line.mjs';
 import { watchParkedPrConflicts, buildConflictFindingBody, buildSupersedeStandDownComment, defaultPostConflictFinding, CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { buildStandDownComment, WATCHER_STAND_DOWN_ACTOR } from '../stand-down.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 
 const setting = value => ({ conflictWatch: { sameLineConflict: value } });
 const labels = (...names) => names.map(name => ({ name }));
@@ -51,6 +52,18 @@ describe('same-line conflict setting', () => {
   it('allows a later valid explicit override after a failed layer', () => {
     expect(resolveSameLineConflictSetting({ platform: setting('invalid'), repo: setting('fixer') }))
       .toMatchObject({ value: 'fixer', source: 'repo' });
+  });
+  it.each([null, [], 'stand-down', true, 42])('fails closed on malformed configuration documents (%j)', doc => {
+    for (const source of ['platform', 'repo']) {
+      expect(resolveSameLineConflictSetting({ [source]: doc }))
+        .toMatchObject({ value: 'stand-down', source });
+    }
+  });
+  it.each([[], 'stand-down', true, 42])('fails closed on malformed conflictWatch blocks (%j)', block => {
+    for (const source of ['platform', 'repo']) {
+      expect(resolveSameLineConflictSetting({ [source]: { conflictWatch: block } }))
+        .toMatchObject({ value: 'stand-down', source });
+    }
   });
   it('uses injectable readers and logs the effective setting once', () => {
     const log = vi.fn();
@@ -124,14 +137,33 @@ describe('same-line routing — live #5017 (2026-10-13)', () => {
     expect(h.order).toEqual([]);
     expect(h.options.listPrComments).not.toHaveBeenCalled();
   });
-  it('superseded watcher recovery still permits later idle reassertion', () => {
-    const h = harness({ thread: [watcher()], prLabels: labels('review:changes', CONFLICT_LABEL) });
+  it('recovers a newer watcher marker after an older superseded episode', () => {
+    const h = harness({ thread: [watcher(), supersede(), watcher()],
+      prLabels: labels('review:changes', CONFLICT_LABEL) });
+    expect(h.sweep()[0].supersededStandDown).toBe(true);
+    expect(h.order).toEqual(['finding', 'supersede']);
     h.sweep();
+    expect(h.order).toEqual(['finding', 'supersede']);
+  });
+  it('superseded watcher recovery still permits later idle reassertion', () => {
+    const now = Date.parse('2026-10-13T12:00:00Z');
+    const thread = [watcher()];
+    const h = harness({ thread, now, prLabels: labels('review:changes', CONFLICT_LABEL) });
+    h.postFinding.mockImplementation(() => thread.push({
+      body: buildConflictFindingBody({ num: 5017 }, { sameLineConflict: true }),
+      author: { login: 'web-everything' }, createdAt: new Date(h.options.now).toISOString(),
+    }));
+    h.sweep();
+    thread.push({ body: CONFLICT_FIX_COMMENT_MARKER, author: { login: 'web-everything' },
+      createdAt: new Date(now + 60_000).toISOString() });
+    h.options.now = now + 120_000;
     h.options.listPrs = () => [{ number: 5017, headRefName: 'lane/builder-priority',
       mergeable: 'CONFLICTING', labels: labels('review:pending', CONFLICT_LABEL) }];
     expect(h.sweep()[0].routedTo).toContain('idle conflict-bounce re-asserted');
     expect(h.postFinding).toHaveBeenCalledTimes(2);
     expect(h.postSupersedeComment).toHaveBeenCalledOnce();
+    h.sweep();
+    expect(h.postFinding).toHaveBeenCalledTimes(2);
   });
   it('superseded watcher marker still permits grace-due routing', () => {
     const h = harness({ thread: [watcher(), supersede()],
