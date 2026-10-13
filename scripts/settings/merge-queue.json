@@ -1,5 +1,5 @@
 {
-  "$comment": "mergeQueue.refreshOnUnsatisfiedWorkflows (on|off): when GitHub's merge queue refuses a green PR because required workflows are not satisfied (runs older than the ruleset), the drain refreshes the PR onto main once per head so fresh runs count, then enqueues it. off leaves the PR failing to enqueue. Env override: WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS. mergeQueue.refreshOnStaleMergeGate (on|off, standard on): refresh a ready PR once per head when its only red required check is a head-bound merge-gate HOLD whose holds are now satisfied; enqueue only on a later green pass. Env override: WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE.",
+  "$comment": "mergeQueue.refreshOnUnsatisfiedWorkflows (on|off): when GitHub's merge queue refuses a green PR because required workflows are not satisfied (runs older than the ruleset), the drain refreshes the PR onto main once per head so fresh runs count, then enqueues it. off leaves the PR failing to enqueue. Env override: WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS. mergeQueue.refreshOnStaleMergeGate (on|off, standard on): refresh a ready PR once per head when its only red required check is a head-bound merge-gate HOLD whose holds are now satisfied; enqueue only on a later green pass. Env override: WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE. mergeQueue.enqueueOnEvent {enabled, debounceSeconds} (card 257, standard {false, 15}): when the drain daemon's PR-events feed marks a PR of this repo with a green check suite or an added review:accepted / ready-to-merge label, the daemon runs the drain's single-PR fast drain (merge-ai-prs --only) for it debounceSeconds after the last such event, between passes, instead of waiting for the next full pass. Every drain gate still runs. Resolved via the policy cascade; env override WE_ENQUEUE_ON_EVENT=on|off. See we:scripts/lib/enqueue-on-event.mjs.",
   "mergeDelivery": {
     "strategy": "github-merge-queue",
     "batchSize": 5,
@@ -9,6 +9,7 @@
   "mergeQueue": {
     "refreshOnUnsatisfiedWorkflows": "on",
     "refreshOnStaleMergeGate": "on",
+    "enqueueOnEvent": { "enabled": true, "debounceSeconds": 15 },
     "enabled": true,
     "batchSize": 1,
     "classOrder": ["main-fix", "normal"],

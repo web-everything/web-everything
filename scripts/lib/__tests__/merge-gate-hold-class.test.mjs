@@ -92,7 +92,7 @@ function plan({ setting = 'on', draft = false, testRed = false, readVerdict = ()
     readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), readChecks: () => [row, green],
     readMergeGateVerdict: readVerdict, readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: setting },
     enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
-    ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound'].map(k => [k, identity])),
+    ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound', 'enrichOwedMainRule'].map(k => [k, identity])),
     resolveMainSha: () => null, readPriority: () => null, ...extra });
 }
 describe('reconcile planner and fresh promotion', () => {

@@ -2926,3 +2926,23 @@ describe('human surface settings use their own diff section', () => {
     expect(score.signals.gateSelf).toBeUndefined();
   });
 });
+
+
+describe('pending beside accepted', () => {
+  const facts = { currentLabels: ['review:pending', 'review:accepted'], acceptedSha: '9db3d19825465e7da28c4e179833e2c799bb94e4', headSha: '922a19a18cd6f25f6838b98b79127277247bd5bc', fetchOk: true };
+  it('requires a successful read and a known accept', () => {
+    expect(decideContradictoryVerdictHeal({ ...facts, fetchOk: false })).toEqual({ heal: false, reason: 'fetch-unavailable' });
+    expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: null })).toEqual({ heal: false, reason: 'accept-sha-unknown' });
+  });
+  it('flags a current accept', () => {
+    expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha })).toEqual({ heal: false, reason: 'accept-current' });
+  });
+  it('drops only stale accepted and explains the review owed', () => {
+    const r = decideContradictoryVerdictHeal(facts);
+    expect(r.heal).toBe(true);
+    expect(r.decision).toMatchObject({ allowed: true, addLabel: null, removeLabels: ['review:accepted'], keepsHuman: false });
+    expect(r.comment).toContain(facts.acceptedSha);
+    expect(r.comment).toContain(facts.headSha);
+    expect(r.comment).toContain('review:pending');
+  });
+});

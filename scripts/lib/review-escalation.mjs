@@ -2069,6 +2069,7 @@ export function findContradictoryReviewVerdicts(labels) {
  * `findContradictoryReviewVerdicts` only ever detects the FOUR review:* labels; today the only pair it can
  * find that ALSO has a "genuine clearance" escape is `accepted` + `human` (a `pending`/`changes` co-presence
  * has no clearance concept and is a DIFFERENT, already-handled shape — `planReviewHoldCleanup`'s point (1)).
+ * Exactly pending+accepted heals only with a known accept SHA on an older head; pending stays.
  * Any other pair this ever starts flagging is `unsupported-pair` here — reported, never guessed at.
  *
  * THE SAME PROOF `decideParkToHuman`'s own `keepHumanClearance` needs, computed by the CALLER (this function
@@ -2085,14 +2086,27 @@ export function findContradictoryReviewVerdicts(labels) {
  * built-in proof — it has to fetch and check separately, because the pair being healed could have arrived from
  * ANY of several routes (this exact bug, a manual `gh` edit, an older pre-fix drain pass), not only the one
  * `shouldReparkForTestTampering` already vetted.
- * @param {{currentLabels?: Array, humanClearedSha?: string|null, headSha?: string|null, fetchOk?: boolean}} o
+ * @param {{currentLabels?: Array, humanClearedSha?: string|null, acceptedSha?: string|null, headSha?: string|null, fetchOk?: boolean}} o
  * @returns {{heal: boolean, reason: string, decision?: object, comment?: string}}
  */
 export function decideContradictoryVerdictHeal({
-  currentLabels = [], humanClearedSha = null, headSha = null, fetchOk = false,
+  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false,
 } = {}) {
   const contradiction = findContradictoryReviewVerdicts(currentLabels);
   if (!contradiction.length) return { heal: false, reason: 'no-contradiction' };
+  if (contradiction.length === 2 && contradiction.includes(REVIEW_LABELS.pending) && contradiction.includes(REVIEW_LABELS.accepted)) {
+    if (!fetchOk || !headSha) return { heal: false, reason: 'fetch-unavailable' };
+    if (!acceptedSha) return { heal: false, reason: 'accept-sha-unknown' };
+    const accepted = acceptedSha.toLowerCase();
+    const head = headSha.toLowerCase();
+    if (accepted.startsWith(head) || head.startsWith(accepted)) return { heal: false, reason: 'accept-current' };
+    return {
+      heal: true, reason: 'stale-accept',
+      decision: { allowed: true, addLabel: null, removeLabels: [REVIEW_LABELS.accepted], keepsHuman: false,
+        reason: `stale review:accepted (reviewed ${acceptedSha.slice(0, 7)}, head ${headSha.slice(0, 7)}) dropped; review:pending stands — a review of the new head is owed` },
+      comment: buildStaleAcceptHealComment({ acceptedSha, headSha }),
+    };
+  }
   if (!contradiction.includes(REVIEW_LABELS.accepted) || !contradiction.includes(REVIEW_LABELS.human)) {
     return { heal: false, reason: 'unsupported-pair' };
   }
@@ -3071,4 +3085,14 @@ export function decideReviewGate({
   // (x30jq9n): landing unreviewed code on a clock is never the right failure mode; a stuck park is handled by
   // the operator, not by the drain.
   return { action: 'park', reason: 'escalated — awaiting an independent review (review:pending)', applyLabel: REVIEW_LABELS.pending, humanRequired: false };
+}
+
+/** Durable evidence for removing an older-head accept beside pending. Pure. */
+export function buildStaleAcceptHealComment({ acceptedSha, headSha }) {
+  return [
+    '**`review:accepted` removed — stale acceptance beside `review:pending`.**',
+    '',
+    `The recorded acceptance reviewed head \`${acceptedSha}\`; the live head is \`${headSha}\`.`,
+    '`review:pending` stands — a review of the new head is owed.',
+  ].join('\n');
 }

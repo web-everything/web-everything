@@ -56,7 +56,7 @@ export default {
       readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }),
       mergeGateSetting: { value: 'on', source: 'soak' },
       enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
-      ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound'].map(k => [k, identity])),
+      ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound', 'enrichOwedMainRule'].map(k => [k, identity])),
       resolveMainSha: () => null, readPriority: () => null, now: Date.parse('2026-10-12T13:00:00Z'),
     });
     const dispatched = (number, kind) => plan.dispatch.some(d => d.prNumber === number && d.kind === kind);

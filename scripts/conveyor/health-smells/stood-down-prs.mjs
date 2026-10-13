@@ -16,7 +16,11 @@ const hasLabel = (pr, name) => (pr?.labels || []).some((l) => (typeof l === 'str
 
 /** PURE: `{standDownAt, reason}` for a stood-down PR, or null when it is not stood down. */
 export function standDownOf(pr) {
-  const matches = standDownComments(pr?.comments);
+  const matches = standDownComments(pr?.comments, { headRefOid: pr?.headRefOid });
+  const raw = standDownComments(Array.isArray(pr?.comments)
+    ? pr.comments.map((c) => c?.standDownLapsed ? { ...c, standDownLapsed: undefined } : c) : []);
+  // All recorded holds lapsed; the remaining label is stale.
+  if (!matches.length && raw.length) return null;
   if (!matches.length && !hasLabel(pr, STAND_DOWN_LABEL)) return null;
   const latest = matches.map((c) => ({ ...c, t: Date.parse(c.createdAt) || 0 })).sort((a, b) => b.t - a.t)[0];
   return { standDownAt: latest?.t || null, reason: latest ? standDownReason(latest.body) : null };

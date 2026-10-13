@@ -1,0 +1,4 @@
+{
+  "$comment": "Head-bound stand-downs lapse on a new push; off preserves them until an operator answer. WE_STAND_DOWN_LAPSE_ON_NEW_HEAD overrides this setting.",
+  "standDown": { "lapseOnNewHead": "on" }
+}

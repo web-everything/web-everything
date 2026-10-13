@@ -105,6 +105,7 @@ export const SMOKE_BUDGET_ENV = Object.freeze({
   laneReleaseMs: 'WE_SMOKE_LANE_RELEASE_MS',
   ghApiMs: 'WE_SMOKE_GH_API_MS',
   ghPrListMs: 'WE_SMOKE_GH_PR_LIST_MS',
+  ghEnvProbeMs: 'WE_SMOKE_GH_ENV_PROBE_MS',
   reconcileMs: 'WE_SMOKE_RECONCILE_MS',
   // #3383 Module D — how long the smoke's own `lane-pool.mjs acquire` may WAIT (`--wait-ms=`) for a busy pool
   // to free a lane, instead of failing instantly on a momentary flicker. See `checkLaneAcquireRelease`.
@@ -195,6 +196,7 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     laneReleaseMs: envMs(env, SMOKE_BUDGET_ENV.laneReleaseMs, resolveChildTimeoutMs(env)),
     ghApiMs: envMs(env, SMOKE_BUDGET_ENV.ghApiMs, 30_000),
     ghPrListMs: envMs(env, SMOKE_BUDGET_ENV.ghPrListMs, 30_000),
+    ghEnvProbeMs: envMs(env, SMOKE_BUDGET_ENV.ghEnvProbeMs, 60_000),
     // Live 2026-10-04: the dispatch dry-run's three LIVE passes took ~90s on a quiet host (load ~10), all of it
     // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
     // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
@@ -832,12 +834,41 @@ export async function runLiveSmoke({
       });
       continue;
     }
+    const childFailures = [];
+    let childCalls = 0;
+    let bootOutputsOk = true;
+    const trackedRunChild = async (cmd, args, opts) => {
+      childCalls++;
+      const start = clock();
+      const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
+      try {
+        const out = await runChild(cmd, args, opts);
+        if (check.name === 'daemon-entries-boot') {
+          try { bootOutputsOk &&= !!JSON.parse(out)?.ok; } catch { bootOutputsOk = false; }
+        }
+        return out;
+      }
+      catch (e) {
+        childFailures.push({ ok: false, ms: clock() - start, mayBeTransient: check.mayBeTransient !== false,
+          detail: `child failed: ${firstLine(e)}`,
+          budgetSkipped: outOfBudget && /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(firstLine(e)) });
+        throw e;
+      }
+    };
     try {
-      result = await check.run(ctx);
+      result = await check.run({ ...ctx, runChild: trackedRunChild });
     } catch (e) {
       result = { ok: false, detail: `threw: ${firstLine(e)}` };
     }
-    results.push({ name: check.name, ms: clock() - startedAt, ...result, mayBeTransient: check.mayBeTransient !== false });
+    // Reconcile aggregates child failures only; other checks can parse a successful child's output into a
+    // code failure. Never hide that output just because a later child was refused by the budget wrapper.
+    const budgetInterrupted = !result.ok && childFailures.some((r) => r.budgetSkipped)
+      && (check.name === 'reconcile-dry-run' || childFailures.length === childCalls
+        || (check.name === 'daemon-entries-boot' && bootOutputsOk))
+      && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
+        || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
+    results.push({ name: check.name, ms: clock() - startedAt, ...result,
+      ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
   }
   return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
     ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
@@ -845,19 +876,35 @@ export async function runLiveSmoke({
 
 // ── Transient vs. code classification (Module D) — see the file header for the full rationale. ──
 
+/** Network errors shared by transient rows and the gate-owned GitHub availability probe. */
+const NETWORK_FAILURE_PATTERNS = Object.freeze([
+  /ETIMEDOUT/i,
+  /ECONNRESET/i,
+  /ENOTFOUND/i,
+  /EAI_AGAIN/i,
+  // `gh` is a Go binary: its network failures read like Go's net/http errors, never Node's `E*` codes above
+  // (live 2026-09-25 08:14 ET: both gh checks failed together and were rejected as `code`, freezing the clone).
+  /could not resolve host/i,
+  /error connecting to api\.github\.com/i,
+  /i\/o timeout/i,
+  /connection reset by peer/i,
+  /broken pipe/i,
+  /TLS handshake timeout/i,
+  /no such host/i,
+  /connection refused/i,
+  /dial tcp/i,
+]);
+
 /** Env/infra fault signatures a failed check's `detail` is matched against — see {@link classifySmokeFailure}.
  *  Frozen and exported so a caller/test can see exactly what counts as "environment noise, not code" without
  *  re-deriving it. Kept as one pattern per alternative (rather than one combined regex) so a single culprit
  *  substring is easy to spot/extend without fighting regex precedence. */
 export const TRANSIENT_FAILURE_PATTERNS = Object.freeze([
+  ...NETWORK_FAILURE_PATTERNS,
   /\b401\b/i,
   /Bad credentials/i,
   /HTTP 5\d\d/i,
   /rate limit/i,
-  /ETIMEDOUT/i,
-  /ECONNRESET/i,
-  /ENOTFOUND/i,
-  /EAI_AGAIN/i,
   // `bounded-child.mjs#runBounded`'s OWN hard-timeout rejection: the WHOLE detail must be `<check prefix> failed:
   // timed out after Nms (process group killed)`, anchored at both ends (no check prefix contains a `:`).
   // NOT a bare /timeout|timed out/: those match ordinary code-failure text ("timed out waiting for #submit",
@@ -867,17 +914,6 @@ export const TRANSIENT_FAILURE_PATTERNS = Object.freeze([
   /no free lane/i, // lane-pool.mjs#cmdAcquire's exhausted-pool message, e.g. `no free lane in pool "we" (12 all held/dirty) — release one or \`provision\` more`
   /all lanes (are )?busy/i,
   /pool (is )?(full|exhausted)/i,
-  /could not resolve host/i,
-  // `gh` is a Go binary: its network failures read like Go's net/http errors, never Node's `E*` codes above
-  // (live 2026-09-25 08:14 ET: both gh checks failed together and were rejected as `code`, freezing the clone).
-  /error connecting to api\.github\.com/i,
-  /i\/o timeout/i,
-  /connection reset by peer/i,
-  /broken pipe/i,
-  /TLS handshake timeout/i,
-  /no such host/i,
-  /connection refused/i,
-  /dial tcp/i,
   /HTTP 429/i,
   /HTTP 403: .*rate limit/i,
 ]);
@@ -923,10 +959,10 @@ export const SMOKE_RETRY_BACKOFF_MS_ENV = 'WE_DAEMON_SMOKE_RETRY_BACKOFF_MS';
 const defaultSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 /**
- * Run {@link runLiveSmoke} and, on a `'transient'` verdict ONLY (see {@link classifySmokeFailure}), retry the
+ * Run {@link runLiveSmoke} and, on a `'transient'` verdict (see {@link classifySmokeFailure}), retry the
  * WHOLE smoke (never just the failed check — the checks share live state like a lane lease) up to `retries`
- * more times, sleeping `backoffMs` between attempts. A `'code'` verdict never retries — it is a real finding,
- * not noise. The kill switch is checked up front and short-circuits identically to {@link runLiveSmoke}'s own
+ * more times, sleeping `backoffMs` between attempts. Code verdicts retry only through the independently
+ * evidenced environment paths below. The kill switch is checked up front and short-circuits identically to {@link runLiveSmoke}'s own
  * kill-switch path, without spending an attempt.
  *
  * GITHUB AUTH (see {@link refreshSmokeGithubEnv} / {@link probeGithubAuth}): every attempt first gets a FRESH
@@ -935,12 +971,15 @@ const defaultSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms);
  * force a re-mint and retry once (no sleep); still 401 → verdict `'auth-broken'` (never `'code'`), which the
  * rebuild raises as a `github-auth-broken` alert and holds on, without a reject record.
  * @param {{root:string, env?:NodeJS.ProcessEnv, runChild?:typeof runBounded, sleep?:(ms:number)=>Promise<void>,
- *   retries?:number, backoffMs?:number, refreshAuth?:typeof refreshSmokeGithubEnv}} o
+ *   retries?:number, backoffMs?:number, refreshAuth?:typeof refreshSmokeGithubEnv, log?:Console}} o
  *
  * ENVIRONMENT TIMEOUT (see {@link isEnvTimeoutFailureSet}): a `'code'` verdict whose failures are all "ran out of
  * time" (measured by the gate's own `clock`) is retried ONCE with every budget widened
  * ({@link widenSmokeBudgetsEnv}); still timing out → `'env-timeout'` with `envTimeout` (rows, load average).
- * @returns {Promise<{verdict:'pass'|'transient'|'code'|'auth-broken'|'env-timeout', attempts?:number, smoke?:object,
+ * GITHUB API (live 2026-10-12 13:10 ET): candidate read failures get a gate-owned bulk-read probe and
+ * up to `retries` separate exponential retries within the outer deadline. Confirmed unavailability holds
+ * last-good as `env-unavailable`; a passing attempt still passes, and unrelated code rows still reject.
+ * @returns {Promise<{verdict:'pass'|'transient'|'code'|'auth-broken'|'env-timeout'|'env-unavailable', attempts?:number, smoke?:object,
  *   disabled?:boolean, auth?:{probe:string, refresh:string|null, retried:boolean}}>}
  */
 export async function runLiveSmokeWithRetry({
@@ -951,6 +990,7 @@ export async function runLiveSmokeWithRetry({
   refreshAuth = refreshSmokeGithubEnv,
   clock = Date.now,
   loadAvg = () => loadavg(),
+  log = console,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { verdict: 'pass', disabled: true };
   let smoke;
@@ -961,6 +1001,9 @@ export async function runLiveSmokeWithRetry({
   let auth = null;
   let attemptEnv = env; // widened once, for the env-timeout retry below
   let envTimeout = null;
+  let githubEnv = null;
+  let githubRetries = 0;
+  const githubPolicy = resolveSmokeGithubEnvProbe(env);
   const minElapsedMs = envMs(env, SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV, DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS);
   for (;;) {
     attempts += 1;
@@ -969,6 +1012,15 @@ export async function runLiveSmokeWithRetry({
     forceRefresh = false;
     smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, clock });
     verdict = classifySmokeFailure(smoke.results);
+    // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
+    // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
+    // Still reject any independent code row, and never promote skips without prior probe confirmation.
+    if (githubEnv?.confirmed && smoke.results.some((r) => !r.ok && r.budgetInterrupted)
+      && smoke.results.filter((r) => !r.ok).every((r) => r.budgetInterrupted || isGithubReadFailureRow(r)
+        || isEnvTimeoutRow(r, { minElapsedMs }) || (r.mayBeTransient !== false && isTransientDetail(r.detail)))) {
+      verdict = 'env-unavailable';
+      break;
+    }
     // ENVIRONMENT TIMEOUT (live 2026-09-26 22:37Z) — see {@link isEnvTimeoutFailureSet}. Retry ONCE with every
     // budget widened; still timing out → `'env-timeout'` (held, never a reject record, never an overlay suspect).
     if (verdict === 'code' && isEnvTimeoutFailureSet(smoke.results, { minElapsedMs })) {
@@ -999,10 +1051,42 @@ export async function runLiveSmokeWithRetry({
       }
       // The probe authenticated fine with the same env — the tree's own 401 is its own; classify as usual.
     }
-    if (verdict !== 'transient' || attempts > retries + (authRetried ? 1 : 0) + (envTimeout ? 1 : 0)) break;
+    // Live 2026-10-12 13:10 ET: a bulk GitHub read failed while dispatch exhausted its cap. Tree text
+    // only invites this gate-owned probe; it can NEVER confirm an outage by itself (NO LAUNDERING).
+    if (githubPolicy.enabled && (verdict === 'code' || verdict === 'transient')
+      && isGithubEnvCandidateSet(smoke.results, { minElapsedMs })) {
+      const budgets = resolveSmokeBudgets(env);
+      const probe = await probeGithubApiAvailability({ env: runEnv, runChild, budgets,
+        repos: Object.values(CONSTELLATION_REPOS).map((r) => r.slug) });
+      githubEnv ??= { confirmed: false, attempts: [] };
+      if (probe.unavailable) githubEnv.confirmed = true;
+      const failed = smoke.results.filter((r) => !r.ok).map((r) => r.name);
+      githubEnv.attempts.push({ attempt: attempts,
+        probe: { unavailable: probe.unavailable, ok: probe.ok, detail: probe.detail }, failed });
+      const backoff = backoffMs * 2 ** githubRetries;
+      const canRetry = githubRetries < retries
+        && !(typeof runChild.deadline === 'number' && runChild.deadline - clock() < backoff + budgets.reconcileMs);
+      const action = canRetry ? 'retry' : githubEnv.confirmed ? 'hold-env-unavailable' : 'classify-as-usual';
+      try {
+        if (log !== console || !process.env.VITEST) log.error?.(`daemon-live-smoke: smoke-env-github ${JSON.stringify({
+          attempt: attempts, probe: probe.unavailable ? 'unavailable' : probe.ok ? 'ok' : 'error',
+          failed: failed.join(','), action, backoffMs: canRetry ? backoff : 0, policySource: githubPolicy.source,
+        })}`);
+      } catch { /* logging never changes the smoke */ }
+      if (canRetry) {
+        githubRetries += 1;
+        await sleep(backoff);
+        continue;
+      }
+      if (githubEnv.confirmed) {
+        verdict = 'env-unavailable';
+        break;
+      }
+    }
+    if (verdict !== 'transient' || attempts > retries + (authRetried ? 1 : 0) + (envTimeout ? 1 : 0) + githubRetries) break;
     await sleep(backoffMs);
   }
-  return { verdict, attempts, smoke, ...(auth ? { auth } : {}), ...(envTimeout ? { envTimeout } : {}) };
+  return { verdict, attempts, smoke, ...(auth ? { auth } : {}), ...(envTimeout ? { envTimeout } : {}), ...(githubEnv ? { githubEnv } : {}) };
 }
 
 // ── Timed out under load is ENVIRONMENT, never code (live 2026-09-26 22:36-22:37Z, `wev-review-daemon`) ─────
@@ -1159,6 +1243,83 @@ export async function probeGithubAuth({ env, runChild = runBounded, budgets = re
   }
 }
 
+/**
+ * Live 2026-10-12 13:10 ET: GitHub 502/504s made reconcile's bulk read fail and dispatch time out;
+ * the drain smoke rejected healthy code and blamed overlays. These forgeable tree signatures ONLY decide
+ * whether to probe. Only the external probe's own error can establish environment unavailability.
+ */
+export const GITHUB_READ_FAILURE_SIGNATURES = Object.freeze([
+  /could not read state/,
+  /Command failed: gh /,
+  /HTTP 5\d\d/i,
+  /Bad Gateway|Gateway Time-?out|Service Unavailable/i,
+  /rate limit/i,
+  /HTTP 429/i,
+  /Something went wrong while executing your query/i,
+]);
+
+/** PURE: does this failed row invite an independent GitHub read probe? Never a verdict. */
+export function isGithubReadFailureRow(row) {
+  return !!row && !row.ok && GITHUB_READ_FAILURE_SIGNATURES.some((re) => re.test(String(row.detail ?? '')));
+}
+
+/** PURE: a GitHub read plus only measured timeouts / eligible transient noise; one code row refuses probing. */
+export function isGithubEnvCandidateSet(results, opts = {}) {
+  const failures = (Array.isArray(results) ? results : []).filter((r) => !r.ok);
+  return failures.some(isGithubReadFailureRow) && failures.every((r) => isGithubReadFailureRow(r)
+    || isEnvTimeoutRow(r, opts) || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
+}
+
+/** Mirrors the bulk read reconcile made in the 2026-10-12 incident: ask GitHub the same kind of question. */
+export const GITHUB_PROBE_PR_LIST_FIELDS = 'number,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files';
+const GITHUB_API_UNAVAILABLE_PATTERNS = Object.freeze([
+  /timed out after \d+ms \(process group killed\)/,
+  /HTTP 5\d\d/i,
+  /Bad Gateway|Gateway Time-?out|Service Unavailable/i,
+  /Something went wrong while executing your query/i,
+  /rate limit/i,
+  /HTTP 429/i,
+  ...NETWORK_FAILURE_PATTERNS,
+]);
+
+/** Policy `smokeGithubEnvProbe`: env `WE_SMOKE_GH_ENV_PROBE` 0|1 over standard `{enabled:true}`.
+ *  @returns {{enabled:boolean, source:string}} */
+export function resolveSmokeGithubEnvProbe(env = process.env) {
+  try {
+    const v = env?.WE_SMOKE_GH_ENV_PROBE;
+    const r = cascadePolicy('smokeGithubEnvProbe', undefined, {
+      env, standard: { enabled: true },
+      envValues: { enabled: v === '0' ? false : v === '1' ? true : undefined },
+      valid: { enabled: (x) => typeof x === 'boolean' },
+    });
+    return { enabled: r.value?.enabled !== false, source: r.sources?.enabled ?? 'standard' };
+  } catch { return { enabled: true, source: 'standard' }; }
+}
+
+/**
+ * Gate-owned external evidence (live 2026-10-12 13:10 ET), with the SAME env the smoke used. Slugs come
+ * from the gate's constellation, never tree row text. Auth rejection belongs to the auth path. Never throws.
+ * @returns {Promise<{unavailable:boolean, ok:boolean, detail:string, repos:Array<{repo:string, ok:boolean, unavailable:boolean, detail:string}>}>}
+ */
+export async function probeGithubApiAvailability({ env, runChild = runBounded, budgets = resolveSmokeBudgets(env),
+  repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug) }) {
+  const results = [];
+  for (const repo of repos) {
+    try {
+      await runChild('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--repo', repo,
+        '--json', GITHUB_PROBE_PR_LIST_FIELDS], { env, timeoutMs: budgets.ghEnvProbeMs });
+      results.push({ repo, ok: true, unavailable: false, detail: `gh pr list --repo ${repo} ok with the smoke env` });
+    } catch (e) {
+      const text = `${String(e?.message ?? e)}\n${String(e?.stderr ?? '')}`;
+      const unavailable = !/\b401\b|Bad credentials/i.test(text)
+        && GITHUB_API_UNAVAILABLE_PATTERNS.some((re) => re.test(text));
+      results.push({ repo, ok: false, unavailable, detail: `gh pr list --repo ${repo} failed with the smoke env: ${text.trim().replace(/\s+/g, ' ')}` });
+    }
+  }
+  return { unavailable: results.some((r) => r.unavailable), ok: results.length > 0 && results.every((r) => r.ok),
+    detail: results.map((r) => r.detail).join('; '), repos: results };
+}
+
 // ── Reject-cache: remember the last merged sha the gate rejected, so a daemon never re-runs the (real,
 // live-touching) smoke against the SAME known-bad `origin/main` every single tick until it actually moves. ──
 
@@ -1241,7 +1402,7 @@ export function rollbackToSha({ root, sha, run = gitRun }) {
  * @param {{root:string, preMergeSha:string|null, mergedIdentitySha?:string|null, env?:NodeJS.ProcessEnv,
  *   runChild?:typeof runBounded, run?:typeof gitRun, log?:Console}} o
  * @returns {Promise<{adopt:boolean, reason:'kill-switch-disabled'|'still-rejected'|'smoke-pass'|
- *   'smoke-transient'|'github-auth-broken'|'smoke-env-timeout'|'smoke-fail', smoke?:object, rollback?:object, quarantine?:true}>}
+ *   'smoke-transient'|'github-auth-broken'|'smoke-env-timeout'|'smoke-env-unavailable'|'smoke-fail', smoke?:object, rollback?:object, quarantine?:true}>}
  */
 export async function gateMergedCommit({
   root, preMergeSha, mergedIdentitySha = null, env = process.env, runChild = runBounded, run = gitRun, log = console,
@@ -1259,13 +1420,13 @@ export async function gateMergedCommit({
   }
 
   // #3383 Module D — retry-on-transient (classifySmokeFailure) wraps the single runLiveSmoke call below.
-  const { verdict, smoke, disabled } = await runLiveSmokeWithRetry({ root, env, runChild });
+  const { verdict, smoke, disabled } = await runLiveSmokeWithRetry({ root, env, runChild, log });
   if (verdict === 'pass') {
     if (mergedIdentitySha) clearRejectedSha(root, env);
     return { adopt: true, reason: disabled ? 'kill-switch-disabled' : 'smoke-pass', smoke };
   }
 
-  if (verdict === 'transient' || verdict === 'auth-broken' || verdict === 'env-timeout') {
+  if (verdict === 'transient' || verdict === 'auth-broken' || verdict === 'env-timeout' || verdict === 'env-unavailable') {
     // 'auth-broken': GitHub rejected the environment's credential even after a forced re-mint — an
     // environment fault, handled exactly like transient noise below (never a reject record).
     // Env/infra noise (a 401, a busy lane pool, a network blip) survived every retry — roll back so the
@@ -1277,7 +1438,7 @@ export async function gateMergedCommit({
       `daemon-live-smoke: TRANSIENT live smoke failure (env/infra noise, not recording a rejection — #3383 Module D) `
       + `after retry; ${rollback.ok ? `rolled back to ${preMergeSha}` : `ROLLBACK FAILED (${rollback.reason}) — clone may be left mid-move, needs a hand \`git reset --hard ${preMergeSha}\``}`,
     );
-    const reason = { 'auth-broken': 'github-auth-broken', 'env-timeout': 'smoke-env-timeout' }[verdict] ?? 'smoke-transient';
+    const reason = { 'auth-broken': 'github-auth-broken', 'env-timeout': 'smoke-env-timeout', 'env-unavailable': 'smoke-env-unavailable' }[verdict] ?? 'smoke-transient';
     const result = { adopt: false, reason, smoke, rollback };
     if (!rollback.ok) result.quarantine = true;
     return result;

@@ -10,7 +10,7 @@ vi.mock('../../conveyor/health-watch-section.mjs', () => ({ healthSectionLines: 
 const queue = await import('../operator-queue.mjs');
 const { readSettings } = await import('../../lib/settings-files.mjs');
 const { buildOperatorAnswer } = await import('../../conveyor/stand-down-answer-core.mjs');
-const { STAND_DOWN_MARKER } = await import('../../conveyor/stand-down.mjs');
+const { STAND_DOWN_MARKER, buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
 const UNKNOWN = 'UNKNOWN — reads failed, re-run';
 const originalExitCode = process.exitCode;
 let log, stderr, sleep;
@@ -35,6 +35,29 @@ const stdout = () => log.mock.calls.map(([line]) => line).join('\n');
 const standDown = { id: 'SD1', body: `${STAND_DOWN_MARKER}\nNeed a ruling`, author: { login: 'web-everything' }, createdAt: '2026-10-11T10:00:00Z' };
 const answer = { id: 'A1', body: buildOperatorAnswer({ standDownId: 'SD1', reason: 'Proceed', actor: 'chalbert', channel: 'console' }), author: { login: 'web-everything' }, createdAt: '2026-10-11T11:00:00Z' };
 const pr = (number, comments) => ({ number, title: `PR ${number}`, labels: [], comments, mergeable: 'MERGEABLE' });
+
+it('does not surface an answered hold that lapsed on a new head', () => {
+  vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', head: 'a'.repeat(40) }) };
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(1, [held, answer]), headRefOid: 'b'.repeat(40) }]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.stoodDown).toEqual([]);
+  expect(report.standDownAnswered ?? []).toEqual([]);
+});
+
+it('answers the latest live hold rather than a newer lapsed hold', () => {
+  vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');
+  const head = 'b'.repeat(40);
+  const live = { ...standDown, id: 'LIVE', createdAt: '2026-10-11T09:00:00Z',
+    body: buildStandDownComment({ reason: 'needs-judgment', head }) };
+  const stale = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', head: 'a'.repeat(40) }) };
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(1, [live, stale, answer]), headRefOid: head }]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.stoodDown).toEqual([expect.objectContaining({ number: 1, standDownAt: live.createdAt })]);
+  expect(report.standDownAnswered ?? []).toEqual([]);
+});
 
 // Match gh api's @tsv output, including multiline bodies and the GraphQL comment id.
 const commentTsv = (comments) => comments.map((comment) => [

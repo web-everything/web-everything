@@ -244,6 +244,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *                          rather than re-deriving a second one — never a manual `~/.claude/jobs/<id>/` move.
  *   `owed-elsewhere`     — real work is owed, by a job this pass does not run (a human clear, a CI heal, a
  *                          rebase). Named rather than dropped, so the PR is visible in the report.
+ *   `owed-main-rule`     — drain-assigned numbers await main’s CI exemption; never undo them via ci-heal.
  *   `owed-ci-rerun`      — we:backlog/x5uqim1-*.md (#4075/#3383): the required check failed while `main`'s OWN
  *                          CI was red (`we:scripts/conveyor/main-red-recovery.mjs#isPrCiFailureOwedRerun`) and
  *                          this PR's head has not yet been refreshed onto the now-recovered `main`. Owed a
@@ -294,7 +295,7 @@ export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
-  'owed-elsewhere', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
+  'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — a ci-heal already escalated THIS EXACT
   // head (`ci-heal-escalation-mark.mjs`); see that file's own header for the live incident (#2783, three
   // sessions in one evening). `ci-heal-escalated` — a genuine judgment call, terminal until a new push.
@@ -2642,7 +2643,8 @@ export function planReconcile({
       }
     }
 
-    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+    // `hold` (PR #5082): the drain-number hold's facts, so a CodeQL heal planned under it keeps those numbers.
+    const planCodeqlHeal = (hold = {}) => {
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null,
         recheck: verdictSettings.recheckNotCiBreak, voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen });
       const healBudget = healBudgetFor(pr);
@@ -2663,14 +2665,29 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
-          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+          ...base, ...withPhase, ...hold, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
+          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`
+            + (hold.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${hold.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
         });
       }
+    };
+    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+      planCodeqlHeal();
       continue;
     }
 
     if (ciRepairOwed) {
+      // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
+      const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
+      const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
+      // When another check keeps the ci-heal, the healer is told to leave `test`'s drain-assigned numbers alone.
+      const owedMainRuleFact = owedMainRuleHold ? { owedMainRule: { check: 'test', nums: [...(pr.owedMainRule.nums ?? [])] } } : {};
+      if (owedMainRuleHold && onlyTestRed) {
+        // The drain also enforces CodeQL (not a required check): a failed CodeQL keeps its own heal under the hold.
+        if (pr?.codeqlFailure) { planCodeqlHeal(owedMainRuleFact); continue; }
+        refuse('owed-main-rule', { ...withPhase, why: `the required check failed only on the hand-picked-NNN rule for card number(s) the drain itself assigned (${(pr.owedMainRule.nums ?? []).map(n => `#${n}`).join(', ')}); owed a refresh once main accepts drain-numbered cards (drain-branch-numbering-ci-v1), never a ci-heal that would revert the number` });
+        continue;
+      }
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:
       // 'DIRTY'` (real conflicts with `main`, confirmed live via `gh pr view --json mergeStateStatus,mergeable`
@@ -2930,10 +2947,11 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
-            + ` (cap from ${ciHealCapSource})`,
+            + ` (cap from ${ciHealCapSource})`
+            + (owedMainRuleFact.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${owedMainRuleFact.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
         });
       }
       continue;

@@ -5,9 +5,12 @@ import { readSettings } from '../lib/settings-files.mjs';
 
 export const FIX_SCOPE_DEFAULTS = Object.freeze({
   holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20,
+  waitForLandingHolder: Object.freeze({ enabled: true, holderStates: Object.freeze(['review:accepted', 'in-merge-queue']) }),
   priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: Object.freeze(['fast-track', 'priority:urgent']),
 });
+const validHolderStates = v => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string' && s.trim() !== '');
 const valid = {
+  waitForLandingHolder: v => typeof v === 'boolean' || validHolderStates(v),
   holdMode: v => ['active-session', 'pr-lifetime'].includes(v),
   overlapGranularity: v => ['region', 'file'].includes(v),
   regionMarginLines: v => Number.isInteger(v) && v >= 0 && v <= 10000,
@@ -19,13 +22,29 @@ const numberEnv = v => v === undefined ? undefined : String(v).trim() === '' ? v
 const booleanEnv = v => v === undefined ? undefined : /^(on|true|1)$/i.test(v) ? true : /^(off|false|0)$/i.test(v) ? false : v;
 const read = fn => { try { return fn() ?? {}; } catch { return {}; } };
 export function resolveFixScopePolicy({ env = process.env, readTool = readSettings, platform } = {}) {
-  return cascadePolicy('fixScope', read(readTool).fixScope, { standard: FIX_SCOPE_DEFAULTS, platform, env, valid,
+  const resolved = cascadePolicy('fixScope', read(readTool).fixScope, { standard: FIX_SCOPE_DEFAULTS, platform, env, valid,
     envValues: {
       holdMode: env.WE_FIX_SCOPE_HOLD_MODE, overlapGranularity: env.WE_FIX_SCOPE_OVERLAP_GRANULARITY,
       regionMarginLines: numberEnv(env.WE_FIX_SCOPE_REGION_MARGIN_LINES), priorityBypass: booleanEnv(env.WE_FIX_SCOPE_PRIORITY_BYPASS),
       stalledAfterMinutes: numberEnv(env.WE_FIX_SCOPE_STALLED_AFTER_MINUTES),
     },
   });
+  // The cascade validates by top-level key; enforce each nested leaf's distinct shape afterward.
+  // waitForLandingHolder deliberately has no environment override.
+  const setting = resolved.value.waitForLandingHolder;
+  resolved.value.waitForLandingHolder = {
+    enabled: setting?.enabled,
+    holderStates: setting?.holderStates,
+  };
+  for (const [leaf, check] of [['enabled', v => typeof v === 'boolean'], ['holderStates', validHolderStates]]) {
+    const path = `waitForLandingHolder.${leaf}`;
+    if (check(resolved.value.waitForLandingHolder[leaf])) continue;
+    resolved.invalid.push(`${resolved.sources[path] ?? 'tool'}.${path}=${JSON.stringify(resolved.value.waitForLandingHolder[leaf])}`);
+    resolved.value.waitForLandingHolder[leaf] = FIX_SCOPE_DEFAULTS.waitForLandingHolder[leaf];
+    resolved.sources[path] = 'standard';
+    resolved.leafValues[path] = FIX_SCOPE_DEFAULTS.waitForLandingHolder[leaf];
+  }
+  return resolved;
 }
 const prNumber = v => /^(?:#)?[1-9]\d*$/.test(String(v)) && Number.isSafeInteger(Number(String(v).replace(/^#/, ''))) ? Number(String(v).replace(/^#/, '')) : null;
 export function resolveOperatorPriorityPrs({ env = process.env, readTool = readSettings, platform } = {}) {
@@ -34,6 +53,84 @@ export function resolveOperatorPriorityPrs({ env = process.env, readTool = readS
     envValues: { priority: env.WE_BUILD_PRIORITY === undefined ? undefined : String(env.WE_BUILD_PRIORITY).split(/[,\s]+/).filter(Boolean) },
   });
   return { prs: new Set(resolved.value.priority.map(prNumber)), source: resolved.sources.priority };
+}
+
+const matchedHolderStates = (state, holderStates) => (holderStates ?? []).filter(s =>
+  (s === 'in-merge-queue' && state.inMergeQueue === true)
+  || (state.labels ?? []).some(label => (typeof label === 'string' ? label : label?.name) === s));
+
+/** PURE: only a holder near landing can use a real conflict to serialize fixers. */
+export function landingHolderDecision({ state, setting }) {
+  if (setting?.enabled !== true) return { hold: true, why: 'trial merge conflicts' };
+  if (state == null) return { hold: true, failedClosed: true, why: 'trial merge conflicts; holder state unreadable, retaining hold' };
+  const matched = matchedHolderStates(state, setting.holderStates);
+  if (matched.length) return { hold: true, landing: true,
+    why: `trial merge conflicts; holder is landing (${matched.join(', ')}) — waiting until it merges` };
+  return { hold: false, why: 'trial merge conflicts; holder not near landing — dispatching in parallel, land-time conflict handling resolves it' };
+}
+
+/** PURE: parse one GraphQL page into PR states; null means the response is unreadable. */
+export function parseHolderStates(json) {
+  try {
+    const data = typeof json === 'string' ? JSON.parse(json) : json;
+    const nodes = data?.data?.repository?.pullRequests?.nodes;
+    if (data?.errors?.length || !Array.isArray(nodes)) return null;
+    const states = new Map();
+    for (const node of nodes) {
+      if (prNumber(node?.number) === null || typeof node.headRefOid !== 'string'
+        || typeof node.isInMergeQueue !== 'boolean' || !Array.isArray(node.labels?.nodes)
+        || !node.labels.nodes.every(label => typeof label?.name === 'string')) return null;
+      states.set(Number(node.number), { labels: node.labels.nodes.map(label => label.name),
+        inMergeQueue: node.isInMergeQueue, headRefOid: node.headRefOid });
+    }
+    return states;
+  } catch { return null; }
+}
+
+/** One lazy, cached open-PR snapshot per pass, paginated at most five times. Never throws.
+ * A partial or failed snapshot is unreadable rather than evidence that a holder is absent. */
+export function createHolderStateReader({ repo, // owner/name slug (ghRepoSlug); missing = unreadable, fail closed
+  exec = (command, args) => execFileSync(command, args, {
+    encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  }),
+} = {}) {
+  let loaded = false, states = null;
+  const load = () => {
+    if (loaded) return;
+    loaded = true;
+    try {
+      const [owner, name] = String(repo ?? '').split('/');
+      if (!owner || !name) return;
+      const query = `query($owner: String!, $name: String!, $cursor: String) {
+        repository(owner: $owner, name: $name) {
+          pullRequests(states: OPEN, first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes { number headRefOid isInMergeQueue labels(first: 50) { nodes { name } } }
+          }
+        }
+      }`;
+      const snapshot = new Map();
+      let cursor = null;
+      for (let page = 0; page < 5; page++) {
+        const json = JSON.parse(String(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
+          '-f', `owner=${owner}`, '-f', `name=${name}`, ...(cursor ? ['-f', `cursor=${cursor}`] : [])])));
+        const parsed = parseHolderStates(json);
+        const info = json?.data?.repository?.pullRequests?.pageInfo;
+        if (!parsed || typeof info?.hasNextPage !== 'boolean') return;
+        for (const [pr, state] of parsed) snapshot.set(pr, state);
+        if (!info.hasNextPage) { states = snapshot; return; }
+        if (typeof info.endCursor !== 'string' || !info.endCursor || info.endCursor === cursor) return;
+        cursor = info.endCursor;
+      }
+    } catch { /* unreadable state retains conflict holds */ }
+  };
+  return {
+    stateFor(pr) { load(); return states?.get(Number(pr)) ?? null; },
+    landingPrs(holderStates) {
+      load();
+      return states ? [...states].filter(([, state]) => matchedHolderStates(state, holderStates).length).map(([pr]) => pr) : [];
+    },
+  };
 }
 
 /** Old-side coordinates. null per file means a non-text/add/delete/rename or unreadable patch. */
@@ -66,7 +163,7 @@ export function rangesIntersect(rangesA, rangesB, margin = 20) {
 export function regionOverlapDecision({ file, hunksA, hunksB, margin = 20, mergeConflict }) {
   const a = hunksA?.get(file), b = hunksB?.get(file);
   if (!a?.length || !b?.length || mergeConflict == null) return { overlap: true, why: 'region observation unavailable; retaining file hold', failedClosed: true };
-  if (mergeConflict) return { overlap: true, why: 'trial merge conflicts' };
+  if (mergeConflict) return { overlap: true, conflict: true, why: 'trial merge conflicts' };
   const overlap = rangesIntersect(a, b, margin);
   return { overlap, why: overlap ? 'changed regions intersect within margin' : 'changed regions are disjoint and trial merge is clean' };
 }

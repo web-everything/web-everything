@@ -76,7 +76,7 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
-import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap } from './fix-scope-policy.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -1859,6 +1859,7 @@ export function runReconcileFixDispatch({
   const priorityPrs = resolveOperatorPriorityPrs().prs;
   // As with net-scope, unit dispatch runs must not contact origin. The reader has its own hermetic git tests.
   const regionReader = isUnderTestEnv() ? null : createRegionReader({ root });
+  const holderStateReader = isUnderTestEnv() ? null : createHolderStateReader({ repo: ghRepoSlug(repoKey) });
   const holderEntries = new Map();
   for (const [pr, e] of [
     ...(reconciled.openPrFiles ?? []).map(e => [Number(e.pr), e]),
@@ -1869,9 +1870,17 @@ export function runReconcileFixDispatch({
     holderEntries.set(pr, { ...previous, ...e, headRefOid: e.headRefOid || previous?.headRefOid, labels: e.labels ?? previous?.labels });
   }
   const regionOverlap = createLiveRegionOverlap({ holderEntries, readPrHeads, regionReader, policy: scopePolicy, root });
+  const landingHolders = [];
+  if (scopePolicy.value.waitForLandingHolder?.enabled && scopePolicy.value.overlapGranularity === 'region' && holderStateReader) {
+    for (const pr of holderStateReader.landingPrs(scopePolicy.value.waitForLandingHolder.holderStates)) {
+      const scope = actualScopes.get(pr);
+      if (Array.isArray(scope) && scope.length) landingHolders.push({ pr, scope, headRefOid: holderStateReader.stateFor(pr)?.headRefOid });
+    }
+  }
   const scopeFilter = filterFixesByInFlightScope(
     stackOrder.planned, listBuildClaims(), claims, {
       urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
+      holderState: holderStateReader ? pr => holderStateReader.stateFor(pr) : null, landingHolders,
     },
   );
   for (const d of scopeFilter.scopeDecisions ?? []) {
@@ -2405,6 +2414,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   rebaseExempt = defaultRebaseExempt,
   stackAbove = new Map(),
   policy = null, regionOverlap = null, priorityPrs = new Set(), holderEntries = new Map(),
+  holderState = null, landingHolders = [],
 } = {}) {
   const accepted = [];
   const refusals = [];
@@ -2412,11 +2422,15 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   const released = [];
   const scopeDecisions = [];
   const settings = policy?.value;
+  const wait = settings?.waitForLandingHolder;
   const priority = e => settings?.priorityBypass && (priorityPrs.has(Number(e.pr)) || e.mainFix === true
     || (e.labels ?? []).some(l => settings.fastTrackLabels.includes(typeof l === 'string' ? l : l.name)));
   const decide = (entry, holder, rule, overlap, why, failedClosed) => {
     scopeDecisions.push({ pr: entry.pr, holder: holder.pr ?? holder.num, decision: overlap ? 'blocked' : 'admitted', rule, why,
-      setting: `fixScope.${rule}=${settings[rule]} (${policy.sources?.[rule] ?? 'standard'})`,
+      setting: settings[rule] && Object.getPrototypeOf(settings[rule]) === Object.prototype
+        ? Object.entries(settings[rule]).map(([leaf, value]) =>
+          `fixScope.${rule}.${leaf}=${JSON.stringify(value)} (${policy.sources?.[`${rule}.${leaf}`] ?? 'standard'})`).join(', ')
+        : `fixScope.${rule}=${settings[rule]} (${policy.sources?.[rule] ?? 'standard'})`,
       ...(failedClosed ? { failedClosed: true } : {}) });
   };
   const beatTime = c => Date.parse(c.heartbeatAt ?? c.meta?.claimedAt);
@@ -2463,6 +2477,12 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         .map((c) => ({ ...holderEntries.get(Number(c.meta?.pr)), ...c.meta, pr: Number(c.meta?.pr), id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope, claim: c })),
       ...picked.filter(c => !above.has(c.pr)),
     ];
+    if (settings && wait?.enabled && settings.overlapGranularity === 'region') {
+      for (const { pr, scope, headRefOid } of landingHolders) {
+        if (pr === entry.pr || above.has(pr) || inFlight.some(c => c.pr === pr)) continue;
+        inFlight.push({ ...holderEntries.get(pr), pr, headRefOid, id: `fix PR #${pr}`, scope, landing: true });
+      }
+    }
     if (settings?.holdMode === 'active-session') {
       for (const c of released.filter(c => !above.has(c.pr))) {
         if (overlapsInFlight(scopeFor(entry), [c])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
@@ -2491,12 +2511,20 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         if (!observation.overlap) {
           decide(entry, c, 'overlapGranularity', false, observation.why); return false;
         }
+        if (c.landing && observation.conflict !== true) return false;
+        if (observation.conflict && wait?.enabled) {
+          const d = landingHolderDecision({ state: holderState ? holderState(c.pr) : null, setting: wait });
+          if (!d.hold) {
+            decide(entry, c, 'waitForLandingHolder', false, d.why); return false;
+          }
+          observation = { overlap: true, why: d.why, failedClosed: d.failedClosed, rule: 'waitForLandingHolder' };
+        }
       }
       if (priority(entry) && !acceptedIds.has(c.id) && (!priority(c) || stalled(c))) {
         decide(entry, c, 'priorityBypass', false, stalled(c) ? 'priority candidate passes stalled holder' : 'priority candidate passes non-priority holder');
         return false;
       }
-      decide(entry, c, settings.priorityBypass && priority(entry) ? 'priorityBypass' : 'overlapGranularity', true,
+      decide(entry, c, settings.priorityBypass && priority(entry) ? 'priorityBypass' : (observation.rule ?? 'overlapGranularity'), true,
         acceptedIds.has(c.id) ? 'overlapping fix already accepted this pass' : observation.why, observation.failedClosed);
       return true;
     });
