@@ -114,7 +114,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
-import { BORROW_REASON, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -1164,14 +1164,16 @@ export function roundEscalationFor(planned, { fixSettings, loadLadder = () => lo
 }
 
 /** The Claude-only inputs of a planned fix or ci-heal entry, as the router and the borrow guard both read them. */
-function claudeOnlyInputs(planned, { fixSettings, loadLadder }) {
-  return { ...planned, round: planned.round ?? roundOf(planned), mainFix: planned.mainFix === true,
+function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readRoutedOutcomes }) {
+  const id = { repo: planned.repo ?? 'we', pr: planned.pr };
+  const codexUnproductive = consecutiveUnproductiveOnHead(readRouted(id), { ...id, head: planned.headRefOid });
+  return { ...planned, codexUnproductive, round: planned.round ?? roundOf(planned), mainFix: planned.mainFix === true,
     strongerModel: !!planned.strongerModel || !!roundEscalationFor(planned, { fixSettings, loadLadder }) };
 }
 
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
-export function routeFixExecutor(planned, { setting, fixSettings, loadLadder, launcherAvailable }) {
-  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder }), setting, launcherAvailable });
+export function routeFixExecutor(planned, { setting, fixSettings, loadLadder, launcherAvailable, readRouted }) {
+  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, launcherAvailable });
 }
 
 /** Card xrbu1bp — the routing table this fix launch runs on: the ruling rung, the takeover rung, or the round rung. */
@@ -1472,6 +1474,7 @@ export function dispatchFix(planned, {
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
+          mergeOnto: mergeOntoFor(planned),
           policyRoute: { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
       } catch (e) {
@@ -1872,7 +1875,7 @@ export function runReconcileFixDispatch({
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
       // A borrowed non-Claude launch skips the router, so any entry the router keeps on Claude (ruling send-back,
       // takeover, red-main fix, round escalation, round 3+) keeps waiting for the fixer cap instead.
-      const claudeOnly = b.executor !== 'claude' ? claudeOnlyReason(claudeOnlyInputs(entry, { fixSettings, loadLadder })) : null;
+      const claudeOnly = b.executor !== 'claude' ? claudeOnlyReason(claudeOnlyInputs({ ...entry, repo: repoKey }, { fixSettings, loadLadder })) : null;
       if (claudeOnly) {
         refusals.push({ pr: entry.pr, kind: t.kind, why: `${t.why}; not borrowing a ${b.executor} builder slot: this repair stays on Claude (${claudeOnly})` });
         continue;
@@ -1912,7 +1915,7 @@ export function runReconcileFixDispatch({
     // OTHER planned entry in this tick, including unrelated ordinary dispatches that would have succeeded)
     // rather than refusing just this one entry — the same per-entry isolation `dispatch(...)` below already
     // gets, now extended to cover this earlier call site too.
-    const executorDecision = !borrowed && fixExecutorRoute ? fixExecutorRoute({ ...entry, round: roundOf(entry) }) : null;
+    const executorDecision = !borrowed && fixExecutorRoute ? fixExecutorRoute({ ...entry, repo: repoKey, round: roundOf(entry) }) : null;
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {

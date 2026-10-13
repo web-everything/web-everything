@@ -204,7 +204,7 @@ export const CLAIM_OWNED_FRONTMATTER_KEYS = Object.freeze([
 
 /**
  * Frontmatter keys a standalone PREPARE worker run may change: the card's own `scope:` (factual drift
- * correction, #4658), `size:` (operator ruling on #4670, 2026-10-03: a prepare worker may change it directly,
+ * correction, #4658), `estimatedLoc:` (task touch-set estimate), `size:` (operator ruling on #4670, 2026-10-03: a prepare worker may change it directly,
  * grounded in file:line evidence and stated in `## Progress`) plus the two stamps `prepare-stamp` writes. The
  * prepare worker brief (`skills-src/conveyor/prepare-item-worker-brief.md`) names exactly these, and a contract
  * test asserts it — one constant so the brief and the runner's tamper check cannot drift apart.
@@ -213,7 +213,7 @@ export const CLAIM_OWNED_FRONTMATTER_KEYS = Object.freeze([
  * `## Proposed blockedBy changes` section ({@link parseProposedBlockedBy}); the frontmatter stays untouched
  * until an independent reviewer confirms (the parked PR's review), so a direct `blockedBy:` edit is still tamper.
  */
-export const PREPARE_OWNED_FRONTMATTER_KEYS = Object.freeze(['scope', 'size', 'preparedDate', 'preparedAgainstSha']);
+export const PREPARE_OWNED_FRONTMATTER_KEYS = Object.freeze(['scope', 'size', 'estimatedLoc', 'preparedDate', 'preparedAgainstSha']);
 
 // Two-form backlog id; the contract test keeps this aligned with check-standards' ITEM_REF_RX.
 export const BACKLOG_ID_SOURCE = '\\d{1,5}|x[0-9a-z]{6}';

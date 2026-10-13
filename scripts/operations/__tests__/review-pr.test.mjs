@@ -2663,20 +2663,20 @@ describe('#x6t2z6h — the two seats disagree', () => {
 // double). They do NOT sweep call sites, do NOT prove that every caller passes `--careLevel` — nothing here
 // can, because omitting it is still legal — and do NOT assert anything about live PRs.
 describe('#3335 the caller declares the shape its touch-set earns', () => {
-  /** A `read` view whose NET file list is exactly #1580's — the statute, which scores care `high`. */
-  const statuteRead = () => {
+  /** A `read` view with a sensitive workflow fixture, which scores care `high`. */
+  const workflowRead = () => {
     const raw = stubReader({})({ pr: 1580, repo: 'web-everything/web-everything' });
-    return { ...raw, net: { ...raw.net, paths: ['docs/agent/platform-decisions.md'] } };
+    return { ...raw, net: { ...raw.net, paths: ['.github/workflows/review.yml'] } };
   };
 
   it('#3335 — `read` REFUSES a declared shape the PR contradicts, naming BOTH values', () => {
-    // CRITERION 3. The stub's net list scores `high` (statute); the run declares `none`. The refusal runs the
+    // CRITERION 3. The stub's net list scores `high` (workflow); the run declares `none`. The refusal runs the
     // REAL `scoreEscalation` over those files — there is no injected scorer and no double.
-    const shape = () => shapeReadFinding(statuteRead(), { pr: 1580, repo: 'o/n', careLevel: 'none' });
+    const shape = () => shapeReadFinding(workflowRead(), { pr: 1580, repo: 'o/n', careLevel: 'none' });
     expect(shape).toThrow(/declared shape/);
     expect(shape).toThrow(/--careLevel=none/);           // what the caller said
     expect(shape).toThrow(/gives care `high`/);           // what the files score
-    expect(shape).toThrow(/statute/);                     // and why
+    expect(shape).toThrow(/workflow/);                     // and why
     expect(shape).toThrow(/dialled for less care than the diff that will land earns/);
   });
 
@@ -2696,7 +2696,7 @@ describe('#3335 the caller declares the shape its touch-set earns', () => {
     // Nothing here can force a caller to declare — a default would be the operation inventing a band from a
     // touch-set it has not read. What it CAN do is record what the files earned either way, and say in the
     // write-up that no shape was declared. Both are asserted.
-    const shaped = shapeReadFinding(statuteRead(), { pr: 1580, repo: 'o/n' });
+    const shaped = shapeReadFinding(workflowRead(), { pr: 1580, repo: 'o/n' });
     expect(shaped.earnedShape.careLevel).toBe('high');
     expect(shaped.earnedShape.declaredCareLevel).toBe(null);
     expect(shaped.earnedShape.earnedLenses).toHaveLength(5);

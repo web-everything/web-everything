@@ -72,6 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
@@ -883,6 +884,22 @@ export function defaultReapSessions({ priorityNames = null } = {}) {
 }
 
 /**
+ * Convert-advisory is default ON; env beats the product setting; malformed settings keep the default.
+ */
+export function resolveConvertAdvisoryEnabled(env = process.env, {
+  path = resolve(fileURLToPath(import.meta.url), '../../../scripts/lib/review-fix-policy-settings.json'),
+} = {}) {
+  const e = String(env?.REVIEW_DAEMON_CONVERT_ADVISORY ?? '').trim().toLowerCase();
+  if (e === '0' || e === 'false') return false;
+  if (e === '1' || e === 'true') return true;
+  try {
+    const v = JSON.parse(readFileSync(path, 'utf8'))?.convertAdvisory?.enabled;
+    if (typeof v === 'boolean') return v;
+  } catch { /* missing/corrupt file = default */ }
+  return true;
+}
+
+/**
  * PURE: the session names worth reaping FIRST this tick, given the LAST tick's own `liveProcessPrs` (a PR
  * `reconcile-core.mjs#assessLiveness` refused `live-process` for — see `runReviewTick`'s own field doc). A
  * blocking session's ROLE (review/fix/ci-heal) is not recorded on that refusal, so all three of a PR's
@@ -943,11 +960,11 @@ export function buildCliDaemonEffects({
   runConvertAdvisories = (opts) => runConvertAdvisoryTickAllRepos({
     readPrs: defaultReadPrs, readAgents: defaultReadAgents, ...opts,
   }),
-  // PR #2781 review — OPT-IN, OFF BY DEFAULT for its first landing. The stage posts real comments, applies real
-  // `advisory:*` labels and spawns a billed judge on trust-sensitive escalations, so it only runs when the
-  // operator sets REVIEW_DAEMON_CONVERT_ADVISORY=1 on the daemon — flipped on deliberately once live behavior
-  // has been watched (e.g. via `convert-advisory-dispatch.mjs <pr> --dry-run`), never by merely shipping this.
-  convertAdvisoryEnabled = process.env.REVIEW_DAEMON_CONVERT_ADVISORY === '1',
+  // ON by default: the planner withholds a normal review from a convert-advisory-owed PR, so leaving
+  // its executor off strands the PR forever (live #5020, 2026-10-12). The committed product knob is
+  // convertAdvisory.enabled in scripts/lib/review-fix-policy-settings.json;
+  // REVIEW_DAEMON_CONVERT_ADVISORY=0 is the emergency off switch.
+  convertAdvisoryEnabled = resolveConvertAdvisoryEnabled(),
   // card x5f2daz — the light prep review. ON by default in `advise` (it only ever posts a note + `review:prep`);
   // `WE_PREP_REVIEW_MODE=off` turns it off. Injectable so the daemon tests never spawn a model.
   runPrepReview = () => runPrepReviewStage(),
@@ -1001,6 +1018,8 @@ export function buildCliDaemonEffects({
         } catch (e) {
           log.error(`review-daemon: convert-advisory tick failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
         }
+      } else {
+        log.error('review-daemon: convert-advisory stage disabled (convertAdvisory.enabled=false) — any PR owed a convert-advisory is stranded');
       }
       // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
       let prepReview = null;
