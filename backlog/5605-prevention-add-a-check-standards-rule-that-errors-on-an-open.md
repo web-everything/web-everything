@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5064 (finding 1: `we:backlog/5991-diagnose-unknown-prepare-result-failure-d286713ba96e5f50.md:28` — Add a check:standards rule that refuses to move a card from open to in-progress, or to land its fix, while any TODO placeholder remains in Acceptance or Edge cases. Have the filer pre-fill 'Untrusted text' for any card that reads ledger or terminal evidence.) · key `approval-prevention-key:web-everything/web-everything#5064@8e0dbff7d014b712fb8008c5969ed33c9dab901d`

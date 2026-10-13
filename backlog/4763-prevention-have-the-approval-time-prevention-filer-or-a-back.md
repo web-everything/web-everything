@@ -25,4 +25,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5051 (finding 1: `we:backlog/xhlx9bt-prevention-restrict-the-ledger-excuse-to-rows-whose-reason-i.md:6` — Make the approval-time prevention filer add a dependency on the source PR, or a check:standards rule that open backlog card scope paths resolve on main or name an open blocking PR.) · key `approval-prevention-key:web-everything/web-everything#5051@809e1f0d20d6dac08221bc79f8ef1a540710e8ae`
+- Also raised by web-everything/web-everything#5051 (finding 1: `we:backlog/6008-prevention-restrict-the-ledger-excuse-to-rows-whose-reason-i.md:6` — Make the approval-time prevention filer add a dependency on the source PR, or a check:standards rule that open backlog card scope paths resolve on main or name an open blocking PR.) · key `approval-prevention-key:web-everything/web-everything#5051@809e1f0d20d6dac08221bc79f8ef1a540710e8ae`

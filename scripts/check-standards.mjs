@@ -120,6 +120,7 @@ import {
 import { TRUST_CHAIN, POLICY_SPEC_BASENAMES } from './lib/gate-config.mjs';
 // #2892 — the leash-pin rule asserts against the REAL rubric, not a copy of its predicate.
 import { scoreEscalation } from './lib/review-escalation.mjs';
+import { committedFixEvidenceFindings } from './lib/transient-paths.mjs';
 import { localChangedSet } from './lib/verify-lane-gate.mjs';
 import { scanDiffBranchCoverage } from './lib/diff-branch-coverage.mjs';
 import { isHash } from './backlog/id.mjs';
@@ -1040,6 +1041,9 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   }) });
   if (!scopeChanges) throw new Error('Cannot enforce backlog scope guards: unable to read the diff against origin/main. Fetch the base history and retry.');
+  for (const path of committedFixEvidenceFindings(scopeChanges)) {
+    err(`"${path}" is a fix-evidence scratch file and must never be committed — it is shared by every fixer and conflicts every other PR that carries it. Post evidence as a PR comment (gh pr comment --body-file <file outside the repo>) and \`git rm --cached ${path}\`.`);
+  }
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
     f.startsWith('backlog/') && f.endsWith('.md') && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
