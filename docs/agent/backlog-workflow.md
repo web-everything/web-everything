@@ -1146,6 +1146,52 @@ Present the proposed slices + DAG for the candidate(s) and get **one "go"** befo
 
 A split **opens** items and (for a story) converts one — it never `resolve`s the original (its scope now lives in the children) and never deletes anything. Report the result as a net-flow line (`+<slices opened>`, original story → epic, or an already-epic left in place) and point `/batch` at the freshly-batchable slices.
 
+## Closing an item as not built — `status: closed` {#closed-not-built}
+
+**Ratified 2026-10-13 by the operator (Nicolas Gilbert), [#2982](/backlog/2982-how-a-folded-duplicate-backlog-item-retires-foldedinto-point/).**
+An item leaves the backlog by exactly one of two doors: **delivered** (`status: resolved`) or **closed, not
+built** (`status: closed`). The second door works like GitHub's "closed as not planned". It never counts as
+delivered, and it can always be reopened.
+
+```yaml
+status: closed
+closedReason: duplicate        # duplicate | fixed-elsewhere | obsolete | wont-do
+closedInto: "2839"             # duplicate only — the survivor card (required for duplicate)
+closedBy: "64e5fa127"          # fixed-elsewhere only — the commit or PR that fixed it (optional: a pointer where one exists)
+dateClosed: "2026-10-13"
+```
+
+- **Never delivered.** A closed item books no points. The burndown drops it from scope entirely (scope
+  removed, not scope completed — `#faithful-derivation-exclude-not-fabricate`). Throughput, velocity and the
+  batch-calibration `--points` figure count only `resolved`, so they ignore it.
+- **Out of every work queue.** Readiness selection, the conveyor dispatch, and the conveyor build-queue
+  sidecar all skip it. Closing through the operation also removes the id from the sidecar.
+- **Still on the board.** The file, its `NNN` and its detail page stay. `/backlog/` shows a neutral
+  "Closed" pill with the reason and a link to the survivor or the fixing change; closed items are hidden by
+  default, like resolved ones.
+- **Terminal for parents, not for dependents.** A closed child no longer holds its epic open. A closed
+  item may not leave a live dependent behind: `check:standards` refuses a closed item that an open item
+  still lists in `blockedBy`, an unresolvable or self `closedInto`, and a `closedInto` that is itself closed.
+- **How to close.** Use the declared operation, never a hand edit:
+  `node scripts/operations/run.mjs close-items --ids=4426,4548 --reason=duplicate --into=6001` (one survivor for
+  all ids) or `--triage=<file.json> --category=DUPLICATE` (pointers read per row). It is a **dry run unless
+  `--apply`**, it records the actor, channel and reason, and it **refuses** any id on
+  `scripts/settings/build-priority.json`, any `status: active` card, any card named by an open PR, and any
+  card with a live dependent.
+- **How to reopen.** `node scripts/operations/run.mjs reopen-items --ids=… --reason='…' [--apply]` flips
+  `closed → open`, drops the `closed*` fields, and stamps `reopenedReason` + `dateReopened`. Reopening is
+  ordinary, not a correction (contrast `unresolve`).
+- **Who may close.** Closing is an operator decision. A duplicate close needs the containment bar of
+  *The three outcomes → Fold* (the survivor's delivery wholly satisfies this card); a `wont-do` or
+  `obsolete` close needs an operator ruling. No agent closes work it simply did not want to do — the
+  same anti-escape rule as *The hold model* ([#hold-model](#hold-model)).
+
+**Why a status and not a field.** `status` is the card's one statement of its own state, so a closed card
+must say `closed`. Every surveyed tracker (Bugzilla, Jira, GitHub, GitLab, Linear) moves the state field
+itself and adds the reason and pointer beside it. This is a base-state change plus additive markers, so it
+composes with `we:docs/agent/reference-retirement.md`: there, an entry can be both dead and superseded; here,
+delivered and closed are genuinely exclusive.
+
 ## Consolidating related items — group only when it's genuinely one job {#consolidating}
 
 > Use via the `consolidate-backlog-items` skill (`/consolidate`). Consolidation is the **inverse of splitting**: it takes items **already filed** that are really *one job* and groups them into a logical set — an **umbrella epic** or a **batch pack** — so they get worked together instead of drifting apart. As with `/split`, the output is **always a report** and the on-disk change is **gated on one "go"**. The conservative instinct **inverts**: a *needless* consolidation is the expensive mistake — it buries independently-deliverable work under an umbrella nobody can batch, and hides a real deliverable behind a parent that won't resolve until its slowest sibling lands. A *missed* consolidation just leaves two adjacent cards to pick up separately. So **when the cluster isn't obvious, leave the items alone** — record them as *left apart* with the signal that made them look related, and move on.
@@ -1170,7 +1216,7 @@ A split **opens** items and (for a story) converts one — it never `resolve`s t
 
 - **Umbrella** — coupled items that add up to one deliverable → scaffold (or reuse) a `kind: epic` and set `parent:` on each member. The epic carries **no `size`** (children hold the points) and stays `open` until the last child lands.
 - **Pack** — items that stay separate but are best worked in one pass (shared context, shared fixture) → lift the real prerequisites into `blockedBy` edges and name the pack in the report for `/batch`. **No epic** — a pack is a *scheduling* fact, not a hierarchy.
-- **Fold** — one member's scope sits entirely inside another's. **Report only, no mutation**, pending the retirement decision (*How a folded-duplicate backlog item retires*): `resolve` means *delivered* and feeds the burndown, so closing a never-built duplicate books points nobody earned. Name the survivor and the cross-refs in the report and stop there.
+- **Fold** — one member's scope sits entirely inside another's (delivering the survivor wholly satisfies the absorbed card's acceptance criteria). After approval, close the absorbed card **not built** with `closedReason: duplicate` and `closedInto: <survivor>` through the `close-items` operation (*→ [Closing an item as not built](#closed-not-built)*, ratified by #2982). Never `resolve` it: `resolve` means *delivered* and feeds the burndown.
 
 ### The report — always produced
 
@@ -1184,7 +1230,9 @@ Present the clusters and get **one "go"**. Then, per approved cluster:
 2. **Pack:** add the `blockedBy` edges the investigation proved real (never a "see also" edge — that's `crossRef`), and record the pack in the report. Nothing else moves.
 3. **Gate:** `npm run check:standards` green (it errors on a sized epic with sized children, an unresolvable `parent`, a cycle, or an open item with no CTA). Re-evaluate `blockedBy` per *Keep the blocker DAG honest*.
 
-A consolidation **never** renumbers, deletes, or `resolve`s a member — it only adds an umbrella and rewires edges. Close with a net-flow line (`+1 epic`, *N* members re-parented, *M* clusters left apart) and point `/batch` at the grouped set.
+3a. **Fold:** `node scripts/operations/run.mjs close-items --ids=<absorbed> --reason=duplicate --into=<survivor>` — dry run first, then `--apply`.
+
+A consolidation **never** renumbers, deletes, or `resolve`s a member — it adds an umbrella, rewires edges, or closes a folded duplicate *not built*. Close with a net-flow line (`+1 epic`, *N* members re-parented, *M* clusters left apart) and point `/batch` at the grouped set.
 
 ## NNN collision — the standard resolution {#nnn-collision}
 

@@ -1,8 +1,11 @@
 ---
 bornAs: xm3vnk8
 kind: decision
-status: open
+status: resolved
 dateOpened: "2026-08-06"
+dateResolved: "2026-10-13"
+graduatedTo: none
+codifiedIn: "docs/agent/backlog-workflow.md#closed-not-built"
 preparedDate: "2026-08-17"
 relatedTo: ["2983"]
 relatedReport: reports/2026-08-17-2982-folded-duplicate-retirement.md
@@ -17,6 +20,28 @@ absorbed one** — `resolve` means *delivered* and books points, a park needs a 
 non-delivered close plus a pointer to the survivor; none leaves it open with only a cross-reference.** Two
 forks follow — whether a proven-contained duplicate leaves the open set, and whether the marker is a new
 `status` value or a field on an item that stays `open`.
+
+## Ruling — 2026-10-13, ratified and widened
+
+**Operator (Nicolas Gilbert), 2026-10-13 ~10:00 ET, verbatim: "yes to all"**, given in reply to this option:
+
+> (b) Widen [card 2982] into one general 'closed, not built' state with a reason (duplicate / fixed elsewhere /
+> obsolete / won't do) and a pointer where one exists. It never counts as delivered and can be reopened. This
+> works like GitHub's 'closed as not planned'.
+
+- **Fork 1 → (a)**, retire non-delivered. **Fork 2 → (a)**, a new status value plus a pointer field.
+- **Widened beyond duplicates.** The status is the general `closed`, not `folded`. Fields: `closedReason`
+  (`duplicate` | `fixed-elsewhere` | `obsolete` | `wont-do`), `closedInto` (the survivor, required for a
+  duplicate), `closedBy` (the fixing commit or PR, for fixed-elsewhere, where one exists), `dateClosed`.
+- **Never delivered:** no burndown points, no throughput, ignored by batch calibration. **Reversible:**
+  `reopen-items` is the inverse of `close-items` and ships with it, as the *Supported by default* section
+  required.
+- **Codified in** [we:docs/agent/backlog-workflow.md#closed-not-built](docs/agent/backlog-workflow.md#closed-not-built).
+  The statute file delegates backlog lifecycle to that doc (*Statute-overlap check* below), so no new
+  statute anchor is minted.
+- The same reply approved bulk-clearing the backlog by triage category (56 duplicates, 58 already-fixed,
+  2 obsolete, 473 low-value; 370 kept). That apply is a separate operator step after this lands, through the
+  dry-run-first `close-items` operation.
 
 ## Why there is nothing to reach for today
 
