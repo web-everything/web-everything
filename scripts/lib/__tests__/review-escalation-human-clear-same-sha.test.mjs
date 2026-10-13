@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
 
 // Live #5193 (2026-10-13): the operator cleared 9c7202417 (clear-human); a false no-push re-arm then triggered an AI
@@ -25,5 +25,18 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
   });
   it('defaults to the declared setting (on)', () => {
     expect(parseLatestHumanClearedSha([clear(X), accept(X)])).toBe(X);
+  });
+  it('loads the default setting once per process while permitting explicit overrides', async () => {
+    const load = vi.fn(() => ({ value: 'on', source: 'standard' }));
+    vi.doMock('../review-clearance-settings.mjs', () => ({ loadReviewClearanceSetting: load }));
+    vi.resetModules();
+    try {
+      const { parseLatestHumanClearedSha: parse } = await import('../review-escalation.mjs');
+      expect(parse([clear(X), accept(X)], { sameShaCarries: false })).toBeNull();
+      expect(load).not.toHaveBeenCalled();
+      expect(parse([clear(X), accept(X)])).toBe(X);
+      expect(parse([clear(X), accept(X)])).toBe(X);
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally { vi.doUnmock('../review-clearance-settings.mjs'); vi.resetModules(); }
   });
 });

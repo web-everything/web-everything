@@ -14,6 +14,7 @@ Live #5193 (2026-10-13): a stale review-hold merge-gate failure read as red CI a
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A2] **Approval trust review** — For each trust predicate on an automatic approval-granting path, require a named negative test in the review test plan. Cover forged marker authors, non-automation removal actors (including the operator), missing evidence, time-window violations, and intervening holds by both the removal actor and another actor. A duplicate hold in the same timestamp must also block restoration; only one original automated swap event is exempt. PR #5237 pins these negatives in `review-clearance-guard.test.mjs`; preserve them when wiring the held paths. This checklist is the review requirement until a predicate-to-test lint exists.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

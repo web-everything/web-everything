@@ -144,10 +144,26 @@ export function buildRearmComment({ actor, decision }) {
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) {
-  const { isUnderTest } = await import('../lib/under-test.mjs');
-  const pr = Number(process.argv[2]);
-  const repo = process.argv.find(a => a.startsWith('--repo='))?.slice('--repo='.length);
-  if (repo && Number.isSafeInteger(pr) && pr > 0 && !isUnderTest()) {
+  let argv = process.argv.slice(2);
+  // Match the shared CLI's positional selection, including flags before the PR number.
+  const pr = Number(argv.find(a => /^\d+$/.test(a)));
+  let repo = argv.find(a => a.startsWith('--repo='))?.slice('--repo='.length);
+  if (Number.isSafeInteger(pr) && pr > 0) {
+    if (!repo) {
+      const { createGhProvider } = await import('../lib/review-label-provider.mjs');
+      try { repo = createGhProvider().currentRepo(); }
+      catch (e) {
+        const { writeLineSync } = await import('../lib/write-all-sync.mjs');
+        writeLineSync(1, JSON.stringify({ error: `cannot derive repo for clearance guard: ${e.message}` }));
+        process.exit(1);
+      }
+      // The guard and label writer must address the same repo, even if cwd changes between reads.
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+        console.error('rearm-review: invalid cwd repo — expected <owner/name>');
+        process.exit(1);
+      }
+      argv = [...argv.filter(a => !a.startsWith('--repo=')), `--repo=${repo}`];
+    }
     const { createReviewClearanceGuard } = await import('../lib/review-clearance-guard.mjs');
     const result = createReviewClearanceGuard({ repo }).guardRearm({ pr });
     if (result.refuse) {
@@ -174,6 +190,7 @@ if (IS_CLI) {
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
   runReviewLabelCli({
+    argv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.

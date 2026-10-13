@@ -4,7 +4,7 @@ import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewCle
 
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isTrustedMarkerAuthor, isAutomationAuthored } from './marker-authorship.mjs';
 import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
@@ -105,11 +105,16 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
   if (removals.some(e => !Number.isFinite(Date.parse(at(e))))) return no('unlabel event time unreadable');
   const removal = removals.sort((a, b) => Date.parse(at(a)) - Date.parse(at(b))).at(-1);
   const login = removal?.actor?.login;
-  if (!login || !isTrustedMarkerAuthor({ author: { login } }) || !(Date.parse(at(removal)) > Date.parse(record.at))
+  if (!login || !isAutomationAuthored({ author: { login } }) || !(Date.parse(at(removal)) > Date.parse(record.at))
     || !rearms.some(c => Math.abs(Date.parse(at(c)) - Date.parse(at(removal))) <= 180_000)) return no('accepted removal not tied to trusted re-arm');
-  if (events.some(e => e.event === 'labeled' && ['review:pending', 'review:human', 'review:changes'].includes(e.label?.name)
-    && (!Number.isFinite(Date.parse(at(e))) || Date.parse(at(e)) > Date.parse(at(removal)))
-    && String(e.actor?.login ?? '').toLowerCase() !== login.toLowerCase())) return no('later label hold by another actor');
+  // Only the original automated pending swap is exempt. Actor equality alone cannot prove that a later
+  // label event belongs to that swap: a subsequent hold from the same identity is still a revocation.
+  const originalPending = events.find(e => e.event === 'labeled' && e.label?.name === 'review:pending'
+    && Date.parse(at(e)) === Date.parse(at(removal))
+    && String(e.actor?.login ?? '').toLowerCase() === login.toLowerCase());
+  if (events.some(e => e.event === 'labeled' && holds.includes(e.label?.name)
+    && (!Number.isFinite(Date.parse(at(e))) || Date.parse(at(e)) > Date.parse(record.at))
+    && e !== originalPending)) return no('intervening label hold');
   return { restore: true, record: { ...record, url: comments[record.index]?.url }, rearmComment, why: 'trusted no-push re-arm removed the original clearance' };
 }
 

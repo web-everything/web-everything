@@ -1932,8 +1932,13 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
 }
 
 /** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */
+let sameShaCarriesDefault;
 function sameShaCarriesSetting() {
-  try { return loadReviewClearanceSetting({ key: 'humanClearanceSurvivesSameShaAccept' }).value === 'on'; } catch { return false; }
+  if (sameShaCarriesDefault === undefined) {
+    try { sameShaCarriesDefault = loadReviewClearanceSetting({ key: 'humanClearanceSurvivesSameShaAccept' }).value === 'on'; }
+    catch { sameShaCarriesDefault = false; }
+  }
+  return sameShaCarriesDefault;
 }
 
 /**

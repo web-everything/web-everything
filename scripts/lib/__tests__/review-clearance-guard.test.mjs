@@ -1,4 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
 import {
   REVIEW_CLEARANCE_SETTINGS, REARM_MARKER, resolveReviewClearanceSetting, loadReviewClearanceSetting,
@@ -91,6 +96,65 @@ describe('#5193 review clearance', () => {
     expect(decideClearanceRestore({ ...restoreFacts, ...patch }).restore).toBe(false);
   });
   it('pins the local marker', () => expect(REARM_MARKER).toBe(REARM_COMMENT_MARKER));
+  it.each(['chalbert', 'mallory'])('never restores an acceptance removed by %s', login => {
+    const revoked = events.map(e => e.label.name === 'review:accepted' && e.event === 'unlabeled'
+      ? { ...e, actor: { login } } : e);
+    expect(decideClearanceRestore({ ...restoreFacts, events: revoked }).restore).toBe(false);
+  });
+  it.each(['web-everything[bot]', 'chalbert'])('honours a later pending hold by %s', login => {
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
+      event('labeled', 'review:pending', '19:03:00', login)] }).restore).toBe(false);
+  });
+  it('honours a second pending event even within the original swap timestamp', () => {
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
+      event('labeled', 'review:pending', '19:02:57')] }).restore).toBe(false);
+  });
+  it('rejects a forged re-arm comment', () => {
+    expect(decideClearanceRestore({ ...restoreFacts, comments: [acceptance,
+      { ...rearm, author: { login: 'mallory' } }] }).restore).toBe(false);
+  });
+  it('requires removal within 180 seconds of the trusted re-arm', () => {
+    expect(decideClearanceRestore({ ...restoreFacts, comments: [acceptance,
+      { ...rearm, createdAt: '2026-10-13T19:05:58Z' }] }).restore).toBe(false);
+  });
+});
+
+describe('rearm-review CLI same-head clearance', () => {
+  it.each([
+    { explicitRepo: true, flagsFirst: false }, { explicitRepo: false, flagsFirst: false },
+    { explicitRepo: true, flagsFirst: true }, { explicitRepo: false, flagsFirst: true },
+  ])('refuses without label writes: %j', ({ explicitRepo, flagsFirst }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'rearm-clearance-'));
+    const callsPath = join(dir, 'calls.jsonl');
+    const script = resolve(dirname(fileURLToPath(import.meta.url)), '../../conveyor/rearm-review.mjs');
+    const fake = `#!${process.execPath}\nconst fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CLEARANCE_CALLS, JSON.stringify(args) + '\\n');
+let out;
+if (args[0] === 'repo' && args[1] === 'view') out = ${JSON.stringify(repo)};
+else if (args[0] === 'pr' && args[1] === 'view') out = JSON.stringify(${JSON.stringify({ headRefOid: head, headRefName: 'lane/5193', labels: ['review:accepted'], state: 'OPEN' })});
+else if (args.some(a => a.includes('/comments'))) out = JSON.stringify([${JSON.stringify(rest([acceptance]))}]);
+else if (args.some(a => a.includes('/git/ref/'))) out = JSON.stringify({object:{sha:${JSON.stringify(head)}}});
+else if (args.some(a => a.includes('/reviews') || a.includes('/events'))) out = '[[]]';
+else { console.error('unexpected gh: ' + JSON.stringify(args)); process.exit(91); }
+process.stdout.write(out + '\\n');`;
+    try {
+      writeFileSync(join(dir, 'gh'), fake, { mode: 0o755 });
+      const flags = explicitRepo ? [`--repo=${repo}`] : ['--actor=fixture'];
+      const result = spawnSync(process.execPath, [script, ...(flagsFirst ? [...flags, '5193'] : ['5193', ...flags])], {
+        encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, WE_UNDER_TEST: '1', CLEARANCE_CALLS: callsPath,
+          WE_REVIEW_CLEARANCE_REARM_REQUIRES_HEAD_CHANGE: 'on' },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, pr: 5193, rearmed: false, refused: 'same-head-clearance' });
+      const calls = readFileSync(callsPath, 'utf8').trim().split('\n').map(s => JSON.parse(s));
+      expect(calls.some(a => a[1] === 'edit' || a[1] === 'comment' || a.includes('POST'))).toBe(false);
+      expect(calls.some(a => a.some(s => s.includes('/git/ref/')))).toBe(true);
+      if (!explicitRepo) expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('settings', () => {
