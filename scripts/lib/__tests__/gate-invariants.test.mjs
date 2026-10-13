@@ -156,7 +156,7 @@ describe('INVARIANT 1 — policy/statute ⇒ human; engine ⇒ escalate-but-agen
     for (const gateFile of DECLARATIVE_LEASH_FILES) {
       for (const noise of powerset(LEAF_FILES)) {
         for (const [diffLines, dismissedFindings, crossRepo] of noiseSignals) {
-          const r = scoreEscalation({ changedFiles: [...noise, gateFile], diffLines, dismissedFindings, crossRepo });
+          const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [...noise, gateFile], diffLines, dismissedFindings, crossRepo });
           expect(r.humanRequired).toBe(true); // the encoded policy — never falls to agent-reviewable
           expect(r.escalate).toBe(true);
         }
@@ -178,10 +178,10 @@ describe('INVARIANT 1 — policy/statute ⇒ human; engine ⇒ escalate-but-agen
     for (const leash of DECLARATIVE_LEASH_FILES) {
       for (const code of DERIVATION_CODE_FILES) {
         for (const noise of powerset(LEAF_FILES).slice(0, 4)) {
-          const r = scoreEscalation({ changedFiles: [...noise, code, leash] });
+          const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [...noise, code, leash] });
           expect(r.humanRequired).toBe(true);
           // …and on the cumulative human basis too, where the leash rides an ancestor commit (#2390).
-          expect(scoreEscalation({ changedFiles: [code], humanBasisFiles: [code, leash] }).humanRequired).toBe(true);
+          expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: [code], humanBasisFiles: [code, leash] }).humanRequired).toBe(true);
         }
       }
     }
@@ -189,14 +189,14 @@ describe('INVARIANT 1 — policy/statute ⇒ human; engine ⇒ escalate-but-agen
   it('the leash never LOSES its human gate to a de-inflated stacked base (#2390 — the human basis wins)', () => {
     for (const leash of DECLARATIVE_LEASH_FILES) {
       // own-delta looks innocuous; the cumulative basis carries the leash edit → still human.
-      expect(scoreEscalation({ changedFiles: ['demos/spa.html'], humanBasisFiles: ['demos/spa.html', leash] }).humanRequired).toBe(true);
+      expect(scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['demos/spa.html'], humanBasisFiles: ['demos/spa.html', leash] }).humanRequired).toBe(true);
     }
   });
   it('the STATUTE layer ⇒ humanRequired (a governance rule a human must ratify, #2412)', () => {
     for (const s of STATUTE_FILES) {
       expect(isStatutePath(s)).toBe(true);
       for (const noise of powerset(LEAF_FILES)) {
-        const r = scoreEscalation({ changedFiles: [...noise, s] });
+        const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [...noise, s] });
         expect(r.humanRequired).toBe(true);
         expect(r.escalate).toBe(true);
       }
@@ -217,7 +217,7 @@ describe('INVARIANT 1 — policy/statute ⇒ human; engine ⇒ escalate-but-agen
     for (const moved of RELOCATED_POLICY_FILES) expect(isGateSelfPath(moved)).toBe(true);
     for (const moved of RELOCATED_LEASH_FILES) {
       for (const noise of powerset(LEAF_FILES)) {
-        const r = scoreEscalation({ changedFiles: [...noise, moved], diffLines: 0 });
+        const r = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [...noise, moved], diffLines: 0 });
         expect(r.humanRequired).toBe(true); // the coordinator can never auto-clear a change to its own leash
         expect(r.escalate).toBe(true);
       }
@@ -420,7 +420,7 @@ describe('INVARIANT 6 — producerReviewLabel matches the score across both tier
   it('any DECLARATIVE-LEASH or STATUTE diff ⇒ producer label review:human, across noise', () => {
     for (const gateFile of [...DECLARATIVE_LEASH_FILES, ...STATUTE_FILES]) {
       for (const noise of powerset(LEAF_FILES)) {
-        const score = scoreEscalation({ changedFiles: [...noise, gateFile] });
+        const score = scoreEscalation({ humanSurfaces: 'broad', changedFiles: [...noise, gateFile] });
         expect(producerReviewLabel(score)).toBe(REVIEW_LABELS.human);
       }
     }
@@ -599,7 +599,7 @@ describe('INVARIANT 13 — a re-score never revokes a recorded clearance (#x9xqe
 
   it('(a) …but a cleared PR whose head ADVANCED onto a leash path DOES re-escalate, to review:human', () => {
     // The ride-in edits `gate-config.mjs` — the declarative leash — so the fresh score is humanRequired.
-    const score = scoreEscalation({ changedFiles: ['scripts/lib/gate-config.mjs'] });
+    const score = scoreEscalation({ humanSurfaces: 'broad', changedFiles: ['scripts/lib/gate-config.mjs'] });
     expect(score.humanRequired).toBe(true);
     const g = decideReviewGate({
       escalate: score.escalate,

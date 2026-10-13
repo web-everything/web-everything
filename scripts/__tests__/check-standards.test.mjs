@@ -647,7 +647,7 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
       git(['update-ref', 'HEAD', baseline]);
       git(['update-ref', 'refs/remotes/origin/main', baseline]);
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
-      copyFileSync(join(ROOT, 'scripts/check-standards.mjs'), join(repo, 'scripts/check-standards.mjs'));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
       const runGate = (args) => {
         const result = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...args], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
@@ -719,7 +719,7 @@ ${note}
       execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
       // The gate's scope guards need an origin/main base ref; a clone of a CI checkout has none (the empty-stdout failure).
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
       const warnings = () => {
@@ -762,7 +762,7 @@ ${note}
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
       const warnings = () => {
         const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
@@ -789,5 +789,28 @@ ${note}
       n += scopeMissingTestFile(fm.data, tracked, fm.content).length + bodyDeliverablesMissingFromScope(fm.data, fm.content).length;
     }
     expect(n).toBeLessThanOrEqual(187); // measured after scope backfill (2026-10-03); lower as the corpus is backfilled
+  });
+});
+
+// ── #4490 — citation gates delegate their git grep scan to the shared fail-closed helper ─────────
+// The gate wiring is a top-to-bottom script, not unit-testable; same source-assertion technique as the
+// §6d-sexies wiring test above. Gates 6f-ii-c / 6f-ii-d must call `runGitGrepGate` with their own emitter,
+// and the hand-rolled `execFileSync('git', ['grep'` (whose catch-all reported a failed scan as clean) is gone.
+describe('#4490 citation gates use runGitGrepGate', () => {
+  const gate = readFileSync(join(ROOT, 'scripts/check-standards.mjs'), 'utf8');
+  const sectionOf = (startMarker) => {
+    const from = gate.indexOf(startMarker);
+    expect(from).toBeGreaterThan(-1);
+    const next = gate.indexOf('\nmark(', from);
+    return gate.slice(from, next < 0 ? undefined : next);
+  };
+
+  it('citation gates delegate scans and forward failures to their emitters', () => {
+    expect(gate).toMatch(/import \{ runGitGrepGate \} from '\.\/lib\/git-grep-gate\.mjs';/);
+    const c = sectionOf('const emit3 = CITATION_GATES_ENFORCED');
+    const d = sectionOf('const emit4 = CITATION_GATES_ENFORCED');
+    expect(c).toMatch(/runGitGrepGate\(HASH_PATH_CITE_SOURCE, \{[^}]*emit: emit3/s);
+    expect(d).toMatch(/runGitGrepGate\(BACKLOG_GLOB_CITE_SOURCE, \{[^}]*emit: emit4/s);
+    for (const s of [c, d]) expect(s).not.toMatch(/execFileSync\(\s*'git', \['grep'/);
   });
 });
