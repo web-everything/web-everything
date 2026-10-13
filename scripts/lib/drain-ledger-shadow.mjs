@@ -14,11 +14,12 @@
  * THE COMPARISON, per PR:
  *   • label verdict  — `clear` when the drain's final decision is `merge`, else `hold`.
  *   • ledger verdict — `decideLedgerGate({ authority: 'ledger' })`: `clear` | `hold` | `unreadable`.
- *   • status         — `agree` | `disagree` | `unreadable`. An unreadable ledger read is NEVER agreement (A4).
+ *   • status         — `agree` | `disagree` | `transient` | `unreadable`. An unreadable ledger read is NEVER agreement (A4).
  *   • direction      — for a disagreement: `ledger-holds-label-clears` (flipping to `both` would block this merge)
  *                      or `ledger-clears-label-holds` (the ledger alone would merge what the labels hold).
  *
- * The ledger facts are the minimum the hold rules read (`pr`, `repo`, `head.sha`, `now`): the shadow makes NO
+ * Mechanical facts already on the drain verdict add holds to the comparison; stale mechanical events may be
+ * reported transient but retain a held ledger verdict. The ledger facts are the minimum the hold rules read (`pr`, `repo`, `head.sha`, `now`): the shadow makes NO
  * per-PR `gh` call. One ledger store read per repo per pass, time-boxed; a failed or late read is unreadable.
  *
  * Edge cases (card): PR bodies/comments are never read here (untrusted text); a cut-off read is unreadable, never
@@ -31,6 +32,8 @@ import { foldVerdictLedger, readLedgerEventsFromStore } from './verdict-ledger.m
 import { derivePrState } from './pr-state.mjs';
 import { newRunRecord } from '../operations/run-record.mjs';
 import { newRunId, writeRun } from '../operations/run-store.mjs';
+import { readShadowRuns, measureReadiness, resolvePromotionSettings, formatReadinessLine } from './ledger-promotion-readiness.mjs';
+import { readSettings } from './settings-files.mjs';
 
 export const SHADOW_OP = 'drain-ledger-shadow';
 export const SHADOW_WRITER = 'merge-ai-prs (drain ledger shadow, #5444)';
@@ -39,6 +42,51 @@ export const LEDGER_READ_TIMEOUT_MS = 20_000;
 export const MAX_ROWS = 300;
 
 const slug = (r) => String(r ?? '').trim().toLowerCase();
+
+const FACT_FIELDS = ['requiredCheckReadError', 'certifyLabel', 'aiGenerated', 'humanCleared', 'offDefaultBase',
+  'testGreen', 'codeqlBlocked', 'mergeable', 'state', 'queueBlockedRelief', 'redMainHold'];
+const landable = (v) => ['CLEAN', 'UNSTABLE'].includes(v?.state) || v?.queueBlockedRelief === true;
+
+/** Pure, additive mechanical evidence. Missing fields supply no evidence of failure. Never throws. */
+export function liveFactHolds(verdict) {
+  try {
+    const v = verdict ?? {};
+    const holds = [];
+    const add = (fails, code, reason) => { if (fails) holds.push({ code: `fact:${code}`, reason }); };
+    add(v.requiredCheckReadError, 'required-check-unreadable', 'required checks could not be read');
+    add(['certifyLabel', 'aiGenerated', 'humanCleared'].every(k => v[k] === false), 'not-certified', 'PR is not certified');
+    add(v.offDefaultBase === true, 'off-default-base', 'base is not the default branch');
+    add(v.testGreen === false, 'required-check-not-green', 'required check is not green');
+    add(v.codeqlBlocked === true, 'codeql-failed', 'CodeQL blocked');
+    add(v.mergeable !== undefined && v.mergeable !== 'MERGEABLE', 'not-mergeable', 'PR is not mergeable');
+    add(v.state !== undefined && !landable(v), 'merge-state-unlandable', 'merge state is unlandable');
+    add(v.redMainHold === true, 'red-main-hold', 'red-main-hold');
+    return holds;
+  } catch { return []; }
+}
+
+/**
+ * True only for a nonempty list consisting entirely of stale mechanical drain holds.
+ * Without facts, classify mechanical codes only (legacy label-clear replay).
+ * With facts, require explicit contradictory evidence; red-main absence is allowed by the label-clear caller.
+ */
+export function classifyHoldCodes(codes, facts) {
+  if (!Array.isArray(codes) || !codes.length) return false;
+  return codes.every(code => {
+    if (typeof code !== 'string' || !code.startsWith('hold:drain:')) return false;
+    const reason = code.slice('hold:drain:'.length);
+    const rules = [
+      ['required check', v => v.testGreen === true],
+      ['not mergeable', v => v.mergeable === 'MERGEABLE'],
+      ['merge state', landable],
+      ['base is not', v => v.offDefaultBase === false],
+      ['red-main-hold', v => v.redMainHold !== true],
+      ['codeql', v => v.codeqlBlocked === false],
+    ];
+    const rule = rules.find(([prefix]) => reason.startsWith(prefix));
+    return Boolean(rule && (facts === undefined || rule[1](facts ?? {})));
+  });
+}
 
 /**
  * One PR's label-vs-ledger row. Pure; never throws.
@@ -50,7 +98,10 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
   const head = verdict?.listedHeadSha || verdict?.headSha || null;
   const labelsClear = verdict?.decision === 'merge';
   const live = decideLedgerGate({ labelsClear, authority: DEFAULT_REVIEW_AUTHORITY });
-  const base = { pr, repo, head, labelVerdict: labelsClear ? 'clear' : 'hold', liveClear: live.clear };
+  const facts = Object.fromEntries(FACT_FIELDS.filter(k => verdict?.[k] !== undefined).map(k => [k, verdict[k]]));
+  const factHolds = liveFactHolds(verdict).map(h => h.code);
+  const base = { pr, repo, head, labelVerdict: labelsClear ? 'clear' : 'hold', liveClear: live.clear,
+    labelReason: String(verdict?.reason ?? '').trim().slice(0, 200), facts };
   let folded = null;
   let derived = null;
   if (Array.isArray(events)) {
@@ -64,21 +115,31 @@ export function shadowRow({ verdict, repo, events, now = new Date().toISOString(
     } catch { folded = null; derived = null; }
   }
   const ledger = decideLedgerGate({ folded, derived, head, labelsClear, authority: 'ledger' });
-  if (ledger.defer) return { ...base, ledgerVerdict: 'unreadable', status: 'unreadable', direction: null, reason: ledger.reason };
-  const ledgerVerdict = ledger.clear ? 'clear' : 'hold';
   const noRow = folded && !folded.history?.length;
-  const reason = noRow && !ledger.clear ? 'no ledger row for this PR' : ledger.reason;
-  if (ledger.clear === labelsClear) return { ...base, ledgerVerdict, status: 'agree', direction: null, reason };
-  return { ...base, ledgerVerdict, status: 'disagree',
+  const ledgerHolds = [...(noRow ? ['no-ledger-row'] : (derived?.holds ?? []).map(h => h?.code ?? 'unknown')), ...factHolds];
+  const result = { ...base, ledgerHolds };
+  if (ledger.defer) return { ...result, ledgerVerdict: 'unreadable', status: 'unreadable', direction: null, reason: ledger.reason };
+  const clears = ledger.clear && !factHolds.length;
+  const ledgerVerdict = clears ? 'clear' : 'hold';
+  const reason = noRow && !clears ? 'no ledger row for this PR'
+    : ledger.clear && factHolds.length ? `ledger holds (live facts): ${factHolds.join(', ')}` : ledger.reason;
+  if (clears === labelsClear) return { ...result, ledgerVerdict, status: 'agree', direction: null, reason };
+  const covered = folded?.current?.coverage?.headSha;
+  if (labelsClear && folded?.clears === true && (!covered || covered === head)
+    && classifyHoldCodes(ledgerHolds, facts)) {
+    return { ...result, ledgerVerdict, status: 'transient', direction: null, transient: 'stale-drain-mechanical-hold', reason };
+  }
+  return { ...result, ledgerVerdict, status: 'disagree',
     direction: labelsClear ? 'ledger-holds-label-clears' : 'ledger-clears-label-holds', reason };
 }
 
 /** Roll the rows up. Pure. */
 export function summarizeShadow(rows = []) {
-  const s = { compared: rows.length, agree: 0, disagree: 0, unreadable: 0,
+  const s = { compared: rows.length, agree: 0, disagree: 0, unreadable: 0, transient: 0, transientBy: {},
     directions: { 'ledger-holds-label-clears': 0, 'ledger-clears-label-holds': 0 }, liveUnchanged: true };
   for (const r of rows) {
     s[r.status] += 1;
+    if (r.status === 'transient') s.transientBy[r.transient] = (s.transientBy[r.transient] ?? 0) + 1;
     if (r.direction) s.directions[r.direction] += 1;
     // Shadow invariant: under `labels` authority the live gate answer IS the label answer.
     if (r.liveClear !== (r.labelVerdict === 'clear')) s.liveUnchanged = false;
@@ -88,9 +149,9 @@ export function summarizeShadow(rows = []) {
 
 /** The ONE run record a pass appends. Pure given `id` and `at`. */
 export function buildShadowRunRecord({ id, at, repos = [], rows = [], summary, stores = {} }) {
-  const rec = newRunRecord({ id, op: SHADOW_OP, input: { at, repos, authority: DEFAULT_REVIEW_AUTHORITY, writer: SHADOW_WRITER } });
+  const rec = newRunRecord({ id, op: SHADOW_OP, input: { schema: 2, at, repos, authority: DEFAULT_REVIEW_AUTHORITY, writer: SHADOW_WRITER } });
   // Disagreements and unreadables first, so the bound never drops the rows that matter.
-  const rank = { disagree: 0, unreadable: 1, agree: 2 };
+  const rank = { disagree: 0, unreadable: 1, transient: 2, agree: 3 };
   const kept = [...rows].sort((a, b) => rank[a.status] - rank[b.status] || a.pr - b.pr).slice(0, MAX_ROWS);
   rec.findings = { summary, stores, rows: kept, rowsTruncated: rows.length > kept.length };
   rec.verdict = summary.disagree || summary.unreadable ? 'drift' : 'clean';
@@ -107,10 +168,10 @@ function withTimeout(promise, ms) {
  * Run the shadow for one drain pass. NEVER throws and never changes a verdict: every failure is reported in the
  * return value (and an unreadable store marks its PRs unreadable).
  * @param {{verdicts: object[], localSlug?: string|null, dryRun?: boolean, readEvents?: Function, write?: Function,
- *   mintId?: Function, now?: Function, timeoutMs?: number}} o
+ *   mintId?: Function, now?: Function, timeoutMs?: number, readiness?: Function}} o
  */
 export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun = false, readEvents = readLedgerEventsFromStore,
-  write = writeRun, mintId = newRunId, now = () => new Date().toISOString(), timeoutMs = LEDGER_READ_TIMEOUT_MS } = {}) {
+  write = writeRun, mintId = newRunId, now = () => new Date().toISOString(), timeoutMs = LEDGER_READ_TIMEOUT_MS, readiness = defaultReadiness } = {}) {
   try {
     const at = now();
     const byRepo = new Map();
@@ -132,20 +193,38 @@ export async function runLedgerShadow({ verdicts = [], localSlug = null, dryRun 
       for (const v of vs) rows.push(shadowRow({ verdict: v, repo, events, now: at }));
     }
     const summary = summarizeShadow(rows);
-    if (dryRun || !rows.length) return { ok: true, written: false, summary, rows, stores };
-    const record = buildShadowRunRecord({ id: mintId(SHADOW_OP), at, repos: [...byRepo.keys()], rows, summary, stores });
-    const path = write(record);
-    return { ok: true, written: true, id: record.id, path, summary, rows, stores };
+    if (dryRun) return { ok: true, written: false, summary, rows, stores };
+    const result = { ok: true, written: false, summary, rows, stores };
+    if (rows.length) {
+      const record = buildShadowRunRecord({ id: mintId(SHADOW_OP), at, repos: [...byRepo.keys()], rows, summary, stores });
+      Object.assign(result, { written: true, id: record.id, path: write(record) });
+    }
+    let promotion;
+    try {
+      promotion = await withTimeout(Promise.resolve().then(() => readiness({ now: at })), timeoutMs);
+      if (promotion?.status === 'unreadable') promotion = { ok: false, error: promotion.error };
+    } catch (e) { promotion = { ok: false, error: String(e?.message ?? e).split('\n')[0].slice(0, 200) }; }
+    return { ...result, readiness: promotion };
   } catch (e) {
     return { ok: false, written: false, error: String(e?.message ?? e).split('\n')[0].slice(0, 200) };
   }
 }
 
-/** The one stderr line a pass prints. Pure. */
+async function defaultReadiness({ now }) {
+  const settingsResult = resolvePromotionSettings({ repo: readSettings(), env: process.env });
+  const { runs } = readShadowRuns();
+  return { ok: true, measure: measureReadiness(runs, { now, settings: settingsResult.settings }), settingsResult };
+}
+
+/** The stderr lines a pass prints. Pure. */
 export function formatShadowLine(res) {
   if (!res?.ok) return `merge-ai-prs · ledger shadow: FAILED (${res?.error ?? 'unknown'}) — merge behaviour unaffected`;
   const s = res.summary;
-  const dis = (res.rows || []).filter((r) => r.status === 'disagree').slice(0, 10).map((r) => `#${r.pr}(${r.labelVerdict}/${r.ledgerVerdict})`).join(' ');
-  return `merge-ai-prs · ledger shadow: compared ${s.compared} · agree ${s.agree} · disagree ${s.disagree} · unreadable ${s.unreadable}`
+  const dis = (res.rows || []).filter((r) => r.status === 'disagree').slice(0, 10).map((r) => `#${r.pr}(drain:${r.labelVerdict}/ledger:${r.ledgerVerdict})`).join(' ');
+  const line = `merge-ai-prs · ledger shadow: compared ${s.compared} · agree ${s.agree} · disagree ${s.disagree} · unreadable ${s.unreadable} · transient ${s.transient ?? 0}`
     + (dis ? ` · ${dis}` : '') + (res.written ? ` · record ${res.id}` : ' · not recorded');
+  if (!res.readiness) return line;
+  const r = res.readiness;
+  return line + '\n' + (r.ok === false ? `merge-ai-prs · ledger readiness: FAILED (${r.error ?? 'unknown'})`
+    : formatReadinessLine(r.measure, r.settingsResult));
 }

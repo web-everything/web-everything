@@ -30,7 +30,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings } from '../lib/card-batch-settings.mjs';
+import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const NOT_BATCHED_EXIT = 3;
@@ -41,11 +41,13 @@ const RETRYABLE = new Set(['lease-held', 'ff-reject']);
 const optedOut = (batch) => batch === false || ['false', '0', 'no'].includes(String(batch ?? '').trim().toLowerCase());
 
 /** PURE: should this filing join the batch? */
-export function decideBatchFiling({ batch, actor = 'mechanical', priority, settings, policy }) {
+export function decideBatchFiling({ batch, actor = 'mechanical', priority, settings, policy, kind = 'filing', preventionSettings }) {
+  const activeSettings = kind === 'prevention' ? preventionSettings : settings;
+  const namespace = kind === 'prevention' ? 'prevention' : 'cards';
   if (optedOut(batch)) return { batch: false, reason: 'opt-out (--batch=false)' };
   if (INTERACTIVE_ACTORS.has(String(actor).toLowerCase())) return { batch: false, reason: `actor ${actor} files alone` };
-  if (!settings.batchFiling) return { batch: false, reason: `cards.batchFiling is off (${settings.sources?.batchFiling ?? 'standard'})` };
-  if (bypassesBatch({ priority }, policy.filing)) return { batch: false, reason: `priority ${priority} bypasses the batch` };
+  if (!activeSettings.batchFiling) return { batch: false, reason: `${namespace}.batchFiling is off (${activeSettings.sources?.batchFiling ?? 'standard'})` };
+  if (bypassesBatch({ priority }, policy[kind])) return { batch: false, reason: `priority ${priority} bypasses the batch` };
   return { batch: true, reason: 'mechanical filing' };
 }
 
@@ -76,12 +78,12 @@ export function launchSealJob(statePath, { spawn = spawnChild, open = openSync }
 export async function fileIntoBatch({
   laneDir, cardPath, source = {}, batch, actor, priority, idemKey, kind = 'filing',
 }, {
-  settings = loadCardBatchSettings(), admit = admitCard, launch = launchSealJob, stateDir = cardBatchStateDir(),
+  settings = loadCardBatchSettings(), preventionSettings = loadPreventionBatchSettings(), admit = admitCard, launch = launchSealJob, stateDir = cardBatchStateDir(),
   baseSha, log = (line) => console.error(line), retries = 5, pause = (ms) => new Promise((done) => setTimeout(done, ms)),
 } = {}) {
-  log(formatCardBatchSettings(settings));
-  const policy = effectiveCardBatchPolicy(settings);
-  const decision = decideBatchFiling({ batch, actor, priority, settings, policy });
+  log(kind === 'prevention' ? formatPreventionBatchSettings(preventionSettings) : formatCardBatchSettings(settings));
+  const policy = effectiveCardBatchPolicy(settings, preventionSettings);
+  const decision = decideBatchFiling({ batch, actor, priority, settings, preventionSettings, policy, kind });
   if (!decision.batch) return { batched: false, reason: decision.reason };
   const cardId = cardIdOf(cardPath);
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}` };

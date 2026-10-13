@@ -6,7 +6,7 @@
  *   a loud audit line). The gh shell is injected (never actually called).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
+import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, isStrippableTestPath, stripStringsAndComments, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
 
 // A capturing fake gh exec + a capturing stderr sink, so nothing shells out and the audit line is observable.
 const fakeExec = () => { const calls = []; const exec = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { ok: true }; }; return { exec, calls }; };
@@ -325,6 +325,112 @@ describe('pr-merge-gate — scanTestTampering (#2440 the deterministic gate)', (
     ].join('\n');
     // `deleted file mode` here attaches to the same non-test file → still not flagged.
     expect(scanTestTampering({ diffText: diff }).tampered).toBe(false);
+  });
+});
+
+describe('pr-merge-gate — scanTestTampering ignores skip/only markers in strings and comments (#5945, live #4717)', () => {
+  const diffOf = (lines, path = 'scripts/lib/__tests__/merge-gate-ci.test.mjs') =>
+    [`diff --git a/${path} b/${path}`, '@@', ...lines.map((l) => `+${l}`)].join('\n');
+  const scan = (lines, path) => scanTestTampering({ diffText: diffOf(lines, path) });
+  const skipped = (r) => r.findings.filter((f) => f.kind === 'test-skipped');
+
+  it('1: a marker only inside a string fixture is clean (the #4717 line)', () => {
+    expect(scan(['  "it.skip(\'x\', () => {});",']).tampered).toBe(false);
+    expect(scan(['  const s = "it.skip(\\"x\\", () => {})";']).tampered).toBe(false);
+  });
+  it('2: a template-literal line is scanned raw (accepted residual false positive)', () => {
+    expect(scan(['  const s = `describe.only(\'a\')`;']).tampered).toBe(true);
+  });
+  it('3: markers inside line comments are clean', () => {
+    expect(scan(["  // it.skip('x')"]).tampered).toBe(false);
+    expect(scan(['  run(); // xit(']).tampered).toBe(false);
+  });
+  it('4: real markers are still flagged (no over-stripping)', () => {
+    expect(skipped(scan(["  it.skip('flaky', () => {});"]))).toHaveLength(1);
+    expect(skipped(scan(["  it.skip('a'); // note"]))).toHaveLength(1);
+    expect(skipped(scan(['  it.skip']))).toHaveLength(1);
+    expect(skipped(scan(['  it.skip.each([1])("x", () => {});']))).toHaveLength(1);
+    expect(skipped(scan(['  xit("x", () => {});']))).toHaveLength(1);
+    expect(skipped(scan(['  fit("x", () => {});']))).toHaveLength(1);
+  });
+  it('5: a marker after a string on the same line is still flagged', () => {
+    expect(skipped(scan(["  foo('a'); it.skip('b')"]))).toHaveLength(1);
+  });
+  it('6: an unterminated quote or template is scanned raw', () => {
+    expect(scan(["  it.skip('x"]).tampered).toBe(true);
+    expect(scan(['  const s = `it.only( ']).tampered).toBe(true);
+  });
+  it('7: the same string fixture in a non-JS file under __tests__/ is flagged (scanned raw)', () => {
+    expect(scan(['  "it.skip(\'x\', () => {});",'], 'scripts/__tests__/fixture.md').tampered).toBe(true);
+  });
+  it('8: an escaped quote stays inside the string; an escaped backslash closes it', () => {
+    expect(scan(['  "a\\" it.skip(\'x\')"']).tampered).toBe(false);
+    expect(skipped(scan(['  "a\\\\"; it.skip(\'x\')']))).toHaveLength(1);
+  });
+  it('9: fail-closed guards — regex/division, interpolation, unclosed block comment, code beside a comment', () => {
+    expect(skipped(scan(["  /\\//.test(p); it.skip('x')"]))).toHaveLength(1);
+    expect(skipped(scan(["  /'/; it.skip(x, ''); /'/"]))).toHaveLength(1);
+    expect(skipped(scan(["  `${it.skip('x', () => {})}`"]))).toHaveLength(1);
+    expect(skipped(scan(["  /* it.skip('a')"]))).toHaveLength(1);
+    expect(skipped(scan(["  /* don't */ it.skip('x')"]))).toHaveLength(1);
+    expect(skipped(scan(["  it.skip('x') // don't"]))).toHaveLength(1);
+  });
+  it('9b: a line that closes a block comment opened earlier is scanned raw (apostrophe in the comment tail)', () => {
+    expect(skipped(scan(["  can't */ it.skip('x') // it's"]))).toHaveLength(1);
+    expect(stripStringsAndComments("a */ b 'c'")).toBe("a */ b 'c'");
+  });
+  it('9c: the line after a backslash-continued line is scanned raw (escaped-newline string continuation)', () => {
+    expect(skipped(scan(["  const a = 'x\\", "  '; it.skip('y', () => {}); const b = 'z\\", "  ';"]))).toHaveLength(1);
+    // an even run of backslashes is an escaped backslash, not a continuation: the next line is stripped as usual
+    expect(scan(['  // dir C:\\\\', '  "it.skip(\'x\')"']).tampered).toBe(false);
+    // …and a single trailing backslash IS a continuation (same second line is now scanned raw)
+    expect(scan(['  // dir C:\\', '  "it.skip(\'x\')"']).tampered).toBe(true);
+  });
+  it('9d: .jsx/.tsx files are scanned raw (JSX text apostrophes are not string delimiters)', () => {
+    for (const ext of ['jsx', 'tsx']) {
+      expect(skipped(scan(["  <p>don't</p>; it.skip('x', () => {}); <p>can't</p>"], `scripts/__tests__/ui.test.${ext}`))).toHaveLength(1);
+    }
+  });
+  it('10: a marker-free mid-line string stays clean', () => {
+    expect(scan(["  const note = 'todo: drop the it.skip before merge';"]).tampered).toBe(false);
+  });
+  it('11: closingMultilineTemplateDoesNotHideSkip — a backtick line is never stripped', () => {
+    const open = 'const a = `';
+    const mid = "`; it.skip('x', () => {}); const b = `";
+    expect(skipped(scan([open, mid, '`;']))).toHaveLength(1);
+    expect(skipped(scan([mid]))).toHaveLength(1);
+    expect(skipped(scan(["  body text `; describe.only('x', () => {}); const b = `"]))).toHaveLength(1);
+    expect(skipped(scan(["  `; it.skip.each([1])('x', () => {}); `"]))).toHaveLength(1);
+    expect(skipped(scan(['  `; xit("x"); `']))).toHaveLength(1);
+    expect(skipped(scan(['  `; fit("x"); `']))).toHaveLength(1);
+    // a backtick inside a quote/comment before the executable marker: the pre-check runs before any stripping
+    expect(skipped(scan(["  '`'; it.skip('x', () => {});"]))).toHaveLength(1);
+    // a mid-template line (no backtick) with interpolation is scanned raw too
+    expect(skipped(scan(["  text ${'a'} ${it.skip('x', () => {})} 'b'"]))).toHaveLength(1);
+    // the exact partial-hunk fixture: context lines are not counted as added
+    const partial = [
+      'diff --git a/scripts/__tests__/template-boundaries.test.mjs b/scripts/__tests__/template-boundaries.test.mjs',
+      '--- a/scripts/__tests__/template-boundaries.test.mjs',
+      '+++ b/scripts/__tests__/template-boundaries.test.mjs',
+      '@@ -1,2 +1,3 @@',
+      ' const a = `',
+      "+`; it.skip('x', () => {}); const b = `",
+      ' `;',
+    ].join('\n');
+    const r = scanTestTampering({ diffText: partial });
+    expect(r.tampered).toBe(true);
+    expect(skipped(r)).toHaveLength(1);
+    expect(skipped(r)[0].detail).toBe('1 skip/only marker(s) added');
+  });
+  it('the helper only deletes: returns the original line on any unknown context', () => {
+    expect(stripStringsAndComments('a `b')).toBe('a `b');
+    expect(stripStringsAndComments("x = 'it.skip(' + y")).toBe("x = '' + y");
+    expect(stripStringsAndComments('a / b')).toBe('a / b');
+    expect(stripStringsAndComments('/* c */ go() /* d */')).toBe(' go() ');
+  });
+  it('isStrippableTestPath covers plain JS/TS extensions only (not jsx/tsx)', () => {
+    for (const p of ['a.js', 'a.mjs', 'a.cjs', 'a.ts', 'a.mts', 'a.cts']) expect(isStrippableTestPath(p)).toBe(true);
+    for (const p of ['a.jsx', 'a.tsx', 'a.md', 'a.json', 'a.mjs.snap', '']) expect(isStrippableTestPath(p)).toBe(false);
   });
 });
 

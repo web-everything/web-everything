@@ -5,7 +5,7 @@
  *   requeued, stalled → stopped then requeued, 3 attempts → failed, the cap), stopping a frozen process, and
  *   one real detached launch from a pinned snapshot that finishes exactly once.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, probeHandle, readProcStart,
+  JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
   reattachTick, runJob, selfHandle, stopHandle,
 } from '../daemon-jobs-runtime.mjs';
 import { defineJobKind, kindRegistry, markClaimed, markLaunching } from '../daemon-jobs.mjs';
@@ -73,7 +73,72 @@ describe('createJobStore.list — sidecar files vs torn records', () => {
   });
 });
 
+describe('localHostAliases', () => {
+  it('collects sanitized hostname and macOS names with bounded scutil calls, without caching injected options', () => {
+    const execFn = vi.fn((command, args) => args[1] === 'LocalHostName' ? ' MacBook-Pro\n' : ' My Mac:Book\n');
+    const options = { host: 'Mac:Office.example', platform: 'darwin', execFn };
+    const expected = new Set(['Mac-Office.example', 'Mac-Office', 'Mac-Office.local', 'MacBook-Pro', 'MacBook-Pro.local', 'My-Mac-Book']);
+    expect(localHostAliases(options)).toEqual(expected);
+    expect(execFn.mock.calls).toEqual([
+      ['scutil', ['--get', 'LocalHostName'], { timeout: 5_000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }],
+      ['scutil', ['--get', 'ComputerName'], { timeout: 5_000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }],
+    ]);
+    expect(localHostAliases(options)).toEqual(expected);
+    expect(execFn).toHaveBeenCalledTimes(4);
+  });
+
+  it('uses only hostname aliases on Linux without executing commands', () => {
+    const execFn = vi.fn();
+    expect(localHostAliases({ host: 'server.example', platform: 'linux', execFn })).toEqual(new Set(['server.example', 'server', 'server.local']));
+    expect(execFn).not.toHaveBeenCalled();
+  });
+
+  it('skips a throwing scutil call and still collects the other name', () => {
+    const execFn = vi.fn((command, args) => {
+      if (args[1] === 'LocalHostName') throw new Error('unavailable');
+      return 'My Mac';
+    });
+    expect(localHostAliases({ host: 'Mac', platform: 'darwin', execFn })).toEqual(new Set(['Mac', 'Mac.local', 'My-Mac']));
+    expect(execFn).toHaveBeenCalledTimes(2);
+    expect(localHostAliases({ host: 'Mac', platform: 'darwin', execFn: () => { throw new Error('unavailable'); } })).toEqual(new Set(['Mac', 'Mac.local']));
+  });
+
+  it('drops empty names rather than adding an empty short-name alias', () => {
+    expect(localHostAliases({ host: '', platform: 'darwin', execFn: () => ' \n' })).toEqual(new Set());
+  });
+});
+
 describe('handle liveness', () => {
+  const oldHandle = 'MacBook-Pro.local:43287:Mon Oct 12 18:14:01 2026';
+  const aliases = new Set(['Mac', 'MacBook-Pro', 'MacBook-Pro.local']);
+
+  it('recognizes an old local hostname when pid and start time match', () => {
+    const readStart = vi.fn(() => 'Mon Oct 12 18:14:01 2026');
+    expect(probeHandle(oldHandle, { host: 'Mac', aliases, readStart })).toBe('alive');
+    expect(readStart).toHaveBeenCalledWith(43287);
+  });
+
+  it('reads an old-name handle with a gone pid as dead', () => {
+    expect(probeHandle(oldHandle, { host: 'Mac', aliases, readStart: () => null })).toBe('dead');
+  });
+
+  it('reads an old-name handle with a reused pid as dead', () => {
+    expect(probeHandle(oldHandle, { host: 'Mac', aliases, readStart: () => 'Tue Oct 13 09:00:00 2026' })).toBe('dead');
+  });
+
+  it('does not probe another machine even when local aliases are supplied', () => {
+    const readStart = vi.fn();
+    expect(probeHandle('some-other-host:43287:Mon Oct 12 18:14:01 2026', { host: 'Mac', aliases, readStart })).toBe('foreign');
+    expect(readStart).not.toHaveBeenCalled();
+  });
+
+  it('keeps exact-match behavior when only host is injected', () => {
+    const readStart = vi.fn(() => 'Mon Oct 12 18:14:01 2026');
+    expect(probeHandle(oldHandle, { host: 'MacBook-Pro', readStart })).toBe('foreign');
+    expect(readStart).not.toHaveBeenCalled();
+    expect(probeHandle(oldHandle, { host: 'MacBook-Pro.local', readStart })).toBe('alive');
+  });
+
   it('reads this process as alive and refuses the same pid with another start time (pid reuse)', () => {
     const me = selfHandle();
     expect(me.procStart).toBeTruthy();

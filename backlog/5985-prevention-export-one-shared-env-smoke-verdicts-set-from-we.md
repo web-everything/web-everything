@@ -43,3 +43,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5045 (finding 1: `we:scripts/lib/daemon-live-smoke.mjs:1031` — Add a unit test for a mixed-probe sequence; judge the final verdict on the last attempt's probe, or require the last probe to be unavailable.)

@@ -42,6 +42,7 @@ export default {
       const dispatched = [];
       const results = watchParkedPrConflicts({
         repo: 'o/n',
+        sameLineConflict: 'stand-down',
         listPrs: () => [{ number: 3771, mergeable: 'CONFLICTING', headRefName: 'lane/judge-decision-2026-10-03',
           labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }] }],
         provider: { currentRepo: () => 'o/n', ensureLabel() {}, setLabels() {}, postComment() {} },

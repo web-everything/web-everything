@@ -35,11 +35,11 @@ const validValue = (key, value) => key === 'batchFiling'
   : Number.isSafeInteger(value) && value > 0;
 
 /** Env strings → typed values; anything unparseable stays a string so it fails validation by name. */
-function envLayer(env) {
+function envLayer(env, keys = CARD_BATCH_SETTING_KEYS, names = CARD_BATCH_ENV) {
   if (!isObject(env)) return undefined;
   const layer = {};
-  for (const key of CARD_BATCH_SETTING_KEYS) {
-    const raw = env[CARD_BATCH_ENV[key]];
+  for (const key of keys) {
+    const raw = env[names[key]];
     if (raw === undefined || raw === '') continue;
     if (key === 'batchFiling') layer[key] = raw === '1' || raw === 'true' ? true : raw === '0' || raw === 'false' ? false : raw;
     else layer[key] = /^\d+$/.test(String(raw)) ? Number(raw) : raw;
@@ -89,9 +89,58 @@ export function loadCardBatchSettings({
   return resolveCardBatchSettings({ standard, platform: readCards(platformPath, read), repo, env });
 }
 
-/** The full card-batch policy with the `filing` kind overlaid by the effective `cards.*` settings. */
-export function effectiveCardBatchPolicy(settings = loadCardBatchSettings()) {
+/**
+ * Prevention uses the same per-key cascade as cards: standard prevention policy → platform.prevention →
+ * declared repo prevention → env. The standard window is 120 minutes; the operator's 60-minute default
+ * lives in scripts/settings/prevention-batch.json. Invalid optional values retain the lower layer.
+ */
+const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards']);
+const PREVENTION_BATCH_ENV = Object.freeze({
+  batchFiling: 'WE_PREVENTION_BATCH_FILING',
+  batchWindowMinutes: 'WE_PREVENTION_BATCH_WINDOW_MINUTES',
+  batchMaxCards: 'WE_PREVENTION_BATCH_MAX_CARDS',
+});
+
+/** PURE: resolve boolean batchFiling and positive integer window/count, retaining each source. */
+export function resolvePreventionBatchSettings({ standard, platform, repo, env } = {}) {
+  if (!isObject(standard)) throw new TypeError('prevention batch settings: standard prevention policy is required');
+  const out = { batchFiling: standard.enabled, batchWindowMinutes: standard.maxAgeMinutes, batchMaxCards: standard.maxCards };
+  const sources = Object.fromEntries(PREVENTION_BATCH_SETTING_KEYS.map((k) => [k, 'standard']));
+  const invalid = [];
+  for (const [name, layer] of [['platform', platform], ['repo', repo],
+    ['env', envLayer(env, PREVENTION_BATCH_SETTING_KEYS, PREVENTION_BATCH_ENV)]]) {
+    if (!isObject(layer)) continue;
+    for (const key of PREVENTION_BATCH_SETTING_KEYS) {
+      if (!Object.hasOwn(layer, key)) continue;
+      if (!validValue(key, layer[key])) { invalid.push(`${name}.${key}`); continue; }
+      out[key] = layer[key];
+      sources[key] = name;
+    }
+  }
+  return { ...out, sources, invalid };
+}
+
+/** One log line naming every prevention value, source and ignored invalid setting. */
+export function formatPreventionBatchSettings(settings) {
+  const parts = PREVENTION_BATCH_SETTING_KEYS.map((k) => `prevention.${k}=${settings[k]} (${settings.sources?.[k] ?? 'standard'})`);
+  if (settings.invalid?.length) parts.push(`ignored invalid: ${settings.invalid.join(', ')}`);
+  return `prevention-batch settings: ${parts.join(', ')}`;
+}
+
+/** IO: optional platform/repo layers may be missing or unreadable. */
+export function loadPreventionBatchSettings({
+  env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH,
+  repo = (() => { try { return readSettings()?.prevention; } catch { return undefined; } })(),
+} = {}) {
+  let platform;
+  try { platform = JSON.parse(read(platformPath, 'utf8'))?.prevention; } catch { /* no preference */ }
+  return resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, platform, repo, env });
+}
+
+/** The full policy with independent filing and prevention settings overlays. */
+export function effectiveCardBatchPolicy(settings = loadCardBatchSettings(), prevention = loadPreventionBatchSettings()) {
   return loadCardBatchPolicy({
     filing: { enabled: settings.batchFiling, maxCards: settings.batchMaxCards, maxAgeMinutes: settings.batchMaxMinutes },
+    prevention: { enabled: prevention.batchFiling, maxCards: prevention.batchMaxCards, maxAgeMinutes: prevention.batchWindowMinutes },
   });
 }
