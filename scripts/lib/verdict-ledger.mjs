@@ -607,6 +607,10 @@ const EVENT_PAYLOAD = Object.freeze({
     ['label', isStr, (v) => oneLine(v, 128)],
     ['sender', isStr, (v) => oneLine(v, 200)],
     ['change', oneOf(LABEL_INPUT_CHANGES), (v) => v],
+    // Optional for legacy rows. The mirror witnesses the clearances already present when it observed a
+    // hold; a clearance outside this baseline wins even if it persists before the delayed input append.
+    ['clearanceBaseline', (v) => v === undefined || (Array.isArray(v) && v.every(id => typeof id === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(id))), (v) => v === undefined ? undefined : [...v]],
+    ['timelineId', (v) => v === undefined || (typeof v === 'string' && v.length > 0 && v.length <= 200), (v) => v],
   ],
   // Card 5469 — identity = path + symbol + defect class (never free text). `path`/`symbol` may be empty (a finding
   // citing no file, or a line outside any named declaration); `round` is the review round on this head (>= 1).
