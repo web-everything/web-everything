@@ -153,12 +153,16 @@ afterAll(() => {
 const HERMETIC_FREEZE_ENV = { WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only' };
 
 /** Run the REAL entrypoint against a canned fixture, return its parsed --json result. */
-function runDrain(fixture, args) {
+// The narrow human-review default demotes gate-self edits to AI care; tests that prove the entrypoint's human park
+// over a gate-config.mjs fixture opt into the broad surface set, as pr-land.test.mjs does for its restore path.
+const BROAD_HUMAN_SURFACES_ENV = { WE_HUMAN_REVIEW_SURFACES: 'broad' };
+
+function runDrain(fixture, args, extraEnv = {}) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
   writeFileSync(fxPath, JSON.stringify(fixture));
   const stdout = execFileSync('node', [SCRIPT, ...args, '--dry-run', '--this-repo', '--json'], {
     cwd: workDir,                                   // a clean dir — no park-state, no real repo
-    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -170,14 +174,14 @@ function runDrain(fixture, args) {
  *  lease bypassed (`--no-drain-lease`, the documented tests/break-glass escape) and every `gh pr comment`
  *  recorded. Returns `{ result, comments }`. Used only by the finding-1 test — a merge never happens because the
  *  fixtures are all held/parked (empty `toMerge`), so the cascade is a no-op and nothing touches the real tree. */
-function runDrainLive(fixture, args) {
+function runDrainLive(fixture, args, extraEnv = {}) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
   const logPath = join(workDir, `comments-${fixture._id}.log`);
   writeFileSync(fxPath, JSON.stringify(fixture));
   writeFileSync(logPath, '');
   const stdout = execFileSync('node', [SCRIPT, ...args, '--no-drain-lease', '--this-repo', '--json'], {
     cwd: workDir,
-    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -214,13 +218,13 @@ describe('the real drain entrypoint consults the gate before merging', () => {
           labels: [{ name: 'ready-to-merge' }, { name: 'review:human' }], _commits: AI_COMMIT, _files: [{ path: 'backlog/y.md', additions: 2, deletions: 0 }] },
       ],
     };
-    const r = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    const r = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels'], BROAD_HUMAN_SURFACES_ENV);
 
     // the clean leaf PR is landable — the entrypoint would merge it
     expect(nums(r.toMerge)).toContain(101);
 
-    // the gate-self PR must be PARKED as human-required, and must NOT be in the merge set — the core proof
-    // that the REAL entrypoint refuses to auto-merge an edit to its own gate
+    // under the broad surface set the gate-self PR must be PARKED as human-required, and must NOT be in the merge
+    // set — the proof that the REAL entrypoint refuses to auto-merge an edit to its own gate
     expect(nums(r.toMerge)).not.toContain(102);
     expect(nums(r.merged)).not.toContain(102);
     const p102 = r.parked.find((p) => Number(p.num) === 102);
@@ -239,6 +243,12 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     const p103 = r.parked.find((p) => Number(p.num) === 103);
     expect(p103).toBeTruthy();
     expect(p103.humanRequired).toBe(true);
+
+    // Under the narrow default (no opt-in) the gate-self edit still never lands — it parks for AI care, not a human.
+    const narrow = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    expect(nums(narrow.toMerge)).not.toContain(102);
+    expect(nums(narrow.merged)).not.toContain(102);
+    expect(narrow.parked.find((p) => Number(p.num) === 102)?.humanRequired).toBe(false);
   });
 
   // #2502 — the tip commit's head SHA, threaded onto every emitted result-bucket entry (not just `toMerge`),
@@ -631,7 +641,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
           labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], ...stale },
       ],
     };
-    const { result, comments } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
+    const { result, comments } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels'], BROAD_HUMAN_SURFACES_ENV);
 
     // Both are held and re-parked HUMAN — the notice changes no merge decision (#2285 INVARIANT 2 intact).
     expect(nums(result.toMerge)).toEqual([]);
