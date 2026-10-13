@@ -1,0 +1,4 @@
+{
+  "$comment-mergeQueue-numberCardsBeforeEnqueue": "Number hash backlog cards and resolve the PR's own card on its branch before enqueueing in GitHub's merge queue. The new head must pass review and CI again. Queue lands never publish numbering or resolve commits to main; merge_group CI refuses remaining hash cards. Override with WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE=on|off|true|false|1|0. drain-direct keeps its existing behaviour.",
+  "mergeQueue": { "numberCardsBeforeEnqueue": true }
+}
