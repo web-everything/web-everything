@@ -139,9 +139,12 @@ export function summarizeFastDrain(json, num) {
   const hit = (list) => (Array.isArray(list) ? list.find((x) => Number(x?.num) === Number(num)) : null);
   const failed = hit(json.failed);
   if (failed) return `failed: ${String(failed.detail || failed.reason || failed.error || '').slice(0, 200)}`;
+  const aborted = hit(json.revalidationAborted);
+  if (aborted) return `not enqueued: ${String(aborted.reason || aborted.detail || '').slice(0, 200)}`;
+  // An enqueued PR is also listed in skipReasons ("ready-not-reached": queued, not merged), so toMerge wins over it.
+  if (hit(json.merged) || hit(json.toMerge)) return 'passed every drain gate — enqueued';
   const skip = hit(json.skipReasons) || hit(json.skipped);
   if (skip) return `skipped: ${String(skip.reason || skip.kind || '').slice(0, 200)}`;
-  if (hit(json.merged) || hit(json.toMerge)) return 'passed every drain gate — enqueued';
   if (!json.considered) return 'not listed (not ready-to-merge, closed, or already queued)';
   return 'no verdict for the PR';
 }

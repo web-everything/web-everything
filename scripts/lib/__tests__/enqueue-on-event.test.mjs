@@ -295,3 +295,14 @@ describe('wakeWorthy — a wake filter, never the gate', () => {
     expect(lines.some((l) => l.includes('#42') && l.includes('not woken'))).toBe(true);
   });
 });
+
+describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)', () => {
+  it('reports an enqueued PR as enqueued although the drain also lists it as ready-not-reached', () => {
+    const json = { considered: 1, toMerge: [{ num: 5202 }], failed: [], skipReasons: [{ num: 5202, kind: 'ready-not-reached', reason: 'ready at pass start; the pass ended before it was reached' }] };
+    expect(summarizeFastDrain(json, 5202)).toMatch(/enqueued/);
+  });
+  it('reports a revalidation abort as not enqueued', () => {
+    const json = { considered: 1, toMerge: [{ num: 7 }], revalidationAborted: [{ num: 7, reason: 'numbered card(s) on branch before enqueue' }], skipReasons: [] };
+    expect(summarizeFastDrain(json, 7)).toMatch(/^not enqueued: numbered/);
+  });
+});
