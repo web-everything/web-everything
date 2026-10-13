@@ -39,3 +39,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5038 (finding 1: `we:scripts/lib/build-queue.mjs:28` — failing-input, degraded Canonical zero-padded numeric IDs silently lose their build priority.)
