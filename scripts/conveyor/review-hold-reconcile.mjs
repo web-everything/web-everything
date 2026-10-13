@@ -28,11 +28,11 @@
  * (`we:scripts/lib/review-escalation.mjs`) stops FUTURE occurrences, but an already-contradictory PR needs its
  * COMMENT HISTORY read first: #x9xqexm forbids an automated pass from ever deleting a GENUINE, currently-valid
  * human clearance, and a label-only read cannot tell one from a bare, superseded agent accept. So this sweep
- * fetches comments ONLY for a PR that already carries the pair (cheap — never a list-wide hop), and:
+ * re-reads metadata and complete comments for every cleanup candidate, and:
  *   - a genuine clearance of the LIVE head (`parseLatestHumanClearedSha` matches) → FLAG only, same as before;
  *   - no such clearance (the confirmed #2766/#2767 shape) → HEAL: `review:accepted` comes off, `review:human`
  *     stays, a durable comment explains why (`decideContradictoryVerdictHeal`/`buildContradictoryVerdictHealComment`).
- *   - the fetch itself fails → FLAG only (fail closed toward NEVER deleting on unproven data).
+ *   - a live read fails → SKIP with a diagnostic (never delete on unproven data).
  *
  * NOT A DUPLICATE of `we:scripts/conveyor/advisory-label-sweep.mjs` — that sweep drops an advisory label whose
  * REVIEWED HEAD has gone stale (the PR moved past what the advisory looked at); this one drops an advisory label
@@ -61,7 +61,8 @@ import {
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { defaultListPrs } from './advisory-label-sweep.mjs';
+import { defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -126,45 +127,64 @@ export function needsReviewHoldCleanup(pr) {
  * Drop every stray review-hold / gate-scoped-advisory label off every open PR that carries one, and — for a
  * PR carrying the contradictory `review:accepted` + `review:human` pair (#2766/#2767) — either HEAL it
  * (`review:accepted` off, a comment explaining why, `review:human` untouched) or FLAG it, depending on what
- * that PR's own comment history proves. `readPrState`/comments are fetched LAZILY, only for a PR
- * `planReviewHoldCleanup` already flagged from its labels alone — never a list-wide hop.
+ * that PR's own comment history proves. Snapshot labels only nominate candidates; fresh metadata
+ * and a complete thread decide every removal, in dry-run as well as real execution.
  * @param {{repo?: string|null, listPrs?: Function, provider?: object, dryRun?: boolean}} [o]
  * @returns {Array<{num: number, remove?: string[], healed?: string[], commentPosted?: boolean,
- *   flagged?: string[], flagReason?: string, error?: string, fetchError?: string}>} one entry per PR that
+ *   flagged?: string[], flagReason?: string, error?: string, skipped?: string}>} one entry per PR that
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
+  readComments = readCompletePrComments, readPr = defaultReadPr,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
   let resolvedRepo = repo;
-  const repoOf = () => { if (resolvedRepo == null) resolvedRepo = provider.currentRepo(); return resolvedRepo; };
+  const repoOf = () => {
+    if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+    if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
+    return resolvedRepo;
+  };
   for (const pr of Array.isArray(prs) ? prs : []) {
-    const plan = planReviewHoldCleanup({ currentLabels: pr.labels });
+    if (!needsReviewHoldCleanup(pr)) continue;
+    let state;
+    try {
+      const metadata = provider.readPrState(repoOf(), pr.number);
+      state = { ...metadata, comments: readComments(pr.number, { repo: repoOf() }) };
+      if (state.state !== 'OPEN') throw new Error('PR is not open');
+      if (!Array.isArray(state.labels) || state.labels.some((label) =>
+        typeof (label?.name ?? label) !== 'string' || !(label?.name ?? label).trim())) throw new Error('unusable labels');
+      if (typeof state.headRefOid !== 'string' || !state.headRefOid.trim()) throw new Error('missing head');
+      if (!Array.isArray(state.comments)) throw new Error('comments read returned no array');
+      if (state.number != null && state.number !== pr.number) throw new Error('PR number mismatch');
+    } catch (e) {
+      results.push({ num: pr.number, skipped: `live re-read failed: ${String(e?.message ?? e).split('\n')[0]}` });
+      continue;
+    }
+    const plan = planReviewHoldCleanup({ currentLabels: state.labels });
     if (plan.remove.length === 0 && !plan.flagged?.length) continue;
     const entry = { num: pr.number, ...(plan.remove.length ? { remove: plan.remove } : {}) };
+    let cleanupApplied = dryRun;
     if (!dryRun && plan.remove.length) {
       try {
         provider.setLabels(repoOf(), pr.number, { remove: plan.remove });
+        cleanupApplied = true;
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
       }
     }
     if (plan.flagged?.length) {
-      // LAZY fetch — one `gh pr view` (labels/headRefOid/comments in the SAME call, `PR_STATE_FIELDS`), only
-      // for a PR that already tripped the label-only check above.
-      let state = null;
-      let fetchErr = null;
-      try { state = provider.readPrState(repoOf(), pr.number); } catch (e) { fetchErr = String((e && e.message) || e).split('\n')[0]; }
       const heal = decideContradictoryVerdictHeal({
-        currentLabels: pr.labels,
-        humanClearedSha: state ? parseLatestHumanClearedSha(state.comments) : null,
-        headSha: state ? state.headRefOid : null,
-        fetchOk: !!state,
+        currentLabels: state.labels,
+        humanClearedSha: parseLatestHumanClearedSha(state.comments),
+        headSha: state.headRefOid,
+        fetchOk: true,
       });
       if (heal.heal) {
-        const toRemove = heal.decision.removeLabels.filter((l) => hasReviewLabel(pr.labels, l));
+        // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.
+        const toRemove = heal.decision.removeLabels.filter((l) => hasReviewLabel(state.labels, l)
+          && !(cleanupApplied && plan.remove.includes(l)));
         entry.healed = toRemove;
         if (!dryRun) {
           // COMMENT FIRST (mirrors `review-set-label.mjs`'s own #2964 ordering, applied here in the SAFER
@@ -188,7 +208,6 @@ export function sweepReviewHoldLabels({
       } else {
         entry.flagged = plan.flagged;
         entry.flagReason = heal.reason;
-        if (fetchErr) entry.fetchError = fetchErr;
       }
     }
     results.push(entry);
@@ -202,23 +221,17 @@ export function sweepReviewHoldLabels({
   } catch (e) {
     results.push({ num: 0, carry: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
-  // `advisory:ruling-needed` — a derived label (a parked review whose confirmed findings await the operator's
-  // ruling on the current head), added and removed from the SAME listing this sweep already read. Its own entry
-  // shape (`ruling`), so the three existing fields above keep their meaning. A failure here never costs the sweep.
-  // `review.referralDefault=auto-block`: rule the confirmed referrals `block` as `auto-policy` and send the PR back BEFORE
-  // the label sweep, which then skips them (the listing above is stale for those PRs). Off by default (`operator`).
-  const autoBlocked = new Set();
+  // Each composed writer gets its own live read. In particular, the ruling-label pass
+  // must see any new rulings or label changes after auto-block, never reuse its decision record.
   try {
-    for (const r of sweepAutoBlock({ repo, resolveRepo: () => repoOf(), listPrs: () => prs, dryRun, ...(settings ? { settings } : {}), ...(runRuling ? { runRuling } : {}) })) {
+    for (const r of sweepAutoBlock({ repo, resolveRepo: () => repoOf(), readPr, listPrs: () => prs, dryRun, ...(settings ? { settings } : {}), ...(runRuling ? { runRuling } : {}) })) {
       results.push({ num: r.num, autoBlock: r.action, findings: r.findings, operatorKept: r.operatorKept, ...(r.error ? { error: r.error } : {}) });
-      // Only a PR with nothing left for the operator skips the label sweep; judgment calls and disputes keep the signal.
-      if (r.action === 'auto-blocked' && !r.operatorKept) autoBlocked.add(r.num);
     }
   } catch (e) {
     results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
   try {
-    for (const r of sweepRulingNeededLabels({ repo, listPrs: () => prs.filter((p) => !autoBlocked.has(p.number)), provider, dryRun })) {
+    for (const r of sweepRulingNeededLabels({ repo: resolvedRepo, listPrs: () => prs, readPr, provider, dryRun })) {
       results.push({ num: r.num, ruling: r.action, ...(r.error ? { error: r.error } : {}) });
     }
   } catch (e) {
@@ -244,6 +257,7 @@ if (IS_CLI) {
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
+        if (r.skipped) writeLineSync(2, `  ⚠ PR #${r.num}: ${r.skipped}`);
         if (r.remove?.length) {
           const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
           writeLineSync(2, `  ⚠ PR #${r.num}: ${did} remove ${r.remove.join(',')} (stray review-hold / gate-scoped advisory)${r.error ? ` (${r.error})` : ''}`);

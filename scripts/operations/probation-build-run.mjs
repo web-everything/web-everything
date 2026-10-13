@@ -78,6 +78,7 @@ import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
+import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
 import { parseCard } from '../lib/priority-order.mjs';
 import { appendScorecard as appendScorecardRow } from '../conveyor/run-scorecard-store.mjs';
@@ -271,6 +272,7 @@ export async function runProbationBuild(args, io) {
   if (!['doc-fix', 'bugfix', 'test-fix', 'prepare'].includes(taskType)) throw new Error('taskType must be doc-fix or bugfix or test-fix or prepare');
   if (!num || !session || !worker?.id) throw new Error('probation-build-run: --num, --session and --worker are required');
   const preparing = taskType === 'prepare';
+  const prepareAutoSize = preparing && (io.preparePolicy ?? readPreparePolicy()).autoSize;
   if (preparing && !['codex', 'antigravity-gemini'].includes(worker.id)) throw new Error('prepare requires codex or antigravity-gemini');
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);
   let declinedReason = null;
@@ -614,8 +616,14 @@ export async function runProbationBuild(args, io) {
           if (!verdict.approved) return abandon('gate-red', `the ${worker.checker} checker did not approve: ${verdict.reason}`, { diff: diffRow });
         }
 
+        const sizeFields = preparing && prepareAutoSize ? parseYamlFrontmatter(postWorkerItem.raw) : null;
+        const missingSize = sizeFields && (sizeFields.kind === 'task'
+          ? !(Number.isInteger(sizeFields.estimatedLoc) && sizeFields.estimatedLoc > 0)
+          : !String(sizeFields.size ?? '').trim());
         const resolved = preparing
-          ? (missingTestScope(postWorkerItem.raw).length
+          ? (missingSize
+            ? { ok: false, out: 'Missing size: a task needs a positive integer estimatedLoc (a story needs size:) — author it from the touch set' }
+            : missingTestScope(postWorkerItem.raw).length
             ? { ok: false, out: `Missing test scope: ${missingTestScope(postWorkerItem.raw).join(', ')}` }
             : prepareCardStatus(postWorkerItem?.raw).hasSections
             ? io.stampPrepare(num, lanePath)

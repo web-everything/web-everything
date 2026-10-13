@@ -157,6 +157,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // `build` gate, so the two cores can never disagree about what a given marker holds. No fs comes in with it.
 import { resolvePausedKinds, isScopedPause } from '../readiness/dispatch-pause.mjs';
 import { createQueueBudget, dispatchDemandMinutes, DEFAULT_ARRIVAL_WINDOW_MINUTES } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — the pure queue-time admission (the IO half lives in heavy-admission.mjs)
+import { readPreparePolicy } from './prepare-policy-settings.mjs';
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
 
@@ -1274,13 +1275,20 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // same way. And with `config.prepareAheadWindow` set (the build daemon passes 4), only the cards within the next
   // N to build (pinned first) are prepared now; the rest wait, noted `prepare-ahead-window`.
   // builder-starved — a card the caller holds (`bookkeeping.prepareHeldNums`) never takes a window slot.
+  const prepareAutoSize = config.prepareAutoSize === true || (
+    config.prepareAutoSize === undefined && Array.isArray(config.launchKinds)
+    && config.launchKinds.includes('prepare-item') && !config.launchKinds.includes('prepare')
+    && readPreparePolicy().autoSize);
   const prepareWindow = prepareAheadNums({
-    queue, launch: plan.launch, held: plan.held,
+    queue, launch: plan.launch,
+    held: prepareAutoSize && Array.isArray(plan.held)
+      ? plan.held.map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
+      : plan.held,
     window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
     skip: bookkeeping.prepareHeldNums ?? [],
   });
   const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
-    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale') && h.num != null);
+    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null);
   const needsPrepareHeld = prepareCandidates
     .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
     .map((h) => ({ num: h.num }));
@@ -1293,7 +1301,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
 
   // #3849 — the `no-size` holds, read straight off THIS TICK's dispatch plan, same pattern as
   // `needs-investigation` just above (#3567): a no-size item has no separate `state` derivation step either.
-  // UNLIKE investigation, it is NOT a distinct spawn kind — it is folded into the SAME `prepare` candidate set
+  // Unless auto-size routes it to prepare-item above, it is folded into the SAME `prepare` candidate set
   // as `unshaped` (not a new sink, no new guard `kind`), because #3842's prepare-scope agent already authors a
   // missing size/estimate in the same turn it authors a missing `scope:` — one prepare agent serves both holds.
   // A num held BOTH `unshaped-no-scope` and `no-size` is deduped (dispatch-plan.mjs never emits both for the
@@ -1301,7 +1309,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   const noSizeHeld = (Array.isArray(plan.held) ? plan.held : [])
     .filter((h) => h && h.reason === 'no-size' && h.num != null)
     .map((h) => ({ num: h.num }));
-  const scopeOrSizeNeeded = noSizeHeld.length === 0 ? unshaped : [
+  const scopeOrSizeNeeded = prepareAutoSize
+    ? (Array.isArray(unshaped) ? unshaped : []).filter(u => !noSizeHeld.some(n => normNum(n.num) === normNum(u.num)))
+    : noSizeHeld.length === 0 ? unshaped : [
     ...(Array.isArray(unshaped) ? unshaped : []),
     ...noSizeHeld.filter((n) => !(Array.isArray(unshaped) ? unshaped : []).some((u) => normNum(u.num) === normNum(n.num))),
   ];

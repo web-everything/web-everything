@@ -92,6 +92,11 @@ export type WindowedCollectionFlavorName = string; // owned by #2523 (list-virtu
 export type CrossProviderFallbackPolicy = 'park-now' | 'wait-then-park' | 'same-provider-other-model';
 export type CrossProviderFallbackFlavorName = CrossProviderFallbackPolicy;
 
+/** Where backlog IDs are numbered (#3732). `integration-branch` is declared but unbuilt. */
+export type BacklogIdNumberingSetting = 'producer-at-pr-open' | 'integration-branch';
+/** How far the backlog ID check reaches (#3732). `full-history-squash` is declared but unbuilt. */
+export type BacklogIdReachSetting = 'tip-tree' | 'full-history-squash';
+
 /** The inline value shape of the `crossProviderFallback` dimension. */
 export interface CrossProviderFallbackValue {
   policy: CrossProviderFallbackPolicy;
@@ -128,6 +133,10 @@ export interface WebEverythingConfig {
    * `same-provider-other-model`, plus the `waitTimeoutMs` parameter. Resolved via `config-extends-platform-default`.
    */
   crossProviderFallback?: DimensionEntry<CrossProviderFallbackFlavorName, CrossProviderFallbackValue>;
+  /** Backlog numbering location; resolved and enforced by repo tooling (#4985). */
+  backlogIdNumbering?: DimensionEntry<BacklogIdNumberingSetting, BacklogIdNumberingSetting>;
+  /** Backlog reach-main extent; resolved and enforced by repo tooling (#4985). */
+  backlogIdReach?: DimensionEntry<BacklogIdReachSetting, BacklogIdReachSetting>;
   /** Open-set: any further dimension keyed by name. */
   [dimension: string]: DimensionEntry | undefined;
 }

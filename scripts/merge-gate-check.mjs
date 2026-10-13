@@ -3,7 +3,8 @@
  * @file scripts/merge-gate-check.mjs
  * @description The required `merge-gate` CI check: every gate the drain applies right before its merge write,
  *   evaluated in CI so GitHub's merge queue can do the merging (strategy `github-merge-queue`). THIS FILE ONLY
- *   GATHERS FACTS; every decision is `./lib/merge-gate-ci.mjs`, which reuses the drain's own pure functions.
+ *   GATHERS FACTS; gate decisions live in `./lib/merge-gate-ci.mjs`, with PR-event candidacy deferral
+ *   in `./lib/merge-gate-hold-class.mjs`. Both reuse the drain's rules.
  *   The gate list and where each gate lives is `./lib/merge-gate-inventory.mjs`.
  *
  * Usage:
@@ -35,6 +36,7 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluatePrGates, evaluateGroup, groupMembership, prNumberOfSubject, formatPrResult } from './lib/merge-gate-ci.mjs';
+import { deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting } from './lib/merge-gate-hold-class.mjs';
 import { readDrainAcceptance, computeNetDiffSignals, computeNetDiffText } from './merge-ai-prs.mjs';
 import { extractManifestFromBody } from './readiness/lane-manifest.mjs';
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
@@ -279,6 +281,11 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
         return { sha, parents: String(parents || '').split(' ').filter(Boolean), subject: rest.join('\t') };
       });
   } catch { commitsRead = false; }
+  if (commitsRead) {
+    // Stacked per-entry groups use the previous entry's group commit as base_sha; only entries in this range belong.
+    const groupShas = new Set(commits.map((c) => c.sha));
+    entries = entries.filter((entry) => groupShas.has(entry?.headCommit?.oid));
+  }
   // A commit whose subject names no PR (squash/rebase merge, a hand-made commit) is resolved through the
   // commit→PR API; anything still unmapped makes the group incomplete.
   const resolved = {};
@@ -465,7 +472,10 @@ async function main() {
   if (expectHead && nums.length !== 1) { process.stderr.write('merge-gate-check: --expect-head pins exactly one --pr\n'); process.exit(3); }
   const pinOf = (num) => (f['merge-group'] ? { expectedHeadSha: membership?.heads?.[num] ?? null, requireExpectedHead: true } : { expectedHeadSha: expectHead });
   const factsOf = nums.map((num) => gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain, mainCi, ...pinOf(num) }));
-  const prs = factsOf.map((facts) => evaluatePrGates(facts, { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
+  const mergeEvent = mergeEventOfFlags(f);
+  const setting = loadMergeGateHoldSetting({ key: 'prEventCandidacyHoldsPass' });
+  const prs = factsOf.map((facts) => deferCandidacyHoldsOnPrEvent(
+    evaluatePrGates(facts, { policy, blockOnCodeQL, mergeEvent }), { mergeEvent, setting }));
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };

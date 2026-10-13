@@ -74,6 +74,16 @@ describe('pure helpers', () => {
 });
 
 describe('readSharedOpenPrs — one fetch serves the fleet', () => {
+  it('preserves capped comments unchanged through fresh and cached projections (#5955)', () => {
+    const comments = Array.from({ length: 100 }, (_, i) => ({ body: `comment ${i}`, author: { login: 'someone' } }));
+    const { exec, calls } = fakeExec([{ ...PRS[0], comments }]);
+    const fields = 'number,labels,headRefOid,comments';
+    const first = readSharedOpenPrs(opts({ fields, exec }));
+    expect(first).toEqual([{ number: PRS[0].number, labels: PRS[0].labels, headRefOid: PRS[0].headRefOid, comments }]);
+    expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(first);
+    expect(calls).toHaveLength(1);
+    expect(SNAPSHOT_FIELDS).toContain('comments');
+  });
   it('8 readers with 8 different field sets inside the TTL cost ONE right-sized fetch (was 8 full lists)', () => {
     const { exec, calls } = fakeExec();
     const fieldSets = [

@@ -3,7 +3,7 @@ bornAs: xmizuz1
 kind: task
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/dispatch-lane-io.mjs"]
+
 dateOpened: "2026-09-27"
 tags: []
 ---
@@ -15,3 +15,12 @@ tags: []
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+## Findings (standalone worker, 2026-10-12)
+
+The build-dispatch daemon held #4303 with:
+
+> worker-declined: **could-not-prepare** — #4303 leaves a policy choice unresolved: retain per-session directories with trust retries, or adopt a bounded reusable pool, including what dispatch does when every slot is occupied. Current code confirms: - Per-session allocation remains in 'we:scripts/operations/dispatch-lane-io.mjs:2144'. - Trust refusal gets one retry in 'we:scripts/operations/dispatch-lane-io.mjs:1955'. - Cleanup deletes directories and revokes trust in 'we:scripts/conveyor/session-reaper.mjs:1929', so pooling requires coordinated lifecycle changes. I found no subsequent recorded decision settling t…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
