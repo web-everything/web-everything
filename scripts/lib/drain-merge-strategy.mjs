@@ -39,6 +39,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
 /** Env: a JSON settings file read INSTEAD of the declared files for the `mergeDelivery` tool layer (always honoured — how a
@@ -201,6 +202,7 @@ export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
+  cancelObsoleteRuns = cancelObsoleteQueueRuns,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -296,11 +298,15 @@ export function createDrainMergeStrategy({
      * then calls `confirmQueueFollowUps`, which is the only thing that retires them. A crash or a failed post-land
      * step in between leaves them pending, so the next pass runs the (idempotent) follow-up again.
      * Only a PR that left the queue CLOSED, or one already confirmed, is dropped here.
-     * No state file → no `gh` call (drain-direct stays byte-identical).
+     * Queue mode first sweeps obsolete workflow runs, even without a follow-up state file.
      * @param {{merged:Array, landedThisPass:Set, landedIdsFor:Function}} o
      * @returns {Array} the pending entries whose follow-up this pass must confirm
      */
     collectQueueMerged({ merged, landedThisPass, landedIdsFor = () => [] }) {
+      if (enqueueMode) {
+        try { cancelObsoleteRuns({ repo: localSlug, exec, dryRun, log }); }
+        catch (e) { say(`  ⚠ merge-queue: obsolete run cancellation failed (${firstLine(e)}) — continuing drain pass`); }
+      }
       const state = readQueueState(statePath, readFile);
       if (state.unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — no queue follow-up this pass (file left untouched); fix or remove it`); return []; }
       if (!state.exists || !state.pending.length) return [];
