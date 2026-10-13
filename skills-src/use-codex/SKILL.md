@@ -57,22 +57,27 @@ not a silent claim). `--timeout-ms=` (default 30 min) is a parent-imposed wall �
 timeout of its own. `--ephemeral` skips Codex's own session persistence (default: persisted, so a stalled
 run is resumable by hand via `codex exec resume <thread-id>` — the report prints the thread id).
 
-**Model / effort — nothing is ever left to Codex's own implicit default** (`#3635`, ratified; the rule is
-`we:docs/agent/backlog-workflow.md#codex-model-routing`):
+**Model / effort — per-task routing** (operator re-ratification, 2026-10-12):
 
-- `--model=<slug>` — forwarded as `-m`. **Defaults to `CODEX_MODEL` (`gpt-6-astra`)**; there is no way to
-  make the script omit `-m`. Override only with a slug the ChatGPT entitlement actually lists — a guessed
-  name is a hard 400, not a soft fallback.
-- `--effort=low|medium|high|xhigh|max|ultra` — forwarded as `-c model_reasoning_effort=<level>`, unchanged
-  (no clamping). Throws on any other value. The levels above `high` are real on `gpt-6-astra` but no probe
-  has exercised them, so reaching for one is a deliberate call — and a `--model` override may not offer all
-  six.
-- `--tier=haiku|sonnet|opus` — the rung vocabulary instead of a raw level, mapped by `CODEX_TIER_EFFORT` to
-  `low`/`medium`/`high`. **It selects effort only — all three rungs run the same model.** **Ignored when
-  `--effort` is also given** (an explicit level outranks a named rung). Pass neither and you get the
-  `sonnet` rung's `medium` — explicitly, not inherited. Read the routing rule before picking: the evidence
-  behind the rungs is mixed (raising effort scored *worse* on one model, and is a no-op on the pinned one),
-  so treat them as a cost/latency dial that gets recorded, not as a correctness ladder.
+- `--task-kind=<kind>` defaults to `worker`, or `review` with `--review`.
+  `fix`, `ci-heal`, `build`, `worker`, and `review` default to `gpt-6.1-sol` / `medium`;
+  `trivial` to `gpt-6-luna` / `low`; `prepare` to `gpt-6-astra` / `medium`;
+  `prepare-complex`, `takeover`, `design`, and `review-mandatory` to `gpt-6-astra` / `high`.
+- `--size=<n>`, `--epic`, `--decision`, and `--care=low|normal|elevated|high` classify preparation:
+  size ≥ 8, epic, decision, or elevated/high care selects `prepare-complex`.
+  Aliases: `stronger`/`stronger-model` → `takeover`; card filing/rename/prevention and conflict → `trivial`;
+  `delivery` → `build`; `heal` → `ci-heal`.
+- `--model=<slug>` overrides the route's model. `CODEX_MODEL` remains the Astra registry identity and
+  strong rung, while launch defaults come from `codex.modelByTask`.
+- `--effort=low|medium|high|xhigh|max|ultra` overrides effort unchanged. Known unsupported pairs
+  (for example Luna + ultra) throw; unknown caller-pinned models defer entitlement to Codex.
+- `--tier=haiku|sonnet|opus` selects `low`/`medium`/`high` effort only; explicit `--effort` wins.
+  With neither flag, the task route supplies effort.
+
+Cascade: standard defaults → platform `codexModelByTask` → `scripts/settings/codex.json`
+→ `WE_CODEX_MODEL_BY_TASK` JSON → explicit caller pins. Each launch logs its task, model, effort,
+per-leaf sources and usage bucket. `--json` includes the full route. Bucket attribution is observed
+rollout evidence, not a field supplied by the model catalogue.
 
 **`--clear-rollout-after-run`** (default off) — `#3635` Fork 4. Every non-`--ephemeral` run reads a real
 quota signal (`used_percent` / `window_minutes` / `resets_at` / `plan_type`) out of Codex's persisted rollout
