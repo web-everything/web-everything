@@ -2018,6 +2018,11 @@ export function planRecordDecision(view) {
   if (to === 'accepted' && verdict.pendingVerifications?.length) {
     throw new Error('Tool-bearing verification required before recording acceptance; retry the unresolved claims.');
   }
+  // PR #5025 review — a claim retired on ONE verifier answer leaves the accept to a human. `humanRequired` is what addresses the
+  // confirm to a human, so an accept on a run whose confirm was the agent's (any mechanical accept path) is refused.
+  if (to === 'accepted' && verdict.uncorroboratedRetirements?.length && verdict.humanRequired !== true) {
+    throw new Error('A claim on this head was retired on one verifier answer; only a human-addressed confirm may record acceptance.');
+  }
   if (verdict.pendingReferrals?.length || (to === 'accepted' && verdict.blockedReferrals?.length)) {
     throw new Error('Mandatory finding-specific ruling required before recording acceptance; resume the referral review.');
   }
@@ -2276,6 +2281,12 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     ...renderAwaitingRulingSection(v),
     body,
     ...renderDeferredAdvisorySection({ read, verdict: v }),
+    // PR #5025 review — the human signing off is told which claims were retired on one verifier answer, not only that it accepts.
+    ...(Array.isArray(v.uncorroboratedRetirements) && v.uncorroboratedRetirements.length
+      ? ['', `**Retired on one verifier answer (${v.uncorroboratedRetirements.length}):** a tool-bearing seat answered "not reproduced" `
+        + 'and nothing corroborated it, so these are no longer referrals but still need your look before you accept:',
+      ...v.uncorroboratedRetirements.map((r) => `- ${foldUntrusted(String(r?.reason ?? 'no reason recorded')).replace(/\s+/g, ' ').slice(0, 300)}`)]
+      : []),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
     // The `**Verdict:**` line above cannot carry it: on a `review:human` PR it is always "human review required".
     ...(outcome
@@ -3023,8 +3034,12 @@ export function reviewPrOperation({
           // It is the verdict basis WITHOUT the advisory Codex seat.
           findings: buildPanelFindings(verdictAdmitted),
         });
-        const acceptHeld = panelVerdict === VERDICTS.ACCEPT && retiredOnOneAnswer.length > 0;
-        const verdict = acceptHeld ? VERDICTS.NEEDS_HUMAN : panelVerdict;
+        // Held: every verdict the loop can turn into an accept by itself — a clean accept, and a prevention-outstanding one (the loop
+        // files the guard, then accepts). A `changes` verdict still bounces to the fixer; the round-cards accept refuses it
+        // (`roundCardsRefusal`), and `planRecordDecision` refuses any agent-addressed accept while this list is non-empty.
+        const acceptHeld = retiredOnOneAnswer.length > 0
+          && (panelVerdict === VERDICTS.ACCEPT || panelVerdict === VERDICTS.PREVENTION_OUTSTANDING);
+        const verdict = acceptHeld && panelVerdict === VERDICTS.ACCEPT ? VERDICTS.NEEDS_HUMAN : panelVerdict;
         const humanRequired = panelHumanRequired || acceptHeld;
         return {
           verdict,

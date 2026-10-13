@@ -1044,8 +1044,8 @@ export function createReviewPrSinks({
               }
               const single = append(record);
               if (renderReferralRecord(single).length > commentBudget - 2000) {
-                // A retired (not-reproduced) claim holds nothing, so one too large to record is skipped and verified again, never parked.
-                if (verified?.outcome === 'not-reproduced') { out(`verification not recorded: finding key sha256:${referralHash(referral.key)} exceeds ${commentBudget} characters`); continue; }
+                // A retired (not-reproduced) claim too large to record parks too (PR #5025 review): its record is what holds the accept
+                // for a human on later runs of this head, so skipping it would let a quiet re-run reduce to a clean accept.
                 overflow(`finding key sha256:${referralHash(referral.key)} from ${sourceByKey.get(referral.key) ?? prUrl} exceeds ${commentBudget} characters with its v1 identity intact; requires manual review`);
                 continue;
               }

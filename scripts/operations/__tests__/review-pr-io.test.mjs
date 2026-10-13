@@ -2723,20 +2723,16 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
   });
 
-  it('A NOT-REPRODUCED CLAIM TOO LARGE TO RECORD is skipped and verified again — it never parks the PR for a human', async () => {
+  // Self-review of the PR #5025 repair: the retiring record is what holds the accept on later runs of the head, so a claim too
+  // large to record parks for a human (the overflow hold) instead of being skipped, where a quiet re-run would reduce to accept.
+  it('A NOT-REPRODUCED CLAIM TOO LARGE TO RECORD parks for a human (overflow hold) instead of being skipped', async () => {
     const w = world();
     const huge = { ...original, summary: `${'x'.repeat(70_000)} confirmed defect` };
     const first = await w.runOnce('run-1', NOT_REPRODUCED, huge);
-    expect(w.lines.some((l) => /verification not recorded: finding key sha256:[0-9a-f]+ exceeds 60000 characters/.test(l))).toBe(true);
-    expect(w.lines.some((l) => l.startsWith('referral-overflow'))).toBe(false);
-    expect(w.records()).toEqual([]);
-    expect(w.trace).not.toContain('referral');
-    expect(w.state.labels).not.toContain('review:human');
-    expect(first.verdict.pendingReferrals).toEqual([]);
-    // never parked with review:human, but the lone answer still leaves the accept to a human (PR #5025 review)
+    expect(w.lines.some((l) => /^referral-overflow: finding key sha256:[0-9a-f]+ .*exceeds 60000 characters/.test(l))).toBe(true);
+    expect(first.verdict.pendingReferrals.length).toBeGreaterThan(0);
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
-    await w.runOnce('run-2', NOT_REPRODUCED, huge);
-    expect(w.spawns).toHaveLength(2);
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
   });
 
   it('a hostile verifier reason (newlines, backticks, a forged marker) is stored folded and cannot forge a record or an outcome line', async () => {

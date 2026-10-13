@@ -4414,6 +4414,10 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(reduce.pendingVerifications).toBeUndefined();
       // the advisory still states its own outcome: the claim is settled for this head, only the acceptance waits
       expect(deriveAdvisoryOutcome(reduce)).toBe('accept');
+      // ...and tells the human signing off which claim was retired on one answer
+      const note = renderAdvisoryNote({ read: run.findings.read, verdict: reduce });
+      expect(note).toContain('**Retired on one verifier answer (1):**');
+      expect(note).toContain('the guard holds on the head');
       const notes = reduce.findings.filter((f) => String(f.summary).includes('Unverified by a tool-bearing seat'));
       expect(notes).toHaveLength(1);
       expect(notes[0].summary).toContain('the guard holds on the head');
@@ -4525,6 +4529,25 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(reduce.uncorroboratedRetirements).toHaveLength(1);
       const view = { input: { repo: 'o/n', pr: 7, actor: 'operator' }, findings: { read: { ...shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' }) }, confirm: 'accept' }, verdict: reduce };
       expect(() => planRecordDecision(view)).not.toThrow();
+      // the same accept on an AGENT-addressed confirm (any mechanical path: humanRequired off) is refused
+      expect(() => planRecordDecision({ ...view, verdict: { ...reduce, humanRequired: false } })).toThrow(/one verifier answer/);
+      // and a changes answer is never refused for it: the fixer bounce still works
+      expect(() => planRecordDecision({ ...view, findings: { ...view.findings, confirm: 'changes' }, verdict: { ...reduce, verdict: 'changes', humanRequired: false } }))
+        .not.toThrow(/one verifier answer/);
+    });
+
+    // Self-review of the repair: the loop also accepts a `prevention-outstanding` run by itself (it files the guard, then accepts).
+    it('a lone negative also holds a prevention-outstanding verdict for a human, so the loop cannot file-and-accept it', () => {
+      const prevention = { summary: 'one guard', findings: [{ summary: 'a resolved carve-out with an uncaptured prevention guard', disposition: 'carve-out',
+        introduced: false, worseThanBase: false, parallelizable: true, prevention: 'a check:standards rule', preventionCaptured: false, impactIfUnfixed: 'broken' }] };
+      const held = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judge: prevention, judgeReferralVerifier: NOT_REPRODUCED });
+      expect(held.reduce.verdict).toBe('prevention-outstanding');
+      expect(held.reduce.humanRequired).toBe(true);
+      expect(held.reduce.acceptHeld).toBe(true);
+      // control: without a retirement the same verdict stays agent-addressed (the loop's own prevention branch)
+      const control = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { judge: prevention });
+      expect(control.reduce.verdict).toBe('prevention-outstanding');
+      expect(control.reduce.humanRequired).toBe(false);
     });
 
     it.each([['docs', NET_PATHS[1]], ['config', NET_PATHS[0]], ['data', NET_PATHS[0]]])('a %s-kind claim is verified the same way', (category, file) => {

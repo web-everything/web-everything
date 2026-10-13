@@ -710,6 +710,8 @@ describe('cards 5471 + 5470: round budget and binding prior round', async () => 
       expect(roundBudgetDecision({ verdict: verdictOf([degraded], { blockedReferrals: [{ key: 'k' }] }), round: 4, budget: 3 }).reason).toBe('referral-blocked');
       expect(roundBudgetDecision({ verdict: verdictOf([degraded], { pendingReferrals: ['k'] }), round: 4, budget: 3 }).reason).toBe('referral-pending');
       expect(roundBudgetDecision({ verdict: verdictOf([degraded], { humanRequired: true }), round: 4, budget: 3 }).reason).toBe('human-required');
+      // PR #5025 review: a claim retired on one verifier answer leaves the accept to a human, so no round turns into cards
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded], { uncorroboratedRetirements: [{ key: 'k', reason: 'r' }] }), round: 4, budget: 3 }).reason).toBe('uncorroborated-retirement');
       expect(roundBudgetDecision({ verdict: verdictOf([degraded], { verdict: VERDICTS.NEEDS_HUMAN }), round: 4, budget: 3 }).reason).toBe('not-changes');
       expect(roundBudgetDecision({ verdict: verdictOf([]), round: 4, budget: 3 }).reason).toBe('no-held-finding');
     });
