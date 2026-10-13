@@ -3,17 +3,19 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { checkReviewLabelSingleHomeCode } from '../review-skill-guard.mjs';
 import {
   MAX_NUMBERING_COMMITS, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo,
 } from '../numbering-carry.mjs';
 
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const subject = 'drain: JIT-number xf74q20→#6053, xztd0mv→#6054 at land (#2288)';
 it('keeps numbering acceptance writes in the shared review-label provider', () => {
   const files = ['scripts/lib/numbering-carry.mjs', 'scripts/lib/review-label-provider.mjs'].map((file) => ({
-    file, content: readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'),
+    file, content: readFileSync(join(ROOT, file), 'utf8'),
   }));
   expect(checkReviewLabelSingleHomeCode(files).errors).toEqual([]);
 });
