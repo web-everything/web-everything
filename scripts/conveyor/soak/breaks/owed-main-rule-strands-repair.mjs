@@ -28,6 +28,9 @@ export default {
         const out = planReconcile({ prs: [pr], agents: [], durableCounts: {}, requiredChecks: ['test', 'soak-replay-gate'], now: Date.parse('2026-10-12T23:00:00Z') });
         if (out.refusals.some(r => r.kind === 'owed-main-rule') || !out.dispatch.length)
           violations.push({ variant, tick, detail: JSON.stringify(out.refusals) });
+        // The kept heal must still be told the `test` failure is drain-assigned numbers to leave alone.
+        else if (variant === 'other-red' && !out.dispatch[0].owedMainRule?.nums?.includes(5994))
+          violations.push({ variant, tick, detail: 'ci-heal dispatched without the drain-number hold' });
       }
     }
     return { violations };

@@ -156,6 +156,14 @@ describe('dispatchCiHeal (#3852)', () => {
     );
   });
 
+  it('tells the healer to keep drain-assigned numbers and skips the brief-less probation worker (PR #5082)', async () => {
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal({ ...PLANNED, owedMainRule: { check: 'test', nums: [5994] } }, { readBrief: () => TEMPLATE, sinks });
+    expect(calls[0].prompt).toContain('## Leave the drain-assigned card numbers alone');
+    expect(calls[0].prompt).toContain('#5994');
+    expect(calls[0].probationWorker).toBeNull();
+  });
+
   it('hands one ci-heal payload keyed on the PR to the dispatch effect sink', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });

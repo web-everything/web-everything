@@ -2674,7 +2674,10 @@ export function planReconcile({
     if (ciRepairOwed) {
       // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
-      if (pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && onlyTestRed && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? '')) {
+      const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
+      // When another check keeps the ci-heal, the healer is told to leave `test`'s drain-assigned numbers alone.
+      const owedMainRuleFact =owedMainRuleHold && !onlyTestRed ? { owedMainRule: { check: 'test', nums: [...(pr.owedMainRule.nums ?? [])] } } : {};
+      if (owedMainRuleHold && onlyTestRed) {
         refuse('owed-main-rule', { ...withPhase, why: `the required check failed only on the hand-picked-NNN rule for card number(s) the drain itself assigned (${(pr.owedMainRule.nums ?? []).map(n => `#${n}`).join(', ')}); owed a refresh once main accepts drain-numbered cards (drain-branch-numbering-ci-v1), never a ci-heal that would revert the number` });
         continue;
       }
@@ -2937,10 +2940,11 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
-            + ` (cap from ${ciHealCapSource})`,
+            + ` (cap from ${ciHealCapSource})`
+            + (owedMainRuleFact.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${owedMainRuleFact.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
         });
       }
       continue;

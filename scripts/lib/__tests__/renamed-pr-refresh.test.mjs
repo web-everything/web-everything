@@ -8,6 +8,7 @@ import {
   resolveRefreshSettings, logRefreshSettings,
 } from '../renamed-pr-refresh.mjs';
 import { planReconcile, REFUSAL_KINDS } from '../../conveyor/reconcile-core.mjs';
+import { withOwedMainRuleSection } from '../../operations/ci-heal-pr-dispatch.mjs';
 
 const error = 'Backlog item "5994-diagnose-unknown-prepare-result-failure-97b1d8c1d2e808d2" carries a hand-picked NNN id (#5994) that is not on origin/main — new items must be hash-keyed (xNNNNNN); the drain assigns the real number at land (#2288). Rename it with a hash id, or set WE_SKIP_HAND_NUMBERED_GATE=1 if this is the sanctioned collision-heal renumbering path (#2548).';
 const tail = `2026-10-12T22:28:54.0617823Z \x1b[31m error\x1b[0m ${error}\n2026-10-12T22:28:54.0617839Z \n2026-10-12T22:28:54.0618663Z \x1b[31m1 error(s)\x1b[0m, 6093 warning(s) \x1b[2m(checked 81 blocks, ...)\x1b[0m\n2026-10-12T22:28:54.0628539Z ##[error]Process completed with exit code 1.`;
@@ -160,7 +161,18 @@ describe('reconcile ownership', () => {
     const rollup = first ? [...extra, ...pr().statusCheckRollup] : [...pr().statusCheckRollup, ...extra];
     const result = planReconcile({ prs: [owedPr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks, now: Date.parse('2026-10-12T23:00:00Z') });
     expect(result.refusals.some(r => r.kind === 'owed-main-rule')).toBe(false);
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: expect.arrayContaining(['test', other]) })]);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: expect.arrayContaining(['test', other]), owedMainRule: { check: 'test', nums: [5994] } })]);
+    // The healer's brief carries the hold, and the probation worker (which drops the brief) is not used.
+    const brief = withOwedMainRuleSection('BASE', { owedMainRule: result.dispatch[0].owedMainRule });
+    expect(brief).toMatch(/^BASE\n\n## Leave the drain-assigned card numbers alone/);
+    expect(brief).toContain('#5994');
+    expect(brief).toMatch(/Do NOT rename, renumber or re-key/);
+  });
+  it('carries no hold into a ci-heal that has no proven drain-number failure', () => {
+    const rollup = [...pr().statusCheckRollup, otherRed];
+    const result = planReconcile({ prs: [pr({ statusCheckRollup: rollup })], agents: [], durableCounts: {}, requiredChecks: ['test', 'soak-replay-gate'], now: Date.parse('2026-10-12T23:00:00Z') });
+    expect(result.dispatch[0]).not.toHaveProperty('owedMainRule');
+    expect(withOwedMainRuleSection('BASE', {})).toBe('BASE');
   });
   // Self-review variant: a superseded red `test` run must not prove a hold over the latest run.
   const run = (id, conclusion) => ({ __typename: 'CheckRun', id, name: 'test', status: 'COMPLETED', conclusion, detailsUrl: `https://github.com/web-everything/web-everything/actions/runs/1/job/${id}` });
