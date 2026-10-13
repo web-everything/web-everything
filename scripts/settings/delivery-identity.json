@@ -1,7 +1,19 @@
 {
   "delivery": {
     "identity": {
-      "$comment": "Per-role GitHub App identity (operator decision 2026-10-10; migration card per-role-app-identity). Roles: worker, reviewer, merger, ledger, observer. Each role = { appId, installations: {owner|owner/repo: installationId}, key: {file: path} | {keychain: {service, account}}, botLogin }. NEVER the key itself. An unset role uses today's App (WE_GITHUB_APP_* env), so nothing changes until a role is filled in. Optional callerRoles: {callerName: role} re-routes a caller. Cascade: standard -> platform preference (delivery.identity) -> this file -> env WE_DELIVERY_IDENTITY (JSON). Trusted bot logins: delivery.botLogins (list; default today's bot + every role's botLogin; env WE_DELIVERY_BOT_LOGINS). See scripts/lib/github-app-identity.mjs."
+      "$comment": "Per-role GitHub App identity (operator decision 2026-10-10; migration card per-role-app-identity). Roles: worker, reviewer, merger, ledger, observer. Each role = { appId, installations: {owner|owner/repo: installationId}, key: {name: <keyName>} (resolved on the host as $WE_GITHUB_APP_KEY_DIR/<keyName>.pem; never commit a host path; {file}/{keychain} are host-local back-compat only), botLogin }. NEVER the key itself. An unset role uses today's App (WE_GITHUB_APP_* env), so nothing changes until a role is filled in. Optional callerRoles: {callerName: role} re-routes a caller. Cascade: standard -> platform preference (delivery.identity) -> this file -> env WE_DELIVERY_IDENTITY (JSON; 'none' pins every role to today's App). Trusted bot logins: delivery.botLogins (list; default today's bot + every role's botLogin; env WE_DELIVERY_BOT_LOGINS). See scripts/lib/github-app-identity.mjs.",
+      "reviewer": {
+        "appId": "5267537",
+        "installations": {
+          "web-everything": "170085874",
+          "plateauapp": "170085861",
+          "frontier-ui": "170085845"
+        },
+        "key": {
+          "name": "plateau-reviewer"
+        },
+        "botLogin": "plateau-reviewer[bot]"
+      }
     }
   }
 }

@@ -3,7 +3,7 @@ bornAs: x16g3q5
 kind: story
 size: 5
 status: open
-humanGate: { kind: setup, what: "operator creates + installs the 5 Apps (DONE 2026-10-10, IDs below), then confirms each App's private-key keychain item name, applies the main and ops/** rulesets, and uninstalls the old Web Everything App" }
+humanGate: { kind: setup, what: "operator creates + installs the 5 Apps (DONE 2026-10-10, IDs below; keys moved to the host and verified 2026-10-10), sets WE_GITHUB_APP_KEY_DIR in each daemon plist and the operator shell, applies the main and ops/** rulesets, and uninstalls the old Web Everything App" }
 scope: ["we:scripts/settings/delivery-identity.json", "we:scripts/lib/github-app-identity.mjs", "we:scripts/lib/github-app-auth-env.mjs", "we:scripts/lib/gh-app-shim.mjs"]
 dateOpened: "2026-10-10"
 tags: [github-app, identity, ruleset, cutover]
@@ -59,13 +59,13 @@ The code checks each role's App against `ROLE_REQUIRED_PERMISSIONS` before using
 | ledger | 5267551 | 170085739 | 170085724 | 170085702 |
 | observer | 5267580 | 170085659 | 170085627 | 170085606 |
 
-Setting shape for one role (the key is a REFERENCE, never key material; keychain item names still to be confirmed):
+Setting shape for one role. The key is a REFERENCE, never key material: keys referenced by name, resolved via the host env var `WE_GITHUB_APP_KEY_DIR` as `<dir>/<name>.pem` (operator rule 2026-10-13: never commit a host-local path; `file`/`keychain` refs still work but are host-local, never committed). The five keys moved to the host on 2026-10-10 and were verified there.
 
 ```json
 { "delivery": { "identity": {
   "reviewer": { "appId": "5267537",
     "installations": { "web-everything": "170085874", "plateauapp": "170085861", "frontier-ui": "170085845" },
-    "key": { "keychain": { "service": "<keychain item name>" } },
+    "key": { "name": "plateau-reviewer" },
     "botLogin": "plateau-reviewer[bot]" }
 } } }
 ```
@@ -73,8 +73,8 @@ Setting shape for one role (the key is a REFERENCE, never key material; keychain
 ## Cutover (4 steps)
 
 1. **Prep (done, this PR).** Per-role setting + cascade, role-aware token minting and gh shim, loud fallback + smell, `delivery.botLogins`, ledger role on ops/** writes, and a dry-run CLI (`node` we:scripts/lib/github-app-identity.mjs `--caller=<name>`).
-2. **Operator (HUMAN GATE).** Create + install the 5 Apps (DONE). Confirm each private key's keychain item name (or file path). Never paste a key into a setting or a chat.
-3. **Switch one role at a time, reviewer → worker → merger** (then ledger, observer). For each: add the role block to we:scripts/settings/delivery-identity.json; reload that role's daemon (launchctl bootout + bootstrap); prove it: we:scripts/conveyor/github-app-status.mjs shows the caller `applied: true, role: <role>` with no `fallback`; the next comment/label/merge on a real PR is authored by the role's bot (`roleOfBotLogin(author.login)` = the role); the github-app-config smell stays closed. A failure falls back loudly to worker, then today's App, so the fleet keeps working.
+2. **Operator (HUMAN GATE).** Create + install the 5 Apps (DONE). Keys moved to the host and verified (DONE 2026-10-10); each role's key is referenced by name (`plateau-<role>`). Set `WE_GITHUB_APP_KEY_DIR=$HOME/.secrets/github-apps` in each daemon's local launchd plist and the operator shell (never in the repo). Unset or a missing file is a loud fallback. Never paste a key into a setting or a chat.
+3. **Switch one role at a time, reviewer → worker → merger** (then ledger, observer). Reviewer block committed by name (`key: {name: "plateau-reviewer"}`). For each: add the role block to we:scripts/settings/delivery-identity.json; reload that role's daemon (launchctl bootout + bootstrap); prove it: we:scripts/conveyor/github-app-status.mjs shows the caller `applied: true, role: <role>` with no `fallback`; the next comment/label/merge on a real PR is authored by the role's bot (`roleOfBotLogin(author.login)` = the role); the github-app-config smell stays closed. A failure falls back loudly to worker, then today's App, so the fleet keeps working.
 4. **Rulesets + retire.** Apply the main ruleset (Merger + operator bypass) and the ops/** ruleset (Ledger + operator). Move the drain's direct main pushes (JIT numbering, resolve-on-land) and the ops/** transport pushes from the operator's SSH key to HTTPS with the Merger / Ledger token, or SSH stays a second writer (the ruleset's operator bypass hides it). Then uninstall the old Web Everything App and drop `web-everything[bot]` from `delivery.botLogins` only after no open PR still carries its markers.
 
 ## Acceptance

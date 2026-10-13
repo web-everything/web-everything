@@ -124,6 +124,12 @@ if (hermetic) {
   }
   addedPathPrefix = fakeGhDir;
   process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
+  // Per-role App identity pinned to NONE (today's App for every role): a role block committed in
+  // we:scripts/settings/delivery-identity.json must never change a test's dispatch argv/env, shim or auth outcome
+  // (#5182 CI: ~8 tests broke the moment the reviewer role landed). Children inherit it. A test of a configured
+  // role passes its own `identity`, an injected `read`, or its own WE_DELIVERY_IDENTITY JSON (applied even when
+  // pinned) — see we:scripts/lib/github-app-identity.mjs.
+  if (process.env.WE_DELIVERY_IDENTITY === undefined) process.env.WE_DELIVERY_IDENTITY = 'none';
   const hermeticSettings = setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home'), afterSettle: cleanupFileTmp }).settings;
   // Roots found from the checkout's location rather than the home (lane pool, telemetry): a private per-file dir.
   for (const [key, name] of Object.entries(hermeticSettings.fixtureRootEnv || {})) {
