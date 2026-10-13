@@ -158,12 +158,16 @@ export function withCodeQLSection(prompt, planned, repo = 'we') {
   return `${prompt}\n\n${codeqlBriefSection(planned.codeql, { repo: slug, pr: planned.pr })}\n`;
 }
 
-/** PR #5082 — another required check keeps this heal, but `test` failed only on numbers the drain assigned. */
+/** PR #5082 — another failing check (a required one, or the drain's CodeQL) keeps this heal, but `test` failed only on numbers the drain assigned. */
 export function withOwedMainRuleSection(prompt, planned) {
   const rule = planned?.owedMainRule;
   if (!rule) return prompt;
   const nums = (Array.isArray(rule.nums) ? rule.nums : []).filter(Number.isSafeInteger).map(n => `#${n}`).join(', ') || 'the drain-assigned numbers';
-  return `${prompt}\n\n## Leave the drain-assigned card numbers alone\n\nThe \`test\` check's hand-picked-NNN errors (${nums}) are numbers the drain itself assigned at land. They clear once main accepts drain-numbered cards. Do NOT rename, renumber or re-key those backlog cards, and do not set WE_SKIP_HAND_NUMBERED_GATE. Repair only the other failing required checks.\n`;
+  // A CodeQL heal may have no other failing required check: name the alert as the work, so the two sections agree.
+  const scope = planned.reason === 'codeql'
+    ? 'Repair the CodeQL alert above (and any other failing check); the red `test` check is not yours to fix.'
+    : 'Repair only the other failing required checks.';
+  return `${prompt}\n\n## Leave the drain-assigned card numbers alone\n\nThe \`test\` check's hand-picked-NNN errors (${nums}) are numbers the drain itself assigned at land. They clear once main accepts drain-numbered cards. Do NOT rename, renumber or re-key those backlog cards, and do not set WE_SKIP_HAND_NUMBERED_GATE. ${scope}\n`;
 }
 
 /** Read current holds once at the CI-heal boundary. A read error is a visible refusal. */

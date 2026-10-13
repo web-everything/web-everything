@@ -164,6 +164,15 @@ describe('dispatchCiHeal (#3852)', () => {
     expect(calls[0].probationWorker).toBeNull();
   });
 
+  it('gives a CodeQL heal under the drain-number hold one consistent ask: fix the alert, keep the numbers (PR #5082)', async () => {
+    const { calls, sinks } = recordingSink();
+    await dispatchCiHeal({ ...PLANNED, reason: 'codeql', codeql: { checkRunId: 7, alerts: [{ rule: 'js/sql-injection', path: 'x.mjs', line: 1, message: 'new' }] }, owedMainRule: { check: 'test', nums: [5994] } }, { readBrief: () => TEMPLATE, sinks });
+    expect(calls[0].prompt).toContain('js/sql-injection');
+    expect(calls[0].prompt).toContain('## Leave the drain-assigned card numbers alone');
+    expect(calls[0].prompt).toMatch(/Repair the CodeQL alert above/);
+    expect(calls[0].prompt).not.toMatch(/Repair only the other failing required checks/);
+  });
+
   it('hands one ci-heal payload keyed on the PR to the dispatch effect sink', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
