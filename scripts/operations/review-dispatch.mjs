@@ -168,7 +168,7 @@ import { reviewSessionSlug } from '../conveyor/review-session-slug.mjs';
 import { ADVISORY_LENSES, MANDATE_LENSES } from '../lib/jury-core.mjs';
 import { REVIEW_SEAT_PROVIDERS, selectReviewSeatProvider, workerTierFor, AGY_CLAUDE_MODEL_BY_TIER } from '../lib/provider-routing.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
-import { CODEX_MODEL } from '../lib/codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
@@ -201,8 +201,9 @@ export const EXTRA_JUROR_MANDATE = MANDATE_LENSES.CORRECTNESS;
  *  xn2wf9t split the old single `gemini` entry into the `agy` CLI's two real backends (see
  *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` keeps the exact model/effort the old
  *  `gemini` entry ran, byte for byte; `agy-claude` is new. */
+const codexReviewDefault = resolveCodexTaskRoute({ kind: 'review', log: false });
 export const REVIEW_SEAT_MODELS = Object.freeze({
-  codex: Object.freeze({ model: CODEX_MODEL, effort: 'medium' }),
+  codex: Object.freeze({ model: codexReviewDefault.model, effort: codexReviewDefault.effort }),
   // `gemini-3.1-pro` offers only `low`/`high` (agy refused `medium` live, 2026-09-26); `low` is the combination
   // the review-pr Antigravity seat already runs (`ANTIGRAVITY_REVIEW_EFFORT`).
   'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'low' }),
@@ -251,8 +252,11 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards
     plannedLoad[pick.provider] = (plannedLoad[pick.provider] ?? 0) + 1;
     // One call left: every later seat rides the call this first pick already costs.
     if (callsRemaining < 2) usable = [pick.provider];
-    const { model, effort } = REVIEW_SEAT_MODELS[pick.provider];
-    routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy), reasoning: pick.reasoning });
+    // These added advisory seats have no care input or mandatory-lens seat; use the ordinary review route.
+    const { model, effort } = pick.provider === 'codex'
+      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false })
+      : REVIEW_SEAT_MODELS[pick.provider];
+    routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? (pick.provider === 'codex' ? effort : resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy)), reasoning: pick.reasoning });
   }
   return { routes, skipped };
 }
