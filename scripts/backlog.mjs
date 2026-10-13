@@ -58,7 +58,7 @@ import { fitAffineCost, budgetFromFit, impliedCapacity, isKnownStopReason, KNOWN
 import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
-import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
+import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
@@ -1114,6 +1114,7 @@ function overlapYieldConfig() {
  * rank) come straight off the loader (`...data`), which is authoritative for them.
  */
 function buildQueue() {
+  const buildPriority = readBuildPrioritySettings({ env: process.env });
   // A `--backlog-dir=` fixture run is uncached unless the caller opts in with WE_BUILD_QUEUE_CACHE=1 (the cache-key
   // regression test does, so it can exercise the cache on a small corpus instead of the live 5k-card backlog).
   const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=')) &&
@@ -1129,7 +1130,7 @@ function buildQueue() {
   const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
   const key = baseKey === null ? null
-    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
+    : JSON.stringify([baseKey, buildPriority, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
       process.env.WE_PLATFORM_PREFERENCES_FILE,
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
@@ -1184,7 +1185,7 @@ function buildQueue() {
   });
   // Platform preference → tool → env through the shared policy cascade (logs each value's source once).
   const priority = readBuildQueuePrioritySettings({ env: process.env });
-  const detailed = orderQueueDetailed(items, config, Date.now(), { priority });
+  const detailed = orderQueueDetailed(items, config, Date.now(), { priority, buildPriority: buildPriority.ids });
   const shadow = priority.mode === 'shadow'
     ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};
   if (priority.mode === 'shadow') console.error(formatBuildQueuePriorityShadowLine(detailed, priority.mode));
@@ -1200,22 +1201,24 @@ function buildQueue() {
     dateOpened: r.item.dateOpened ?? null,
     buildQueued: r.buildQueued, // cleared for build: membership of the conveyor sidecar (#2613, #4355)
     queuedAt: r.item.queuedAt ?? null,
+    buildPriority: r.buildPriorityIndex,
     priorityClass: r.priorityClass,
     priorityScore: r.priorityScore,
     priorityReasons: r.priorityReasons,
   }));
+  const priorityHeader = buildPriority.ids.length ? `build.priority: ${buildPriority.ids.length} ids (${buildPriority.source})` : '';
   if (argv.includes('--next')) {
     // The builder's ACTUAL next = the top-ordered item the human has CLEARED for build (#2530), not merely the
     // top ready one. A ready, high-tier item that hasn't been cleared is never auto-built.
     const head = rows.find((r) => r.buildQueued) ?? null;
-    return emit({ verb: 'build-queue', next: head, config, priorityMode: priority.mode, prioritySource: priority.source, ...shadow },
-      head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.priorityClass} · ${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
-           : `${DIM}build queue empty (no items cleared for build)${RST}`);
+    return emit({ verb: 'build-queue', next: head, config, buildPriority, priorityMode: priority.mode, prioritySource: priority.source, ...shadow },
+      (priorityHeader ? `${priorityHeader}\n` : '') + (head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.priorityClass} · ${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
+           : `${DIM}build queue empty (no items cleared for build)${RST}`));
   }
   const clearedCount = rows.filter((r) => r.buildQueued).length;
   const sidecarInfo = { path: queueSrc.path, source: queueSrc.source, entries: sidecar.length };
-  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, sidecar: sidecarInfo, priorityMode: priority.mode, prioritySource: priority.source, ...shadow, queue: rows, config },
-    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build (${sidecar.length} in ${queueSrc.path}) · ${priority.mode === 'enforce' ? 'class-first order' : 'next-to-build order'}, priority ${priority.mode})${RST}\n` +
+  return emit({ verb: 'build-queue', buildPriority, count: rows.length, cleared: clearedCount, sidecar: sidecarInfo, priorityMode: priority.mode, prioritySource: priority.source, ...shadow, queue: rows, config },
+    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build (${sidecar.length} in ${queueSrc.path}) · ${priority.mode === 'enforce' ? 'class-first order' : 'next-to-build order'}, priority ${priority.mode}${priorityHeader ? ` · ${priorityHeader}` : ''})${RST}\n` +
     rows.slice(0, 25).map((r, i) => `  ${String(i + 1).padStart(2)}. ${r.buildQueued ? `${GRN}✓${RST}` : ' '} ${BLD}#${r.num}${RST} ${DIM}[${r.priorityClass} · ${r.tier} · ${r.score.toFixed(2)}] ${r.priorityReasons.join('; ')}${RST} ${r.title}`).join('\n') +
     (rows.length > 25 ? `\n  ${DIM}… +${rows.length - 25} more${RST}` : ''));
 }

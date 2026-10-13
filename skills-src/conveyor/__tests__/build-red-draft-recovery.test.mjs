@@ -109,6 +109,69 @@ describe('abandoned builder draft recovery', () => {
     const out = spawnSync(process.execPath, ['skills-src/conveyor/build-dispatch-daemon.mjs', '--bogus-flag'], { encoding: 'utf8' });
     expect(out.status, out.stderr).toBe(2);
   });
+  it.each([
+    ['candidacy', null],
+    ['stale-freeze', null],
+    ['test-gaming', 'merge-gate'],
+    ['fail-closed', 'merge-gate'],
+    ['unreadable', 'merge-gate'],
+    ['throws', 'merge-gate'],
+    ['test-red', 'test'],
+    ['off', 'merge-gate'],
+  ])('classifies REST merge-gate HOLD evidence: %s', async (kind, failure) => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-hold-'));
+    const repo = 'web-everything/web-everything';
+    const labels = [{ name: 'review:pending' }];
+    const gate = { id: 5022, name: 'merge-gate', status: 'completed', conclusion: 'failure',
+      started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:06:00Z',
+      details_url: `https://github.com/${repo}/actions/runs/123/job/456` };
+    // REST is newest-first. The older row must not supply the verdict job.
+    const checks = [gate, { ...gate, id: 5021, details_url: `https://github.com/${repo}/actions/runs/122/job/455` }];
+    if (kind === 'test-red') checks.push({ id: 5023, name: 'test', status: 'completed', conclusion: 'failure' });
+    const result = kind === 'stale-freeze'
+      ? { id: 'red-main-freeze', status: 'hold', reason: 'main is RED (freeze: manual freeze: maintenance)' }
+      : { id: kind === 'test-gaming' ? 'test-gaming' : 'candidate-label',
+        status: kind === 'fail-closed' ? 'fail-closed' : 'hold', reason: 'not a merge candidate' };
+    const io = {
+      stateRoot: dir,
+      store: { list: () => ['dispatch-lane-hold'], read: () => ({ effects: [{
+        type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', status: 'applied',
+        payload: { launchKind: 'build', num: '4502' }, result: { pr: 5012 },
+      }] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: vi.fn(path => path.startsWith('pulls/')
+        ? { draft: true, state: 'open', labels, head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: repo } } }
+        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        : { check_runs: checks }),
+      mergeGateSetting: kind === 'off' ? 'off' : 'on',
+      readMergeGateVerdict: vi.fn(() => kind === 'unreadable' ? { error: 'log unavailable' }
+        : { num: 5012, head_sha: 'abc', ok: false, results: [result],
+          completed_at: gate.completed_at, mainCiGreen: true }),
+      readFreeze: vi.fn(() => ({ frozen: false, publishedAt: '2026-09-30T02:00:00Z' })),
+      ...(kind === 'throws' ? { excuseMergeGateRows: () => { throw new Error('excusal unavailable'); } } : {}),
+      paged: vi.fn(() => [{ annotation_level: 'failure', message: 'gate failed' }]),
+      gh: vi.fn(), freeLanes: () => [8], reserve: vi.fn(() => ({ ok: true })), release: vi.fn(),
+      dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
+    };
+    const args = { rawOpenPrs: [{ repo: 'we', prs: [{ number: 5012, isDraft: true, headRefName: candidate.laneRef }] }], allowResume: true };
+    try {
+      const recovered = await cliRecoverBuilderDrafts(args, io);
+      if (failure) {
+        expect(recovered).toEqual([{ pr: 5012, num: '4502', action: 'resume' }]);
+        expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: failure, firstError: 'gate failed' } }));
+      } else {
+        expect(recovered).toEqual([]);
+        expect(io.dispatch).not.toHaveBeenCalled();
+        expect(io.reserve).not.toHaveBeenCalled();
+        expect(io.paged).not.toHaveBeenCalled();
+      }
+      expect(io.gh).not.toHaveBeenCalled();
+      if (!['throws', 'off'].includes(kind)) {
+        expect(io.readMergeGateVerdict).toHaveBeenCalledWith({ repo, jobId: 456, prNumber: 5012 });
+      }
+      if (kind === 'stale-freeze') expect(io.readFreeze).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
   it('wires REST check evidence, same-branch dispatch, durable retries and the needs-human label', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
