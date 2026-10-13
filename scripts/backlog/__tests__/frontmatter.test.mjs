@@ -313,3 +313,40 @@ describe('#2530 buildQueued splice — set writes a real boolean, remove is CRLF
     expect(removeFrontmatterField(bodyKeyword, 'buildQueued')).toBe(bodyKeyword);
   });
 });
+
+describe('closed, not built transitions', () => {
+  const today = '2026-10-13';
+  it.each(['open', 'parked'])('closes %s without touching the body or booking delivery', (status) => {
+    const before = ITEM.replace('status: open', `status: ${status}`);
+    const { content } = applyTransition(before, 'close', { today, reason: 'duplicate', into: '100' });
+    const parsed = matter(content);
+    expect(parsed.content).toBe(matter(before).content);
+    expect(parsed.data).toMatchObject({ status: 'closed', closedReason: 'duplicate', closedInto: '100', dateClosed: today });
+    expect(parsed.data.dateResolved).toBeUndefined();
+  });
+  it.each(['active', 'preparing', 'resolved', 'closed'])('refuses close from %s', (status) => {
+    expect(applyTransition(ITEM.replace('status: open', `status: ${status}`), 'close', { today, reason: 'obsolete' }).error).toBeTruthy();
+  });
+  it.each([
+    {}, { reason: 'unknown' }, { reason: 'duplicate' }, { reason: 'duplicate', into: ' ' },
+    { reason: 'obsolete', into: '100' }, { reason: 'wont-do', by: 'abc' },
+  ])('refuses invalid closure arguments %j', (opts) => {
+    expect(applyTransition(ITEM, 'close', { today, ...opts }).error).toBeTruthy();
+  });
+  it.each(['fixed-elsewhere', 'obsolete', 'wont-do'])('supports %s', (reason) => {
+    const { content } = applyTransition(ITEM, 'close', { today, reason, ...(reason === 'fixed-elsewhere' ? { by: 'PR #10' } : {}) });
+    expect(matter(content).data.closedReason).toBe(reason);
+  });
+  it('reopens with a quoted reason, dropping all closure fields and preserving the body', () => {
+    const closed = applyTransition(ITEM, 'close', { today, reason: 'duplicate', into: '100' }).content;
+    const before = setFrontmatterField(closed, 'closedBy', '"stale"');
+    const { content } = applyTransition(before, 'reopen', { today, reason: 'Need "more": evidence' });
+    expect(matter(content).content).toBe(matter(ITEM).content);
+    expect(matter(content).data).toMatchObject({ status: 'open', reopenedReason: 'Need "more": evidence', dateReopened: today });
+    for (const key of ['closedReason', 'closedInto', 'closedBy', 'dateClosed']) expect(readField(content, key)).toBeUndefined();
+    expect(applyTransition(before, 'reopen', { today, reason: ' ' }).error).toBeTruthy();
+  });
+  it.each(['open', 'parked', 'active', 'preparing', 'resolved'])('refuses reopen from %s', (status) => {
+    expect(applyTransition(ITEM.replace('status: open', `status: ${status}`), 'reopen', { today, reason: 'more work' }).error).toBeTruthy();
+  });
+});

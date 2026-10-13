@@ -1,3 +1,4 @@
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/backlog/epic-resolve.mjs
  * @description The PURE core of epic-resolve-on-last-child (#2752) — the drain-side, session-free pass that
@@ -66,7 +67,7 @@ export function planEpicResolveOnLand(s) {
   if (!s.hasParent) return { action: 'skip', reason: 'no-parent' };
   if (!s.parentFound) return { action: 'skip', reason: 'parent-missing' };
   if (s.kind !== 'epic') return { action: 'skip', reason: 'parent-not-epic' };
-  if (s.status === 'resolved') return { action: 'skip', reason: 'already-resolved' };
+  if (isTerminalStatus(s.status)) return { action: 'skip', reason: `already-${s.status}` };
   if (s.ongoing === true || s.childlessReason === 'program') return { action: 'skip', reason: 'standing-program' };
   if (s.openChildrenCount > 0) return { action: 'skip', reason: 'open-children' };
   // Last child has landed. Everything past here is a candidate to close — gate on the judgment markers.

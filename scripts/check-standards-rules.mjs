@@ -13,6 +13,8 @@
  * feed (#095/#196/#197) and the human output are unchanged.
  */
 
+import { CLOSED_REASONS, isTerminalStatus } from './lib/backlog-status.cjs';
+
 import { createRequire } from 'node:module';
 import { normalizeRelatedReport } from './lib/related-report.cjs';
 
@@ -205,7 +207,7 @@ export const THRESHOLD_KNOBS = new Set([
 // docs/agent/backlog-workflow.md. Exported so the script and the tests share one definition.
 // `preparing` (#375) — a decision being researched by /prepare: non-open + in-flight (drops from
 // selection like `active`) but distinct on the board from a story mid-build.
-export const BACKLOG_STATUSES = new Set(['open', 'active', 'preparing', 'parked', 'resolved']);
+export const BACKLOG_STATUSES = new Set(['open', 'active', 'preparing', 'parked', 'resolved', 'closed']);
 // Valid `parkedReason` values (#1392) — the machine-readable WHY a non-epic item is parked, mirror of an
 // epic's childlessReason. Vocab + pill colours live in backlogMeta.js `parkedReasonMeta`.
 // Tightened 2026-06-22 (parked-item sweep): parking is NOT a prioritisation escape. A park must reduce to a
@@ -498,6 +500,38 @@ export function validateBacklogItem(item, ctx) {
   // Resolution date is what the burndown plots — required once resolved.
   if (item.status === 'resolved' && !item.dateResolved)
     err(`Backlog item "${item.id}" is resolved but has no dateResolved — the burndown needs the resolution date`);
+
+  // Closed is terminal, but records no delivery. Resolve pointers against the raw registry.
+  const closedFields = ['closedReason', 'closedInto', 'closedBy', 'dateClosed'];
+  if (item.status !== 'closed') {
+    for (const field of closedFields) if (item[field] !== undefined)
+      err(`Backlog item "${item.id}" has stale ${field} on non-closed status "${item.status}"`);
+  } else {
+    if (!CLOSED_REASONS.has(item.closedReason))
+      err(`Backlog item "${item.id}" closed requires closedReason: ${[...CLOSED_REASONS].join(' / ')}`);
+    if (!item.dateClosed || !/^\d{4}-\d{2}-\d{2}$/.test(item.dateClosed))
+      err(`Backlog item "${item.id}" is closed but requires dateClosed (YYYY-MM-DD)`);
+    if (item.closedReason === 'duplicate') {
+      if (!item.closedInto || !String(item.closedInto).trim())
+        err(`Backlog item "${item.id}" closed as duplicate requires closedInto`);
+      else {
+        const target = ctx.itemByRef?.get(String(item.closedInto));
+        if (!target) err(`Backlog item "${item.id}" closedInto "${item.closedInto}" does not resolve to an existing item`);
+        else if (target.id === item.id) err(`Backlog item "${item.id}" closedInto must not point to itself`);
+        else if (target.status === 'closed') err(`Backlog item "${item.id}" closedInto points to closed item #${target.num}`);
+      }
+    } else if (item.closedInto !== undefined)
+      err(`Backlog item "${item.id}" closedInto is only allowed for duplicate`);
+    if (item.closedBy !== undefined && item.closedReason !== 'fixed-elsewhere')
+      err(`Backlog item "${item.id}" closedBy is only allowed for fixed-elsewhere`);
+  }
+  if (!isTerminalStatus(item.status)) {
+    for (const ref of Array.isArray(item.blockedBy) ? item.blockedBy : []) {
+      const blocker = ctx.itemByRef?.get(String(ref));
+      if (blocker?.status === 'closed')
+        err(`Backlog item #${item.num || item.id} blockedBy closed item #${blocker.num || blocker.id} — a closed blocker cannot satisfy a live dependent`);
+    }
+  }
 
   // UI-fidelity contract shape (#2805, epic #2804) — a UI item is born carrying a `fidelity:` block naming
   // its real assembled route, host shell, frozen webcase required-set, data seeds (empty+overflow
@@ -2891,7 +2925,7 @@ export function duplicateBornAs(items = []) {
   for (const [hash, twins] of byHash) {
     if (twins.length < 2) continue;
     const names = twins.map((t) => `#${t.num}${t.status ? ` (${t.status})` : ''}`).join(' and ');
-    const live = twins.filter((t) => t.status !== 'resolved');
+    const live = twins.filter((t) => !isTerminalStatus(t.status));
     const msg =
       `Backlog hash \`${hash}\` is the \`bornAs\` of ${twins.length} cards — ${names}. Under JIT numbering `
       + "(#2288) the hash is the item's identity across its rename, so this is ONE item minted twice — "
@@ -3784,7 +3818,7 @@ const SCOPE_REPO_PREFIX_RE = /^(?:we|fui|plateau|webeverything|frontierui|platea
 export function dirLevelScopeFinding(item) {
   const scope = item?.scope;
   if (!Array.isArray(scope)) return [];
-  if (item?.status === 'resolved') return [];
+  if (isTerminalStatus(item?.status)) return [];
   const rationale = typeof item?.scopeRationale === 'string' ? item.scopeRationale.trim() : '';
   if (rationale) return [];
   return scope.filter((p) => typeof p === 'string' && SCOPE_REPO_PREFIX_RE.test(p) && p.endsWith('/'));
@@ -3866,7 +3900,7 @@ export function buildTrackedPathIndex(trackedPaths) {
 export function scopeBasenameMismatches(item, index) {
   const scope = item?.scope;
   if (!Array.isArray(scope)) return [];
-  if (item?.status === 'resolved') return [];
+  if (isTerminalStatus(item?.status)) return [];
   const rationale = typeof item?.scopeRationale === 'string' ? item.scopeRationale.trim() : '';
   if (rationale) return [];
   const paths = index?.paths, byBasename = index?.byBasename;
@@ -3922,7 +3956,7 @@ const SOURCE_EXT_RE = /\.(mjs|ts)$/;
 const isTestPath = (p) => /(^|\/)__tests__\//.test(p) || /\.test\.[a-z]+$/.test(p);
 
 function scopeEscaped(item) {
-  if (item?.status === 'resolved') return true;
+  if (isTerminalStatus(item?.status)) return true;
   return typeof item?.scopeRationale === 'string' && item.scopeRationale.trim() !== '';
 }
 

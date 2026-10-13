@@ -134,7 +134,8 @@ export function localSlug() {
  * @returns {{num, item, repos, blockedBy, stackParents, reviewChanges, testRed, crossRepo, disposition, reason}}
  *   disposition ∈ 'ready' | 'conflict' | 'test-red' | 'review-changes' | 'blocked' | 'unknown'
  */
-export function classifyLane(pr, resolvedItems) {
+export function classifyLane(pr, resolvedItems, closedItems = new Set()) {
+  if (closedItems.has(pr.item)) return { ...pr, disposition: 'blocked', reason: `target #${pr.item} is closed — reopen before resuming` };
   const blockedBy = pr.blockedBy || [];
   const unlanded = blockedBy.filter((b) => !resolvedItems.has(b));
   const crossRepo = (pr.repos || []).some((r) => r.repo && r.repo !== 'we');
@@ -578,7 +579,7 @@ function readManifest(ref, { repo = null } = {}) {
  * @param {string} [cwd]
  * @returns {Set<number>}
  */
-export function resolvedItemSet(cwd = process.cwd()) {
+export function resolvedItemSet(cwd = process.cwd(), { status = 'resolved' } = {}) {
   const set = new Set();
   let files = [];
   try { files = execFileSync('git', ['ls-tree', '-r', '--name-only', 'origin/main'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n').filter((f) => /^backlog\/\d+-/.test(f)); } catch { return set; }
@@ -586,7 +587,7 @@ export function resolvedItemSet(cwd = process.cwd()) {
     const n = Number((f.match(/^backlog\/(\d+)-/) || [])[1]);
     try {
       const doc = execFileSync('git', ['show', `origin/main:${f}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-      if (docIsResolved(doc)) set.add(n);
+      if (readField(doc, 'status') === status) set.add(n);
     } catch { /* skip */ }
   }
   return set;
@@ -809,7 +810,7 @@ function openPrMissingLane(ref, { repo = null } = {}) {
   const item = deriveItemFromRef({ manifestItem: man?.item ?? null, commitSubjects, changedBacklogFiles });
   // The backlog is WE-global (#2383's own rule): resolve against THIS process's cwd (the WE checkout the
   // operator is running `/finish` from), never `dir` — a remote repo's sibling clone has no `backlog/` tree.
-  const resolvedOnMainByOtherCommit = item != null && resolvedItemSet().has(item);
+  const resolvedOnMainByOtherCommit = item != null && (resolvedItemSet().has(item) || resolvedItemSet(process.cwd(), { status: 'closed' }).has(item));
   const plan = planOpenPrMissingRef({ ref, existingPr, tipOnMain, item, resolvedOnMainByOtherCommit });
   if (!plan.ok) return { ok: false, ref, reason: plan.reason };
 
@@ -879,6 +880,7 @@ function discover(asJson, { repos = null, singleRepo = false, windowDays = 7 } =
   const self = localSlug();
   const REPOS = resolveRepos({ repos, singleRepo, self });
   const resolved = resolvedItemSet();
+  const closed = resolvedItemSet(process.cwd(), { status: 'closed' });
   const lanes = [];
   for (const repo of REPOS) {
     const isLocal = repo == null || repo === self;
@@ -895,6 +897,7 @@ function discover(asJson, { repos = null, singleRepo = false, windowDays = 7 } =
     if (truncated) process.stderr.write(`lane-resume ⚠ ${repo || 'cwd repo'}: the open-PR listing hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${READY_LABEL} PR past it can be missing this pass (#no-label-search)\n`);
     for (const p of prs) {
       const man = readManifest(p.headRefName, { repo: isLocal ? null : repo }) || { item: null, repos: [], blockedBy: [], stackParents: [] };
+      if (closed.has(man.item)) continue;
       const lane = classifyLane({
         num: p.number, mergeable: p.mergeable, mergeState: p.mergeStateStatus,
         testConclusion: testConclusionOf(p),

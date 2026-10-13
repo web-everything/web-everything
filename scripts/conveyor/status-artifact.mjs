@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/conveyor/status-artifact.mjs
  * @description The CONVEYOR STATUS-ARTIFACT generator (epic #2612) — the INTERIM status surface the conveyor
@@ -54,7 +55,7 @@ for (const f of files) {
   const fm = (t.split(/^---$/m)[1]) || '';
   const g = (k) => { const m = fm.match(new RegExp('^' + k + ':\\s*(.+)$', 'm')); return m ? m[1].trim().replace(/^["']|["']$/g, '') : ''; };
   const status = g('status');
-  if (status === 'resolved') continue;
+  if (isTerminalStatus(status)) continue;
   const num = g('num') || f.split('-')[0];
   const title = (g('title') || f.replace(/^\d+-/, '').replace(/\.md$/, '').replace(/-/g, ' ')).slice(0, 62);
   const workItem = g('workItem'); const type = g('type'); const kind = g('kind'); const size = g('size'); const parent = g('parent');
@@ -90,7 +91,7 @@ for (const f of files) {
   for (const p of (pm[1].match(/\d+/g) || [])) {
     childCount[p] = childCount[p] || { open: 0, total: 0 };
     childCount[p].total++;
-    if (st !== 'resolved') childCount[p].open++;
+    if (!isTerminalStatus(st)) childCount[p].open++;
   }
 }
 
@@ -174,7 +175,7 @@ const hasOpenBlocker = (blockedBy) => !!blockedBy && blockedBy.split(/[,\s]+/)
   .some((b) => (b in statusByNum) && statusByNum[b] !== 'resolved' && !mergedToday.includes(b));
 // classify ONE child into a single state, reusing the generator's live maps
 const classifyChild = (c) => {
-  if (c.status === 'resolved' || mergedToday.includes(String(c.num))) return 'done';
+  if (isTerminalStatus(c.status) || mergedToday.includes(String(c.num))) return 'done';
   const pr = prByNum[c.num];
   if (pr) {
     if (pr.labels.includes('review:accepted')) return 'landing';

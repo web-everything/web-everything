@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isTerminalStatus } from './lib/backlog-status.cjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
 /**
  * check-standards.mjs — consistency & convention validator for Web Everything.
@@ -847,6 +848,7 @@ mark("6c-bis. Capability vocabulary + static build-matrix (#204, foundation of e
 // the script composes it here over the live registry, then layers the cross-item graph checks
 // (dup nums, blockedBy DAG, double-count) below.
 const backlogCtx = {
+  itemByRef: new Map([...backlog.filter((i) => i.bornAs).map((i) => [String(i.bornAs), i]), ...backlog.map((i) => [String(i.num), i])]),
   projectById,
   graduatedKinds,
   knownNums: new Set(backlog.map((i) => i.num).filter(Boolean)), // every item's num — for parent resolution
@@ -1099,7 +1101,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     // corpus and pressure authors to under-scope; a warning surfaces the finer-lease debt without either hazard.
     // Resolved items are historical (no author will re-scope a shipped item), so they are skipped.
     const scopeRationale = typeof raw?.scopeRationale === 'string' ? raw.scopeRationale.trim() : '';
-    if (raw?.status !== 'resolved' && !scopeRationale) {
+    if (!isTerminalStatus(raw?.status) && !scopeRationale) {
       const dirs = dirLevelScopeFinding(raw);
       if (dirs.length)
         warn(`Backlog item "${id}" has directory-level scope entr${dirs.length > 1 ? 'ies' : 'y'} ${JSON.stringify(dirs)} (a repo-qualified prefix ending in "/") — scope defaults to FILE-LEVEL (#2739/#2679). A bare directory scope re-creates the coarse serialization finer leases removed: file-disjoint items stall behind one broad dir-scope. NARROW it to the specific files this item writes (never fewer than the real write-set — an under-scope breaches the lease at build time), OR, if the item genuinely spans the directory / is inherently cross-cutting, add a short \`scopeRationale:\` note stating why and this flag clears.`);
@@ -1160,7 +1162,7 @@ for (const item of backlog) {
   // This is the #1210 trap, and it's the failure mode the CHILDLESS_REASONS exemption above could mask, so
   // surface it here. Partial-resolved is normal (prereqs land one at a time), so only flag a FULLY cleared
   // block. The fix: start the item, or re-point blockedBy at the genuine remaining open dependency.
-  if (item.status !== 'resolved' && targets.length && targets.every((t) => statusByNum.get(t) === 'resolved'))
+  if (!isTerminalStatus(item.status) && targets.length && targets.every((t) => statusByNum.get(t) === 'resolved'))
     warn(`Backlog item "${item.id}" is still marked blocked but every blockedBy target (${targets.map((t) => `#${t}`).join(', ')}) is resolved — the block is stale. Start it, or re-point blockedBy at the real remaining open dependency (and clear \`childlessReason: blocked\` if it no longer applies).`);
 }
 // Cycle detection over the resolved edges (DFS with a colour map). A back-edge means A blocks B
@@ -1198,7 +1200,7 @@ if (!LOCAL_MODE) {
 // it is noise.
 const kindByNum = new Map(backlog.map((i) => [i.num, i.kind]));
 for (const item of backlog) {
-  if (item.status === 'resolved' || item.parent === undefined || !Array.isArray(item.blockedBy)) continue;
+  if (isTerminalStatus(item.status) || item.parent === undefined || !Array.isArray(item.blockedBy)) continue;
   const parentNum = String(item.parent);
   const parentKind = kindByNum.get(parentNum);
   if (parentKind !== 'epic' && parentKind !== 'feature') continue;
@@ -1293,12 +1295,12 @@ for (const item of backlog) {
   if (item.kind !== 'epic' && item.kind !== 'feature') continue;
   const kids = childrenOf.get(item.num) || [];
   if (!kids.length) continue;
-  const openKids = kids.filter((k) => k.status !== 'resolved');
+  const openKids = kids.filter((k) => !isTerminalStatus(k.status));
   if (item.status === 'resolved' && openKids.length)
     err(`Backlog item "${item.id}" is a resolved ${item.kind} but has ${openKids.length} open child slice(s) (${openKids.map((k) => `#${k.num}`).join(', ')}) — a closed umbrella with live work under it. Reopen it or resolve/re-parent the open child(ren).`);
-  else if (item.status !== 'resolved' && (item.blockedBy?.length) && !openKids.length && !CHILDLESS_REASONS.has(item.childlessReason))
+  else if (!isTerminalStatus(item.status) && (item.blockedBy?.length) && !openKids.length && !CHILDLESS_REASONS.has(item.childlessReason))
     err(`Backlog item "${item.id}" is a blocked ${item.kind} with no open children and no childlessReason — set childlessReason: ${[...CHILDLESS_REASONS].join('|')} so the board shows why it's stalled, or add the next slice.`);
-  else if (item.status !== 'resolved' && !openKids.length && !item.ongoing && !CHILDLESS_REASONS.has(item.childlessReason))
+  else if (!isTerminalStatus(item.status) && !openKids.length && !item.ongoing && !CHILDLESS_REASONS.has(item.childlessReason))
     warn(`Backlog item "${item.id}" is a ${item.kind} whose every child is resolved ('all slices done') — reconcile it: resolve it (its scope is delivered) or scaffold the next slice.`);
   // An `ongoing: true` epic (a perpetual program, e.g. the flagship exercise apps) is intentionally never
   // a resolve cue — between slices it legitimately has every child resolved without being "done".
@@ -1353,7 +1355,7 @@ for (const item of backlog) {
     err(`Backlog item "${item.id}" has unsplittableReason: undecided — a buried fork that blocks splitting is a first-class \`kind: decision\` item, not an inline reason. Carve the decision and point this story's \`blockedBy\` at it, then re-run /split once it's resolved.`);
   else if (!UNSPLITTABLE_REASONS.has(item.unsplittableReason))
     err(`Backlog item "${item.id}" has unsplittableReason: "${item.unsplittableReason}" — not a known reason. Use one of: ${[...UNSPLITTABLE_REASONS].join('|')}.`);
-  else if (item.kind !== 'story' || typeof item.size !== 'number' || item.size <= 8 || item.status === 'resolved')
+  else if (item.kind !== 'story' || typeof item.size !== 'number' || item.size <= 8 || isTerminalStatus(item.status))
     err(`Backlog item "${item.id}" has unsplittableReason but is not an open oversized story (kind: story, size > 8) — the field only clears the /split flag there. Drop it, or re-size/re-kind the item.`);
 }
 
@@ -2879,7 +2881,7 @@ mark("17c. Leash pin (#2892 — enforces #2840 trigger 3; guards #2838's flip-ed
 try {
   // Collision universe: every NON-resolved item's scope — a resolved item no longer holds a live lane,
   // so its historical scope is not a real serialization cost.
-  const backlogScopes = backlog.filter((it) => it.status !== 'resolved').map((it) => it.scope || []);
+  const backlogScopes = backlog.filter((it) => !isTerminalStatus(it.status)).map((it) => it.scope || []);
   // Candidates: every FILE-shaped (not a directory/glob), "we:"-qualified scope entry named by ANY
   // non-resolved item, deduped. Shared with the #2782 calibration guard so both select one population.
   const candidatePaths = lockPointCandidatePaths(backlogScopes);

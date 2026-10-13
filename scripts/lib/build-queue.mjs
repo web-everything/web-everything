@@ -1,3 +1,4 @@
+import { isTerminalStatus } from './backlog-status.cjs';
 /**
  * Build-queue prioritization engine (#2528) — the pure ordering layer of the autonomous AI build queue
  * (epic #2527), per the ratified design decision #2526.
@@ -217,7 +218,7 @@ function unblocksCount(item, items) {
   let n = 0;
   for (const other of items) {
     if (other === item) continue;
-    if (other.status === 'resolved' || other.tier === EXCLUDED_TIER) continue;
+    if (isTerminalStatus(other.status) || other.tier === EXCLUDED_TIER) continue;
     const bb = Array.isArray(other.blockedBy) ? other.blockedBy : [];
     if (bb.some((b) => keys.has(String(b)))) n++;
   }
