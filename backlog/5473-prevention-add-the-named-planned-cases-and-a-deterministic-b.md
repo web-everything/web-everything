@@ -41,3 +41,4 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5160 (finding 1: `we:backlog/5943-red-main-repair-patterns-resolve-host-wide-not-per-caller.md:63` — Add a preparation gate requiring each explicit behavioral guarantee to reference a named planned test and its observable assertion; review that assertion for semantic adequacy.) · key `approval-prevention-key:web-everything/web-everything#5160@bbbcd56e8249ec6895433e4b4959981c9c10eb35`
+- Also raised by web-everything/web-everything#5225 (finding 1: `we:backlog/4674-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:27` — Add a preparation gate requiring each behavioral guarantee to map to a repository-qualified planned test, named case, and observable assertion; include omitted settings and override logging explicitly.) · key `approval-prevention-key:web-everything/web-everything#5225@cdaee5662950a8f02789cb92b4b1da765c2ea215`
