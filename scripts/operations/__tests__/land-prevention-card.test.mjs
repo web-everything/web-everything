@@ -25,6 +25,9 @@ import {
 import { findBadBodyLinks } from '../../check-standards-rules.mjs';
 import { renderItem } from '../../backlog/scaffold.mjs';
 import yaml from 'js-yaml';
+import { fileIntoBatch } from '../card-batch-file.mjs';
+import { resolvePreventionBatchSettings } from '../../lib/card-batch-settings.mjs';
+import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 
 const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
   batch: async () => ({ batched: false, reason: 'per-card test' }), ...deps,
@@ -603,7 +606,8 @@ describe('postLandingRetraction — a failed job retracts its own marker on the 
 
 
 describe('prevention batch landing', () => {
-  const deps = { dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {} };
+  const deps = { dedupe: () => null, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
+    loadPreventionBatchSettings: () => resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention }) };
   it.each([null, { repo: 'o/r', pr: '42', headSha: 'abc' }])('hands a new hash card to the batch and releases without publishing (%j)', async (retract) => {
     const rel = 'backlog/x123456-prevention.md';
     const { exec, calls } = scriptedExec([ACQUIRE_OK, JSON.stringify({ verdict: { rel } }), 'released']);
@@ -613,11 +617,55 @@ describe('prevention batch landing', () => {
     expect(result).toEqual({ ok: true, step: 'batched', num: null, rel, pr: null, url: null, reason: null, batchRef: 'lane/card-batch-prevention-1' });
     expect(batch).toHaveBeenCalledWith({ laneDir: JSON.parse(ACQUIRE_OK).path, cardPath: rel, kind: 'prevention',
       actor: 'mechanical', idemKey: 'prevention:x123456',
-      source: { repo: 'web-everything/web-everything', pr: retract?.pr ?? null, head: retract?.headSha ?? null, note: retract ? 'Prevention guard (from o/r#42)' : 'Prevention guard' } });
+      source: { repo: 'web-everything/web-everything', pr: retract?.pr ?? null, head: retract?.headSha ?? null, note: retract ? 'Prevention guard (from o/r#42)' : 'Prevention guard' } }, expect.objectContaining({ retries: 30, pause: expect.any(Function) }));
     expect(calls).toHaveLength(3);
     expect(calls[2].args).toContain('release');
     expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some((op) => args.includes(op)))).toBe(false);
     expect(write).toHaveBeenCalledWith('land-prevention-card: batched ' + rel + ' into lane/card-batch-prevention-1\n');
+  });
+  it.each([1, 7])('waits through two held leases and batches with a %s minute budget', async (minutes) => {
+    const preventionSettings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention,
+      repo: { batchLeaseWaitMinutes: minutes } });
+    const loadPreventionBatchSettings = vi.fn(() => preventionSettings);
+    const sleep = vi.fn(async () => {});
+    const admit = vi.fn()
+      .mockResolvedValueOnce({ action: 'refuse', reason: 'lease-held' })
+      .mockResolvedValueOnce({ action: 'refuse', reason: 'lease-held' })
+      .mockResolvedValue({ action: 'admit', batchRef: 'lane/card-batch-prevention-1' });
+    const batch = vi.fn((input, options) => {
+      expect(options).toMatchObject({ pause: expect.any(Function), retries: expect.any(Number) });
+      return fileIntoBatch(input, { ...options, admit,
+        baseSha: 'a'.repeat(40), stateDir: '/tmp/unused-batch-state', launch: () => {}, log: () => {} });
+    });
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'released']);
+    expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, sleep, loadPreventionBatchSettings, write: () => {} }))
+      .toMatchObject({ ok: true, step: 'batched' });
+    expect(loadPreventionBatchSettings).toHaveBeenCalledTimes(1);
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(batch.mock.calls[0][1]).toMatchObject({ retries: minutes * 2, preventionSettings, pause: expect.any(Function) });
+    expect(admit).toHaveBeenCalledTimes(3);
+    expect(sleep.mock.calls).toEqual([[30_000], [30_000]]);
+    expect(calls).toHaveLength(3);
+  });
+  it('opens one fallback PR when the lease wait budget is exhausted', async () => {
+    const preventionSettings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention,
+      repo: { batchLeaseWaitMinutes: 1 } });
+    const sleep = vi.fn(async () => {});
+    const admit = vi.fn(async () => ({ action: 'refuse', reason: 'lease-held' }));
+    const batch = vi.fn((input, options) => {
+      expect(options).toMatchObject({ pause: expect.any(Function), retries: expect.any(Number) });
+      return fileIntoBatch(input, { ...options, admit,
+        baseSha: 'a'.repeat(40), stateDir: '/tmp/unused-batch-state', launch: () => {}, log: () => {} });
+    });
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+    const write = vi.fn();
+    expect(await realLandPreventionCard(INPUT, { ...deps, exec, batch, sleep,
+      loadPreventionBatchSettings: () => preventionSettings, write })).toMatchObject({ ok: true, step: 'done', pr: 5555 });
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledTimes(3);
+    expect(sleep.mock.calls).toEqual([[30_000], [30_000]]);
+    expect(write).toHaveBeenCalledWith("land-prevention-card: batch lease still held after 1 min; opening the card's own PR\n");
+    expect(calls.filter(({ args }) => args.includes('open-pr'))).toHaveLength(1);
   });
   it.each([false, true])('falls back on refusal or throw (throw=%s)', async (throws) => {
     const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);

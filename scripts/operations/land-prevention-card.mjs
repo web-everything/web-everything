@@ -84,8 +84,10 @@ import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
+import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -364,6 +366,8 @@ export async function landPreventionCard(input, {
   rmTmp = (dir) => rmSync(dir, { recursive: true, force: true }),
   dedupe = runCardDedupe,
   batch = fileIntoBatch,
+  loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
+  sleep: wait = sleep,
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -469,19 +473,27 @@ export async function landPreventionCard(input, {
 
     if (rel && mentioned.length === 0) {
       try {
+        const preventionSettings = loadBatchSettings();
+        const minutes = preventionSettings.batchLeaseWaitMinutes;
+        // A detached job can wait through the seal job's verification lease. Keep other callers' defaults.
+        const retries = Math.ceil(minutes * 60 / 30);
         const result = await batch({
           laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical',
           idemKey: `prevention:${cardIdOf(rel) ?? num ?? input.session}`,
           // The batch PR lives where the card lives (web-everything), whatever repo the source PR was in.
           source: { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
             note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title },
-        });
+        }, { preventionSettings, retries, pause: () => wait(30_000) });
         if (result.batched) {
           const { batchRef } = result;
           write(`land-prevention-card: batched ${rel} into ${batchRef}\n`);
           return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef };
         }
-        write(`land-prevention-card: not batched — ${result.reason}; opening the card's own PR\n`);
+        if (result.reason === 'coordinator refused: lease-held') {
+          write(`land-prevention-card: batch lease still held after ${minutes} min; opening the card's own PR\n`);
+        } else {
+          write(`land-prevention-card: not batched — ${result.reason}; opening the card's own PR\n`);
+        }
       } catch (error) {
         write(`land-prevention-card: batch failed — ${String(error?.message || error).split('\n')[0]}; opening the card's own PR\n`);
       }

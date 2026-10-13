@@ -92,19 +92,22 @@ export function loadCardBatchSettings({
 /**
  * Prevention uses the same per-key cascade as cards: standard prevention policy → platform.prevention →
  * declared repo prevention → env. The standard window is 120 minutes; the operator's 60-minute default
- * lives in scripts/settings/prevention-batch.json. Invalid optional values retain the lower layer.
+ * lives in scripts/settings/prevention-batch.json. Lease waiting defaults to 15 minutes here, independently
+ * of the policy overlay. Invalid optional values retain the lower layer.
  */
-const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards']);
+const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards', 'batchLeaseWaitMinutes']);
 const PREVENTION_BATCH_ENV = Object.freeze({
   batchFiling: 'WE_PREVENTION_BATCH_FILING',
   batchWindowMinutes: 'WE_PREVENTION_BATCH_WINDOW_MINUTES',
   batchMaxCards: 'WE_PREVENTION_BATCH_MAX_CARDS',
+  batchLeaseWaitMinutes: 'WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES',
 });
 
-/** PURE: resolve boolean batchFiling and positive integer window/count, retaining each source. */
+/** PURE: resolve boolean batchFiling and positive integer window/count/lease wait, retaining each source. */
 export function resolvePreventionBatchSettings({ standard, platform, repo, env } = {}) {
   if (!isObject(standard)) throw new TypeError('prevention batch settings: standard prevention policy is required');
-  const out = { batchFiling: standard.enabled, batchWindowMinutes: standard.maxAgeMinutes, batchMaxCards: standard.maxCards };
+  const out = { batchFiling: standard.enabled, batchWindowMinutes: standard.maxAgeMinutes,
+    batchMaxCards: standard.maxCards, batchLeaseWaitMinutes: 15 };
   const sources = Object.fromEntries(PREVENTION_BATCH_SETTING_KEYS.map((k) => [k, 'standard']));
   const invalid = [];
   for (const [name, layer] of [['platform', platform], ['repo', repo],
