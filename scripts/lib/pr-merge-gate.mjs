@@ -315,9 +315,10 @@ function ledgerVerdict({ folded, derived, head }) {
   if (unreadable) return { clear: false, defer: true, reason: 'ledger-unreadable: deferring, an unreadable ledger is a hold' };
   const holds = derived.holds ?? [];
   if (holds.length) return { clear: false, defer: false, reason: `ledger holds: ${holds.map(h => h?.code ?? 'unknown').join(', ')}` };
-  if (folded.clears !== true || derived.clears !== true) return { clear: false, defer: false, reason: 'ledger does not clear' };
+  const exempt = !folded.current && derived.reviewExempt === true;
+  if ((folded.clears !== true && !exempt) || derived.clears !== true) return { clear: false, defer: false, reason: 'ledger does not clear' };
   const sha = typeof head === 'string' ? head : head?.sha;
   const covered = folded.current?.coverage?.headSha;
   if (sha && covered && sha !== covered) return { clear: false, defer: false, reason: `ledger clearance covers ${covered}, head is ${sha}` };
-  return { clear: true, defer: false, reason: 'ledger clears' };
+  return { clear: true, defer: false, reason: exempt ? 'ledger clears (review-exempt at this head)' : 'ledger clears' };
 }

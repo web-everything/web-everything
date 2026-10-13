@@ -120,6 +120,20 @@ export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
     minAgreementPct: 99,
     /** Maximum rows where ledger clears while the drain holds; all count as unsafe. */
     maxUnsafeDisagreements: 0,
+    /**
+     * The nightly readiness check run by the health watch (we:scripts/lib/ledger-readiness-daily.mjs). Once per ET
+     * day it appends one line to <health dir>/ledger-readiness-history.jsonl and raises the
+     * `ledger-readiness-regressed` smell when unsafe disagreements exceed maxUnsafeDisagreements or agreement drops
+     * versus the previous day. Read-only toward PRs. Env: WE_LEDGER_DAILY_CHECK_ENABLED, WE_LEDGER_DAILY_CHECK_AT.
+     * Mirrored in scripts/lib/ledger-readiness-daily.mjs.
+     */
+    dailyCheck: {
+      /** Run the nightly check at all. */
+      enabled: true,
+      /** 'quiet-start' (the quiet-hours start, 22:00 ET by default) or 'HH:MM' in the quiet-hours time zone;
+       *  turning quiet mode on ("good night") runs it early either way. */
+      at: 'quiet-start',
+    },
   },
 } as const;
 

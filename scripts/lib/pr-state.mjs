@@ -55,7 +55,12 @@ export function ledgerView(events, facts) {
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
   if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now)) clears = true;
-  return { events: mine, folded, clears, referrals: deriveReferrals(mine) };
+  const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
+  const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
+  const reviewExempt = !cur && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
+    && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
+  clears = clears || reviewExempt;
+  return { events: mine, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };
 }
 
 /** Map a core phase plus the hold picture to a lifecycle state. The core's phase is kept except for two restrictions. */
@@ -97,7 +102,7 @@ function derive(events, facts, settings) {
   const view = ledgerView(events, facts);
   const holds = evaluateHolds({ view, facts, settings }, settings.holdRules);
   const cur = view.folded?.current ?? null;
-  const covered = view.clears && !holds.some(h => h.code === 'stale-acceptance');
+  const covered = view.clears && !!cur && !holds.some(h => h.code === 'stale-acceptance');
   const labels = covered ? ['review:accepted'] : cur && !view.clears ? [verdictLabel(cur.verdict)].filter(Boolean) : [];
   const open = openReferralKeys(view.referrals);
   const capHold = holds.find(h => h.code === 'same-head-cap' && h.needsYou);
@@ -107,7 +112,8 @@ function derive(events, facts, settings) {
   const phase = derivePrPhase(coreFacts, settings);
   const humanGate = (cur?.verdict === 'human' && !view.clears) || holds.some(h => h.code === 'label-input:review:human');
   const lifecycleState = lifecycleOf(phase, { holds, humanGate, facts });
-  return finish({ lifecycleState, verdict: cur?.verdict ?? null, clears: view.clears && holds.length === 0, holds, phase });
+  const clears = view.clears && holds.length === 0;
+  return finish({ lifecycleState, verdict: cur?.verdict ?? null, clears, reviewExempt: view.reviewExempt && clears, holds, phase });
 }
 
 /** A derive that cannot trust its input holds the PR in NEEDS-OPERATOR without consulting the core. */
@@ -116,11 +122,11 @@ function heldOutright(code, reason, next) {
   return finish({ lifecycleState: 'NEEDS-OPERATOR', verdict: null, clears: false, holds: [hold], phase: { phase: 'NEEDS-OPERATOR', headline: reason, next, evidence: [] } });
 }
 
-function finish({ lifecycleState, verdict, clears, holds, phase }) {
+function finish({ lifecycleState, verdict, clears, reviewExempt = false, holds, phase }) {
   const row = lifecycleRow(lifecycleState);
   const needsYou = [...new Set(holds.map(h => h.needsYou).filter(Boolean))];
   if (row?.owner === 'operator' && !['MERGED', 'CLOSED'].includes(lifecycleState) && !needsYou.length) needsYou.push(phase.headline);
-  return { lifecycleState, verdict, clears, holds, needsYou, labels: renderLabels(lifecycleState),
+  return { lifecycleState, verdict, clears, reviewExempt, holds, needsYou, labels: renderLabels(lifecycleState),
     reasons: [...holds.map(h => h.reason), phase.headline], next: phase.next, owner: row?.owner ?? null,
     maxTimeInState: row?.maxTimeInState ?? null, phase };
 }

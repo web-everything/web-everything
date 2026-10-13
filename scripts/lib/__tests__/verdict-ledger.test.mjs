@@ -869,6 +869,7 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
   const SHA = 'b'.repeat(40);
   const base = { repo: REPO, pr: 7, at: AT, source: 'test', writer: 'h:1:w', declaredActor: 'op', session: 's1', channel: 'c' };
   const payloads = {
+    'review-exempt': { headSha: SHA, basis: 'no review needed' },
     referral: { headSha: SHA, findingKeys: ['f1', 'f2'] },
     ruling: { findingKey: 'f1', ruling: 'block' },
     'review-run': { headSha: SHA, phase: 'completed', posted: false },
@@ -932,9 +933,9 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     expect(validateVerdictRecord({ ...v1, type: 'verdict' }).valid).toBe(true);
   });
 
-  it('bears: verdicts, referrals, rulings, holds, releases, approvals, send-backs; not review-run, author, label-input', () => {
+  it('bears: verdicts, review exemptions, referrals, rulings, holds, releases, approvals, send-backs; not review-run, author, label-input', () => {
     const bearing = EVENT_TYPE_VALUES.filter((t) => eventBears(t));
-    expect(bearing).toEqual(['verdict', 'referral', 'ruling', 'hold', 'release', 'approval', 'send-back']);
+    expect(bearing).toEqual(['verdict', 'review-exempt', 'referral', 'ruling', 'hold', 'release', 'approval', 'send-back']);
     expect(EVENT_TYPES.REVIEW_RUN).toBe('review-run');
   });
 

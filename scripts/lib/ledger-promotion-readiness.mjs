@@ -52,6 +52,26 @@ export function reclassifyRow(row) {
   return { ...row, status: 'transient', direction: null, transient: 'stale-drain-mechanical-hold' };
 }
 
+/** Read-only replay: remove only the strictness the additive drain facts would resolve. */
+export function projectDrainFactsRow(row) {
+  if (row?.status !== 'disagree' || row?.direction !== 'ledger-holds-label-clears') return row;
+  const codes = drainFactHoldCodes(row);
+  if (!codes?.length) return row;
+  const remaining = codes.filter(code => code !== 'no-ledger-row' && code !== 'stale-acceptance'
+    && !(typeof code === 'string' && code.startsWith('hold:drain:')));
+  return remaining.length ? row : { ...row, status: 'agree', direction: null, projected: true };
+}
+
+// Shared with replay residual reporting so legacy reasons and structured codes count identically.
+export function drainFactHoldCodes(row) {
+  if (Array.isArray(row?.ledgerHolds)) return row.ledgerHolds;
+  if (row?.reason === 'no ledger row for this PR') return ['no-ledger-row'];
+  if (typeof row?.reason === 'string' && row.reason.startsWith('ledger holds: ')) {
+    return row.reason.slice('ledger holds: '.length).split(',').map(code => code.trim()).filter(Boolean);
+  }
+  return null;
+}
+
 /** IO is inherited from the history reader and injectable. */
 export function readShadowRuns(options = {}) {
   return readCheckRuns({ ...options, op: SHADOW_OP });
