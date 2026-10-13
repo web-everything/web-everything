@@ -91,7 +91,7 @@ In we:scripts/__tests__/lane-drain.test.mjs (pure helper tests plus a throwaway-
 
 ## Follow-ups
 
-- Review and prepared-card lint prevention filed as [#xrrmid8](/backlog/xrrmid8-lint-prepared-card-parse-forms-and-review-helper-reuse/): require citation/import of existing normalization helpers and flag accepted parse forms without matching named tests in `check:standards`. This card pairs inline arrays, trailing comments, block lists, and absent/empty lists with the cases above.
+- Review and prepared-card lint prevention filed as [#6078](/backlog/6078-lint-prepared-card-parse-forms-and-review-helper-reuse/): require citation/import of existing normalization helpers and flag accepted parse forms without matching named tests in `check:standards`. This card pairs inline arrays, trailing comments, block lists, and absent/empty lists with the cases above.
 - Implementation test gate: require the named `multi-line blockedBy`, `padded id / canonical helper`, `unreadable blocker refuses`, and `invalid blocker never reaches lookup` cases, using deterministic throwing readers and lookup spies. Include their integration assertions for no resolve call or commit.
 - Auto-resolve a skipped card when its last blocker resolves (the stranded sweep could do it once the check passes).
 - Optional warning in the `resolve` verb of we:scripts/backlog.mjs when blockers are open (human path stays allowed).
