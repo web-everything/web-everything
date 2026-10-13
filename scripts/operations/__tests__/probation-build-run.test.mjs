@@ -841,6 +841,71 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
+  it('writes grouped prepare and per-member refusal lines in the actual PR body', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
+    try {
+      const bodyFile = realIo().writePrBody(dir, { num: '4291', worker: codex, diff: { files: 2, loc: 24 }, taskType: 'prepare',
+        groupMembers: ['4292', '4293'], groupDropped: ['4293'], groupDropReasons: { '4293': 'unresolved choice' } });
+      const body = readFileSync(bodyFile, 'utf8');
+      expect(body).toContain('Grouped prepare: #4291, #4292');
+      expect(body).toContain('Not prepared: #4293 — unresolved choice');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('parses grouped prepare members', () => {
+    expect(parseArgs(['--num=4291', '--worker=codex', '--taskType=prepare', '--group-members=4292,4293']).groupMembers).toEqual(['4292', '4293']);
+  });
+  it.each(['prepared', 'declined', 'tampered', 'stamp-failed', 'unchanged', 'missing-sections', 'invalid-edge', 'multiple', 'checker-rejected', 'missing-size', 'missing-test-scope', 'over-envelope', 'outside-lease'])('isolates a %s member in one lead commit and PR', async mode => {
+    const { io, calls } = prepareIo();
+    const memberPath = 'backlog/4292-member.md';
+    const initialRaw = mode === 'missing-size' ? ITEM_RAW.replace('status: open', 'kind: task\nstatus: open') : ITEM_RAW;
+    const accepted = mode === 'prepared' || mode === 'multiple';
+    const requested = mode === 'multiple' ? ['4292', '4293'] : ['4292'];
+    const cards = new Map([
+      ['4291', { path, raw: initialRaw, scope: ['we:docs/probation/probation.md'], slug: 'lead' }],
+      ['4292', { path: memberPath, raw: initialRaw, scope: ['we:docs/probation/probation.md'] }],
+    ]);
+    if (mode === 'multiple') cards.set('4293', { path: 'backlog/4293-member.md', raw: ITEM_RAW, scope: ['we:docs/probation/probation.md'] });
+    const tasks = [], bodies = [];
+    io.findItem = n => cards.has(String(n)) ? { ...cards.get(String(n)) } : null;
+    io.blockedByGraph = () => new Map();
+    io.diffText = (_d, _b, paths) => paths.join(',');
+    io.runChecker = () => tasks.at(-1).includes(memberPath) ? 'REJECT invalid member' : 'APPROVE';
+    if (mode === 'missing-size') io.preparePolicy = { autoSize: true };
+    io.writeCard = (_d, p, raw) => { [...cards.values()].find(c => c.path === p).raw = raw; };
+    io.writeTaskFile = (_d, name, text) => { tasks.push(text); return name; };
+    io.runWorker = () => {
+      cards.get('4291').raw = mode === 'missing-size' ? prepared.replace('status: open', 'kind: task\nestimatedLoc: 20\nstatus: open') : prepared;
+      if (mode === 'multiple') cards.get('4293').raw = prepared;
+      cards.get('4292').raw = mode === 'tampered' ? prepared.replace('status: open', 'status: resolved')
+        : mode === 'unchanged' ? ITEM_RAW
+        : mode === 'missing-sections' ? ITEM_RAW + '\n## Design\nPartial\n'
+        : mode === 'missing-size' ? prepared.replace('status: open', 'kind: task\nstatus: open')
+        : mode === 'missing-test-scope' ? prepared.replace('we:docs/probation/probation.md', 'we:scripts/example.mjs')
+        : mode === 'invalid-edge' ? prepared + '\n## Proposed blockedBy changes\n- add 999 — missing target (we:scripts/example.mjs:1)\n' : prepared;
+      return { ok: true, lastMessage: mode === 'declined' ? 'Not prepared: #4292 — unresolved choice' : '' };
+    };
+    io.diffNumstat = () => [...cards.values()].filter(c => c.raw !== initialRaw).map(c => `${mode === 'over-envelope' && c.path === memberPath ? 1001 : 12}\t0\t${c.path}`).join('\n');
+    io.stampPrepare = n => {
+      calls.push(['stamp', String(n)]);
+      if (n === '4292' && mode === 'stamp-failed') return { ok: false, reason: 'invalid prose' };
+      cards.get(String(n)).raw = cards.get(String(n)).raw.replace('---\n', '---\npreparedDate: "2026-09-30"\npreparedAgainstSha: "base-sha"\n');
+      return { ok: true };
+    };
+    io.readCommittedCard = (_d, p) => [...cards.values()].find(c => c.path === p).raw;
+    io.writePrBody = (_d, body) => { bodies.push(body); return '/tmp/body'; };
+    const result = await runProbationBuild({ ...prepareArgs(), scope: mode === 'outside-lease' ? [`we:${path}`] : [], worker: mode === 'checker-rejected' ? { ...codex, checker: 'codex' } : codex, groupMembers: requested }, io);
+    expect(result).toMatchObject({ outcome: 'opened-pr', groupMembers: requested, groupDropped: accepted ? [] : ['4292'] });
+    expect(tasks[0]).toContain('## Also prepare #4292');
+    expect(tasks[0]).toContain('# Prepare 4292: ' + memberPath);
+    expect(calls.filter(c => c[0] === 'commit')).toHaveLength(1);
+    expect(calls.filter(c => c[0] === 'openPr')).toHaveLength(1);
+    expect(calls.some(c => c[0] === 'claim' || c[0] === 'resolve')).toBe(false);
+    expect(calls.find(c => c[0] === 'commit')[1]).toEqual(accepted ? [path, memberPath, ...(mode === 'multiple' ? ['backlog/4293-member.md'] : [])] : [path]);
+    expect(bodies[0]).toMatchObject({ groupMembers: requested, groupDropped: accepted ? [] : ['4292'] });
+    if (accepted) expect(cards.get('4292').raw).toContain('preparedAgainstSha: "base-sha"');
+    else expect(cards.get('4292').raw).toBe(initialRaw);
+    if (mode === 'multiple') expect(cards.get('4293').raw).toContain('preparedAgainstSha: "base-sha"');
+  });
   it.each([undefined, 0, -1, 1.5])('repairs a task missing a positive integer estimate (%s)', async estimate => {
     const raw = prepared.replace('status: open', 'kind: task\nstatus: open');
     const postWorkerRaw = estimate === undefined ? raw : raw.replace('status: open', `estimatedLoc: ${estimate}\nstatus: open`);

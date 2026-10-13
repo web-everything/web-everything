@@ -32,6 +32,7 @@
  */
 
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
+import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
@@ -329,6 +330,8 @@ const LEDGER_HOLD_REASON = 'prepare-unstamped';
 
 async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
   effects = timer.wrap(effects);
+  const groupingSettings = readBuildGroupingSettings();
+  console.error(formatBuildGroupingLine(groupingSettings));
   // Item 95 — held transient prepare failures whose backoff elapsed become dispatchable again BEFORE holds are read.
   // Live only: a dry-run must not mutate the ledger.
   if (live && typeof effects.releaseDuePrepareRetries === 'function') {
@@ -574,18 +577,61 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   };
   const retired = [];
   const inFlight = [];
-  for (const c of effects.listClaims()) {
+  const claims = effects.listClaims();
+  const groupDropped = new Set((bookkeeping.groupDropped ?? []).map(normNum));
+  const droppedNow = new Set();
+  const failedGroups = new Set();
+  const groupFailures = [];
+  for (const [lead, settled] of settledByNum) {
+    if (!settled.groupDropped?.length || inFlightNums.has(lead) || pendingLaunch.build.has(lead)) continue;
+    const groupClaims = claims.filter(c => normNum(c.meta?.num) === lead || normNum(c.meta?.groupLead) === lead);
+    // Member claims survive the wrapper's lead release, and still identify the attempt. An older
+    // settled drop must never retire claims acquired by a subsequent dispatch.
+    if (groupClaims.some(c => c.meta?.claimedAt && settled.startedAt && settled.startedAt < c.meta.claimedAt)) continue;
+    for (const raw of settled.groupDropped) {
+      const num = normNum(raw);
+      groupDropped.add(num);
+      droppedNow.add(num);
+    }
+    if (groupingSettings.groupMemberFailure === 'fail-group' && groupClaims.length) {
+      failedGroups.add(lead);
+      heldNums.add(lead);
+      // Do not immediately launch the failed group's released members again in this same tick.
+      for (const c of groupClaims) heldNums.add(normNum(c.meta.num));
+      const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}` }) : null;
+      groupFailures.push({ num: lead, stage: 'group', reason: 'group-member-dropped', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts } : {}) });
+    }
+  }
+  const leadAlive = lead => pendingLaunch.build.has(lead) || inFlightNums.has(lead)
+    || claims.some(c => c.meta?.groupLead == null && normNum(c.meta?.num) === lead
+      && !doneWhy(lead, { claimedAt: c.meta?.claimedAt || null }));
+  const protectedMembers = new Set();
+  for (const c of claims) {
     const num = normNum(c.meta?.num);
-    const why = doneWhy(num, { claimedAt: c.meta?.claimedAt || null });
+    const lead = c.meta?.groupLead == null ? null : normNum(c.meta.groupLead);
+    const why = failedGroups.has(lead ?? num) ? 'group-member-dropped'
+      : lead != null && droppedNow.has(num) ? 'group-member-dropped'
+        : lead != null ? retireMemberWhy({ member: num, leadAlive: leadAlive(lead),
+          leadDelivered: openPrs.some(p => prDeliversNum(p, lead)),
+          memberStillQueued: scopeByNum.has(num), groupMemberFailure: groupingSettings.groupMemberFailure })
+          : doneWhy(num, { claimedAt: c.meta?.claimedAt || null });
     if (why) {
       if (live) effects.releaseClaim({ num });
       retired.push({ num, why, released: live });
       continue;
     }
-    inFlight.push({ num, scope: c.meta?.scope || [], source: `claim ${c.owner}` });
+    if (lead != null) {
+      protectedMembers.add(num);
+      // A retained member under an open PR occupies no running slot. While the lead is running,
+      // merge this scope into its row by giving it the lead's num (the planner deduplicates).
+      if (leadAlive(lead)) {
+        const run = runStoreInFlight.find(r => normNum(r.num) === lead);
+        inFlight.push({ ...run, num: lead, scope: [...new Set([...(run?.scope || []), ...(c.meta?.scope || [])])], source: `member claim ${c.owner}` });
+      }
+    } else inFlight.push({ num, scope: c.meta?.scope || [], source: `claim ${c.owner}` });
   }
   for (const r of runStoreInFlight) {
-    if (!doneWhy(r.num)) inFlight.push(r);
+    if (!protectedMembers.has(normNum(r.num)) && !failedGroups.has(normNum(r.num)) && !doneWhy(r.num)) inFlight.push(r);
   }
   // Card 87 — a fix borrowing a builder slot occupies it (no build may be started over it).
   try { inFlight.push(...(effects.listBorrowedFixes?.() ?? [])); } catch { /* an unreadable claim set never blocks the tick */ }
@@ -595,6 +641,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // as if the tick core had never surfaced it — this is the actual fix for the re-dispatch loop the
   // settle/release above would otherwise tighten rather than close.
   const candidates = spawn
+    .filter((s) => !protectedMembers.has(normNum(s.num)))
     .filter((s) => !heldNums.has(normNum(s.num)))
     .filter((s) => !prepareRows.some(r => normNum(r.num) === normNum(s.num) && !completedPrepares.has(normNum(s.num))))
     .map((s) => ({ num: normNum(s.num), lane: s.lane ?? null, scope: scopeByNum.get(normNum(s.num)) || [] }));
@@ -614,15 +661,49 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // derivation `dryRun` also calls — see its own docblock for why `runStoreInFlight`/`settledRows` ARE this
   // builder's own durable dispatch-lane run records, and why the two staying in sync matters.
   const dispatchedByBuilder = deriveDispatchedByBuilder(runStoreInFlight, settledRows);
-  const plan = planBuildDispatch({
+  const fixInFlight = effects.listFixClaims ? effects.listFixClaims() : [];
+  const mainRedFreeze = (() => { try { return effects.mainRedFreeze ? effects.mainRedFreeze() : null; } catch { return null; } })();
+  const dispatchInputs = {
     candidates, inFlight, openPrs, externalBuilding, killSwitch: effects.killSwitch(), policy, dispatchedByBuilder,
-    fixInFlight: effects.listFixClaims ? effects.listFixClaims() : [],
+    fixInFlight,
     // Card xu1nixv — freeze kind `main-red` (setting freeze.mainRed); an effect that is absent or throws = no freeze.
-    mainRedFreeze: (() => { try { return effects.mainRedFreeze ? effects.mainRedFreeze() : null; } catch { return null; } })(),
-  });
+    mainRedFreeze,
+  };
+  const plan = planBuildDispatch(dispatchInputs);
+  // Re-probe potential members without this tick's picks/capacity restriction. This admits hot-file
+  // holds ONLY when the conflict is exclusively with a pick, and still checks PRs, running builds,
+  // fix scopes, freeze and routing (including wip-cap rows whose route wasn't checked yet).
+  const poolNums = new Set(plan.hold.filter(h => ['cap', 'wip-cap', 'hot-file'].includes(h.rule)).map(h => normNum(h.num)));
+  // Probe separately: members may overlap each other through a signal other than disjointFiles.
+  const safePool = candidates.filter(c => poolNums.has(c.num)
+    && planBuildDispatch({ ...dispatchInputs, candidates: [c], policy: { ...policy,
+      maxConcurrentBuilds: Number.MAX_SAFE_INTEGER, maxConcurrentExternalBuilds: Number.MAX_SAFE_INTEGER,
+      maxOpenItems: Number.MAX_SAFE_INTEGER } }).dispatch.length > 0);
+  // Conveyor queue rows carry admission metadata, not the card's grouping frontmatter. Read once
+  // for both build and prepare, reusing this round's routing backlog snapshot in the CLI.
+  let groupRowsByNum = new Map((admission.queue ?? []).map(r => [normNum(r.num), r]));
+  let groupingCardsLoaded = true;
+  try {
+    const cards = await effects.loadGroupingCards?.();
+    if (cards !== undefined) {
+      const cardsByNum = new Map(cards.map(card => [normNum(card.num), card]));
+      groupRowsByNum = new Map((admission.queue ?? []).map(row => {
+        const card = cardsByNum.get(normNum(row.num));
+        const fields = Object.fromEntries(['kind', 'size', 'estimatedLoc', 'parent', 'tags', 'locus', 'blockedBy']
+          .map(key => [key, card?.[key]]));
+        return [normNum(row.num), { ...row, ...fields }];
+      }));
+    }
+  } catch (e) {
+    groupingCardsLoaded = false;
+    console.error(`build-dispatch-daemon: grouping card load failed; grouping disabled for this tick: ${String(e?.message || e).split('\n')[0]}`);
+  }
+  const groupedPlan = planBuildGroups({ picks: plan.dispatch, pool: safePool,
+    rowsByNum: groupRowsByNum,
+    settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings && groupingCardsLoaded }, exclude: groupDropped });
 
   const dispatched = [];
-  const failures = [];
+  const failures = [...groupFailures];
   // A CARD-LEVEL PERMANENT REFUSAL (a dispatch-lane step refused because of what the card says) is never retried on
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
@@ -714,11 +795,21 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   };
   const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
+      if (groupedPlan.absorbed.has(pick.num)) continue;
       if (launchSlotBusy()) continue;
       const clash = sameTickClash(pick.num, pick.scope);
       if (clash) { sameTickHolds.push({ num: pick.num, kind: 'build', why: clash }); continue; }
       // x3mdsyv — one launch's failure (a throwing gate, claim or dispatch) never aborts the others.
       let claimed = false;
+      const group = groupedPlan.groups.find(g => normNum(g.lead) === pick.num);
+      let groupMembers = [];
+      const releaseMembers = () => {
+        for (const num of groupMembers) {
+          try { effects.releaseClaim({ num }); }
+          catch (e) { failures.push({ num, stage: 'release', reason: String(e?.message || e).split('\n')[0], groupLead: pick.num }); }
+        }
+        groupMembers = [];
+      };
       try {
         if (!(await cloneGate('build', pick.num))) continue;
         const gate = loadGateFor('build', pick.num);
@@ -728,23 +819,39 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         catch (e) { claim = { ok: false, reason: String(e?.message || e).split('\n')[0] }; }
         if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
         claimed = true;
+        for (const raw of group?.members ?? []) {
+          const num = normNum(raw);
+          const clash = sameTickClash(num, scopeByNum.get(num));
+          if (clash) { sameTickHolds.push({ num, kind: 'build', why: clash }); continue; }
+          let memberClaim;
+          try { memberClaim = effects.acquireClaim({ num, scope: scopeByNum.get(num) || [], groupLead: pick.num }); }
+          catch (e) { memberClaim = { ok: false, reason: String(e?.message || e).split('\n')[0] }; }
+          if (memberClaim.ok) groupMembers.push(num);
+          else failures.push({ num, stage: 'claim', reason: memberClaim.reason, groupLead: pick.num });
+        }
+        if (groupMembers.length && groupMembers.length + 1 < groupingSettings.groupMin) releaseMembers();
         let res;
-        try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+        try { res = await effects.dispatch({ num: pick.num, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}), bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
         if (res?.pending) startedThisTick += 1;
         if (res?.dispatching) {
           claimed = false;
-          launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: pick.scope });
-          dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
+          launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: [...new Set([...pick.scope, ...groupMembers.flatMap(num => scopeByNum.get(num) || [])])] });
+          dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}) });
+          if (groupMembers.length) console.error(`build-dispatch-daemon: grouped build #${pick.num} members ${groupMembers.map(num => `#${num}`).join(',')} (related: ${groupMembers.map(num => `${num}=${group.related[num]}`).join(',')})`);
           if (!res.pending) effects.clearBuildFailure?.({ num: pick.num });
         } else {
           claimed = false;
           effects.releaseClaim({ num: pick.num });
+          releaseMembers();
           const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
           if (live) surfaceCardRefusal(pick.num, rec, res);
           failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
         }
       } catch (e) {
         if (claimed) { try { effects.releaseClaim({ num: pick.num }); } catch { /* the orphan sweep reclaims it */ } }
+        if (claimed || !dispatched.some(d => d.num === pick.num)) {
+          try { releaseMembers(); } catch { /* the orphan sweep reclaims it */ }
+        }
         failures.push({ num: pick.num, stage: 'launch', reason: String(e?.message || e).split('\n')[0] });
       }
     }
@@ -824,8 +931,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     }
   }
   for (const num of inspectNums) {
-    if (pendingLaunch.prepare.has(num)) { prepareBusy.add(num); continue; } // 78b — launch still starting; the claim stays
     const claim = prepareClaims.find((c) => normNum(c.meta.num) === num);
+    // Members belong to the lead's worker; retire them after observing all leads, never as separate attempts.
+    if (claim?.meta?.groupLead != null) continue;
+    if (pendingLaunch.prepare.has(num)) { prepareBusy.add(num); continue; } // 78b — launch still starting; the claim stays
     const settled = settledPrepares.get(num);
     // As with build retirement, an older attempt must not settle a fresh claim.
     // A wrapper failure needs evidence too; an exception alone is not transient. A dead-session retirement is
@@ -969,22 +1078,59 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       && (bookkeeping.prepareGuards ?? []).some((old) => guardId(old) === guardId(g))) prepareBusy.add(normNum(g.num));
   }
   for (const num of heldNums) prepareBusy.delete(num);
+  const prepareMembers = new Set();
+  for (const claim of prepareClaims.filter(c => c.meta?.groupLead != null)) {
+    const num = normNum(claim.meta.num), lead = normNum(claim.meta.groupLead);
+    prepareBusy.delete(num); // A member claim never consumes a worker slot, including after restart.
+    const leadTracked = prepareBusy.has(lead) || prepareClaims.some(c => c.meta?.groupLead == null
+      && normNum(c.meta.num) === lead && !finishedPrepares.has(lead));
+    const why = prepareStatus.get(num)?.preparedDate ? 'prepared on main' : !leadTracked ? 'group-lead-gone' : null;
+    if (why) {
+      if (live) effects.releasePrepareClaim({ num });
+      prepare.retired.push({ num, why, released: live });
+      finishedPrepares.add(num);
+    } else prepareMembers.add(num);
+  }
   prepare.inFlight = [...prepareBusy];
   // Card x60i0ie — a light prepare skips an open-PR-count freeze (`lightOpenPrFreeze: skip`); a kill switch or a
   // freeze label still holds it. Rule OFF: `freezeHolds` is exactly `plan.freeze.frozen` (today).
   prepare.freezeHeld = freezeHolds('prepare-item', plan.freeze, costSettings);
+  const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
+    && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
+    && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
+    && !sameTickClash(num, scopeByNum.get(normNum(num)));
+  const needsPrepare = new Set((admission.held ?? [])
+    .filter(h => ['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
+  const otherPrepareHolds = new Set((admission.held ?? [])
+    .filter(h => !['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
+  const prepareGroupPlan = planBuildGroups({
+    picks: prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num))),
+    pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
+      && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
+    rowsByNum: groupRowsByNum,
+    settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
+      && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
+  });
+  prepare.groups = prepareGroupPlan.groups;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
-      if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
-      prepare.planned.push({ ...pick, num });
+      if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
+        || finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
+      const group = prepareGroupPlan.groups.find(g => normNum(g.lead) === num);
+      let groupMembers = [];
+      prepare.planned.push({ ...pick, num, ...(group ? { groupMembers: group.members } : {}) });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
       const clash = sameTickClash(num, scopeByNum.get(num));
       if (clash) { sameTickHolds.push({ num, kind: 'prepare', why: clash }); continue; }
       // x3mdsyv — one prepare launch throwing never aborts the remaining launches of the tick.
       let prepareClaimed = false;
+      const releasePrepareMembers = () => {
+        for (const member of groupMembers) effects.releasePrepareClaim({ num: member });
+        groupMembers = [];
+      };
       try {
         if (!(await cloneGate('prepare', num))) continue;
         if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
@@ -1010,21 +1156,42 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           continue;
         }
         prepareClaimed = true;
+        for (const raw of group?.members ?? []) {
+          const member = normNum(raw);
+          try {
+            const before = await effects.readPreparedStamp?.({ num: member });
+            const memberStamp = before ? (before.preparedDate
+              ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null) : undefined;
+            const memberClaim = effects.acquirePrepareClaim({ num: member, scope: scopeByNum.get(member) ?? [], groupLead: num,
+              ...(memberStamp !== undefined ? { replacesStamp: memberStamp } : {}) });
+            if (memberClaim.ok) groupMembers.push(member);
+          } catch (e) { await failPrepare(member, 'claim', String(e?.message || e)); }
+        }
+        if (groupMembers.length && groupMembers.length + 1 < groupingSettings.groupMin) releasePrepareMembers();
         let res;
-        try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
+        try { res = await effects.dispatch({ num, ...(groupMembers.length ? { groupMembers } : {}), bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
         catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
         if (res?.pending) startedThisTick += 1;
         prepareClaimed = false;
         if (res?.dispatching) {
           prepareBusy.add(num);
           launchedThisTick.push({ num, kind: 'prepare', scope: scopeByNum.get(num) ?? [] });
-          prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
+          for (const member of groupMembers) {
+            prepareMembers.add(member);
+            launchedThisTick.push({ num: member, kind: 'prepare', scope: scopeByNum.get(member) ?? [] });
+          }
+          prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null,
+            ...(groupMembers.length ? { groupMembers } : {}) });
         } else {
+          releasePrepareMembers();
           effects.releasePrepareClaim({ num });
           await failPrepare(num, res?.refused ? 'dispatch-refused' : 'dispatch', res?.reason ?? 'not dispatched', res?.evidence ?? {}, res?.attempt ?? new Date().toISOString());
         }
       } catch (e) {
-        if (prepareClaimed) { try { effects.releasePrepareClaim({ num }); } catch { /* the retirement pass reclaims it */ } }
+        if (prepareClaimed) {
+          try { releasePrepareMembers(); } catch { /* the retirement pass reclaims them */ }
+          try { effects.releasePrepareClaim({ num }); } catch { /* the retirement pass reclaims it */ }
+        }
         prepare.failures.push({ num, stage: 'launch', reason: String(e?.message || e).split('\n')[0], cause: 'daemon-observation', retry: true });
       }
     }
@@ -1050,6 +1217,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     statusLine: d.statusLine || '',
     tickCore: { building: externalBuilding, spawnBuilds: spawn, held: admission.held || [], planned: admission.planned || [], queue: admission.queue || [], suppressedBuilds: d.suppressedBuilds || [] },
     plan,
+    grouping: { settings: groupingSettings, groups: groupedPlan.groups },
     retired,
     // #4349 — items dropped from THIS tick's candidates by a non-PR terminal-outcome cooldown (never the tick
     // core's own `tickCore.held`, a different, capacity/supervision-driven concept) — visible so a `--dry-run`
@@ -1093,6 +1261,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     holdRoutingResult,
     nextBookkeeping: settleBookkeeping(bookkeeping, {
       ...out?.nextState,
+      groupDropped: [...groupDropped].slice(-200),
       itemPrepareAttempts,
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),
     }, dispatched.map((x) => x.num), prepare.launched.map((x) => x.num)),
@@ -1223,13 +1392,16 @@ export async function loadRouteInputs(root = REPO_ROOT) {
 }
 
 export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInputs = () => loadRouteInputs() } = {}) {
-  let inputs;
-  return async (num, scope) => {
-    if (inputs === undefined) {
-      try { inputs = await loadInputs(); } catch { inputs = null; }
-    }
+  let inputsPromise;
+  const getInputs = () => inputsPromise ??= Promise.resolve().then(loadInputs);
+  const predictor = async (num, scope) => {
+    let inputs;
+    try { inputs = await getInputs(); } catch { inputs = null; }
     return inputs ? predict(num, scope, inputs) : predict(num, scope);
   };
+  // Keep the rejection for grouping to fail closed rather than retrying the failed shared load.
+  predictor.loadGroupingCards = async () => (await getInputs()).loadItems();
+  return predictor;
 }
 
 // #4351's own build-dispatch follow-up (guided by #4309 spend accounting) — this was the top GraphQL spender in the fleet (121
@@ -1318,7 +1490,7 @@ export async function cliListSettledBuilds({ launchKind = 'build', records = nul
       const outcome = e.result?.outcome ?? (e.status === 'failed' ? 'wrapper-failed' : launchKind === 'prepare-item' ? 'prepare-ended' : null);
       if (!outcome) continue;
       const startedAt = typeof e.startedAt === 'string' ? e.startedAt : '';
-      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt, ...(launchKind === 'prepare-item' ? { evidence: cliPrepareFailureEvidence(e) } : {}) });
+      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt, ...(Array.isArray(e.result?.groupMembers) ? { groupMembers: e.result.groupMembers } : {}), ...(Array.isArray(e.result?.groupDropped) ? { groupDropped: e.result.groupDropped } : {}), ...(launchKind === 'prepare-item' ? { evidence: cliPrepareFailureEvidence(e) } : {}) });
     }
   }
   return rows;
@@ -1421,7 +1593,7 @@ export function cliListHolds() {
 }
 
 /** The dispatch-lane argv + env for one launch, with its bookkeeping/tick handoff files written under `dir`. */
-function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping, tickAt }, dir) {
+function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, groupMembers, tick, tickBookkeeping, tickAt }, dir) {
   const file = join(dir, 'bookkeeping.json');
   // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
   // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
@@ -1429,6 +1601,7 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
   // Its model override travels in JSON argv plus a recorded reason, not a run.mjs control flag.
   writeFileSync(file, JSON.stringify({ bookkeeping: bookkeeping || {} }), { mode: 0o600 });
   const argv = [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'];
+  if (groupMembers?.length) argv.push(`--groupMembers=${groupMembers.join(',')}`);
   // `at` is the PLAN time (`tickAt`), so dispatch-lane's under-5-min bound measures the plan's real age. A
   // caller that cannot say when the plan was made hands off nothing: dispatch-lane re-plans.
   if (tick && Number.isFinite(Date.parse(tickAt))) {
@@ -2104,9 +2277,11 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
   } });
 }
 
-function cliEffects() {
+/** Real IO adapters; exported for isolated tests against a temporary coordination root. */
+export function cliEffects() {
   let prepareReader;
   return {
+    loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
     completePrepareFailures,
     releaseDuePrepareRetries: () => {
       let checkedCount = false;
@@ -2177,7 +2352,7 @@ function cliEffects() {
     listFixClaims: () => liveFixInFlight(),
     listBorrowedFixes: () => liveBorrowedFixInFlight(),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),
-    acquireClaim: ({ num, scope }) => acquireBuildDispatchClaim({ num, scope }),
+    acquireClaim: ({ num, scope, groupLead }) => acquireBuildDispatchClaim({ num, scope, groupLead }),
     listRunStoreInFlight: () => [],
     // #4349 — `listSettledBuilds` is ASYNC (a run-store scan) so it gets the SAME "placeholder default,
     // overwritten with a fresh read before use" treatment `listRunStoreInFlight` above already has — see
@@ -2338,6 +2513,7 @@ async function dryRun(flags) {
   effects.planTick = createRoundPlanTick(round);
   const predictRoute = createRoundRoutePredictor();
   effects.predictRoute = predictRoute;
+  effects.loadGroupingCards = predictRoute.loadGroupingCards;
   const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords());
   const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
   effects.listRunStoreInFlight = () => runStoreRows;
@@ -2486,6 +2662,7 @@ async function live(flags) {
     const round = startPlanningRound();
     effects.planTick = createRoundPlanTick(round);
     effects.predictRoute = createRoundRoutePredictor();
+    effects.loadGroupingCards = effects.predictRoute.loadGroupingCards;
     try {
       const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords()); // #5322 — one read for the three readers below
       const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));

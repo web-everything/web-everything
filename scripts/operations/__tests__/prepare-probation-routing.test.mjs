@@ -8,11 +8,12 @@ describe('prepare probation routing', () => {
   it('routes prepare-item to Codex with Sonnet fallback and launches prepare mode', () => {
     const route = decideDispatchRoute({ kind: 'prepare-item', scopePaths: ['we:scripts/lib/example.mjs'] });
     expect(route).toMatchObject({ tier: 'sonnet', probationWorker: { id: 'codex', taskType: 'prepare' } });
-    const request = { launchKind: 'prepare-item', probationWorker: route.probationWorker, num: '123', sessionSlug: 'prepare-123', runId: 'original-run', effectKey: 'original-key' };
+    const request = { launchKind: 'prepare-item', probationWorker: route.probationWorker, num: '123', sessionSlug: 'prepare-123', runId: 'original-run', effectKey: 'original-key', groupMembers: ['124', '125'] };
     expect(routeDispatchProvider(request, { probationLaunch: 'on', scriptExists: () => true, probation: () => 'probation', agent: () => 'claude' })).toBe('probation');
     let argv;
     probationWorkerDetachedProvider(request, { spawnDetached: (a) => { argv = a; return { pid: 123 }; }, logPathFor: () => '/tmp/unused' });
     expect(argv).toContain('--taskType=prepare');
+    expect(argv).toContain('--group-members=124,125');
     expect(argv).toContain('--run-id=original-run');
     expect(argv).toContain('--effect-key=original-key');
     expect(argv[0]).toMatch(/probation-build-run.mjs$/);

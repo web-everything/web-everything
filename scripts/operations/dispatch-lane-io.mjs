@@ -1587,6 +1587,7 @@ export function createDispatchSinks({
           // the effect payload; part of the port's request because a MECHANICAL provider (a wrapper, not an
           // agent reading a brief) needs them as data. The `claude --bg` path ignores all five.
           launchKind: payload?.launchKind,
+          groupMembers: payload?.groupMembers,
           lane: payload?.lane,
           scope: payload?.scope,
           pr: payload?.pr,

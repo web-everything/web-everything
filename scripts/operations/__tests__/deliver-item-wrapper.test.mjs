@@ -3302,6 +3302,49 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     execFileSync.mockReset();
   });
 
+  it.each(['requeue-alone', 'fail-group'])('drives grouped delivery and drop settlement with %s policy', async (policy) => {
+    const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+    process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
+    findItem.mockImplementation((num) => ({ num, slug: `card-${num}`, specPath: `backlog/${num}-card-${num}.md`, scope: [] }));
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'grouped-run', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build' }, result: null, error: null }] });
+    const provider = { vendor: 'claude', spawn: vi.fn(({ prompt }) => {
+      expect(prompt).toContain('#1235 — backlog/1235-card-1235.md');
+      expect(prompt).toContain('#1236 — backlog/1236-card-1236.md');
+      writeFileSync(join(lane, '.delivery-group-drop'), '1236: cannot deliver\n');
+    }) };
+    try {
+      const result = await deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+        groupMembers: ['1235', '1236'], runId: 'grouped-run', effectKey: 'dispatch:0:0' }, provider,
+        { newSessionId: () => 'uuid-fixed' });
+      const claims = execFileSync.mock.calls.filter((c) => c[1]?.[1] === 'claim');
+      expect(claims.map((c) => c[1][2])).toEqual(['--ref=9999', '--ref=1235', '--ref=1236']);
+      expect(claims.every((c) => c[2].cwd === lane)).toBe(true);
+      expect(result.groupMembers).toEqual(['1235', '1236']);
+      expect(result.groupDropped).toEqual(['1236']);
+      expect(store.read('grouped-run').effects[0].result).toMatchObject({
+        groupMembers: ['1235', '1236'], groupDropped: ['1236'], groupDropReasons: { '1236': 'cannot deliver' },
+        outcome: policy === 'fail-group' ? 'group-member-dropped' : 'pr-opened',
+      });
+      const openCalls = execFileSync.mock.calls.filter((c) => c[1]?.[1] === 'open-pr');
+      if (policy === 'fail-group') {
+        expect(result.result).toBe('group-member-dropped');
+        expect(openCalls).toHaveLength(0);
+      } else {
+        expect(result.result).toContain('PR #4321');
+        const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+        expect(body).toContain('Resolves #1235\n');
+        expect(body).toContain('Dropped from group: #1236 — cannot deliver');
+      }
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally {
+      if (previousPolicy === undefined) delete process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+      else process.env.WE_BUILD_GROUP_MEMBER_FAILURE = previousPolicy;
+    }
+  });
+
   it('refuses to publish a build with no durable dispatch identity', async () => {
     await expect(deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '' },
       { spawn: vi.fn() }, { newSessionId: () => 'uuid-fixed' }))
@@ -4341,5 +4384,82 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       }
       expect(envelopeReportOrNull(null, 's')).toBeNull();
     });
+  });
+});
+
+describe('grouped delivery contracts', () => {
+  beforeEach(async () => { findItem.mockImplementation((await vi.importActual('../dispatch-lane-io.mjs')).findItem); });
+  const loadItems = () => [
+    { num: '1234', slug: 'lead' },
+    { num: '1235', slug: 'member' },
+  ];
+  it('appends member paths and the drop-file contract to the actual filled brief', () => {
+    const prompt = fillMinimalBrief('Read {{ITEM_SPEC_PATH_BASENAME}}.',
+      { item: '1234', sessionSlug: 's', lane: 1, groupMembers: ['1235'] }, { loadItems });
+    expect(prompt).toContain('GROUPED BUILD');
+    expect(prompt).toContain('#1235 — backlog/1235-member.md');
+    expect(prompt).toContain('.delivery-group-drop');
+    expect(prompt).toContain('status: active');
+  });
+  it('lists only delivered members in Resolves and names dropped members separately', () => {
+    const body = buildPrBody({ item: '1234', groupMembers: ['1235', '1236'],
+      groupDropped: ['1236'], groupDropReasons: { '1236': 'cannot deliver' } });
+    expect(body).toContain('Grouped build (2 cards): #1234, #1235');
+    expect(body).toContain('Resolves #1235\n');
+    expect(body).not.toContain('Resolves #1235, #1236');
+    expect(body).toContain('Dropped from group: #1236 — cannot deliver');
+  });
+  it('claims each member and records a failed claim without abandoning siblings', async () => {
+    const { claimGroupMembers } = await import('../deliver-item-wrapper.mjs');
+    const run = vi.fn((cmd, args) => { if (args.includes('--ref=1236')) throw new Error('busy'); return '{}'; });
+    const result = claimGroupMembers({ groupMembers: ['1235', '1236'], sessionSlug: 's', lanePath: '/lane' }, { run });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls.every((c) => c[2].cwd === '/lane')).toBe(true);
+    expect(result.groupMembers).toEqual(['1235']);
+    expect(result.groupDropped).toEqual(['1236']);
+    expect(result.groupDropReasons['1236']).toContain('busy');
+  });
+  it('restores dropped card paths, commits the restoration and removes the private drop file', async () => {
+    const { processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const lane = mkdtempSync(join(tmpdir(), 'group-drop-'));
+    try {
+      writeFileSync(join(lane, '.delivery-group-drop'), '1235: cannot deliver\n');
+      const run = vi.fn(() => '');
+      const result = processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, { run, loadItems });
+      expect(result.groupDropped).toEqual(['1235']);
+      expect(run).toHaveBeenCalledWith('git', ['checkout', 'origin/main', '--', 'backlog/1235-member.md'], { cwd: lane });
+      expect(run.mock.calls.some((c) => c[1].includes('drop #1235 from group: cannot deliver'))).toBe(true);
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+});
+
+describe('group drop restoration with a real git index', () => {
+  beforeEach(async () => { findItem.mockImplementation((await vi.importActual('../dispatch-lane-io.mjs')).findItem); });
+  it('restores the card to origin/main without committing the drop file or unrelated edits', async () => {
+    const { execFileSync: execReal } = await vi.importActual('node:child_process');
+    const { processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const lane = mkdtempSync(join(tmpdir(), 'group-git-'));
+    const git = (...args) => execReal('git', args, { cwd: lane, encoding: 'utf8' });
+    try {
+      git('init', '-q'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.test');
+      mkdirSync(join(lane, 'backlog'));
+      writeFileSync(join(lane, 'backlog/1235-member.md'), 'status: queued\n');
+      writeFileSync(join(lane, 'other.txt'), 'original\n');
+      git('add', '.'); git('commit', '-qm', 'fixture main'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(lane, 'backlog/1235-member.md'), 'status: active\n');
+      git('add', '.'); git('commit', '-qm', 'fixture claims');
+      writeFileSync(join(lane, 'other.txt'), 'unrelated\n'); git('add', 'other.txt');
+      writeFileSync(join(lane, '.delivery-group-drop'), '1235: cannot deliver\n');
+      processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, {
+        loadItems: () => [{ num: '1235', slug: 'member' }],
+        run: (cmd, args, opts) => execReal(cmd, args, { ...opts, encoding: 'utf8' }),
+      });
+      expect(git('show', 'HEAD:backlog/1235-member.md')).toBe('status: queued\n');
+      expect(git('show', 'HEAD:other.txt')).toBe('original\n');
+      expect(git('diff', '--cached', '--name-only').trim()).toBe('other.txt');
+      expect(git('ls-tree', '--name-only', 'HEAD')).not.toContain('.delivery-group-drop');
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
   });
 });

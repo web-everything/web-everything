@@ -829,9 +829,40 @@ export function parseFreeLanes(raw) {
     .sort((a, b) => a - b);
 }
 
+/** PURE: retain the backlog metadata required by dispatch and grouped-build planning. */
+export function projectBuildQueueRow(r, it) {
+  return {
+    num: r.num,
+    // `kind` drives the epic → `needs-slice` hold (#2645): a container is never built. Absent when the loader
+    // failed to load (the catch above) — then it reads as non-epic and falls through to the scope gate, a SAFE
+    // degradation (an unscoped epic still holds `unshaped-no-scope` rather than launching to build).
+    kind: it?.kind,
+    // `parent` marks a graduation slice (#3836): a child of the drifting branch's `graduationItem` is exempt
+    // from the `branch-drift-blocked` hold.
+    parent: it?.parent,
+    tags: Array.isArray(it?.tags) ? it.tags : [],
+    locus: it?.locus,
+    blockedBy: Array.isArray(it?.blockedBy) ? it.blockedBy : [],
+    scope: Array.isArray(it?.scope) ? it.scope.map(p => String(p).replace(/^[^/:]+:/, '')) : undefined,
+    openBlockers: Array.isArray(it?.openBlockers) ? it.openBlockers : [],
+    // #3849 — the size-gate's own inputs: a story's Fibonacci `size:`, a task's `estimatedLoc:` (#3839).
+    // Absent when the loader failed to load (safe degradation — reads as unsized under `block`, held
+    // `no-size` rather than launching blind on an unmeasured number).
+    size: it?.size,
+    estimatedLoc: it?.estimatedLoc,
+    // card #4470 — the prepare gate's own input: a story/task's `preparedDate:` frontmatter (written by
+    // `we:scripts/backlog.mjs prepare-stamp`). Absent when the loader failed to load (safe degradation —
+    // reads as unprepared under the live default policy, held `needs-prepare` rather than launching blind on
+    // a card nobody has actually prepared).
+    preparedDate: it?.preparedDate,
+    // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
+    preparedAgainstSha: it?.preparedAgainstSha,
+    rawScope: Array.isArray(it?.scope) ? it.scope : undefined,
+  };
+}
+
 // ── IO SHELL (runs only as a CLI — owns all child_process; keeps the pure core import-clean) ──────────────────
 
-// Lazily required so importing the pure core pulls in NO node built-ins beyond scope-lease.mjs.
 async function main(argv) {
   const { runBounded, installChildReaper, resolveChildTimeoutMs } = await import('../lib/bounded-child.mjs');
   const { fileURLToPath } = await import('node:url');
@@ -982,34 +1013,7 @@ async function main(argv) {
   // never silently dropped (#2613 review, required 2b). Using `resolvedSidecar` (not the raw `sidecar`) means a
   // stale-hash row that the bornAs index just resolved is judged by its landed NNN, not its dead hash spelling.
   const notReady = clearedNotReady(resolvedSidecar, bqRows, normNum, observeSelection);
-  const queue = rows.map((r) => {
-    const it = byNum.get(String(r.num));
-    return {
-      num: r.num,
-      // `kind` drives the epic → `needs-slice` hold (#2645): a container is never built. Absent when the loader
-      // failed to load (the catch above) — then it reads as non-epic and falls through to the scope gate, a SAFE
-      // degradation (an unscoped epic still holds `unshaped-no-scope` rather than launching to build).
-      kind: it?.kind,
-      // `parent` marks a graduation slice (#3836): a child of the drifting branch's `graduationItem` is exempt
-      // from the `branch-drift-blocked` hold.
-      parent: it?.parent,
-      scope: Array.isArray(it?.scope) ? toRepoRelative(it.scope) : undefined,
-      openBlockers: Array.isArray(it?.openBlockers) ? it.openBlockers : [],
-      // #3849 — the size-gate's own inputs: a story's Fibonacci `size:`, a task's `estimatedLoc:` (#3839).
-      // Absent when the loader failed to load (safe degradation — reads as unsized under `block`, held
-      // `no-size` rather than launching blind on an unmeasured number).
-      size: it?.size,
-      estimatedLoc: it?.estimatedLoc,
-      // card #4470 — the prepare gate's own input: a story/task's `preparedDate:` frontmatter (written by
-      // `we:scripts/backlog.mjs prepare-stamp`). Absent when the loader failed to load (safe degradation —
-      // reads as unprepared under the live default policy, held `needs-prepare` rather than launching blind on
-      // a card nobody has actually prepared).
-      preparedDate: it?.preparedDate,
-      // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
-      preparedAgainstSha: it?.preparedAgainstSha,
-      rawScope: Array.isArray(it?.scope) ? it.scope : undefined,
-    };
-  });
+  const queue = rows.map(r => projectBuildQueueRow(r, byNum.get(String(r.num))));
 
   // Local git facts first; only a detached, exclusive two-item refresh may contact GitHub.
   // Cached positives hold both ready and not-ready rows. Unknowns stay unknown; the dispatch

@@ -118,6 +118,7 @@ export function deliverItemDetachedProvider(request, {
   // (`deliver-item-wrapper.mjs#deliverItem`'s `finish()`/catch, via `deliver-item-settle.mjs`). Omitted
   // entirely when the sink didn't have one to give (an older caller, a hand-built request in a test) — the
   // settle call is a documented no-op without both, never a guess.
+  if (request?.groupMembers?.length) argv.push(`--group-members=${request.groupMembers.join(',')}`);
   if (request?.runId) argv.push(`--run-id=${request.runId}`);
   if (request?.effectKey) argv.push(`--effect-key=${request.effectKey}`);
   // mechanical-dispatcher (epic #3383) Part 2 — THE DRIVER'S ONLY provider-selection logic, and it is
