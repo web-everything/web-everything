@@ -31,6 +31,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathS
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { fallbackMinNext } from './queue-branch-numbering.mjs';
 import { defineJobKind, kindRegistry } from './daemon-jobs.mjs';
 import { createJobStore, enqueueJob, reattachTick } from './daemon-jobs-runtime.mjs';
 import { daemonJobsDir, daemonJobsRoot } from '../operations/run-store.mjs';
@@ -66,13 +67,14 @@ export function defineDrainFollowupKind({ prepareWorktree, maxAttempts } = {}) {
  * @param {{passId?: string, landedLocal?: boolean, merged?: Array, landedItems?: Array, carriers?: Array,
  *   openHeadRefs?: Iterable}} o
  */
-export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
+export function buildFollowupInput({ numberingOnBranch = false, passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
   return {
     // The operator's primary checkout to ff-sync once main has the follow-up commits (absent = nothing to sync).
     // `passCwd`: the pass's own checkout, which the pass already fast-forwards inline — the job must never pull it too.
     ...(primary ? { primary: String(primary), primaryHinted: !!primaryHinted, ...(passCwd ? { passCwd: String(passCwd) } : {}) } : {}),
     passId: passId == null ? null : String(passId),
     landedLocal: !!landedLocal,
+    ...(numberingOnBranch ? { numberingOnBranch: true } : {}),
     merged: (Array.isArray(merged) ? merged : []).filter((m) => m && m.num != null)
       .map((m) => ({ num: Number(m.num), repo: m.repo == null ? null : String(m.repo) })),
     landedItems: strList(landedItems),
@@ -170,8 +172,8 @@ function underNumberingLock(withNumberingLock, label, fn) {
  */
 export function followupSteps(deps) {
   const {
-    cwd, exec = execFileSync, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
-    regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, now = () => new Date().toISOString(),
+    cwd, exec = execFileSync, minNext = fallbackMinNext, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
+    regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, log = process.stderr, now = () => new Date().toISOString(),
   } = deps;
   return [
     {
@@ -179,7 +181,11 @@ export function followupSteps(deps) {
       run: ({ input }) => underNumberingLock(withNumberingLock, 'number-resolve-push', (heartbeat = () => {}) => {
         const baseSha = resetToRemoteTip({ exec, cwd });
         heartbeat();
-        const n = numberPendingHashes(cwd);
+        if (input.numberingOnBranch) {
+          const files = String(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (files.split(/\r?\n/).some((file) => /^backlog\/x[0-9a-z]{6}-[^/]*\.md$/.test(file))) log.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
+        }
+        const n = numberPendingHashes(cwd, input.numberingOnBranch ? { minNext: minNext({ cwd, exec }) } : {});
         heartbeat();
         const plan = planResolveOnLand({ landedItems: input.landedItems, assigned: n.assigned, carriers: input.carriers, openHeadRefs: input.openHeadRefs });
         const resolved = [];
