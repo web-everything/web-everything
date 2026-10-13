@@ -183,6 +183,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
@@ -6056,6 +6057,7 @@ async function runCli() {
   // a FRESH re-read right before the merge (see `revalidateForMerge`): reported, never silently dropped, and
   // left `skip` so it keeps blocking its dependents and is re-read fresh next pass.
   const revalidationAborted = [];
+  const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
   const MERGE_QUEUE = loadMergeQueueSettings();
@@ -6526,6 +6528,12 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} confirmed merged despite the gh error above (local branch-delete/network failure, or a concurrent lander) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
+          // Defer required-workflows recovery until the live cascade finishes.
+          if (e?.code && e.code === REQUIRED_WORKFLOWS_UNSATISFIED) {
+            c.decision = 'skip'; const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+            requiredWorkflowsRefusals.push({ c, headSha: e.headSha || c.headSha, detail });
+            continue;
+          }
           // #xngv3vn — a REAL merge failure (not the idempotent-already-merged case just above): the trace
           // built earlier is NEVER posted here — `postMergeTrace` is simply not called on this path — so this
           // PR never carries a "landed head ... — merged by drain" claim it did not earn. The failure is
@@ -6548,9 +6556,47 @@ async function runCli() {
       }
       if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
     }
+    // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
+    if (requiredWorkflowsRefusals.length) {
+      const requiredWorkflowsRefresh = resolveRefreshOnUnsatisfiedWorkflows();
+      if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})${requiredWorkflowsRefresh.invalid.length ? ` · ignored invalid: ${requiredWorkflowsRefresh.invalid.join('; ')}` : ''}\n`);
+      for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
+        const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+        const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
+          setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
+          refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+        if (recovery.handled) {
+          revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+          if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+        } else {
+          failedMerges.push({ num: c.num, repo: c.repo, detail, headSha: c.headSha ?? null });
+          if (!AS_JSON) process.stderr.write(`  ✗ ${repoTag(c.repo)}${c.num} merge failed: ${detail}\n`);
+        }
+      }
+    }
     if (deferred.length && !AS_JSON) process.stderr.write(`  · ${deferred.length} deferred (blockedBy an unlanded PR): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
+  }
+  if (queueEnqueueMode) {
+    const staleMergeGateRefresh = resolveRefreshOnStaleMergeGate();
+    if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnStaleMergeGate=${staleMergeGateRefresh.value} (${staleMergeGateRefresh.source})${staleMergeGateRefresh.invalid.length ? ` · ignored invalid: ${staleMergeGateRefresh.invalid.join('; ')}` : ''}\n`);
+    for (const c of skipped) {
+      const pr = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
+      const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+      const recovery = await handleStaleMergeGate({ c: { ...c, repo: c.repo || localSlug }, pr,
+        requiredChecks: queueRequiredChecksOf(c.repo), classifyPr,
+        classifyOptions: { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(c.repo),
+          allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (escalationRelief.passWide && !!label) },
+        setting: staleMergeGateRefresh, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
+        tag: repoTag(c.repo), readAcceptance: readDrainAcceptance,
+        refreshStalePr, needsAcceptanceRestamp, restampAcceptance,
+        warn: line => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+      if (recovery.handled) {
+        revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+        if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+      } else if (recovery.reason) c.reason += `; ${recovery.reason}`;
+    }
   }
   const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 

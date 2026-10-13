@@ -35,7 +35,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine, MERGE_DELIVERY_STRATEGIES } from './merge-delivery-policy.mjs';
-import { mergeActionFor, enqueuePr, planQueueFollowUps } from './merge-queue-enqueue.mjs';
+import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSATISFIED } from './merge-queue-enqueue.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -272,7 +272,12 @@ export function createDrainMergeStrategy({
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec });
-      if (!r.ok) throw new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
+      if (!r.ok) {
+        const err = new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
+        // required-workflows refusal (ruleset 24930207): carry the exact enqueue pin into the cascade catch.
+        if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
+        throw err;
+      }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
