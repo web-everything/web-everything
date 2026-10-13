@@ -37,8 +37,9 @@ function planRows({ verdicts, repo, events, now }, emit) {
     const mine = normalized.filter(e => e.pr === pr && slug(e.repo) === slug(repo));
     const folded = foldVerdictLedger(mine.filter(isVerdict)).get(pr);
     const common = { repo, pr, at: now, source: DRAIN_FACTS_SOURCE, declaredActor: 'drain' };
+    const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
     if (v.reviewGate?.reviewExempt === true && !folded?.current
-      && !mine.some(e => e.type === EVENT_TYPES.REVIEW_EXEMPT && e.headSha === head)) {
+      && lastExempt?.headSha !== head) {
       emit('exempt', buildLedgerEvent, { ...common, type: EVENT_TYPES.REVIEW_EXEMPT, headSha: head, basis: EXEMPT_BASIS });
     }
     const old = folded?.current?.coverage?.headSha;

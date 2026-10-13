@@ -19,12 +19,23 @@ describe('drain ledger facts', () => {
     expect(drainReviewGateFact({ action: 'merge', reason: 'review:accepted — reviewer accepted, merge' }).acceptedMerge).toBe(true);
     expect(drainReviewGateFact(null)).toEqual({ reviewExempt: false, acceptedMerge: false });
   });
-  it('writes exemption once per head and never over a bearing verdict', () => {
+  it('dedupes the latest exempt head and never writes over a bearing verdict', () => {
     const rows = plan();
     expect(rows).toHaveLength(1); expect(rows[0]).toMatchObject({ type: 'review-exempt', headSha: head });
     expect(plan(rows)).toEqual([]);
     expect(plan(rows, { listedHeadSha: old })).toHaveLength(1);
     for (const kind of ['pending', 'changes', 'human', 'accepted']) expect(plan([verdict(kind)])).toEqual([]);
+  });
+  it('dedupes against the latest exemption when a head returns', () => {
+    const exempt = headSha => event('review-exempt', { headSha, basis: 'test' });
+    const events = [exempt(head), exempt(old), verdict('observed')];
+    const rows = plan(events);
+    expect(rows).toMatchObject([{ type: 'review-exempt', headSha: head }]);
+    expect(plan([...events, ...rows, verdict('observed')])).toEqual([]);
+    expect(plan([exempt(head),
+      buildLedgerEvent({ ...base, pr: 2, type: 'review-exempt', headSha: old, basis: 'test' }),
+      buildLedgerEvent({ ...base, repo: 'other/r', type: 'review-exempt', headSha: old, basis: 'test' }),
+    ])).toEqual([]);
   });
   it('restamps only a clearing acceptance on a different head', () => {
     const gate = { reviewGate: { acceptedMerge: true } };
