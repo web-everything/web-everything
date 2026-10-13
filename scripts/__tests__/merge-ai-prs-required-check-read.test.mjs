@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -137,7 +137,12 @@ const a = process.argv.slice(2);
 const pr = JSON.parse(process.env.CHECK_PR);
 let out = [];
 if (a[0] === 'repo') out = 'main';
-else if (a[0] === 'pr' && a[1] === 'list') out = [pr];
+else if (a[0] === 'pr' && a[1] === 'list') {
+  if (a[a.indexOf('--json') + 1].split(',').includes('mergeable')) {
+    fs.writeFileSync(process.env.CHECK_LIST_ARGV, JSON.stringify(a));
+  }
+  out = [pr];
+}
 else if (a[0] === 'pr' && a[1] === 'view') out = { commits: pr.commits };
 else if (a[0] === 'api' && a[1].includes('/check-runs?')) {
   if (process.env.CHECK_FAIL) { fs.writeSync(2, 'HTTP 503'); process.exit(1); }
@@ -148,12 +153,14 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  const cli = (fail = false) => spawnSync(process.execPath, [
+  const cli = (fail = false, workflowEditHuman = 'on') => spawnSync(process.execPath, [
     join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
-    '--this-repo', '--label=ready-to-merge', '--dry-run', '--json',
+    '--this-repo', '--label=ready-to-merge', '--no-reconcile-labels', '--dry-run', '--json',
     '--no-drain-lease', '--no-red-main-freeze', '--no-rebase-drop', '--no-heal-collision', '--no-review-escalation', '--no-overlap-yield',
   ], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
-    LANE_POOL_ROOT: root, CHECK_PR: JSON.stringify(pr()), CHECK_RUNS: JSON.stringify([run()]), CHECK_FAIL: fail ? '1' : '',
+    LANE_POOL_ROOT: root, CHECK_PR: JSON.stringify({ ...pr(), files: [{ path: 'README.md', changeType: 'MODIFIED' }] }),
+    CHECK_RUNS: JSON.stringify([run()]), CHECK_FAIL: fail ? '1' : '',
+    CHECK_LIST_ARGV: join(root, 'list-argv.json'), WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditHuman,
   } });
 
   it('admits the exactly-100-context listing through the real CLI', () => {
@@ -172,5 +179,12 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(report.deferred).toEqual([expect.objectContaining({ num: 3432, waitOn: ['required-check-read'] })]);
     expect(report.reconciledLabels).toEqual([]);
     expect(result.stderr).toContain('direct read failed; deferred this pass');
+  });
+
+  it.each(['on', 'off'])('requests listing files only with the workflow-edit gate on (%s)', (setting) => {
+    const result = cli(false, setting);
+    expect(result.status, result.stderr).toBe(0);
+    const argv = JSON.parse(readFileSync(join(root, 'list-argv.json'), 'utf8'));
+    expect(argv[argv.indexOf('--json') + 1].split(',').includes('files')).toBe(setting === 'on');
   });
 });
