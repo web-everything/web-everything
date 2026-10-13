@@ -1002,7 +1002,7 @@ export function restackStackedPr(d, {
  * shape and injectability exactly — every reader/writer is injectable so the whole sweep is exercisable with no
  * network and no credential.
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
- *   readRequiredContexts?:Function, readHeadCommittedAt?:Function, readComments?:Function,
+ *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
  *   now?:number}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
@@ -1011,6 +1011,7 @@ export function sweepMissingRunRecovery({
   repo = null, apply = false, defaultBranch = 'main',
   mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr, readIsCrossRepository = defaultReadIsCrossRepository,
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
+  readAttributedRequiredChecks = defaultReadAttributedRequiredChecks,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
@@ -1026,7 +1027,12 @@ export function sweepMissingRunRecovery({
   // The daemon's App token cannot read protection (403 → null), which would blind the partial-rollup check
   // (draft #3850: `test` never reported beside green siblings). Fall back to the repo's DECLARED required set —
   // used ONLY for that check, never to widen the all-absent test (PR #2740 review).
-  const stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
+  let stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
+  // live #5060 (2026-10-13): include ruleset-only merge-gate in the partial-rollup test.
+  try {
+    const attributed = readAttributedRequiredChecks({ repo, branch: defaultBranch });
+    if (Array.isArray(attributed)) stalledPartialContexts = [...new Set([...(stalledPartialContexts ?? []), ...attributed])];
+  } catch { /* An unavailable attributed read preserves the existing set. */ }
   const rawCandidates = buildMissingRunCandidates(prs, { requiredContexts: requiredContexts ?? null, stalledPartialContexts });
   if (rawCandidates.length && mainRuns === null) {
     try { mainRuns = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }); }
