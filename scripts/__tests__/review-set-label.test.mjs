@@ -2121,6 +2121,31 @@ describe('the write arc and its #2964 ordering', () => {
     expect(p.calls).not.toContain('postComment');
   });
 
+  // Card xk8ab41, operator send-back #5 (2026-10-13): the native-review mirror runs AFTER the label swap, with the
+  // verdict, the reviewed head and the PRE-swap labels (a review:human accept must mirror as a COMMENT, never APPROVE).
+  it.each([
+    [['review:pending'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}],
+    [['review:accepted'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}],
+    // The fix agent's re-arm (`rearm-review.mjs` pins the target): back to pending, so the mirror dismisses ours.
+    [['review:changes'], ['1048', '--repo=o/n'], 'rearm', { fixedTo: 'rearm' }],
+  ])('calls the native-review mirror once, after the swap, from %j', (labels, argv, to, config) => {
+    const p = stubProvider({ labels });
+    const mirrorNative = vi.fn(() => { p.calls.push('mirrorNative'); });
+    const { exitCode } = run(p, argv, { mirrorNative, ...config });
+    expect(exitCode).toBe(0);
+    expect(mirrorNative).toHaveBeenCalledTimes(1);
+    expect(mirrorNative).toHaveBeenCalledWith({ repo: 'o/n', pr: 1048, verdict: to, labels: labels.map((name) => ({ name })), headSha: 'a'.repeat(40) });
+    const order = p.calls.filter((c) => c === 'setLabels' || c === 'mirrorNative');
+    expect(order).toEqual(['setLabels', 'mirrorNative']);
+  });
+
+  it('never mirrors a refused verdict', () => {
+    const p = stubProvider({ labels: ['review:human'] });
+    const mirrorNative = vi.fn();
+    run(p, ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], { mirrorNative });
+    expect(mirrorNative).not.toHaveBeenCalled();
+  });
+
   describe('automatic session-delegation trials (#3690)', () => {
     const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
     const author = '<!-- authored-by-actor: delegation-author -->';
