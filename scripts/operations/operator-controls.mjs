@@ -17,8 +17,15 @@ export function validateOperatorAttribution({ actor, channel, reason }) {
   return { actor: actor.toLowerCase(), channel: channel.trim(), reason };
 }
 export function buildOperatorActionComment(record) {
-  return [`🛠 operator action — ${record.op}`, '', `Operator @${record.actor} via ${record.channel}:`,
-    `> ${record.reason.replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${record.details.undo}`, '',
+  // Quoted prose is still scanned for trusted review markers. Remove delimiters to a
+  // fixed point (as in parseDeviationDisclosure) so nested input cannot re-form them.
+  const stripCommentDelimiters = value => {
+    let text = value;
+    for (let prev = null; prev !== text;) { prev = text; text = text.replace(/<!--|-->/g, ''); }
+    return text;
+  };
+  return [`🛠 operator action — ${record.op}`, '', `Operator @${stripCommentDelimiters(record.actor)} via ${stripCommentDelimiters(record.channel)}:`,
+    `> ${stripCommentDelimiters(record.reason).replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${record.details.undo}`, '',
     `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')} -->`].join('\n');
 }
 export function parseOperatorActions(comments = []) {

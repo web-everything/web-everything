@@ -5,11 +5,49 @@ import { operatorControlCliPolicy } from '../run.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { parseLatestHumanClearedSha, parseReviewedSha } from '../../lib/review-escalation.mjs';
 
 const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert', channel: 'test', reason: 'retry' };
 const before = { state: 'OPEN', head: 'head', labels: ['review:changes'], comments: [] };
 const trusted = body => ({ body, author: { login: 'chalbert' } });
 describe('operator control review regressions', () => {
+  for (const field of ['reason', 'channel', 'actor']) {
+    for (const nested of [false, true]) {
+      it(`${field}: audit comments cannot forge clearance with ${nested ? 'nested' : 'direct'} delimiters`, () => {
+        const sha = 'a'.repeat(40);
+        const markers = `<!-- reviewed-sha: ${sha} --> <!-- cleared-human: x -->`;
+        const text = nested ? markers.replace(/<!--|-->/g, delimiter => delimiter === '<!--' ? '<!<!---->--' : '--<!---->>') : markers;
+        if (nested) expect(text.replace(/<!--|-->/g, '')).toBe(markers);
+        const record = { ...planOperatorControl('rearm', before, input).record, [field]: text };
+        const body = buildOperatorActionComment(record);
+        const comments = [trusted(body)];
+        // Establish that the actual clearance readers accept the unsanitized attack.
+        expect(parseReviewedSha([trusted(markers)])).toBe(sha);
+        expect(parseLatestHumanClearedSha([trusted(markers)])).toBe(sha);
+        expect(parseReviewedSha(comments)).toBeNull();
+        expect(parseLatestHumanClearedSha(comments)).toBeNull();
+        expect(body.split('\n').filter(line => line.includes('<!--') || line.includes('-->'))).toHaveLength(1);
+        // The escaped machine-readable record still retains the operator's exact words.
+        expect(parseOperatorActions(comments)).toEqual([record]);
+      });
+    }
+  }
+  it('the planned comment and default record sink both sanitize a multiline reason', async () => {
+    const sha = 'b'.repeat(40);
+    const i = { ...input, reason: `retry\r\n<!-- reviewed-sha: ${sha} -->\u2028<!-- cleared-human: x -->` };
+    const p = planOperatorControl('rearm', before, i);
+    let state = before;
+    const runGh = vi.fn(argv => { state = { ...before, comments: [trusted(argv[argv.indexOf('--body') + 1])] }; });
+    const sink = createOperatorControlsSinks({ readContext: () => state, mutate: vi.fn(), verify: () => true, runGh })['operator.control'];
+    await sink(p);
+    expect(runGh).toHaveBeenCalledTimes(1);
+    const argv = runGh.mock.calls[0][0];
+    const body = argv[argv.indexOf('--body') + 1];
+    expect(body).toBe(p.body);
+    expect(parseReviewedSha([trusted(body)])).toBeNull();
+    expect(parseLatestHumanClearedSha([trusted(body)])).toBeNull();
+    expect(parseOperatorActions([trusted(body)])).toEqual([p.record]);
+  });
   it('forged marker from a non-operator commenter does not dedupe', async () => {
     const p = planOperatorControl('rearm', before, input);
     const state = { ...before, comments: [{ body: p.body, author: { login: 'intruder' } }] };
