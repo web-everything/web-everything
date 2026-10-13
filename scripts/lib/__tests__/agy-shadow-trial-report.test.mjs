@@ -1,5 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, renameSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { newRunRecord, resolveRunsDir, migrateLegacyRuns } from '../../operations/run-store.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
+import * as reportModule from '../agy-shadow-trial-report.mjs';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal();
+  return { ...fs, ...Object.fromEntries(['mkdirSync', 'writeFileSync', 'copyFileSync', 'renameSync', 'rmSync']
+    .map((name) => [name, vi.fn(fs[name])])) };
+});
+
+vi.mock('../../operations/run-store.mjs', async (importOriginal) => {
+  const store = await importOriginal();
+  return { ...store, resolveRunsDir: vi.fn(store.resolveRunsDir), migrateLegacyRuns: vi.fn(store.migrateLegacyRuns) };
+});
 
 const model = 'gemini-4-argon-high';
 const row = (extra = {}) => ({
@@ -14,6 +30,93 @@ const fixRecord = (files, extra = {}) => ({
   ...extra,
 });
 const report = (rows, extra = {}) => buildTrialReport({ rows, model, ...extra });
+
+describe('report evidence wiring', () => {
+  it.each([undefined, 'caller-value'])('report CLI does not migrate records and restores WE_UNDER_TEST (%s)', (initial) => {
+    const root = mkdtempSync(join(tmpdir(), 'shadow-report-'));
+    const legacy = join(root, 'legacy'), shared = join(root, 'shared'), jobs = join(root, 'jobs');
+    mkdirSync(legacy);
+    const path = join(legacy, 'review-pr-first.json');
+    const record = { ...newRunRecord({ id: 'review-pr-first', op: 'review-pr', input: { repo: 'o/r', pr: 7 } }),
+      ...fixRecord({ 'file.mjs': [10] }) };
+    const original = JSON.stringify(record);
+    writeFileSync(path, original);
+    const keys = ['WE_UNDER_TEST', 'WE_SHARED_RUNS_DIR', 'WE_DAEMON_JOBS_ROOT', 'OPERATION_RUNS_DIR'];
+    const previous = keys.map((key) => process.env[key]);
+    if (initial === undefined) delete process.env.WE_UNDER_TEST;
+    else process.env.WE_UNDER_TEST = initial;
+    process.env.WE_SHARED_RUNS_DIR = shared;
+    process.env.WE_DAEMON_JOBS_ROOT = jobs;
+    delete process.env.OPERATION_RUNS_DIR;
+    const writes = [mkdirSync, writeFileSync, copyFileSync, renameSync, rmSync, resolveRunsDir, migrateLegacyRuns];
+    writes.forEach((spy) => spy.mockClear());
+    let output = '';
+    try {
+      reportModule.main([`--model=${model}`, '--json', '--no-gh'], {
+        readRows: () => [row({ agyFindings: [anchor('file.mjs', 10)] })], write: (text) => { output += text; },
+        evidenceIO: { resolveDirs: () => reportModule.reportRunDirs({ legacyDir: legacy }) },
+      });
+      writes.forEach((spy) => expect(spy).not.toHaveBeenCalled());
+      expect(process.env.WE_UNDER_TEST).toBe(initial);
+      expect(readFileSync(path, 'utf8')).toBe(original);
+      expect(readdirSync(root)).toEqual(['legacy']);
+      expect(JSON.parse(output).findings.confirmedByFix).toBe(1);
+    } finally {
+      keys.forEach((key, i) => {
+        if (previous[i] === undefined) delete process.env[key];
+        else process.env[key] = previous[i];
+      });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('loads REST-shaped trusted red-team comments across pages and rejects untrusted authors', () => {
+    const body = `<!-- we:red-team-advisory pr=7 rev=${'a'.repeat(40)} -->\n1. [**confirmed**] (edge-case, broken) \`file.mjs:10\` — confirmed break`;
+    const comments = [[{ user: { login: 'web-everything' }, created_at: '2026-10-12T01:00:00Z', body }],
+      [{ user: { login: 'outsider' }, created_at: '2026-10-12T02:00:00Z', body }]];
+    const exec = vi.fn(() => JSON.stringify(comments));
+    const redTeamByPrHead = reportModule.loadRedTeam([row()], { exec });
+    expect(exec.mock.calls[0][1]).toContain('--paginate');
+    expect(redTeamByPrHead.get('o/r#7@' + 'a'.repeat(40)).findings[0]).toMatchObject({ confirmed: true, file: 'file.mjs', line: 10 });
+    expect(report([row({ agyFindings: [anchor('file.mjs', 10)] })], { redTeamByPrHead }).findings.confirmedByRedTeam).toBe(1);
+    expect(reportModule.loadRedTeam([row()], { exec: () => JSON.stringify([comments[1]]) }).get('o/r#7@' + 'a'.repeat(40))).toBeNull();
+    expect(reportModule.loadRedTeam([row()], { exec: () => { throw new Error('unavailable'); } }).size).toBe(0);
+  });
+
+  it('reads run evidence from shared and daemon run homes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'shadow-evidence-'));
+    const shared = join(root, 'shared'), jobs = join(root, 'jobs'), daemon = join(jobs, 'review');
+    mkdirSync(daemon, { recursive: true });
+    const record = { ...newRunRecord({ id: 'review-pr-later', op: 'review-pr', input: { repo: 'o/r', pr: 7 } }),
+      ...fixRecord({ 'file.mjs': [10] }), verdict: { lensVerdicts: { security: 'changes' } } };
+    writeFileSync(join(daemon, 'review-pr-later.json'), JSON.stringify(record));
+    try {
+      const dirs = reportModule.reportRunDirs({ env: { WE_SHARED_RUNS_DIR: shared, WE_DAEMON_JOBS_ROOT: jobs }, legacyDir: join(root, 'legacy') });
+      expect(dirs).toContain(daemon);
+      const evidence = reportModule.loadRunEvidence([row({ runId: 'review-pr-later', agyFindings: [anchor('file.mjs', 10)] })], { resolveDirs: () => dirs });
+      const result = report([row({ runId: 'review-pr-later', agyFindings: [anchor('file.mjs', 10)] })], evidence);
+      expect(result.findings.confirmedByFix).toBe(1);
+      expect(result.runs[0].otherVerdicts.security).toBe('changes');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('renders every report field without control characters while retaining intended line breaks', () => {
+    const result = report([row({ repo: 'o/r\u001b\u2028', status: 'failed', reasons: ['a\nforged\u0085\u200b'] })]);
+    const rendered = reportModule.renderReport(result);
+    expect(rendered).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b\u2028\u2029]/u);
+    expect(rendered).toContain('  runs:\n');
+  });
+
+  it('continues past unreadable homes and deduplicates copied run ids', () => {
+    const evidence = reportModule.loadRunEvidence([row()], {
+      resolveDirs: () => ['/missing', '/shared', '/daemon'],
+      listIds: (dir) => { if (dir === '/missing') throw new Error('unreadable'); return ['review-pr-first']; },
+      readRun: (_id, dir) => dir === '/missing' ? null : fixRecord({ 'file.mjs': [10] }),
+      stat: () => ({ mtimeMs: Date.now() }),
+    });
+    expect(evidence.prRuns.get('o/r#7')).toHaveLength(1);
+  });
+});
 
 describe('buildTrialReport', () => {
   it('counts quota holds, failures, voided attempts and actual-model fallback attempts separately', () => {

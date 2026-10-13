@@ -78,6 +78,15 @@ export function settingsFromRoutingPolicy(policy, { shadowModel = null } = {}) {
 
 const loggedShadowMessages = new Set();
 
+/** One-line log boundary shared by seat selection, execution and trial rendering. */
+export function sanitizeReviewLog(value) {
+  return String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+}
+
+export function logReviewSeat(log, message) {
+  log(sanitizeReviewLog(message));
+}
+
 /** The live routing settings plus the advisory shadow model cascade; log each distinct selection once. */
 export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), log = (m) => console.error(m) } = {}) {
   const settings = settingsFromRoutingPolicy(policy, { shadowModel });
@@ -95,7 +104,7 @@ export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowMod
       const message = `review-seat: agy shadow seats (${seats.join(', ')}) ${description}`;
       if (!loggedShadowMessages.has(message)) {
         loggedShadowMessages.add(message);
-        log(message);
+        logReviewSeat(log, message);
       }
     }
   }

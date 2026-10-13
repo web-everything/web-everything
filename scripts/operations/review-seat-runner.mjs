@@ -23,6 +23,7 @@
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers } from '../lib/review-shadow-agreement.mjs';
+import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
 /** The closed set of directive modes this runner accepts. */
 export const SEAT_RUN_MODES = Object.freeze(['agy', 'shadow']);
@@ -78,7 +79,7 @@ export async function runSeatWithProvider(request, {
       appendRow(makeRow(agyRun, model, { fellBackTo: directive.fallbackModel }));
       fallbackFrom = { model, status: agyRun.status, reasons: agyRun.reasons ?? [] };
       const reason = String(fallbackFrom.reasons[0] ?? 'no reason given').slice(0, 200);
-      log(`review-seat: agy shadow ${lens} on PR ${directive.repo}#${directive.pr} head ${head12}: ${model} ${agyRun.status} (${reason}) — FALLING BACK to ${directive.fallbackModel}`);
+      logReviewSeat(log, `review-seat: agy shadow ${lens} on PR ${directive.repo}#${directive.pr} head ${head12}: ${model} ${agyRun.status} (${reason}) — FALLING BACK to ${directive.fallbackModel}`);
       actualModel = directive.fallbackModel;
       agyRun = await runAgy(actualModel);
     }
@@ -90,7 +91,7 @@ export async function runSeatWithProvider(request, {
     const { claudeVerdict, agyVerdict, verdictAgree, overlap, agyMatched } = row;
     const comparison = { claudeVerdict, agyVerdict, verdictAgree, overlap, agyMatched };
     const recorded = appendRow(row);
-    log(`review-seat: agy shadow verdict PR ${directive.repo}#${directive.pr} head ${head12} seat ${lens} model ${actualModel} status ${agyRun.status} verdict ${agyVerdict ?? 'none'} findings ${row.agyFindingsCount ?? 'none'} (claude ${claudeVerdict}, agree ${verdictAgree ?? 'n/a'})`);
+    logReviewSeat(log, `review-seat: agy shadow verdict PR ${directive.repo}#${directive.pr} head ${head12} seat ${lens} model ${actualModel} status ${agyRun.status} verdict ${agyVerdict ?? 'none'} findings ${row.agyFindingsCount ?? 'none'} (claude ${claudeVerdict}, agree ${verdictAgree ?? 'n/a'})`);
     const shadow = {
       provider: 'agy', model: actualModel, requestedModel: model, modelSource,
       ...(fallbackFrom ? { fallbackFrom } : {}),

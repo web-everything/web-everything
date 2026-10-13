@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /** Read-only evidence for one advisory agy model; Claude remains the mandatory seat. */
-import { statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readShadowRows, isQuotaHeldShadow } from './review-shadow-agreement.mjs';
 import { resolveShadowSeatModel, resolveShadowTrialReviews } from './review-seat-settings.mjs';
-import { resolveRunsDir, tryReadRun, listRunIds, runPath } from '../operations/run-store.mjs';
+import { sharedRunsDir, runsDir, daemonJobsRoot, tryReadRun, listRunIds, runPath } from '../operations/run-store.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
+import { sanitizeReviewLog } from './review-seat-provider.mjs';
 
 const prKey = (row) => `${row.repo}#${row.pr}`;
 const headKey = (row) => `${prKey(row)}@${row.head}`;
@@ -106,7 +107,7 @@ export function renderTrialLine(trial) {
   if (!trial || trial.target == null) return `  trial: ${trial?.reviews ?? 0} completed review(s); no trial length set (shadowSeats.antigravity.trialReviews)`;
   return `  trial: ${trial.reviews} of ${trial.target} reviews${trial.complete ? ' — trial complete (promotion is the operator\'s call; nothing changes automatically)' : ''} (target source: ${TRIAL_SOURCE[trial.source] ?? trial.source})`;
 }
-function renderReport(report) {
+export function renderReport(report) {
   const { agreement: a, findings: f } = report;
   return [
     `agy shadow trial — model ${report.model} (${report.attempts} attempts since ${report.runs[0]?.at ?? 'n/a'})`,
@@ -116,38 +117,59 @@ function renderReport(report) {
     `  findings: ${f.total} raised, ${f.matchedByMandatory} also raised by the mandatory seat, ${f.agyOnly} agy-only; confirmed by fixer change ${f.confirmedByFix}, by red-team re-check ${f.confirmedByRedTeam}, not confirmed ${f.notConfirmed}, pending ${f.pending}`,
     '  runs:',
     ...report.runs.slice(-20).map((run) => `    ${run.at} ${run.pr} ${run.head12} ${run.seat} ${run.model} ${run.status} verdict ${run.agyVerdict ?? 'n/a'} findings ${run.findings ?? 'n/a'} | claude ${run.claudeVerdict ?? 'n/a'}${Object.entries(run.otherVerdicts).map(([lens, verdict]) => ` | ${lens} ${verdict}`).join('')}${run.reason ? ` | ${run.reason.replace(/[\r\n]/g, ' ')}` : ''}`),
-  ].join('\n');
+  ].map(sanitizeReviewLog).join('\n');
 }
 
-function loadRunEvidence(rows) {
-  // resolveRunsDir normally migrates (writes) legacy records. Suppress only that
-  // synchronous resolution side effect and restore the caller's environment.
-  const previous = process.env.WE_UNDER_TEST;
-  let dir;
-  try { process.env.WE_UNDER_TEST = '1'; dir = resolveRunsDir(); }
-  finally {
-    if (previous === undefined) delete process.env.WE_UNDER_TEST;
-    else process.env.WE_UNDER_TEST = previous;
+/** Read-only discovery: never call the migrating resolveRunsDir resolver. */
+export function reportRunDirs({ env = process.env, readdir = readdirSync, legacyDir = runsDir() } = {}) {
+  const dirs = [sharedRunsDir(env), legacyDir];
+  if (env.OPERATION_RUNS_DIR?.trim()) dirs.unshift(resolve(env.OPERATION_RUNS_DIR.trim()));
+  const root = daemonJobsRoot(env);
+  try {
+    for (const entry of readdir(root, { withFileTypes: true })) {
+      if (entry.isDirectory()) dirs.push(join(root, entry.name));
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') process.stderr.write(`trial report: cannot list daemon run homes (${sanitizeReviewLog(error.message)})\n`);
   }
+  return [...new Set(dirs)];
+}
+
+export function loadRunEvidence(rows, {
+  resolveDirs = reportRunDirs, listIds = listRunIds, readRun = tryReadRun, stat = statSync,
+} = {}) {
+  const dirs = resolveDirs();
   const runRecords = new Map(), prRuns = new Map();
   const involved = new Set(rows.map(prKey));
-  const read = (id) => {
-    try { return tryReadRun(id, dir); }
-    catch { process.stderr.write(`trial report: unreadable run ${id}\n`); return null; }
+  const read = (id, dir) => {
+    try { return readRun(id, dir); }
+    catch { process.stderr.write(`trial report: unreadable run ${sanitizeReviewLog(id)}\n`); return null; }
   };
   for (const id of new Set(rows.map((row) => row.runId).filter(Boolean))) {
-    const record = read(id);
-    if (record) runRecords.set(id, record);
+    for (const dir of dirs) {
+      const record = read(id, dir);
+      if (record) { runRecords.set(id, record); break; }
+    }
   }
   if (!rows.length) return { runRecords, prRuns };
   const dates = rows.map((row) => Date.parse(row.at)).filter(Number.isFinite);
   const cutoff = dates.length ? Math.min(...dates) - 60 * 60 * 1000 : -Infinity;
-  for (const id of listRunIds(dir)) {
+  const seen = new Set();
+  const idsIn = (dir) => {
+    try { return listIds(dir); }
+    catch {
+      process.stderr.write(`trial report: unreadable run home ${sanitizeReviewLog(dir)}\n`);
+      return [];
+    }
+  };
+  for (const dir of dirs) for (const id of idsIn(dir)) {
     if (!id.startsWith('review-pr-')) continue;
-    try { if (statSync(runPath(id, dir)).mtimeMs < cutoff) continue; }
+    if (seen.has(id)) continue;
+    try { if (stat(runPath(id, dir)).mtimeMs < cutoff) continue; }
     catch { continue; }
-    const record = runRecords.get(id) ?? read(id);
+    const record = read(id, dir);
     if (!record) continue;
+    seen.add(id);
     const key = prKey(record.input ?? {});
     if (!involved.has(key)) continue;
     const records = prRuns.get(key) ?? [];
@@ -157,7 +179,7 @@ function loadRunEvidence(rows) {
   return { runRecords, prRuns };
 }
 
-function loadRedTeam(rows) {
+export function loadRedTeam(rows, { exec = execFileSync } = {}) {
   const byPr = new Map(), result = new Map();
   for (const row of rows.filter((row) => row.status === 'ok')) {
     const group = byPr.get(prKey(row)) ?? [];
@@ -167,17 +189,19 @@ function loadRedTeam(rows) {
   for (const group of byPr.values()) {
     const { repo, pr } = group[0];
     try {
-      const pages = JSON.parse(execFileSync('gh', ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/comments?per_page=100`],
+      const pages = JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/comments?per_page=100`],
         { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
       if (!Array.isArray(pages)) continue;
-      const comments = pages.flat().map((comment) => ({ ...comment, createdAt: comment.created_at ?? comment.createdAt }));
+      const comments = pages.flat().filter((comment) => comment && typeof comment === 'object').map((comment) => ({
+        ...comment, author: comment.user ?? comment.author, createdAt: comment.created_at ?? comment.createdAt,
+      }));
       for (const row of group) result.set(headKey(row), redTeamForHead(comments, pr, row.head));
     } catch { /* No fetched evidence for this PR on failure. */ }
   }
   return result;
 }
 
-function main(args) {
+export function main(args, { readRows = readShadowRows, write = (text) => process.stdout.write(text), evidenceIO } = {}) {
   let model = resolveShadowSeatModel().value ?? 'gemini-4-argon-high', since = null;
   for (const arg of args) {
     if (arg.startsWith('--model=')) model = arg.slice(8);
@@ -186,10 +210,10 @@ function main(args) {
       if (!Number.isFinite(since)) throw new Error('--since must be a valid ISO timestamp');
     } else if (arg !== '--json' && arg !== '--no-gh') throw new Error(`unknown argument: ${arg}`);
   }
-  const rows = readShadowRows().filter((row) => row && (since == null || Date.parse(row.at) >= since));
+  const rows = readRows().filter((row) => row && (since == null || Date.parse(row.at) >= since));
   // Only this model's attempts need run records and red-team comments.
   const own = rows.filter((row) => row.model === model);
-  const evidence = loadRunEvidence(own);
+  const evidence = loadRunEvidence(own, evidenceIO);
   const report = buildTrialReport({
     rows: own, model, ...evidence, redTeamByPrHead: args.includes('--no-gh') ? new Map() : loadRedTeam(own),
     trialReviews: resolveShadowTrialReviews(),
@@ -202,12 +226,12 @@ function main(args) {
     models.set(row.model, counts);
   }
   report.storeWide = Object.fromEntries([...models].map(([id, c]) => [id, c]));
-  if (args.includes('--json')) { process.stdout.write(`${JSON.stringify(report, null, 2)}\n`); return; }
-  process.stdout.write(`${renderReport(report)}\n`);
-  process.stdout.write(`store-wide quota${since == null ? '' : ` since ${new Date(since).toISOString()}`}: ${[...models].sort(([a], [b]) => String(a).localeCompare(String(b))).map(([id, c]) => `${id}: ${c.attempts} attempts, ${c.held} held`).join('; ') || 'no attempts'}\n`);
+  if (args.includes('--json')) { write(`${JSON.stringify(report, null, 2)}\n`); return; }
+  write(`${renderReport(report)}\n`);
+  write(`${sanitizeReviewLog(`store-wide quota${since == null ? '' : ` since ${new Date(since).toISOString()}`}: ${[...models].sort(([a], [b]) => String(a).localeCompare(String(b))).map(([id, c]) => `${id}: ${c.attempts} attempts, ${c.held} held`).join('; ') || 'no attempts'}`)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { main(process.argv.slice(2)); }
-  catch (error) { process.stderr.write(`trial report: ${error.message}\n`); process.exitCode = 1; }
+  catch (error) { process.stderr.write(`trial report: ${sanitizeReviewLog(error.message)}\n`); process.exitCode = 1; }
 }

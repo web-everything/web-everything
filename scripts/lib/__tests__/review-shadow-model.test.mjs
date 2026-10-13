@@ -64,9 +64,24 @@ describe('shadow directives', () => {
     expect(logs[0]).toContain('env WE_REVIEW_SHADOW_AGY_MODEL');
     expect(logs[0]).toContain(`fallback ${routingModel}`);
   });
+  it('sanitizes the selection log through the shared log boundary', () => {
+    const logs = [];
+    loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY,
+      shadowModel: { value: 'unique\nmodel\u001b\u200b', source: 'env' }, log: (message) => logs.push(message) });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+  });
 });
 
 describe('shadow runner', () => {
+  it('keeps external text on one log line without terminal controls', async () => {
+    const result = await run([{ status: 'failed', reasons: ['a\nreview-seat: forged\r\u001b[31m\u0085\u2028\u2029\u0000\u007f\u200b'] }, ok],
+      { repo: 'o/r\nforged', modelSource: 'settings\u001b' });
+    for (const message of result.logs) {
+      expect(message).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+    }
+    expect(result.logs[0]).toContain('FALLING BACK');
+  });
   it('records a failed attempt before loudly falling back and keeps Claude answer', async () => {
     const result = await run([{ status: 'failed', reasons: ['trial unavailable'] }, ok]);
     expect(result.models).toEqual([model, routingModel]);
