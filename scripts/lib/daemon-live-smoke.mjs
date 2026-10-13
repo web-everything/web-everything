@@ -834,12 +834,41 @@ export async function runLiveSmoke({
       });
       continue;
     }
+    const childFailures = [];
+    let childCalls = 0;
+    let bootOutputsOk = true;
+    const trackedRunChild = async (cmd, args, opts) => {
+      childCalls++;
+      const start = clock();
+      const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
+      try {
+        const out = await runChild(cmd, args, opts);
+        if (check.name === 'daemon-entries-boot') {
+          try { bootOutputsOk &&= !!JSON.parse(out)?.ok; } catch { bootOutputsOk = false; }
+        }
+        return out;
+      }
+      catch (e) {
+        childFailures.push({ ok: false, ms: clock() - start, mayBeTransient: check.mayBeTransient !== false,
+          detail: `child failed: ${firstLine(e)}`,
+          budgetSkipped: outOfBudget && /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(firstLine(e)) });
+        throw e;
+      }
+    };
     try {
-      result = await check.run(ctx);
+      result = await check.run({ ...ctx, runChild: trackedRunChild });
     } catch (e) {
       result = { ok: false, detail: `threw: ${firstLine(e)}` };
     }
-    results.push({ name: check.name, ms: clock() - startedAt, ...result, mayBeTransient: check.mayBeTransient !== false });
+    // Reconcile aggregates child failures only; other checks can parse a successful child's output into a
+    // code failure. Never hide that output just because a later child was refused by the budget wrapper.
+    const budgetInterrupted = !result.ok && childFailures.some((r) => r.budgetSkipped)
+      && (check.name === 'reconcile-dry-run' || childFailures.length === childCalls
+        || (check.name === 'daemon-entries-boot' && bootOutputsOk))
+      && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
+        || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
+    results.push({ name: check.name, ms: clock() - startedAt, ...result,
+      ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
   }
   return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
     ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
@@ -983,6 +1012,15 @@ export async function runLiveSmokeWithRetry({
     forceRefresh = false;
     smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, clock });
     verdict = classifySmokeFailure(smoke.results);
+    // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
+    // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
+    // Still reject any independent code row, and never promote skips without prior probe confirmation.
+    if (githubEnv?.confirmed && smoke.results.some((r) => !r.ok && r.budgetInterrupted)
+      && smoke.results.filter((r) => !r.ok).every((r) => r.budgetInterrupted || isGithubReadFailureRow(r)
+        || isEnvTimeoutRow(r, { minElapsedMs }) || (r.mayBeTransient !== false && isTransientDetail(r.detail)))) {
+      verdict = 'env-unavailable';
+      break;
+    }
     // ENVIRONMENT TIMEOUT (live 2026-09-26 22:37Z) — see {@link isEnvTimeoutFailureSet}. Retry ONCE with every
     // budget widened; still timing out → `'env-timeout'` (held, never a reject record, never an overlay suspect).
     if (verdict === 'code' && isEnvTimeoutFailureSet(smoke.results, { minElapsedMs })) {

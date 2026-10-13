@@ -29,7 +29,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { runSoak } from '../soak.mjs';
 
 const MOVE_ROUND = 1;
@@ -37,7 +37,38 @@ const JUDGE_ROUND = 2;
 const SPECIFIC = new Set([
   'reject-record-written', 'overlay-blamed-or-fallback', 'held-as-harness-broken',
   'not-held-as-env-unavailable', 'rebuild-state-unreadable',
+  'budget-exhausted-outage-rejected',
 ]);
+
+// Post-accept red team, 2026-10-13: the confirmed outage retry consumed all three reconcile caps,
+// then dispatch/boot/status were refused. Use the production budget wrapper and a virtual clock so
+// this recovery-path scenario costs milliseconds rather than six minutes and never needs a fleet.
+export async function replayBudgetExhaustedOutage(root) {
+  const { runLiveSmokeWithRetry } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-live-smoke.mjs')).href);
+  const { budgetedRunChild } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/smoke.mjs')).href);
+  let t = 0;
+  let attempt = 0;
+  const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+    runChild: async (cmd, args, opts) => {
+      if (cmd === 'gh' && args.includes('number,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files')) {
+        throw new Error('HTTP 502: Bad Gateway');
+      }
+      if (cmd === 'node' && args[1] === 'list') { attempt++; return '[]'; }
+      if (args[1] === 'acquire') return '{"lane":1}';
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        if (attempt === 1) throw new Error('could not read state: Command failed: gh pr list');
+        t += opts.timeoutMs;
+        throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+      }
+      if (args[0] === '--input-type=module') return String(args[2]).includes('daemon-boot-smoke:entry-boot')
+        ? '{"ok":true}' : '[{"kind":"stub","ok":true}]';
+      return '';
+    } });
+  return runLiveSmokeWithRetry({ root, runChild, clock: () => t,
+    env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_GH_ENV_PROBE: '1', WE_RESOURCE_SHADOW: 'off' },
+    refreshAuth: async ({ env }) => ({ env, refresh: null }),
+    retries: 1, backoffMs: 10, sleep: async (ms) => { t += ms; }, log: { error() {} } });
+}
 
 export default {
   id: 'smoke-github-outage',
@@ -58,7 +89,7 @@ export default {
     } catch { return false; }
   },
   async run({ log } = {}) {
-    return runSoak({
+    const report = await runSoak({
       name: 'break:smoke-github-outage',
       rounds: JUDGE_ROUND + 1,
       daemons: ['review'],
@@ -119,6 +150,15 @@ export default {
         api.say(`r${String(round).padStart(2, '0')} judge: adopted=${adopted} held=${JSON.stringify(state.held?.reason ?? null)} rejected=${!!state.rejected} alert kinds: ${[...new Set(kinds)].join(', ') || '(none)'}`);
       },
     });
+    const root = new URL('../../../../', import.meta.url);
+    const exhausted = await replayBudgetExhaustedOutage(fileURLToPath(root));
+    const budgetSkips = exhausted.smoke?.results.filter((r) => !r.ok && /skipped: rebuild smoke budget exhausted/.test(r.detail));
+    if (exhausted.verdict !== 'env-unavailable' || exhausted.attempts !== 2
+      || !exhausted.githubEnv?.confirmed || !budgetSkips?.length) {
+      report.violations.push({ invariant: 'budget-exhausted-outage-rejected',
+        detail: `confirmed outage retry with budget refusals: verdict=${exhausted.verdict} attempts=${exhausted.attempts} skips=${budgetSkips?.length ?? 0}` });
+    }
+    return report;
   },
   judge(report) {
     return report.violations

@@ -1712,6 +1712,7 @@ describe('lane-pool probes under a busy pool are SKIPPED (recorded), never allow
 import { SMOKE_ENVIRONMENT_VERDICTS } from '../daemon-rebuild/smoke-classify/index.mjs';
 import * as liveSmoke from '../daemon-live-smoke.mjs';
 import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
+import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
 
 const probeFields = 'number,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files';
 function githubOutageHost({ probeError = 'HTTP 502: Bad Gateway', recover = false, codeRow = false, dispatchTimeout = true } = {}) {
@@ -1754,6 +1755,66 @@ async function replayGithubOutage(host, options = {}) {
 }
 
 describe('GitHub API outage — gate-owned confirmation, never tree-text laundering', () => {
+  it('budget refusals alone never confirm an outage', async () => {
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 0, now: () => 0, runChild: base.runChild });
+    const { result } = await replayGithubOutage({ runChild, clock: () => 0 });
+    expect(result.verdict).toBe('code');
+    expect(result.githubEnv).toBeUndefined();
+    expect(base.runChild).not.toHaveBeenCalled();
+  });
+  it.each(['ok', 'code', 'malformed'])('partially booted outage retry preserves valid boot output (%s)', async (bootOutput) => {
+    let t = 0;
+    let attempt = 0;
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+      runChild: async (cmd, args, opts) => {
+        if (cmd === 'node' && args[1] === 'list') attempt++;
+        if (attempt === 2 && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+          t += 105000;
+          throw new Error('could not read state: Command failed: gh pr list');
+        }
+        if (attempt === 2 && args[0] === '--input-type=module'
+          && String(args[2]).includes('daemon-boot-smoke:entry-boot')) {
+          t += opts.timeoutMs;
+          return bootOutput === 'ok' ? '{"ok":true}' : bootOutput === 'code'
+            ? '{"ok":false,"error":"SyntaxError"}' : 'invalid JSON';
+        }
+        return base.runChild(cmd, args, opts);
+      } });
+    const { result } = await replayGithubOutage({ runChild, clock: () => t }, {
+      sleep: async (ms) => { t += ms; },
+    });
+    expect(result.attempts).toBe(2);
+    expect(result.githubEnv.confirmed).toBe(true);
+    const boot = result.smoke.results.find((r) => r.name === 'daemon-entries-boot');
+    expect(boot.detail).toContain('skipped: rebuild smoke budget exhausted');
+    expect(result.verdict).toBe(bootOutput === 'ok' ? 'env-unavailable' : 'code');
+  });
+  it.each([false, true])('budget-exhausted outage retry preserves the hold unless a code row failed (code=%s)', async (codeRow) => {
+    let t = 0;
+    let attempt = 0;
+    const base = githubOutageHost({ dispatchTimeout: false });
+    const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+      runChild: async (cmd, args, opts) => {
+        if (cmd === 'node' && args[1] === 'list') attempt++;
+        if (attempt === 2 && cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+          t += opts.timeoutMs;
+          throw new Error(codeRow && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)
+            ? 'exited 1: SyntaxError: Unexpected token'
+            : `timed out after ${opts.timeoutMs}ms (process group killed)`);
+        }
+        return base.runChild(cmd, args, opts);
+      } });
+    const { result } = await replayGithubOutage({ runChild, clock: () => t }, {
+      sleep: async (ms) => { t += ms; },
+    });
+    expect(result.attempts).toBe(2);
+    expect(result.githubEnv.confirmed).toBe(true);
+    expect(result.smoke.results.filter((r) => !r.ok).map((r) => r.detail).join('\n'))
+      .toContain('skipped: rebuild smoke budget exhausted');
+    expect(result.verdict).toBe(codeRow ? 'code' : 'env-unavailable');
+  });
   it('replays the live shape with exponential whole-smoke retries and one log per probe', async () => {
     const host = githubOutageHost();
     const { result, sleep, log } = await replayGithubOutage(host);
