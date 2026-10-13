@@ -88,6 +88,7 @@ import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel } from './codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from './codex-task-route.mjs';
 import { JUDGE_TIMEOUT_GRACE_MS, JUDGE_TIMEOUT_MS, JudgeTimeoutError } from './judge-spawn.mjs';
 // #3383 mechanical-dispatcher Bug 2 fix — THE missing run-quality recording call for the advisory-review
 // judge seat: `appendScorecard` (`we:scripts/conveyor/run-scorecard-store.mjs`) had zero real callers before
@@ -348,15 +349,15 @@ export function assertNoCodexToolAllowlist(allowedTools) {
  * @param {string} opts.cwd - a scratch working directory. NOT a lane — this provider's shell is read-only
  *   regardless of cwd (it cannot write anywhere), so `-C` only decides how much ambient repo doctrine gets
  *   loaded (probe 9), never what the juror can write.
- * @param {string} [opts.model] - Codex's `-m`. #3635: defaults to the ratified `CODEX_MODEL` pin and is
+ * @param {string} [opts.model] - Codex's `-m`. defaults to the review task route and is
  *   ALWAYS emitted — there is no code path here that omits `-m`. A caller must name a model to get a
  *   different one; it can no longer get an unrecorded one by saying nothing.
  * @param {string} [opts.effort] - one of `judge-spawn.mjs`'s `EFFORT_LEVELS`; mapped via `CODEX_EFFORT_MAP`.
- *   Left UNSET-able on purpose — see the `-c model_reasoning_effort` note in the body.
+ *   Defaults to the review task route; the resolved effort is always emitted.
  * @returns {string[]} argv AFTER the binary name.
  */
 export function buildCodexJudgeArgv({
-  schemaFile, outputLastMessageFile, cwd, model = CODEX_MODEL, effort,
+  schemaFile, outputLastMessageFile, cwd, model, effort, mandatoryLens, care, env = process.env, route,
 } = {}) {
   if (typeof schemaFile !== 'string' || !schemaFile.trim()) {
     throw new TypeError('codex-judge-spawn: `schemaFile` must be a non-empty path');
@@ -377,30 +378,11 @@ export function buildCodexJudgeArgv({
     '--ephemeral',                  // no session persistence — the `--no-session-persistence` analogue.
     '-C', cwd,
   ];
-  // #3635 Fork 1, RATIFIED: "Every Codex invocation names its model explicitly — never the CLI's own
-  // implicit default." UNCONDITIONAL, not `if (model !== undefined)` as this previously read: no caller
-  // supplied a model, so every judge run inherited whatever `codex exec` resolves to — measured live as
-  // `gpt-6-astra`, the top rung. The hole is not that the inherited model is WRONG (it is the same model this
-  // pin names); it is that nothing recorded the choice, so a server-side catalogue re-rank — the CLI fetches
-  // and caches its model list with a `priority` order, no release needed — would silently move the judge seat
-  // onto a different model with no diff, no log and no transcript entry to notice it by.
-  argv.push('-m', assertCodexModel(model, 'codex-judge-spawn'));
-  // EFFORT IS DELIBERATELY STILL OPTIONAL, and that is a KNOWN, NARROWER residual of the same rule — recorded
-  // rather than fixed here. #3635 applies "never implicit" to effort too (`resolveCodexEffort` pins the
-  // `sonnet` rung's `medium` when a caller names neither `tier` nor `effort`), and omitting `-c
-  // model_reasoning_effort` lets Codex pick its own `default_reasoning_level`. That default is measured as
-  // `medium` — the same value the `sonnet` rung would pin — so the gap costs no behaviour TODAY, only the
-  // record. It is left alone on purpose: the judge seat's right default effort is exactly what the live
-  // effort-level investigation is measuring, and pinning a rung here now would pre-empt its answer with a
-  // guess. Close it when that lands, by resolving through `resolveCodexEffort` the way the delivery provider
-  // and `codex-direct-task.mjs` already do.
-  if (effort !== undefined) {
-    const mapped = CODEX_EFFORT_MAP[effort];
-    if (!mapped) {
-      throw new TypeError(`codex-judge-spawn: \`effort\` must be one of ${Object.keys(CODEX_EFFORT_MAP).join('|')}, got ${JSON.stringify(effort)}`);
-    }
-    argv.push('-c', `model_reasoning_effort=${mapped}`);
-  }
+  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false });
+  // #3635 Fork 1: unconditional `-m`; an inherited default can be re-ranked server-side with no diff.
+  // The old "effort deliberately optional" residual is CLOSED: the review route always emits effort.
+  argv.push('-m', assertCodexModel(route.model, 'codex-judge-spawn'));
+  argv.push('-c', `model_reasoning_effort=${route.effort}`);
   // NO POSITIONAL PROMPT — see the file header's stdin-trap note. Everything rides stdin instead.
   return argv;
 }
@@ -658,7 +640,7 @@ export async function codexJudgeSpawn({
   input,
   shape,
   model,
-  effort,
+  effort, mandatoryLens, care, log,
   allowedTools = null,
   cwd = null,
   env = null,
@@ -690,6 +672,9 @@ export async function codexJudgeSpawn({
   }
   assertNoCodexToolAllowlist(allowedTools);
 
+  const route = resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env: env ?? process.env, log });
+  ({ model, effort } = route);
+
   const workDir = mkTempDir(join(tmpdir(), 'codex-judge-'));
   const childEnv = env ?? defaultCodexSpawnEnv(process.env, { scratchHome: workDir });
   const spawnCwd = cwd || workDir;
@@ -697,7 +682,7 @@ export async function codexJudgeSpawn({
   const outputLastMessageFile = join(workDir, 'last-message.txt');
   writeFile(schemaFile, JSON.stringify(shape));
 
-  const argv = buildCodexJudgeArgv({ schemaFile, outputLastMessageFile, cwd: spawnCwd, model, effort });
+  const argv = buildCodexJudgeArgv({ route, schemaFile, outputLastMessageFile, cwd: spawnCwd, model, effort });
   const prompt = buildCodexPrompt(mandate, input);
 
   const startedAt = Date.now();

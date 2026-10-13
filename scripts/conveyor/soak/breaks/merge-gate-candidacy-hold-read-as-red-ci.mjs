@@ -13,7 +13,8 @@ const candidacyLog = number => `2026-10-12T09:49:30.3934630Z #${number}: HOLD
 2026-10-12T09:49:30.3939344Z   pass              default-base           base main vs main
 2026-10-12T09:49:30.3956372Z   pass              red-main-freeze        no freeze (ops/red-main-freeze:red-main-freeze.json + ci.yml@main)
 2026-10-12T09:49:30.3959878Z merge-gate: HOLD — held`;
-const log5008 = `#5008: HOLD
+const log5008 = `main CI (ci.yml@main): green
+#5008: HOLD
   hold              candidate-label        no "ready-to-merge" label — the drain never considers it
   hold              red-main-freeze        main is RED (freeze: manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12))
   pass              ledger                 labels: labels clear (ledger not consulted)
@@ -29,7 +30,12 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { runReconcilePass } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-pass.mjs')).href);
     const { parsePrResultTable } = await import(pathToFileURL(join(root, 'scripts/lib/merge-gate-hold-class.mjs')).href);
-    const prs = [5008, 5012, 5020].map(number => ({
+    const failureLogs = {
+      5022: log5008.replaceAll('5008', '5022').replace('manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12)', 'main CI red since bbbbbbbbb'),
+      5023: candidacyLog(5023).replace('merge-gate: HOLD — held', 'merge-gate: HOLD — workflow self-check failed — fail closed: cannot compare workflow with main; held'),
+      5024: log5008.replaceAll('5008', '5024').replace('main CI (ci.yml@main): green', 'main CI (ci.yml@main): RED since bbbbbbbbb'),
+    };
+    const prs = [5008, 5012, 5020, 5022, 5023, 5024].map(number => ({
       number, state: 'OPEN', headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main',
       labels: [{ name: 'review:pending' }], comments: [], isDraft: number !== 5008,
       statusCheckRollup: [
@@ -44,7 +50,7 @@ export default {
       readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
       readChecks: () => { throw new Error('complete fixture rollups must not hydrate checks'); },
       readMergeGateVerdict: ({ prNumber }) => ({
-        ...parsePrResultTable(prNumber === 5008 ? log5008 : candidacyLog(prNumber), prNumber),
+        ...parsePrResultTable(failureLogs[prNumber] ?? (prNumber === 5008 ? log5008 : candidacyLog(prNumber)), prNumber),
         head_sha: sha, completed_at: '2026-10-12T11:56:08Z',
       }),
       readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }),
@@ -59,6 +65,10 @@ export default {
     if (!dispatched(5008, 'review')) violations.push('PR #5008 candidacy + cleared manual freeze was not owed review');
     if (!dispatched(5012, 'promote-draft')) violations.push('PR #5012 candidacy-only draft was not owed promote-draft');
     if (!dispatched(5020, 'ci-heal')) violations.push('PR #5020 real test FAILURE was not owed ci-heal');
+    for (const number of Object.keys(failureLogs).map(Number)) {
+      if (!dispatched(number, 'ci-heal')) violations.push(`PR #${number} real merge-gate failure was incorrectly excused`);
+      if (dispatched(number, 'review') || dispatched(number, 'promote-draft')) violations.push(`PR #${number} real merge-gate failure allowed review or promotion`);
+    }
     return { violations };
   },
   judge(report) { return report.violations; },

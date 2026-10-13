@@ -2842,20 +2842,25 @@ mark("16. A DECLARED module contract must cover every specifier the module impor
 }
 
 mark("17b. `--all` inside a git hook (#3196)");
-// ── 17c. Leash pin (#2892 — enforces #2840 trigger 3; guards #2838's flip-edit safeguard) ──────
-// No declarative-leash (`POLICY_SPEC`) file may be dropped from the human gate — checked against the roster AND
-// against the real `scoreEscalation`, so neither a reclassification nor a rubric edit can quietly hand the
-// contract (and with it the shadow→enforce flip) to an agent panel. Pure rule + its rationale live in
-// check-standards-rules.mjs (`checkLeashPin`); this only wires the real roster, rubric and filesystem in.
+// ── 17c. Leash pin: broad restore path and active-set escalation ──────
+// The broad preset must human-gate every pinned leash home. Under the active category set each home
+// must still escalate, even when narrow routes it to AI review. The shared roster stays unchanged.
 // #4167 — every finding `checkLeashPin` can produce is unconditionally `global: true` (its own
 // `descriptor()` helper always sets it), so `--local` always demotes it; skip the whole check.
 if (!LOCAL_MODE) {
   const pin = checkLeashPin({
     specBasenames: POLICY_SPEC_BASENAMES,
     roster: TRUST_CHAIN,
-    isHumanGated: (path, hunks) => scoreEscalation({ changedFiles: [path], diffHunks: hunks }).humanRequired,
+    isHumanGated: (path, hunks) => scoreEscalation({ changedFiles: [path], diffHunks: hunks, humanSurfaces: 'broad' }).humanRequired,
     homeExists: (rel) => existsSync(join(ROOT, rel)),
   });
+  for (const entry of TRUST_CHAIN.filter(e => POLICY_SPEC_BASENAMES.has(e.file))) {
+    for (const home of entry.homes ?? [entry.file]) {
+      if (!scoreEscalation({ changedFiles: [home] }).escalate) {
+        err(`leash pin: active human surfaces no longer escalate ${home}`, { kind: 'leash-pin', fix: 'model', file: 'scripts/lib/review-escalation.mjs', global: true });
+      }
+    }
+  }
   for (const e of pin.errors) err(e.message, e.descriptor);
   for (const w of pin.warnings) warn(w.message, w.descriptor);
 }

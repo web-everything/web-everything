@@ -310,10 +310,11 @@ If you are dispatched against a `convert-advisory` entry, do NOT run a fresh `re
    the same advisory-only shape (no `**Decision:**` line, no `review:*` label touched) `renderAdvisoryNote` posts,
    quoting the prior verdict verbatim — and clear `review:awaiting-advisory` exactly as the `advise` step does.
 
-The executor exists — `we:scripts/conveyor/convert-advisory-dispatch.mjs` — but the review daemon runs it
-**only when the operator opts in** with `REVIEW_DAEMON_CONVERT_ADVISORY=1` (off by default; it posts real
-comments, applies real `advisory:*` labels, and spends one billed judge call per PR). Before flipping it on,
-preview one PR with `node scripts/conveyor/convert-advisory-dispatch.mjs <pr> --repo=<owner/name> --dry-run`:
+The executor exists — `we:scripts/conveyor/convert-advisory-dispatch.mjs` — and the review daemon runs it
+every tick by default (setting `convertAdvisory.enabled` in `we:scripts/lib/review-fix-policy-settings.json`;
+env `REVIEW_DAEMON_CONVERT_ADVISORY=0` turns it off in an emergency) — it posts real comments, applies real
+`advisory:*` labels and spends one billed judge call per PR. To preview one PR,
+run `node scripts/conveyor/convert-advisory-dispatch.mjs <pr> --repo=<owner/name> --dry-run`:
 dry-run writes nothing to the PR, but it does run the read-only evidence fetch and the one judge call, so the
 preview shows the real note. Running that CLI without `--dry-run` is the one-PR manual path. Either way the
 targeted check only decides from real evidence (the named test diff for test-gaming, the comment history for

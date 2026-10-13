@@ -1,0 +1,4 @@
+{
+  "$comment": "Operator decision 2026-10-12: narrow human approval to sensitive surfaces. humanReviewSurfaces accepts narrow, broad, or a non-empty array of workflow, protection, permission, identity, secrets, gate-self, statute, marked-invariant. Standard → platform → this tool file → WE_HUMAN_REVIEW_SURFACES (narrow, broad, or comma-separated categories). Restore the old broad gate by setting broad. Workflow and the human-surface-setting self-protection floor always apply.",
+  "humanReviewSurfaces": "narrow"
+}

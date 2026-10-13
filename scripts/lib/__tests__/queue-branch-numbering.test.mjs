@@ -171,40 +171,28 @@ describe('queue branch numbering', () => {
     const x = setup(); x.args.lock = () => ({ ran: false });
     expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('mutex');
   });
-  it('resolves the local manifest card using its assigned id, with publication disabled', () => {
-    const x = setup();
-    x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
+  it('leaves a numeric unresolved manifest card final without committing or pushing', () => {
+    const x = setup({ pending: false });
+    x.args.c = { ...x.args.c, hasManifest: true, item: '041' };
     x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: open\n---\n' : '{"reservations":[]}');
-    x.args.resolveItem = vi.fn(() => ({ flipped: true }));
-    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', resolved: ['041'] });
-    expect(x.args.resolveItem).toHaveBeenCalledWith('/tmp/fake/tree', '041', { sync: false, publish: false });
-  });
-  it('uses the trusted transition and commits only the card path', () => {
-    const x = setup();
-    x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
-    x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: open\n---\n' : '{"reservations":[]}');
-    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', resolved: ['041'] });
-    expect(x.exec).toHaveBeenCalledWith('git', ['commit', '-m', 'drain: mark card 041 resolved on land (#2748)', '--', 'backlog/041-foo.md'], expect.any(Object));
-    expect(x.fs.writeFileSync).toHaveBeenCalledWith('/tmp/fake/tree/backlog/041-foo.md', expect.stringContaining('status: resolved'));
-    expect(x.exec.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true);
-  });
-  it('refuses a transition rejected by the trusted resolver without pushing', () => {
-    const x = setup();
-    x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
-    x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: blocked\n---\n' : '{"reservations":[]}');
-    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('only an in-flight item') });
+    expect(prepareBranchBeforeEnqueue(x.args)).toEqual({ action: 'final' });
+    expect(x.number).not.toHaveBeenCalled();
+    expect(x.lock).not.toHaveBeenCalled();
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
     expect(x.exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]))).toBe(false);
   });
-  it('refuses unresolved cards and failed numbering without pushing', () => {
+  it('numbers a hash manifest card without resolving it', () => {
     const x = setup();
     x.args.c = { ...x.args.c, hasManifest: true, item: 'xabc123' };
     x.fs.readFileSync.mockImplementation((path) => path.endsWith('.md') ? '---\nstatus: open\n---\n' : '{"reservations":[]}');
-    x.args.resolveItem = () => ({ flipped: false, reason: 'guard refused' });
-    expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('guard refused');
+    expect(prepareBranchBeforeEnqueue(x.args)).toEqual({ action: 'numbered', newHead: 'new', assigned: [{ hash: 'xabc123', nnn: '041' }] });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'commit')).toBe(false);
+    expect(x.fs.writeFileSync.mock.calls.some(([path]) => path.endsWith('.md'))).toBe(false);
+  });
+  it('refuses failed numbering without pushing', () => {
+    const x = setup(); x.args.number = () => ({ assigned: [], error: 'number failed' });
+    expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('number failed');
     expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
-    const y = setup(); y.args.number = () => ({ assigned: [], error: 'number failed' });
-    expect(prepareBranchBeforeEnqueue(y.args).reason).toContain('number failed');
-    expect(y.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
   });
   it('refuses invalid reservation schemas instead of overwriting them', () => {
     for (const state of ['{}', '{"reservations":[{}]}', '{"reservations":null}']) {
@@ -309,7 +297,9 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     expect(process.env).toEqual(envBefore);
     expect(result, result.reason).toMatchObject({ action: 'numbered', assigned: [{ hash: 'xabc123', nnn: '011' }] });
     expect(existsSync(sentinel)).toBe(false);
-    expect(git('show', `${result.newHead}:backlog/011-foo.md`)).toContain('status: resolved');
+    expect(git('show', `${result.newHead}:backlog/011-foo.md`)).toContain('status: open');
+    expect(result).not.toHaveProperty('resolved');
+    expect(git('log', '--format=%s', `${old}..${result.newHead}`).split('\n')).toEqual(['drain: JIT-number xabc123→#011 at land (#2288)']);
     expect(git('ls-remote', 'origin', 'refs/heads/main').split(/\s/)[0]).toBe(main);
     expect(git('ls-remote', 'origin', 'refs/heads/topic').split(/\s/)[0]).toBe(result.newHead);
     git('merge-base', '--is-ancestor', old, result.newHead);
@@ -387,7 +377,8 @@ it('probes on every live queue pass and repairs when inline numbering will not r
   const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
   expect(source).toContain('if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());');
   expect(source).toContain('if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain(');
-  expect(source).toContain('queuedHashOnMain ? { minNext: fallbackMinNext(');
+  expect(source).toContain('(numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext(');
+  expect(source).toContain('if (landedLocal && !DRY_RUN) {\n    if (queuedHashOnMain)');
 });
 
 it('repairs fresh remote main under the lock above reservations, leaving the checkout alone', () => {
