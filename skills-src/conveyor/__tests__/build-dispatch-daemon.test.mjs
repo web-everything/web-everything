@@ -93,7 +93,7 @@ describe('build.priority tick log', () => {
   });
   it('wires the formatter, conditional stderr emission and key update into live ticks', () => {
     // live() owns a process lease and heartbeat; pin its adapter without starting the daemon.
-    const source = readFileSync(new URL('../build-dispatch-daemon.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'build-dispatch-daemon.mjs'), 'utf8');
     const live = source.slice(source.indexOf('async function live(flags) {'));
     expect(live).toContain('const priorityLog = buildPriorityLog(buildPriority, r, lastBuildPriority);');
     expect(live).toContain('if (priorityLog.line !== null) console.error(priorityLog.line);');
