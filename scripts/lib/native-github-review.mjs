@@ -188,11 +188,18 @@ export function checkReviewerIdentity({ identity, viewerLogin, prAuthorLogin }) 
   return { ok: true, reviewerLogin };
 }
 
-/** Idempotency is scoped to reviewer, head and event. Pure. */
+/** Decisive events deduplicate only against the reviewer's latest standing verdict. Pure. */
 export function findExistingNativeReview({ reviews, head, event, reviewerLogin }) {
   if (!reviewerLogin || !EVENT_STATE[event]) return null;
-  return (reviews ?? []).find(review => normaliseLogin(review?.user?.login) === normaliseLogin(reviewerLogin)
-    && review.commit_id === head && review.state === EVENT_STATE[event]) ?? null;
+  const login = normaliseLogin(reviewerLogin);
+  const own = (reviews ?? []).filter(review => normaliseLogin(review?.user?.login) === login);
+  // Comments do not replace a decisive verdict; retain their per-head idempotency.
+  if (event === 'COMMENT') return own.find(review => review.commit_id === head && review.state === 'COMMENTED') ?? null;
+  const latest = own.reduce((last, review) => {
+    if (review.state !== 'APPROVED' && review.state !== 'CHANGES_REQUESTED') return last;
+    return !last || review.id > last.id ? review : last;
+  }, null);
+  return latest?.commit_id === head && latest.state === EVENT_STATE[event] ? latest : null;
 }
 
 /** Only this reviewer's still-standing change requests can be dismissed. Pure. */

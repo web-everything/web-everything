@@ -100,10 +100,22 @@ describe('identity and review history', () => {
     expect(f.posts).toHaveLength(0);
   });
   it('accepts the separate reviewer identity', () => expect(checkReviewerIdentity({ identity, viewerLogin: 'app/plateau-reviewer', prAuthorLogin: 'web-everything' })).toEqual({ ok: true, reviewerLogin: 'plateau-reviewer' }));
-  it('matches history by author, head and state, returning the first match', () => {
+  it('matches the latest decisive review by author, head and state', () => {
     const reviews = [review(1, 'APPROVED', otherHead), review(2, 'APPROVED', head, 'other'), review(3, 'COMMENTED'), review(4, 'APPROVED'), review(5, 'APPROVED')];
-    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer' })).toBe(reviews[3]);
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer' })).toBe(reviews[4]);
     expect(findExistingNativeReview({ reviews, head, event: 'REQUEST_CHANGES', reviewerLogin: 'plateau-reviewer' })).toBeNull();
+  });
+  it('does not reuse a verdict superseded on another head', () => {
+    const reviews = [review(7, 'APPROVED'), review(9, 'CHANGES_REQUESTED', otherHead)];
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer' })).toBeNull();
+  });
+  it('keeps comment idempotency independent of decisive reviews', () => {
+    const reviews = [review(7, 'COMMENTED'), review(9, 'APPROVED')];
+    expect(findExistingNativeReview({ reviews, head, event: 'COMMENT', reviewerLogin: 'plateau-reviewer' })).toBe(reviews[0]);
+  });
+  it('ignores comments, dismissed reviews and other reviewers after the latest matching verdict', () => {
+    const reviews = [review(7, 'CHANGES_REQUESTED'), review(9, 'APPROVED'), review(10, 'COMMENTED'), review(11, 'DISMISSED'), review(12, 'CHANGES_REQUESTED', head, 'other')];
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'app/plateau-reviewer' })).toBe(reviews[1]);
   });
   it('lists only own standing numeric change request ids across heads', () => {
     const reviews = [review(1, 'CHANGES_REQUESTED'), review(2, 'CHANGES_REQUESTED', otherHead), review(3, 'DISMISSED'), review(4, 'CHANGES_REQUESTED', head, 'other')];
@@ -149,6 +161,17 @@ describe('synchronous mirror shell', () => {
     const f = fixture({}, { reviews: [review(7, state, commit)] });
     expect(f.result.outcome).toBe(outcome);
     expect(f.posts).toHaveLength(posts);
+  });
+  it.each([
+    ['accepted', 'APPROVED', 'CHANGES_REQUESTED', 'APPROVE'],
+    ['changes', 'CHANGES_REQUESTED', 'APPROVED', 'REQUEST_CHANGES'],
+  ])('reposts %s after an intervening opposite verdict on the same head', (verdict, initial, opposite, event) => {
+    // Deliberately unordered: review IDs, not array position, define recency.
+    const f = fixture({ verdict }, { reviews: [review(9, opposite), review(7, initial), review(10, 'COMMENTED'), review(11, 'DISMISSED')] });
+    expect(f.result.outcome).toBe('posted');
+    expect(f.posts).toHaveLength(1);
+    expect(f.posts[0]).toContain(`event=${event}`);
+    expect(f.result.line).toContain(`native=${event} outcome=posted agree=yes`);
   });
   it('clear-human dismisses only own holds without posting', () => {
     const f = fixture({ verdict: 'clear-human' }, { reviews: [review(7, 'CHANGES_REQUESTED'), review(8, 'CHANGES_REQUESTED', head, 'other')] });
