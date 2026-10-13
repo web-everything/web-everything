@@ -8,6 +8,15 @@ import { classifyHoldCodes } from './drain-ledger-shadow.mjs';
 export const PROMOTION_DEFAULTS = Object.freeze({
   windowDays: 7, minShadowDays: 7, minComparedPRs: 100, minAgreementPct: 99, maxUnsafeDisagreements: 0,
 });
+/**
+ * Shadow records written BEFORE this instant are not counted: they were produced by the comparison #5174 fixed
+ * (it merged 2026-10-13T15:10:00Z, read from the PR), so their disagreements describe the old comparison, not the
+ * ledger. Records at or before it are reported as excluded, never silently dropped; records after it are always
+ * counted. `null` (repo layer) counts every record. Mirrors PLATFORM_VERDICT_LEDGER_DEFAULTS.promotion.countRecordsAfter.
+ */
+export const COUNT_RECORDS_AFTER_DEFAULT = '2026-10-13T15:10:00Z';
+const COUNT_RECORDS_AFTER_ENV = 'WE_LEDGER_PROMOTION_COUNT_RECORDS_AFTER';
+const validCutoff = (v) => v === null || (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v) && Number.isFinite(Date.parse(v)));
 const ENV_KEYS = {
   windowDays: 'WE_LEDGER_PROMOTION_WINDOW_DAYS',
   minShadowDays: 'WE_LEDGER_PROMOTION_MIN_SHADOW_DAYS',
@@ -35,11 +44,37 @@ export function resolvePromotionSettings({ repo, env } = {}) {
       else invalid.push(`env.${ENV_KEYS[k]}`);
     }
   }
+  settings.countRecordsAfter = COUNT_RECORDS_AFTER_DEFAULT;
+  sources.countRecordsAfter = 'standard';
+  const layer = repo?.verdictLedger?.promotion;
+  if (layer && Object.hasOwn(layer, 'countRecordsAfter')) {
+    if (validCutoff(layer.countRecordsAfter)) { settings.countRecordsAfter = layer.countRecordsAfter; sources.countRecordsAfter = 'repo'; }
+    else invalid.push('repo.verdictLedger.promotion.countRecordsAfter');
+  }
+  const raw = env?.[COUNT_RECORDS_AFTER_ENV];
+  if (raw !== undefined && raw !== '') {
+    const v = String(raw).trim();
+    if (v === 'none') { settings.countRecordsAfter = null; sources.countRecordsAfter = 'env'; }
+    else if (validCutoff(v)) { settings.countRecordsAfter = v; sources.countRecordsAfter = 'env'; }
+    else invalid.push(`env.${COUNT_RECORDS_AFTER_ENV}`);
+  }
   return { settings, sources, invalid };
 }
 
+/** Split runs at the cutoff. Pure. A run with an unparseable time is KEPT (never dropped on a guess). */
+export function splitAtCutoff(runs = [], cutoff = COUNT_RECORDS_AFTER_DEFAULT) {
+  const at = cutoff == null ? NaN : Date.parse(cutoff);
+  if (!Number.isFinite(at)) return { kept: runs, excluded: [] };
+  const kept = [], excluded = [];
+  for (const r of runs) {
+    const t = Date.parse(r?.input?.at);
+    (Number.isFinite(t) && t <= at ? excluded : kept).push(r);
+  }
+  return { kept, excluded };
+}
+
 export function formatPromotionSettings(s) {
-  return Object.keys(PROMOTION_DEFAULTS).map(k => `${k}=${s.settings[k]} (${s.sources[k]})`).join(', ')
+  return [...Object.keys(PROMOTION_DEFAULTS), 'countRecordsAfter'].filter(k => k in s.settings).map(k => `${k}=${s.settings[k]} (${s.sources[k]})`).join(', ')
     + (s.invalid?.length ? ` · ignored invalid: ${s.invalid.join(', ')}` : '');
 }
 
@@ -83,10 +118,12 @@ export function measureReadiness(runs = [], { now = new Date(), settings = PROMO
   const to = etDay(now);
   if (!to) throw new TypeError('invalid readiness time');
   const from = dayBefore(to, s.windowDays - 1);
-  const selected = runs.filter(r => {
+  const inWindow = runs.filter(r => {
     const day = etDay(r?.input?.at);
     return day && day >= from && day <= to;
   });
+  const cutoff = Object.hasOwn(s, 'countRecordsAfter') ? s.countRecordsAfter : COUNT_RECORDS_AFTER_DEFAULT;
+  const { kept: selected, excluded } = splitAtCutoff(inWindow, cutoff);
   const days = new Set(), prs = new Set(), reasons = new Map();
   const m = { window: { from, to }, records: selected.length, shadowDays: 0, comparedPRs: 0,
     rows: 0, agree: 0, disagree: 0, unreadable: 0, transient: 0, unsafe: 0 };
@@ -107,6 +144,8 @@ export function measureReadiness(runs = [], { now = new Date(), settings = PROMO
       }
     }
   }
+  m.excluded = { records: excluded.length, rows: excluded.reduce((n, r) => n + (r.findings?.rows?.length ?? 0), 0),
+    countRecordsAfter: cutoff ?? null, reason: 'written before the shadow comparison fix (#5174); not counted' };
   m.shadowDays = days.size;
   m.comparedPRs = prs.size;
   const denominator = m.agree + m.disagree + m.unreadable;
@@ -129,5 +168,6 @@ export function formatReadinessLine(m, settingsResult = resolvePromotionSettings
   return `merge-ai-prs · ledger readiness: ${m.ready ? 'READY (operator flips mergeGate.reviewAuthority; nothing here flips it)' : 'NOT READY'}`
     + ` · agreement ${m.agreementPct.toFixed(1)}% (need ≥${s.minAgreementPct}) · PRs ${m.comparedPRs}/${s.minComparedPRs}`
     + ` · days ${m.shadowDays}/${s.minShadowDays} · unsafe ${m.unsafe}/≤${s.maxUnsafeDisagreements} · transient ${m.transient}`
+    + (m.excluded?.records ? ` · excluded ${m.excluded.records} record(s) / ${m.excluded.rows} row(s) at or before ${m.excluded.countRecordsAfter} (pre-#5174 comparison)` : '')
     + ` · settings ${formatPromotionSettings(settingsResult)}`;
 }

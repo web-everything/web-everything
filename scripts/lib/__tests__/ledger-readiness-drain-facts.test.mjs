@@ -5,7 +5,7 @@ const { runs } = vi.hoisted(() => ({ runs: [{ input: { schema: 2, at: '2026-10-1
   { status: 'disagree', direction: 'ledger-clears-label-holds', ledgerHolds: ['hold:drain:review'], reason: 'unsafe' },
   { status: 'disagree', direction: 'ledger-holds-label-clears', reason: 'unknown strictness' },
 ] } }] }));
-vi.mock('../settings-files.mjs', () => ({ readSettings: () => ({}) }));
+vi.mock('../settings-files.mjs', () => ({ readSettings: () => ({ verdictLedger: { promotion: { countRecordsAfter: null } } }) }));
 vi.mock('../ledger-promotion-readiness.mjs', async importOriginal => ({ ...await importOriginal(), readShadowRuns: () => ({ runs, corrupt: 0 }) }));
 it('replay reports before, after, projected and residual strictness without projecting live readiness', async () => {
   const argv = process.argv;

@@ -22,6 +22,7 @@
  *   { schema, day, at, trigger, ready, blockers[], agreementPct, previousAgreementPct, agreementDelta, agree,
  *     disagree, unreadable, transient, unsafe, comparedPRs, shadowDays, window{from,to}, minAgreementPct,
  *     maxUnsafeDisagreements, unsafeOverLimit, agreementDropped, topDisagreeReasons[{reason,n}] (top 5),
+ *     countRecordsAfter, excludedRecords, excludedRows, excludedReason (records at or before the cutoff, not counted),
  *     settings (formatted promotion settings with source layers), dailyCheck (formatted dailyCheck settings) }
  * A morning status reads the LAST line (`readLatestLines(path, 2)` returns it plus the line before).
  */
@@ -114,6 +115,9 @@ export function buildDailyLine({ measure: m, previous = null, promotion, dailyCh
     unsafeOverLimit: m.unsafe > s.maxUnsafeDisagreements,
     agreementDropped: prev !== null && agreementPct < prev,
     topDisagreeReasons: (m.topDisagreeReasons ?? []).slice(0, 5),
+    countRecordsAfter: m.excluded?.countRecordsAfter ?? null,
+    excludedRecords: m.excluded?.records ?? 0, excludedRows: m.excluded?.rows ?? 0,
+    excludedReason: m.excluded?.reason ?? null,
     settings: formatPromotionSettings(promotion),
     dailyCheck: formatDailyCheckSettings(dailyCheck),
   };
@@ -134,6 +138,7 @@ export function formatDailyLine(line) {
   return `ledger-readiness daily ${line.day}: ${line.ready ? 'READY' : 'NOT READY'} · agreement ${line.agreementPct}%`
     + (line.previousAgreementPct === null ? '' : ` (prev ${line.previousAgreementPct}%)`)
     + ` · unsafe ${line.unsafe}/≤${line.maxUnsafeDisagreements} · PRs ${line.comparedPRs} · days ${line.shadowDays}`
+    + (line.excludedRecords ? ` · excluded ${line.excludedRecords} pre-cutoff record(s) (≤ ${line.countRecordsAfter})` : '')
     + ` · trigger: ${line.trigger} · ${line.dailyCheck}`;
 }
 

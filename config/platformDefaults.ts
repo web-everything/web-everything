@@ -121,6 +121,13 @@ export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
     /** Maximum rows where ledger clears while the drain holds; all count as unsafe. */
     maxUnsafeDisagreements: 0,
     /**
+     * Count only shadow records written AFTER this ISO instant. Default = the merge time of #5174 (the shadow
+     * comparison fix), read from the PR: older records describe the old comparison, not the ledger. Excluded records
+     * are reported (readiness line, `ledger-readiness`, the nightly history line), never dropped silently.
+     * Repo `null` counts everything; env WE_LEDGER_PROMOTION_COUNT_RECORDS_AFTER (ISO instant, or `none`).
+     */
+    countRecordsAfter: '2026-10-13T15:10:00Z' as string | null,
+    /**
      * The nightly readiness check run by the health watch (we:scripts/lib/ledger-readiness-daily.mjs). Once per ET
      * day it appends one line to <health dir>/ledger-readiness-history.jsonl and raises the
      * `ledger-readiness-regressed` smell when unsafe disagreements exceed maxUnsafeDisagreements or agreement drops
