@@ -1,6 +1,6 @@
 /**
  * @file scripts/lib/review-seat-settings.mjs
- * @description The two `review.*` seat-scheduling settings, under the policy cascade (the same shape
+ * @description The `review.*` seat settings, under the policy cascade (the same shape
  *   `we:scripts/lib/red-main-hold.mjs` uses): standard default (built-in) → platform preference
  *   (`we:scripts/settings/review.json`) → tool override (env).
  *
@@ -10,6 +10,14 @@
  *   - `review.seatsByTouchSet` (`on` | `off`, built-in `on`; env `WE_REVIEW_SEATS_BY_TOUCH_SET`) — the review
  *     daemon's driver (`we:scripts/operations/review-loop-cli.mjs`) chooses the seat list from the PR's touch-set
  *     BEFORE the run starts: an all-prose PR does not seat the security juror. `off` = always seat both.
+ *
+ *   - `review.shadowSeats.antigravity.model` (built-in null; env `WE_REVIEW_SHADOW_AGY_MODEL`) — names the agy
+ *     model ONLY for routing-policy `shadow` mandatory seats (advisory, never counted). Null uses the routing model.
+ *     It never changes a seat's weight, mode or blocking role, never applies to a non-shadow `agy` seat, and never
+ *     applies to the advisory agy-correctness seat.
+ *   - `review.shadowSeats.antigravity.trialReviews` (built-in null; env `WE_REVIEW_SHADOW_AGY_TRIAL_REVIEWS`) — the
+ *     trial length, in completed shadow reviews by that model; read by `we:scripts/lib/agy-shadow-trial-report.mjs`.
+ *     Reporting only: reaching it never promotes the model.
  *
  *   Unknown values fall through to the next layer. `true`/`false` (booleans or strings) are accepted as on/off so a
  *   JSON settings file can use either spelling. PURE except the settings-file read.
@@ -62,4 +70,44 @@ export function parallelSeatsEnabled(o) {
 /** `review.seatsByTouchSet` as a boolean. */
 export function seatsByTouchSetEnabled(o) {
   return resolveReviewSeatSetting('seatsByTouchSet', o).value === 'on';
+}
+
+export const SHADOW_AGY_MODEL_ENV = 'WE_REVIEW_SHADOW_AGY_MODEL';
+
+/** Resolve the advisory shadow model: env > settings > null (routing policy). Never throws. */
+export function resolveShadowSeatModel({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  const valid = (value) => typeof value === 'string' && /^[a-z][a-z0-9.-]{0,63}$/.test(value);
+  try {
+    const value = env?.[SHADOW_AGY_MODEL_ENV];
+    if (valid(value)) return { value, source: 'env' };
+  } catch { /* next layer */ }
+  try {
+    const value = JSON.parse(readFile(file))?.shadowSeats?.antigravity?.model;
+    if (valid(value)) return { value, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: null, source: 'default' };
+}
+
+export const SHADOW_AGY_TRIAL_REVIEWS_ENV = 'WE_REVIEW_SHADOW_AGY_TRIAL_REVIEWS';
+
+/**
+ * `review.shadowSeats.antigravity.trialReviews` — how many completed shadow reviews the model named by
+ * `shadowSeats.antigravity.model` must reach before its trial counts as complete (operator 2026-10-13: measure the
+ * trial by review count, not days). env > settings > null (no trial target). A positive integer only; anything else
+ * falls through. It is a REPORTING target: reaching it never promotes the model or changes any seat — promotion stays
+ * the operator's call. Never throws.
+ * @returns {{value: number|null, source: 'env'|'settings'|'default'}}
+ */
+export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  const valid = (v) => {
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN);
+    return Number.isInteger(n) && n > 0 && n <= 100000 ? n : null;
+  };
+  const fromEnv = valid(env?.[SHADOW_AGY_TRIAL_REVIEWS_ENV]);
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try {
+    const f = valid(JSON.parse(readFile(file))?.shadowSeats?.antigravity?.trialReviews);
+    if (f) return { value: f, source: 'settings' };
+  } catch { /* built-in */ }
+  return { value: null, source: 'default' };
 }

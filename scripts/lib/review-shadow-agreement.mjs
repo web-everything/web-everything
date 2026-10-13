@@ -3,7 +3,7 @@
  * review-shadow-agreement.mjs — HOW OFTEN DOES THE agy SHADOW JUROR AGREE WITH THE CLAUDE JUROR? (card 84)
  *
  * On a `shadow` seat (`review.seatProvider.<lens>`, `we:scripts/lib/review-seat-provider.mjs`) Claude judges and only
- * its verdict counts; an agy juror judges the same seat beside it. Each such run appends ONE row here, per seat. The
+ * its verdict counts; an agy juror judges the same seat beside it. Each attempt appends a row here, per seat; failed attempts superseded by fallback are excluded from agreement. The
  * report folds the rows per seat so the operator can decide, with evidence, whether to flip a seat to `agy`.
  *
  * WHAT "AGREE" MEANS, and nothing softer:
@@ -24,6 +24,7 @@ import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
+import { findingDefectClass } from './review-round-rules.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 
 /** A quota hold/exhaustion is the agy backend being out of budget: no juror ran, so it is neither a failure of the seat nor evidence about agy. */
@@ -42,12 +43,12 @@ export function resolveShadowAgreementPath(env = process.env) {
  * @param {{findings?: object[]}|null} o.agy - null when the agy run produced no usable answer.
  * @param {Array<object>} [o.prTable] - the PR's finding-identity table (`findingIdentityTable`), when known.
  * @returns {{claudeVerdict: string, agyVerdict: string|null, verdictAgree: boolean|null,
- *   overlap: {claudeCount: number, agyCount: number, matched: number, claudeOnly: number, agyOnly: number, jaccard: number}|null}}
+ *   agyMatched: boolean[], overlap: {claudeCount: number, agyCount: number, matched: number, claudeOnly: number, agyOnly: number, jaccard: number}|null}}
  */
 export function compareShadowAnswers({ claude, agy, prTable = [] }) {
   const claudeFindings = normalizeFindings(claude?.findings);
   const claudeVerdict = deriveVerdict({ findings: claudeFindings });
-  if (!agy) return { claudeVerdict, agyVerdict: null, verdictAgree: null, overlap: null };
+  if (!agy) return { claudeVerdict, agyVerdict: null, verdictAgree: null, overlap: null, agyMatched: [] };
   const agyFindings = normalizeFindings(agy.findings);
   const agyVerdict = deriveVerdict({ findings: agyFindings });
   const table = claudeFindings.map((f, i) => findingIdentityEntry(f, `c${i}`)).filter(Boolean);
@@ -59,12 +60,16 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
   // ONE-TO-ONE: each Claude finding is matched by at most one agy finding, so two agy wordings of one Claude finding
   // count one match and one agy-only duplicate — never an inflated overlap (PR #4131 review).
   const matchedClaude = new Set();
+  const agyMatched = agyFindings.map(() => false);
   agyFindings.forEach((_f, i) => {
     let hit = direct[i] != null ? Number(direct[i].slice(1)) : -1;
     if ((hit < 0 || matchedClaude.has(hit)) && viaPr && viaPr.agy[i] != null) {
       hit = viaPr.claude.findIndex((id, j) => id === viaPr.agy[i] && !matchedClaude.has(j));
     }
-    if (hit >= 0 && !matchedClaude.has(hit)) matchedClaude.add(hit);
+    if (hit >= 0 && !matchedClaude.has(hit)) {
+      matchedClaude.add(hit);
+      agyMatched[i] = true;
+    }
   });
   const matchedAgy = matchedClaude.size;
   const union = claudeFindings.length + agyFindings.length - matchedAgy;
@@ -72,6 +77,7 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
     claudeVerdict,
     agyVerdict,
     verdictAgree: claudeVerdict === agyVerdict,
+    agyMatched,
     overlap: {
       claudeCount: claudeFindings.length,
       agyCount: agyFindings.length,
@@ -87,7 +93,9 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
  * The durable row for one shadow seat run. PURE. Carries counts and identities, never finding text.
  * @param {object} o
  */
-export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun, comparison }) {
+export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun, comparison,
+  agyAnswer, claudeAnswer, requestedModel, modelSource, fellBackTo, fallbackFrom }) {
+  const findings = normalizeFindings(agyAnswer?.findings);
   return {
     at, repo: repo ?? null, pr: pr ?? null, head: head ?? null, lens, runId: runId ?? null,
     provider: 'agy', model,
@@ -97,6 +105,24 @@ export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun,
     claudeSessionId: agyRun.claudeSessionId ?? null,
     agyWallMs: agyRun.wallMs ?? null,
     ...comparison,
+    ...(requestedModel != null ? { requestedModel } : {}),
+    ...(modelSource != null ? { modelSource } : {}),
+    ...(fellBackTo != null ? { fellBackTo } : {}),
+    ...(fallbackFrom ? { fallbackFrom: {
+      model: fallbackFrom.model, status: fallbackFrom.status,
+      reasons: (fallbackFrom.reasons ?? []).slice(0, 3).map((r) => String(r).slice(0, 300)),
+    } } : {}),
+    ...(agyAnswer !== undefined ? {
+      agyFindingsCount: agyAnswer ? findings.length : null,
+      agyFindings: findings.slice(0, 30).map((finding, i) => ({
+        path: finding.file ?? finding.path ?? null, line: finding.line ?? null,
+        defectClass: findingDefectClass(finding),
+        // The canonical normalizer exposes impact/disposition rather than a raw severity label.
+        severity: finding.impactIfUnfixed ?? finding.disposition ?? null,
+        matched: comparison?.agyMatched?.[i] ?? false,
+      })),
+    } : {}),
+    ...(claudeAnswer != null ? { claudeFindingsCount: normalizeFindings(claudeAnswer.findings).length } : {}),
   };
 }
 
@@ -126,7 +152,7 @@ export function readShadowRows({ path = resolveShadowAgreementPath(), read = rea
 export function summarizeShadowAgreement(rows = []) {
   const byLens = new Map();
   for (const row of rows) {
-    if (!row || typeof row.lens !== 'string') continue;
+    if (!row || typeof row.lens !== 'string' || Object.hasOwn(row, 'fellBackTo')) continue;
     const s = byLens.get(row.lens) ?? { lens: row.lens, runs: 0, compared: 0, voided: 0, failed: 0, held: 0, agree: 0, overlapSum: 0, prs: new Set() };
     s.runs += 1;
     if (row.pr != null) s.prs.add(`${row.repo}#${row.pr}`);
