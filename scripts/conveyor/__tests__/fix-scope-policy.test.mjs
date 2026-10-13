@@ -1,8 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import * as policyApi from '../fix-scope-policy.mjs';
 import { filterFixesByInFlightScope, planFixesFromReconcile } from '../reconcile-fix-dispatch.mjs';
@@ -14,11 +13,7 @@ const claim = (pr, extra = {}) => ({ heartbeatAt: new Date(NOW).toISOString(), m
 const gate = (planned, claims = [], overrides = {}, options = {}) => filterFixesByInFlightScope(planned, [], claims, { now: NOW, maxWaitMinutes: null, rebaseExempt: null, policy: policy({ overlapGranularity: 'file', ...overrides }), ...options });
 
 describe('live region head freshness', () => {
-  // Exercise the production closure: unit dispatch deliberately disables region IO.
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../reconcile-fix-dispatch.mjs'), 'utf8');
-  const start = source.indexOf('  const observedHeads = new Map();');
-  const end = source.indexOf('\n  };', source.indexOf('  const regionOverlap =', start)) + '\n  };'.length;
-  const makeOverlap = new Function('holderEntries', 'readPrHeads', 'regionReader', 'scopePolicy', 'regionOverlapDecision', 'root', `${source.slice(start, end)}\nreturn regionOverlap;`);
+  // The production callback with injected IO: unit dispatch deliberately disables region IO.
   const run = ({ holderHead, candidateHead = 'C', observedHead = null }) => {
     const heads = [], reads = [], merges = [];
     const holderEntries = new Map([[1, { headRefOid: holderHead }]]);
@@ -30,9 +25,9 @@ describe('live region head freshness', () => {
       },
       mergeConflicts: (a, b) => { merges.push([a, b]); return a && b ? b !== 'A' : null; },
     };
-    const regionOverlap = makeOverlap(holderEntries, (_root, prs) => {
+    const regionOverlap = policyApi.createLiveRegionOverlap({ holderEntries, readPrHeads: (_root, prs) => {
       reads.push(...prs); return new Map(prs.map(pr => [pr, observedHead]));
-    }, regionReader, policy(), policyApi.regionOverlapDecision, '/unused');
+    }, regionReader, policy: policy(), root: '/unused' });
     const out = gate([entry(2, { headRefOid: candidateHead, claim: claim(2, { headSha: 'A' }) })],
       [claim(1, { headSha: 'A' })], { overlapGranularity: 'region', priorityBypass: false }, { holderEntries, regionOverlap });
     return { out, heads, reads, merges };

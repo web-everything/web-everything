@@ -71,6 +71,34 @@ export function regionOverlapDecision({ file, hunksA, hunksB, margin = 20, merge
   return { overlap, why: overlap ? 'changed regions intersect within margin' : 'changed regions are disjoint and trial merge is clean' };
 }
 
+/** The live `regionOverlap` callback for filterFixesByInFlightScope. IO is injected: `readPrHeads(root, prs)`
+ * returns a Map of current heads, and `regionReader` is a {@link createRegionReader} (null disables regions). */
+export function createLiveRegionOverlap({ holderEntries = new Map(), readPrHeads, regionReader, policy, root }) {
+  const observedHeads = new Map();
+  const headFor = e => {
+    const pr = Number(e.pr);
+    // Claim metadata records the acquisition head; heartbeats do not track fixer pushes.
+    // Only current PR observations can release a file hold. Missing heads fail closed below.
+    const sha = e.headRefOid || holderEntries.get(pr)?.headRefOid;
+    if (sha) return sha;
+    if (!observedHeads.has(pr)) observedHeads.set(pr, readPrHeads(root, [pr]).get(pr) ?? null);
+    return observedHeads.get(pr);
+  };
+  return (candidate, holder, sharedFile) => {
+    // Only identical file entries can use regions. Directory/ancestor scopes remain exclusive.
+    if (!regionReader) return { overlap: true, why: 'region reader unavailable', failedClosed: true };
+    if (!holder.pr || !(candidate.overlapScope ?? candidate.scope)?.includes(sharedFile)
+      || !holder.scope?.includes(sharedFile) || sharedFile.endsWith('/')) {
+      return { overlap: true, why: 'build or directory scope requires file hold', failedClosed: true };
+    }
+    const file = sharedFile.replace(/^[^:]+:/, '');
+    const a = headFor(candidate), b = headFor(holder);
+    return regionOverlapDecision({ file, hunksA: regionReader.hunksFor(a, candidate.pr),
+      hunksB: regionReader.hunksFor(b, holder.pr), margin: policy.value.regionMarginLines,
+      mergeConflict: a && b ? regionReader.mergeConflicts(a, b) : null });
+  };
+}
+
 /** git seam receives argv and returns stdout; subprocess failures carry their numeric exit status. Never throws.
  * Cache includes origin/main's current tip, so a reader remains valid across base movement. */
 export function createRegionReader({ root, git = args => execFileSync('git', ['-C', root, ...args], {

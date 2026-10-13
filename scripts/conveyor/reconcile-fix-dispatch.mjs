@@ -76,7 +76,7 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
-import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, regionOverlapDecision } from './fix-scope-policy.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -1868,29 +1868,7 @@ export function runReconcileFixDispatch({
     const previous = holderEntries.get(pr);
     holderEntries.set(pr, { ...previous, ...e, headRefOid: e.headRefOid || previous?.headRefOid, labels: e.labels ?? previous?.labels });
   }
-  const observedHeads = new Map();
-  const headFor = e => {
-    const pr = Number(e.pr);
-    // Claim metadata records the acquisition head; heartbeats do not track fixer pushes.
-    // Only current PR observations can release a file hold. Missing heads fail closed below.
-    const sha = e.headRefOid || holderEntries.get(pr)?.headRefOid;
-    if (sha) return sha;
-    if (!observedHeads.has(pr)) observedHeads.set(pr, readPrHeads(root, [pr]).get(pr) ?? null);
-    return observedHeads.get(pr);
-  };
-  const regionOverlap = (candidate, holder, sharedFile) => {
-    // Only identical file entries can use regions. Directory/ancestor scopes remain exclusive.
-    if (!regionReader) return { overlap: true, why: 'region reader unavailable', failedClosed: true };
-    if (!holder.pr || !(candidate.overlapScope ?? candidate.scope)?.includes(sharedFile)
-      || !holder.scope?.includes(sharedFile) || sharedFile.endsWith('/')) {
-      return { overlap: true, why: 'build or directory scope requires file hold', failedClosed: true };
-    }
-    const file = sharedFile.replace(/^[^:]+:/, '');
-    const a = headFor(candidate), b = headFor(holder);
-    return regionOverlapDecision({ file, hunksA: regionReader.hunksFor(a, candidate.pr),
-      hunksB: regionReader.hunksFor(b, holder.pr), margin: scopePolicy.value.regionMarginLines,
-      mergeConflict: a && b ? regionReader.mergeConflicts(a, b) : null });
-  };
+  const regionOverlap = createLiveRegionOverlap({ holderEntries, readPrHeads, regionReader, policy: scopePolicy, root });
   const scopeFilter = filterFixesByInFlightScope(
     stackOrder.planned, listBuildClaims(), claims, {
       urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
