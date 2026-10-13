@@ -135,6 +135,7 @@ import { ADVISORY_LABELS } from './lib/advisory-labels.mjs';
 // minutes after acceptance kept it for good.
 import { RULING_NEEDED_LABEL } from './lib/ruling-ledger.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { mirrorNativeReview } from './lib/native-github-review.mjs'; // card xk8ab41 — native review mirror
 // #3631 slice — the LAST bare `execFileSync` in this file's own gh-adjacent write path. This exec closure is
 // `computeNetDiffText`'s injected exec, and today it is only ever invoked with `cmd==='git'` (a fetch/diff/
 // merge-base against `origin`, never a `gh` call — the label reads/writes above already route through
@@ -1870,6 +1871,9 @@ export function runReviewLabelCli({
     newLabels = [...new Set([...names, decision.addLabel])];
   }
 
+  // Card xk8ab41 — mirror the verdict as a native GitHub review (`review.nativeGithubReview`): pinned to the reviewed head,
+  // posted only as the reviewer App, stderr-only, never throws, never a gate (we:scripts/lib/native-github-review.mjs).
+  mirrorNativeReview({ repo, pr: Number(pr), verdict: to, labels: Array.isArray(currentLabels) ? currentLabels : [], headSha });
   emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision, labels: newLabels }))}\n`);
   process.exit(0);
 }

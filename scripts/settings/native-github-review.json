@@ -1,0 +1,6 @@
+{
+  "$comment": "Repo override (card xk8ab41). review.nativeGithubReview off|mirror|authoritative: our review verdict also posts as a real GitHub pull-request review from the reviewer App (accepted -> APPROVE, changes -> REQUEST_CHANGES, human-review advisory -> COMMENT, never APPROVE), pinned to the reviewed head and idempotent per (PR, head, verdict); it posts nothing unless the live token is the configured reviewer App and not the PR author (fail closed). off = nothing posted. mirror = posted in addition to the labels; no gate changes; each mirror logs one 'native-review:' comparison line (stderr and the conveyor native-review.log) next to the label verdict. authoritative = reserved, behaves like mirror until the operator's ruleset step makes GitHub's required approval the gate. Cascade: standard off -> platform preference (review.nativeGithubReview in scripts/lib/delivery-platform-preferences.json) -> this file -> env WE_REVIEW_NATIVE_GITHUB_REVIEW; the comparison line names the source layer. See scripts/lib/native-github-review.mjs.",
+  "review": {
+    "nativeGithubReview": "mirror"
+  }
+}
