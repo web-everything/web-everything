@@ -2701,6 +2701,26 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(quiet.pending.asks).toContain('the PR description this does not reproduce');
   });
 
+  it('AN INDEPENDENT BLOCK survives a negative verifier answer and a quiet same-head rerun', async () => {
+    const w = world();
+    const key = referralFindingKey('judgeAntigravityReview', original);
+    w.referralJudge.mockImplementation(async (request) => ({ sessionId: request.sessionId,
+      value: { rulings: [{ key, result: 'block', rationale: 'the cited defect reproduces independently',
+        evidence: ['x.mjs:1 independent reproduction'] }] } }));
+
+    await w.runOnce('run-1', NOT_REPRODUCED);
+    expect(w.records()[0].verified[0].outcome).toBe('not-reproduced');
+    expect(mandatoryReferralState(w.state.comments, { head: H1 }).blocked).toHaveLength(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+
+    await w.runOnce('run-2', REPRODUCED, { ...original, verdict: 'PLAUSIBLE' });
+    expect(w.spawns).toHaveLength(1);
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
+    expect(activeReferrals(w.records()[0])).toHaveLength(1);
+    expect(mandatoryReferralState(w.state.comments, { head: H1 }).blocked).toHaveLength(1);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+  });
+
   // PR #5025 review: a steered verifier's lone "does not reproduce" (free-form evidence, no line in the claim's own file) must not
   // write a retiring record through the real sink. The claim stays held and the same head asks again.
   it('A STEERED NEGATIVE (no line cited in the claim\'s own file) writes no retiring record, holds acceptance, and is asked again', async () => {

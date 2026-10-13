@@ -2866,8 +2866,8 @@ export function verificationCandidates({ seats, known = new Map() }) {
 
 /**
  * Does the verifier's STORED reason (`foldVerifyReason`: folded, one line, capped) cite a line (`<path>:<n>`, n ≥ 1) in the
- * claim's OWN cited file? It runs on the same text that is persisted, so a retiring record always shows the citation that let it
- * retire. The path is data: matched literally, case-sensitive, as a whole path token (no letter, digit or path character of any
+ * claim's OWN cited file? It runs on the same text that is persisted, so the recorded negative always shows the citation that let it
+ * be recorded. The path is data: matched literally, case-sensitive, as a whole path token (no letter, digit or path character of any
  * script before it), and never opened. A claim with no file has nothing to cite, so this is false for it.
  *
  * THIS IS A FORMAT FILTER, NOT A SECOND SIGNAL. It turns away a lazy or free-form "does not reproduce", and makes every recorded

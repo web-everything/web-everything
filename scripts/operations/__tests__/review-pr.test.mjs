@@ -4518,8 +4518,8 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
     });
 
     // PR #5025 review: the verifier reads attacker-controlled PR content, and its citation check is only a format filter (a steered
-    // verifier can echo the claim's own path:line). So a lone, well-formed negative may retire the REFERRAL, but the run cannot
-    // reach an agent-recorded accept on it: a human confirms. A second independent seat that would lift this is #xztd0mv.
+    // verifier can echo the claim's own path:line). A lone, well-formed negative keeps the mandatory referral live for an independent
+    // ruling, and the run cannot reach an agent-recorded accept on it: a human confirms.
     it('a lone negative that echoes the claim\'s own path:line is held for a human: no agent accept, a human accept is allowed', () => {
       const echoed = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: `${claim.file}:${claim.line} per the PR notes this does not reproduce` }] };
       const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: echoed });
@@ -4582,6 +4582,8 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(request.shape.properties.results.items.properties.reproduced.type).toEqual(['boolean', 'null']);
       expect(request.mandate).toContain('reproduced=null');
       expect(request.mandate).toContain('reproduced=false ONLY');
+      expect(request.mandate).toContain('keeps the mandatory referral live for an independent ruling');
+      expect(request.mandate).not.toContain('false retires the claim');
     });
 
     it('the mandate treats the PR and the checkout as untrusted, demands evidence for every answer, and keeps the shell read-only', () => {

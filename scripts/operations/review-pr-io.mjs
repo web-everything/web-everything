@@ -979,7 +979,7 @@ export function createReviewPrSinks({
         for (const v of Array.isArray(payload.verifications) ? payload.verifications : []) {
           try {
             if (typeof v?.seat !== 'string' || !v.seat || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome) || !requiresMandatoryReferral(v.original)) continue;
-            // PR #5025 review: a retiring record is written only for a reason that itself cites a line in the claim's own file — the
+            // PR #5025 review: a negative outcome is recorded only for a reason that itself cites a line in the claim's own file — the
             // same check `settleVerification` made, re-made here on the text this sink stores. It grants no retirement authority.
             if (v.outcome === 'not-reproduced' && !verifierEvidenceCitesClaim(v.original, v.reason)) continue;
             verifiedByKey.set(referralFindingKey(v.seat, v.original), v);
