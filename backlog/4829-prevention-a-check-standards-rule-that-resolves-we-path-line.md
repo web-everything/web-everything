@@ -22,3 +22,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5074 (finding 2: `we:backlog/4648-reconcile-dead-build-run-records-even-after-their-dispatch-c.md:24` — Add a check:standards rule that resolves we:path:line citations in backlog cards against preparedAgainstSha and flags a cited line that is blank or a bare closing brace.)

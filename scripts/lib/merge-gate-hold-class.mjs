@@ -16,7 +16,10 @@ const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'sk
 const gates = new Set(GATE_IDS);
 const candidacy = new Set(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance']);
 const blocking = r => r.status === 'hold' || r.status === 'fail-closed';
-const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold' && r.reason?.includes('(freeze:');
+// The evaluator wraps both main-CI failures and manual freezes in `(freeze: ...)`.
+// Only combineRedMain's explicit manual origin can be cleared by the shared document.
+const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
+  && /^main is RED \(freeze: manual freeze: .+\)$/.test(r.reason ?? '');
 
 /** Shared candidacy classification; workflow-edit protection is applied separately by PR-event policy. */
 export function isCandidacyHold(result) {
@@ -56,12 +59,28 @@ export function parsePrResultTable(log, prNumber) {
     seen.add(m[2]);
     results.push({ status: m[1], id: m[2], reason: m[3] });
   }
+  // A PR table does not include workflow self-check or other job-level failures.
+  // Inspect the entire remaining log (including other PR tables), and authorize
+  // excusal only with the known table-only HOLD footer. Missing, duplicate and
+  // unknown summaries are insufficient evidence, including truncated logs.
+  if (header[2] === 'HOLD') {
+    const summaries = lines.slice(start + 1).filter(line => /^merge-gate:/.test(line));
+    if (summaries.length !== 1 || summaries[0] !== 'merge-gate: HOLD — held') {
+      return { error: 'missing, ambiguous or job-level merge-gate failure' };
+    }
+  }
   if (!results.length || (header[2] === 'HOLD') !== results.some(blocking)) return { error: 'verdict header disagrees with rows' };
-  return { num: Number(header[1]), ok: header[2] === 'PASS', results };
+  // A manual freeze takes precedence over main-CI red in combineRedMain. Its
+  // table row alone therefore cannot prove main CI passed. Bind the diagnostic
+  // to this invocation, never an older table's completed verdict.
+  const priorSummary = lines.slice(0, start).findLastIndex(line => /^merge-gate: (?:PASS|HOLD)\b/.test(line));
+  const mainCi = lines.slice(priorSummary + 1, start).filter(line => /^main CI\b/.test(line));
+  const mainCiGreen = mainCi.length === 1 && /^main CI \(.+\): green$/.test(mainCi[0]);
+  return { num: Number(header[1]), ok: header[2] === 'PASS', results, mainCiGreen };
 }
 
 /** Pure classification; a candidate must have an actually passing merge-gate. */
-export function classifyMergeGateHold({ results, prLabels, freeze, verdictCompletedAt } = {}) {
+export function classifyMergeGateHold({ results, prLabels, freeze, verdictCompletedAt, mainCiGreen } = {}) {
   const unreadable = why => ({ excused: false, kind: 'unreadable', holds: [], others: [], why });
   if (!Array.isArray(results) || !results.length || !Array.isArray(prLabels)
     || prLabels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
@@ -71,7 +90,7 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   for (const r of holds) {
     if (r.status === 'fail-closed') { others.push(r); continue; }
     if (isCandidacyHold(r)) { hasCandidacy = true; continue; }
-    if (manualFreeze(r) && freeze?.frozen === false && !freeze.error
+    if (manualFreeze(r) && mainCiGreen === true && freeze?.frozen === false && !freeze.error
       && Number.isFinite(Date.parse(verdictCompletedAt)) && Date.parse(freeze.publishedAt) > Date.parse(verdictCompletedAt)) { hasStaleFreeze = true; continue; }
     others.push(r);
   }
@@ -101,7 +120,7 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     if (verdict?.error || verdict?.num !== prNumber || !verdict?.head_sha
       || verdict.head_sha.toLowerCase() !== headSha.toLowerCase() || verdict.ok !== false) return unchanged;
     const currentFreeze = verdict.results?.some(manualFreeze) && typeof freeze === 'function' ? freeze() : freeze;
-    const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at });
+    const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen });
     if (!classification.excused) return unchanged;
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
