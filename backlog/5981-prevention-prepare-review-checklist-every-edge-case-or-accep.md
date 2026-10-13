@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:55` — Prepare-review checklist: every edge-case or acceptance bullet that asserts new runtime behaviour must map to a Design or MVP line. This can ride on the #x7m2q9v contract test.
+1. `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:55` — Prepare-review checklist: every edge-case or acceptance bullet that asserts new runtime behaviour must map to a Design or MVP line. This can ride on the #5989 contract test.
 2. `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:88` — Prepare review should check that each injected option a test plan names exists on the entry point under test. This is a review lens, not a gate.
 3. `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md` — Add deterministic planned tests in we:scripts/readiness/__tests__/drain-lock.test.mjs for omitted configuration, valid overrides including zero, and invalid-value fallback; assert the wrapper's actual injected wait duration as well as resolver results.
 
