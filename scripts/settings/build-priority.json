@@ -1,7 +1,17 @@
 {
-  "$comment": "Ordered operator build priority: card numbers, bornAs/x-ids, or parent ids (inherited by descendants). Lifts ready cards after P0 without bypassing blockers or build clearance. Cascade: standard [] \u2192 platform build.priority \u2192 this tool setting \u2192 WE_BUILD_PRIORITY (comma-separated; empty clears).",
+  "$comment": "Ordered operator build priority: card numbers, bornAs/x-ids, or parent ids (inherited by descendants). Lifts ready cards after P0 without bypassing blockers or build clearance. Cascade: standard [] → platform build.priority → this tool setting → WE_BUILD_PRIORITY (comma-separated; empty clears).",
   "build": {
     "priority": [
+      "6031",
+      "5694",
+      "4674",
+      "5823",
+      "5303",
+      "6021",
+      "5895",
+      "5209",
+      "5028",
+      "5919",
       "5754",
       "5762",
       "5745",
