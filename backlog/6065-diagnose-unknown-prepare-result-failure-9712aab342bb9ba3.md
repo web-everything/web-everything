@@ -1,4 +1,5 @@
 ---
+bornAs: xb70adi
 kind: story
 size: 2
 status: open

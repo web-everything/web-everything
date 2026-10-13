@@ -1,20 +1,22 @@
 ---
+bornAs: xsw1g1f
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/__tests__/stand-down.test.mjs"]
+scope: ["we:scripts/operations/operator-controls.mjs", "we:scripts/operations/__tests__/operator-controls.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a we:stand-down.test.mjs case where the CLI builds a fix-loop-exhausted comment from detail c… (from web-everything/web-everything#5155 review)
+# Prevention — Add a recurrence test per PR-scoped op: apply, restore the same labels and head, and assert a sec… (from web-everything/web-everything#5169 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/stand-down.mjs:165` — Add a we:stand-down.test.mjs case where the CLI builds a fix-loop-exhausted comment from detail containing 'Head: <sha>.' and no head. Better, make the legacy prose path apply only to trailer-less bodies, and require a `head=` trailer for every body that has a trailer.
+1. `we:scripts/operations/operator-controls.mjs:62` — Add a recurrence test per PR-scoped op: apply, restore the same labels and head, and assert a second apply. Alternatively, include a monotonic nonce in the key, such as the count of prior operator-action records for that op and target.
+2. `we:scripts/operations/operator-controls.mjs:14` — Bind the actor to the credential: require the `gh` authenticated user to equal `--actor` for PR and item controls, and write the verified login into the item record. Alternatively add a deterministic check-standards rule that fails if a new mutating operation is missing from every agent deny list. Today that is only a unit test on the health investigator's list.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5155@5f9b6a4a4bdd84b38e7c67931a275f8b121d4762
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5169@ce75f7d66a313caea79c60fa98fac463b0d2a19f
 
 ## Acceptance
 

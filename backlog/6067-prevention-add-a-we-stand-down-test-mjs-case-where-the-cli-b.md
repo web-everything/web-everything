@@ -1,22 +1,21 @@
 ---
+bornAs: xi5g1sn
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/conveyor/fix-loop-ledger.mjs", "we:scripts/conveyor/stale-base-refresh.mjs", "we:scripts/operations/__tests__/fix-run.test.mjs", "we:scripts/conveyor/__tests__/fix-loop-ledger.test.mjs", "we:scripts/conveyor/__tests__/stale-base-refresh.test.mjs"]
+scope: ["we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/__tests__/stand-down.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Assert in the ci-heal launch test that the spawned prompt omits the 'authoritative ask' sentence.… (from web-everything/web-everything#5185 review)
+# Prevention — Add a we:stand-down.test.mjs case where the CLI builds a fix-loop-exhausted comment from detail c… (from web-everything/web-everything#5155 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/fix-run.mjs` — Assert in the ci-heal launch test that the spawned prompt omits the 'authoritative ask' sentence. Better, build the ci-heal preamble from a separate constant so no regex is involved.
-2. `we:scripts/conveyor/fix-loop-ledger.mjs` — Add a test for aggregate infraFailures combined with a ledger outcome and no infraRows, asserting `until` and the build-change rearm.
-3. `we:scripts/conveyor/stale-base-refresh.mjs` — Persist an attempt reservation durably before refresh and add a deterministic regression test that invokes the gate again after both refresh and marker posting fail, asserting that refresh is called only once for that base.
+1. `we:scripts/conveyor/stand-down.mjs:165` — Add a we:stand-down.test.mjs case where the CLI builds a fix-loop-exhausted comment from detail containing 'Head: <sha>.' and no head. Better, make the legacy prose path apply only to trailer-less bodies, and require a `head=` trailer for every body that has a trailer.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5185@d1670db4c6790c1832a9ba18bb30a13f90564489
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5155@5f9b6a4a4bdd84b38e7c67931a275f8b121d4762
 
 ## Acceptance
 
