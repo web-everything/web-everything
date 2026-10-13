@@ -28,11 +28,25 @@ export function createCiHealReserve({
     tryAdmit() {
       const reserve = resolveCiHealReserve({ env });
       if (liveHeal === null) {
-        try { holders = listClaims().filter((c) => c?.meta?.kind === 'ci-heal').map((c) => `#${c.meta.pr}`); } catch { holders = []; }
+        try {
+          const seen = new Set();
+          holders = [];
+          for (const claim of listClaims()) {
+            if (claim?.meta?.kind !== 'ci-heal') continue;
+            const pr = claim.meta.pr;
+            // A PR occupies one reserve slot even if it has multiple live claims.
+            // Unidentified claims still each occupy a slot; never collapse them together.
+            if (pr == null) { holders.push('unknown PR'); continue; }
+            const key = String(pr);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            holders.push(`#${pr}`);
+          }
+        } catch { holders = []; }
         liveHeal = holders.length;
       }
       if (liveHeal >= reserve) {
-        const who = holders.length ? ` — held by ci-heal ${holders.join(', ')}; this PR is next in line` : '';
+        const who = holders.length ? ` — held by ci-heal ${holders.join(', ')}; queued oldest-first` : '';
         return { admit: false, kind: 'fix-cap', why: `fixer cap full and the ${reserve} reserved ci-heal slot(s) (WE_CI_HEAL_RESERVE) are in use (${liveHeal} live ci-heal)${who}` };
       }
       let g = { admit: true };

@@ -21,7 +21,8 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
-import { dispatchCiHeal, runReconcileCiHealDispatch, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
+import { dispatchCiHeal, runReconcileCiHealDispatch, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
+import { createCiHealReserve } from '../../lib/ci-heal-reserve.mjs';
 import { readUnsupported } from '../../conveyor/unsupported-repo.mjs';
 import { flushOwedWrites, readOwedWrites, recordOwedWrite, OWED_MAX_AGE_MS } from '../../conveyor/ci-heal-owed.mjs';
 import { STAND_DOWN_MARKER } from '../../conveyor/stand-down.mjs';
@@ -74,6 +75,63 @@ afterAll(() => {
 });
 
 const FRESH = () => ({ fresh: true, behind: 0 });
+
+describe('oldest owed CI-heal first', () => {
+  const timed = (prNumber, completedAt) => ({ prNumber,
+    failingRequiredChecks: [{ name: 'test', completedAt }] });
+
+  it.each([
+    [5087, 5082, 5017], [5017, 5087, 5082], [5082, 5017, 5087],
+  ])('orders failure completion times regardless of input order: %j', (...numbers) => {
+    const entries = numbers.map(n => timed(n, { 5017: '2026-10-13T02:00:00Z',
+      5082: '2026-10-13T03:00:00Z', 5087: '2026-10-13T04:00:00Z' }[n]));
+    const original = [...entries];
+    expect(orderCiHealEntriesOldestFirst(entries).map(e => e.prNumber)).toEqual([5017, 5082, 5087]);
+    expect(entries).toEqual(original);
+  });
+
+  it('uses the earliest failure time, then waitingSince, with stable ties', () => {
+    const first = timed(5087, '2026-10-13T01:00:00Z');
+    first.failingRequiredChecks.push({ name: 'build', completedAt: '2026-10-13T04:00:00Z' });
+    const second = { prNumber: 5082, waitingSince: '2026-10-13T02:00:00Z' };
+    const third = timed(5017, '2026-10-13T03:00:00Z');
+    const tie = { ...first, tag: 'tie' };
+    expect(orderCiHealEntriesOldestFirst([third, second, first, tie])).toEqual([first, tie, second, third]);
+  });
+
+  it('falls back to ascending PR number for absent or invalid timestamps and keeps ties stable', () => {
+    const entries = [{ prNumber: 5087, failingRequiredChecks: ['test'], check: 'red' },
+      { prNumber: 5017, waitingSince: 'invalid' }, timed(5082, null), { prNumber: 5017, tag: 'tie' }];
+    expect(orderCiHealEntriesOldestFirst(entries)).toEqual([entries[1], entries[3], entries[2], entries[0]]);
+  });
+
+  it('dispatches the oldest real reconcile entry when the reserve has one free slot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-oldest-'));
+    const plan = planReconcile({ requiredChecks: ['test'], prs: [5087, 5082, 5017].map(number => ({
+      number, state: 'OPEN', headRefName: `lane/${number}`, headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'ci:failed' }], comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    })) });
+    expect(plan.dispatch.map(e => e.prNumber)).toEqual([5087, 5082, 5017]);
+    const dispatch = vi.fn(async planned => ({ pr: planned.pr }));
+    try {
+      const result = await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
+        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap' }) },
+        ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '3' }, gate: () => ({ admit: true }),
+          listClaims: () => [5042, 5051].map(pr => ({ meta: { kind: 'ci-heal', pr } })) }),
+        pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        salvage: async () => null, currentBuild: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch.mock.calls[0][0].pr).toBe(5017);
+      expect(result.dispatched).toEqual([{ pr: 5017 }]);
+      expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 const TEMPLATE = 'heal #{{ITEM_NUM}} pr={{PR_NUM}} ref={{LANE_REF}} lane={{LANE}} slug={{SESSION_SLUG}} scope={{SCOPE}} why={{REASON}}';
 
