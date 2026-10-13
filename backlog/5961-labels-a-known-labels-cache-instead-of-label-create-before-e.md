@@ -3,7 +3,7 @@ bornAs: xqce2qz
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/ensure-label.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/lib/forge-land-provider.mjs"]
+scope: ["we:scripts/lib/ensure-label.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/lib/forge-land-provider.mjs", "we:scripts/lib/__tests__/ensure-label.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/review-label-provider.test.mjs", "we:scripts/lib/__tests__/forge-land-provider.test.mjs"]
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "8e6ac5c8b85595160693d112b6996004db63cd16"
@@ -44,16 +44,18 @@ Musts: the cache module with TTL + lock/atomic write; review provider, land prov
 ## Test plan
 
 In `we:scripts/lib/__tests__/ensure-label.test.mjs` with injected `create` and clock (all RED before: module absent):
-- hit within TTL → `create` not called.
-- miss, expired entry (TTL+1 ms), and different repo/name → `create` called once each.
-- `create` throws → nothing recorded, error surfaces (no false "known").
-- corrupt/unparseable state file → treated as empty and rewritten valid; create still runs.
-- two interleaved writers keep both keys (merge under lock).
-- `invalidateKnownLabel` forces the next ensure to create.
-- `create` failing with realistic "label with name \"X\" already exists" stderr → treated as success and recorded (second call makes no `gh` call); a different failure (auth/network) records nothing and rethrows.
-- name starting with `--` is rejected before any `create`.
-- provider test in `we:scripts/lib/__tests__/review-label-provider.test.mjs`: `setLabels` failing with realistic "could not add label: 'X' not found" invalidates, re-ensures once with remembered opts, retries once; a second failure propagates; an unrelated failure (rate limit, PR not found) neither invalidates nor retries.
-- land-provider test in `we:scripts/lib/__tests__/forge-land-provider.test.mjs`: a second `ensureLabel` for the same label within the TTL makes no `gh` call.
+- Capability (Red today): hit within TTL → `create` not called.
+- Capability (Red today): miss, expired entry (TTL+1 ms), and different repo/name → `create` called once each.
+- Capability (Red today): `create` throws → nothing recorded, error surfaces (no false "known").
+- Capability (Red today): corrupt/unparseable state file → treated as empty and rewritten valid; create still runs.
+- Capability (Red today): two interleaved writers keep both keys (merge under lock).
+- Capability (Red today): `invalidateKnownLabel` forces the next ensure to create.
+- Capability (Red today): `create` failing with realistic "label with name \"X\" already exists" stderr → treated as success and recorded (second call makes no `gh` call); a different failure (auth/network) records nothing and rethrows.
+- Capability (Red today): name starting with `--` is rejected before any `create`.
+- Capability (Red today): review provider, in `we:scripts/lib/__tests__/review-label-provider.test.mjs`: `setLabels` failing with realistic "could not add label: 'X' not found" invalidates, re-ensures once with remembered opts, retries once; a second failure propagates.
+- Preservation (GREEN today; mutation proof: make the retry unconditional and it fails): same file, an unrelated `setLabels` failure (rate limit, PR not found) neither invalidates nor retries.
+- Capability (Red today): land provider, in `we:scripts/lib/__tests__/forge-land-provider.test.mjs`: a second `ensureLabel` for the same label within the TTL makes no `gh` call.
+- Capability (Red today): in `we:scripts/__tests__/merge-ai-prs.test.mjs`, two sweeps in separate processes (fresh `ensuredLabels`) mint each label once, not twice.
 
 ## Proof plan
 
