@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { planCloseItems, closeItemsOperation, evidencePointer, CATEGORIES } from '../close-items.mjs';
 import { planReopenItems, reopenItemsOperation } from '../reopen-items.mjs';
 import { createCloseItemsReader, createReopenItemsReader, createCloseItemsSinks } from '../close-items-io.mjs';
@@ -125,7 +124,7 @@ describe('close-items fixture batches', () => {
       '002': body('closed', 'closedReason: duplicate\nclosedInto: "xsurvivor"\n'),
       '003': body('closed', 'bornAs: xblocker\n') });
     const before = readFileSync(f.path('001'), 'utf8');
-    const cli = fileURLToPath(new URL('../../backlog.mjs', import.meta.url));
+    const cli = createRequire(import.meta.url).resolve('../../backlog.mjs');
     const result = spawnSync(process.execPath, [cli, verb, '1', '--reason=obsolete', '--force',
       `--backlog-dir=${join(f.root, 'backlog')}`], { encoding: 'utf8' });
     expect(result.status).toBe(1);
