@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-10-09"
-preparedAgainstSha: "1c5dc7c02cbea88fa7727cbe278d66b4ce00e278"
+preparedDate: "2026-10-13"
+preparedAgainstSha: "16926de026fd25486d1c47239c2cd9f23e6168b7"
 tags: []
 ---
 
@@ -19,11 +19,11 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
-- Rechecked against lane HEAD `1c5dc7c02cbea88fa7727cbe278d66b4ce00e278`: the owed guard is not delivered. The opt-out test at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901` still supplies an untracked throwing stub and asserts only null states and agents. This is source evidence, not an executed mutation result.
-- Old premise/scope: the prior preparation cited the test at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:869-874`, the opt-out/catch at `we:scripts/conveyor/lease-reaper.mjs:1299-1306`, and the cached listing at `we:scripts/operations/dispatch-lane-io.mjs:3351-3364`; its scope was one test file with explicit cache isolation. Corrected premise/scope: the test moved to `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901` and the opt-out/catch moved to `we:scripts/conveyor/lease-reaper.mjs:1340-1347`. The listing location is unchanged. Both production branches still return the same null/empty-map result, so the original throwing stub cannot distinguish them. The single-file implementation scope remains correct.
+- Rechecked against lane HEAD `16926de026fd25486d1c47239c2cd9f23e6168b7`: the owed guard is not delivered. The opt-out test at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901` still supplies an untracked throwing stub and asserts only null states and agents. This is source evidence, not an executed mutation result.
+- Old premise/scope: the previous preparation placed the cached listing at `we:scripts/operations/dispatch-lane-io.mjs:3351-3364` and scoped delivery to one test file with explicit cache isolation. Corrected premise/scope: `defaultListAgents` now lives at `we:scripts/operations/dispatch-lane-io.mjs:3385-3399`; its cached exec closure is at lines 3386-3397 of that file. The test remains at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901`, and the opt-out/read/catch remains at `we:scripts/conveyor/lease-reaper.mjs:1340-1347`. Both production branches still return the same null/empty-map result, so the original throwing stub cannot distinguish them. The single-file implementation scope remains correct; no moved production code needs an implementation edit.
 - Cache isolation remains necessary for deterministic mutation proof: `we:scripts/lib/claude-agents-cache.mjs:7-17` disables caching under tests by default, but an explicit positive TTL overrides that default; a fresh cache returns without calling exec at `we:scripts/lib/claude-agents-cache.mjs:25-28`. Set the TTL to zero and restore the prior environment exactly.
 - Scope already names the matching existing test, `we:scripts/conveyor/__tests__/lease-reaper.test.mjs`; no production source change is planned. Production paths below are research and temporary mutation targets only. Size remains 3 for the isolated assertion change, environment cleanup, and before/after mutation proof. No dependency changes are proposed; no unresolved policy or design fork was found.
-- The neighboring PR-axis follow-up citations also moved: the throwing-stub tests are now at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:1072-1079`, with their REST-backed opt-out/read/catch at `we:scripts/conveyor/lease-reaper.mjs:1277-1299`.
+- The neighboring PR-axis follow-up citations remain current: the throwing-stub tests are at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:1072-1079`, with their REST-backed opt-out/read/catch at `we:scripts/conveyor/lease-reaper.mjs:1277-1299`.
 - Preparation edits only this card. Tests and mutation proof are delivery work specified below, not results claimed here; the probation runner owns preparation checks, stamping, and the parked independent review. Existing preparation metadata is left unchanged for that runner.
 
 ## Done when
@@ -33,9 +33,9 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Design
 
-Strengthen the existing test at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901`; `vi` is already imported at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:21`. Wrap the existing throwing implementation in `vi.fn(() => { throw new Error('must not be called'); })`. Preserve its failure behavior: if the opt-out return is removed, the call is recorded before the exception is caught. Retain both null assertions, add `expect(result.pidAlive.size).toBe(0)`, and add `expect(exec).not.toHaveBeenCalled()`.
+Strengthen the existing test at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:896-901`; `vi` is already imported at `we:scripts/conveyor/__tests__/lease-reaper.test.mjs:21`. Wrap the existing throwing implementation in `vi.fn(() => { throw new Error('must not be called'); })`. Preserve its failure behavior: if the opt-out return is removed, the call is recorded before the exception is caught. Retain both null assertions, add `expect(result.pidAlive).toBeInstanceOf(Map)` plus `expect(result.pidAlive.size).toBe(0)`, and add `expect(exec).not.toHaveBeenCalled()`.
 
-Within this test, save the prior `process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS`, set it to `'0'`, and restore its exact prior value in `finally` (delete the key if originally absent). This bypasses cache reads and writes via `we:scripts/lib/claude-agents-cache.mjs:16-17`, including hosts with an explicit positive TTL. Keep the environment setup local to this synchronous test.
+Within this test, save the prior `process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS`, set it to `'0'`, and restore its exact prior value in `finally` (delete the key if originally absent). The listing helper at `we:scripts/operations/dispatch-lane-io.mjs:3385-3399` forwards the default process environment to the cache. This bypasses cache reads and writes via `we:scripts/lib/claude-agents-cache.mjs:16-17`, including hosts with an explicit positive TTL. Keep the environment setup local to this synchronous test.
 
 The existing seam is `fetchSessionSignals(flags, { exec })` at `we:scripts/conveyor/lease-reaper.mjs:1339`: passing `{ 'no-check-sessions': true }` must return `{ states: null, pidAlive: new Map(), agents: null }` without invoking exec. No API, runtime behavior, consumers, or data migration change. Ship the test and its isolation together as one small change; sibling PR-axis guards remain follow-up work.
 
@@ -49,7 +49,7 @@ The existing seam is `fetchSessionSignals(flags, { exec })` at `we:scripts/conve
 - Focus the test in `we:scripts/conveyor/__tests__/lease-reaper.test.mjs` with the name filter `no-check-sessions disables`. Assert both result compatibility and the absence of execution, without real subprocess calls.
 - Validate the mutation's failure comes from the exec-call assertion, not an import, environment, or unrelated test failure. Retaining the throwing spy makes the caught-error result identical to the opt-out result, isolating the missing guard as the reason for red.
 - Run the complete `we:scripts/conveyor/__tests__/lease-reaper.test.mjs` after restoring the source. Its adjacent failed-listing, interactive-only-listing, and malformed-listing cases must remain green.
-- All test and standards invocations use `we:scripts/readiness/heavy-admission.mjs` with `run --`. From the WE checkout, pass `npx vitest run` the repository-relative form of `we:scripts/conveyor/__tests__/lease-reaper.test.mjs`, optionally followed by `-t "no-check-sessions disables"`; pass `npm run check:standards` for the standards gate. Strip the documentation-only `we:` prefix when passing filesystem arguments.
+- All test and standards invocations use `we:scripts/readiness/heavy-admission.mjs` with `run --`. From the WE checkout, pass `npx vitest run` the repository-relative form of `we:scripts/conveyor/__tests__/lease-reaper.test.mjs`, optionally followed by `-t "no-check-sessions disables"`. Set `WE_CLAUDE_AGENTS_CACHE_TTL_MS=0` on full-file runs too, since the neighboring listing tests do not locally override a positive host TTL; pass `npm run check:standards` for the standards gate. Strip the documentation-only `we:` prefix when passing filesystem arguments.
 
 ## Proof plan
 
