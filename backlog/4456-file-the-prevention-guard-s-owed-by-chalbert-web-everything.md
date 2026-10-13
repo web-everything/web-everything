@@ -32,11 +32,18 @@ Extend the existing pure validation surface in we:scripts/check-standards-rules.
 
 For an epic, derive child existence from the complete collection's `parent` edges, normalizing IDs to strings. Require an existing allowed Fibonacci size when there are no children. Enforce the complementary documented rule that an epic with any child has no size. Do not infer children from narrative promises, count only open children, or exempt resolved children. Leave other kinds' sizing rules intact. Diagnostics identify the card and offending field and explain the structural correction; they must not choose a point estimate for an author.
 
+## Operator ruling (2026-10-13 ~13:40 ET): re-scoped to the retired-field guard only
+
+The prepare was blocked as a spec-defect. The operator said "ok" to re-scoping: **drop the epic-size guard entirely and keep only the `workItem` guard.**
+
+- The "sliced epic has no size" half is already enforced by the standards gate.
+- The "childless epic must have a size" half reverses the slicing rule. A sub-epic slice is deliberately scaffolded with no size, because an epic is decomposed, never built directly (we:skills-src/split-backlog-item/SKILL.md, "Sub-epic slice").
+- Every epic-size item in Design, Test plan and Done when below is therefore out of scope. Only the `workItem` parts remain.
+
 ## MVP
 
-1. **Must 1:** The standards gate rejects a childless epic without size and a sliced epic with size, while accepting the corresponding correctly sized/unsized shapes.
-2. **Must 2:** The standards gate requires the current canonical classification and rejects authored `workItem`, including when valid `kind` coexists. Existing valid kinds and malformed-YAML handling retain their behavior.
-3. **Must 3:** Pure fixtures and an actual gate integration regression cover both guards, with named diagnostics and failing exit status. No production backlog cards are mutated by tests.
+1. **Must 1 (was Must 2):** The standards gate rejects an authored retired `workItem` key, including when a valid `kind` coexists. Required-`kind` and enum checks and malformed-YAML handling keep their behaviour. The one card on main that still carries `workItem` is migrated in the same change, using we:scripts/backlog/migrate-kind.mjs.
+2. **Must 2 (was Must 3):** Pure fixtures and one gate integration regression cover the guard, with a named diagnostic and a failing exit status. Tests mutate no production backlog cards.
 
 ## Test plan
 
