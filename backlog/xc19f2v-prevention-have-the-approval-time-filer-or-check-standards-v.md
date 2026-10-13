@@ -3,7 +3,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x4txkj2-prevention-have-the-approval-time-prevention-filer-group-ite.md"]
+scope: ["we:backlog/5970-prevention-have-the-approval-time-prevention-filer-group-ite.md"]
 dateOpened: "2026-10-12"
 tags: []
 ---
