@@ -252,11 +252,12 @@ export const OPERATIONS = Object.freeze({
     declaration: clearStuckSessionOperation({ readStuckFacts: createClearStuckSessionReader() }),
     sinks: createClearStuckSessionSinks(),
   }),
+  // Batch close/reopen declare guarded writing effects; dry-run inputs do not make them reads.
+  [CLOSE_ITEMS_OP]: () => ({ declaration: closeItemsOperation({ readCloseItemsContext: createCloseItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
+  [REOPEN_ITEMS_OP]: () => ({ declaration: reopenItemsOperation({ readReopenItemsContext: createReopenItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
   // #xrrpfo7 — `claim`'s sibling: the CLOSE of the lifecycle whose OPEN #3034 declared. Same shape (read →
   // plan → write), same guarded writer, and the guards are REPLAYED from `we:scripts/backlog.mjs`'s
   // `transition()` rather than reinvented.
-  [CLOSE_ITEMS_OP]: () => ({ declaration: closeItemsOperation({ readCloseItemsContext: createCloseItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
-  [REOPEN_ITEMS_OP]: () => ({ declaration: reopenItemsOperation({ readReopenItemsContext: createReopenItemsReader() }), sinks: createCloseItemsSinks(), finish: finishItemsOutcome }),
   [RESOLVE_OP]: () => ({
     declaration: buildResolveOperation({ readResolveContext: createResolveReader() }),
     sinks: createResolveSinks(),

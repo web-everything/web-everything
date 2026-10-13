@@ -85,7 +85,7 @@
       "description": "The allowed values for a backlog item's `kind` field (#466/#487/#2691/#3567). A kind outside this set is a hard ERROR. Adding a value widens what the gate accepts as a valid backlog item shape."
     },
     "backlogStatuses": {
-      "value": ["open", "active", "preparing", "parked", "resolved"],
+      "value": ["open", "active", "preparing", "parked", "resolved", "closed"],
       "impl": "BACKLOG_STATUSES",
       "description": "The allowed values for a backlog item's `status` field (#375). A status outside this set is a hard ERROR. Adding a value widens the backlog's state machine without a matching workflow."
     },

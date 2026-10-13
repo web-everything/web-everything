@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 import { missingDoneWhenProof, forkLeansOnUnruled, PROSE_PREREQ, ANY_REF } from '../audit-backlog-health.mjs';
 
 // #3522: exercise the live extractors so G1/D2 cannot silently lose short or long ids.
@@ -26,6 +27,7 @@ describe('PROSE_PREREQ — G1', () => {
       PROSE_PREREQ,
       norm: String,
       isDecision: () => false,
+      isTerminalStatus,
       title: () => 'Enumeration regression',
       flags,
     });
