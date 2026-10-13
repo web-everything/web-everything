@@ -2,9 +2,10 @@
 bornAs: x4bppjr
 kind: story
 size: 3
-status: open
+status: active
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/heavy-repair-priority.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-13"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "481cfe502d4dd9b5364c4cbf1f2e6ad448b637f5"
 tags: []
@@ -26,6 +27,16 @@ Historical filing attribution: held finding 231 (2026-10-11), reportedly approve
 - Corrected attribution: the current #4814 card is a sandbox-workflow prevention item, not evidence of approval for repair priority. Treat the original approval attribution as unverified historical context; the concrete defect is independently visible in we:scripts/readiness/heavy-admission.mjs:240 and we:scripts/readiness/heavy-repair-priority.mjs:74–83.
 - Corrected timing premise: we:scripts/readiness/heavy-repair-priority.mjs:124–125 validates before starting the matching deadline. The 150 ms budget bounds match execution across fields/patterns, not the entire function's elapsed duration including validation and VM setup. Preserve that boundary and prove budget propagation deterministically.
 - Expanded proof within the existing scope: we:scripts/readiness/__tests__/heavy-admission.test.mjs:1570–1605 already exercises torn reads and separate checkout loaders for capacity; extend these fixtures to priority. Permissive regex assumptions also occur at we:scripts/readiness/__tests__/heavy-admission.test.mjs:1786–1834, beyond the cascade assertions previously singled out. No source or test file has moved; we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs remains a planned new file.
+
+- Delivery sanity read: the shared-priority exemption and broad-pattern acceptance remain in current source; the spec is coherent and buildable. Added regression coverage before implementation for host policy, grammar, loader recovery, yielding and deterministic matching deadlines.
+
+- Baseline proof: the required queued two-file Vitest run acquired a host slot after 569359 ms and executed 256 tests: 231 passed, 24 expected regression assertions failed (shared priority, broad/literal pattern acceptance and bounded diagnostics), and one new child-watchdog harness failed because Vitest supplied an HTTP module URL. Corrected that harness to use an explicit filesystem URL; this was distinct from admission timeout. Baseline output retained at /tmp/5943-before-tests.log. Existing yielding and deterministic deadline tests passed before implementation.
+
+- Implemented the shared-host priority cascade using the existing resolver, retaining private overrides and per-caller timeout behavior. Added exact built-in/anchored repair-literal validation with whole-layer rejection, bounded one-line invalid diagnostics, and updated resolver documentation. The matcher deadline and scheduler are unchanged; the same two-file queued test command is running against the implementation.
+
+- Final delivery proof: reran `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/readiness/__tests__/heavy-admission.test.mjs we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs` through the host queue: **2 files, 256 tests passed**, exit 0, 26.53 s test duration. Output retained at /tmp/5943-after-tests.log. Syntax checks passed for both changed source modules. Reviewed source/test changes against pre-edit copies without git; authored changes are confined to the four declared implementation/test paths plus this Progress section.
+- Captured diagnostic assertions prove `priority.mode=off (platform)`, ignored tool/env priority values, and `invalid: platform.priority.repairPatterns=` with bounded single-line text. Four payload fixtures each capture exactly one `yielding to red-main repair waiter` log and resume ordinary admission after three polls. Controlled VM/clock assertions prove a post-validation deadline of 150 ms, match timeouts of 50 ms then 20 ms as time advances, and no further VM execution at exhaustion. The corrected child watchdog passes against the low-level catastrophic matcher.
+- Delivery boundary: working-tree edits are ready for the wrapper. No git commands or gate commands were run; the wrapper owns committing and the queued `check:standards` requirement (A3). No out-of-scope implementation follow-up was introduced.
 
 ## Design
 
