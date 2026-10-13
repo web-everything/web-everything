@@ -47,6 +47,7 @@
  *       `repos/{o}/{r}/branches/{name}` (URL-encoded branch, head SHA and committer date),
  *       `repos/{o}/{r}/commits/{sha}/check-runs` and `…/status` (only for an open PR's current head sha;
  *       `…/status` always lists no legacy statuses)
+ *   - `api graphql -f query=…` for pr-list-paged.mjs's light open-PR query (paged, CREATED_AT DESC)
  *   - Fields produced with GitHub's real shape (camelCase for `--json`, snake_case for `api`'s REST JSON) —
  *     see `fake-gh.mjs`'s `buildPrGraphqlView` / `restEvent` / `listChangedFilesRest`.
  *
@@ -71,6 +72,7 @@ import {
   refOid, createMergeCommit, listChangedFilesNative, listChangedFilesRest,
   buildPrGraphqlView, pushCommitToRef,
 } from './fake-gh.mjs';
+import { buildOpenPrPageQuery, PAGED_LIGHT_FIELDS } from '../../../lib/pr-list-paged.mjs';
 
 const STORE_PATH = process.env.FAKE_GH_STORE;
 const LOG_PATH = process.env.FAKE_GH_LOG;
@@ -439,6 +441,28 @@ function handleLabelCreate(store, rest) {
 // `gh api` — REST-shaped (snake_case), matched by path against the endpoints this fixture supports.
 // -------------------------------------------------------------------------------------------------------
 
+function handleOpenPrPage(store, rest) {
+  const query = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')].find(v => v?.startsWith('query='))?.slice(6);
+  const repoMatch = query?.match(/repository\(owner:("[^"\n]+"),name:("[^"\n]+")\)/);
+  const pageMatch = query?.match(/pullRequests\(states:OPEN,first:(\d+)(?:,after:("(?:[^"\\]|\\.)*"))?,orderBy:/);
+  if (!repoMatch || !pageMatch) return { stderr: 'fake-gh: unsupported graphql query\n', exitCode: 1 };
+  const repo = `${JSON.parse(repoMatch[1])}/${JSON.parse(repoMatch[2])}`;
+  const pageSize = Number(pageMatch[1]);
+  const after = pageMatch[2] ? JSON.parse(pageMatch[2]) : null;
+  if (query !== buildOpenPrPageQuery({ repo, pageSize, after })) return { stderr: 'fake-gh: unsupported graphql query\n', exitCode: 1 };
+  if (after !== null && !/^fake-pr-page:\d+$/.test(after)) return { stderr: 'fake-gh: invalid graphql cursor\n', exitCode: 1 };
+  const offset = after === null ? 0 : Number(after.slice('fake-pr-page:'.length));
+  const repoState = requireRepo(store, repo);
+  const prs = filterPrs(repoState, { state: 'open' }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.number - a.number);
+  const nodes = prs.slice(offset, offset + pageSize).map(pr => {
+    const view = buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields: PAGED_LIGHT_FIELDS });
+    const { labels, statusCheckRollup, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
+    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
+  });
+  return jsonResult({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
+    pageInfo: { hasNextPage: offset + nodes.length < prs.length, endCursor: nodes.length ? `fake-pr-page:${offset + nodes.length}` : null } } } } });
+}
+
 function handleApi(store, rest) {
   return guarded(() => {
     const method = flagValue(rest, '--method') || flagValue(rest, '-X') || 'GET';
@@ -454,6 +478,7 @@ function handleApi(store, rest) {
     if (path && path.includes('{owner}/{repo}')) path = path.replace('{owner}/{repo}', resolveRepoSlug(store, null));
     if (method !== 'GET') return { stderr: `fake-gh: unsupported api --method ${method}\n`, exitCode: 1 };
     if (!path) return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
+    if (path === 'graphql') return handleOpenPrPage(store, rest);
 
     let m;
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)$/))) {
