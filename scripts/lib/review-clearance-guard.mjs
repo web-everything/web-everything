@@ -152,15 +152,18 @@ export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true 
     try { return JSON.parse(runGh(args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'review-clearance-read', repo } })); }
     catch { return null; }
   };
-  const view = read(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName,labels,comments,statusCheckRollup']);
-  const facts = { prHead: view?.headRefOid ?? null, refHead: null, labels: view?.labels ?? null, comments: view?.comments ?? null,
+  // Every list read is complete (`--paginate --slurp`, flattened); a failed read is null, never a partial list.
+  const list = path => { const pages = read(['api', '--paginate', '--slurp', `${path}?per_page=100`]); return Array.isArray(pages) ? pages.flat() : null; };
+  const view = read(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName,labels,statusCheckRollup']);
+  const rest = view ? list(`repos/${repo}/issues/${pr}/comments`) : null;
+  const comments = rest && rest.map(c => ({ body: c.body, createdAt: c.created_at, author: { login: c.user?.login ?? '' }, url: c.html_url }));
+  const facts = { prHead: view?.headRefOid ?? null, refHead: null, labels: view?.labels ?? null, comments,
     rows: view?.statusCheckRollup ?? null, reviews: null, events: null };
   // `full: 'if-restore'` (the sweep) pays for reviews / events / the ref read only when a restore is plausible.
-  if (!view || (full === 'if-restore' && !mayNeedRestore(facts))) return facts;
+  if (!view || (full === 'if-restore' && !(comments && mayNeedRestore(facts)))) return facts;
   const ref = view.headRefName ? read(['api', `repos/${repo}/git/ref/heads/${view.headRefName}`]) : null;
   return { ...facts, refHead: ref?.object?.sha ?? null,
-    reviews: read(['api', `repos/${repo}/pulls/${pr}/reviews`, '--paginate']),
-    events: read(['api', `repos/${repo}/issues/${pr}/events`, '--paginate']) };
+    reviews: list(`repos/${repo}/pulls/${pr}/reviews`), events: list(`repos/${repo}/issues/${pr}/events`) };
 }
 
 export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdict = readMergeGateVerdict,

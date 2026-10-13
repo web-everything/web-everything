@@ -103,19 +103,20 @@ describe('settings', () => {
   });
 });
 
-function fakeGh(labels = ['review:accepted']) {
+const rest = list => list.map(c => ({ body: c.body, created_at: c.createdAt, user: { login: c.author.login }, html_url: c.url }));
+function fakeGh(labels = ['review:accepted'], thread = comments) {
   const calls = [];
   const runGh = args => {
     calls.push(args);
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5193', labels, comments, statusCheckRollup: rows });
-    if (args.at(-1).endsWith('/reviews')) return '[]';
-    if (args.at(-1).endsWith('/events')) return JSON.stringify(events);
-    if (args[1]?.includes('/git/ref/')) return JSON.stringify({ object: { sha: head } });
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5193', labels, statusCheckRollup: rows });
+    const path = args.find(a => a.startsWith('repos/')) ?? '';
+    if (path.includes('/comments')) return JSON.stringify([rest(thread)]);
+    if (path.includes('/reviews')) return '[[]]';
+    if (path.includes('/events')) return JSON.stringify([events.slice(0, 2), events.slice(2)]);
+    if (path.includes('/git/ref/')) return JSON.stringify({ object: { sha: head } });
     return '';
   };
-  // Paginated API commands end in --paginate.
-  const wrapped = args => runGh(args.at(-1) === '--paginate' ? args.slice(0, -1) : args);
-  return { calls, runGh: wrapped };
+  return { calls, runGh };
 }
 describe('I/O shell', () => {
   it('refuses a heal and requests the stale job rerun', async () => {
@@ -157,11 +158,17 @@ describe('sweep (fix daemon tick)', () => {
     expect(out).toEqual([expect.objectContaining({ pr: 5193, restored: true, rerun: true })]);
     expect(calls.filter(a => a[1] === 'edit')).toEqual([['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']]);
   });
-  it('pays only the one view read for a review:pending PR with no no-push re-arm', () => {
-    const calls = [];
-    const runGh = args => { calls.push(args); return JSON.stringify({ headRefOid: head, headRefName: 'lane/x', labels: ['review:pending'], comments: [acceptance], statusCheckRollup: rows }); };
+  it('pays only the view and comment reads for a review:pending PR with no no-push re-arm', () => {
+    const { calls, runGh } = fakeGh(['review:pending'], [acceptance]);
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
     expect(guard.sweep([{ prNumber: 9, labels: ['review:pending'] }])).toEqual([]);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+  it('reads every page of comments, reviews and events', () => {
+    const { calls, runGh } = fakeGh(restoreFacts.labels);
+    const facts = readPrClearanceFacts({ repo, pr: 5193, runGh });
+    expect(facts.events).toHaveLength(events.length);
+    expect(facts.comments.map(c => c.url)).toEqual(comments.map(c => c.url));
+    expect(calls.filter(a => a.includes('--paginate')).every(a => a.includes('--slurp'))).toBe(true);
   });
 });
