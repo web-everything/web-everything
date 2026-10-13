@@ -15,11 +15,16 @@ import {
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, describeExecError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
-  sweepMissingRunRecovery, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
+  sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
 } from '../ci-red-recovery-watch.mjs';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
 import { REVIEW_LABELS } from '../../lib/review-escalation.mjs';
+
+const sweepMissingRunRecovery = (options) => sweepMissingRunRecoveryWithIo({
+  readAttributedRequiredChecks: () => null,
+  ...options,
+});
 
 const failingCheck = (completedAt) => ({ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt });
 const greenCheck = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-09-25T01:00:00Z' };
