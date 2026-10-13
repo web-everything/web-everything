@@ -11,11 +11,26 @@ export const CLOSE_ITEMS_EFFECT = 'close-items.write';
 export const CLOSED_REASONS = ['duplicate', 'fixed-elsewhere', 'obsolete', 'wont-do'];
 export const CATEGORIES = { DUPLICATE: 'duplicate', 'ALREADY-FIXED': 'fixed-elsewhere', OBSOLETE: 'obsolete', 'LOW-VALUE': 'wont-do' };
 export const CLOSE_ITEMS_REFUSALS = Object.freeze(['not-found', 'on-priority', 'in-flight', 'already-terminal',
-  'open-pr', 'live-dependent', 'open-children', 'bad-pointer', 'pack-not-fold', 'transition-refused', 'open-pr-check-unavailable']);
+  'open-pr', 'live-dependent', 'open-children', 'closed-duplicates', 'bad-pointer', 'pack-not-fold', 'transition-refused', 'open-pr-check-unavailable']);
 const fail = (reason, detail) => { throw Object.assign(new Error(detail), { reason }); };
 export const splitIds = (ids) => [...new Set(String(ids ?? '').split(',').map(normNum).filter(Boolean))];
 export function cardIndex(cards) {
   return new Map(cards.flatMap(c => [c.id, c.num, c.bornAs].filter(x => x != null && x !== '').map(x => [normNum(x), c])));
+}
+export function closedBlockersFor(card, index) {
+  return [...new Set((card.blockedBy ?? []).map(ref => index.get(normNum(ref)))
+    .filter(blocker => blocker?.status === 'closed'))];
+}
+export function closedDuplicatesBySurvivor(cards, index) {
+  const duplicates = new Map();
+  for (const c of cards) {
+    if (c.status !== 'closed' || c.closedReason !== 'duplicate') continue;
+    const survivor = index.get(normNum(c.closedInto));
+    if (!survivor) continue;
+    if (!duplicates.has(survivor)) duplicates.set(survivor, []);
+    duplicates.get(survivor).push(c.num ?? c.id);
+  }
+  return duplicates;
 }
 export function closeRequests(input, triage) {
   if (input.triage) {
@@ -42,6 +57,7 @@ export function planCloseItems(read, input = {}) {
   const unavailable = read.openPrs?.unavailable || read.openPrs?.partial?.length;
   if (input.apply && unavailable) fail('open-pr-check-unavailable', 'Cannot apply: open PR check unavailable or incomplete');
   const index = cardIndex(read.cards);
+  const closedDuplicates = closedDuplicatesBySurvivor(read.cards, index);
   const priority = new Map((read.priority ?? []).map((x, i) => [normNum(x), i]));
   const openPrs = new Set((read.openPrs?.nums ?? []).map(normNum));
   const requestedCards = new Set(requests.map(r => index.get(r.id)).filter(Boolean));
@@ -55,6 +71,10 @@ export function planCloseItems(read, input = {}) {
     if (!why && ['active', 'preparing'].includes(c.status)) why = 'in-flight';
     if (!why && isTerminalStatus(c.status)) why = 'already-terminal';
     if (!why && openPrs.has(normNum(c.num))) why = 'open-pr';
+    if (!why && closedDuplicates.has(c)) {
+      refuse(r, 'closed-duplicates', `Cannot close ${r.id}: closed duplicates ${closedDuplicates.get(c).join(', ')} still point to it via closedInto`);
+      continue;
+    }
     if (!why && r.reason === 'duplicate' && (!target || target === c || target.status === 'closed' || requestedCards.has(target))) why = 'bad-pointer';
     if (why) { refuse(r, why, `Cannot close ${r.id}: ${why}`); continue; }
     const into = r.into == null ? undefined : String(target?.num ?? r.into);

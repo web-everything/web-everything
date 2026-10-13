@@ -78,6 +78,7 @@ import { startRun } from './operations/engine.mjs';
 import { createMemoryRunStore, newRunId } from './operations/run-store.mjs';
 import { claimOperation } from './operations/claim.mjs';
 import { createClaimReader, createClaimSinks } from './operations/claim-io.mjs';
+import { cardIndex, closedBlockersFor, closedDuplicatesBySurvivor } from './operations/close-items.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // #3445 — `--backlog-dir=<path>` points this CLI's own file reads (and, via `WE_BACKLOG_DIR`, the
@@ -357,6 +358,16 @@ function transition(v) {
       if (offending.length)
         console.error(`${YEL}warning:${RST} ${DIM}--force: resolving #${idFromName(file)} over ${offending.length} undeclared presentation surface(s): ${offending.join(', ')}${RST}`);
     }
+  }
+  if (v === 'close' || v === 'reopen' || v === 'unresolve') {
+    const cards = files().map(name => ({ ...requireCjs('gray-matter')(readFileSync(join(DIR, name), 'utf8')).data,
+      num: idFromName(name), file: name }));
+    const index = cardIndex(cards), card = cards.find(c => c.file === file);
+    const linked = v === 'close' ? closedDuplicatesBySurvivor(cards, index).get(card) ?? []
+      : closedBlockersFor(card, index).map(c => c.num);
+    if (linked.length) die(v === 'close'
+      ? `Cannot close ${card.num}: closed duplicates ${linked.join(', ')} still point to it via closedInto`
+      : `Cannot reopen ${card.num}: closed blockers ${linked.join(', ')} must be reopened first`);
   }
   const res = applyTransition(before, v, { today: today(), graduatedTo: flag('graduated-to'), codifiedTo: flag('codified-to'), reason: flag('reason'), into: flag('into'), by: flag('by') });
   if (res.error) die(`#${idFromName(file)} — ${res.error}`);

@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { planCloseItems, closeItemsOperation, evidencePointer, CATEGORIES } from '../close-items.mjs';
 import { planReopenItems, reopenItemsOperation } from '../reopen-items.mjs';
 import { createCloseItemsReader, createReopenItemsReader, createCloseItemsSinks } from '../close-items-io.mjs';
@@ -84,6 +86,51 @@ describe('close-items fixture batches', () => {
     expect(planCloseItems(f.reader({}), { ids: '1,2', reason: 'obsolete' }).output.counts.wouldClose).toBe(2);
     const read = f.reader({}); read.cards.find(c => c.num === '2').status = 'active';
     expect(planCloseItems(read, { ids: '1,2', reason: 'obsolete' }).output.counts.wouldClose).toBe(0);
+  });
+  it.each([false, true])('refuses to close a survivor of existing duplicates (apply=%s)', async apply => {
+    const f = fixture({ 1: body('open', 'bornAs: xsurvivor\nblockedBy: ["5"]\n'), 2: body(), 3: body(), 4: body(), 5: body() });
+    const sinks = createCloseItemsSinks(f.options);
+    await run(closeItemsOperation({ readCloseItemsContext: f.reader }), { ids: '2,3', reason: 'duplicate', into: '1', apply: true }, sinks);
+    // Both canonical and pre-numbering references must protect the survivor.
+    writeFileSync(f.path(3), readFileSync(f.path(3), 'utf8').replace('closedInto: "1"', 'closedInto: "xsurvivor"'));
+    const before = [1, 2, 3, 5].map(id => readFileSync(f.path(id), 'utf8'));
+    const queueBefore = readFileSync(f.queueFile, 'utf8');
+    for (const reason of ['duplicate', 'fixed-elsewhere', 'obsolete', 'wont-do']) {
+      const record = await run(closeItemsOperation({ readCloseItemsContext: f.reader }), {
+        ids: 'xsurvivor,5', reason, ...(reason === 'duplicate' ? { into: '4' } : {}),
+        ...(reason === 'fixed-elsewhere' ? { by: '#1234' } : {}), apply,
+      }, sinks);
+      expect(record.verdict.counts[apply ? 'closed' : 'wouldClose']).toBe(0);
+      expect(record.verdict.refused).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'xsurvivor', refusal: 'closed-duplicates', detail: expect.stringMatching(/2.*3/) }),
+        expect.objectContaining({ id: '5', refusal: 'live-dependent' }),
+      ]));
+      expect([1, 2, 3, 5].map(id => readFileSync(f.path(id), 'utf8'))).toEqual(before);
+      expect(readFileSync(f.queueFile, 'utf8')).toBe(queueBefore);
+    }
+  });
+  it.each([false, true])('refuses to reopen a dependent with closed blockers (apply=%s)', async apply => {
+    const f = fixture({ 1: body('closed', 'closedReason: obsolete\ndateClosed: "2026-10-13"\nblockedBy: ["002", "xblocker", "4"]\n'),
+      2: body('closed'), 3: body('closed', 'bornAs: xblocker\n'), 4: body('resolved') });
+    const before = readFileSync(f.path(1), 'utf8');
+    const record = await run(reopenItemsOperation({ readReopenItemsContext: createReopenItemsReader(f.options) }),
+      { ids: '1', reason: 'returned', apply }, createCloseItemsSinks(f.options));
+    expect(record.verdict.counts).toMatchObject({ [apply ? 'reopened' : 'wouldReopen']: 0, refused: 1, byRefusal: { 'closed-blockers': 1 } });
+    expect(record.verdict.refused[0]).toMatchObject({ id: '1', refusal: 'closed-blockers', detail: expect.stringMatching(/2.*3/) });
+    expect(readFileSync(f.path(1), 'utf8')).toBe(before);
+  });
+  it.each(['close', 'reopen', 'unresolve'])('guards links through the backlog CLI %s verb', verb => {
+    const f = fixture({ '001': body(verb === 'close' ? 'open' : verb === 'unresolve' ? 'resolved' : 'closed',
+      'bornAs: xsurvivor\nblockedBy: ["xblocker"]\n'),
+      '002': body('closed', 'closedReason: duplicate\nclosedInto: "xsurvivor"\n'),
+      '003': body('closed', 'bornAs: xblocker\n') });
+    const before = readFileSync(f.path('001'), 'utf8');
+    const cli = fileURLToPath(new URL('../../backlog.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [cli, verb, '1', '--reason=obsolete', '--force',
+      `--backlog-dir=${join(f.root, 'backlog')}`], { encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(verb === 'close' ? /closed duplicates 002/ : /closed blockers 003/);
+    expect(readFileSync(f.path('001'), 'utf8')).toBe(before);
   });
   it('applies through guarded writes, removes number and bornAs, then reopens without queue insertion', async () => {
     const f = fixture({ 1: body('open', 'bornAs: xabc123\n'), 2: body(), 99: body() });

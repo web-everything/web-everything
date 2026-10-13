@@ -1177,10 +1177,12 @@ dateClosed: "2026-10-13"
   all ids) or `--triage=<file.json> --category=DUPLICATE` (pointers read per row). It is a **dry run unless
   `--apply`**, it records the actor, channel and reason, and it **refuses** any id on
   `scripts/settings/build-priority.json`, any `status: active` card, any card named by an open PR, and any
-  card with a live dependent.
+  card with a live dependent or any closed duplicate still pointing to it via `closedInto`.
 - **How to reopen.** `node scripts/operations/run.mjs reopen-items --ids=… --reason='…' [--apply]` flips
   `closed → open`, drops the `closed*` fields, and stamps `reopenedReason` + `dateReopened`. Reopening is
-  ordinary, not a correction (contrast `unresolve`).
+  ordinary, not a correction (contrast `unresolve`). It refuses cards with closed `blockedBy` blockers,
+  naming them so they can be reopened first in a separate operation. These link guards also apply to
+  the `backlog.mjs close|reopen` verbs.
 - **Who may close.** Closing is an operator decision. A duplicate close needs the containment bar of
   *The three outcomes → Fold* (the survivor's delivery wholly satisfies this card); a `wont-do` or
   `obsolete` close needs an operator ruling. No agent closes work it simply did not want to do — the

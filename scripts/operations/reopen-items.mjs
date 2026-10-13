@@ -1,6 +1,6 @@
 /** Reopen retired work without clearing it for the conveyor. Pure declaration. */
 import { applyTransition } from '../backlog/frontmatter.mjs';
-import { batchOperation, cardIndex, splitIds } from './close-items.mjs';
+import { batchOperation, cardIndex, splitIds, closedBlockersFor } from './close-items.mjs';
 export const REOPEN_ITEMS_OP = 'reopen-items';
 export const REOPEN_ITEMS_EFFECT = 'reopen-items.write';
 export function planReopenItems(read, input) {
@@ -10,6 +10,11 @@ export function planReopenItems(read, input) {
   for (const id of ids) {
     const c = index.get(id);
     if (!c || c.status !== 'closed') { refused.push({ id, refusal: c ? 'not-closed' : 'not-found', detail: 'Only a closed card can reopen' }); continue; }
+    const closedBlockers = closedBlockersFor(c, index);
+    if (closedBlockers.length) {
+      refused.push({ id, refusal: 'closed-blockers', detail: `Cannot reopen ${id}: closed blockers ${closedBlockers.map(blocker => blocker.num ?? blocker.id).join(', ')} must be reopened first` });
+      continue;
+    }
     const res = applyTransition(c.content, 'reopen', { today: read.today, reason: input.reason });
     if (res.error) { refused.push({ id, refusal: 'transition-refused', detail: res.error }); continue; }
     reopened.push({ id, file: c.file }); writes.push({ abs: c.abs, rel: c.file, content: res.content });
