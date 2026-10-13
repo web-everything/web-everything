@@ -44,21 +44,43 @@ export function mainAcceptsBranchNumbering({ cwd = process.cwd(), exec = execFil
   } catch { return false; }
 }
 
+/**
+ * Birth hash → number pairs the drain assigned on this branch. A later collision-heal commit that moves a
+ * drain-assigned number (`#5979→#5321`) carries the pair to the new number; a heal never exempts a number
+ * the drain did not assign first (PR #5042: xaxezem→#5979 by the drain, then #5979→#5321 by the heal).
+ * Heal subjects: nnn-collision-heal.mjs / pr-land.mjs (`(#a→#b, #c→#d)`) and rebase-drop-manifest.mjs
+ * (`, renumber #a→#b/#c→#d`). Walked parents-first (`--topo-order --reverse`), never by commit date.
+ */
 export function drainNumberedPairs({ cwd, exec = execFileSync, base = 'origin/main' }) {
   try {
     const authors = trustedDrainAuthors({ cwd, exec });
-    const subjects = exec('git', ['log', '--format=%an%x00%ae%x00%s', `${base}..HEAD`], { cwd, encoding: 'utf8', stdio: 'pipe' });
-    const pairs = new Set();
+    const subjects = exec('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', `${base}..HEAD`], { cwd, encoding: 'utf8', stdio: 'pipe' });
+    let pairs = new Set();
     for (const line of lines(subjects)) {
-      const [name, email, text] = line.split('\0');
+      const [name, email, text = ''] = line.split('\0');
+      // Only a drain commit by an author accepted `main` already trusts can ASSIGN a pair. A heal subject only
+      // moves a pair that assignment already produced, so it can never exempt a number the drain did not hand out.
       const subject = trustedDrainSubject({ author: { name, email }, subject: text }, authors);
-      if (!subject) continue;
-      const match = subject.match(/^drain: JIT-number (.+) at land \(#2288\)$/);
-      if (!match) continue;
-      for (const assignment of match[1].split(', ')) {
-        const pair = assignment.match(/^(x[0-9a-z]{6})→#(\d+)$/);
-        if (pair) pairs.add(`${pair[1]}→${Number(pair[2])}`);
+      const match = subject?.match(/^drain: JIT-number (.+) at land \(#2288\)$/);
+      if (match) {
+        for (const assignment of match[1].split(', ')) {
+          const pair = assignment.match(/^(x[0-9a-z]{6})→#(\d+)$/);
+          if (pair) pairs.add(`${pair[1]}→${Number(pair[2])}`);
+        }
+        continue;
       }
+      const heal = text.match(/^backlog: heal new-item id collision\(s\) (?:pre-check|on land) \((.+)\) \(#(?:2222|2071)\)$/)
+        || text.match(/^drain: rebase .+, renumber (#\d+→#\d+(?:\/#\d+→#\d+)*)$/);
+      if (!heal) continue;
+      const moves = new Map();
+      for (const move of heal[1].split(/, |\//)) {
+        const m = move.match(/^#(\d+)→#(\d+)$/);
+        if (m) moves.set(Number(m[1]), Number(m[2]));
+      }
+      pairs = new Set([...pairs].map((pair) => {
+        const [hash, num] = pair.split('→');
+        return moves.has(Number(num)) ? `${hash}→${moves.get(Number(num))}` : pair;
+      }));
     }
     return pairs;
   } catch { return new Set(); }

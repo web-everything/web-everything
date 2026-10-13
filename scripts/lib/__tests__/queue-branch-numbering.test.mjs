@@ -22,10 +22,51 @@ describe('queue branch numbering', () => {
       'drain: JIT-number invalid→#5988, xabc123→#bad at land (#2288)',
     ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n'));
     expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xabc123→5986', 'xdef456→5987', 'xghi789→42']));
-    expect(exec).toHaveBeenCalledWith('git', ['log', '--format=%an%x00%ae%x00%s', 'origin/main..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(exec).toHaveBeenCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', 'origin/main..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
     drainNumberedPairs({ cwd: '/clone', exec, base: 'custom-base' });
-    expect(exec).toHaveBeenLastCalledWith('git', ['log', '--format=%an%x00%ae%x00%s', 'custom-base..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(exec).toHaveBeenLastCalledWith('git', ['log', '--topo-order', '--reverse', '--format=%an%x00%ae%x00%s', 'custom-base..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
     expect(drainNumberedPairs({ cwd: '/clone', exec: () => { throw new Error('missing ref'); } })).toEqual(new Set());
+  });
+  it('carries a drain pair through later collision-heal renumbers, parents first (PR #5042)', () => {
+    const exec = () => [
+      'drain: JIT-number xaxezem→#5979, xdef456→#5980, xghi789→#5981 at land (#2288)',
+      'backlog: heal new-item id collision(s) pre-check (#5979→#5321, #7000→#7001) (#2222)',
+      'backlog: heal new-item id collision(s) on land (#5321→#6010) (#2071)',
+      'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json, renumber #5980→#6020/#5981→#6021',
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
+    expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaxezem→6010', 'xdef456→6020', 'xghi789→6021']));
+  });
+  it('applies the moves of one heal commit together, so a swap does not chain', () => {
+    const exec = () => [
+      'drain: JIT-number xaaaaaa→#10, xbbbbbb→#11 at land (#2288)',
+      'backlog: heal new-item id collision(s) pre-check (#10→#11, #11→#10) (#2222)',
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
+    expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaaaaaa→11', 'xbbbbbb→10']));
+  });
+  it('never lets a heal subject exempt a number the drain did not assign', () => {
+    const exec = () => [
+      'backlog: heal new-item id collision(s) pre-check (#4000→#4001) (#2222)',
+      'drain: JIT-number xaxezem→#5979 at land (#2288)',
+      'backlog: heal new-item id collision(s) pre-check (#1→#2) (#2222) suffix',
+      'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json',
+      'backlog: heal new-item id collision(s) pre-check (#5979→#5321) (#2222)',
+    ].map(subject => `Trusted\0drain@example.test\0${subject}`).join('\n');
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set(['xaxezem→5321']));
+    const items = [{ id: '5321-healed', num: '5321', bornAs: 'xaxezem' }, { id: '4001-picked', num: '4001' }];
+    const errors = handNumberedNewItems(exemptDrainNumberedItems(items, { drainNumbered: pairs }), []);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('4001-picked');
+  });
+  it('does not let an untrusted author assign a pair, nor a heal of it carry one', () => {
+    const exec = vi.fn((_cmd, args) => args.includes('--grep=^drain: JIT-number ')
+      ? 'Trusted\0drain@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)'
+      : [
+        'Trusted\0drain@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)',
+        'Forger\0forger@example.test\0backlog: heal new-item id collision(s) pre-check (#20→#21) (#2222)',
+      ].join('\n'));
+    expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xaaaaaa→10']));
   });
   it('refuses hash cards in merge groups even when drain numbering is off', () => {
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
