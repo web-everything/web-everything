@@ -15,11 +15,11 @@ Slice (c) of epic xdlnylv: the hash-on-main, duplicate-number and bornAs rules l
 
 ## Design
 
-All changes sit behind the ledger `mode` setting from slice (a); with `mode` below `on` the rules behave
-exactly as today.
+All changes key on `backlog.cardNumbering.mode` (slice (a)). In `rename-before-enqueue` the rules behave
+exactly as today. In `rename-after-land` and `ledger-only` the ledger-aware rules below apply.
 
 - `strandedHashesOnMain` (we:scripts/check-standards-rules.mjs:2963, called from
-  we:scripts/check-standards.mjs:817): with `mode: on`, an `x<6>` file on `origin/main` is legal when the ledger
+  we:scripts/check-standards.mjs:817): outside `rename-before-enqueue`, an `x<6>` file on `origin/main` is legal when the ledger
   has its row. Without a row it is a warning inside the land window (the existing #2956 commit-time window) and
   an error after it.
 - `duplicateBacklogNums` (we:scripts/check-standards-rules.mjs:2842, called at
@@ -53,18 +53,18 @@ One line per class: either the handling, or `n/a: <why>`.
 
 Rule-level unit tests in the existing check-standards rules suite: ledgered x-card on main passes; unledgered
 x-card errors after the window and warns inside it; ledger number colliding with a numeric file errors; a
-ledger conflict errors; `mode: shadow` keeps today's behaviour byte-for-byte.
+ledger conflict errors; `rename-before-enqueue` keeps today's behaviour byte-for-byte.
 
 ## Proof plan
 
 Live: in a lane, add a fixture x-named card plus a fixture ledger row and run `node
-we:scripts/operations/run.mjs verify --checkout=<lane>` with `WE_CARD_NUMBER_LEDGER=on`. Before this slice: the
+we:scripts/operations/run.mjs verify --checkout=<lane>` with `WE_CARD_NUMBERING_MODE=ledger-only`. Before this slice: the
 hash-on-main rule errors. After: clean. Remove the row: the rule errors again. Paste all three outputs.
 
 ## Done when
 
-- With `mode: on`, a ledger-numbered x-card on main passes the gate and an unledgered one fails it.
-- With `mode: shadow`, the gate output on current main is unchanged.
+- Outside `rename-before-enqueue`, a ledger-numbered x-card on main passes the gate and an unledgered one fails it.
+- In `rename-before-enqueue`, the gate output on current main is unchanged.
 
 ## Acceptance
 
@@ -73,5 +73,4 @@ hash-on-main rule errors. After: clean. Remove the row: the rule errors again. P
 
 ## Non-goals
 
-- [N1] The #5057 merge_group refusal is not touched here; that is slice (d), behind the operator's
-  confirmation.
+- [N1] The #5057 merge_group refusal is not touched here; that is slice (d).

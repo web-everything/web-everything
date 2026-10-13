@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
-scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-number-ledger.json", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
@@ -24,8 +24,11 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
     loop of `appendLedgerRows` (we:scripts/lib/verdict-ledger-io.mjs:163); a non-fast-forward push re-reads and
     recomputes.
   - Row: `{"id","num","pr","at","by":"drain","kind":"assign"|"seed"|"shadow"}`.
-- Setting `we:scripts/settings/card-number-ledger.json`: `{ "mode": "off" | "shadow" | "on" }`, default
-  `shadow` for this slice. Env override `WE_CARD_NUMBER_LEDGER`.
+- Policy `backlog.cardNumbering.mode` (epic xdlnylv, "Card naming policy"), resolved through `cascadePolicy`
+  (we:scripts/lib/policy-cascade.mjs) with its source logged. Declared values: `rename-before-enqueue`,
+  `rename-after-land` (standard default), `ledger-only`. This slice adds a repo override in
+  we:scripts/settings/card-numbering.json pinning `rename-before-enqueue`, so behaviour does not change until
+  slice (d). Env override `WE_CARD_NUMBERING_MODE`.
 - Shadow hook: in `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch-numbering.mjs:238-300), after
   `numberPendingHashes` returns `n.assigned` (hash to NNN pairs, line 271), write one `kind:"shadow"` row per
   pair with the SAME number the rename chose. The rename path stays the source of truth. A ledger write failure
@@ -35,7 +38,8 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
 
 ## MVP
 
-The store module, the setting, the shadow write in the enqueue path, and the seed script. No reader changes.
+The store module, the policy key (with the repo override), the shadow write in the enqueue path, and the seed
+script. No reader changes.
 
 ## Edge cases this change must handle
 
@@ -79,4 +83,5 @@ NNN the rename gave the file. Paste both outputs.
 ## Non-goals
 
 - [N1] No reader, renderer or gate reads the ledger yet; that is slices (b) and (c).
+- [N3] No mode other than `rename-before-enqueue` is active yet.
 - [N2] The rename commit is not removed here; that is slice (d).
