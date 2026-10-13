@@ -152,20 +152,31 @@ describe('followupSteps', () => {
     });
     const log = { write: vi.fn() };
     const minNext = vi.fn(() => 102);
-    const number = vi.fn(deps.numberPendingHashes);
-    const out = followupSteps({ ...deps, exec, log, minNext, numberPendingHashes: number })[0].run({ input: { ...input, numberingOnBranch: true } });
+    const number = vi.fn(hasHash ? deps.numberPendingHashes : () => {
+      calls.number += 1;
+      return { assigned: [], committed: false };
+    });
+    const plan = vi.fn(deps.planResolveOnLand);
+    const queuedInput = hasHash ? input : buildFollowupInput({
+      landedLocal: true, landedItems: ['123'],
+      carriers: [{ item: '123', isWe: true, headRef: 'lane/a', manifestRefs: ['lane/a'] }],
+    });
+    const out = followupSteps({ ...deps, exec, log, minNext, numberPendingHashes: number, planResolveOnLand: plan })[0].run({ input: { ...queuedInput, numberingOnBranch: true } });
     expect(exec).toHaveBeenCalledWith('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], expect.any(Object));
     expect(exec.mock.calls.findIndex(([, args]) => args[0] === 'fetch')).toBeLessThan(exec.mock.calls.findIndex(([, args]) => args[0] === 'ls-tree'));
-    expect(calls.number).toBe(hasHash ? 1 : 0);
-    expect(minNext).toHaveBeenCalledTimes(hasHash ? 1 : 0);
-    if (hasHash) expect(number).toHaveBeenCalledWith(worktree, { minNext: 102 });
-    expect(calls.push).toEqual(hasHash ? [true] : []);
+    expect(calls.number).toBe(1);
+    expect(minNext).toHaveBeenCalledWith({ cwd: worktree, exec });
+    expect(number).toHaveBeenCalledWith(worktree, { minNext: 102 });
+    expect(plan).toHaveBeenCalledWith({ landedItems: queuedInput.landedItems, assigned: hasHash ? [{ hash: 'xabc123', nnn: 7 }] : [], carriers: queuedInput.carriers, openHeadRefs: queuedInput.openHeadRefs });
+    expect(calls.resolve).toEqual([{ id: hasHash ? 7 : '123', sync: false, publish: false }]);
+    expect(out.resolveOnLand.resolved).toEqual([hasHash ? '7' : '123']);
+    expect(out.numbering.pushed).toBe(true);
+    expect(out).not.toHaveProperty('skipped');
+    expect(calls.push).toEqual([true]);
     if (hasHash) {
       expect(out.numbering.pushed).toBe(true);
       expect(log.write).toHaveBeenCalledWith('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     } else {
-      expect(out.skipped).toEqual(expect.any(String));
-      expect(calls.resolve).toEqual([]);
       expect(log.write).not.toHaveBeenCalled();
     }
   });

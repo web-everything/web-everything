@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
-import { applyTransition, readField } from '../backlog/frontmatter.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { queueStatePath } from './drain-merge-strategy.mjs';
 
@@ -127,20 +126,6 @@ export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs =
   return reservationPlan(files, readReservations(fs, statePath), () => undefined).minNext;
 }
 
-function resolveBranchItem(worktree, id, { git, fs, now }) {
-  try {
-    const path = lines(git(['ls-files', `backlog/${id}-*.md`], worktree))[0];
-    if (!path) return { flipped: false, alreadyResolved: false, reason: 'card not found' };
-    const content = fs.readFileSync(join(worktree, path), 'utf8');
-    if (readField(content, 'status') === 'resolved') return { flipped: false, alreadyResolved: true };
-    const next = applyTransition(content, 'resolve', { today: now().slice(0, 10) });
-    if (next.error) return { flipped: false, alreadyResolved: false, reason: next.error };
-    fs.writeFileSync(join(worktree, path), next.content);
-    git(['commit', '-m', `drain: mark card ${id} resolved on land (#2748)`, '--', path], worktree);
-    return { flipped: true, alreadyResolved: false };
-  } catch (e) { return { flipped: false, alreadyResolved: false, reason: String(e.message || e) }; }
-}
-
 /** Recover stranded main hashes even when this pass enqueued or merged nothing. */
 export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs = nodeFs,
   statePath = numberingStatePath(), lock = withNumberingLock, number = numberPendingHashes, log = process.stderr } = {}) {
@@ -183,11 +168,10 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
 export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(), isLocal = true,
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
-  resolveItem, now = () => new Date().toISOString() } = {}) {
+  now = () => new Date().toISOString() } = {}) {
   return withHooksDisabled(() => {
     let temporary, pushedHead;
     const git = safeGit(exec, cwd);
-    resolveItem ??= (worktree, id) => resolveBranchItem(worktree, id, { git, fs, now });
     const pinned = () => {
       if (git(['ls-remote', '--heads', 'origin', `refs/heads/${c.headRef}`]).split(/\s/)[0] !== traceHeadSha) throw new Error('remote branch head moved from judged head');
     };
@@ -201,12 +185,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
       const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
       const files = tracked();
-      const own = c.hasManifest && isLocal && c.item != null ? files.find((p) =>
-        cardId(p) === String(c.item).padStart(isNum(c.item) ? 3 : 0, '0') ||
-        (isHash(c.item) && new RegExp(`^bornAs:\\s*${c.item}\\s*$`, 'm').test(fs.readFileSync(join(worktree, p), 'utf8')))) : null;
-      if (c.hasManifest && isLocal && c.item != null && !own) throw new Error(`candidate card ${c.item} not found on branch`);
-      const needsResolve = own && !/^status:\s*['"]?resolved['"]?\s*$/m.test(fs.readFileSync(join(worktree, own), 'utf8').split('---')[1] || '');
-      if (!hashBacklogFiles(files).length && !needsResolve) return { action: 'final' };
+      if (!hashBacklogFiles(files).length) return { action: 'final' };
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
@@ -218,13 +197,6 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const n = number(worktree, { minNext: plan.minNext });
         if (n.error || hashBacklogFiles(tracked()).length) throw new Error(n.error || 'hash card(s) still pending after numbering');
         if ((n.assigned?.length || n.droppedDuplicates?.length) && !n.committed) throw new Error('numbering commit failed');
-        const resolved = [];
-        if (needsResolve) {
-          const id = n.assigned?.find((a) => a.hash === cardId(own))?.nnn || cardId(own);
-          const r = resolveItem(worktree, id, { sync: false, publish: false });
-          if (!r.flipped && !r.alreadyResolved) throw new Error(`card ${id} resolve refused: ${r.reason || 'not resolved'}`);
-          if (r.flipped) resolved.push(id);
-        }
         const newHead = git(['rev-parse', 'HEAD'], worktree);
         // Persist BEFORE publication: a crash or an ambiguous push failure must never release allocated numbers.
         const nnns = (n.assigned || []).map((a) => Number(a.nnn));
@@ -236,7 +208,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         pinned();
         git(['push', '--no-verify', 'origin', `HEAD:refs/heads/${c.headRef}`], worktree);
         pushedHead = newHead;
-        return { action: 'numbered', newHead, assigned: n.assigned || [], resolved };
+        return { action: 'numbered', newHead, assigned: n.assigned || [] };
       }, { runUnlockedOnContention: false });
       if (outcome.ran === false) throw new Error('numbering mutex refused — retry next pass');
       return outcome.result;

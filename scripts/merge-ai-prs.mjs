@@ -6086,7 +6086,7 @@ async function runCli() {
     if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
     return false;
   };
-  // Queue-mode branch numbering (mq-number-before-enqueue): number + resolve cards on the PR branch before enqueue.
+  // Queue-mode branch numbering (mq-number-before-enqueue): number cards on the PR branch before enqueue.
   const numberCardsBeforeEnqueue = logQueueNumbering();
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
   if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
@@ -6606,12 +6606,12 @@ async function runCli() {
   if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
   const queuedHashOnMain = !!numbered.files?.length;
   if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
-  if (landedLocal && !DRY_RUN && (!numberingOnBranch || queuedHashOnMain)) {
+  if (landedLocal && !DRY_RUN) {
     if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
     // the TTL-bounded numbering mutex so a concurrent drain/land never mints the same NNN off the same base.
     const numLock = withNumberingLock(() => {
-      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), queuedHashOnMain ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
+      const n = __t.time('jitNumbering', () => numberPendingHashes(process.cwd(), (numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext({ cwd: process.cwd() }) } : {}));
       const __resolveOnLandT0 = __t.mark(); // x2e120n — everything from here through the resolve loop below
       // #2899 A5 — RESOLVE-ON-LAND for the LABEL lander. This drain single-sourced lane-drain's NUMBERING but
       // never its RESOLVING, so it assigned the NNN and left `status:` untouched — delivered work kept ranking

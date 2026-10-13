@@ -162,8 +162,7 @@ export function followupSteps(deps) {
         heartbeat();
         if (input.numberingOnBranch) {
           const files = String(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
-          if (!files.split(/\r?\n/).some((file) => /^backlog\/x[0-9a-z]{6}-[^/]*\.md$/.test(file))) return { skipped: 'numbering and resolve happen on the PR branch before enqueue' };
-          log.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
+          if (files.split(/\r?\n/).some((file) => /^backlog\/x[0-9a-z]{6}-[^/]*\.md$/.test(file))) log.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
         }
         const n = numberPendingHashes(cwd, input.numberingOnBranch ? { minNext: minNext({ cwd, exec }) } : {});
         heartbeat();
