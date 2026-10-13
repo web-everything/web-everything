@@ -421,9 +421,9 @@ describe('#4355 build-queue --json cache is invalidated by every input the clear
 
 
 describe('build.priority operator list', () => {
-  it('accepts all 38 shipped repo priority ids through the real settings reader', () => {
+  it('accepts all 48 shipped repo priority ids through the real settings reader', () => {
     const shipped = JSON.parse(readFileSync(join(SETTINGS_DIR, 'build-priority.json'), 'utf8')).build.priority;
-    expect(shipped).toHaveLength(38);
+    expect(shipped).toHaveLength(48);
     expect(resolveBuildPriority({ tool: { priority: shipped } }))
       .toEqual({ ids: shipped, source: 'tool' });
     // Explicit env isolates this pin from operator overrides and local platform preferences.
