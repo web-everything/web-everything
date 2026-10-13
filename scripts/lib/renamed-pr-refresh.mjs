@@ -5,6 +5,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 import { readSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -132,9 +133,9 @@ export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache
 
 /** Mutates the supplied PR facts, like the reconcile enrichers; no IO for sibling repos or green checks. */
 export function enrichPrsWithOwedMainRule(prs, { repo, read = readOwedMainRule } = {}) {
-  if (repo !== 'we' && repo !== 'web-everything/web-everything') return prs;
+  if (repoKeyForSlug(repo) !== 'we') return prs;
   for (const pr of prs) if (redTest(pr)) {
-    try { pr.owedMainRule = { ...read(pr, { slug: 'web-everything/web-everything' }), head: pr.headRefOid }; }
+    try { pr.owedMainRule = { ...read(pr, { slug: CONSTELLATION_REPOS.we.slug }), head: pr.headRefOid }; }
     catch (e) { pr.owedMainRule = { head: pr.headRefOid, owed: false, nums: [], reason: `unreadable: ${e.message}` }; }
   }
   return prs;
