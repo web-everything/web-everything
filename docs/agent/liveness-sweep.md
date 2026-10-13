@@ -71,4 +71,4 @@ Default logs/state derive from `homedir()`; tails are bounded to 256/512 KiB.
 Follow-ups: wire `--apply` into the health-watch tick (health-watch.mjs is held by an
 open PR today); route notify-operator rows into the operator queue and the PR #5169
 operator ops (`refresh`, `grant-rounds`). Until those land, requires rungs stay off.
-Tracked in card `xozb05m`.
+Tracked in card `6079`.

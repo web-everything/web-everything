@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xpvgt8e-holdgivesway-verdict-test.md:16` — Add a check:standards rule that a backlog card whose scope names symbols or tests absent from main must carry a `blockedBy`/`dependsOn` field. Require that every non-n/a edge-case line maps to an acceptance item.
+1. `we:backlog/6050-holdgivesway-verdict-test.md:16` — Add a check:standards rule that a backlog card whose scope names symbols or tests absent from main must carry a `blockedBy`/`dependsOn` field. Require that every non-n/a edge-case line maps to an acceptance item.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5189@8d50d236b8b31d25b29c6492b25c92c40a94bc53
 
