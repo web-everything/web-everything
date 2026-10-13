@@ -63,6 +63,7 @@ import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
+import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
@@ -1202,6 +1203,12 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // never reads the host's real file, same rule as `appToken` below.
   probes.drainHistory = flags['lock-root'] && !flags['drain-history'] ? null
     : attempt('drainHistory', () => probeDrainHistory({ ...(flags['drain-history'] ? { path: flags['drain-history'] } : {}), nowMs: now }));
+  // Nightly ledger readiness (verdictLedger.promotion.dailyCheck): runs once per ET day at quiet-hours start or when
+  // quiet mode turns on, appends one line to <health dir>/ledger-readiness-history.jsonl, feeds the
+  // `ledger-readiness-regressed` smell. Read-only toward PRs. A fixture tick never reads the host's shadow records.
+  probes.ledgerReadiness = (flags['lock-root'] || flags['state-root'] || flags['logs-dir']) && !flags['ledger-readiness-history'] ? undefined
+    : attempt('ledgerReadiness', () => runDailyReadinessCheck({ now, dryRun: !!flags['dry-run'],
+      historyPath: flags['ledger-readiness-history'] || ledgerReadinessHistoryPath(dir) }));
   // Build/prepare supervision — external (Codex) runs live only in the build daemon's dispatch run records; fs-only,
   // bounded, every tick. A fixture tick (`--lock-root`) never reads the host's real records.
   if (!flags['lock-root']) {
