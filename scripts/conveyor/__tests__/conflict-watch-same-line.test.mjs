@@ -34,11 +34,23 @@ describe('same-line conflict setting', () => {
     expect(resolveSameLineConflictSetting({ platform: setting('stand-down'), repo: setting('fixer') })).toMatchObject({ value: 'fixer', source: 'repo' });
     expect(resolveSameLineConflictSetting({ repo: setting('fixer'), env: { WE_CONFLICT_WATCH_SAME_LINE: 'stand-down' } })).toMatchObject({ value: 'stand-down', source: 'env' });
   });
-  it.each(['platform', 'repo', 'env'])('ignores and reports invalid %s values', source => {
-    const args = { platform: setting('stand-down'), [source]: source === 'env' ? { WE_CONFLICT_WATCH_SAME_LINE: 'invalid' } : setting('invalid') };
+  it.each(['platform', 'repo', 'env'])('fails closed and reports invalid %s values', source => {
+    const args = { [source]: source === 'env' ? { WE_CONFLICT_WATCH_SAME_LINE: 'invalid' } : setting('invalid') };
     const result = resolveSameLineConflictSetting(args);
-    expect(result.value).toBe(source === 'platform' ? 'fixer' : 'stand-down');
+    expect(result.value).toBe('stand-down');
     expect(result.ignored).toEqual([expect.objectContaining({ source })]);
+  });
+  it.each(['platform', 'repo', 'env'])('fails closed on unreadable %s layers', source => {
+    expect(resolveSameLineConflictSetting({ readErrors: [{ source, reason: 'unreadable' }] }))
+      .toMatchObject({ value: 'stand-down', source });
+  });
+  it.each(['stand-down ', '', null, true, {}, 'FIXER'])('fails closed on malformed explicit values (%j)', value => {
+    expect(resolveSameLineConflictSetting({ env: { WE_CONFLICT_WATCH_SAME_LINE: value } }))
+      .toMatchObject({ value: 'stand-down', source: 'env' });
+  });
+  it('allows a later valid explicit override after a failed layer', () => {
+    expect(resolveSameLineConflictSetting({ platform: setting('invalid'), repo: setting('fixer') }))
+      .toMatchObject({ value: 'fixer', source: 'repo' });
   });
   it('uses injectable readers and logs the effective setting once', () => {
     const log = vi.fn();
@@ -47,15 +59,43 @@ describe('same-line conflict setting', () => {
     loadSameLineConflictSetting(options);
     expect(log.mock.calls).toEqual([['parked-pr-conflict-watch · conflictWatch.sameLineConflict=fixer (source: repo)']]);
   });
-  it('ignores malformed blocks and unreadable layers with diagnostics', () => {
+  it('fails closed on malformed blocks and unreadable layers with diagnostics', () => {
     expect(resolveSameLineConflictSetting({ platform: { conflictWatch: null }, repo: setting('stand-down') })).toMatchObject({ value: 'stand-down', ignored: [expect.objectContaining({ source: 'platform' })] });
     const result = loadSameLineConflictSetting({ env: {}, readFile: () => { throw new Error('bad JSON'); }, readDeclared: () => { throw new Error('bad repo'); }, log: vi.fn() });
-    expect(result).toMatchObject({ value: 'fixer', source: 'standard' });
+    expect(result).toMatchObject({ value: 'stand-down', source: 'repo' });
     expect(result.ignored.map(x => x.source)).toEqual(['platform', 'repo']);
+  });
+  it('routes an invalid explicit policy through the human stand-down path', () => {
+    const resolved = loadSameLineConflictSetting({ env: { WE_CONFLICT_WATCH_SAME_LINE: 'stand-down ' },
+      readFile: () => '{}', readDeclared: () => ({ settings: setting('fixer'), errors: [], duplicates: [] }), log: vi.fn() });
+    const h = harness({ mode: resolved.value });
+    expect(h.sweep()[0].routedTo).toBe('stand-down');
+    expect(h.postStandDown).toHaveBeenCalledOnce();
+    expect(h.postFinding).not.toHaveBeenCalled();
   });
 });
 
 describe('same-line routing — live #5017 (2026-10-13)', () => {
+  const matrix = ['none', 'live', 'superseded'].flatMap(markerState =>
+    ['recheck', 'graceDue', 'idleConflictBounce', 'sameLineRecovery'].map(route => ({ markerState, route })));
+  it.each(matrix)('routes marker=$markerState, state=$route', ({ markerState, route }) => {
+    const thread = markerState === 'none' ? [] : markerState === 'live' ? [watcher()] : [watcher(), supersede()];
+    const prLabels = {
+      recheck: labels('review:human', CONFLICT_LABEL),
+      graceDue: labels('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
+      idleConflictBounce: labels('review:pending', CONFLICT_LABEL),
+      sameLineRecovery: labels('review:changes', CONFLICT_LABEL),
+    }[route];
+    const h = harness({ thread, prLabels, conflictReassertSettings: { reviewHuman: true } });
+    h.sweep();
+    // Human recheck deliberately retains its historical supersede guard; an active changes bounce
+    // already has a fixer owner and needs recovery only while its watcher marker is live.
+    const routed = markerState === 'live' || (route !== 'sameLineRecovery'
+      && !(route === 'recheck' && markerState === 'superseded'));
+    expect(h.postFinding).toHaveBeenCalledTimes(routed ? 1 : 0);
+    expect(h.postSupersedeComment).toHaveBeenCalledTimes(markerState === 'live' ? 1 : 0);
+    expect(h.postStandDown).not.toHaveBeenCalled();
+  });
   it('fresh statute conflict goes to a fixer with accurate alert wording', () => {
     const h = harness();
     expect(h.sweep()[0].routedTo).toBe('reconcile-finding (same-line conflict → fixer)');
@@ -83,6 +123,22 @@ describe('same-line routing — live #5017 (2026-10-13)', () => {
     h.sweep();
     expect(h.order).toEqual([]);
     expect(h.options.listPrComments).not.toHaveBeenCalled();
+  });
+  it('superseded watcher recovery still permits later idle reassertion', () => {
+    const h = harness({ thread: [watcher()], prLabels: labels('review:changes', CONFLICT_LABEL) });
+    h.sweep();
+    h.options.listPrs = () => [{ number: 5017, headRefName: 'lane/builder-priority',
+      mergeable: 'CONFLICTING', labels: labels('review:pending', CONFLICT_LABEL) }];
+    expect(h.sweep()[0].routedTo).toContain('idle conflict-bounce re-asserted');
+    expect(h.postFinding).toHaveBeenCalledTimes(2);
+    expect(h.postSupersedeComment).toHaveBeenCalledOnce();
+  });
+  it('superseded watcher marker still permits grace-due routing', () => {
+    const h = harness({ thread: [watcher(), supersede()],
+      prLabels: labels('review:accepted', 'ready-to-merge', CONFLICT_LABEL) });
+    expect(h.sweep()[0].routedTo).toBe('reconcile-finding (same-line conflict → fixer)');
+    expect(h.postFinding).toHaveBeenCalledOnce();
+    expect(h.postSupersedeComment).not.toHaveBeenCalled();
   });
   it('the common unchanged tick reads no comments', () => {
     const h = harness({ listPrs: () => [{ number: 5017, mergeable: 'MERGEABLE', labels: labels('review:pending') }] });

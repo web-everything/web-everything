@@ -1582,8 +1582,8 @@ export function watchParkedPrConflicts({
       try {
         recoveryComments = listPrComments({ number: pr?.number, repo });
         if (!Array.isArray(recoveryComments)) continue;
-        if (findWatcherStandDownComment(recoveryComments)) {
-          if (isWatcherMarkerAlreadySuperseded(recoveryComments)) continue;
+        // A historical supersede finishes recovery only; idle retries and expired grace still own routing.
+        if (findWatcherStandDownComment(recoveryComments) && !isWatcherMarkerAlreadySuperseded(recoveryComments)) {
           if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
           if (!dryRun) {
             postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });

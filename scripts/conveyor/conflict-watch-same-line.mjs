@@ -4,21 +4,26 @@ import { readDeclaredSettings } from '../lib/settings-files.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-/** Invalid layers are reported and skipped; later valid layers still win. */
+/** Invalid layers fail closed to stand-down; later valid layers still win. */
 export function resolveSameLineConflictSetting({ platform = {}, repo = {}, env = {}, readErrors = [] } = {}) {
   let result = { value: 'fixer', source: 'standard' };
   const ignored = [...readErrors];
   for (const [source, doc] of [['platform', platform], ['repo', repo], ['env', env]]) {
-    if (readErrors.some(error => error.source === source)) continue;
+    if (readErrors.some(error => error.source === source)) {
+      result = { value: 'stand-down', source };
+      continue;
+    }
     const block = doc?.conflictWatch;
     if (source !== 'env' && (!object(doc) || (block !== undefined && !object(block)))) {
       ignored.push({ source, reason: 'invalid conflictWatch settings block' });
+      result = { value: 'stand-down', source };
       continue;
     }
     const value = source === 'env' ? doc?.WE_CONFLICT_WATCH_SAME_LINE : block?.sameLineConflict;
     if (value === undefined) continue;
     if (!['fixer', 'stand-down'].includes(value)) {
       ignored.push({ source, reason: 'invalid conflictWatch.sameLineConflict: expected fixer|stand-down' });
+      result = { value: 'stand-down', source };
       continue;
     }
     result = { value, source };
@@ -44,6 +49,6 @@ export function loadSameLineConflictSetting({ env = process.env, readFile = read
     logged = true;
     log(`parked-pr-conflict-watch · conflictWatch.sameLineConflict=${result.value} (source: ${result.source})`);
   }
-  for (const { source, reason } of result.ignored) log(`parked-pr-conflict-watch · ignored ${source}: ${reason}`);
+  for (const { source, reason } of result.ignored) log(`parked-pr-conflict-watch · fail-closed ${source}: ${reason}`);
   return result;
 }
