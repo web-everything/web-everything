@@ -1,4 +1,5 @@
 ---
+bornAs: x1q1f74
 kind: story
 size: 2
 status: open

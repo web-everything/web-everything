@@ -1,21 +1,22 @@
 ---
+bornAs: xs07oob
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/github-app-identity.test.mjs", "we:scripts/lint-host-paths.mjs", "we:scripts/__tests__/lint-host-paths.test.mjs"]
+scope: ["we:scripts/lib/pr-list-paged.mjs", "we:scripts/lib/__tests__/pr-list-paged.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add an auth-env test with a named key and a missing file, asserting the loud fallback record. A r… (from web-everything/web-everything#5193 review)
+# Prevention — Run the shared transient-retry wrapper around every gh call in this module, and add a test that i… (from web-everything/web-everything#5203 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/__tests__/github-app-identity.test.mjs:139` — Add an auth-env test with a named key and a missing file, asserting the loud fallback record. A review lens that asks 'is each prose guarantee defended through the production caller, not just the CLI?' would also catch this class.
-2. `we:scripts/lint-host-paths.mjs:43` — Add a deterministic CI comparison against the base revision that rejects new baseline entries and increased counts, with a regression test where both the document count and its baseline allowance increase together.
+1. `we:scripts/lib/pr-list-paged.mjs:152` — Run the shared transient-retry wrapper around every gh call in this module, and add a test that injects one transient failure per call kind. A lint or standards rule could require that exec calls in `we:scripts/lib/pr-list-paged.mjs` go through a retry helper.
+2. `we:scripts/lib/__tests__/pr-list-paged.test.mjs:62` — Extend the named test with a structurally valid page containing a nonempty errors array and assert rejection; this deterministic regression test should fail when the errors guard is removed.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5193@9c72024172156f0f8b1b1c0c3f94b44d1031bdd3
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5203@ee3f3b3bf56019faed946942ef3218f110e5214b
 
 ## Acceptance
 

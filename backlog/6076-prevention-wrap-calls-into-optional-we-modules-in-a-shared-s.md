@@ -1,21 +1,22 @@
 ---
+bornAs: xwb5txn
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5823-prevention-store-a-hash-of-the-request-and-compare-hashes-al.md"]
+scope: ["we:tools/drain-daemon/daemon.mjs", "we:tools/drain-daemon/__tests__/daemon.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a card lint that requires each 'must/never' clause in a Design item to map to a named test bu… (from web-everything/web-everything#5227 review)
+# Prevention — Wrap calls into optional WE modules in a shared safe-call helper, or add a test that stubs a throwing tic… (from plateauapp/plateau-app#224 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5823-prevention-store-a-hash-of-the-request-and-compare-hashes-al.md:22` — Add a card lint that requires each 'must/never' clause in a Design item to map to a named test bullet in the Test plan. Failing that, add a review-lens checklist item that does the same.
-2. `we:backlog/5823-prevention-store-a-hash-of-the-request-and-compare-hashes-al.md:21` — Add the two planned deterministic regressions and verify during implementation that replacing serialization-failure rejection with a matching sentinel makes them fail.
+1. `we:tools/drain-daemon/daemon.mjs:274` — Wrap calls into optional WE modules in a shared safe-call helper, or add a test that stubs a throwing tick() and asserts feedLoop survives. A lint rule against un-awaited async calls outside try blocks would also catch it.
+2. `we:tools/drain-daemon/daemon.mjs:632` — Check pause in the heartbeat tick (kill children when PAUSE_PATH appears), and add a unit test that runs the heartbeat with a pause file present and a live fast-drain handle. More generally, add a lens or test checklist item that every long-lived merge-capable child is covered by each revocation signal (lease, pause, exit-3).
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5227@3b2a0fbb634f0366865e777db35ff3d368c6e3da
+Idempotency key (do not edit): approval-prevention-key:plateauapp/plateau-app#224@631e809bcd0c33954f12384edc9ffbbbc6cd9869
 
 ## Acceptance
 
