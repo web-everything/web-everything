@@ -229,6 +229,9 @@ const a = process.argv.slice(2);
 const s = JSON.parse(fs.readFileSync('state.json', 'utf8'));
 fs.appendFileSync('calls.jsonl', JSON.stringify(a) + '\\n');
 if (a[0] === 'pr' && a[1] === 'view') {
+ if (a[a.indexOf('--json') + 1]?.includes('statusCheckRollup')) {
+  console.log(JSON.stringify(s)); process.exit(0);
+ }
  s.reads = (s.reads || 0) + 1;
  if (s.reads === 3 && ${JSON.stringify(scenario)} === 'head-race') s.headRefOid = 'f'.repeat(40);
  if (s.reads === 3 && ${JSON.stringify(scenario)} === 'verdict-race') s.labels = [{name:'review:changes'}];
@@ -237,6 +240,17 @@ if (a[0] === 'pr' && a[1] === 'view') {
 else if (a[0] === 'api' && a.includes('GET') && a.some(x => /\\/pulls\\/\\d+\\/reviews$/.test(x))) {
  for (const r of (s.reviews || [])) console.log(JSON.stringify(r)); // PR #4631 round 11: a clearance carry reads the formal reviews
 }
+else if (a[0] === 'api' && a.includes('repos/web-everything/web-everything/issues/42/comments?per_page=100')) {
+ console.log(JSON.stringify([s.comments.map(c => ({body:c.body, user:c.author}))]));
+}
+else if (a[0] === 'api' && a.includes('repos/web-everything/web-everything/git/ref/heads/lane')) {
+ const sha = require('node:child_process').execFileSync('git', ['rev-parse', 'refs/heads/lane'], {encoding:'utf8'}).trim();
+ console.log(JSON.stringify({object:{sha}}));
+}
+else if (a[0] === 'api' && [
+ 'repos/web-everything/web-everything/issues/42/events?per_page=100',
+ 'repos/web-everything/web-everything/pulls/42/reviews?per_page=100',
+].some(path => a.includes(path))) { console.log(JSON.stringify([[]])); }
 else if (a[0] === 'pr' && a[1] === 'comment') {
  const body = a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : a[a.indexOf('--body') + 1];
  s.comments.push({author:{login:'web-everything'}, body});
@@ -274,7 +288,13 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       expect(calls.filter(c => c[1] === 'edit')).toHaveLength(rearmed ? 1 : 0);
       // The formal-reviews GET (a carried operator clearance, PR #4631 round 11) names the repo inside its endpoint path.
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
-        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
+        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews'))
+        || (c[0] === 'api' && [
+          'repos/web-everything/web-everything/issues/42/comments?per_page=100',
+          'repos/web-everything/web-everything/issues/42/events?per_page=100',
+          'repos/web-everything/web-everything/pulls/42/reviews?per_page=100',
+          'repos/web-everything/web-everything/git/ref/heads/lane',
+        ].some(path => c.includes(path))))).toBe(true);
       if (carried) expect(calls.filter(c => c[0] === 'api').length).toBeGreaterThanOrEqual(1);
       if (scenario === 'unchanged') console.info('CI-heal proven replay', JSON.stringify(proof));
       if (scenario === 'soak') {
@@ -393,6 +413,10 @@ const s = JSON.parse(fs.readFileSync('state.json', 'utf8'));
 fs.appendFileSync('calls.jsonl', JSON.stringify(a) + '\\n');
 if (a[0] === 'pr' && a[1] === 'view') {
  if (scenario.readFails || (scenario.childReadFails && s.reads >= 1) || (scenario.refetchFails && s.written)) process.exit(1);
+ // Clearance observations are separate from the label writer's race checkpoints.
+ if (a[a.indexOf('--json') + 1]?.includes('statusCheckRollup')) {
+  console.log(JSON.stringify(s)); process.exit(0);
+ }
  s.reads = (s.reads || 0) + 1;
  if (s.reads === (scenario.raceAt || 2) && scenario.race) Object.assign(s, scenario.race);
  if (s.written && scenario.afterWrite) Object.assign(s, scenario.afterWrite);
@@ -407,6 +431,13 @@ if (a[0] === 'pr' && a[1] === 'view') {
   if (a[i] === '--add-label' && !s.labels.some(l => l.name === a[i + 1])) s.labels.push({name: a[i + 1]});
   if (a[i] === '--remove-label') s.labels = s.labels.filter(l => l.name !== a[i + 1]);
  }
+} else if (a[0] === 'api' && [
+ 'repos/web-everything/web-everything/issues/${scenario.pr || 42}/comments?per_page=100',
+ 'repos/web-everything/web-everything/issues/${scenario.pr || 42}/events?per_page=100',
+ 'repos/web-everything/web-everything/pulls/${scenario.pr || 42}/reviews?per_page=100',
+].some(path => a.includes(path))) {
+ // These routing-loss incidents have no acceptance record; --slurp wraps the empty page.
+ console.log(JSON.stringify([[]]));
 } else { console.error('unexpected gh call', a); process.exit(1); }
 fs.writeFileSync('state.json', JSON.stringify(s));
 `);
@@ -434,7 +465,12 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       const afterGreen = validLabels.map(l => l.name).filter(l => l !== 'review-status:fixing' && !cleanup.toRemove.includes(l));
       expect(afterGreen, JSON.stringify({ pushedSha: healHead, result: result.stdout, calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8'), labels: final.labels })).toEqual(scenario.expected);
       const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything'))).toBe(true);
+      expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
+        || (c[0] === 'api' && [
+          `repos/web-everything/web-everything/issues/${scenario.pr || 42}/comments?per_page=100`,
+          `repos/web-everything/web-everything/issues/${scenario.pr || 42}/events?per_page=100`,
+          `repos/web-everything/web-everything/pulls/${scenario.pr || 42}/reviews?per_page=100`,
+        ].some(path => c.includes(path))))).toBe(true);
       const edits = calls.filter(c => c[1] === 'edit');
       if (scenario.restoreOnly) {
         expect(final.comments.some(c => c.body.includes(CI_HEAL_COMMENT_MARKER))).toBe(false);
