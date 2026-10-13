@@ -35,7 +35,7 @@ import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
-import { createFileRunStore } from '../../scripts/operations/run-store.mjs';
+import { createFileRunStore, readRun } from '../../scripts/operations/run-store.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
@@ -71,7 +71,7 @@ import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mj
 // #4465 — a held item's own route (already-done / out-of-scope / other) and the live sweep that acts on it.
 // See that file's own header for the three routes and why this daemon owns the sweep.
 import { planHoldRouting, routeHeldItems, reserveHoldRoute, releaseHoldRoute, appendHoldFinding } from '../../scripts/conveyor/build-dispatch-hold-router.mjs';
-import { readBuilderRuns, readAuthorship, backfillAuthorship } from '../../scripts/operations/build-pr-authorship.mjs';
+import { readBuilderRuns, readAuthorship, backfillAuthorship, builderRunsDir } from '../../scripts/operations/build-pr-authorship.mjs';
 import { resolveCoordinationRoot } from '../../scripts/operations/coordination-root.mjs';
 // #4131/#4382 build-orphan-adopt — see that module's own header for the mechanism this closes.
 import { classifyClaimLiveness, settleOrphanRow, adoptOrphanedBuildClaims, decideOrphanAction, RESUME_SPAWN_GRACE_MS } from '../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
@@ -88,6 +88,7 @@ import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { readLimitState, isBranchAllowedNow, isGlobalOffNow, countOpenPrsForDispatch, decideOpenPr } from '../../scripts/lib/pr-limit.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
@@ -2107,7 +2108,30 @@ function cliEffects() {
   let prepareReader;
   return {
     completePrepareFailures,
-    releaseDuePrepareRetries: () => releaseDuePrepareRetries({ cardChange: (num, since) => cliCardChangedSince(num, since) }),
+    releaseDuePrepareRetries: () => {
+      let checkedCount = false;
+      let underLimit = false;
+      return releaseDuePrepareRetries({
+        openPrRun: runId => {
+          if (!/^open-pr-[0-9a-f-]{36}$/.test(runId)) return null;
+          try { return readRun(runId, builderRunsDir()); } catch { return null; }
+        },
+        cardChange: (num, since) => cliCardChangedSince(num, since),
+        prLimitClear: f => {
+          try {
+            const state = readLimitState();
+            if (isGlobalOffNow(state) || isBranchAllowedNow(state, f.prRef)) return true;
+            if (!checkedCount) {
+              checkedCount = true;
+              const count = countOpenPrsForDispatch('we');
+              underLimit = !count.unavailable && count.unresolved === 0 && Number.isFinite(count.count)
+                && decideOpenPr({ repoKey: 'we', limit: count.limit, openCount: count.count }).allowed;
+            }
+            return underLimit;
+          } catch { return false; }
+        },
+      });
+    },
     dispatcherFresh: () => cliDispatcherFresh(),
     recordBuildFailure: (o) => recordBuildFailure(o),
     clearBuildFailure: ({ num }) => clearBuildFailure(num),

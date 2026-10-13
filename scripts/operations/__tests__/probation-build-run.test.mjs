@@ -1086,6 +1086,43 @@ describe('standalone prepare', () => {
         status: succeeds ? 'applied' : 'failed', result }]);
     }
   });
+  it('retries a stale prepare ref on b and opens the PR', async () => {
+    const { io } = prepareIo();
+    const tags = [];
+    io.openPr = o => { tags.push(o.attemptTag); return tags.length === 1
+      ? { ok: false, reason: 'the lane HEAD is not the tip of lane/4291-prepare-example' }
+      : { ok: true, pr: 9001 }; };
+    expect(await runProbationBuild({ ...prepareArgs(), attemptTag: '' }, io)).toMatchObject({ outcome: 'opened-pr' });
+    expect(tags).toEqual(['', 'b']);
+  });
+  it('stops stale-tip retries at e and preserves a stable evidence marker', async () => {
+    const { io } = prepareIo();
+    const tags = [];
+    io.openPr = o => { tags.push(o.attemptTag); return { ok: false, reason: 'the lane HEAD is not the tip of lane/4291-prepare-example' }; };
+    const result = await runProbationBuild({ ...prepareArgs(), attemptTag: '' }, io);
+    expect(tags).toEqual(['', 'b', 'c', 'd', 'e']);
+    expect(result.evidence.error).toMatch(/^push-rejected-stale-tip:/);
+    expect(result.cause).toBe('stale-prepare-branch');
+  });
+  it('stops on a PR-limit refusal and preserves its JSON', async () => {
+    const { io } = prepareIo();
+    const reason = 'open-pr reported no PR number: {"outcome":"refused","reason":"pr-limit"}';
+    const tags = [];
+    io.openPr = o => { tags.push(o.attemptTag); return tags.length === 1
+      ? { ok: false, reason: 'the lane HEAD is not the tip of lane/4291-prepare-example' }
+      : { ok: false, reason }; };
+    const result = await runProbationBuild({ ...prepareArgs(), attemptTag: '' }, io);
+    expect(tags).toEqual(['', 'b']);
+    expect(result.evidence.error).toBe(reason);
+    expect(result.cause).toBe('pr-limit');
+  });
+  it('does not rotate an explicit attempt tag', async () => {
+    const { io } = prepareIo();
+    const tags = [];
+    io.openPr = o => { tags.push(o.attemptTag); return { ok: false, reason: 'the lane HEAD is not the tip of lane/4291b-prepare-example' }; };
+    await runProbationBuild({ ...prepareArgs(), attemptTag: 'b' }, io);
+    expect(tags).toEqual(['b']);
+  });
   it('accepts a card-only prepare, stamps it, and never claims or resolves', async () => {
     const { io, calls } = prepareIo();
     expect(await runProbationBuild(prepareArgs(), io)).toMatchObject({ outcome: 'opened-pr' });
@@ -1305,4 +1342,30 @@ it.each(['4397', '4389'])('replays incident #%s using its checkout card and real
     // Publication and gate callbacks are spies: no live model, commit, push, or PR occurs.
     expect(calls.some(c => c[0] === 'gate')).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('openPr evidence before operation output truncation', () => {
+  it.each([0, 1])('preserves a late stale-tip signal at exit %s', exitCode => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-open-pr-'));
+    try {
+      mkdirSync(join(dir, 'scripts/operations'), { recursive: true });
+      const output = JSON.stringify({ runId: 'x'.repeat(2000), stopped: 'effect-halted',
+        error: 'push-failed — the lane HEAD is not the tip of lane/5754-prepare-example' });
+      writeFileSync(join(dir, 'scripts/operations/run.mjs'), `console.log(${JSON.stringify(output)}); process.exitCode = ${exitCode};`);
+      const result = realIo({ session: 'test' }).openPr({ lanePath: dir, num: '5754', slug: 'example', attemptTag: '', taskType: 'prepare' });
+      expect(result.reason).toMatch(/^push-rejected-stale-tip:/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([0, 1])('preserves refusal JSON and retry ref at exit %s', exitCode => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-open-pr-'));
+    try {
+      mkdirSync(join(dir, 'scripts/operations'), { recursive: true });
+      const refusal = { outcome: 'refused', reason: 'pr-limit', detail: 'open-PR backpressure limit reached', pr: null };
+      const output = JSON.stringify({ runId: 'x'.repeat(2000), findings: { submit: { effects: [{ result: refusal }] } } });
+      writeFileSync(join(dir, 'scripts/operations/run.mjs'), `console.log(${JSON.stringify(output)}); process.exitCode = ${exitCode};`);
+      const result = realIo({ session: 'test' }).openPr({ lanePath: dir, num: '5754', slug: 'example', attemptTag: 'b', taskType: 'prepare' });
+      expect(result.reason).toContain(JSON.stringify(refusal));
+      expect(result.reason).toContain('lane/5754b-prepare-example');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

@@ -65,6 +65,43 @@ export function preparedReportRoute(evidence = {}) {
 const LANE_BUSY_EXHAUSTED = 'needs-you: prepare lane-busy - every lane stayed leased for the whole retry window; clear it with a reviewed prepare release once a lane is free';
 /** The hold reason of an infra-transient card whose whole retry budget was spent: surfaced, never silently held. */
 const INFRA_EXHAUSTED = `needs-you: prepare infra-transient - the ${INFRA_RETRY_BUDGET} retries for temporary infrastructure failures were spent; clear it with a reviewed prepare release once the infrastructure is healthy`;
+const PR_LIMIT_HOLD = 'needs-you: prepare PR refused by the open-PR limit - re-dispatches on its own when the limit frees or pr-limit allow grants its branch';
+const STALE_BRANCH_HOLD = 'needs-you: prepare stale branch retry spent - inspect the existing prepare refs before releasing';
+const publicationText = evidence => String(evidence?.error ?? evidence?.reason ?? '').replace(/\\+"/g, '"');
+/** Recover effect diagnostics omitted by a truncated open-pr dump; the stored evidence stays intact. */
+function publicationEvidence(evidence, openPrRun) {
+  const runId = publicationText(evidence).replace(/\\[nrt]/g, ' ')
+    .match(/"runId"\s*:\s*"(open-pr-[0-9a-f-]{36})"/)?.[1];
+  if (!runId || typeof openPrRun !== 'function') return { evidence };
+  try {
+    const run = openPrRun(runId);
+    if (!Array.isArray(run?.effects)) return { evidence };
+    const detail = redactSpawnText(run.effects.flatMap(effect => [
+      typeof effect?.error === 'string' ? effect.error : '',
+      effect?.result == null ? '' : JSON.stringify(effect.result),
+    ]).filter(Boolean).join('\n'));
+    return {
+      evidence: { ...evidence, error: `${redactSpawnText(String(evidence?.error ?? evidence?.reason ?? ''))}\n${detail}` },
+      publicationDetail: detail.slice(0, 500),
+      prRef: typeof run.input?.ref === 'string' ? redactSpawnText(run.input.ref) : null,
+    };
+  } catch { return { evidence }; }
+}
+function publicationFailure(state, failure, cause) {
+  delete failure.unstampedRetry;
+  delete failure.unstampedRetryAt;
+  delete failure.unstampedReason;
+  delete failure.retryAfter;
+  if (cause === 'pr-limit') {
+    Object.assign(failure, { held: true, retry: false, holdReason: PR_LIMIT_HOLD,
+      prRef: publicationText(failure.evidence).match(/lane\/[\w./-]+/)?.[0] ?? null });
+  } else {
+    const used = Object.values(state.failures).filter(f => f !== failure && String(f.num) === String(failure.num) && f.cause === cause).length;
+    Object.assign(failure, { held: used >= 1, retry: used < 1 });
+    if (failure.held) failure.holdReason = STALE_BRANCH_HOLD;
+    else delete failure.holdReason;
+  }
+}
 const unstampedReason = evidence => {
   for (const candidate of [evidence?.error, evidence?.reason, 'missing terminal evidence']) {
     const text = redactSpawnText(String(candidate ?? ''));
@@ -117,6 +154,10 @@ export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // The quoted `worker report: …` tail is worker prose, not a failure signal: a worker that MENTIONS a rate limit or a
   // live lease must not steer its own classification, so the infra patterns read only what precedes it.
   const infraText = error.replace(/\bworker report:[\s\S]*$/i, '');
+  const publish = publicationText({ error: infraText });
+  if (/open-PR backpressure limit reached/i.test(publish)
+      || (/"outcome"\s*:\s*"refused"/.test(publish) && /"reason"\s*:\s*"pr-limit"/.test(publish))) return 'pr-limit';
+  if (/push-rejected-stale-tip:|is not the tip of lane\/\d+[a-z]?-prepare-/.test(publish)) return 'stale-prepare-branch';
   if (!launchOwned && INFRA_TRANSIENT_RE.test(infraText)) return 'infra-transient';
   if (!launchOwned && LANE_BUSY_RE.test(infraText)) return 'lane-busy';
   if (!launchOwned && INFRA_LATE_RE.test(infraText)) return 'infra-transient';
@@ -200,6 +241,7 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
   const previous = Object.values(state.failures).filter(f => f.num === num && f.cause === 'infra-transient').length;
   const retry = cause === 'infra-transient' && previous < INFRA_RETRY_BUDGET;
   const failure = { num, attempt, stage, cause, evidence: redactEvidence(evidence), retry, held: !retry, recordedAt: new Date(now).toISOString() };
+  if (cause === 'pr-limit' || cause === 'stale-prepare-branch') publicationFailure(state, failure, cause);
   // The infra budget spent: held for good, so surface it like an exhausted lane-busy instead of holding it silently.
   if (cause === 'infra-transient' && !retry) failure.holdReason = INFRA_EXHAUSTED;
   // Read off the RAW evidence (redaction never changes a route). The caller places a fresh route hold itself.
@@ -258,12 +300,13 @@ export function completePrepareFailures(num, path = failureStatePath()) {
 /** Held transient failures whose backoff has elapsed become retryable again. Returns the card numbers that now have
  * NO remaining held failure (their hold files can be released). Exhausted failures are never released here. */
 /**
- * @param {{path?: string, now?: number, settings?: object,
+ * @param {{path?: string, now?: number, settings?: object, prLimitClear?: ((failure: object) => boolean)|null,
+ *   openPrRun?: ((runId: string) => object|null)|null,
  *   cardChange?: ((num: string, sinceIso: string) => ({commit: string, at: string}|null))|null}} [o] - `cardChange`
  *   names the newest origin/main commit that changed the card's file AFTER `sinceIso` (null when none); it releases
  *   a held `needs-you` record (step e). Omitted, needs-you holds are left alone.
  */
-export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings(), cardChange = null, preparePolicy = readPreparePolicy() } = {}) {
+export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings(), cardChange = null, prLimitClear = null, openPrRun = null, preparePolicy = readPreparePolicy() } = {}) {
   const state = readFailureState(path);
   const touched = new Set();
   // builder-starved (2026-10-07) — SELF-HEAL held dispatch failures the CURRENT policy would never have held:
@@ -296,10 +339,21 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
   // hold recorded by older code — the ledger is never edited by hand.
   for (const f of Object.values(state.failures)) {
     if (!f.held || f.completed || !RECLASSIFIABLE_CAUSES.includes(f.cause)) continue;
-    const cause = classifyPrepareFailure(f.evidence, f.stage);
+    const publication = publicationEvidence(f.evidence, openPrRun);
+    const cause = classifyPrepareFailure(publication.evidence, f.stage);
     if (cause === f.cause) continue;
     const healedAt = new Date(now).toISOString();
-    if (cause === 'infra-transient') {
+    if (cause === 'pr-limit' || cause === 'stale-prepare-branch') {
+      publicationFailure(state, f, cause);
+      if (publication.publicationDetail !== undefined) f.publicationDetail = publication.publicationDetail;
+      if (cause === 'pr-limit' && publication.prRef) f.prRef = publication.prRef;
+      Object.assign(f, { cause, healedFrom: f.cause, healedAt });
+      if (f.retry) {
+        f.releasedAt = healedAt;
+        touched.add(f.num);
+      }
+      healed = true;
+    } else if (cause === 'infra-transient') {
       const used = Object.values(state.failures).filter(o => o.num === f.num && o !== f && o.cause === 'infra-transient').length;
       if (used >= INFRA_RETRY_BUDGET) {
         Object.assign(f, { cause, healedFrom: f.cause, healedAt, retry: false, holdReason: INFRA_EXHAUSTED });
@@ -323,6 +377,15 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
         : { holdReason: route.holdReason });
       if (route.routeHold) touched.add(f.num);
       healed = true;
+    }
+  }
+  if (typeof prLimitClear === 'function') {
+    for (const f of Object.values(state.failures)) {
+      if (!f.held || f.completed || f.cause !== 'pr-limit') continue;
+      try { if (prLimitClear(f) !== true) continue; } catch { continue; }
+      Object.assign(f, { held: false, retry: true, releasedAt: new Date(now).toISOString(), releasedBy: { prLimit: true } });
+      delete f.holdReason;
+      touched.add(f.num);
     }
   }
   // Live 2026-10-09 — (e) a could-not-prepare (`needs-you`) hold waits for the operator's ruling, and the ruling lands
@@ -353,7 +416,7 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
     }
   }
   for (const f of Object.values(state.failures)) {
-    if (f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {
+    if (f.cause !== 'pr-limit' && f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {
       Object.assign(f, { held: false, retry: true, retriedAt: new Date(now).toISOString() });
       touched.add(f.num);
     }
