@@ -35,6 +35,7 @@
  * would have been re-planned every tick. Threading `repo` through here is what makes the two sides agree.
  */
 import { isUnderTest } from '../lib/under-test.mjs';
+import { createReviewClearanceGuard } from '../lib/review-clearance-guard.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
 import { readAgyHold } from '../lib/antigravity-run-evidence.mjs';
 import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
@@ -395,6 +396,7 @@ export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
   repo = null,
   dispatch = dispatchCiHeal,
+  clearanceGuard,
   reconcile = runReconcilePass,
   pickFreeLanes = null,
   resolveProfile = repoProfile,
@@ -424,6 +426,7 @@ export async function runReconcileCiHealDispatch({
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  if (clearanceGuard === undefined) clearanceGuard = isUnderTest() ? null : createReviewClearanceGuard({ repo: CONSTELLATION_REPOS[repoKey].slug });
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
@@ -432,6 +435,7 @@ export async function runReconcileCiHealDispatch({
   const owedFlush = flushOwed(repoKey);
   const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  clearanceGuard?.sweep([...(reconciled.dispatch ?? []), ...(reconciled.refusals ?? [])]);
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
@@ -551,6 +555,12 @@ export async function runReconcileCiHealDispatch({
     }
     const strongerModel = infraFailures >= 2 || disposition.action === 'rearm'
       || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid);
+    const clearance = clearanceGuard?.beforeCiHeal(entry);
+    if (clearance?.launch === false) {
+      refusals.push({ pr: entry.prNumber, kind: 'no-failing-ci', why: clearance.why });
+      console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} not launched — ${clearance.why}`);
+      continue;
+    }
     let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
     if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
     if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
