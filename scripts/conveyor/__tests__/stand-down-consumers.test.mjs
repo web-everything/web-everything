@@ -59,6 +59,7 @@ describe('head-aware stand-down consumers', () => {
       };
       syncBuiltinESMExports();
       const { standDownComments } = await import(${JSON.stringify(STAND_DOWN_URL)});
+      reads = 0; // module load itself reads every declared settings file; count only the batch call
       delete process.env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD;
       standDownComments(${JSON.stringify([hold, hold, hold])}, { headRefOid: ${JSON.stringify(head)} });
       console.log(reads);
