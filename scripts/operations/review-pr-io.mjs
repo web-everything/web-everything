@@ -1019,13 +1019,17 @@ export function createReviewPrSinks({
             operatorRulings: readOperatorRulings(state.comments, context(state)).rulings,
             head: read.netBasis.rev, repo: read.repo, pr: read.pr,
           };
-          const live = [], superseded = [];
-          const disputed = [...disputedAdditions.values()].map(({ reason, ...referral }) => ({ referral, by: null,
-            verified: { key: referral.key, outcome: 'not-reproduced', reason } }));
+          const live = [], superseded = [], disputed = [];
           for (const referral of additions.values()) {
             const by = env.WE_REFERRAL_ADVISORY_SUPERSEDE === '0' ? null : findSupersedingNotReal(referral, supersessionContext);
             const verified = verifiedByKey.get(referral.key)?.outcome === 'reproduced' ? { key: referral.key, outcome: 'reproduced' } : undefined;
             (by ? superseded : live).push({ referral, by, verified });
+            if (by) out(`referral superseded: ${referral.seat} ${referral.finding.file ?? ''}${referral.finding.line == null ? '' : `:${referral.finding.line}`} — mandatory not-real ruling ${by.rulingId ?? 'operator'} stands`);
+          }
+          for (const { reason, ...referral } of disputedAdditions.values()) {
+            const by = env.WE_REFERRAL_ADVISORY_SUPERSEDE === '0' ? null : findSupersedingNotReal(referral, supersessionContext);
+            (by ? superseded : disputed).push({ referral, by,
+              verified: { key: referral.key, outcome: 'not-reproduced', reason } });
             if (by) out(`referral superseded: ${referral.seat} ${referral.finding.file ?? ''}${referral.finding.line == null ? '' : `:${referral.finding.line}`} — mandatory not-real ruling ${by.rulingId ?? 'operator'} stands`);
           }
           // Keep disputed claims separate for audit; they spend the same independent ruling attempt as other live referrals.

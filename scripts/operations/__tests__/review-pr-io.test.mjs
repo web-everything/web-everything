@@ -1588,6 +1588,34 @@ describe('#4315 durable referral effects', () => {
     }
   });
 
+  it.each([undefined, '0'])('a not-reproduced claim reuses an eligible prior mandatory not-real ruling (switch %s)', async enabled => {
+    const h = harness({ failure: 'judge', env: enabled ? { WE_REFERRAL_ADVISORY_SUPERSEDE: enabled } : {} });
+    const old = seedReferrals(h, ['judge'], h.state.headRefOid, r => [{
+      id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'not-real', rationale: 'Verified pinned diff', evidence: ['diff:x'],
+    }]);
+    h.payload.referrals = [];
+    h.payload.verifications = [{ seat: 'judgeCorrectnessAdvisory', original: old.referrals[0].original,
+      outcome: 'not-reproduced', reason: 'x.mjs:1 the guard holds on the head' }];
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const added = result.records.find(r => r.runId !== old.runId);
+    const key = referralFindingKey('judgeCorrectnessAdvisory', old.referrals[0].original);
+    expect(added.verified).toEqual([{ key, outcome: 'not-reproduced', reason: 'x.mjs:1 the guard holds on the head' }]);
+    if (enabled === '0') {
+      expect(added.superseded).toBeUndefined();
+      expect(h.judge).toHaveBeenCalledOnce();
+      expect(result.pending).toHaveLength(1);
+    } else {
+      expect(added.superseded).toEqual([{ key,
+        reason: 'superseded: the mandatory owner already ruled this finding not-real on this head',
+        by: { runId: old.runId, key: old.referrals[0].key, rulingId: 'r1' } }]);
+      expect(added.attempted).toBe(false);
+      expect(h.judge).not.toHaveBeenCalled();
+      expect(result.pending).toEqual([]);
+      expect(h.lines.some(line => line.startsWith('referral superseded: judgeCorrectnessAdvisory'))).toBe(true);
+    }
+  });
+
   it('keeps superseded additions out of live chunks and judge input', async () => {
     const h = harness({});
     const old = seedReferrals(h, ['judge'], h.state.headRefOid, r => [{
