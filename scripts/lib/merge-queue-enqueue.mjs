@@ -11,6 +11,141 @@
  *   drain last followed up, so the drain's existing post-land path runs for them.
  */
 import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
+import { reviewCiGate } from './review-ci-gate.mjs';
+import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { readSharedFreeze } from './red-main-freeze-shared.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+
+export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
+
+/** Pure: required-workflows refusal (ruleset 24930207), never a status-check-only refusal. */
+export function isRequiredWorkflowsUnsatisfiedError(text) {
+  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
+}
+
+/** Standard behaviour: refresh a green PR refused by the queue so fresh required workflows can count. */
+export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
+
+/**
+ * mergeQueue.refreshOnUnsatisfiedWorkflows: first valid env > settings > platform > standard value.
+ * Inject settings/platform objects to avoid filesystem reads. Settings discovery and test isolation match
+ * loadMergeQueueSettings; this key resolves independently of the other queue settings.
+ * @returns {{value: 'on'|'off', source: string, invalid: string[]}}
+ */
+export const resolveRefreshOnUnsatisfiedWorkflows = options => resolveRefreshSetting('refreshOnUnsatisfiedWorkflows', 'WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS', options);
+export const resolveRefreshOnStaleMergeGate = options => resolveRefreshSetting('refreshOnStaleMergeGate', 'WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE', options);
+
+function resolveRefreshSetting(key, envKey, { env = process.env, settings, platform } = {}) {
+  const invalid = [];
+  const readJson = (path, source) => {
+    try { return JSON.parse(readFileSync(path, 'utf8')); }
+    catch (e) {
+      if (e?.code !== 'ENOENT') invalid.push(`${source}: ${String(e?.message ?? e).split('\n')[0]}`);
+      return {};
+    }
+  };
+  const layers = [
+    ['env', () => env?.[envKey]],
+    ['settings', () => {
+      let src = settings;
+      const override = String(env?.WE_MERGE_QUEUE_SETTINGS_FILE ?? '').trim();
+      if (src === undefined && override) src = readJson(override, 'settings');
+      if (src === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) src = {};
+      if (src === undefined) {
+        const read = readDeclaredSettings();
+        src = read.settings;
+        invalid.push(...read.errors.map((e) => `settings: ${e.source}: ${e.error}`));
+      }
+      return src?.mergeQueue?.[key];
+    }],
+    ['platform', () => (platform === undefined ? readJson(PLATFORM_PREFERENCES_PATH, 'platform') : platform)?.mergeQueue?.[key]],
+  ];
+  for (const [source, read] of layers) {
+    const value = read();
+    if (value === 'on' || value === 'off') return { value, source, invalid };
+    if (value !== undefined) invalid.push(`${source}: mergeQueue.${key}=${JSON.stringify(value)} (expected on|off)`);
+  }
+  return { value: REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT, source: 'standard', invalid };
+}
+
+/** Pure once-per-head decision; a refusal of the produced head needs human inspection, not another refresh. */
+export function decideRequiredWorkflowsRefresh({ key, headSha, state = {}, setting }) {
+  if ((setting?.value ?? setting) === 'off') return { action: 'off', reason: 'required-workflows refresh is off' };
+  const short = String(headSha || '').slice(0, 9), previous = state[key];
+  if (headSha && previous?.newHead === headSha) return { action: 'skip', reason: `ruleset still refuses head ${short} after a refresh from ${String(previous.fromHead).slice(0, 9)} — a person should look` };
+  if (headSha && previous?.fromHead === headSha) return { action: 'skip', reason: `head ${short} was already refreshed once to ${String(previous.newHead || '').slice(0, 9)} for required workflows — waiting for the fresh head` };
+  return { action: 'refresh', reason: `head ${short} has never been refreshed for required workflows` };
+}
+
+export function requiredWorkflowsRefreshStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-required-workflows-refresh.json'); }
+
+/** Missing, malformed or unreadable state is empty; callers can inject filesystem reads. */
+export function readRequiredWorkflowsRefreshState(path, readFile = readFileSync) {
+  try { const s = JSON.parse(readFile(path, 'utf8')); return s && typeof s === 'object' && !Array.isArray(s) ? s : {}; } catch { return {}; }
+}
+
+/** Atomic writer, matching the drain's other coordination state writers. */
+function writeRequiredWorkflowsRefreshState(path, state) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+/** Re-read before recording; retain the newest 500 PRs. Injected writeFile accepts (path, state). */
+export function recordRequiredWorkflowsRefresh(path, key, { fromHead, newHead, action, at }, { readFile = readFileSync, writeFile = writeRequiredWorkflowsRefreshState } = {}) {
+  const state = { ...readRequiredWorkflowsRefreshState(path, readFile), [key]: { fromHead, newHead, action, at } };
+  const entries = Object.entries(state).sort((a, b) => String(a[1]?.at || '').localeCompare(String(b[1]?.at || ''))).slice(-500);
+  writeFile(path, Object.fromEntries(entries));
+}
+
+/**
+ * Handle required-workflows refusal (ruleset 24930207) through the existing freshness path. IO is injected:
+ * refreshStalePr, needsAcceptanceRestamp and restampAcceptance are the drain's existing implementations.
+ * Returns a skip reason for JSON and a stderr line; off falls through to the original enqueue failure path.
+ * runId is deliberately null: re-running a pre-ruleset run cannot satisfy required workflows.
+ */
+export function handleRequiredWorkflowsRefusal(options) { return handleQueueRefresh(options); }
+
+async function handleQueueRefresh({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
+  readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
+  decide = decideRequiredWorkflowsRefresh, runId = null, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
+  refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn = () => {}, now = () => new Date().toISOString() }) {
+  if (dryRun) return { handled: false };
+  const decision = decide({ key, headSha, setting, state: readState(statePath) });
+  if (decision.action === 'off') return { handled: false };
+  if (decision.action === 'skip') return { handled: true, reason: `merge-queue: ${decision.reason}`, line: `  ⏸ ${label}: PR ${tag}${c.num} — ${decision.reason}` };
+  let out;
+  try {
+    out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
+      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, expectedHead: headSha });
+  } catch (e) { out = { ok: false, error: errText(e) }; }
+  if (!out.ok) {
+    const reason = `merge-queue: ${wording} → refresh FAILED: ${out.error}`;
+    return { handled: true, reason, line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
+  }
+  let note = '';
+  // Record before restamping: a successful refresh must not loop even if acceptance IO fails.
+  try { record(statePath, key, { fromHead: headSha, newHead: out.newCommit, action: out.action, at: now() }); }
+  catch (e) { note = `; refresh state record failed: ${errText(e)}`; }
+  if (out.action === 'rebased' && needsAcceptanceRestamp(c, { action: 'rebased' })) {
+    let rs;
+    try { rs = await restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newCommit, cwd }); }
+    catch (e) { rs = { ok: false, reason: errText(e) }; }
+    if (!rs.ok) {
+      note += `; acceptance re-stamp failed: ${String(rs.reason).slice(0, 200)}`;
+      warn(`  ⚠ ${tag}${c.num} acceptance re-stamp failed (${rs.reason}) — it may re-park`);
+    }
+  }
+  const sha = String(out.newCommit || '').slice(0, 9);
+  return { handled: true, reason: `merge-queue: ${wording} → refresh ${out.action} ${sha}${note}`,
+    line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → ${out.action} ${sha} — enqueue retried once the new runs are green${note}` };
+}
+
 
 export const ENQUEUE_MUTATION = 'mutation($id:ID!,$sha:GitObjectID){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$sha}){mergeQueueEntry{id position state}}}';
 
@@ -126,12 +261,15 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
     const errs = out?.errors;
     if (Array.isArray(errs) && errs.length) {
       const msg = errs.map((x) => x?.message).join('; ');
+      const refusal = errs.find((x) => isRequiredWorkflowsUnsatisfiedError(x?.message));
+      if (refusal) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: msg, ...(refusal.type != null ? { type: refusal.type } : {}), ...(refusal.code != null ? { code: refusal.code } : {}) };
       return isAlreadyQueuedError(msg) ? { ok: true, already: true } : { ok: false, error: msg };
     }
     const entry = out?.data?.enqueuePullRequest?.mergeQueueEntry ?? null;
     return entry ? { ok: true, entry } : { ok: false, error: 'no merge queue entry returned' };
   } catch (e) {
     const t = errText(e);
+    if (isRequiredWorkflowsUnsatisfiedError(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: t };
     return isAlreadyQueuedError(t) ? { ok: true, already: true } : { ok: false, error: t };
   }
 }
@@ -179,4 +317,78 @@ export function rulesetSuggestion(policy, requiredChecks = ['test', 'smoke', 'da
 
 function errText(e) {
   return String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
+}
+
+// Separate coordination ledger; the atomic bounded storage and refresh/restamp path are shared.
+export const staleMergeGateRefreshStatePath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'drain-stale-merge-gate-refresh.json');
+export function decideStaleMergeGateRefresh({ key, headSha, state = {}, setting } = {}) {
+  if ((setting?.value ?? setting) === 'off') return { action: 'skip', reason: 'stale merge-gate refresh is off' };
+  if (!headSha) return { action: 'skip', reason: 'missing head' };
+  const previous = state[key];
+  if (previous?.fromHead === headSha || previous?.newHead === headSha) return { action: 'skip', reason: 'merge-gate head already refreshed once — waiting for fresh verdict; a person should look if it remains held' };
+  return { action: 'refresh', reason: 'merge-gate holds now satisfied' };
+}
+
+/** Pure: this authorizes a new run, never excusal or enqueue on the old verdict. */
+export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState, humanClearedSha, freeze } = {}) {
+  const no = reason => ({ stale: false, reason: `merge-gate ${reason}` });
+  if (!headSha || verdict?.head_sha !== headSha) return no('verdict head mismatch');
+  if (verdict.error || verdict.ok !== false || !Array.isArray(verdict.results) || !verdict.results.length) return no('verdict unreadable or not HOLD');
+  if (!landableApartFromMergeState) return no('PR is not otherwise landable');
+  const satisfied = new Set();
+  for (const row of verdict.results) {
+    if (row.status === 'fail-closed') return no(`fail-closed row ${row.id}`);
+    if (row.status !== 'hold') {
+      if (!['pass', 'queue', 'enqueue', 'skipped-by-policy'].includes(row.status)) return no('verdict row unreadable');
+      continue;
+    }
+    if (row.id === 'test-gaming' || (row.id === 'review-acceptance' && row.reason?.startsWith('human-only:'))) {
+      if (humanClearedSha !== headSha) return no(`hold ${row.id} not cleared on this head`);
+      satisfied.add('human clearance');
+    } else if (['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance'].includes(row.id)
+      || (row.id === 'ledger' && row.reason?.startsWith('labels:'))) {
+      satisfied.add('candidacy');
+    } else if (row.id === 'red-main-freeze' && /^main is RED \(freeze: manual freeze: .+\)$/.test(row.reason ?? '')) {
+      if (freeze?.error || freeze?.frozen !== false || !Number.isFinite(Date.parse(verdict.completed_at))
+        || !(Date.parse(freeze.publishedAt) > Date.parse(verdict.completed_at))) return no('hold red-main-freeze not proven lifted after verdict');
+      satisfied.add('red-main-freeze lifted');
+    } else return no(`hold ${row.id} remains real`);
+  }
+  return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
+}
+
+/** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
+export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
+  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance,
+  statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
+  const unchanged = { handled: false };
+  if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
+    || !c.reason?.startsWith('merge state BLOCKED') || !pr?.headRefOid) return unchanged;
+  if (['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(String(pr.reviewDecision || '').toUpperCase())) return unchanged;
+  // The real classifier must also pass its gates AFTER the merge-state arm (body and review holds).
+  if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
+  const headSha = pr.headRefOid;
+  const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
+  if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
+  const run = latestFailingMergeGate(pr.statusCheckRollup);
+  if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
+  const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
+  const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);
+  if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return { ...unchanged, reason: 'merge-gate run/job URL unreadable' };
+  let classification;
+  try {
+    const verdict = await readVerdict({ repo: c.repo, jobId, prNumber: c.num });
+    if (verdict?.num !== c.num) return { ...unchanged, reason: 'merge-gate PR verdict unreadable' };
+    let evidence = acceptance;
+    if (verdict.results?.some(r => r.status === 'hold' && (r.id === 'test-gaming' || (r.id === 'review-acceptance' && r.reason?.startsWith('human-only:'))))) {
+      evidence ??= await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd });
+      if (evidence?.headSha !== headSha) return { ...unchanged, reason: 'merge-gate acceptance head mismatch' };
+    }
+    const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
+      ? await readFreeze({ board: refreshOptions.cloneDir }) : undefined;
+    classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze });
+  } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}` }; }
+  if (!classification.stale) return { ...unchanged, reason: classification.reason };
+  return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
+    decide: decideStaleMergeGateRefresh, runId, label: 'stale merge-gate', wording: `stale merge-gate (${classification.reason})` });
 }

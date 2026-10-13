@@ -6,6 +6,9 @@ import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
  *   and the per-tick sequence, both with every effect injected (no real gh/claude, no real lease/timer).
  */
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mocked so `defaultReapSessions`'s own describe block below can assert exactly what it passes through
 // WITHOUT ever shelling a real `claude agents`/`claude stop`/`gh` call — this repo's own hard rule (never touch
@@ -34,6 +37,7 @@ import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
+  resolveConvertAdvisoryEnabled,
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { tagReviewStatus } from '../../../scripts/conveyor/review-status-tag.mjs';
@@ -1061,18 +1065,46 @@ describe('runConvertAdvisoryTickAllRepos', () => {
   });
 });
 
+describe('resolveConvertAdvisoryEnabled', () => {
+  it.each([
+    ['disabled setting', '{"convertAdvisory":{"enabled":false}}', {}, false],
+    ['env enables over setting', '{"convertAdvisory":{"enabled":false}}', { REVIEW_DAEMON_CONVERT_ADVISORY: '1' }, true],
+    ['missing file', null, {}, true],
+    ['corrupt JSON', '{', {}, true],
+    ['env disables over setting', '{"convertAdvisory":{"enabled":true}}', { REVIEW_DAEMON_CONVERT_ADVISORY: '0' }, false],
+    ['non-boolean setting', '{"convertAdvisory":{"enabled":"false"}}', {}, true],
+    ['missing setting', '{}', {}, true],
+    ['normalized true', '{"convertAdvisory":{"enabled":false}}', { REVIEW_DAEMON_CONVERT_ADVISORY: ' TRUE ' }, true],
+    ['normalized false', '{"convertAdvisory":{"enabled":true}}', { REVIEW_DAEMON_CONVERT_ADVISORY: ' FALSE ' }, false],
+    ['unknown env falls back to setting', '{"convertAdvisory":{"enabled":false}}', { REVIEW_DAEMON_CONVERT_ADVISORY: 'unknown' }, false],
+  ])('%s', (_name, contents, env, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-daemon-settings-'));
+    try {
+      const path = join(dir, 'settings.json');
+      if (contents !== null) writeFileSync(path, contents);
+      expect(resolveConvertAdvisoryEnabled(env, { path })).toBe(expected);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the committed product setting resolves to true with empty env', () => {
+    expect(resolveConvertAdvisoryEnabled({})).toBe(true);
+  });
+});
+
 describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage onto the tick result (#xconv1)', () => {
   const fakeReview = () => ({ repos: [], reviewsOwed: 0, dispatched: [], failed: [] });
 
-  it('PR #2781 review — OFF BY DEFAULT: with no opt-in, the live daemon never runs the convert-advisory stage (no real gh write, no judge spawn)', async () => {
+  it('ON BY DEFAULT: with env unset, the daemon runs the convert-advisory stage', async () => {
     const saved = process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
     delete process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
     try {
       const runConvertAdvisories = vi.fn(async () => ({ posted: [] }));
       const effects = buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories, runPrepReview: noPrepReview });
       const result = await effects.tickOnce();
-      expect(runConvertAdvisories).not.toHaveBeenCalled();
-      expect(result.convertAdvisory).toBeNull();
+      expect(runConvertAdvisories).toHaveBeenCalledTimes(1);
+      expect(result.convertAdvisory).toEqual({ posted: [] });
       expect(result).toHaveProperty('repos');
     } finally {
       if (saved === undefined) delete process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
@@ -1080,10 +1112,10 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
     }
   });
 
-  it('PR #2781 review — the opt-in is the env flag REVIEW_DAEMON_CONVERT_ADVISORY=1 (anything else stays off)', async () => {
+  it('honors boolean env overrides and uses the enabled setting for an empty env flag', async () => {
     const saved = process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
     try {
-      for (const [value, expected] of [['1', 1], ['0', 0], ['true', 0], ['', 0]]) {
+      for (const [value, expected] of [['1', 1], ['true', 1], ['0', 0], ['false', 0], ['', 1]]) {
         process.env.REVIEW_DAEMON_CONVERT_ADVISORY = value;
         const runConvertAdvisories = vi.fn(async () => ({ posted: [] }));
         await buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories, runPrepReview: noPrepReview }).tickOnce();
@@ -1092,6 +1124,23 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
     } finally {
       if (saved === undefined) delete process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
       else process.env.REVIEW_DAEMON_CONVERT_ADVISORY = saved;
+    }
+  });
+
+  it('explicitly disabled skips conversion and logs the stranded-PR warning once per tick', async () => {
+    const log = { error: vi.fn() };
+    const runConvertAdvisories = vi.fn();
+    const effects = buildCliDaemonEffects({
+      owner: 'x', log, reapSessions: () => null, runReview: fakeReview,
+      runConvertAdvisories, runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
+    });
+    for (let tick = 1; tick <= 2; tick++) {
+      expect((await effects.tickOnce()).convertAdvisory).toBeNull();
+      expect(runConvertAdvisories).not.toHaveBeenCalled();
+      expect(log.error.mock.calls.filter(([line]) => line.includes('convert-advisory stage disabled')))
+        .toEqual(Array.from({ length: tick }, () => [
+          'review-daemon: convert-advisory stage disabled (convertAdvisory.enabled=false) — any PR owed a convert-advisory is stranded',
+        ]));
     }
   });
 
@@ -1301,7 +1350,7 @@ describe('buildCliDaemonEffects.tickOnce — carries liveProcessPrs into the NEX
         : { repos: [], reviewsOwed: 0, dispatched: [], failed: [], liveProcessPrs: [] };
     };
     const reapSessions = vi.fn(() => ({ scanned: 0, stopped: 0, alreadyGone: 0, failures: 0, anomalies: 0, kept: 0 }));
-    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview, runPrepReview: noPrepReview });
+    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview, runConvertAdvisories: () => null, runPrepReview: noPrepReview });
     await effects.tickOnce();
     expect(reapSessions).toHaveBeenNthCalledWith(1, { priorityNames: new Set() });
     await effects.tickOnce();

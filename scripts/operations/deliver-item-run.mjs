@@ -51,6 +51,7 @@
  * process's own log file. The dispatch observer (`dispatch-lane-io.mjs#createDispatchObservers`) resolves the
  * effect off the merged PR exactly as it already did for the agent path — unchanged by this wiring.
  */
+import { assertCodexModel } from '../lib/codex-model-routing.mjs';
 import { settleDispatchEffect } from './deliver-item-settle.mjs';
 import { resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
 import { resolveOperationEffort, resolveOperationRoute, resolvePolicyModel, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
@@ -166,6 +167,7 @@ export async function runDeliverItemCli(argv = [], {
   write = (line) => process.stdout.write(line),
   writeErr = (line) => process.stderr.write(line),
   selectProvider = selectDeliveryAgentProvider,
+  readPolicy = readRoutingPolicy,
 } = {}) {
   let launch;
   let selected;
@@ -179,18 +181,32 @@ export async function runDeliverItemCli(argv = [], {
     launch = parseDeliverItemRunArgv(argv);
     // #3580 — resolved BEFORE the delivery starts, so a bad `--provider=` exits here rather than after a lane
     // and a claim have already been taken (see `selectDeliveryAgentProvider`'s own docblock).
-    const policy = readRoutingPolicy();
+    const policy = readPolicy();
     const configured = launch.provider ? null : resolveOperationRoute({ operation: 'build', available: ['claude', 'codex'], gateClosed: policy.criticalWorkGate.kinds.includes('build'), policy });
     selected = selectProvider(configured ? configured.provider === 'claude' ? 'claude-restricted' : configured.provider : launch.provider);
     const providerName = selected.name === 'claude-restricted' ? 'claude' : selected.name;
     const pin = launch.model ?? configured?.model;
-    const model = pin ? resolvePolicyModel(providerName, pin, policy) : undefined;
-    const effort = resolvePolicyEffort(providerName, launch.effort ?? configured?.effort ?? resolveOperationEffort('build', providerName, undefined, policy));
+    // Caller-pinned Codex slugs use the shared validator; the older vendor policy catalogue can lag it.
+    const model = pin ? providerName === 'codex'
+      ? assertCodexModel(Object.hasOwn(policy.aliases?.codex ?? {}, pin) ? policy.aliases.codex[pin] : pin)
+      : resolvePolicyModel(providerName, pin, policy) : undefined;
+    // resolveOperationRoute fills in a policy effort even when the configured route omitted it.
+    // Recover the selected build entry's actual pin so an inferred policy default cannot mask the task route.
+    const buildEntry = policy.operations.build ?? policy.operations['*'];
+    const configuredEntry = configured && providerName === 'codex'
+      ? [buildEntry, ...(buildEntry?.fallback ?? [])].find(entry => entry?.provider === 'codex'
+        && resolvePolicyModel('codex', entry.model, policy) === configured.model) : undefined;
+    const configuredEffort = providerName === 'codex'
+      ? (typeof configuredEntry?.effort === 'string' ? configuredEntry.effort : configuredEntry?.effort?.codex)
+      : configured?.effort;
+    const effortPin = launch.effort ?? configuredEffort;
+    const effort = providerName === 'codex' && effortPin === undefined ? undefined
+      : resolvePolicyEffort(providerName, effortPin ?? resolveOperationEffort('build', providerName, undefined, policy));
     launch.effort = effort;
     if (model) launch.model = model;
     const underlying = selected.provider;
     selected = { ...selected, provider: { ...underlying, ...(model ? { model } : {}), effort,
-      spawn: request => underlying.spawn({ ...request, ...(model ? { model } : {}), effort }) } };
+      spawn: request => underlying.spawn({ ...request, ...(providerName === 'codex' ? { taskKind: 'build' } : {}), ...(model ? { model } : {}), ...(effort !== undefined ? { effort } : {}) }) } };
 
   } catch (e) {
     settleFailure(e);

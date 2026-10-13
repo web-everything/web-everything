@@ -679,7 +679,7 @@ function rewriteSoakCardCitation(content, visit) {
  * Commits the rename+rewrites in ONE scoped commit; the caller publishes. Best-effort like the rest of the reconcile: a
  * failure is reported, the land stands.
  */
-export function numberPendingHashes(CWD, { dryRun = false } = {}) {
+export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   // Phase costs expose where the drain pass budget goes, including refused passes.
   const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
   let readSource = 'worktree';
@@ -954,6 +954,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const dupHashes = new Set(dupDropped.map((d) => d.hash));
   // Assign contiguous max+1 only to eligible cards, retaining their topological order.
   let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
+  maxNum = Math.max(maxNum, minNext - 1);
   const assigned = [];
   for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)) && !dupHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);

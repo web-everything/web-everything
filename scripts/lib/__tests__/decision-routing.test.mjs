@@ -576,7 +576,7 @@ describe('#3309 routeReviewShape — a CODE PR still gets the full mandatory pan
   });
 
   it('#3309 a high-care code PR gets every panel lens, 3 rounds and 2 jurors — the router shrinks nothing', () => {
-    const plan = routeReviewShape({ changedFiles: ['docs/agent/platform-decisions.md', 'scripts/lib/gate-config.mjs'] });
+    const plan = routeReviewShape({ changedFiles: ['.github/workflows/review.yml'] });
     expect(plan.subject).toBe(REVIEW_SUBJECTS.CODE);
     expect(plan.careLevel).toBe(CARE_LEVELS.HIGH);
     expect(plan.lenses).toEqual([...PANEL_LENSES]);

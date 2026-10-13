@@ -6,7 +6,7 @@
  *   launch that is SIGKILLed mid-job, picked up by a fresh store after a simulated daemon restart, and resumes
  *   from its checkpoint so numbering and its push happen exactly once.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DRAIN_FOLLOWUP_ENTRY, DRAIN_FOLLOWUP_KIND, assertLinkedWorktree, buildFollowupInput, defineDrainFollowupKind,
-  followupNeeded, followupSteps, makeFollowupWorktreePreparer,
+  fetchRemoteTip, followupNeeded, followupSteps, makeFollowupWorktreePreparer, resetToRemoteTip,
 } from '../drain-followup-job.mjs';
 import { createJobStore, enqueueJob, reattachTick } from '../daemon-jobs-runtime.mjs';
 import { kindRegistry } from '../daemon-jobs.mjs';
@@ -143,6 +143,44 @@ describe('followupSteps', () => {
 
   beforeEach(() => { makeFollowupWorktreePreparer({ repoDir: clone, worktreeDir: worktree })(); });
 
+  it.each([false, true])('number-resolve-push with branch numbering checks fresh main (hash present: %s)', (hasHash) => {
+    const { calls, deps } = fakes();
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'rev-parse') return args[1] === '--git-dir' ? '/repo/.git/worktrees/job' : args[1] === '--git-common-dir' ? '/repo/.git' : 'tip';
+      if (args[0] === 'ls-tree') return hasHash ? 'backlog/xabc123-card.md' : 'backlog/123-card.md\nother/xabc123-card.md\nbacklog/nested/xabc123-card.md';
+      return '';
+    });
+    const log = { write: vi.fn() };
+    const minNext = vi.fn(() => 102);
+    const number = vi.fn(hasHash ? deps.numberPendingHashes : () => {
+      calls.number += 1;
+      return { assigned: [], committed: false };
+    });
+    const plan = vi.fn(deps.planResolveOnLand);
+    const queuedInput = hasHash ? input : buildFollowupInput({
+      landedLocal: true, landedItems: ['123'],
+      carriers: [{ item: '123', isWe: true, headRef: 'lane/a', manifestRefs: ['lane/a'] }],
+    });
+    const out = followupSteps({ ...deps, exec, log, minNext, numberPendingHashes: number, planResolveOnLand: plan })[0].run({ input: { ...queuedInput, numberingOnBranch: true } });
+    expect(exec).toHaveBeenCalledWith('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], expect.any(Object));
+    expect(exec.mock.calls.findIndex(([, args]) => args[0] === 'fetch')).toBeLessThan(exec.mock.calls.findIndex(([, args]) => args[0] === 'ls-tree'));
+    expect(calls.number).toBe(1);
+    expect(minNext).toHaveBeenCalledWith({ cwd: worktree, exec });
+    expect(number).toHaveBeenCalledWith(worktree, { minNext: 102 });
+    expect(plan).toHaveBeenCalledWith({ landedItems: queuedInput.landedItems, assigned: hasHash ? [{ hash: 'xabc123', nnn: 7 }] : [], carriers: queuedInput.carriers, openHeadRefs: queuedInput.openHeadRefs });
+    expect(calls.resolve).toEqual([{ id: hasHash ? 7 : '123', sync: false, publish: false }]);
+    expect(out.resolveOnLand.resolved).toEqual([hasHash ? '7' : '123']);
+    expect(out.numbering.pushed).toBe(true);
+    expect(out).not.toHaveProperty('skipped');
+    expect(calls.push).toEqual([true]);
+    if (hasHash) {
+      expect(out.numbering.pushed).toBe(true);
+      expect(log.write).toHaveBeenCalledWith('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
+    } else {
+      expect(log.write).not.toHaveBeenCalled();
+    }
+  });
+
   it('numbers, resolves from the RECORD (deferring a half-open couple) and pushes once, under the lock with no unlocked fallback', () => {
     // A crashed earlier attempt left an unpushed local commit: the step must rebuild from the remote tip.
     writeFileSync(join(worktree, 'backlog', 'stray.md'), 'x');
@@ -181,6 +219,45 @@ describe('followupSteps', () => {
   it('refuses to run in a primary clone (the daemon clone is never reset)', () => {
     const { deps } = fakes();
     expect(() => followupSteps({ ...deps, cwd: clone })[0].run({ input })).toThrow(/not a linked worktree/);
+  });
+});
+
+describe('fetchRemoteTip — a lost ref-lock race is retried, not a failed step', () => {
+  const lockRace = () => Object.assign(new Error("Command failed: git fetch origin main --quiet\nerror: cannot lock ref 'refs/remotes/origin/main': is at 2d1a6333 but expected 176afcf9\n"), { stderr: '' });
+  const flaky = (failures, err = lockRace) => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push(args[0]); if (args[0] === 'fetch' && failures-- > 0) throw err(); return ''; };
+    return { exec, calls };
+  };
+
+  it('retries the fetch after "cannot lock ref" and then succeeds (red main @ cd8d6e3bd)', () => {
+    const { exec, calls } = flaky(2);
+    const waits = [];
+    fetchRemoteTip({ exec, cwd: '/x', sleep: (ms) => waits.push(ms) });
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(3);
+    expect(waits).toHaveLength(2);
+  });
+
+  it('gives up after the attempt cap and rethrows the lock error', () => {
+    const { exec, calls } = flaky(99);
+    expect(() => fetchRemoteTip({ exec, cwd: '/x', attempts: 3, sleep: () => {} })).toThrow(/cannot lock ref/);
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(3);
+  });
+
+  it('does NOT retry any other fetch failure (auth, network) — it throws at once', () => {
+    const { exec, calls } = flaky(99, () => new Error('fatal: could not read from remote repository'));
+    expect(() => fetchRemoteTip({ exec, cwd: '/x', sleep: () => {} })).toThrow(/could not read/);
+    expect(calls.filter((c) => c === 'fetch')).toHaveLength(1);
+  });
+
+  it('resetToRemoteTip survives the race inside a real linked worktree', () => {
+    makeFollowupWorktreePreparer({ repoDir: clone, worktreeDir: worktree })();
+    let lost = 1;
+    const exec = (cmd, args, opts) => {
+      if (args[0] === 'fetch' && lost-- > 0) throw lockRace();
+      return execFileSync(cmd, args, opts);
+    };
+    expect(resetToRemoteTip({ exec, cwd: worktree, sleep: () => {} })).toMatch(/^[0-9a-f]{40}$/);
   });
 });
 
@@ -318,7 +395,9 @@ describe('a real detached drain-followup job across a daemon restart', () => {
     const first = await reattachTick({ store: storeA, kinds: kinds(), ...tickOpts });
     expect(first.actions).toEqual([expect.objectContaining({ id: 'fu-1', action: 'launch', attempt: 1 })]);
     // The child dies mid-job (step 2), after step 1 checkpointed — daemon A is gone too.
-    await waitFor(() => existsSync(effects) && readFileSync(effects, 'utf8').includes('crash-in-regen'));
+    await waitFor(() => existsSync(effects) && readFileSync(effects, 'utf8').includes('crash-in-regen')).catch((e) => {
+      throw new Error(`${e.message}\n${readFileSync(join(jobsDir, 'fu-1.log'), 'utf8')}`);
+    });
     await sleep(300);
     expect(storeA.read('fu-1').job).toMatchObject({ status: 'running', checkpoint: { step: 1 } });
 
