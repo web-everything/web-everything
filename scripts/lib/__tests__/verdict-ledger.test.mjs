@@ -9,7 +9,7 @@
  * (`review-escalation.test.mjs`, `jury-ledger.test.mjs`, …). The card's path is corrected rather than followed.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -1328,6 +1328,17 @@ describe('ledger plan follow-up: the git store accepts every v2 event type (dual
     expect(clear).toMatchObject({ ok: false, ledgerWriteMiss: true });
     const block = appendVerdict(ev('ruling', { findingKey: 'f2', ruling: 'block' }), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} });
     expect(block).toMatchObject({ ok: true, ledgerWriteMiss: true });
+  });
+
+  it('a release or approval that misses git does not clear and leaves no home row (F4); a hold still applies', () => {
+    const miss = () => { throw new Error('push rejected'); };
+    for (const type of ['release', 'approval']) {
+      expect(appendVerdict(ev(type, payloads[type]), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} }), type)
+        .toMatchObject({ ok: false, ledgerWriteMiss: true });
+    }
+    expect(existsSync(verdictLedgerPath(REPO))).toBe(false);
+    expect(appendVerdict(ev('hold', payloads.hold), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} }))
+      .toMatchObject({ ok: true, ledgerWriteMiss: true });
   });
 });
 

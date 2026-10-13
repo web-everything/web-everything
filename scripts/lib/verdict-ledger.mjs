@@ -1145,9 +1145,10 @@ export function verdictLedgerPath(repo) {
 }
 
 /** Whether a normalized ledger event CLEARS a hold (so a git miss must not leave a home row, F4). A verdict follows
- *  {@link verdictClears}; a v2 event has no `verdict`, and a ruling that is not `block` clears its finding's hold. */
+ *  {@link verdictClears}; a v2 event has no `verdict`: a review exemption, a release and an approval clear, and a
+ *  ruling that is not `block` clears its finding's hold. A home-only clearing row would suppress the caller's retry. */
 function eventClears(row) {
-  if (row?.type === EVENT_TYPES.REVIEW_EXEMPT) return true;
+  if ([EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.RELEASE, EVENT_TYPES.APPROVAL].includes(row?.type)) return true;
   if (row?.type === EVENT_TYPES.RULING) return row.ruling !== 'block';
   return verdictClears(row?.verdict);
 }

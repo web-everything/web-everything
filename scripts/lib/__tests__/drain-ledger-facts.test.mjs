@@ -91,6 +91,19 @@ describe('drain ledger facts', () => {
     expect(result).toMatchObject({ ok: false, ledgerWriteMiss: true });
     expect(calls).toEqual(['git']);
   });
+  it('a release that misses the shared store fails, writes no home row, and is retried next pass', () => {
+    const home = [event('hold', { reasonCode: 'review', holdSource: 'drain' })], calls = [];
+    const run = gitAppend => recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read: () => home,
+      append: row => appendVerdict(row, { store: 'dual', board: '/board', warn: () => {}, gitAppend,
+        homeAppend: r => { calls.push('home'); home.push(r); return { ok: true, record: r }; } }) });
+    const missed = run(() => { calls.push('git'); throw new Error('push refused'); });
+    expect(missed).toMatchObject({ ok: false, appended: { released: 0 } });
+    expect(calls).toEqual(['git']);
+    expect(home.map(e => e.type)).toEqual(['hold']);
+    calls.length = 0;
+    expect(run(() => { calls.push('git'); return { status: 'appended' }; })).toMatchObject({ ok: true, appended: { released: 1 } });
+    expect(calls).toEqual(['git', 'home']);
+  });
   it('dedupes a live drain hold but records it again after release', () => {
     const hold = event('hold', { reasonCode: 'review', holdSource: 'drain' });
     const writes = [], append = row => { writes.push(row); return { ok: true }; };
