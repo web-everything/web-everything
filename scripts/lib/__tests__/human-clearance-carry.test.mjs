@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
+  proveHumanClearanceCarry, decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
@@ -594,5 +594,21 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         expect(logs.join('')).toContain('tier contribution');
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('human clearance numbering tier', () => {
+  const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
+    headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
+  it('carries a fingerprint mismatch only with a numbering proof', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: true, reason: 'verified renames' }) });
+    expect(d).toMatchObject({ carry: true, tier: 'numbering', actor: 'chalbert' });
+    expect(buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff })).toContain('card-numbering');
+  });
+  it('keeps the original refusal when numbering also refuses', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: false, reason: 'mixed change' }) });
+    expect(d.carry).toBe(false);
+    expect(d.reason).toContain('net diff changed');
+    expect(d.reason).toContain('numbering tier: mixed change');
   });
 });

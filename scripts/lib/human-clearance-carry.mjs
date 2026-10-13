@@ -37,6 +37,7 @@
  *   `git patch-id --stable` also differs (it hashes context), so carry compares the contribution fingerprint
  *   (reviewed-contribution, identical 4b8019dbed02) and proves the move by replay: `git merge-tree` of the cleared
  *   change onto the new main base reproduces the head tree, .lane-manifest.json ignored.
+ *   Live #5025: drain card-numbering changes fingerprints; a separate numbering-only proof carries the original clearance.
  *   Setting: `review.carryEquivalence` (contribution|strict), env `WE_REVIEW_CARRY_EQUIVALENCE`.
  */
 import { readFileSync } from 'node:fs';
@@ -47,6 +48,7 @@ import {
   buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
+import { proveNumberingOnlyMove } from './numbering-carry.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const HUMAN_CLEARANCE_CARRY_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
@@ -197,7 +199,8 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
  * @returns {{carry:boolean, applicable:boolean, reason:string, fromSha?:string, toSha?:string,
  *   fingerprint?:string, actor?:string, tier?:string, mechanicalReason?:string}}
  */
-export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main', equivalence = resolveCarryEquivalenceSetting().value } = {}) {
+export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main',
+  equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove } = {}) {
   try {
     const clearance = evidence?.humanClearance;
     if (!clearance || !evidence?.headSha) return { carry: false, applicable: false, reason: 'no recorded human clearance or live head' };
@@ -210,8 +213,15 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     }
     const inputs = { enabled, equivalence, clearance, headSha: evidence.headSha, headDiff: evidence.headDiff };
     const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
-    if (!pre.carry) return { ...pre, applicable: true };
     const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
+    if (!pre.carry) {
+      if (!enabled) return { ...pre, applicable: true };
+      const proof = proveNumbering({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+      if (proof.ok) return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
+        fingerprint: liveCarryFingerprints(evidence.headDiff).diff || 'unscored', actor: clearance.actor,
+        tier: 'numbering', mechanicalReason: proof.reason, reason: proof.reason };
+      return { ...pre, applicable: true, reason: `${pre.reason}; numbering tier: ${proof.reason}` };
+    }
     const mechanical = proveMechanicalMove({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef, requireReplay: pre.tier === 'contribution' });
     const decision = decideHumanClearanceCarry({ ...inputs, mechanical });
     return { ...decision, applicable: true, ...(decision.carry ? { mechanicalReason: mechanical.reason, reason: mechanical.reason } : {}) };
@@ -237,10 +247,12 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     '',
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
-      + (tier === 'contribution'
+      + (tier === 'numbering'
+        ? `the head moved only by the drain's own card-numbering commit(s), verified mechanically (${mechanicalReason})`
+        : tier === 'contribution'
         ? "the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree"
         : `the PR's net diff vs its merge-base is byte-identical (\`${fingerprint.slice(0, 12)}\`) and the move is mechanical`)
-      + `${mechanicalReason ? ` (${mechanicalReason})` : ''}. Any substantive change still needs a fresh human approval.`,
+      + `${mechanicalReason && tier !== 'numbering' ? ` (${mechanicalReason})` : ''}. Any substantive change still needs a fresh human approval.`,
     '',
     buildReviewedShaMarker(toSha),
     buildReviewedDiffMarker(headDiffText),
