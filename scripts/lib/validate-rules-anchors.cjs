@@ -500,7 +500,7 @@ function collectItemStatuses(backlogDir) {
 function collectOpenItemIds(backlogDir) {
   const open = new Set();
   for (const [id, status] of collectItemStatuses(backlogDir)) {
-    if (status === 'resolved' || status === 'dropped') continue;
+    if (status === 'resolved' || status === 'closed' || status === 'dropped') continue;
     open.add(id);
   }
   return open;
@@ -555,7 +555,7 @@ function collectOpenItemIds(backlogDir) {
 // `path:line` prefix, once in the fix clause. That requirement is load-bearing, not a nicety — without it the
 // gate is the classic one that gets suppressed.
 
-const CLAIM_STATUS_WORDS = ['open', 'active', 'resolved', 'dropped', 'parked'];
+const CLAIM_STATUS_WORDS = ['open', 'active', 'resolved', 'closed', 'dropped', 'parked'];
 // A — the cite itself carries the status word: `#2398, resolved`, `#1073 (open, to slice)`. The trailing
 // `(?![-\w])` is guard 1 (`#086 (open-core …)` must not match).
 const CLAIM_A_RE = new RegExp(

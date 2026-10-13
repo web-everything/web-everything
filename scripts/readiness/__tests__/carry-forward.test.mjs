@@ -98,7 +98,7 @@ describe('partitionCloseout — the full one-call closeout summary', () => {
       { num: '099', status: 'carried' }, // foreign
     ];
     expect(partitionCloseout(ledger, S('010', '011'))).toEqual({
-      resolved: ['010'],
+      closed: [], resolved: ['010'],
       reopen: ['011'],
       foreign: ['099'],
     });
@@ -114,3 +114,8 @@ describe('partitionCloseout — the full one-call closeout summary', () => {
     expect(partitionCloseout(ledger, claimed).reopen).toEqual(computeReopenSet(ledger, claimed));
   });
 });
+
+ it('never reopens a closed ledger entry or counts it as delivered', () => {
+   expect(classifyEntry({ num: '010', status: 'closed' }, new Set(['010']))).toBe('closed');
+   expect(partitionCloseout([{ num: '010', status: 'closed' }], new Set(['010']))).toEqual({ resolved: [], closed: ['010'], reopen: [], foreign: [] });
+ });

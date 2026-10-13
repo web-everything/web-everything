@@ -1,3 +1,4 @@
+import { isTerminalStatus } from './backlog-status.cjs';
 /**
  * @file scripts/lib/lane-whois-core.mjs
  * @description The PURE decision core behind `scripts/lane-whois.mjs` (#3383). Everything here takes plain
@@ -108,7 +109,7 @@ export function classifyLaneVerdict({
 
   const cardsKnown = cardStatuses.length > 0;
   const prsKnown = prStates.length > 0;
-  const cardsResolved = cardsKnown && cardStatuses.every((s) => s === 'resolved');
+  const cardsResolved = cardsKnown && cardStatuses.every((s) => isTerminalStatus(s));
   const prsTerminal = prsKnown && prStates.every((s) => TERMINAL_PR_STATES.has(String(s).toLowerCase()));
   const doneSignal = cardsResolved || prsTerminal;
 

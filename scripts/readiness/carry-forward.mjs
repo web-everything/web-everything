@@ -28,6 +28,7 @@
 //   'reopen'    — un-resolved AND this run claimed it → flip active→open at closeout.
 //   'foreign'   — un-resolved but NOT claimed by this run (another session owns it) → leave untouched.
 export function classifyEntry(entry, claimedThisRun) {
+  if (entry?.status === 'closed') return 'closed';
   if (!entry || entry.status === 'resolved') return 'resolved';
   const claimedKnown = claimedThisRun && claimedThisRun.size > 0;
   if (!claimedKnown) return 'reopen'; // scope unknown → legacy: reopen every un-resolved entry
@@ -54,8 +55,8 @@ export function computeReopenSet(ledger, claimedThisRun) {
 // Full closeout partition of a ledger into { resolved, reopen, foreign } num-lists (deduped, order-preserving)
 // — the reviewable one-call summary of where every item ended up. `reopen` is exactly `computeReopenSet`.
 export function partitionCloseout(ledger, claimedThisRun) {
-  const buckets = { resolved: [], reopen: [], foreign: [] };
-  const seen = { resolved: new Set(), reopen: new Set(), foreign: new Set() };
+  const buckets = { resolved: [], closed: [], reopen: [], foreign: [] };
+  const seen = { resolved: new Set(), closed: new Set(), reopen: new Set(), foreign: new Set() };
   for (const entry of Array.isArray(ledger) ? ledger : []) {
     if (!entry) continue;
     const bucket = classifyEntry(entry, claimedThisRun);

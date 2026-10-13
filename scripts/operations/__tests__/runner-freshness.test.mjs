@@ -64,6 +64,7 @@ describe('runner freshness policy', () => {
         "agent-activity",
         "claim",
         "clear-stuck-session",
+        "close-items",
         "daemon-status",
         "dispatch-eligibility",
         "dispatch-lane",
@@ -92,6 +93,7 @@ describe('runner freshness policy', () => {
         "priority-sync",
         "record-referral-ruling",
         "record-verdict",
+        "reopen-items",
         "resolve",
         "resource-status",
         "restart-runner",
@@ -110,6 +112,9 @@ describe('runner freshness policy', () => {
         "verify",
       ]
     `);
+    for (const name of ['close-items', 'reopen-items']) {
+      expect(isReadOnlyOperation(resolveOperation(name).declaration), name).toBe(false);
+    }
     for (const name of names) {
       const { declaration } = resolveOperation(name);
       expect(requiresFreshRunner(declaration), name).toBe(name === 'verify' || !isReadOnlyOperation(declaration));

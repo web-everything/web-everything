@@ -21,6 +21,7 @@
 // (scripts/check-standards.mjs) all consume. There is no backlog.json.
 const { readdirSync, readFileSync, existsSync } = require('node:fs');
 const { join } = require('node:path');
+const { isTerminalStatus } = require('../../scripts/lib/backlog-status.cjs');
 const matter = require('gray-matter');
 const { createHash } = require('node:crypto');
 const { createBacklogIndex } = require('../../scripts/lib/backlog-index.cjs');
@@ -277,7 +278,7 @@ function deriveNotBatchableReason(item) {
 // Map keyed by BOTH the full item id and its leading num-token → owning session; `queuedNums` is a Set of
 // ready-to-merge nums (padded to width-3, matching queued-state.mjs).
 function deriveBuildState(item, { claimedBy, queuedNums } = {}) {
-  if (item.status === 'resolved') return { state: 'resolved' };
+  if (isTerminalStatus(item.status)) return { state: item.status };
   if (queuedNums && queuedNums.has(String(item.num).padStart(3, '0'))) return { state: 'queued' };
   const session = claimedBy && (claimedBy.get(item.id) || claimedBy.get(String(item.num)));
   if (session) return { state: 'claimed', session };
@@ -408,6 +409,8 @@ function buildBacklog(fileNames) {
         dateOpened: toDateString(data.dateOpened),
         dateStarted: toDateString(data.dateStarted),
         dateResolved: toDateString(data.dateResolved),
+        dateClosed: toDateString(data.dateClosed),
+        dateReopened: toDateString(data.dateReopened),
         reportDate,
         // Optional predicted touch-set (#x53zzf9) — sanitized to a clean string[] or undefined. Overrides the
         // raw `...data.scope` spread above so every consumer sees the normalized shape.
@@ -476,6 +479,10 @@ function buildBacklog(fileNames) {
     // false-surfaces as Tier A / batchable (the #2031-packed-despite-open-#2017 defect). So a dead edge is
     // kept as a synthetic blocker with a non-resolved status — it GATES (Tier C) rather than disappears.
     // The validator (check-standards.mjs) still flags the unresolvable edge for the human to fix.
+    const survivor = byNum.get(String(item.closedInto)) || items.find((it) => it.bornAs && String(it.bornAs) === String(item.closedInto));
+    if (item.status === 'closed' && survivor) {
+      item.closedIntoTarget = { id: survivor.id, num: survivor.num, title: survivor.title, url: `/backlog/${survivor.id}/` };
+    }
     item.blockers = edges.map((n) => {
       const num = String(n);
       const target = byNum.get(num);
@@ -514,7 +521,7 @@ function buildBacklog(fileNames) {
     // "Human setup" tab (backlog.njk), which gathers the residuals only a person can clear. A derived
     // boolean rather than a template-side `rejectattr` because Eleventy's Nunjucks `rejectattr` only honors
     // the attribute-presence form, not the 3-arg `equalto` test — and `where` does strict `===` on one value.
-    item.humanSetupPending = item.humanGated && item.status !== 'resolved';
+    item.humanSetupPending = item.humanGated && !isTerminalStatus(item.status);
 
     item.tier = deriveTier(item);
 
@@ -616,7 +623,7 @@ function buildBacklog(fileNames) {
     // carries no burndown points (they roll up to a parent) but still consumes a session's context, so
     // it is weighted at a nominal TASK_COST (2). A `story`/unstoried-epic uses its own `size`. The
     // budget sums this, NOT burndown `size`, so a task-heavy chain can't slip through "free".
-    item.batchCost = item.kind === 'task' ? 2
+    item.batchCost = item.status === 'closed' ? 0 : item.kind === 'task' ? 2
       : typeof item.size === 'number' ? item.size
       : undefined;
 
@@ -716,7 +723,7 @@ function buildBacklog(fileNames) {
     // How many child slices are still unresolved — drives the tile's epic-state badge. An open epic with
     // 0 open children is effectively delivered (ready to resolve); a resolved epic with >0 open children
     // is a contradiction worth flagging.
-    item.openChildCount = item.children.filter((c) => c.status !== 'resolved').length;
+    item.openChildCount = item.children.filter((c) => !isTerminalStatus(c.status)).length;
 
     // For a ready-to-slice epic, WHICH action it actually needs — so the Prioritisation bucket separates
     // the few epics that want attention from the many that are just live rollups (their work already sits

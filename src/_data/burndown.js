@@ -24,7 +24,7 @@ module.exports = function burndown() {
 
   // Only items that carry points contribute to the burndown.
   const sized = all
-    .filter((it) => typeof it.size === 'number' && FIB.has(it.size))
+    .filter((it) => it.status !== 'closed' && typeof it.size === 'number' && FIB.has(it.size))
     .map((it) => ({
       num: it.num,
       size: it.size,

@@ -15,6 +15,8 @@
  * runs against the live backlog or an in-memory fixture in tests.
  */
 
+import { CLOSED_REASONS } from '../lib/backlog-status.cjs';
+
 import { usdFromTokens, parseCostTokens, formatCostTokens } from './cost-rates.mjs';
 
 /** Match a top-level `key:` line inside the frontmatter (not indented list items). */
@@ -214,14 +216,36 @@ export function validateCodifiedIn(value) {
  * card is uncommon enough that an unintentional call should have to say so explicitly.
  *
  * @param {string} content
- * @param {'claim'|'resolve'|'release'|'unresolve'} verb
- * @param {{ today: string, graduatedTo?: string, codifiedTo?: string, as?: 'active'|'preparing', reason?: string }} opts
+ * @param {'claim'|'resolve'|'release'|'unresolve'|'close'|'reopen'} verb
+ * @param {{ today: string, graduatedTo?: string, codifiedTo?: string, as?: 'active'|'preparing', reason?: string, into?: string, by?: string }} opts
  * @returns {{ content: string } | { error: string }}
  */
-export function applyTransition(content, verb, { today, graduatedTo, codifiedTo, as, reason } = {}) {
+export function applyTransition(content, verb, { today, graduatedTo, codifiedTo, as, reason, into, by } = {}) {
   const status = readField(content, 'status');
   const DATE_ANCHORS = ['dateOpened', 'dateStarted', 'dateResolved', 'status', 'blockedBy', 'size', 'kind'];
 
+  if (verb === 'close') {
+    if (status !== 'open' && status !== 'parked') return { error: `status is "${status}", expected "open" or "parked" — in-flight and terminal items cannot close` };
+    if (!CLOSED_REASONS.has(reason)) return { error: `reason must be ${[...CLOSED_REASONS].join(' / ')}` };
+    if (reason === 'duplicate' && !String(into ?? '').trim()) return { error: 'duplicate requires into' };
+    if (into !== undefined && reason !== 'duplicate') return { error: 'into is only allowed for duplicate' };
+    if (by !== undefined && reason !== 'fixed-elsewhere') return { error: 'by is only allowed for fixed-elsewhere' };
+    let next = setFrontmatterField(content, 'status', 'closed');
+    next = setFrontmatterField(next, 'closedReason', quoteScalar(reason), { after: ['status'] });
+    if (into !== undefined) next = setFrontmatterField(next, 'closedInto', JSON.stringify(String(into).trim()), { after: ['closedReason'] });
+    if (by !== undefined) next = setFrontmatterField(next, 'closedBy', JSON.stringify(String(by)), { after: ['closedReason'] });
+    next = setFrontmatterField(next, 'dateClosed', quoteDate(today), { after: ['closedReason', 'closedInto', 'closedBy'] });
+    return { content: next };
+  }
+  if (verb === 'reopen') {
+    if (status !== 'closed') return { error: `status is "${status}", expected "closed"` };
+    if (!String(reason ?? '').trim()) return { error: 'reopen requires a non-empty reason' };
+    let next = setFrontmatterField(content, 'status', 'open');
+    for (const field of ['closedReason', 'closedInto', 'closedBy', 'dateClosed']) next = removeFrontmatterField(next, field);
+    next = setFrontmatterField(next, 'reopenedReason', JSON.stringify(String(reason).trim()), { after: ['status'] });
+    next = setFrontmatterField(next, 'dateReopened', quoteDate(today), { after: ['reopenedReason'] });
+    return { content: next };
+  }
   if (verb === 'claim') {
     if (status !== 'open') return { error: `status is "${status}", expected "open" — lost the race or already claimed` };
     const target = as === 'preparing' ? 'preparing' : 'active';
