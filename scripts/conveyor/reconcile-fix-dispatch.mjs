@@ -76,6 +76,8 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, regionOverlapDecision } from './fix-scope-policy.mjs';
+import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
@@ -113,7 +115,7 @@ import {
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
-import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
+import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
@@ -277,7 +279,8 @@ export function defaultConfirmWait(ms) {
  *   {@link resolvePrWorkUnit} — see its own docblock for the full contract.
  * @returns {{planned:Array<{itemNum:string|null,pr:number,laneRef:string,scope:string[],scopeSource:('item'|'pr-diff'),isConflict:boolean,body:string|null,headRefOid:string|null}>, refusals:Array<{pr:number,kind:string,why:string}>}}
  */
-export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope = () => [], repo = 'we', fetchItemlessDiffPaths = () => [], resolveCardScopeAtRef = () => []) {
+// includeLabels opts the live scope gate into label metadata; legacy planner callers retain their result shape.
+export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope = () => [], repo = 'we', fetchItemlessDiffPaths = () => [], resolveCardScopeAtRef = () => [], { includeLabels = false } = {}) {
   const planned = [];
   const refusals = [];
   for (const entry of Array.isArray(dispatchEntries) ? dispatchEntries : []) {
@@ -347,6 +350,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       planned.push({
         ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),
         ...(entry.labels?.includes('review:human') ? { reviewHuman: true } : {}),
+        ...(includeLabels && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
         overlapScope: fetchDiffPathsForEntry(pr).map((path) => `${prefix}:${path}`),
         itemNum: null, pr, laneRef: headRefName, scope: itemlessScope, scopeSource: 'pr-diff',
         isConflict: isConflictItemless, body: entry.body ?? null, headRefOid: entry.headRefOid ?? null,
@@ -466,6 +470,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     planned.push({
       ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),
       ...(entry.labels?.includes('review:human') ? { reviewHuman: true } : {}),
+        ...(includeLabels && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
       overlapScope: changedPaths.map((path) => `${prefix}:${path}`),
       itemNum: itemNumOut, pr, laneRef: headRefName, scope, scopeSource, isConflict, body: entry.body ?? null,
       // #xu2krte security review finding — needed by `tryResumeFix` to confirm a resume CANDIDATE actually
@@ -1786,7 +1791,7 @@ export function runReconcileFixDispatch({
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
   }
-  const { planned: plannedAll, refusals: planRefusals } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
+  const { planned: plannedAll, refusals: planRefusals } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
   // Refresh existing PR claims too: a prepare's old declared implementation scope must
   // not survive as ownership. Reuse the reconcile snapshot, then one read per missing PR.
   const prefix = profile.canonicalPrefix || repoKey;
@@ -1832,7 +1837,7 @@ export function runReconcileFixDispatch({
     idleLaneTips ??= readLaneTips(root);
     if (!idleLaneTips || idleLaneTips.get(synthetic.headRefName) !== synthetic.headRefOid) continue;
     const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
-      repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
+      repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
     planRefusals.push(...idle.refusals);
     const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
     // An idle top is only ever dispatched for its restack, so a release to ordinary dispatch is not one: say nothing of it.
@@ -1847,12 +1852,51 @@ export function runReconcileFixDispatch({
   // a clock saved only at the end of the pass restarts on every pass that dies early, and the hold never ages out.
   if (clearUnheldHolds(stacks, heldTops)) restackMemoryChanged = true;
   if (restackMemoryChanged && writeStacks) { writeStacks(root, nextRemembered(stacks)); restackMemoryChanged = false; }
-  // Serialize against live claims and higher-ranked waiters, including blocked ones.
+  // Resolve configurable live holds; the public gate without policy retains historical waiter semantics.
   let urgentPrs = new Set();
   try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
+  const scopePolicy = resolveFixScopePolicy();
+  const priorityPrs = resolveOperatorPriorityPrs().prs;
+  // As with net-scope, unit dispatch runs must not contact origin. The reader has its own hermetic git tests.
+  const regionReader = isUnderTestEnv() ? null : createRegionReader({ root });
+  const holderEntries = new Map();
+  for (const [pr, e] of [
+    ...(reconciled.openPrFiles ?? []).map(e => [Number(e.pr), e]),
+    ...(reconciled.dispatch ?? []).map(e => [Number(e.prNumber), e]),
+    ...stackOrder.planned.map(e => [Number(e.pr), e]),
+  ]) {
+    const previous = holderEntries.get(pr);
+    holderEntries.set(pr, { ...previous, ...e, headRefOid: e.headRefOid || previous?.headRefOid, labels: e.labels ?? previous?.labels });
+  }
+  const observedHeads = new Map();
+  const headFor = e => {
+    const pr = Number(e.pr);
+    const sha = e.claim?.meta?.headSha || e.headRefOid || holderEntries.get(pr)?.headRefOid;
+    if (sha) return sha;
+    if (!observedHeads.has(pr)) observedHeads.set(pr, readPrHeads(root, [pr]).get(pr) ?? null);
+    return observedHeads.get(pr);
+  };
+  const regionOverlap = (candidate, holder, sharedFile) => {
+    // Only identical file entries can use regions. Directory/ancestor scopes remain exclusive.
+    if (!regionReader) return { overlap: true, why: 'region reader unavailable', failedClosed: true };
+    if (!holder.pr || !(candidate.overlapScope ?? candidate.scope)?.includes(sharedFile)
+      || !holder.scope?.includes(sharedFile) || sharedFile.endsWith('/')) {
+      return { overlap: true, why: 'build or directory scope requires file hold', failedClosed: true };
+    }
+    const file = sharedFile.replace(/^[^:]+:/, '');
+    const a = headFor(candidate), b = headFor(holder);
+    return regionOverlapDecision({ file, hunksA: regionReader.hunksFor(a, candidate.pr),
+      hunksB: regionReader.hunksFor(b, holder.pr), margin: scopePolicy.value.regionMarginLines,
+      mergeConflict: a && b ? regionReader.mergeConflicts(a, b) : null });
+  };
   const scopeFilter = filterFixesByInFlightScope(
-    stackOrder.planned, listBuildClaims(), claims, { urgentPrs, stackAbove: stackOrder.stackAbove },
+    stackOrder.planned, listBuildClaims(), claims, {
+      urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
+    },
   );
+  for (const d of scopeFilter.scopeDecisions ?? []) {
+    console.error(`reconcile-fix-dispatch: fix-scope PR #${d.pr} ${d.decision === 'admitted' ? 'admitted past' : 'blocked by'} #${d.holder} — ${d.rule}: ${d.why} [${d.setting}]`);
+  }
   const planned = scopeFilter.planned;
   const refusals = [...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
@@ -2380,10 +2424,25 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   // `null` = no exemption (the behaviour before the card).
   rebaseExempt = defaultRebaseExempt,
   stackAbove = new Map(),
+  policy = null, regionOverlap = null, priorityPrs = new Set(), holderEntries = new Map(),
 } = {}) {
   const accepted = [];
   const refusals = [];
   const picked = [];
+  const released = [];
+  const scopeDecisions = [];
+  const settings = policy?.value;
+  const priority = e => settings?.priorityBypass && (priorityPrs.has(Number(e.pr)) || e.mainFix === true
+    || (e.labels ?? []).some(l => settings.fastTrackLabels.includes(typeof l === 'string' ? l : l.name)));
+  const decide = (entry, holder, rule, overlap, why, failedClosed) => {
+    scopeDecisions.push({ pr: entry.pr, holder: holder.pr ?? holder.num, decision: overlap ? 'blocked' : 'admitted', rule, why,
+      setting: `fixScope.${rule}=${settings[rule]} (${policy.sources?.[rule] ?? 'standard'})`,
+      ...(failedClosed ? { failedClosed: true } : {}) });
+  };
+  const beatTime = c => Date.parse(c.heartbeatAt ?? c.meta?.claimedAt);
+  const expired = c => Number.isFinite(beatTime(c)) && now - beatTime(c)
+    > (c.ttlMinutes ?? c.meta?.ttlMinutes ?? DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES) * 60000;
+  const stalled = c => now - (c.claim ? beatTime(c.claim) : Date.parse(c.waitingSince)) > settings.stalledAfterMinutes * 60000;
   const acceptedIds = new Set();
   const agedAdmits = [];
   const waitingTime = (entry) => {
@@ -2402,6 +2461,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   const queue = [...planned].sort((a, b) => {
     const ar = rankByPr.get(a.pr), br = rankByPr.get(b.pr);
     return Number(Boolean(br.urgent)) - Number(Boolean(ar.urgent))
+      || Number(Boolean(priority(b))) - Number(Boolean(priority(a)))
       || Number(br.aged) - Number(ar.aged)
       || (!ar.aged ? br.score - ar.score : 0)
       || waitingTime(a) - waitingTime(b)
@@ -2417,23 +2477,68 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const inFlight = [
       ...buildClaims
         .filter((c) => !(entry.itemNum != null && String(c.meta?.num) === String(entry.itemNum)))
-        .map((c) => ({ id: `build #${c.meta?.num}`, scope: c.meta?.scope })),
+        .map((c) => ({ id: `build #${c.meta?.num}`, num: c.meta?.num, scope: c.meta?.scope, build: true })),
       ...fixClaims
         .filter((c) => c.meta?.pr !== entry.pr && !above.has(Number(c.meta?.pr)))
-        .map((c) => ({ id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope })),
+        .map((c) => ({ ...holderEntries.get(Number(c.meta?.pr)), ...c.meta, pr: Number(c.meta?.pr), id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope, claim: c })),
       ...picked.filter(c => !above.has(c.pr)),
     ];
-    let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
+    if (settings?.holdMode === 'active-session') {
+      for (const c of released.filter(c => !above.has(c.pr))) {
+        if (overlapsInFlight(scopeFor(entry), [c])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
+      }
+    }
+    let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => {
+      if (!overlapsInFlight(scopeFor(entry), [c])) return false;
+      if (!settings) return true; // Public API compatibility: historical policy when omitted.
+      if (settings.holdMode === 'active-session' && c.claim && expired(c.claim)) {
+        decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
+      }
+      let observation = { overlap: true, why: 'shared file held' };
+      if (settings.overlapGranularity === 'region') {
+        const results = [];
+        for (const file of scopeFor(entry) ?? []) {
+          for (const held of c.scope ?? []) {
+            if (!overlapsInFlight([file], [{ scope: [held] }])) continue;
+            let result = { overlap: true, why: 'region observation unavailable; retaining file hold', failedClosed: true };
+            if (!c.build && file === held && !file.endsWith('/') && regionOverlap) {
+              try { result = regionOverlap(entry, c, file) ?? result; } catch { /* fail closed */ }
+            }
+            results.push(result);
+          }
+        }
+        observation = results.find(r => r.overlap) ?? results[0] ?? { overlap: true, why: 'unknown scope', failedClosed: true };
+        if (!observation.overlap) {
+          decide(entry, c, 'overlapGranularity', false, observation.why); return false;
+        }
+      }
+      if (priority(entry) && !acceptedIds.has(c.id) && (!priority(c) || stalled(c))) {
+        decide(entry, c, 'priorityBypass', false, stalled(c) ? 'priority candidate passes stalled holder' : 'priority candidate passes non-priority holder');
+        return false;
+      }
+      decide(entry, c, settings.priorityBypass && priority(entry) ? 'priorityBypass' : 'overlapGranularity', true,
+        acceptedIds.has(c.id) ? 'overlapping fix already accepted this pass' : observation.why, observation.failedClosed);
+      return true;
+    });
     // #3881 — aging override: past the bound, only a fix ACCEPTED earlier in this same pass still blocks.
     const waitedMinutes = Math.floor((now - waitingTime(entry)) / 60_000);
     const agedOut = maxWaitMinutes != null && blockers.length > 0 && waitedMinutes >= maxWaitMinutes;
     const bypassed = agedOut ? blockers.filter((c) => !acceptedIds.has(c.id)).map((c) => c.id) : [];
-    if (agedOut) blockers = blockers.filter((c) => acceptedIds.has(c.id));
+    if (agedOut) {
+      if (settings) for (const d of scopeDecisions.filter(d => d.pr === entry.pr && d.decision === 'blocked')) {
+        if (blockers.some(c => (c.pr ?? c.num) === d.holder && !acceptedIds.has(c.id))) {
+          d.decision = 'admitted'; d.why += '; existing aging override releases this hold';
+        }
+      }
+      blockers = blockers.filter((c) => acceptedIds.has(c.id));
+    }
     const hit = overlapsInFlight(scopeFor(entry), blockers);
-    // Even a blocked waiter retains its place: a lower-ranked PR must not bypass it
-    // through a second file in its scope. Deduplicate claims for the same fixer.
+    // Only pr-lifetime retains refused waiters. Accepted fixes hold in either mode.
+    // Deduplicate claims for the same fixer when formatting the queue position.
     const ahead = [...new Set(blockers.map((c) => c.id))];
-    picked.push({ pr: entry.pr, id: `fix PR #${entry.pr}`, scope: scopeFor(entry) });
+    const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: scopeFor(entry) };
+    if (hit && settings?.holdMode === 'active-session') released.push(waiter);
+    else picked.push(waiter);
     if (hit) {
       refusals.push({
         pr: entry.pr, kind: 'scope-overlap',
@@ -2453,5 +2558,5 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     }
     accepted.push(entry);
   }
-  return { planned: accepted, refusals, ranks: orderedRanks, ...(agedAdmits.length ? { agedAdmits } : {}) };
+  return { planned: accepted, refusals, ranks: orderedRanks, ...(policy ? { scopeDecisions } : {}), ...(agedAdmits.length ? { agedAdmits } : {}) };
 }
