@@ -122,6 +122,9 @@ export function probationWorkerDetachedProvider(request, {
   const kind = String(request?.launchKind ?? '');
   const sessionSlug = String(request?.sessionSlug ?? '').trim();
   const num = normNum(request?.num);
+  if (request?.groupMembers?.length && (kind !== 'prepare-item' || worker?.taskType !== 'prepare')) {
+    throw notApplied('dispatch-lane: grouped probation requests require prepare-item in prepare mode');
+  }
   if (!worker?.id || !worker?.provider || !worker?.model) throw notApplied('dispatch-lane: refusing a probation launch with no probation worker');
   if (!sessionSlug) throw notApplied(`dispatch-lane: refusing a probation '${kind}' launch with no session slug`);
 

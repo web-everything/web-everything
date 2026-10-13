@@ -822,6 +822,9 @@ describe('streamed worker decline regression', () => {
 
 
 describe('standalone prepare', () => {
+  it.each(['doc-fix', 'bugfix', 'test-fix'])('refuses %s with group members before accessing the lane', async taskType => {
+    await expect(runProbationBuild({ ...args(), taskType, groupMembers: ['4292'] }, {})).rejects.toThrow(/group.*prepare/i);
+  });
   const path = 'backlog/4291-probation-launcher.md';
   const prepared = ITEM_RAW + '\n## Design\nConcrete preparation.\n## MVP\nBounded change.\n## Test plan\nReplay the failure.\n## Proof plan\nProbe the CLI.\n';
   function prepareIo(options = {}) {
@@ -854,11 +857,11 @@ describe('standalone prepare', () => {
   it('parses grouped prepare members', () => {
     expect(parseArgs(['--num=4291', '--worker=codex', '--taskType=prepare', '--group-members=4292,4293']).groupMembers).toEqual(['4292', '4293']);
   });
-  it.each(['prepared', 'declined', 'tampered', 'stamp-failed', 'unchanged', 'missing-sections', 'invalid-edge', 'multiple', 'checker-rejected', 'missing-size', 'missing-test-scope', 'over-envelope', 'outside-lease'])('isolates a %s member in one lead commit and PR', async mode => {
+  it.each(['prepared', 'dispatch-lease', 'declined', 'tampered', 'stamp-failed', 'unchanged', 'missing-sections', 'invalid-edge', 'multiple', 'checker-rejected', 'missing-size', 'missing-test-scope', 'over-envelope', 'outside-lease'])('isolates a %s member in one lead commit and PR', async mode => {
     const { io, calls } = prepareIo();
     const memberPath = 'backlog/4292-member.md';
     const initialRaw = mode === 'missing-size' ? ITEM_RAW.replace('status: open', 'kind: task\nstatus: open') : ITEM_RAW;
-    const accepted = mode === 'prepared' || mode === 'multiple';
+    const accepted = mode === 'prepared' || mode === 'multiple' || mode === 'dispatch-lease';
     const requested = mode === 'multiple' ? ['4292', '4293'] : ['4292'];
     const cards = new Map([
       ['4291', { path, raw: initialRaw, scope: ['we:docs/probation/probation.md'], slug: 'lead' }],
@@ -893,7 +896,27 @@ describe('standalone prepare', () => {
     };
     io.readCommittedCard = (_d, p) => [...cards.values()].find(c => c.path === p).raw;
     io.writePrBody = (_d, body) => { bodies.push(body); return '/tmp/body'; };
-    const result = await runProbationBuild({ ...prepareArgs(), scope: mode === 'outside-lease' ? [`we:${path}`] : [], worker: mode === 'checker-rejected' ? { ...codex, checker: 'codex' } : codex, groupMembers: requested }, io);
+    let scope = mode === 'outside-lease' ? [`we:${path}`] : [];
+    if (mode === 'dispatch-lease') {
+      const { readTick } = await import('../dispatch-lane-io.mjs');
+      const { shapeDispatchRead } = await import('../dispatch-lane.mjs');
+      const { probationWorkerDetachedProvider } = await import('../dispatch-providers/probation-worker.mjs');
+      const raw = readTick({ num: '4291', groupMembers: requested,
+        runNode: () => JSON.stringify({ decisions: { spawnPrepareItems: [{ num: '4291', lane: 1 }] }, nextState: {} }),
+        readText: () => 'Prepare {{ITEM_NUM}} {{GROUP_MEMBERS}}',
+        loadItems: () => [{ num: '4291', slug: 'probation-launcher' }, { num: '4292', slug: 'member' }],
+        listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }),
+        listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+      });
+      const shaped = shapeDispatchRead(raw, { num: '4291', groupMembers: requested });
+      let argv;
+      probationWorkerDetachedProvider({ ...shaped, probationWorker: { ...codex, taskType: 'prepare' } }, {
+        spawnDetached: a => { argv = a; return { pid: 1 }; }, logPathFor: () => '/tmp/unused',
+      });
+      scope = argv.find(a => a.startsWith('--scope=')).slice('--scope='.length).split(',');
+      expect(scope).toContain(`we:${memberPath}`);
+    }
+    const result = await runProbationBuild({ ...prepareArgs(), scope, worker: mode === 'checker-rejected' ? { ...codex, checker: 'codex' } : codex, groupMembers: requested }, io);
     expect(result).toMatchObject({ outcome: 'opened-pr', groupMembers: requested, groupDropped: accepted ? [] : ['4292'] });
     expect(tasks[0]).toContain('## Also prepare #4292');
     expect(tasks[0]).toContain('# Prepare 4292: ' + memberPath);

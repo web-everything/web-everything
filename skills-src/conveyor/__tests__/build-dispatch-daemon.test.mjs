@@ -3277,6 +3277,15 @@ describe('grouped BUILD daemon ticks', () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-')); log = vi.spyOn(console, 'error').mockImplementation(() => {}); });
   afterEach(() => { vi.unstubAllEnvs(); log.mockRestore(); rmSync(root, { recursive: true, force: true }); });
 
+  it('does not group a lead routed to a probation build worker', async () => {
+    const effects = fixture();
+    effects.predictRoute = async () => ({ executor: 'codex', groupCapable: false });
+    const tick = await runBuildDispatchTick({ live: true, policy, effects });
+    expect(tick.grouping.groups).toEqual([]);
+    expect(effects.listClaims()).toHaveLength(1);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+  });
+
   it('groups minimal conveyor queue rows from card frontmatter, loading once per tick', async () => {
     const queue = rows.map(({ num, scope }) => ({ num, scope, preparedDate: '2026-10-13' }));
     const effects = fixture({ queue });
@@ -3490,6 +3499,19 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps agent and unknown prepare routes single-card before claiming members', async () => {
+    for (const route of [{ groupCapable: false }, { error: 'unknown route' }, null]) {
+      const effects = fixture();
+      effects.predictRoute = vi.fn(async () => route);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.groups).toEqual([]);
+      expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(1);
+      expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
+      expect(effects.predictRoute).toHaveBeenCalledWith('7201', rows[0].scope, 'prepare-item');
+      effects.releasePrepareClaim({ num: '7201' });
+    }
+  });
+
   it('keeps per-card prepare dispatch available when grouping cards cannot load', async () => {
     const effects = fixture({ queue: rows.slice(0, 4) });
     effects.loadGroupingCards = vi.fn(() => { throw new Error('backlog unavailable'); });
@@ -3537,6 +3559,20 @@ describe('grouped PREPARE daemon ticks', () => {
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(tick.prepare.inFlight).toEqual(['7201']);
     expect(effects.releasePrepareClaim).not.toHaveBeenCalled();
+  });
+
+  it('retains stale member claims until their replacement stamp lands', async () => {
+    const effects = fixture({ claims: [{ ...rows[1], groupLead: '7201', replacesStamp: { preparedDate: '2026-10-01', preparedAgainstSha: null } }], busy: [{ num: '7201' }], spawns: [rows[1]] });
+    let stamp = '2026-10-01';
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: num === '7202' ? stamp : null });
+    for (let i = 0; i < 2; i++) {
+      await runBuildDispatchTick({ live: true, effects });
+      expect(effects.releasePrepareClaim).not.toHaveBeenCalled();
+      expect(effects.dispatch).not.toHaveBeenCalled();
+    }
+    stamp = '2026-10-13';
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'prepared on main', released: true });
   });
 
   it('stamped members retire even while the lead remains tracked', async () => {

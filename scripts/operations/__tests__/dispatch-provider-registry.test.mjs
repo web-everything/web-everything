@@ -31,6 +31,33 @@
 
 import { describe, it, expect } from 'vitest';
 
+describe('group member launch capability contract', () => {
+  it.each(LAUNCH_KINDS)('%s direct agent provider refuses group members', launchKind => {
+    expect(() => defaultClaudeProvider({ launchKind, groupMembers: ['124'] }, {
+      spawnAgent: () => { throw new Error('must not spawn'); },
+    })).toThrow(/group/i);
+  });
+  it.each(LAUNCH_KINDS.flatMap(kind => ['agent', 'mechanical', 'probation'].map(route => [kind, route])))('%s via %s delivers members or refuses before launch', (launchKind, route) => {
+    const request = { launchKind, groupMembers: ['124', '125'], num: '123', lane: 1, sessionSlug: 'group',
+      ...(route === 'probation' ? { probationWorker: { id: 'codex', provider: 'codex', model: 'model', taskType: launchKind === 'prepare-item' ? 'prepare' : launchKind === 'ci-heal' ? 'ci-heal' : 'doc-fix' } } : {}),
+    };
+    const launched = [];
+    const deliver = r => { launched.push(r); return 'started'; };
+    const io = { agent: deliver, probation: deliver, probationLaunch: route === 'probation' ? 'on' : 'off',
+      modes: { [launchKind]: route === 'mechanical' ? 'mechanical' : 'agent' }, scriptExists: () => true,
+      registry: { [launchKind]: { provider: deliver } },
+    };
+    const capable = (launchKind === 'prepare-item' && route === 'probation') || (launchKind === 'build' && route === 'mechanical');
+    if (capable) {
+      expect(routeDispatchProvider(request, io)).toBe('started');
+      expect(launched[0].groupMembers).toEqual(['124', '125']);
+    } else {
+      expect(() => routeDispatchProvider(request, io)).toThrow(/group/i);
+      expect(launched).toEqual([]);
+    }
+  });
+});
+
 import {
   DISPATCH_PROVIDER_REGISTRY,
   dispatchModeFor,
@@ -42,7 +69,7 @@ import { FIX_RUN_SCRIPT, fixDetachedProvider } from '../dispatch-providers/fix.m
 import { CI_HEAL_RUN_SCRIPT, ciHealDetachedProvider } from '../dispatch-providers/ci-heal.mjs';
 import { PREPARE_SCOPE_RUN_SCRIPT, prepareScopeDetachedProvider } from '../dispatch-providers/prepare.mjs';
 import { PREPARE_DECISION_RUN_SCRIPT, prepareDecisionDetachedProvider } from '../dispatch-providers/prepare-decision.mjs';
-import { routeDispatchProvider } from '../dispatch-lane-io.mjs';
+import { routeDispatchProvider, defaultClaudeProvider } from '../dispatch-lane-io.mjs';
 import { LAUNCH_KINDS } from '../dispatch-lane.mjs';
 
 /** The launch kinds with no registry row at all (each one's brief-driven agent dispatches its own

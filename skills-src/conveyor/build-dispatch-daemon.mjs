@@ -389,7 +389,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (prepareRows.some(r => normNum(r.num) === num && prepareIsLive(r))) continue;
     try {
       const claim = prepareClaims.find(c => normNum(c.meta.num) === num);
-      const status = await effects.readPrepareStatus?.({ num, claimedAt: claim?.meta?.claimedAt, replacesStamp: claimReplacesStamp(num) });
+      let status = await effects.readPrepareStatus?.({ num, claimedAt: claim?.meta?.claimedAt, replacesStamp: claimReplacesStamp(num) });
+      // Apply the stamp identity contract even to injected readers: the old stamp is not completion.
+      if (status?.preparedDate && claimReplacesStamp(num) !== undefined
+        && !stampCoversClaim(status.preparedDate, claim?.meta?.claimedAt,
+          { replaces: claimReplacesStamp(num), preparedAgainstSha: status.preparedAgainstSha })) {
+        status = { ...status, preparedDate: null };
+      }
       prepareStatus.set(num, status);
       if (!status?.preparedDate) continue;
       for (const r of prepareRows.filter(r => normNum(r.num) === num && r.row)) {
@@ -698,7 +704,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     groupingCardsLoaded = false;
     console.error(`build-dispatch-daemon: grouping card load failed; grouping disabled for this tick: ${String(e?.message || e).split('\n')[0]}`);
   }
-  const groupedPlan = planBuildGroups({ picks: plan.dispatch, pool: safePool,
+  // A probation BUILD only delivers its lead; failed route predictions also fail closed for grouping.
+  const groupCapable = c => !effects.predictRoute || (!c.route?.error && c.route?.groupCapable === true);
+  const groupedPlan = planBuildGroups({ picks: plan.dispatch.filter(groupCapable), pool: safePool.filter(groupCapable),
     rowsByNum: groupRowsByNum,
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings && groupingCardsLoaded }, exclude: groupDropped });
 
@@ -1084,7 +1092,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepareBusy.delete(num); // A member claim never consumes a worker slot, including after restart.
     const leadTracked = prepareBusy.has(lead) || prepareClaims.some(c => c.meta?.groupLead == null
       && normNum(c.meta.num) === lead && !finishedPrepares.has(lead));
-    const why = prepareStatus.get(num)?.preparedDate ? 'prepared on main' : !leadTracked ? 'group-lead-gone' : null;
+    const status = prepareStatus.get(num);
+    const replaced = status?.preparedDate && (claim.meta.replacesStamp === undefined
+      || stampCoversClaim(status.preparedDate, claim.meta.claimedAt,
+        { replaces: claim.meta.replacesStamp, preparedAgainstSha: status.preparedAgainstSha }));
+    const why = replaced ? 'prepared on main' : !leadTracked ? 'group-lead-gone' : null;
     if (why) {
       if (live) effects.releasePrepareClaim({ num });
       prepare.retired.push({ num, why, released: live });
@@ -1103,8 +1115,17 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(h => ['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
   const otherPrepareHolds = new Set((admission.held ?? [])
     .filter(h => !['needs-prepare', 'prepare-stale'].includes(h.reason)).map(h => normNum(h.num)));
+  const prepareGroupPicks = [];
+  if (!fallback && groupingSettings.groupSmallFindings && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group') {
+    for (const pick of prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num)))) {
+      try {
+        const route = await effects.predictRoute?.(normNum(pick.num), scopeByNum.get(normNum(pick.num)) ?? [], 'prepare-item');
+        if (!effects.predictRoute || (!route?.error && route?.groupCapable === true)) prepareGroupPicks.push(pick);
+      } catch { /* An unknown prepare route cannot own grouped members. */ }
+    }
+  }
   const prepareGroupPlan = planBuildGroups({
-    picks: prepareSpawns.filter(p => prepareAvailable(p.num) && !otherPrepareHolds.has(normNum(p.num))),
+    picks: prepareGroupPicks,
     pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
     rowsByNum: groupRowsByNum,
@@ -1394,9 +1415,10 @@ export async function loadRouteInputs(root = REPO_ROOT) {
 export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInputs = () => loadRouteInputs() } = {}) {
   let inputsPromise;
   const getInputs = () => inputsPromise ??= Promise.resolve().then(loadInputs);
-  const predictor = async (num, scope) => {
+  const predictor = async (num, scope, launchKind = 'build') => {
     let inputs;
     try { inputs = await getInputs(); } catch { inputs = null; }
+    if (launchKind !== 'build') return predict(num, scope, { ...(inputs ?? {}), launchKind });
     return inputs ? predict(num, scope, inputs) : predict(num, scope);
   };
   // Keep the rejection for grouping to fail closed rather than retrying the failed shared load.
@@ -1825,7 +1847,7 @@ export async function cliRouteHeldItems(plan) {
 /** Predict the executor for admission and the dry run — the SAME `decideDispatchRoute` dispatch-lane calls, with the
  *  item's `deliveryAgent:` override honoured as the mechanical build mode would. Admission prediction: dispatch-lane
  *  recomputes it at dispatch time. */
-export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = process.env, loadItems, scorecards, sizePolicy, promotions } = {}) {
+export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = process.env, loadItems, scorecards, sizePolicy, promotions, launchKind = 'build' } = {}) {
   try {
     const { resolveDispatchRoute: decideDispatchRoute } = await import('../../scripts/lib/dispatch-routing-policy-io.mjs');
     const io = await import('../../scripts/operations/dispatch-lane-io.mjs');
@@ -1835,18 +1857,20 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
     if (!item) throw new Error(`cannot predict route: missing item #${num}`);
     const { dispatchModesFromEnv } = await import('../../scripts/operations/dispatch-provider-registry.mjs');
     const mechanical = dispatchModesFromEnv({ ...env, WE_BUILD_DISPATCH_MODE: env.WE_BUILD_DISPATCH_MODE || 'mechanical' }).build === 'mechanical';
-    const override = mechanical ? readItemDeliveryAgentOverride(num, { root }) : null;
+    const override = mechanical && launchKind === 'build' ? readItemDeliveryAgentOverride(num, { root }) : null;
     const r = decideDispatchRoute({
-      kind: 'build', cause: null, scopePaths: item.scope, size: item.size ?? null,
+      kind: launchKind, cause: null, scopePaths: item.scope, size: item.size ?? null,
       risk: item.risk ?? null, tags: item.tags ?? [],
-      taskKey: { storyRef: num, round: 1, taskId: 'build' }, ...(override || {}),
+      taskKey: { storyRef: num, round: 1, taskId: launchKind }, ...(override || {}),
     }, {
       scorecards: scorecards ?? io.defaultReadScorecards(), sizePolicy: sizePolicy ?? io.defaultReadSizePolicy({ root }), promotions: promotions ?? io.defaultReadPromotions({ root }),
     });
-    const probation = probationLaunchDecision({ launchKind: 'build', probationWorker: r.probationWorker }, probationLaunchFromEnv(env));
+    const probation = probationLaunchDecision({ launchKind, probationWorker: r.probationWorker }, probationLaunchFromEnv(env));
     const executor = probation.launch ? r.probationWorker.executor : r.executed;
     return {
       executor,
+      groupCapable: launchKind === 'prepare-item' ? probation.launch
+        : !probation.launch && (r.policyRoute ? r.policyRoute.provider === 'codex' : mechanical),
       marker: override?.deliveryAgent ?? null,
       taskType: r?.taskType ?? null,
       routed: r?.routed ?? null,

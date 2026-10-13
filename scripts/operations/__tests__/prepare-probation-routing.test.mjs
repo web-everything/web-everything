@@ -5,6 +5,12 @@ import { routeDispatchProvider } from '../dispatch-lane-io.mjs';
 import { probationWorkerDetachedProvider } from '../dispatch-providers/probation-worker.mjs';
 
 describe('prepare probation routing', () => {
+  it.each(['build', 'ci-heal', 'fix', 'investigate', 'prepare-decision'])('%s refuses grouped probation requests before spawning', launchKind => {
+    const spawnDetached = () => { throw new Error('must not spawn'); };
+    expect(() => probationWorkerDetachedProvider({ launchKind, num: '123', pr: '42', sessionSlug: 'group',
+      groupMembers: ['124', '125'], probationWorker: { id: 'codex', provider: 'codex', model: 'model', taskType: 'doc-fix' },
+    }, { spawnDetached })).toThrow(/group.*prepare/i);
+  });
   it('routes prepare-item to Codex with Sonnet fallback and launches prepare mode', () => {
     const route = decideDispatchRoute({ kind: 'prepare-item', scopePaths: ['we:scripts/lib/example.mjs'] });
     expect(route).toMatchObject({ tier: 'sonnet', probationWorker: { id: 'codex', taskType: 'prepare' } });

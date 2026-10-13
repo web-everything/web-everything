@@ -288,6 +288,9 @@ export async function runProbationBuild(args, io) {
   if (!['doc-fix', 'bugfix', 'test-fix', 'prepare'].includes(taskType)) throw new Error('taskType must be doc-fix or bugfix or test-fix or prepare');
   if (!num || !session || !worker?.id) throw new Error('probation-build-run: --num, --session and --worker are required');
   const preparing = taskType === 'prepare';
+  if (!preparing && parseGroupMembers(args.groupMembers ?? []).length) {
+    throw new Error('probation-build-run: grouped requests require prepare mode');
+  }
   const prepareAutoSize = preparing && (io.preparePolicy ?? readPreparePolicy()).autoSize;
   if (preparing && !['codex', 'antigravity-gemini'].includes(worker.id)) throw new Error('prepare requires codex or antigravity-gemini');
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);

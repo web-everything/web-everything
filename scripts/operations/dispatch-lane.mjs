@@ -1097,7 +1097,20 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   // so that is the scope the lane ends up holding; this value is what the run record says was declared. The
   // card (#3165) sets one rule for both prepare kinds, so this is recorded rather than silently widened.
   const repairsExistingPr = launchKind === 'fix' || launchKind === 'ci-heal';
-  const scope = launchKind === 'build' || repairsExistingPr ? itemScope : [`we:${specPath}`];
+  const scope = launchKind === 'build' || repairsExistingPr ? [...itemScope] : [`we:${specPath}`];
+  if (launchKind === 'prepare-item' || launchKind === 'build') {
+    for (const member of groupMembers) {
+      const card = raw.groupItems?.find(card => String(card?.num) === member);
+      if (!card || !/^backlog\/[\w-]+\.md$/.test(card.specPath ?? '')) {
+        throw new Error(`dispatch-lane.read: cannot resolve group member #${member} card path`);
+      }
+      if (launchKind === 'prepare-item') scope.push(`we:${card.specPath}`);
+      else {
+        if (!Array.isArray(card.scope) || !card.scope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
+        for (const path of card.scope) if (!scope.includes(path)) scope.push(path);
+      }
+    }
+  }
   if (blocked('scope', (launchKind === 'build' || repairsExistingPr) && !itemScope.length, { launchKind, scope })) {
     // Unreachable through the core (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and auto-prepares
     // it, so it never reaches `spawnBuilds`, `spawnFixes` or `spawnCiHeals`) — refused anyway, because an empty
@@ -1291,7 +1304,7 @@ export function dispatchLaneOperation({ readTick } = {}) {
     read: compute({
       reads: ['input.groupMembers', 'input.num', 'input.bookkeepingFile', 'input.tickFile', 'input.expectedWithinMinutes'],
       fn: (view) => shapeDispatchRead(
-        readTick({ num: view.input.num, bookkeepingFile: view.input.bookkeepingFile, tickFile: view.input.tickFile }),
+        readTick({ num: view.input.num, bookkeepingFile: view.input.bookkeepingFile, tickFile: view.input.tickFile, groupMembers: view.input.groupMembers }),
         { num: view.input.num, expectedWithinMinutes: view.input.expectedWithinMinutes, groupMembers: view.input.groupMembers },
       ),
     }),

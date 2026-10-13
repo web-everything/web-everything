@@ -4409,6 +4409,27 @@ describe('grouped delivery contracts', () => {
     expect(body).not.toContain('Resolves #1235, #1236');
     expect(body).toContain('Dropped from group: #1236 — cannot deliver');
   });
+  it('redacts claim failures and agent drop reasons before publication and commits', async () => {
+    const { claimGroupMembers, processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const reason = 'busy /Users/operator/private/run.mjs `secret` @someone [link](https://example.com)\u2028stderr';
+    const claimed = claimGroupMembers({ groupMembers: ['1235'], sessionSlug: 's', lanePath: '/lane' }, {
+      run: () => { throw new Error(reason); },
+    });
+    const body = buildPrBody({ item: '1234', groupMembers: ['1235'], ...claimed });
+    expect(body).not.toContain('/Users/operator');
+    expect(body).not.toContain('@someone');
+    expect(body).not.toContain('[link]');
+    const lane = mkdtempSync(join(tmpdir(), 'group-sanitize-'));
+    try {
+      writeFileSync(join(lane, '.delivery-group-drop'), `1235: ${reason}\n`);
+      const run = vi.fn(() => '');
+      const dropped = processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, { run, loadItems });
+      const message = run.mock.calls.find(([cmd, args]) => cmd === 'git' && args[0] === 'commit')[1];
+      expect(message.join(' ')).not.toContain('/Users/operator');
+      expect(message.join(' ')).not.toContain('@someone');
+      expect(dropped.groupDropReasons['1235']).toBe(claimed.groupDropReasons['1235']);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
   it('claims each member and records a failed claim without abandoning siblings', async () => {
     const { claimGroupMembers } = await import('../deliver-item-wrapper.mjs');
     const run = vi.fn((cmd, args) => { if (args.includes('--ref=1236')) throw new Error('busy'); return '{}'; });

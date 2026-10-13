@@ -95,6 +95,7 @@
  */
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
+import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
 import { randomUUID } from 'node:crypto';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -706,11 +707,18 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
 // See that module's own docblocks for the full #3627 live-run reasoning behind both functions.
 
 /** Claim members in the same lane as the lead; a refused member stays out of the agent brief. */
+export function sanitizeGroupDropReason(reason) {
+  // Normalize before redaction so full-width paths and invisible separators cannot hide local paths.
+  const normalized = String(reason ?? '').normalize('NFKC').replace(/\p{Cf}/gu, '');
+  return sanitizeHoldReason(normalized, { max: 600 })
+    .replace(/@/g, '＠').replace(/[\[\]*_~!\\]/g, '').replace(/`/g, "'") || 'not delivered';
+}
+
 export function claimGroupMembers({ groupMembers = [], sessionSlug, lanePath }, { run: runFn = run } = {}) {
   const claimed = [], groupDropped = [], groupDropReasons = {};
   for (const item of groupMembers) {
     try { claimItem({ item, sessionSlug, lanePath }, { run: runFn }); claimed.push(item); }
-    catch (error) { groupDropped.push(item); groupDropReasons[item] = String(error.message ?? error); }
+    catch (error) { groupDropped.push(item); groupDropReasons[item] = sanitizeGroupDropReason(error.message ?? error); }
   }
   return { groupMembers: claimed, groupDropped, groupDropReasons };
 }
@@ -721,11 +729,11 @@ export function processGroupDrops({ lanePath, groupMembers = [] }, { run: runFn 
   const groupDropped = [], groupDropReasons = {};
   if (!existsSync(file)) return { groupDropped, groupDropReasons };
   for (const line of readFileSync(file, 'utf8').split(/\r?\n/).filter((line) => line.trim())) {
-    const match = /^(\d+|x[0-9a-z]{6,}):\s*(.+)$/.exec(line);
+    const match = /^(\d+|x[0-9a-z]{6,}):\s*([\s\S]+)$/.exec(line);
     if (!match || !groupMembers.includes(match[1])) throw new Error('invalid group member drop: ' + line);
     const [, num, reason] = match;
     if (!groupDropped.includes(num)) groupDropped.push(num);
-    groupDropReasons[num] = reason;
+    groupDropReasons[num] = sanitizeGroupDropReason(reason);
   }
   for (const num of groupDropped) {
     const card = `backlog/${resolveItemSpecPathBasename(num, loadItems)}`;
@@ -2574,7 +2582,7 @@ export function buildPrBody({ item, report, delegation = null, groupMembers = []
   const marker = delegation ? buildDelegationMarker(delegation) : '';
   const delivered = groupMembers.filter((num) => !groupDropped.includes(num));
   const groupBody = (delivered.length ? `\n\nGrouped build (${delivered.length + 1} cards): #${item}, ${delivered.map((num) => `#${num}`).join(', ')}\nResolves ${delivered.map((num) => `#${num}`).join(', ')}\n` : '')
-    + groupDropped.map((num) => `\nDropped from group: #${num} — ${groupDropReasons[num] ?? 'not delivered'}`).join('');
+    + groupDropped.map((num) => `\nDropped from group: #${num} — ${sanitizeGroupDropReason(groupDropReasons[num])}`).join('');
   return `## #${item}\n\n${summary}${filesLine}${groupBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
     + '(the mechanical wrapper drove review/gate/PR — the agent only built and reported).\n'
     + (marker ? `${marker}\n` : '');
