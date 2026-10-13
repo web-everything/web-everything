@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-13"
-preparedAgainstSha: "b4676cf68f6edcf092c80d4f878fa7003a340756"
+preparedAgainstSha: "8652127bcfe202e52a08c204b6696878ee72038e"
 tags: []
 ---
 
@@ -86,3 +86,4 @@ Guard cases (pass today, must stay green; not RED):
 - 2026-10-13 re-prepare: premise re-checked against current `main`; claim code unchanged (`readLiveFixClaim` reads kind `fixing` only; no `claim-held` kind). Citations refreshed: merge-site call now we:scripts/merge-ai-prs.mjs:4526, head pin at :6522. Goal, scope and plan unchanged.
 - 2026-10-13 re-stamp: re-checked against b00263a4; in-scope files unchanged since c696f93 (only ci-red-recovery-watch moved, not in scope); plan unchanged, stamp refreshed.
 - 2026-10-13 re-prepare (b4676cf): we:scripts/merge-ai-prs.mjs moved (workflow-human gate work); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations refreshed: attach :900, classifyPr arm :1019, merge-site call :4526, head pin :6522. Plan unchanged.
+- 2026-10-13 re-stamp (8652127): in-scope files unchanged since b4676cf; citations still hold; plan unchanged.
