@@ -25,6 +25,7 @@ import { loadFixerLadder } from './fixer-ladder.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { defaultReadPr } from './advisory-label-sweep.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** The gate's own card rule, so the label never clears while the gate still holds a `card` ruling on a missing card. */
@@ -50,9 +51,9 @@ export function defaultListPrs({ exec = execFileSyncThrottled, repo = null } = {
 
 /**
  * Add/remove the label on every open PR whose derived state disagrees with it.
- * @returns {Array<{num:number, action:'add'|'remove', error?:string}>}
+ * @returns {Array<{num:number, action:'add'|'remove'|'skipped', error?:string}>}
  */
-export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false } = {}) {
+export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs, provider = createGhProvider(), readPr = defaultReadPr, dryRun = false } = {}) {
   const prs = listPrs({ repo });
   const results = [];
   let resolvedRepo = repo;
@@ -60,12 +61,27 @@ export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs,
   let humanAt;
   try { humanAt = loadFixerLadder().humanAt; } catch { /* the platform default stands */ }
   for (const pr of Array.isArray(prs) ? prs : []) {
-    const plan = planRulingNeededLabel(pr, { cardReadable: gateCardReadable, ...(humanAt === undefined ? {} : { humanAt }) });
+    // Missing markers in a partial snapshot cannot exclude a PR from this pass.
+    let live;
+    try {
+      if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+      if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
+      live = readPr({ repo: resolvedRepo, number: pr.number });
+      if (live?.state !== 'OPEN') throw new Error('PR is not open');
+      if (!Array.isArray(live.labels) || live.labels.some((label) =>
+        typeof (label?.name ?? label) !== 'string' || !(label?.name ?? label).trim())) throw new Error('unusable labels');
+      if (typeof live.headRefOid !== 'string' || !live.headRefOid.trim()) throw new Error('missing head');
+      if (!Array.isArray(live.comments)) throw new Error('comments read returned no array');
+      if (live.number != null && live.number !== pr.number) throw new Error('PR number mismatch');
+    } catch (e) {
+      results.push({ num: pr.number, action: 'skipped', error: `live re-read failed: ${String(e?.message ?? e).split('\n')[0]}` });
+      continue;
+    }
+    const plan = planRulingNeededLabel(live, { cardReadable: gateCardReadable, ...(humanAt === undefined ? {} : { humanAt }) });
     if (plan.action === 'none') continue;
     const entry = { num: pr.number, action: plan.action };
     if (!dryRun) {
       try {
-        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         if (plan.action === 'add') {
           provider.ensureLabel(resolvedRepo, RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META);
           provider.setLabels(resolvedRepo, pr.number, { add: RULING_NEEDED_LABEL });

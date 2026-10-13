@@ -329,11 +329,11 @@ describe('buildComment — the comment subcommand glue (renders via renderPanelC
 // the file-kind rosters they lean on are `scoreEscalation`'s and `classifyReviewSubject`'s, each proved in
 // its own suite.
 describe('#3335 buildShapePlan — the shape a touch-set earns', () => {
-  // The exact touch-set of PR #1580, the motivating case: a statute edit reviewed under `correctness` alone.
-  const STATUTE_FILES = ['docs/agent/platform-decisions.md'];
+  // A sensitive workflow fixture preserves the high-care shape regression motivated by PR #1580.
+  const WORKFLOW_FILES = ['.github/workflows/review.yml'];
 
-  it('#3335 — #1580\'s statute touch-set earns care `high`, humanRequired, and all five lenses', () => {
-    const plan = buildShapePlan({ changedFiles: STATUTE_FILES });
+  it('#3335 — a workflow touch-set earns care `high`, humanRequired, and all five lenses', () => {
+    const plan = buildShapePlan({ changedFiles: WORKFLOW_FILES });
     expect(plan.careLevel).toBe('high');
     expect(plan.humanRequired).toBe(true);
     expect(plan.earnedLenses).toHaveLength(5);
@@ -343,14 +343,14 @@ describe('#3335 buildShapePlan — the shape a touch-set earns', () => {
     expect(plan.mandatoryFloor).toEqual([...MANDATORY_LENSES]);
     expect(plan.seatLens).toBe(MANDATORY_LENSES[0]);
     expect(plan.escalated).toBe(true);
-    expect(plan.reasons.join(' ')).toContain('statute');
+    expect(plan.reasons.join(' ')).toContain('workflow-edit');
   });
 
   it('#3335 — its careLevel equals `rigor --reasons=<its own reasons>`, so the two entry points agree', () => {
     // The `rigor` subcommand's derivation, run over the reasons THIS plan produced. `buildShapePlan` reaches
     // the band through `scoreEscalation`'s signals; `careLevelFromReasons` reaches it through the decorated
     // reason strings. Both end at `deriveCareLevel`, and this is the assertion that keeps them one answer.
-    for (const files of [STATUTE_FILES, ['scripts/lib/jury-core.mjs'], ['scripts/lib/review-policy.contract.json']]) {
+    for (const files of [WORKFLOW_FILES, ['scripts/lib/jury-core.mjs'], ['scripts/lib/review-policy.contract.json']]) {
       const plan = buildShapePlan({ changedFiles: files });
       expect(careLevelFromReasons(plan.reasons)).toBe(plan.careLevel);
       // …and the rigor numbers the same reasons dial are the ones the plan reports.
@@ -361,15 +361,15 @@ describe('#3335 buildShapePlan — the shape a touch-set earns', () => {
     }
   });
 
-  it('#3335 — a statute-touching PR earns a DIFFERENT shape than a script-only one', () => {
-    const statute = buildShapePlan({ changedFiles: STATUTE_FILES });
+  it('#3335 — a workflow-touching PR earns a DIFFERENT shape than a script-only one', () => {
+    const workflow = buildShapePlan({ changedFiles: WORKFLOW_FILES });
     const script = buildShapePlan({ changedFiles: ['scripts/review-core-cli.mjs'] });
     // The whole point of the item: the shape is a function of what the PR TOUCHES, not of what the caller typed.
-    expect(statute.careLevel).not.toBe(script.careLevel);
-    expect(statute.humanRequired).toBe(true);
+    expect(workflow.careLevel).not.toBe(script.careLevel);
+    expect(workflow.humanRequired).toBe(true);
     expect(script.humanRequired).toBe(false);
-    expect(statute.jurorsPerLens).toBeGreaterThan(script.jurorsPerLens);
-    expect(statute.rounds).toBeGreaterThan(script.rounds);
+    expect(workflow.jurorsPerLens).toBeGreaterThan(script.jurorsPerLens);
+    expect(workflow.rounds).toBeGreaterThan(script.rounds);
     // …and a code PR still earns the FULL mandatory panel — the derivation never narrows the floor.
     expect(script.mandatoryFloor).toEqual([...MANDATORY_LENSES]);
     expect(script.earnedLenses).toEqual([...PANEL_LENSES]);

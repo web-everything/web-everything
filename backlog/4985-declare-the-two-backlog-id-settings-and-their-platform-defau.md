@@ -3,9 +3,11 @@ bornAs: x2rabof
 kind: story
 size: 3
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:config/platformDefaults.ts", "we:config/defineConfig.ts", "we:config/index.ts", "we:config/__tests__/", "we:scripts/lib/backlog-id-settings.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "6d9d737f3f528a9fde2f5e162cd5d5151abe0d72"
 tags: []
@@ -71,6 +73,9 @@ Write the test first and run it with vitest in the lane before the module exists
 
 ## Progress
 
+- GREEN confirmed 2026-10-12: `npm run test:unit -- config/__tests__` passes both files (29 tests, including 16 new settings tests). The public config barrel passes a focused TypeScript no-emit check. A direct Node probe confirms silent defaults, override precedence over an unbuilt base, and the named `integration-branch` refusal. Standards gate left to the wrapper per the delivery brief; edits remain uncommitted for the wrapper. Wiring/file loading/non-default implementations remain the declared follow-ups.
+- RED confirmed 2026-10-12: the focused Vitest run fails to import the absent tooling resolver. Added the two typed dimensions, public data exports, pinned tooling mirrors, and the pure resolver; implementation remains outside the TS contract.
+- Delivery sanity check 2026-10-12: neither dimension nor the tooling resolver exists in this lane; the spec remains coherent and buildable. Added test vectors first for defaults, override precedence, unbuilt values, malformed descriptors/objects, pointers, null/numeric/array entries, independent dimensions, and one-line hostile-value diagnostics.
 - Premise check 2026-10-09: `git log` for `4985`/`4985` shows only the numbering commit; no backlog-id setting exists in `we:config/`. Not delivered.
 - Scope drift corrected: dropped `we:scripts/lib/gate-config.mjs` (trust-chain path list, no config settings); added `we:config/index.ts` (the barrel must export the resolver). Goal and size unchanged.
 - Review round 1: moved the resolver from WE's TS to repo tooling (statute rule 3, #1282), defined the bare-string rule, fixed line refs and the vitest path.
