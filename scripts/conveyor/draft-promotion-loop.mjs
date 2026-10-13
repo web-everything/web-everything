@@ -22,6 +22,7 @@
  * pay; a conflicting green draft is rare and the tick still promotes it when it is not already landed.
  */
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -87,6 +88,7 @@ export function runDraftPromotionStep({
   readHeadCheckState = defaultReadHeadCheckState,
   readPrView = defaultReadPrView,
   readMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
+  absentNotApplicable,
   readAgents = () => enrichAgents(defaultReadAgents({})),
   readClaim = readLiveFixClaim,
   readRequiredChecks = ({ repoSlug }) => getRequiredStatusChecks({ repo: repoSlug }),
@@ -99,6 +101,8 @@ export function runDraftPromotionStep({
   // candidate fails closed at once instead of re-running a slow failing command per PR.
   const once = (read) => { let memo; return () => { if (!memo) { try { memo = { value: read() }; } catch (error) { memo = { error }; } } if (memo.error) throw memo.error; return memo.value; }; };
   const agentsOnce = once(readAgents);
+  const absentNotApplicableOnce = once(() => absentNotApplicable !== undefined
+    ? absentNotApplicable : loadPromotionRequiredChecksSetting().value);
   for (const repo of repos) {
     let drafts;
     try { drafts = listDrafts({ repoSlug: repo }); } catch (e) { rows.push({ repo, pr: null, action: 'error', why: `draft list: ${oneLine(e)}` }); continue; }
@@ -106,9 +110,12 @@ export function runDraftPromotionStep({
     for (const pr of drafts.filter(isPromotionCandidate)) {
       const n = Number(pr.number);
       const row = (action, why) => rows.push({ repo, pr: n, action, why });
-      let checks;
+      let checks; let notApplicable;
       try {
-        const fresh = readHeadCheckState({ repoSlug: repo, sha: pr.headRefOid, prNumber: n });
+        notApplicable = absentNotApplicableOnce();
+        const fresh = readHeadCheckState({ repoSlug: repo, sha: pr.headRefOid, prNumber: n,
+          ...(readHeadCheckState === defaultReadHeadCheckState ? { forPromotion: true, absentNotApplicable: notApplicable } : {}),
+        });
         checks = { state: fresh?.state, sha: pr.headRefOid };
       } catch (e) { row('error', `check read: ${oneLine(e)}`); continue; }
       const decision = isDraftOwedPromotion({ pr, checks });
@@ -150,7 +157,8 @@ export function runDraftPromotionStep({
       let plan;
       try {
         const prs = excusePrMergeGateHolds([planPr], { repo, readMergeGateVerdict, readFreeze, mergeGateSetting });
-        plan = planReconcile({ repo: repoKey, prs, agents, requiredChecks, now: now() });
+        plan = planReconcile({ repo: repoKey, prs, agents,
+          requiredChecks: promotionRequiredChecks(requiredChecks, view.statusCheckRollup, notApplicable), now: now() });
       } catch (e) { row('error', `classifier: ${oneLine(e)}`); continue; }
       if (!plan.dispatch.some((d) => d.prNumber === n && d.kind === 'promote-draft')) {
         const other = plan.refusals.find((r) => r.prNumber === n) ?? plan.dispatch.find((d) => d.prNumber === n);
