@@ -135,7 +135,7 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
 }
 
 export function buildRestoreComment({ head, record, rearm, setting }) {
-  return `${RESTORE_MARKER}\n\nHead: ${head}. Original clearance carried from ${record.url} at ${record.at}.\nRe-arm: ${rearm.url} at ${at(rearm)} removed `review:accepted` with no push (the head is still the cleared head).\nNo new verdict or acceptance marker is written; the original clearance record above stands.\nreviewClearance.restoreNoPushRearm=${typeof setting === 'string' ? setting : setting.value} (source: ${setting.source ?? 'standard'}).`;
+  return `${RESTORE_MARKER}\n\nHead: ${head}. Original clearance carried from ${record.url} at ${record.at}.\nRe-arm: ${rearm.url} at ${at(rearm)} removed \`review:accepted\` with no push (the head is still the cleared head).\nNo new verdict or acceptance marker is written; the original clearance record above stands.\nreviewClearance.restoreNoPushRearm=${typeof setting === 'string' ? setting : setting.value} (source: ${setting.source ?? 'standard'}).`;
 }
 
 /** Cheap pre-check (comments only): is there a trusted re-arm after a same-sha accept record, not yet restored? */
