@@ -13,14 +13,27 @@
  *   Pure policy, identity and review planning helpers; a small synchronous IO shell that never
  *   throws or writes stdout. All writes require a live, open PR at the reviewed SHA, proven
  *   reviewer identity (distinct from worker and author), and readable review history.
+ *
+ *   Identity is EXACT (operator send-back 2026-10-13, #4): the live token's GraphQL viewer must be a `Bot` with the
+ *   reviewer App's slug, and "our" reviews are those whose REST user is type `Bot` with login `<slug>[bot]`. A human
+ *   account whose login merely normalises to the App's slug never matches.
+ *
+ *   A clearing verdict (rearm/restamp/clear-human, or an accept lifting our stale change request) can run under a
+ *   token that is not the reviewer App, e.g. the operator's clear-human. Its dismissal then runs with the reviewer
+ *   App's own installation token (the shared cache, else minted now); with no token it is queued
+ *   ({@link nativeReviewQueuePath}) and the next run as the reviewer App dismisses it before its own work.
  */
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
-import { readDeliveryIdentity, LEGACY_BOT_LOGINS } from './github-app-identity.mjs';
+import { readDeliveryIdentity, roleCachePath, LEGACY_BOT_LOGINS, ROLE_ENV } from './github-app-identity.mjs';
+import { defaultCachePath, isCacheFresh } from './github-app-auth-env.mjs';
+import { installationCachePath } from './github-app-installations.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 
@@ -132,7 +145,7 @@ export function summarizeReadiness(lines, criteria = STANDARD_PROMOTION) {
   let mirrored = 0;
   let mismatches = 0;
   for (const f of latest.values()) {
-    if (f.outcome === 'posted' || f.outcome === 'already-posted') mirrored++;
+    if ((f.outcome === 'posted' || f.outcome === 'already-posted') && f.agree !== 'no') mirrored++;
     else if (f.agree === 'no' && !NEUTRAL_SKIP_REASONS.some((r) => String(f.reason ?? '').startsWith(r))) mismatches++;
   }
   const ready = mirrored >= criteria.minMirroredVerdicts && mismatches <= criteria.maxMismatches;
@@ -151,62 +164,94 @@ export function nativeReviewLogPath(env = process.env) {
   return env.WE_NATIVE_REVIEW_LOG || join(homedir(), '.claude', 'conveyor', 'native-review.log');
 }
 
-/** Map a reviewed, pinned verdict to a native review and any hold cleanup. Pure. */
+const DECISIVE = Object.freeze(['APPROVED', 'CHANGES_REQUESTED']);
+/** The decisive event whose landing supersedes our earlier opposite review on GitHub (no dismissal needed). */
+const SUPERSEDING = Object.freeze({ APPROVE: true, REQUEST_CHANGES: true });
+
+/**
+ * Map a reviewed, pinned verdict to a native review and the states of our own standing reviews it must dismiss. Pure.
+ * A verdict that returns the PR to pending (`rearm`, `restamp`) leaves no bot verdict of ours standing (operator
+ * send-back #2): a pending label never sits beside a bot APPROVE or REQUEST_CHANGES.
+ */
 export function planNativeReview({ verdict, labels = [], headSha }) {
-  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { event: null, dismissOwnChanges: false, reason: 'no-reviewed-head' };
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { event: null, dismiss: [], reason: 'no-reviewed-head' };
   if (verdict === 'accepted') {
     const human = labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
-    return { event: human ? 'COMMENT' : 'APPROVE', dismissOwnChanges: true, reason: human ? 'human-review: the approval must come from the operator' : '' };
+    if (human) return { event: 'COMMENT', dismiss: [...DECISIVE], reason: 'human-review: the approval must come from the operator' };
+    return { event: 'APPROVE', dismiss: ['CHANGES_REQUESTED'], reason: '' };
   }
-  if (verdict === 'changes') return { event: 'REQUEST_CHANGES', dismissOwnChanges: false, reason: '' };
-  if (verdict === 'advisory') return { event: 'COMMENT', dismissOwnChanges: false, reason: '' };
-  if (verdict === 'clear-human') return { event: null, dismissOwnChanges: true, reason: "human-cleared: the operator's own approval is the native one" };
-  return { event: null, dismissOwnChanges: false, reason: 'not-a-review-verdict' };
+  if (verdict === 'changes') return { event: 'REQUEST_CHANGES', dismiss: ['APPROVED'], reason: '' };
+  if (verdict === 'advisory') return { event: 'COMMENT', dismiss: [], reason: '' };
+  if (verdict === 'clear-human') return { event: null, dismiss: ['CHANGES_REQUESTED'], reason: "human-cleared: the operator's own approval is the native one" };
+  if (verdict === 'rearm' || verdict === 'restamp') return { event: null, dismiss: [...DECISIVE], reason: 'returned-to-pending: no verdict of ours stands' };
+  return { event: null, dismiss: [], reason: 'not-a-review-verdict' };
 }
 
-/** Compare GitHub App spellings consistently. Pure. */
+/** Compare CONFIGURED GitHub App spellings consistently (settings only — never a live identity). Pure. */
 export function normaliseLogin(login) {
   return String(login ?? '').trim().toLowerCase().replace(/^app\//, '').replace(/\[bot\]$/, '');
 }
 
-/** Fail closed unless the live token belongs to the dedicated, non-author reviewer. Pure. */
-export function checkReviewerIdentity({ identity, viewerLogin, prAuthorLogin }) {
+/** The configured reviewer App's exact REST login, `<slug>[bot]`, or null when the setting is not an App slug. Pure. */
+export function reviewerBotLogin(botLogin) {
+  const m = /^(?:app\/)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\[bot\])?$/.exec(String(botLogin ?? '').trim().toLowerCase());
+  return m ? `${m[1]}[bot]` : null;
+}
+
+/** Exactly the reviewer App as a REST user: type `Bot` and login `<slug>[bot]`. A human never matches. Pure. */
+export function isReviewerBotUser(user, botLogin) {
+  return !!botLogin && user?.type === 'Bot' && user?.login === botLogin;
+}
+
+/** The live token's GraphQL viewer is the reviewer App: `__typename` Bot and the exact slug (GraphQL omits `[bot]`). Pure. */
+function viewerIsReviewer(viewer, botLogin) {
+  return viewer?.type === 'Bot' && typeof viewer.login === 'string' && (viewer.login === botLogin || `${viewer.login}[bot]` === botLogin);
+}
+
+/**
+ * Fail closed unless the live token belongs to the dedicated, non-author reviewer App. Pure. `viewer` and `prAuthor`
+ * are `{login, type}`. A refusal past the configuration checks still names the expected `reviewerLogin`.
+ */
+export function checkReviewerIdentity({ identity, viewer, prAuthor }) {
   const reviewer = identity?.roles?.reviewer;
   if (!reviewer) return { ok: false, reason: 'reviewer-role-unconfigured' };
-  const reviewerLogin = normaliseLogin(reviewer.botLogin);
+  const reviewerLogin = reviewerBotLogin(reviewer.botLogin);
   if (!reviewerLogin) return { ok: false, reason: 'reviewer-bot-login-unknown' };
+  const slug = normaliseLogin(reviewerLogin);
   const worker = identity?.roles?.worker;
-  if (LEGACY_BOT_LOGINS.some(login => normaliseLogin(login) === reviewerLogin)
-    || (normaliseLogin(worker?.botLogin) && normaliseLogin(worker.botLogin) === reviewerLogin)
+  if (LEGACY_BOT_LOGINS.some(login => normaliseLogin(login) === slug)
+    || (normaliseLogin(worker?.botLogin) && normaliseLogin(worker.botLogin) === slug)
     || (reviewer.appId != null && worker?.appId != null && String(reviewer.appId) === String(worker.appId))) {
     return { ok: false, reason: 'reviewer-is-shared-app' };
   }
-  const viewer = normaliseLogin(viewerLogin);
-  if (!viewer) return { ok: false, reason: 'viewer-unreadable' };
-  if (viewer !== reviewerLogin) return { ok: false, reason: `token-is-not-reviewer (viewer=${String(viewerLogin).trim()})` };
-  if (normaliseLogin(prAuthorLogin) === viewer) return { ok: false, reason: 'reviewer-is-pr-author' };
+  if (!viewer?.login) return { ok: false, reason: 'viewer-unreadable', reviewerLogin };
+  if (!viewerIsReviewer(viewer, reviewerLogin)) return { ok: false, reason: `token-is-not-reviewer (viewer=${viewer.login}${viewer.type ? ` ${viewer.type}` : ''})`, reviewerLogin };
+  if (isReviewerBotUser(prAuthor, reviewerLogin)) return { ok: false, reason: 'reviewer-is-pr-author', reviewerLogin };
   return { ok: true, reviewerLogin };
 }
 
-/** Decisive events deduplicate only against the reviewer's latest standing verdict. Pure. */
+/**
+ * Decisive events deduplicate only against the reviewer's LATEST opinionated review (operator send-back #1): the
+ * newest of its APPROVED, CHANGES_REQUESTED and DISMISSED reviews by id. An earlier matching review that a later
+ * verdict or a dismissal superseded never counts. Pure.
+ */
 export function findExistingNativeReview({ reviews, head, event, reviewerLogin }) {
   if (!reviewerLogin || !EVENT_STATE[event]) return null;
-  const login = normaliseLogin(reviewerLogin);
-  const own = (reviews ?? []).filter(review => normaliseLogin(review?.user?.login) === login);
+  const own = (reviews ?? []).filter(review => isReviewerBotUser(review?.user, reviewerLogin));
   // Comments do not replace a decisive verdict; retain their per-head idempotency.
   if (event === 'COMMENT') return own.find(review => review.commit_id === head && review.state === 'COMMENTED') ?? null;
   const latest = own.reduce((last, review) => {
-    if (review.state !== 'APPROVED' && review.state !== 'CHANGES_REQUESTED') return last;
+    if (!DECISIVE.includes(review.state) && review.state !== 'DISMISSED') return last;
     return !last || review.id > last.id ? review : last;
   }, null);
   return latest?.commit_id === head && latest.state === EVENT_STATE[event] ? latest : null;
 }
 
-/** Only this reviewer's still-standing change requests can be dismissed. Pure. */
-export function ownStandingChangeRequests({ reviews, reviewerLogin }) {
+/** Ids of this reviewer App's own still-standing reviews in `states` (any head). Pure. */
+export function ownStandingReviews({ reviews, reviewerLogin, states }) {
   if (!reviewerLogin) return [];
-  return (reviews ?? []).filter(review => normaliseLogin(review?.user?.login) === normaliseLogin(reviewerLogin)
-    && review.state === 'CHANGES_REQUESTED' && typeof review.id === 'number').map(review => review.id);
+  return (reviews ?? []).filter(review => isReviewerBotUser(review?.user, reviewerLogin)
+    && (states ?? []).includes(review.state) && typeof review.id === 'number').map(review => review.id);
 }
 
 /** Fixed text and a machine marker; no PR title, body or findings are interpolated. Pure. */
@@ -218,11 +263,168 @@ export function nativeReviewBody({ verdict, event, head }) {
   return `${text}\n\n<!-- native-review: ${JSON.stringify({ head, verdict, event })} -->`;
 }
 
-/** One comparison line for the mirror observation ledger. Pure. */
-export function formatComparisonLine({ repo, pr, head, labelVerdict, event, outcome, reason = '', mode, source }) {
-  const agree = ['posted', 'already-posted'].includes(outcome) ? 'yes' : event && ['skipped', 'failed'].includes(outcome) ? 'no' : 'n/a';
+/**
+ * One comparison line for the mirror observation ledger. Pure. `dismissal` (ok|queued|failed) reports the cleanup of
+ * our own standing reviews; a queued or failed one leaves a bot verdict standing against the label, so it never agrees.
+ */
+export function formatComparisonLine({ repo, pr, head, labelVerdict, event, outcome, reason = '', mode, source, dismissal }) {
+  let agree = ['posted', 'already-posted'].includes(outcome) ? 'yes' : event && ['skipped', 'failed'].includes(outcome) ? 'no' : 'n/a';
+  if (dismissal === 'queued' || dismissal === 'failed') agree = 'no';
   const detail = String(reason).replace(/\s+/g, ' ').trim();
-  return `native-review: repo=${repo} pr=${pr} head=${head?.slice(0, 12) || '-'} label=${labelVerdict} native=${event || 'none'} outcome=${outcome} agree=${agree} mode=${mode}(${source})${detail ? ` reason=${detail}` : ''}`;
+  return `native-review: repo=${repo} pr=${pr} head=${head?.slice(0, 12) || '-'} label=${labelVerdict} native=${event || 'none'} outcome=${outcome} agree=${agree}${dismissal ? ` dismissal=${dismissal}` : ''} mode=${mode}(${source})${detail ? ` reason=${detail}` : ''}`;
+}
+
+/** The pending-dismissal queue (one JSON entry per line), drained by the next run as the reviewer App. */
+export function nativeReviewQueuePath(env = process.env) {
+  return env.WE_NATIVE_REVIEW_DISMISSAL_QUEUE || join(homedir(), '.claude', 'conveyor', 'native-review-dismissals.jsonl');
+}
+
+/**
+ * The file-backed queue. `claim()` renames the queue (and any claim a crashed drainer left) to a fresh claim file,
+ * so an append racing the drain lands in a new queue file and nothing is read twice by two live drainers' renames;
+ * `done()` deletes the claims once their entries are dismissed or re-queued.
+ */
+export function fileDismissalQueue(path) {
+  const dir = dirname(path);
+  const base = basename(path);
+  return {
+    append(entry) {
+      mkdirSync(dir, { recursive: true });
+      appendFileSync(path, `${JSON.stringify(entry)}\n`);
+      return true;
+    },
+    claim() {
+      let names = [];
+      try { names = readdirSync(dir).filter(name => name === base || name.startsWith(`${base}.claim-`)); } catch { names = []; }
+      const claims = [];
+      const entries = [];
+      for (const name of names) {
+        const claim = join(dir, `${base}.claim-${process.pid}-${randomUUID()}`);
+        try { renameSync(join(dir, name), claim); } catch { continue; }
+        claims.push(claim);
+        let text = '';
+        try { text = readFileSync(claim, 'utf8'); } catch { text = ''; }
+        for (const line of text.split('\n')) {
+          if (!line.trim()) continue;
+          try { entries.push(JSON.parse(line)); } catch { /* A torn line is dropped. */ }
+        }
+      }
+      return { entries, done() { for (const claim of claims) { try { unlinkSync(claim); } catch { /* Re-claimed by another drainer. */ } } } };
+    },
+  };
+}
+
+/** Mint an installation token synchronously in a child process (minting is async; this shell is not). */
+function mintTokenSync({ appId, installationId, key, env }) {
+  const script = [
+    'const m = await import(process.env.WE_NRV_MODULE);',
+    'const key = JSON.parse(process.env.WE_NRV_KEY);',
+    "const r = await m.mintInstallationToken({ appId: process.env.WE_NRV_APP, installationId: process.env.WE_NRV_INSTALLATION, privateKeyPath: key.file ?? `keychain:${key.keychain.service}`, ...(key.keychain ? { readKey: () => m.readPrivateKeyRef(key) } : {}) });",
+    'process.stdout.write(r.token);',
+  ].join('\n');
+  return String(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...env, WE_NRV_MODULE: new URL('./github-app-token.mjs', import.meta.url).href, WE_NRV_KEY: JSON.stringify(key), WE_NRV_APP: String(appId), WE_NRV_INSTALLATION: String(installationId) },
+    encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+  })).trim();
+}
+
+function readJsonFile(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+/**
+ * The reviewer App's installation token for `repo`'s owner: the fleet's shared role cache when fresh, else minted
+ * now. Returns `{token}` or `{reason}`. Never throws, never logs the token.
+ */
+export function readReviewerToken({ identity, repo, env = process.env, now = Date.now(), cachePath = defaultCachePath(), readCache = readJsonFile, mintSync = mintTokenSync }) {
+  const app = identity?.roles?.reviewer;
+  if (!app?.appId || !app.installations || !app.key) return { reason: 'reviewer-app-unconfigured' };
+  const owner = String(repo ?? '').split('/')[0].toLowerCase();
+  const installationId = app.installations[owner];
+  if (!installationId) return { reason: `reviewer-app-not-installed (${owner})` };
+  const base = roleCachePath(cachePath, app.appId);
+  for (const path of [installationCachePath(base, installationId), base]) {
+    const cached = readCache(path);
+    if (isCacheFresh(cached, now) && typeof cached.token === 'string' && cached.token
+      && String(cached.appId) === String(app.appId) && String(cached.installationId) === String(installationId)) return { token: cached.token };
+  }
+  try {
+    const token = mintSync({ appId: app.appId, installationId, key: app.key, env });
+    return token ? { token } : { reason: 'reviewer-token-unavailable' };
+  } catch (error) { return { reason: `reviewer-token-unavailable: ${failureReason(error)}` }; }
+}
+
+/** The default reviewer-token exec: `gh` with the reviewer App's token. Never mints under test. */
+function defaultReviewerExec({ repo, identity, env, underTest }) {
+  if (underTest) return { reason: 'reviewer-token-unavailable: under-test' };
+  const got = readReviewerToken({ identity, repo, env });
+  if (!got.token) return { reason: got.reason };
+  const tokenEnv = { ...env, GH_TOKEN: got.token, [ROLE_ENV]: 'reviewer' };
+  return { exec: argv => runGhSync(argv, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: tokenEnv }) };
+}
+
+/** The live token's GraphQL viewer as `{login, type}`; empty when unreadable. */
+function readViewer(run) {
+  try {
+    const raw = String(run(['api', 'graphql', '-f', 'query=query{viewer{__typename login}}', '--jq', '.data.viewer | "\\(.__typename) \\(.login)"'])).trim();
+    const space = raw.indexOf(' ');
+    return space > 0 ? { type: raw.slice(0, space), login: raw.slice(space + 1) } : { type: '', login: raw };
+  } catch { return { type: '', login: '' }; }
+}
+
+/** The PR's full review history; throws when any row is unreadable. */
+function readReviews(run, endpoint) {
+  const raw = run(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `${endpoint}/reviews`, '--jq', '.[] | {id, state, commit_id, user: {login: .user.login, type: .user.type}}']);
+  const reviews = String(raw).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+  if (reviews.some(review => !review || typeof review.id !== 'number' || typeof review.state !== 'string'
+    || typeof review.commit_id !== 'string' || typeof review.user?.login !== 'string' || typeof review.user?.type !== 'string')) throw new Error('reviews-unreadable');
+  return reviews;
+}
+
+function dismiss(run, endpoint, id, verdict, head) {
+  run(['api', '--method', 'PUT', `${endpoint}/reviews/${id}/dismissals`, '-f', 'event=DISMISS', '-f', `message=Superseded: our review verdict is now ${verdict} on ${head.slice(0, 12)}.`]);
+}
+
+const QUEUE_MAX_ATTEMPTS = 20;
+const validQueueEntry = entry => entry && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(entry.repo ?? '') && Number.isInteger(entry.pr) && entry.pr > 0
+  && /^[0-9a-f]{40}$/.test(entry.head ?? '') && /^[a-z-]{1,32}$/.test(entry.verdict ?? '')
+  && Array.isArray(entry.ids) && entry.ids.length > 0 && entry.ids.every(id => Number.isInteger(id) && id > 0);
+
+/**
+ * Dismiss every queued review that is still one of ours and still standing, running as the reviewer App. Only the
+ * ids recorded at queue time are touched, never a later verdict. Failures are re-queued (bounded). Never throws.
+ */
+function drainDismissalQueue({ queue, run, reviewerLogin, record }) {
+  let claimed;
+  try { claimed = queue.claim(); } catch { return; }
+  const retry = [];
+  for (const entry of claimed?.entries ?? []) {
+    if (!validQueueEntry(entry)) continue;
+    const endpoint = `repos/${entry.repo}/pulls/${entry.pr}`;
+    const line = { repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: null };
+    let standing;
+    try { standing = new Set(ownStandingReviews({ reviews: readReviews(run, endpoint), reviewerLogin, states: DECISIVE })); }
+    catch (error) {
+      retry.push(entry);
+      record({ ...line, outcome: 'failed', dismissal: 'failed', reason: `queued dismissal: ${failureReason(error)}` });
+      continue;
+    }
+    const left = [];
+    const errors = [];
+    let dismissed = 0;
+    for (const id of entry.ids) {
+      if (!standing.has(id)) continue;
+      try { dismiss(run, endpoint, id, entry.verdict, entry.head); dismissed++; }
+      catch (error) { left.push(id); errors.push(`dismissal ${id}: ${failureReason(error)}`); }
+    }
+    if (left.length) retry.push({ ...entry, ids: left, attempts: (Number(entry.attempts) || 0) + 1 });
+    if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
+  }
+  for (const entry of retry) {
+    if ((Number(entry.attempts) || 0) >= QUEUE_MAX_ATTEMPTS) continue;
+    try { queue.append(entry); } catch { /* Best effort: the claim file is kept below so the next drainer retries. */ return; }
+  }
+  try { claimed?.done?.(); } catch { /* Best effort. */ }
 }
 
 /** Preserve the actionable last stderr line on gh failures. */
@@ -231,29 +433,44 @@ function failureReason(error) {
   return lines.at(-1) || String(error?.message ?? error ?? 'unexpected-error');
 }
 
-/** Post the native mirror and clean up only our own holds. Synchronous; never throws. */
-export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, env = process.env, exec, identity, mode: modeOpt, log = line => process.stderr.write(line + '\n'), appendLog } = {}) {
+/**
+ * Post the native mirror and clean up only our own standing reviews. Synchronous; never throws.
+ * `reviewerExec({repo, identity, env, underTest})` → `{exec}` | `{reason}` supplies a `gh` running as the reviewer App
+ * when the live token is someone else's (default: {@link readReviewerToken}); `queue` is the pending-dismissal queue
+ * (default: {@link fileDismissalQueue} at {@link nativeReviewQueuePath}; none under test).
+ */
+export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, env = process.env, exec, identity, mode: modeOpt, log = line => process.stderr.write(line + '\n'), appendLog, reviewerExec, queue } = {}) {
   let event = null;
   let mode = { mode: STANDARD_NATIVE_REVIEW_MODE, source: 'standard' };
   let underTest = true;
+  const append = (line) => {
+    try {
+      if (appendLog) appendLog(line);
+      else if (!underTest) {
+        const path = nativeReviewLogPath(env);
+        mkdirSync(dirname(path), { recursive: true });
+        appendFileSync(path, line + '\n');
+      }
+    } catch { /* The comparison ledger is best effort. */ }
+  };
+  // A queued dismissal drained on this run reports under its own PR, head and verdict.
+  const record = (fields) => {
+    const line = formatComparisonLine({ ...fields, ...mode });
+    try { log(line); } catch { /* stderr is best effort here; the ledger still gets the line. */ }
+    append(line);
+  };
   const finish = (outcome, reason = '', extra = {}) => {
-    const result = { outcome, event, reason, line: '', ...extra };
+    const { dismissal, ...rest } = extra;
+    const result = { outcome, event, reason, line: '', ...rest };
     if (['off', 'not-applicable'].includes(outcome)) return result;
-    result.line = formatComparisonLine({ repo, pr, head: headSha, labelVerdict: verdict, event, outcome, reason, ...mode });
+    result.line = formatComparisonLine({ repo, pr, head: headSha, labelVerdict: verdict, event, outcome, reason, dismissal, ...mode });
     try { log(result.line); }
     catch (error) {
       result.outcome = 'failed';
       result.reason = [reason, failureReason(error)].filter(Boolean).join('; ');
-      result.line = formatComparisonLine({ repo, pr, head: headSha, labelVerdict: verdict, event, outcome: result.outcome, reason: result.reason, ...mode });
+      result.line = formatComparisonLine({ repo, pr, head: headSha, labelVerdict: verdict, event, outcome: result.outcome, reason: result.reason, dismissal, ...mode });
     }
-    try {
-      if (appendLog) appendLog(result.line);
-      else if (!underTest) {
-        const path = nativeReviewLogPath(env);
-        mkdirSync(dirname(path), { recursive: true });
-        appendFileSync(path, result.line + '\n');
-      }
-    } catch { /* The comparison ledger is best effort. */ }
+    append(result.line);
     return result;
   };
   try {
@@ -264,31 +481,34 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     if (mode.mode === 'off') return finish('off');
     const plan = planNativeReview({ verdict, labels, headSha });
     event = plan.event;
-    if (!event && !plan.dismissOwnChanges) return finish('not-applicable', plan.reason);
+    if (!event && !plan.dismiss.length) return finish('not-applicable', plan.reason);
     const endpoint = `repos/${repo}/pulls/${pr}`;
     let live;
     try {
-      live = JSON.parse(run(['api', endpoint, '--jq', '{head: .head.sha, author: .user.login, state: .state}']));
-      if (!live || typeof live.head !== 'string' || typeof live.author !== 'string' || !live.author.trim() || typeof live.state !== 'string') return finish('skipped', 'pr-unreadable');
+      live = JSON.parse(run(['api', endpoint, '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state}']));
+      if (!live || typeof live.head !== 'string' || typeof live.author !== 'string' || !live.author.trim() || typeof live.authorType !== 'string' || typeof live.state !== 'string') return finish('skipped', 'pr-unreadable');
     } catch { return finish('skipped', 'pr-unreadable'); }
     if (live.state !== 'open') return finish('skipped', 'pr-not-open');
     if (live.head !== headSha) return finish('skipped', `head-moved (live=${live.head.slice(0, 12)})`);
-    let viewerLogin = '';
-    try { viewerLogin = String(run(['api', 'graphql', '-f', 'query=query{viewer{login}}', '--jq', '.data.viewer.login'])).trim(); }
-    catch { /* Unreadable viewer fails the identity check. */ }
-    const checked = checkReviewerIdentity({ identity: identity ?? readDeliveryIdentity({ env }), viewerLogin, prAuthorLogin: live.author });
-    if (!checked.ok) return finish('skipped', checked.reason);
+    const resolvedIdentity = identity ?? readDeliveryIdentity({ env });
+    const prAuthor = { login: live.author, type: live.authorType };
+    const checked = checkReviewerIdentity({ identity: resolvedIdentity, viewer: readViewer(run), prAuthor });
+    // Only a token that is simply not the reviewer App's may hand a dismissal to the reviewer App; a misconfigured
+    // reviewer, or one that authored the PR, is refused outright.
+    const otherToken = !checked.ok && /^(token-is-not-reviewer|viewer-unreadable)/.test(checked.reason);
+    if (!checked.ok && !(otherToken && plan.dismiss.length)) return finish('skipped', checked.reason);
+    const reviewerLogin = checked.reviewerLogin;
+    const pending = queue ?? (underTest ? null : fileDismissalQueue(nativeReviewQueuePath(env)));
+    // As the reviewer App, first finish any dismissal an earlier non-reviewer run queued, then read this PR fresh.
+    if (checked.ok && pending) drainDismissalQueue({ queue: pending, run, reviewerLogin, record });
     let reviews;
-    try {
-      const raw = run(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `${endpoint}/reviews`, '--jq', '.[] | {id, state, commit_id, user: {login: .user.login}}']);
-      reviews = String(raw).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
-      if (reviews.some(review => !review || typeof review.id !== 'number' || typeof review.state !== 'string'
-        || typeof review.commit_id !== 'string' || typeof review.user?.login !== 'string')) return finish('skipped', 'reviews-unreadable');
-    } catch { return finish('skipped', 'reviews-unreadable'); }
+    try { reviews = readReviews(run, endpoint); }
+    catch { return finish('skipped', checked.ok ? 'reviews-unreadable' : `${checked.reason}; reviews-unreadable`); }
     let outcome = 'not-applicable';
     let reason = plan.reason;
-    if (event) {
-      if (findExistingNativeReview({ reviews, head: headSha, event, reviewerLogin: checked.reviewerLogin })) outcome = 'already-posted';
+    if (event && !checked.ok) { outcome = 'skipped'; reason = checked.reason; }
+    else if (event) {
+      if (findExistingNativeReview({ reviews, head: headSha, event, reviewerLogin })) outcome = 'already-posted';
       else {
         try {
           run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${headSha}`, '-f', `event=${event}`, '-f', `body=${nativeReviewBody({ verdict, event, head: headSha })}`]);
@@ -296,19 +516,44 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
         } catch (error) { outcome = 'failed'; reason = failureReason(error); }
       }
     }
+    // A landed APPROVE or REQUEST_CHANGES supersedes our opposite review on GitHub; anything else dismisses it.
+    const superseded = SUPERSEDING[event] && ['posted', 'already-posted'].includes(outcome);
+    const ids = superseded ? [] : ownStandingReviews({ reviews, reviewerLogin, states: plan.dismiss });
+    if (!checked.ok && !ids.length) return finish('skipped', checked.reason);
     let dismissed = 0;
+    let queued = 0;
     const dismissalErrors = [];
-    if (plan.dismissOwnChanges && !(event === 'APPROVE' && ['posted', 'already-posted'].includes(outcome))) {
-      for (const id of ownStandingChangeRequests({ reviews, reviewerLogin: checked.reviewerLogin })) {
+    let writer = checked.ok ? run : null;
+    if (ids.length && !writer) {
+      // A clearing verdict under another token (e.g. the operator's clear-human): dismiss as the reviewer App.
+      let got;
+      try { got = (reviewerExec ?? defaultReviewerExec)({ repo, identity: resolvedIdentity, env, underTest }) ?? {}; }
+      catch (error) { got = { reason: `reviewer-token-unavailable: ${failureReason(error)}` }; }
+      let unavailable = got.reason || 'reviewer-token-unavailable';
+      if (typeof got.exec === 'function') {
+        const proven = checkReviewerIdentity({ identity: resolvedIdentity, viewer: readViewer(got.exec), prAuthor });
+        if (proven.ok && proven.reviewerLogin === reviewerLogin) writer = got.exec;
+        else unavailable = `reviewer token refused: ${proven.reason}`;
+      }
+      if (!writer) {
         try {
-          run(['api', '--method', 'PUT', `${endpoint}/reviews/${id}/dismissals`, '-f', 'event=DISMISS', '-f', `message=Superseded: our review verdict is now ${verdict} on ${headSha.slice(0, 12)}.`]);
-          dismissed++;
-        } catch (error) { dismissalErrors.push(`dismissal ${id}: ${failureReason(error)}`); }
+          if (!pending) throw new Error('no dismissal queue');
+          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids, at: new Date().toISOString() });
+          queued = ids.length;
+          reason = [reason, `dismissal queued for the reviewer App (${unavailable})`].filter(Boolean).join('; ');
+        } catch (error) { dismissalErrors.push(`dismissal not queued (${unavailable}): ${failureReason(error)}`); }
+      }
+    }
+    if (writer) {
+      for (const id of ids) {
+        try { dismiss(writer, endpoint, id, verdict, headSha); dismissed++; }
+        catch (error) { dismissalErrors.push(`dismissal ${id}: ${failureReason(error)}`); }
       }
     }
     if (dismissalErrors.length) reason = [reason, ...dismissalErrors].filter(Boolean).join('; ');
-    if (!event) outcome = dismissed ? 'dismissed' : dismissalErrors.length ? 'failed' : 'not-applicable';
-    return finish(outcome, reason, plan.dismissOwnChanges ? { dismissed } : {});
+    const dismissal = dismissalErrors.length ? 'failed' : queued ? 'queued' : ids.length ? 'ok' : undefined;
+    if (!event) outcome = dismissalErrors.length ? 'failed' : queued ? 'queued' : dismissed ? 'dismissed' : 'not-applicable';
+    return finish(outcome, reason, plan.dismiss.length ? { dismissed, ...(queued ? { queued } : {}), dismissal } : {});
   } catch (error) {
     try { return finish('failed', failureReason(error)); }
     catch { return { outcome: 'failed', event, reason: 'unexpected-error', line: '' }; }

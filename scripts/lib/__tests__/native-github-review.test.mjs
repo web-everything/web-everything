@@ -2,15 +2,23 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   NATIVE_REVIEW_MODES, NATIVE_REVIEW_ENV, STANDARD_NATIVE_REVIEW_MODE, EVENT_STATE,
   parseNativeReviewMode, resolveNativeReviewMode, loadNativeReviewMode, planNativeReview,
-  normaliseLogin, checkReviewerIdentity, findExistingNativeReview, ownStandingChangeRequests,
-  nativeReviewBody, formatComparisonLine, mirrorNativeReview,
+  normaliseLogin, reviewerBotLogin, isReviewerBotUser, checkReviewerIdentity, findExistingNativeReview, ownStandingReviews,
+  nativeReviewBody, formatComparisonLine, mirrorNativeReview, readReviewerToken, fileDismissalQueue,
   STANDARD_PROMOTION, resolvePromotionCriteria, loadPromotionCriteria, parseComparisonLine, summarizeReadiness, formatReadinessLine,
 } from '../native-github-review.mjs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { roleCachePath } from '../github-app-identity.mjs';
+import { installationCachePath } from '../github-app-installations.mjs';
+import { CACHE_VERSION } from '../github-app-auth-env.mjs';
 
 const head = 'a'.repeat(40);
 const otherHead = 'b'.repeat(40);
 const identity = { roles: { reviewer: { botLogin: 'plateau-reviewer[bot]', appId: 2 }, worker: { botLogin: 'web-everything[bot]', appId: 1 } } };
-const review = (id, state, commit_id = head, login = 'plateau-reviewer[bot]') => ({ id, state, commit_id, user: { login } });
+const review = (id, state, commit_id = head, login = 'plateau-reviewer[bot]', type = 'Bot') => ({ id, state, commit_id, user: { login, type } });
+const bot = { login: 'plateau-reviewer', type: 'Bot' };
+const author = { login: 'web-everything[bot]', type: 'Bot' };
 const throws = () => { throw new Error('unreadable'); };
 function fixture(options = {}, responses = {}) {
   const calls = [];
@@ -26,13 +34,13 @@ function fixture(options = {}, responses = {}) {
       if (responses.dismissError) throw responses.dismissError;
       return '{}';
     }
-    if (argv.includes('graphql')) return responses.viewer ?? 'plateau-reviewer[bot]\n';
+    if (argv.includes('graphql')) return responses.viewer ?? 'Bot plateau-reviewer\n';
     if (argv.includes('--paginate')) {
       if (responses.reviewsError) throw responses.reviewsError;
       return responses.reviewsRaw ?? (responses.reviews ?? []).map(JSON.stringify).join('\n');
     }
     if (responses.prError) throw responses.prError;
-    return responses.prRaw ?? JSON.stringify({ head: responses.head ?? head, author: responses.author ?? 'app/web-everything', state: responses.state ?? 'open' });
+    return responses.prRaw ?? JSON.stringify({ head: responses.head ?? head, author: responses.author ?? 'web-everything[bot]', authorType: responses.authorType ?? 'Bot', state: responses.state ?? 'open' });
   };
   const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec, identity, mode: { mode: 'mirror', source: 'tool' }, log, appendLog, ...options });
   return { result, calls, log, appendLog, posts: calls.filter(a => a.includes('POST')), puts: calls.filter(a => a.includes('PUT')) };
@@ -66,61 +74,95 @@ describe('native review policy and mapping', () => {
   it('the declared repo settings turn the standard off into mirror (tool layer)', () => {
     expect(loadNativeReviewMode({ env: {}, readPlatform: () => undefined })).toEqual({ mode: 'mirror', source: 'tool', invalid: [] });
   });
-  it.each([['accepted', 'APPROVE', true], ['changes', 'REQUEST_CHANGES', false], ['advisory', 'COMMENT', false], ['clear-human', null, true]])('maps %s', (verdict, event, dismissOwnChanges) => {
-    expect(planNativeReview({ verdict, headSha: head })).toMatchObject({ event, dismissOwnChanges });
+  it.each([
+    ['accepted', 'APPROVE', ['CHANGES_REQUESTED']], ['changes', 'REQUEST_CHANGES', ['APPROVED']], ['advisory', 'COMMENT', []],
+    ['clear-human', null, ['CHANGES_REQUESTED']], ['rearm', null, ['APPROVED', 'CHANGES_REQUESTED']], ['restamp', null, ['APPROVED', 'CHANGES_REQUESTED']],
+  ])('maps %s', (verdict, event, dismiss) => {
+    expect(planNativeReview({ verdict, headSha: head })).toMatchObject({ event, dismiss });
   });
   it.each([['review:human'], [{ name: 'review:human' }]])('keeps human approvals with the operator: %j', label => {
-    expect(planNativeReview({ verdict: 'accepted', headSha: head, labels: [label] })).toEqual({ event: 'COMMENT', dismissOwnChanges: true, reason: 'human-review: the approval must come from the operator' });
+    expect(planNativeReview({ verdict: 'accepted', headSha: head, labels: [label] })).toEqual({ event: 'COMMENT', dismiss: ['APPROVED', 'CHANGES_REQUESTED'], reason: 'human-review: the approval must come from the operator' });
   });
-  it.each(['rearm', 'restamp'])('ignores %s', verdict => expect(planNativeReview({ verdict, headSha: head })).toEqual({ event: null, dismissOwnChanges: false, reason: 'not-a-review-verdict' }));
-  it.each([undefined, 'bad', 'A'.repeat(40), 'a'.repeat(39)])('requires a reviewed head: %s', headSha => expect(planNativeReview({ verdict: 'accepted', headSha })).toEqual({ event: null, dismissOwnChanges: false, reason: 'no-reviewed-head' }));
+  it('ignores anything that is not a verdict', () => expect(planNativeReview({ verdict: 'bogus', headSha: head })).toEqual({ event: null, dismiss: [], reason: 'not-a-review-verdict' }));
+  it.each([undefined, 'bad', 'A'.repeat(40), 'a'.repeat(39)])('requires a reviewed head: %s', headSha => expect(planNativeReview({ verdict: 'accepted', headSha })).toEqual({ event: null, dismiss: [], reason: 'no-reviewed-head' }));
 });
 
 describe('identity and review history', () => {
   it('normalises app logins', () => expect(normaliseLogin(' APP/Plateau-Reviewer[bot] ')).toBe('plateau-reviewer'));
+  it.each([['plateau-reviewer[bot]', 'plateau-reviewer[bot]'], [' Plateau-Reviewer ', 'plateau-reviewer[bot]'], ['app/plateau-reviewer', 'plateau-reviewer[bot]'], ['bad login', null], ['', null]])('the configured reviewer App %j is the exact REST login %j', (configured, exact) => {
+    expect(reviewerBotLogin(configured)).toBe(exact);
+  });
   const failures = [
-    [{}, 'plateau-reviewer[bot]', 'reviewer-role-unconfigured'],
-    [{ roles: { reviewer: {} } }, 'plateau-reviewer[bot]', 'reviewer-bot-login-unknown'],
-    [{ roles: { reviewer: { botLogin: 'web-everything[bot]' } } }, 'web-everything[bot]', 'reviewer-is-shared-app'],
-    [{ roles: { reviewer: { botLogin: 'plateau-reviewer', appId: 1 }, worker: { appId: 1 } } }, 'plateau-reviewer', 'reviewer-is-shared-app'],
-    [{ roles: { reviewer: { botLogin: 'plateau-reviewer' }, worker: { botLogin: 'app/plateau-reviewer[bot]' } } }, 'plateau-reviewer', 'reviewer-is-shared-app'],
+    [{}, 'Bot plateau-reviewer', 'reviewer-role-unconfigured'],
+    [{ roles: { reviewer: {} } }, 'Bot plateau-reviewer', 'reviewer-bot-login-unknown'],
+    [{ roles: { reviewer: { botLogin: 'web-everything[bot]' } } }, 'Bot web-everything', 'reviewer-is-shared-app'],
+    [{ roles: { reviewer: { botLogin: 'plateau-reviewer', appId: 1 }, worker: { appId: 1 } } }, 'Bot plateau-reviewer', 'reviewer-is-shared-app'],
+    [{ roles: { reviewer: { botLogin: 'plateau-reviewer' }, worker: { botLogin: 'app/plateau-reviewer[bot]' } } }, 'Bot plateau-reviewer', 'reviewer-is-shared-app'],
     [identity, '', 'viewer-unreadable'],
-    [identity, 'web-everything[bot]', 'token-is-not-reviewer (viewer=web-everything[bot])'],
+    [identity, 'Bot web-everything', 'token-is-not-reviewer (viewer=web-everything Bot)'],
   ];
-  it.each(failures)('fails closed for %j / %s', (configured, viewerLogin, reason) => {
-    expect(checkReviewerIdentity({ identity: configured, viewerLogin, prAuthorLogin: 'operator' })).toEqual({ ok: false, reason });
-    const f = fixture({ identity: configured }, { viewer: viewerLogin });
+  it.each(failures)('fails closed for %j / %s', (configured, viewer, reason) => {
+    const [type, login] = viewer ? viewer.split(' ') : ['', ''];
+    expect(checkReviewerIdentity({ identity: configured, viewer: { login, type }, prAuthor: { login: 'operator', type: 'User' } })).toMatchObject({ ok: false, reason });
+    const f = fixture({ identity: configured }, { viewer });
     expect(f.result).toMatchObject({ outcome: 'skipped', reason });
     expect(f.posts).toHaveLength(0);
     expect(f.puts).toHaveLength(0);
   });
-  it('refuses the PR author', () => {
-    const f = fixture({}, { author: 'app/plateau-reviewer' });
-    expect(f.result.reason).toBe('reviewer-is-pr-author');
+  // Operator send-back #4 (2026-10-13): a human account whose login normalises to the reviewer App's never IS it.
+  it.each([
+    ['plateau-reviewer', 'User'], ['Plateau-Reviewer', 'User'], ['plateau-reviewer[bot]', 'User'], ['app/plateau-reviewer', 'Bot'], ['Plateau-Reviewer', 'Bot'],
+  ])('refuses a live token whose viewer %j (%s) only normalises to the reviewer App', (login, type) => {
+    expect(normaliseLogin(login)).toBe('plateau-reviewer');
+    expect(checkReviewerIdentity({ identity, viewer: { login, type }, prAuthor: author })).toMatchObject({ ok: false, reason: expect.stringMatching(/^token-is-not-reviewer/) });
+    const f = fixture({}, { viewer: `${type} ${login}` });
+    expect(f.result.outcome).toBe('skipped');
     expect(f.posts).toHaveLength(0);
   });
-  it('accepts the separate reviewer identity', () => expect(checkReviewerIdentity({ identity, viewerLogin: 'app/plateau-reviewer', prAuthorLogin: 'web-everything' })).toEqual({ ok: true, reviewerLogin: 'plateau-reviewer' }));
+  it('compares the viewer exactly: padding is not trimmed away inside the identity check', () => {
+    expect(checkReviewerIdentity({ identity, viewer: { login: 'plateau-reviewer ', type: 'Bot' }, prAuthor: author }).ok).toBe(false);
+    expect(checkReviewerIdentity({ identity, viewer: { login: 'plateau-reviewer', type: 'bot' }, prAuthor: author }).ok).toBe(false);
+  });
+  it('a human review whose login normalises to the reviewer App is never ours: no dedupe, no dismissal', () => {
+    const human = [review(7, 'APPROVED', head, 'plateau-reviewer', 'User'), review(8, 'CHANGES_REQUESTED', head, 'Plateau-Reviewer', 'User'), review(9, 'APPROVED', head, 'plateau-reviewer[bot]', 'User')];
+    expect(human.every(r => !isReviewerBotUser(r.user, 'plateau-reviewer[bot]'))).toBe(true);
+    expect(findExistingNativeReview({ reviews: human, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer[bot]' })).toBeNull();
+    expect(ownStandingReviews({ reviews: human, reviewerLogin: 'plateau-reviewer[bot]', states: ['APPROVED', 'CHANGES_REQUESTED'] })).toEqual([]);
+    const f = fixture({}, { reviews: human });
+    expect(f.result.outcome).toBe('posted');
+    expect(f.puts).toHaveLength(0);
+    expect(fixture({ verdict: 'rearm' }, { reviews: human }).puts).toHaveLength(0);
+  });
+  it('refuses the PR author (the exact App), but not a human with the same name', () => {
+    const f = fixture({}, { author: 'plateau-reviewer[bot]', authorType: 'Bot' });
+    expect(f.result.reason).toBe('reviewer-is-pr-author');
+    expect(f.posts).toHaveLength(0);
+    expect(fixture({}, { author: 'plateau-reviewer', authorType: 'User' }).result.outcome).toBe('posted');
+  });
+  it.each([['plateau-reviewer'], ['plateau-reviewer[bot]']])('accepts the separate reviewer App as viewer %s', login => expect(checkReviewerIdentity({ identity, viewer: { login, type: 'Bot' }, prAuthor: author })).toEqual({ ok: true, reviewerLogin: 'plateau-reviewer[bot]' }));
   it('matches the latest decisive review by author, head and state', () => {
     const reviews = [review(1, 'APPROVED', otherHead), review(2, 'APPROVED', head, 'other'), review(3, 'COMMENTED'), review(4, 'APPROVED'), review(5, 'APPROVED')];
-    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer' })).toBe(reviews[4]);
-    expect(findExistingNativeReview({ reviews, head, event: 'REQUEST_CHANGES', reviewerLogin: 'plateau-reviewer' })).toBeNull();
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer[bot]' })).toBe(reviews[4]);
+    expect(findExistingNativeReview({ reviews, head, event: 'REQUEST_CHANGES', reviewerLogin: 'plateau-reviewer[bot]' })).toBeNull();
   });
   it('does not reuse a verdict superseded on another head', () => {
     const reviews = [review(7, 'APPROVED'), review(9, 'CHANGES_REQUESTED', otherHead)];
-    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer' })).toBeNull();
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer[bot]' })).toBeNull();
   });
   it('keeps comment idempotency independent of decisive reviews', () => {
     const reviews = [review(7, 'COMMENTED'), review(9, 'APPROVED')];
-    expect(findExistingNativeReview({ reviews, head, event: 'COMMENT', reviewerLogin: 'plateau-reviewer' })).toBe(reviews[0]);
+    expect(findExistingNativeReview({ reviews, head, event: 'COMMENT', reviewerLogin: 'plateau-reviewer[bot]' })).toBe(reviews[0]);
   });
-  it('ignores comments, dismissed reviews and other reviewers after the latest matching verdict', () => {
+  it('a later dismissal means nothing of ours stands: never reported already-posted', () => {
     const reviews = [review(7, 'CHANGES_REQUESTED'), review(9, 'APPROVED'), review(10, 'COMMENTED'), review(11, 'DISMISSED'), review(12, 'CHANGES_REQUESTED', head, 'other')];
-    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'app/plateau-reviewer' })).toBe(reviews[1]);
+    expect(findExistingNativeReview({ reviews, head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer[bot]' })).toBeNull();
+    expect(findExistingNativeReview({ reviews: reviews.filter(r => r.id !== 11), head, event: 'APPROVE', reviewerLogin: 'plateau-reviewer[bot]' })).toBe(reviews[1]);
   });
-  it('lists only own standing numeric change request ids across heads', () => {
-    const reviews = [review(1, 'CHANGES_REQUESTED'), review(2, 'CHANGES_REQUESTED', otherHead), review(3, 'DISMISSED'), review(4, 'CHANGES_REQUESTED', head, 'other')];
-    expect(ownStandingChangeRequests({ reviews, reviewerLogin: 'plateau-reviewer' })).toEqual([1, 2]);
-    expect(ownStandingChangeRequests({ reviews, reviewerLogin: '' })).toEqual([]);
+  it('lists only own standing numeric ids of the asked states across heads', () => {
+    const reviews = [review(1, 'CHANGES_REQUESTED'), review(2, 'CHANGES_REQUESTED', otherHead), review(3, 'DISMISSED'), review(4, 'CHANGES_REQUESTED', head, 'other'), review(5, 'APPROVED')];
+    expect(ownStandingReviews({ reviews, reviewerLogin: 'plateau-reviewer[bot]', states: ['CHANGES_REQUESTED'] })).toEqual([1, 2]);
+    expect(ownStandingReviews({ reviews, reviewerLogin: 'plateau-reviewer[bot]', states: ['APPROVED', 'CHANGES_REQUESTED'] })).toEqual([1, 2, 5]);
+    expect(ownStandingReviews({ reviews, reviewerLogin: '', states: ['CHANGES_REQUESTED'] })).toEqual([]);
   });
 });
 
@@ -141,9 +183,9 @@ describe('synchronous mirror shell', () => {
     expect(f.result.outcome).toBe('posted');
     expect(f.posts).toHaveLength(1);
     expect(f.posts[0]).toEqual(['api', '--method', 'POST', 'repos/owner/repo/pulls/123/reviews', '-f', `commit_id=${head}`, '-f', 'event=APPROVE', '-f', `body=${nativeReviewBody({ verdict: 'accepted', event: 'APPROVE', head })}`]);
-    expect(f.calls[0]).toEqual(['api', 'repos/owner/repo/pulls/123', '--jq', '{head: .head.sha, author: .user.login, state: .state}']);
-    expect(f.calls[1]).toEqual(['api', 'graphql', '-f', 'query=query{viewer{login}}', '--jq', '.data.viewer.login']);
-    expect(f.calls[2]).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/owner/repo/pulls/123/reviews', '--jq', '.[] | {id, state, commit_id, user: {login: .user.login}}']);
+    expect(f.calls[0]).toEqual(['api', 'repos/owner/repo/pulls/123', '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state}']);
+    expect(f.calls[1]).toEqual(['api', 'graphql', '-f', 'query=query{viewer{__typename login}}', '--jq', '.data.viewer | "\\(.__typename) \\(.login)"']);
+    expect(f.calls[2]).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/owner/repo/pulls/123/reviews', '--jq', '.[] | {id, state, commit_id, user: {login: .user.login, type: .user.type}}']);
     expect(f.result.line).toMatch(/^native-review: /);
     expect(f.result.line).toContain('label=accepted native=APPROVE outcome=posted agree=yes mode=mirror(tool)');
     expect(f.log).toHaveBeenCalledWith(f.result.line);
@@ -195,12 +237,192 @@ describe('synchronous mirror shell', () => {
     expect(f.posts[0]).toContain('event=COMMENT');
     expect(f.puts).toHaveLength(1);
   });
-  it('records dismissal failures and continues other dismissals', () => {
+  it('records dismissal failures, continues other dismissals and counts as disagreement', () => {
     const f = fixture({ verdict: 'clear-human' }, { reviews: [review(7, 'CHANGES_REQUESTED'), review(8, 'CHANGES_REQUESTED')], dismissError: new Error('denied') });
     expect(f.puts).toHaveLength(2);
     expect(f.result.reason).toContain('denied');
-    expect(f.result.dismissed).toBe(0);
+    expect(f.result).toMatchObject({ outcome: 'failed', dismissed: 0 });
+    expect(f.result.line).toContain('agree=no dismissal=failed');
   });
+  // Operator send-back #2: a pending label never sits beside a standing bot APPROVE or REQUEST_CHANGES.
+  it.each(['rearm', 'restamp'])('%s dismisses every standing review of ours, approval and change request alike', verdict => {
+    const f = fixture({ verdict }, { reviews: [review(5, 'APPROVED', otherHead), review(7, 'CHANGES_REQUESTED'), review(8, 'APPROVED'), review(9, 'DISMISSED'), review(10, 'COMMENTED'), review(11, 'APPROVED', head, 'other', 'User')] });
+    expect(f.posts).toHaveLength(0);
+    expect(f.puts.map(a => a[3])).toEqual([5, 7, 8].map(id => `repos/owner/repo/pulls/123/reviews/${id}/dismissals`));
+    expect(f.result).toMatchObject({ outcome: 'dismissed', dismissed: 3, event: null });
+    expect(f.result.line).toContain(`label=${verdict} native=none outcome=dismissed agree=n/a dismissal=ok`);
+  });
+  it('a changes verdict whose request did not land dismisses our standing approval', () => {
+    const f = fixture({ verdict: 'changes' }, { reviews: [review(7, 'APPROVED')], postError: new Error('boom') });
+    expect(f.result.outcome).toBe('failed');
+    expect(f.puts).toHaveLength(1);
+    expect(fixture({ verdict: 'changes' }, { reviews: [review(7, 'APPROVED')] }).puts).toHaveLength(0);
+  });
+  it('a review:human accept also dismisses a standing bot approval', () => {
+    const f = fixture({ labels: ['review:human'] }, { reviews: [review(7, 'APPROVED'), review(8, 'CHANGES_REQUESTED')] });
+    expect(f.posts[0]).toContain('event=COMMENT');
+    expect(f.puts).toHaveLength(2);
+  });
+});
+
+/** A fake GitHub: one PR whose review list the mirror reads, posts to and dismisses on, so a verdict SEQUENCE is real. */
+function fakeGithub({ viewer = 'Bot plateau-reviewer' } = {}) {
+  const reviews = [];
+  let nextId = 100;
+  const exec = (argv) => {
+    if (argv.includes('POST')) {
+      const field = name => argv.find(a => a.startsWith(`${name}=`)).slice(name.length + 1);
+      reviews.push(review(nextId++, { APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED' }[field('event')], field('commit_id')));
+      return '{}';
+    }
+    if (argv.includes('PUT')) {
+      const id = Number(/reviews\/(\d+)\/dismissals$/.exec(argv[3])[1]);
+      reviews.find(r => r.id === id).state = 'DISMISSED';
+      return '{}';
+    }
+    if (argv.includes('graphql')) return viewer;
+    if (argv.includes('--paginate')) return reviews.map(JSON.stringify).join('\n');
+    return JSON.stringify({ head, author: 'web-everything[bot]', authorType: 'Bot', state: 'open' });
+  };
+  // GitHub's standing verdict of one reviewer: its latest opinionated review, unless that one was dismissed.
+  const standing = () => {
+    const latest = reviews.filter(r => r.state !== 'COMMENTED').sort((a, b) => b.id - a.id)[0];
+    return latest && latest.state !== 'DISMISSED' ? latest.state : 'none';
+  };
+  return { reviews, exec, standing };
+}
+const NATIVE_FOR_LABEL = { accepted: 'APPROVED', changes: 'CHANGES_REQUESTED', rearm: 'none', restamp: 'none', 'clear-human': 'none' };
+
+describe('verdict sequences on one head (operator send-back #1 and #2)', () => {
+  const step = (gh, verdict, extra = {}) => mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict, headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, ...extra });
+  it.each([
+    [['accepted', 'changes', 'accepted']],
+    [['changes', 'accepted', 'changes']],
+    [['accepted', 'rearm', 'accepted']],
+    [['changes', 'rearm', 'changes']],
+    [['accepted', 'changes', 'rearm', 'accepted', 'changes', 'accepted']],
+    [['changes', 'clear-human', 'changes']],
+  ])('GitHub ends every step of %j agreeing with the label, and the log never claims a false agreement', (sequence) => {
+    const gh = fakeGithub();
+    for (const verdict of sequence) {
+      const result = step(gh, verdict);
+      expect(gh.standing(), `after ${verdict}`).toBe(NATIVE_FOR_LABEL[verdict]);
+      if (verdict === 'accepted' || verdict === 'changes') {
+        expect(result.outcome, `after ${verdict}`).toBe('posted');
+        expect(result.line).toContain('agree=yes');
+      }
+    }
+  });
+  it('a repeated verdict with nothing in between is still deduplicated', () => {
+    const gh = fakeGithub();
+    expect(step(gh, 'accepted').outcome).toBe('posted');
+    expect(step(gh, 'accepted').outcome).toBe('already-posted');
+    expect(gh.reviews).toHaveLength(1);
+  });
+});
+
+describe('clearing under a token that is not the reviewer App (operator send-back #3)', () => {
+  const operator = 'User chalbert';
+  it('clear-human run by the operator dismisses our change request with the minted reviewer token', () => {
+    const gh = fakeGithub({ viewer: operator });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const reviewerGh = { ...gh, calls: [] };
+    const asReviewer = (argv) => { reviewerGh.calls.push(argv); return argv.includes('graphql') ? 'Bot plateau-reviewer' : gh.exec(argv); };
+    const minted = vi.fn(() => ({ exec: asReviewer }));
+    const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'clear-human', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, reviewerExec: minted });
+    expect(minted).toHaveBeenCalledWith(expect.objectContaining({ repo: 'owner/repo', identity }));
+    expect(reviewerGh.calls.filter(a => a.includes('PUT'))).toHaveLength(1);
+    expect(gh.standing()).toBe('none');
+    expect(result).toMatchObject({ outcome: 'dismissed', dismissed: 1 });
+  });
+  it('an accept under the worker token still posts nothing, but its stale change request is lifted as the reviewer', () => {
+    const gh = fakeGithub({ viewer: 'Bot web-everything' });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const asReviewer = (argv) => (argv.includes('graphql') ? 'Bot plateau-reviewer' : gh.exec(argv));
+    const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, reviewerExec: () => ({ exec: asReviewer }) });
+    expect(result).toMatchObject({ outcome: 'skipped', dismissed: 1 });
+    expect(result.reason).toMatch(/^token-is-not-reviewer/);
+    expect(gh.reviews.filter(r => r.state === 'APPROVED')).toHaveLength(0);
+    expect(gh.standing()).toBe('none');
+  });
+  it('a minted token that is not the reviewer App is refused: nothing is written with it, the dismissal is queued', () => {
+    const gh = fakeGithub({ viewer: operator });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const impostor = vi.fn(argv => (argv.includes('graphql') ? 'User plateau-reviewer' : gh.exec(argv)));
+    const queue = { append: vi.fn(() => true), claim: vi.fn() };
+    const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'clear-human', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, reviewerExec: () => ({ exec: impostor }), queue });
+    expect(impostor.mock.calls.filter(([a]) => a.includes('PUT'))).toHaveLength(0);
+    expect(queue.append).toHaveBeenCalledWith(expect.objectContaining({ repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [7] }));
+    expect(result.outcome).toBe('queued');
+    expect(result.line).toContain('agree=no dismissal=queued');
+  });
+  it('no reviewer token: the dismissal is queued, then the next reviewer-token run dismisses it first', () => {
+    const gh = fakeGithub({ viewer: operator });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const entries = [];
+    const queue = { append: (e) => { entries.push(e); return true; }, claim: () => ({ entries: entries.splice(0), done: () => {} }) };
+    const lines = [];
+    const base = { repo: 'owner/repo', pr: 123, headSha: head, env: { WE_UNDER_TEST: '1' }, identity, mode: { mode: 'mirror', source: 'tool' }, log: (l) => lines.push(l), appendLog: () => {}, queue };
+    const queued = mirrorNativeReview({ ...base, verdict: 'clear-human', exec: gh.exec, reviewerExec: () => ({ reason: 'reviewer-token-unavailable: no key' }) });
+    expect(queued).toMatchObject({ outcome: 'queued', queued: 1 });
+    expect(queued.reason).toContain('reviewer-token-unavailable: no key');
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    // A later run as the reviewer App, on any PR, drains the queue before its own work.
+    const asReviewer = (argv) => (argv.includes('graphql') ? 'Bot plateau-reviewer' : gh.exec(argv));
+    mirrorNativeReview({ ...base, verdict: 'advisory', exec: asReviewer });
+    expect(gh.reviews.find(r => r.id === 7).state).toBe('DISMISSED');
+    expect(entries).toEqual([]);
+    expect(lines.some(l => l.includes('label=clear-human native=none outcome=dismissed') && l.includes('dismissal=ok'))).toBe(true);
+    // The latest line per (PR, head, label) is the drained one: the trial no longer counts it as a mismatch.
+    expect(summarizeReadiness(lines, { minMirroredVerdicts: 1, maxMismatches: 0 }).mismatches).toBe(0);
+  });
+  it('a queued dismissal only touches the review ids recorded at queue time', () => {
+    const gh = fakeGithub();
+    gh.reviews.push(review(7, 'DISMISSED'), review(8, 'CHANGES_REQUESTED'));
+    const queue = { append: vi.fn(() => true), claim: () => ({ entries: [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [7] }, { v: 1, repo: 'bad repo', pr: 1, head, verdict: 'x', ids: [8] }], done: () => {} }) };
+    mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'advisory', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, queue });
+    expect(gh.reviews.find(r => r.id === 8).state).toBe('CHANGES_REQUESTED');
+    expect(queue.append).not.toHaveBeenCalled();
+  });
+});
+
+describe('reviewer token and dismissal queue IO', () => {
+  let dir;
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = null; });
+  const app = { appId: '42', installations: { owner: '7' }, key: { file: '/nonexistent/key.pem' }, botLogin: 'plateau-reviewer[bot]' };
+  it('reads the reviewer App\'s fresh cached installation token, else mints, else says why', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrv-'));
+    const cachePath = join(dir, 'web-everything.json');
+    const now = Date.parse('2026-10-13T20:00:00Z');
+    const entry = (token, extra = {}) => JSON.stringify({ v: CACHE_VERSION, appId: '42', installationId: '7', token, expiresAt: '2026-10-13T21:00:00Z', ...extra });
+    const mintSync = vi.fn(() => 'minted-token');
+    const ids = { identity: { roles: { reviewer: app } }, repo: 'owner/repo', env: {}, now, cachePath, mintSync };
+    writeFileSync(installationCachePath(roleCachePath(cachePath, '42'), '7'), entry('cached-token'));
+    expect(readReviewerToken(ids)).toEqual({ token: 'cached-token' });
+    writeFileSync(installationCachePath(roleCachePath(cachePath, '42'), '7'), entry('wrong-app', { appId: '1' }));
+    expect(readReviewerToken(ids)).toEqual({ token: 'minted-token' });
+    expect(mintSync).toHaveBeenCalledWith(expect.objectContaining({ appId: '42', installationId: '7', key: app.key }));
+    expect(readReviewerToken({ ...ids, mintSync: throws })).toEqual({ reason: 'reviewer-token-unavailable: unreadable' });
+    expect(readReviewerToken({ ...ids, repo: 'other/repo' })).toEqual({ reason: 'reviewer-app-not-installed (other)' });
+    expect(readReviewerToken({ ...ids, identity: {} })).toEqual({ reason: 'reviewer-app-unconfigured' });
+  });
+  it('the file queue appends, claims atomically and keeps a crashed claim for the next drainer', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    const q = fileDismissalQueue(join(dir, 'q.jsonl'));
+    expect(q.claim().entries).toEqual([]);
+    q.append({ a: 1 });
+    q.append({ a: 2 });
+    const crashed = q.claim();
+    expect(crashed.entries).toEqual([{ a: 1 }, { a: 2 }]);
+    q.append({ a: 3 });
+    const next = q.claim(); // the crashed drainer never called done(): its claim is re-claimed
+    expect(next.entries).toEqual(expect.arrayContaining([{ a: 1 }, { a: 2 }, { a: 3 }]));
+    next.done();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+describe('synchronous mirror shell (continued)', () => {
   it.each(['off', 'mirror', 'authoritative'])('honours mode %s', mode => {
     const f = fixture({ mode: { mode, source: 'tool' } });
     expect(f.result.outcome).toBe(mode === 'off' ? 'off' : 'posted');
@@ -210,7 +432,7 @@ describe('synchronous mirror shell', () => {
     }
   });
   it('skips non-verdicts with no IO', () => {
-    const f = fixture({ verdict: 'rearm' });
+    const f = fixture({ verdict: 'bogus' });
     expect(f.result.outcome).toBe('not-applicable');
     expect(f.calls).toHaveLength(0);
     expect(f.log).not.toHaveBeenCalled();

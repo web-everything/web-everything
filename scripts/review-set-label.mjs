@@ -954,6 +954,8 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  // Card xk8ab41 — the native-review mirror hook, injected only by tests (it never throws and is never a gate).
+  mirrorNative = mirrorNativeReview,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1873,7 +1875,7 @@ export function runReviewLabelCli({
 
   // Card xk8ab41 — mirror the verdict as a native GitHub review (`review.nativeGithubReview`): pinned to the reviewed head,
   // posted only as the reviewer App, stderr-only, never throws, never a gate (we:scripts/lib/native-github-review.mjs).
-  mirrorNativeReview({ repo, pr: Number(pr), verdict: to, labels: Array.isArray(currentLabels) ? currentLabels : [], headSha });
+  mirrorNative({ repo, pr: Number(pr), verdict: to, labels: Array.isArray(currentLabels) ? currentLabels : [], headSha });
   emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision, labels: newLabels }))}\n`);
   process.exit(0);
 }
