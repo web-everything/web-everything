@@ -51,6 +51,21 @@ In `we:scripts/__tests__/pr-merge-gate.test.mjs`:
 9. review-driven fail-closed guards (all flagged, i.e. scanned raw): a regex literal with `//` (`/\//.test(p); it.skip('x')`), a regex literal with a quote (`/'/; it.skip(x, ''); /'/`), a template interpolation (`` `${it.skip('x', () => {})}` ``), an unclosed `/* it.skip('a')`, and `/* don't */ it.skip('x')` and `it.skip('x') // don't` (code outside the comment still flagged).
 10. the existing `midLineString` / `terminatedRef` cases (`we:scripts/__tests__/pr-merge-gate.test.mjs:~287`) stay clean.
 11. `closingMultilineTemplateDoesNotHideSkip`: construct valid source with opening line "const a = " + backtick, middle line backtick + "; it.skip('x', () => {}); const b = " + backtick, and a closing-backtick line. Feed the corresponding added lines through `scanTestTampering`; assert `tampered:true` and a `test-skipped` finding. Also exercise a hunk that adds only the middle line (template boundaries are unchanged outside the hunk). Repeat with template-body text before the closing backtick, leading whitespace, `.only`, `.skip.each`, and bare `xit(`/`fit(`. All remain flagged raw. Include a variant with a backtick inside a quote/comment before the executable marker to pin that the backtick pre-check runs before any stripping.
+
+Use this exact partial-hunk fixture for case 11; the context lines must not contribute to the added-marker count:
+
+```diff
+diff --git a/scripts/__tests__/template-boundaries.test.mjs b/scripts/__tests__/template-boundaries.test.mjs
+--- a/scripts/__tests__/template-boundaries.test.mjs
++++ b/scripts/__tests__/template-boundaries.test.mjs
+@@ -1,2 +1,3 @@
+ const a = `
++`; it.skip('x', () => {}); const b = `
+ `;
+```
+
+Assert exactly one `test-skipped` marker for this file as well as `tampered:true`. This isolates the closer-then-opener line: an implementation cannot pass merely by flagging an opening or closing context line.
+
 Cases 2, 4-7 and 9-11 pass today and are guards; 1, 3 and the string half of 8 are the RED cases. Case 11 must fail under a mutation that removes the backtick pre-check and resumes per-line template stripping.
 
 ## Proof plan
