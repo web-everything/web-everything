@@ -2,10 +2,11 @@
 bornAs: xhkx845
 kind: story
 size: 3
-status: active
+status: resolved
 scope: ["we:scripts/lib/pr-snapshot.mjs", "we:scripts/lib/__tests__/pr-snapshot.test.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/__tests__/ruling-needed.test.mjs", "we:scripts/conveyor/__tests__/ruling-needed-sweep.test.mjs", "we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/__tests__/referral-auto-block.test.mjs"]
 dateOpened: "2026-10-12"
 dateStarted: "2026-10-13"
+dateResolved: "2026-10-13"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "4ac28cbadea0a2519698e37b9930486872e71d83"
 tags: []
