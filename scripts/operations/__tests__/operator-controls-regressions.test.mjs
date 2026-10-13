@@ -4,6 +4,7 @@ import { createOperatorControlsReader, createOperatorControlsSinks } from '../op
 import { operatorControlCliPolicy } from '../run.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 
 const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert', channel: 'test', reason: 'retry' };
 const before = { state: 'OPEN', head: 'head', labels: ['review:changes'], comments: [] };
@@ -69,7 +70,8 @@ describe('operator control review regressions', () => {
     }`;
     const hook = 'data:text/javascript,' + encodeURIComponent(loader);
     const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(hook)}, import.meta.url);`);
-    const cli = fileURLToPath(new URL('../run.mjs', import.meta.url));
+    // Resolve a filesystem path, avoiding Vite's new URL(asset, import.meta.url) transform.
+    const cli = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'run.mjs');
     const argv = ['rearm', '--pr=7', '--actor=chalbert', '--channel=test', '--reason=retry'];
     for (const [flags, guard, store] of [[['--preview', '--preview=false'], false, 'persisted'], [['--preview=false', '--preview'], true, 'memory']]) {
       const result = spawnSync(process.execPath, ['--import', preload, cli, ...argv, ...flags], { encoding: 'utf8', timeout: 30000 });

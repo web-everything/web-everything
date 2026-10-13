@@ -53,7 +53,7 @@ export function scanUnauthenticatedCommentMarkerParsers(docs) {
       if (ts.isFunctionLike(node) && node.body) {
         const body = node.body.getText(tree);
         const readsComments = node.parameters.some(p => /comments|thread/i.test(p.name.getText(tree)))
-          || (node.name && /parse|count|read/i.test(node.name.getText(tree)));
+          || (node.name && /^(?:parse|count|read)/i.test(node.name.getText(tree)));
         let referencesMarker = /<!--/.test(body);
         const findMarker = child => {
           if (ts.isIdentifier(child) && markers.has(child.text)) referencesMarker = true;
@@ -70,11 +70,28 @@ export function scanUnauthenticatedCommentMarkerParsers(docs) {
                 while (parent && (ts.isParenthesizedExpression(parent) || ts.isPrefixUnaryExpression(parent))) {
                   expression = parent; parent = parent.parent;
                 }
-                // A predicate's result must be consumed as a guard, never merely called.
-                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ((ts.isIfStatement(parent) && parent.expression === expression)
-                  || (ts.isConditionalExpression(parent) && parent.condition === expression)
-                  || (ts.isBinaryExpression(parent) && parent.left === expression && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken))) guarded = true;
-                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ts.isArrowFunction(parent) && parent.body === expression) {
+                // A rejecting guard must leave the untrusted path before parsing. Merely
+                // testing authorship in an if statement does not filter any comments.
+                const rejectsUntrusted = ts.isPrefixUnaryExpression(expression)
+                  && expression.operator === ts.SyntaxKind.ExclamationToken
+                  && expression.operand === child;
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ts.isIfStatement(parent)
+                  && parent.expression === expression && rejectsUntrusted) {
+                  const branch = parent.thenStatement;
+                  const exit = ts.isBlock(branch) ? branch.statements.at(-1) : branch;
+                  if (exit && (ts.isContinueStatement(exit) || ts.isReturnStatement(exit) || ts.isThrowStatement(exit))
+                    && !/<!--|\.body|bodyOf\(/.test(branch.getText(tree))) guarded = true;
+                }
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && !rejectsUntrusted
+                  && ((ts.isConditionalExpression(parent) && parent.condition === expression
+                    && /<!--|\.body|bodyOf\(/.test(parent.whenTrue.getText(tree)))
+                  || (ts.isBinaryExpression(parent) && parent.left === expression
+                    && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+                    && /<!--|\.body|bodyOf\(/.test(parent.right.getText(tree))))) guarded = true;
+                let predicate = expression;
+                while (ts.isParenthesizedExpression(predicate)) predicate = predicate.expression;
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && predicate === child
+                  && ts.isArrowFunction(parent) && parent.body === expression) {
                   const filter = parent.parent;
                   if (ts.isCallExpression(filter) && ts.isPropertyAccessExpression(filter.expression)
                     && filter.expression.name.text === 'filter' && filter.arguments.includes(parent)) guarded = true;
