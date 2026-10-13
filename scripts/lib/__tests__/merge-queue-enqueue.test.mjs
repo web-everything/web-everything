@@ -4,7 +4,7 @@ import { readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSyn
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
+import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 
 const HEAD = 'a'.repeat(40);
 
@@ -285,5 +285,16 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
       expect(readPinnedChangedFiles({ headSha: 'f'.repeat(40), cwd: clone })).toHaveProperty('error');
       expect(readPinnedChangedFiles({ headSha: 'nope', cwd: clone })).toHaveProperty('error');
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('isAlreadyQueuedError (card 257: a PR another path already enqueued is not a failed land)', () => {
+  it("reads GitHub's 'already in the queue' refusal as already queued", () => {
+    // Live text, 2026-10-13 (#5183, #5191, #5198): counted as a failed land, so the pass exited 2 and backed off.
+    expect(isAlreadyQueuedError('gh: Pull request is already in the queue')).toBe(true);
+    expect(isAlreadyQueuedError('Pull request is already in the merge queue')).toBe(true);
+    expect(isAlreadyQueuedError('is already queued to merge')).toBe(true);
+    expect(isAlreadyQueuedError("Pull request Required workflows 'Soak replay gate' failed")).toBe(false);
+    expect(isAlreadyQueuedError('')).toBe(false);
   });
 });
