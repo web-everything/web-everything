@@ -1222,3 +1222,28 @@ Two parallel lane sessions can allocate the **same** backlog `NNN` for a *new* i
 - `relatedReport` must exist on disk; `relatedProject` must resolve in `projects.json`; `crossRef` needs both `url` and `label`.
 - `reports/` is **not** in the 11ty build, so `relatedReport` shows as a path label, not a link. Real site links go via `crossRef` / `relatedProject`.
 - `npm run check:standards` validates all of the above — it reads `backlog/*.md` through `src/_data/backlog.js`, the same loader the site uses.
+
+## Complete operator task briefs
+
+File an authored task through `we:scripts/operations/run.mjs file-item` with
+`--operatorTask --priority=P0` and the complete body in `--digest`. The body replaces
+scaffold placeholders and must contain nonempty Design, MVP, Done when (or Acceptance),
+Edge cases, Test plan, and Proof plan sections without TODO/TBD placeholders. Pass a
+nonempty `--scope` of `we:`-qualified paths. Filing uses the prepare pass's shared
+section validator, with these additional operator completeness requirements; refusal
+lists missing sections before any write or queue effect. A passing brief gets
+`operatorTask: true`, an ET `preparedDate`, and the local `origin/main` tip as
+`preparedAgainstSha`. A missing origin/main reference refuses stamping.
+
+`--priority=P0|P1|P2|P3|P4` writes the existing `priority` field. P0 precedes
+`build.priority` in every queue mode and takes the next available slot; blockedBy,
+scope holds, sizing, clearance, and stamp staleness still apply.
+
+`we:scripts/settings/operator-task.json` owns `build.operatorTask`:
+`{ enabled: true, maxPriority: "P0" }`. Valid leaves cascade independently from
+standard defaults to platform build preferences to tool settings; policy logs identify
+each leaf's source. `maxPriority` is the highest allowed class (P0 permits P0–P4;
+P1 permits P1–P4). Disabled filing retains the brief and operator marker but adds no
+prepare stamp. Disabled build admission holds previously stamped operator cards for
+prepare too. A real `prepare-stamp` clears the operator filing marker, replacing its
+fast-path admission so the card can build after preparation while disabled.

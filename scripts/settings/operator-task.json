@@ -1,0 +1,4 @@
+{
+  "$comment": "Complete operator briefs filed with --operatorTask skip prepare only after the shared prepare section validator plus Done when/Acceptance, Edge cases and we:-qualified scope checks. Cascade: standard enabled=true/maxPriority=P0 → platform build.operatorTask → tool build.operatorTask. Each leaf source is logged by policy-cascade. maxPriority is the highest allowed priority class (P0 allows all classes). Disabled filing leaves the card unstamped; disabled build admission holds operator cards for prepare even if previously stamped.",
+  "build": { "operatorTask": { "enabled": true, "maxPriority": "P0" } }
+}
