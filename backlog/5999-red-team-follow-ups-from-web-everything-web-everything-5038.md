@@ -43,3 +43,4 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5038 (finding 1: `we:scripts/lib/build-queue.mjs:28` — failing-input, degraded Canonical zero-padded numeric IDs silently lose their build priority.)
+- Also raised by web-everything/web-everything#5038 (finding 1: `we:scripts/lib/build-queue.mjs:28` — failing-input, degraded Accepted zero-padded numeric IDs silently lose their build priority.)
