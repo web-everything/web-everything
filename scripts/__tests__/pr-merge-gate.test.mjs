@@ -6,7 +6,7 @@
  *   a loud audit line). The gh shell is injected (never actually called).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, isJsTestPath, stripStringsAndComments, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
+import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, isStrippableTestPath, stripStringsAndComments, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
 
 // A capturing fake gh exec + a capturing stderr sink, so nothing shells out and the audit line is observable.
 const fakeExec = () => { const calls = []; const exec = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { ok: true }; }; return { exec, calls }; };
@@ -382,7 +382,14 @@ describe('pr-merge-gate — scanTestTampering ignores skip/only markers in strin
   it('9c: the line after a backslash-continued line is scanned raw (escaped-newline string continuation)', () => {
     expect(skipped(scan(["  const a = 'x\\", "  '; it.skip('y', () => {}); const b = 'z\\", "  ';"]))).toHaveLength(1);
     // an even run of backslashes is an escaped backslash, not a continuation: the next line is stripped as usual
-    expect(scan(['  const a = "x\\\\"', '  "it.skip(\'x\')"']).tampered).toBe(false);
+    expect(scan(['  // dir C:\\\\', '  "it.skip(\'x\')"']).tampered).toBe(false);
+    // …and a single trailing backslash IS a continuation (same second line is now scanned raw)
+    expect(scan(['  // dir C:\\', '  "it.skip(\'x\')"']).tampered).toBe(true);
+  });
+  it('9d: .jsx/.tsx files are scanned raw (JSX text apostrophes are not string delimiters)', () => {
+    for (const ext of ['jsx', 'tsx']) {
+      expect(skipped(scan(["  <p>don't</p>; it.skip('x', () => {}); <p>can't</p>"], `scripts/__tests__/ui.test.${ext}`))).toHaveLength(1);
+    }
   });
   it('10: a marker-free mid-line string stays clean', () => {
     expect(scan(["  const note = 'todo: drop the it.skip before merge';"]).tampered).toBe(false);
@@ -421,9 +428,9 @@ describe('pr-merge-gate — scanTestTampering ignores skip/only markers in strin
     expect(stripStringsAndComments('a / b')).toBe('a / b');
     expect(stripStringsAndComments('/* c */ go() /* d */')).toBe(' go() ');
   });
-  it('isJsTestPath covers JS/TS extensions only', () => {
-    for (const p of ['a.js', 'a.mjs', 'a.cjs', 'a.jsx', 'a.ts', 'a.mts', 'a.cts', 'a.tsx']) expect(isJsTestPath(p)).toBe(true);
-    for (const p of ['a.md', 'a.json', 'a.mjs.snap', '']) expect(isJsTestPath(p)).toBe(false);
+  it('isStrippableTestPath covers plain JS/TS extensions only (not jsx/tsx)', () => {
+    for (const p of ['a.js', 'a.mjs', 'a.cjs', 'a.ts', 'a.mts', 'a.cts']) expect(isStrippableTestPath(p)).toBe(true);
+    for (const p of ['a.jsx', 'a.tsx', 'a.md', 'a.json', 'a.mjs.snap', '']) expect(isStrippableTestPath(p)).toBe(false);
   });
 });
 

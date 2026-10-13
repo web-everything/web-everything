@@ -100,9 +100,13 @@ const SKIP_FOCUS_MARKER_RE = /\b(?:it|test|describe)\s*\.\s*(?:skip|only)\s*(?:\
 // consolidating such assertions can't net a phantom removal that mis-parks the couple (#2669).
 const TEST_CASE_OPENER_RE = /(?<![.\w])(?:it|test)\s*(?:\.\s*\w+\s*)?\(\s*['"`]/;
 
-/** A JS/TS source file (the only kind whose lines `stripStringsAndComments` may reason about). Pure. */
-export function isJsTestPath(path) {
-  return /\.[cm]?[jt]sx?$/.test(String(path || ''));
+/**
+ * A plain JS/TS source file — the only kind whose lines `stripStringsAndComments` may reason about. `.jsx`/`.tsx`
+ * are deliberately EXCLUDED: JSX text (`<p>don't</p>`) is not JS-tokenised, so its apostrophes would pair as
+ * string delimiters and could blank out a real marker; they are scanned raw. Pure.
+ */
+export function isStrippableTestPath(path) {
+  return /\.[cm]?[jt]s$/.test(String(path || ''));
 }
 
 /**
@@ -194,7 +198,7 @@ export function scanTestTampering({ diffText = '' } = {}) {
       findings.push({ path: f.path, kind: 'test-file-removed', detail: 'a test file was deleted' });
       continue; // a delete has no surviving markers/cases to also flag
     }
-    const jsFile = isJsTestPath(f.path); // non-JS files under __tests__/ are scanned raw (#5945 A4)
+    const jsFile = isStrippableTestPath(f.path); // non-JS files under __tests__/ are scanned raw (#5945 A4)
     // A line ending in an odd run of backslashes continues a quoted string onto the next added line, which then
     // starts INSIDE that string — so the line after one is scanned raw. (A continuation whose opener is an
     // unchanged context line outside the hunk's added lines is the documented residual, N1.)
