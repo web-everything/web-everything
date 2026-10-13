@@ -41,7 +41,7 @@ import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from './gh-throttle.mjs';
-import { REVIEW_LABELS } from './review-escalation.mjs';
+import { REVIEW_LABELS } from './review-labels.mjs';
 
 /**
  * Finish the labels after a caller has proven and durably recorded an acceptance carry.

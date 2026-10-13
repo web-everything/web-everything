@@ -14,7 +14,32 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { URL } from 'node:url';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
+
+describe('label provider import boundary', () => {
+  it('loads without importing the fix-procedure CLI that lazily loads this provider', () => {
+    // A fresh Node process exercises native ESM linking, which Vitest's transformed imports do not.
+    // Refuse the back edge before it can execute any CLI or forge operation.
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      const result = await nextResolve(specifier, context);
+      if (result.url.endsWith('/conveyor/fix-procedure.mjs')) {
+        throw new Error('label provider imports its fix-procedure caller');
+      }
+      return result;
+    }`;
+    const providerUrl = new URL('../review-label-provider.mjs', import.meta.url).href;
+    const script = `import { register } from 'node:module';
+      register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(loader)}`)}, import.meta.url);
+      await import(${JSON.stringify(providerUrl)});`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+  });
+});
 
 describe('clampLabelDescription', () => {
   it('exports the GitHub limit and preserves strings up to that limit', () => {
