@@ -1667,7 +1667,7 @@ describe('#4315 durable referral effects', () => {
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(result.pending).toEqual([old.referrals[0].key]);
     expect(result.records.every(r => !r.dropped)).toBe(true);
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, readRuns: () => [] })).toThrow(/mandatory referral hold/);
   });
 
   it.each(['agy-gemini', 'agy-claude'])('uses the %s cap and allows acceptance after audited drops', async seat => {
@@ -1678,7 +1678,7 @@ describe('#4315 durable referral effects', () => {
     expect(result.pending).toEqual([]);
     expect(h.judge).not.toHaveBeenCalled();
     expect(h.state.comments.at(-1).body).toContain('dropped: seat disabled by operator config');
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).not.toThrow();
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, readRuns: () => [] })).not.toThrow();
   });
 
   it('re-enabling the seat keeps old drops and holds new findings, including a repeated finding', async () => {
@@ -2008,12 +2008,12 @@ describe('#4315 durable referral effects', () => {
     h.state.comments.push({ body: `<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({ head: 'b'.repeat(40) }))} -->`, author: { login: 'web-everything' } });
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(result.pending).toEqual([]);
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).not.toThrow();
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, readRuns: () => [] })).not.toThrow();
     h.state.comments.push({ body: '<!-- mandatory-referrals-v1: %truncated', author: { login: 'web-everything' } });
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, readRuns: () => [] })).toThrow(/mandatory referral hold/);
     const pending = harness({ failure: 'judge' });
     await pending.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](pending.payload, CTX);
-    expect(() => assertMandatoryReferralsCleared(pending.state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(pending.state, { repo: 'o/r', pr: 7, readRuns: () => [] })).toThrow(/mandatory referral hold/);
   });
   it.each(['judge', 'timeout', 'omitted', 'identity', 'card'])('%s is bounded and human-owned across fresh sink instances', async failure => {
     const h = harness({ failure, result: failure === 'card' ? 'card' : 'not-real' });

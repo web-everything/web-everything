@@ -1995,6 +1995,9 @@ describe('the tick reader', () => {
     // that left this one real would shell `claude` whenever the ambient run store happened to hold an
     // in-flight dispatch.
     listAgents: () => [],
+    // The run store and liveness persistence are host I/O too, even with a fake agent listing.
+    listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+    recordLiveness: (stamped) => stamped,
     // #3457/#3460 + xykwe0h — readTick calls these lazily whenever a launch clears; left to their defaults they
     // shell the real `gh` and read origin/main from the real checkout. Stubbed: nothing is already delivered.
     checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
@@ -3173,6 +3176,8 @@ describe('readTick — the ground-truth check is LAZY: one gh call per dispatch 
     readText: () => BRIEF,
     loadItems: () => [{ num: '3037', slug: 'declare-dispatch', scope: ['we:scripts/operations/'] }],
     listAgents: () => [],
+    listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+    recordLiveness: (stamped) => stamped,
     checkBuildDelivery: () => null,
   };
 
@@ -3531,6 +3536,8 @@ describe('readTick — `openBlockers` reaches the read end to end, from `loadIte
     readText: () => BRIEF,
     loadItems: () => [{ num: '3398', slug: 'conveyor-supervisor-runner-residency', scope: ['we:scripts/conveyor/'], openBlockers: ['3443'] }],
     listAgents: () => [],
+    listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+    recordLiveness: (stamped) => stamped,
     checkAlreadyDone: () => ({ done: false, pr: null, checked: true }),
     checkBuildDelivery: () => null,
   };
