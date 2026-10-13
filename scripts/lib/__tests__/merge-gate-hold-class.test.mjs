@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { isCandidacyHold, deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting } from '../merge-gate-hold-class.mjs';
+import { isCandidacyHold, deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting, excusePrMergeGateHolds } from '../merge-gate-hold-class.mjs';
 import { formatPrResult } from '../merge-gate-ci.mjs';
 import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
 import { readReviewCiGate, readReviewHeadAndLabels } from '../review-ci-gate-io.mjs';
@@ -130,7 +130,8 @@ it('uses a rollup detailsUrl job id and case-insensitive head binding', () => {
   expect(readVerdict).toHaveBeenCalledWith(expect.objectContaining({ jobId: 123, prNumber: 4965 }));
 });
 it('missing labels, job id or completion never authorize excusal', () => {
-  expect(excuseMergeGateRows([row], opts({ labels: undefined })).rows).toEqual([row]);
+  expect(excuseMergeGateRows([row], opts({ labels: undefined }))).toMatchObject({ excused: false, reviewHold: true,
+    rows: [{ ...row, mergeGateReviewHold: { holds: expect.any(Array), jobId: 123 } }] });
   const noId = { ...row, id: undefined };
   expect(excuseMergeGateRows([noId], opts()).rows).toEqual([noId]);
   const pending = { ...row, status: 'IN_PROGRESS' };
@@ -379,5 +380,22 @@ describe('PR-event candidacy deferral', () => {
     expect(loadMergeGateHoldSetting(options)).toEqual({ value: 'off', source: 'repo' });
     loadMergeGateHoldSetting(options);
     expect(log.mock.calls).toEqual([['merge-gate · mergeGate.prEventCandidacyHoldsPass=off (source: repo)']]);
+  });
+});
+
+
+describe('review-hold annotation (card 273, #5157)', () => {
+  it('annotates the latest failing row without making CI green', () => {
+    const readVerdict = () => ({ num: 4965, head_sha: sha, ok: false, results: [{ id: 'test-gaming', status: 'hold' }] });
+    const out = excuseMergeGateRows([row], opts({ readVerdict }));
+    expect(out).toEqual({ excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: { holds: ['test-gaming'], jobId: 123 } }] });
+    expect(excuseMergeGateRows([row], opts({ readVerdict, setting: 'off' }))).toEqual({ rows: [row], excused: false });
+    const pr = { number: 4965, headRefOid: sha, labels: ['review:human'], statusCheckRollup: [row] };
+    expect(excusePrMergeGateHolds([pr], { mergeGateSetting: 'on', readMergeGateVerdict: readVerdict })[0].statusCheckRollup).toEqual(out.rows);
+  });
+  it('never annotates fail-closed or mixed real failures', () => {
+    for (const results of [[{ id: 'test-gaming', status: 'fail-closed' }], [{ id: 'test-gaming', status: 'hold' }, { id: 'red-main-freeze', status: 'hold' }]]) {
+      expect(excuseMergeGateRows([row], opts({ readVerdict: () => ({ num: 4965, head_sha: sha, ok: false, results }) }))).toEqual({ rows: [row], excused: false });
+    }
   });
 });

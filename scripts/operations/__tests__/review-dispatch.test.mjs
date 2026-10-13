@@ -839,3 +839,19 @@ describe('x6n7c2p session-mode CLI report for a skipped dispatch', () => {
     expect(out).toContain('unrecognized brief tokens (reported, not fatal): X');
   });
 });
+
+
+describe('card 273 advisory CI waiver at session dispatch', () => {
+  it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('%s head', state => {
+    let spawns = 0;
+    const out = dispatchReview({ pr: 5157, repo: 'web-everything/web-everything', root: '/repo',
+      ciGate: () => ({ allowed: false, headSha: state === 'missing' ? null : (state === 'mismatched' ? 'b' : 'a').repeat(40),
+        reason: state === 'unreadable' ? 'unreadable-ci' : state === 'head-changed' ? 'head-changed' : 'required-checks-not-successful' }),
+      advisoryCiWaiver: { head: 'A'.repeat(40), reason: 'human-handoff' },
+      checkStaleness: FRESH, readBrief: () => 'review {{PR}}', mintSessionId: () => 'advisory-ci',
+      ensureSessionCwd: path => path, resolveSettingsEnv: () => ({}),
+      isolateSession: () => ({ worktreeSettings: {} }), spawnAgent: () => { spawns++; return ''; } });
+    expect(spawns).toBe(state === 'matching' ? 1 : 0);
+    expect(Boolean(out.skipped)).toBe(state !== 'matching');
+  });
+});

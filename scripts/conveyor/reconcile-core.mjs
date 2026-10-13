@@ -301,7 +301,7 @@ export const REFUSAL_KINDS = Object.freeze([
   // sessions in one evening). `ci-heal-escalated` — a genuine judgment call, terminal until a new push.
   // `waiting-on-system-fix` — the red is the tooling/gate's own fault and a system-level fix is already open
   // for it; this PR owes nothing further until that fix lands or its own head changes.
-  'ci-heal-escalated', 'waiting-on-system-fix',
+  'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
   'ci-timeout-rerun-in-flight',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
@@ -1439,6 +1439,25 @@ export function resolveRoundCap(env = {}) {
     && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
 }
 
+function advisoryHeadState(pr) {
+  const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+  const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
+  const latest = headSha ? latestAdvisory(trustedComments) : undefined;
+  const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+  // Card 273, #5157: only trusted verdict footers count as head coverage.
+  const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
+    || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+  // A newer unpinned advisory also stops repeated reviews until a person rules.
+  let lastHeaded = -1;
+  let lastHeadless = -1;
+  trustedComments.forEach((c, i) => {
+    if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
+    if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
+  });
+  const unpinnedAdvisory = lastHeadless > lastHeaded;
+  return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -1556,10 +1575,11 @@ function dispatchReviewRow({
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
   if (advisoryReview) {
-    if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    if (advisoryReview.ciWaived !== true && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
-      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason }, why: advisoryReview.why,
+      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
+        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
     });
     return;
   }
@@ -1917,6 +1937,7 @@ export function planReconcile({
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
   requiredChecks = null,
+  advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
   // OPTION, never an env read — this file stays pure; a test sets it directly to exercise both sides of the
@@ -2167,24 +2188,7 @@ export function planReconcile({
       // defect is open: that is the gate working, not a defect — no takeover and no "a person must take it over".
       if (takeover?.reason === 'gate-hold') {
         // Live #4764: spent repair rounds still owe a current advisory, or a visible operator handoff.
-        const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
-        const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
-        const latest = headSha ? latestAdvisory(trustedComments) : undefined;
-        const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
-        // Structured evidence only: a verdict counts when its own footer names the live head. A sha merely mentioned
-        // in a verdict's prose (an older review quoting the new head) never marks that head reviewed.
-        const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
-          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
-        // A review whose basis was degraded or unpinned posts an advisory note with NO head to compare (no `Net basis`
-        // footer), so it can never "cover" the live head. When the newest advisory note on the thread is such a
-        // headless one, a review has already run: do not spend another every tick — the operator rules (bounds the loop).
-        let lastHeaded = -1;
-        let lastHeadless = -1;
-        trustedComments.forEach((c, i) => {
-          if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
-          if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
-        });
-        const unpinnedAdvisory = lastHeadless > lastHeaded;
+        const { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
         // The owed advisory goes through dispatchReviewRow, the ONE review decision (referral hold, scope-bloat, draft,
         // already-reviewed-head, CI). If it refuses, the refusal is named in the operator note below, never swallowed.
         let reviewRefusal = null;
@@ -2550,6 +2554,19 @@ export function planReconcile({
       continue;
     }
 
+    // Card 278, #5172: published red without a review label has no daemon owner.
+    if (unlabeledRedAgentPr === 'review-label' && reviewLabelHeal !== 'off'
+        && (pr?.state ?? 'OPEN') === 'OPEN' && !pr?.isDraft
+        && ['open', 'queued'].includes(phase) && String(pr?.headRefName ?? '').startsWith('lane/')
+        && isAiGeneratedPr(pr) && !withPhase.labels.some(l => l.startsWith('review:'))
+        && (withPhase.check === 'red' || withPhase.labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)))
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
+        variant: 'stuck', rule: 'unlabeled-red',
+        why: `agent PR reads ci-red but has no review:* label, so no daemon owns it (phase ${phase} answers nothing-owed); apply review:pending so the review path owns it; real red CI then routes to ci-heal` });
+      continue;
+    }
+
     // A required `review-gate` is red by design while a review label is held, so a `ci-red` PR whose ONLY
     // failing required check is `review-gate` must not be healed (ci-heal cannot clear it; it would re-run
     // every tick). Deliberately narrow: only the `ci-red` phase, and only when `review-gate` is the sole
@@ -2563,8 +2580,22 @@ export function planReconcile({
     // (9 h, zero dispatches). A CI repair is not a review decision: ci-heal never touches a `review:*` label, so
     // the human hold must not exclude it. Only a COMPLETED red (`check.state === 'red'`) opts a needs-human PR in —
     // pending/unchecked stay with the review path exactly as before.
+    const humanHandoffAdvisory = reason => {
+      if (advisoryReviewOnHumanHandoff !== 'on'
+          || !withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) return;
+      const { headSha, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
+      if (!headSha || advisoryIsCurrent || alreadyReviewed || unpinnedAdvisory) return;
+      const folded = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'humanHandoffAdvisory');
+      // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
+        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
+          why: reason === 'human-handoff'
+            ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
+            : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
+    };
     const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
-    if (ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -2677,6 +2708,16 @@ export function planReconcile({
     }
 
     if (ciRepairOwed) {
+      const heldGates = splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required;
+      const latestMergeGate = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(r => r.name === 'merge-gate');
+      if (advisoryReviewOnHumanHandoff === 'on'
+          && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+          && heldGates.length && heldGates.every(name => name === 'review-gate'
+            || (name === 'merge-gate' && latestMergeGate?.mergeGateReviewHold))) {
+        refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+        humanHandoffAdvisory('review-hold');
+        continue;
+      }
       // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
       const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
@@ -2863,6 +2904,7 @@ export function planReconcile({
                 ? `PR #${prNumber}: ci-heal confirmed head \`${escalation.headSha}\` is not a CI break (review gate only) — no further heal owed; review waits for complete successful required checks`
                 : `PR #${prNumber}: ci-heal escalated on head \`${escalation.headSha}\` — ${escalation.reason || 'needs a human judgment call'}; will not re-dispatch until a new push changes this head`,
           });
+          if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
           // Retain the escalation and fold the review prerequisite into the same row.
           // A comment claiming CI is irrelevant cannot override a required check's actual result.
           if (isNotCiBreak && withPhase.labels.includes('review:pending')) {

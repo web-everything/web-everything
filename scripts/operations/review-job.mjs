@@ -786,7 +786,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  ciGate = readReviewCiGate,
+  ciGate = readReviewCiGate, advisoryCiWaiver = null,
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -814,7 +814,12 @@ export function dispatchReviewJob({
   }
 
   const ci = ciGate({ repo: planned.repo, pr: planned.pr });
-  if (!ci?.allowed) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
+  // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
+  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+    && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
+    && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
+    && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
+  if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const settingsEnv = resolveSettingsEnv() || {};
   const childEnv = { ...env, ...settingsEnv };
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the

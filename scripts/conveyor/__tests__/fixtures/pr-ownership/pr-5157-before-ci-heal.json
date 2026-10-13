@@ -1,0 +1,1014 @@
+{
+ "$comment": "Replay of web-everything#5157 at 2026-10-13T12:22Z (review daemon log): review:human gate-self PR, the only red required check is merge-gate, held on test-gaming (needs a review at this head). Rollup/commits from gh pr view, merge-gate row set to its then-latest FAILURE; head pinned to the then-head.",
+ "observedAt": "2026-10-13T12:22:26Z",
+ "pr": {
+  "number": 5157,
+  "state": "OPEN",
+  "isDraft": false,
+  "headRefName": "lane/5945-test-gaming-detector-strings",
+  "baseRefName": "main",
+  "headRefOid": "63e519fead8b89c56bb43990e703716d02e41e1c",
+  "mergeStateStatus": "BLOCKED",
+  "labels": [
+   {
+    "name": "review:human"
+   }
+  ],
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:36:26Z",
+    "startedAt": "2026-10-13T14:36:25Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414800246/job/115356257769",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "changes",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:33:59Z",
+    "startedAt": "2026-10-13T14:33:27Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354687328",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (actions)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:34:10Z",
+    "startedAt": "2026-10-13T14:33:19Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414346473/job/115354662205",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "merge-gate",
+    "status": "COMPLETED",
+    "conclusion": "FAILURE",
+    "completedAt": "2026-10-13T12:20:00Z",
+    "startedAt": "2026-10-13T14:33:19Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414349442/job/115354670164",
+    "workflowName": "Merge gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:33:40Z",
+    "startedAt": "2026-10-13T14:33:21Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414354973/job/115354685716",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:36:34Z",
+    "startedAt": "2026-10-13T14:36:29Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414801253/job/115356268986",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:39:01Z",
+    "startedAt": "2026-10-13T14:38:57Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38415152571/job/115357514006",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:47:27Z",
+    "startedAt": "2026-10-13T14:47:23Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38416380864/job/115361803370",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:49:56Z",
+    "startedAt": "2026-10-13T14:49:53Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38416737754/job/115363066041",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-replay-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:34:08Z",
+    "startedAt": "2026-10-13T14:33:22Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355321/job/115354685962",
+    "workflowName": "Soak replay gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (javascript-typescript)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:36:39Z",
+    "startedAt": "2026-10-13T14:33:19Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414346473/job/115354661751",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (python)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:34:15Z",
+    "startedAt": "2026-10-13T14:33:20Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414346473/job/115354661124",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (rust)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:35:49Z",
+    "startedAt": "2026-10-13T14:33:19Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414346473/job/115354661628",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak-scope",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:33:52Z",
+    "startedAt": "2026-10-13T14:33:22Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354687247",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-selection-measure",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:33:19Z",
+    "startedAt": "2026-10-13T14:33:25Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354732268",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "visual",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:33:19Z",
+    "startedAt": "2026-10-13T14:33:20Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354689205",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard (1)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:43:50Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026179",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard (2)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:42:32Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026159",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard (3)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:41:50Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026010",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard (4)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:43:40Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026042",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard (5)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:36:39Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026027",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "integration",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:41:59Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026009",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "smoke",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:36:33Z",
+    "startedAt": "2026-10-13T14:34:01Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115355026142",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard (1)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:43:46Z",
+    "startedAt": "2026-10-13T14:33:55Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354970859",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard (2)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:46:08Z",
+    "startedAt": "2026-10-13T14:33:55Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354970975",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard (3)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:46:55Z",
+    "startedAt": "2026-10-13T14:33:55Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354970919",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard (4)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:43:09Z",
+    "startedAt": "2026-10-13T14:33:55Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115354971035",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:45:31Z",
+    "startedAt": "2026-10-13T14:43:52Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115360028087",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:47:02Z",
+    "startedAt": "2026-10-13T14:46:58Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/actions/runs/38414355303/job/115361592063",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "CodeQL",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:34:02Z",
+    "startedAt": "2026-10-13T14:33:59Z",
+    "detailsUrl": "https://github.com/web-everything/web-everything/runs/115355023791",
+    "workflowName": ""
+   }
+  ],
+  "commits": [
+   {
+    "oid": "ff9b6c312047a45ca835aa6efa8b04670a458150",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: rebase lane/builder-priority onto origin/main, drop transient …",
+    "messageBody": "….lane-manifest.json",
+    "committedDate": "2026-10-12T17:33:38Z"
+   },
+   {
+    "oid": "9cb7cc0d50a54f7a1a066a4761f6b1c16baf8d2d",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5 (1M context)"
+     }
+    ],
+    "messageHeadline": "conveyor: block-ruled referrals on a review:pending head are owed a f…",
+    "messageBody": "…ix (live #5009)\n\nA carried operator block on the current head makes the review verdict\n'changes', but its write-back can be refused, leaving the label stuck at\nreview:pending. The block-ruled fix branch was gated on needs-human only,\nso nothing dispatched the fix and the same-head hold held it forever.\nWiden the gate to needs-review.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-12T21:21:24Z"
+   },
+   {
+    "oid": "977b8981d7bcb7a5862580d31b012655b5f5f25e",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: JIT-number xsnygl7 duplicate dropped (already 5934-prevention-…",
+    "messageBody": "…compare-the-resolved-humanreviewsurfaces-from-bas.md) at land (#2288)",
+    "committedDate": "2026-10-12T21:34:52Z"
+   },
+   {
+    "oid": "6a3f2e910d7775ce3e2526e42fd820937cf7ec0e",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "PR #5017: pin shipped build priority and daemon logs; restore prevent…",
+    "messageBody": "…ion debt\n\nAdd repo-config acceptance and priority log formatter/gate coverage, including real tick result wiring. Restore the unrelated open prevention card and file the remaining deletion guards and build-clearance advisory.\n\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T01:55:49Z"
+   },
+   {
+    "oid": "5dc1c798a02308d1fc1b6fdf8ad67bb5834db9e3",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "PR #5017: repair daemon priority-log wiring test path",
+    "messageBody": "Resolve the daemon source to a filesystem path using the existing test convention.\nThe red probe reproduced ERR_INVALID_URL_SCHEME in the new wiring assertion;\n310 other affected tests passed. After-verification belongs to the launcher.\n\nCo-Authored-By: Codex <noreply@openai.com>\n\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T06:45:03Z"
+   },
+   {
+    "oid": "caa1d34ad7d6e36b2ef79ba7d9ba70c75dc751ae",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: JIT-number xr8p501→#6013, xsnygl7 duplicate dropped (already 5…",
+    "messageBody": "…934-prevention-compare-the-resolved-humanreviewsurfaces-from-bas.md) at land (#2288)",
+    "committedDate": "2026-10-13T07:15:52Z"
+   },
+   {
+    "oid": "741825abd34a45ebf5df7ed1ae00cb2066c5e48c",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "PR #5017: fix — restore open human-review prevention card",
+    "messageBody": "Restore xsnygl7 byte-for-byte from the reviewed base, retaining all six\noutstanding tasks, open status and approval-prevention idempotency key.\nCard 6013 continues to track the deletion/migration gate and advisory\nbuild-clearance tests; it does not replace the restored card.\n\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T08:16:50Z"
+   },
+   {
+    "oid": "9b8b566177978babf036730f1028d7384d6ec840",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: rebase lane/builder-priority onto origin/main, drop transient …",
+    "messageBody": "….lane-manifest.json",
+    "committedDate": "2026-10-13T08:21:43Z"
+   },
+   {
+    "oid": "dfbba03e03de9ebc91c4690dcd633c7190330808",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "WE #5940: prepare — Dispatcher leases the lane and hands it to fix/ci…",
+    "messageBody": "Built by the codex probation worker (agy-launcher-probation, #4291); the launcher claimed the item,\nran the gate, resolved it, and committed. Full review and a run rating are owed on this change.\n\nProbation-Worker: codex\nExecutor: codex\nModel: gpt-6-astra\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T09:23:46Z"
+   },
+   {
+    "oid": "7cc0aae127bd6a59a406bcb1e5b5baa2e9c59fe3",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "WE #5940: fix — plan explicit truncated lease rejection tests (PR 5140)",
+    "messageBody": "Co-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T11:06:13Z"
+   },
+   {
+    "oid": "9e5d3a48c332d7d0c4aca28cb7e752293471eadf",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5 (1M context)"
+     }
+    ],
+    "messageHeadline": "draft promotion: an ABSENT merge-gate does not block promoting a gree…",
+    "messageBody": "…n draft (live #5060)\n\nA draft retargeted from a lane base to main never gets a merge-gate run\n(pull_request_target filters on base=main; base_ref_changed is not a trigger),\nso reduceCheckState read 'unchecked' forever and the draft was never promoted.\nFor PROMOTION only, a required check named in the cascade setting\ndraftPromotion.absentRequiredChecksNotApplicable (default [merge-gate]) that\nhas NO run on the head is not applicable. An existing run is still judged.\nMerge still requires merge-gate via the ruleset.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T11:09:30Z"
+   },
+   {
+    "oid": "83c3114e0ccaf2dc7a5efa8c4e733c4f8b556d30",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5 (1M context)"
+     }
+    ],
+    "messageHeadline": "conflict watch: a same-line statute conflict goes to a fixer first, n…",
+    "messageBody": "…ot a stand-down (live #5017)\n\nNew cascade setting conflictWatch.sameLineConflict = fixer | stand-down\n(default fixer). With fixer, the watch posts the conflict as a review:changes\nfinding (merge main, keep both sides' intent, stand down only if a hunk is a\ntrue either/or) instead of a watcher stand-down, and supersedes an existing\nwatcher stand-down on an already-labelled conflicting PR (any review label but\nreview:human, which keeps its own recheck). The downstream fix dispatch keeps\nits Codex-first / Claude-fallback and round cap. stand-down keeps old behaviour.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T11:25:10Z"
+   },
+   {
+    "oid": "3a076433f57e377f5aefc9f6dfcc6a05a2edebba",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "WE #5940: fix — name truncated lease fail-closed tests (PR 5140)",
+    "messageBody": "Co-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T11:27:02Z"
+   },
+   {
+    "oid": "e108ae0553766dfbc14fa68678da42f20bd9666e",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5 (1M context)"
+     }
+    ],
+    "messageHeadline": "conflict watch: stand-down-policy replays pin sameLineConflict=stand-…",
+    "messageBody": "…down; add fixer sibling (live #5017)\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T11:29:38Z"
+   },
+   {
+    "oid": "32e17e133eb8af816ca604fabe88c6128400c6bd",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "Merge remote-tracking branch 'origin/main'",
+    "messageBody": "Co-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T11:40:16Z"
+   },
+   {
+    "oid": "41f1731fefb8faa4cdaaaf24ab846adc56241ece",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 4.8 (1M context)"
+     }
+    ],
+    "messageHeadline": "WE #xh31o4o: prevention — Add a card-lint rule (o… (from #5151 review)",
+    "messageBody": "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T11:43:11Z"
+   },
+   {
+    "oid": "aa05c8be29a4540e00b648fc6e93743924c03b95",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5940: fix — put every planned test file in the A1 command and add…",
+    "messageBody": "… truncated-data acceptance (PR 5140)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01QmDCK6QkMedmCuLa4gn39n",
+    "committedDate": "2026-10-13T11:47:23Z"
+   },
+   {
+    "oid": "dbb5a39852da4df76b550981587517da6204cef3",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: JIT-number xh31o4o→#6035 at land (#2288)",
+    "messageBody": "",
+    "committedDate": "2026-10-13T11:48:29Z"
+   },
+   {
+    "oid": "80c628f95f5975ddf1b36b626049b4fe1c50fddf",
+    "authors": [
+     {
+      "email": "conveyor@users.noreply.github.com",
+      "id": "",
+      "login": "",
+      "name": "Web Everything"
+     }
+    ],
+    "messageHeadline": "ci: recover missing PR checks",
+    "messageBody": "Conveyor-Missing-Run-Recovery: 9cb7cc0d50a54f7a1a066a4761f6b1c16baf8d2d",
+    "committedDate": "2026-10-13T11:49:24Z"
+   },
+   {
+    "oid": "bc88ed03c3e3aeb832764ead7b32097468240bf8",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5940: fix — name every planned test, map each guarantee, run pool…",
+    "messageBody": "… tests under the integration config (PR 5140)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01QmDCK6QkMedmCuLa4gn39n",
+    "committedDate": "2026-10-13T11:51:35Z"
+   },
+   {
+    "oid": "dff4a834f5493bcba1405c31d37850ac6c1b1af8",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5940: fix — scope the routed CI-heal test, place the build regres…",
+    "messageBody": "…sion with reserveBuildLane, allow pinned non-regression cases (PR 5140)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01QmDCK6QkMedmCuLa4gn39n",
+    "committedDate": "2026-10-13T11:54:19Z"
+   },
+   {
+    "oid": "7b947cdbb3b8bd5dcacb50b722b41f2cefa402cc",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "PR #5148: preserve conflict retries after watcher recovery and fail c…",
+    "messageBody": "…losed on invalid policy\n\nCover superseded-marker idle and grace routing with a state matrix and lifecycle soak replay.\nResolve malformed or unreadable setting layers to stand-down while retaining valid cascade overrides.\n\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T11:55:09Z"
+   },
+   {
+    "oid": "2405f287f49c1329b8395243760d703a544c2e49",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5745: prepare — Drain: no merge while a fix or ci-heal claim is live",
+    "messageBody": "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01QCQskaePEg6WgiGjQXTtjs",
+    "committedDate": "2026-10-13T11:58:33Z"
+   },
+   {
+    "oid": "d95d8fa3081e7376715acf0a409adfa5afa8b025",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "PR #5148: strengthen conflict recovery lifecycle and fail-closed regr…",
+    "messageBody": "…ession coverage\n\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T11:58:57Z"
+   },
+   {
+    "oid": "a4df90b6ca4f7c465d136892a1bd80b309443922",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5945: test-gaming detector ignores skip/only markers inside strin…",
+    "messageBody": "…gs and comments\n\nStrip string contents and comments from each added line in JS/TS test files before counting skip/only markers; fall back to the raw line on any backtick, unterminated quote, possible regex/division slash or unclosed block comment.\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01V6kdrLuzyn9nU5dwaabSsi",
+    "committedDate": "2026-10-13T12:00:04Z"
+   },
+   {
+    "oid": "8d4f972bcace7e39fa2a43676db448b937560a03",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5945: fail closed on block-comment closer and backslash-continued…",
+    "messageBody": "… lines\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T12:02:30Z"
+   },
+   {
+    "oid": "89ec74bef64942eaf6b43b1b95d7986811b20c95",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5945: fail closed on template interpolation lines; JSDoc matches …",
+    "messageBody": "…guards\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T12:03:54Z"
+   },
+   {
+    "oid": "002d061f3f56500ea649ed5a8eedd85a972ca87a",
+    "authors": [
+     {
+      "email": "332649731+web-everything[bot]@users.noreply.github.com",
+      "id": "BOT_kgDOE9PVAw",
+      "login": "web-everything[bot]",
+      "name": "web-everything[bot]"
+     }
+    ],
+    "messageHeadline": "Merge pull request #5153 from web-everything/lane/xh31o4o-prevention-…",
+    "messageBody": "…card\n\nWE #xh31o4o: prevention — Add a card-lint rule (o… (from #5151 review)",
+    "committedDate": "2026-10-13T12:05:18Z"
+   },
+   {
+    "oid": "80adcef1b79701ed04f297654d90b6d8d767f845",
+    "authors": [
+     {
+      "email": "332649731+web-everything[bot]@users.noreply.github.com",
+      "id": "BOT_kgDOE9PVAw",
+      "login": "web-everything[bot]",
+      "name": "web-everything[bot]"
+     }
+    ],
+    "messageHeadline": "Merge pull request #5154 from web-everything/lane/5745-prepare-item-d…",
+    "messageBody": "…rain-claim-held\n\nWE #5745: prepare — Drain: no merge while a fix or ci-heal claim is l…",
+    "committedDate": "2026-10-13T12:05:44Z"
+   },
+   {
+    "oid": "56873c6a20e5c00a824706df1a9bda7975cbb326",
+    "authors": [
+     {
+      "email": "332649731+web-everything[bot]@users.noreply.github.com",
+      "id": "BOT_kgDOE9PVAw",
+      "login": "web-everything[bot]",
+      "name": "web-everything[bot]"
+     }
+    ],
+    "messageHeadline": "Merge pull request #5017 from web-everything/lane/builder-priority",
+    "messageBody": "builder: operator build priority (build.priority) — blue-green chain…",
+    "committedDate": "2026-10-13T12:06:10Z"
+   },
+   {
+    "oid": "63e519fead8b89c56bb43990e703716d02e41e1c",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5945: scan .jsx/.tsx raw; pin even-backslash case",
+    "messageBody": "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T12:06:55Z"
+   },
+   {
+    "oid": "01eb08b869de981de8dea1bae0cb7ab9d7a54b79",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Sonnet 5.5"
+     }
+    ],
+    "messageHeadline": "WE #5962: prepare — one shared required-checks cache",
+    "messageBody": "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01WsWerYUnXwM7MojUVV32vw",
+    "committedDate": "2026-10-13T12:14:10Z"
+   },
+   {
+    "oid": "d335063ae4b660d0f6bf643439c221d7b67e2c9d",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "Merge remote-tracking branch 'origin/main'",
+    "messageBody": "Co-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T12:14:22Z"
+   },
+   {
+    "oid": "80ac5055278f9ac26e97af2ad2650df0bf373ec9",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 4.8 (1M context)"
+     }
+    ],
+    "messageHeadline": "WE #xwyt3vb: prevention — Add a unit test for a m… (from #5045 review)",
+    "messageBody": "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T12:22:56Z"
+   },
+   {
+    "oid": "bbbcd56e8249ec6895433e4b4959981c9c10eb35",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@openai.com",
+      "id": "U_kgDOD-0LXg",
+      "login": "codex",
+      "name": "Codex"
+     }
+    ],
+    "messageHeadline": "WE #5943: prepare — Red-main repair patterns resolve host-wide, not p…",
+    "messageBody": "Built by the codex probation worker (agy-launcher-probation, #4291); the launcher claimed the item,\nran the gate, resolved it, and committed. Full review and a run rating are owed on this change.\n\nProbation-Worker: codex\nExecutor: codex\nModel: gpt-6-astra\nCo-Authored-By: Codex <noreply@openai.com>",
+    "committedDate": "2026-10-13T12:26:09Z"
+   },
+   {
+    "oid": "d71df802d89fae8775b673f5df036fd20a07910c",
+    "authors": [
+     {
+      "email": "332649731+web-everything[bot]@users.noreply.github.com",
+      "id": "BOT_kgDOE9PVAw",
+      "login": "web-everything[bot]",
+      "name": "web-everything[bot]"
+     }
+    ],
+    "messageHeadline": "Merge pull request #5146 from web-everything/lane/draft-promote-absen…",
+    "messageBody": "…t-gate\n\ndraft promotion: an absent merge-gate no longer strands a green draft…",
+    "committedDate": "2026-10-13T12:28:23Z"
+   },
+   {
+    "oid": "8e6ac5c8b85595160693d112b6996004db63cd16",
+    "authors": [
+     {
+      "email": "332649731+web-everything[bot]@users.noreply.github.com",
+      "id": "BOT_kgDOE9PVAw",
+      "login": "web-everything[bot]",
+      "name": "web-everything[bot]"
+     }
+    ],
+    "messageHeadline": "Merge pull request #5158 from web-everything/lane/5962-prepare-item-r…",
+    "messageBody": "…equired-checks-cache\n\nWE #5962: prepare — One shared per-repo required-checks cache instead…",
+    "committedDate": "2026-10-13T12:28:36Z"
+   },
+   {
+    "oid": "63e519fead8b89c56bb43990e703716d02e41e1c",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: JIT-number xwyt3vb→#6036 at land (#2288)",
+    "messageBody": "",
+    "committedDate": "2026-10-13T12:29:17Z"
+   }
+  ],
+  "author": {
+   "login": "app/web-everything"
+  },
+  "comments": []
+ }
+}

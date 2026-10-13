@@ -1,0 +1,7 @@
+{
+  "prOwnership": {
+    "$comment": "Card 273, incident #5157: advisoryReviewOnHumanHandoff is on|off (standard on); run one advisory AI review when CI repair hands a head to a human or red checks only hold review. The advisory never accepts review:human. Card 278, incident #5172: unlabeledRedAgentPr is review-label|off (standard review-label); restore review:pending on a red agent lane PR with no review label so a daemon owns its next move. Cascade per key: standard defaults → platform prOwnership preferences → repo declared prOwnership settings → env WE_PR_OWNERSHIP_ADVISORY_ON_HANDOFF (on|off) and WE_PR_OWNERSHIP_UNLABELED_RED (review-label|off). Invalid values are ignored and recorded with their layer.",
+    "advisoryReviewOnHumanHandoff": "on",
+    "unlabeledRedAgentPr": "review-label"
+  }
+}
