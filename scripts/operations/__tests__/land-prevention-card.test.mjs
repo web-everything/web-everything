@@ -772,6 +772,24 @@ describe('prevention batch landing', () => {
       expect(calls.some(call => call.includes('close') || call.includes('edit'))).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('fold mode also takes a card the drain already renumbered (lane/x… head, backlog/<NNN>-… file)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fold-prevention-test-'));
+    mkdirSync(join(dir, 'backlog'));
+    const rel = 'backlog/6055-prevention-renumbered.md';
+    const exec = (cmd, args) => {
+      if (args.includes('list')) return JSON.stringify([
+        { number: 5208, headRefName: 'lane/x2kaa36-prevention-card', headRefOid: 'c'.repeat(40), files: [{ path: rel }] }]);
+      if (args.includes('diff')) return `A\t${rel}\n`;
+      if (args.includes('show')) return 'card bytes';
+      return '';
+    };
+    const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-4' }));
+    try {
+      const result = await foldOpenSingles({ lane: dir }, { exec, batch, write: () => {} });
+      expect(result.folded).toEqual([5208]);
+      expect(batch.mock.calls[0][0]).toMatchObject({ cardPath: rel, idemKey: 'prevention:6055' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each(['batched', 'held'])('CLI treats %s as success without retracting the filing marker', async (step) => {
     const retract = vi.fn();
     const { code } = await runLandPreventionCardCli(

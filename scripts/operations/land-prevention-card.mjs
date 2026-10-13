@@ -413,7 +413,7 @@ export async function foldOpenSingles({ lane }, {
     let reason;
     const rel = pr.files?.[0]?.path;
     try {
-      if (pr.files?.length !== 1 || !/^backlog\/x[a-z0-9]{6}-[^/]+\.md$/.test(rel ?? '')) {
+      if (pr.files?.length !== 1 || !/^backlog\/(?:x[a-z0-9]{6}|\d+)-[^/]+\.md$/.test(rel ?? '')) {
         throw new Error('not exactly one added backlog card');
       }
       if (!/^[a-f0-9]{40}$/.test(pr.headRefOid)) throw new Error('invalid PR head');
