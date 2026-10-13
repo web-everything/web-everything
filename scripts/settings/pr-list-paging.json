@@ -1,0 +1,4 @@
+{
+  "$comment": "prListPaging — the shared open-PR reader (scripts/lib/pr-list-paged.mjs, used by scripts/lib/pr-snapshot.mjs) pages the bulk list at pageSize PRs per GraphQL request without comments/body/files, retries a transient page pageRetries times, and re-fetches a PR's comments/body/files only when its updatedAt/head changed or the copy is older than heavyMaxAgeSeconds. Env WE_PR_LIST_PAGE_SIZE overrides pageSize. Layers: standard -> platform -> this file -> env; the source of each value is logged.",
+  "prListPaging": { "pageSize": 20 }
+}

@@ -3,8 +3,7 @@
  * @description #gh-graphql-budget — the host-shared open-PR snapshot. Live 2026-09-27: ~10 daemons each ran their
  *   own `gh pr list --limit 200 --json …` for the same 3 repos every 1-2 min and exhausted the App installation's
  *   6100-points/hour GraphQL budget every hour. Proves: many readers with different field sets inside the TTL
- *   cost ONE right-sized fetch; a write (dirty marker) forces a refresh after the floor; a full page re-fetches
- *   larger; a failed fetch throws (never a silent double spend); tests/cwd repos are never served from disk; and
+ *   share ONE paged refresh with cached heavy hydration; a write (dirty marker) forces a refresh after the floor; full pages advance cursors; a failed fetch throws (never a silent double spend); tests/cwd repos are never served from disk; and
  *   every wired pass reader actually reads the snapshot instead of calling `gh`.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -15,21 +14,46 @@ import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
 } from '../pr-snapshot.mjs';
+import { PrListUnreadableError } from '../pr-list-paged.mjs';
+import { ghThrottleLogPath } from '../gh-throttle.mjs';
 import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
-  headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
-  labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
+  headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+  labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
+    startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
 }));
+
+const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: { pageSize: 'standard' } };
+const pageCalls = calls => calls.filter(a => a[0] === 'api');
+const viewCalls = calls => calls.filter(a => a[0] === 'pr');
 
 function fakeExec(prs = PRS) {
   const calls = [];
   const exec = (file, argv) => {
+    expect(file).toBe('gh');
     calls.push(argv);
-    const limit = Number(argv[argv.indexOf('--limit') + 1]);
-    return JSON.stringify(prs.slice(0, limit));
+    if (argv[0] === 'api') {
+      expect(argv.slice(0, 3)).toEqual(['api', 'graphql', '-f']);
+      const query = argv[3];
+      const size = Number(query.match(/first:(\d+)/)[1]);
+      const start = Number(query.match(/after:"(\d+)"/)?.[1] ?? 0);
+      const end = Math.min(start + size, prs.length);
+      const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, ...p }) => ({
+        ...p, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+          nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
+            ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
+            : { ...c, createdAt: c.startedAt }),
+        } } } }] },
+      }));
+      return JSON.stringify({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
+        pageInfo: { hasNextPage: end < prs.length, endCursor: String(end) } } } } });
+    }
+    expect(argv).toEqual(['pr', 'view', argv[2], '--repo', REPO, '--json', 'comments,body,files']);
+    const { comments, body, files } = prs.find(p => p.number === Number(argv[2]));
+    return JSON.stringify({ comments, body, files });
   };
   return { exec, calls };
 }
@@ -37,7 +61,7 @@ function fakeExec(prs = PRS) {
 let dir;
 let clock;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pr-snapshot-')); clock = Date.parse('2026-09-27T06:00:00Z'); });
-const opts = (extra = {}) => ({ repo: REPO, dir, now: () => clock, env: { VITEST: '1' }, ...extra });
+const opts = (extra = {}) => ({ repo: REPO, dir, now: () => clock, env: { VITEST: '1' }, paging: PAGING, ...extra });
 
 describe('pure helpers', () => {
   it('nextLimit sizes the page to the real open count (+headroom), never below MIN_LIMIT', () => {
@@ -81,10 +105,11 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     const first = readSharedOpenPrs(opts({ fields, exec }));
     expect(first).toEqual([{ number: PRS[0].number, labels: PRS[0].labels, headRefOid: PRS[0].headRefOid, comments }]);
     expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(first);
-    expect(calls).toHaveLength(1);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)).toHaveLength(1);
     expect(SNAPSHOT_FIELDS).toContain('comments');
   });
-  it('8 readers with 8 different field sets inside the TTL cost ONE right-sized fetch (was 8 full lists)', () => {
+  it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();
     const fieldSets = [
       'number,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body', // reconcile
@@ -100,30 +125,37 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
       const got = readSharedOpenPrs(opts({ fields, exec }));
       expect(got).toHaveLength(14);
       expect(Object.keys(got[0]).sort()).toEqual(fields.split(',').sort());
+      expect(got).toEqual(projectPrs(PRS, fields.split(',')));
       clock += 5_000;
     }
-    expect(calls).toHaveLength(1);
-    const argv = calls[0];
-    expect(argv.slice(0, 5)).toEqual(['pr', 'list', '--repo', REPO, '--state']);
-    expect(argv[argv.indexOf('--limit') + 1]).toBe(String(MIN_LIMIT)); // 25, not 200: 1 GraphQL point, not 4
-    expect(argv[argv.indexOf('--json') + 1]).toBe(SNAPSHOT_FIELDS.join(','));
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)).toHaveLength(PRS.length);
+    expect(pageCalls(calls)[0][3]).toContain('first:20');
+    for (const argv of pageCalls(calls)) expect(argv[3]).not.toMatch(/comments|body|files\(/);
   });
 
-  it('refreshes after the TTL, sizing the next page from the last count', () => {
+  it('refreshes after the TTL and reuses unchanged heavy fields', () => {
     const { exec, calls } = fakeExec();
     readSharedOpenPrs(opts({ fields: 'number', exec }));
+    calls.length = 0;
     clock += 80_000;
     readSharedOpenPrs(opts({ fields: 'number', exec }));
-    expect(calls).toHaveLength(2);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)).toHaveLength(0);
+    const snap = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
+    expect(snap.paging).toMatchObject({ hydrated: 0, reused: 14 });
+    expect(Object.keys(snap.heavyMeta[100]).sort()).toEqual(['fetchedAtMs', 'headRefOid', 'updatedAt']);
     expect(snapshotOpenCount(REPO, { dir })).toBe(14);
   });
 
-  it('a full page re-fetches larger instead of silently truncating', () => {
+  it('60 PRs at pageSize 20 use three GraphQL pages', () => {
     const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i }));
     const { exec, calls } = fakeExec(many);
     const got = readSharedOpenPrs(opts({ fields: 'number', exec }));
     expect(got).toHaveLength(60);
-    expect(calls.map((a) => a[a.indexOf('--limit') + 1])).toEqual(['25', '100']);
+    expect(pageCalls(calls)).toHaveLength(3);
+    expect(pageCalls(calls).map(a => a[3].match(/after:"(\d+)"/)?.[1] ?? null)).toEqual([null, '20', '40']);
+    for (const argv of pageCalls(calls)) expect(argv[3]).not.toMatch(/comments|body|files\(/);
   });
 
   it('a write (dirty marker) forces a refresh once past the floor, not before', () => {
@@ -134,10 +166,71 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     const t = new Date(clock + 1_000); utimesSync(dirty, t, t);
     clock += 2_000;
     readSharedOpenPrs(opts({ fields: 'number', exec }));
-    expect(calls).toHaveLength(1); // inside the floor → served
+    expect(pageCalls(calls)).toHaveLength(1); // inside the floor → served
     clock += DIRTY_REFRESH_FLOOR_MS;
     readSharedOpenPrs(opts({ fields: 'number', exec }));
-    expect(calls).toHaveLength(2);
+    expect(pageCalls(calls)).toHaveLength(2);
+  });
+
+  it('hydrates exactly one PR when its updatedAt changes', () => {
+    const prs = structuredClone(PRS);
+    const { exec, calls } = fakeExec(prs);
+    readSharedOpenPrs(opts({ fields: 'number', exec }));
+    calls.length = 0;
+    clock += 80_000;
+    prs[3].updatedAt = 'changed';
+    readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(viewCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)[0][2]).toBe(String(prs[3].number));
+  });
+
+  it('projects number,comments,body,files exactly from fresh and cached rows', () => {
+    const { exec } = fakeExec();
+    const expected = PRS.map(({ number, comments, body, files }) => ({ number, comments, body, files }));
+    expect(readSharedOpenPrs(opts({ fields: 'number,comments,body,files', exec }))).toEqual(expected);
+    expect(readSharedOpenPrs(opts({ fields: 'number,comments,body,files', exec }))).toEqual(expected);
+    expect(readSharedOpenPrs(opts({ fields: 'reviewDecision', exec }))).toEqual(PRS.map(p => ({ reviewDecision: p.reviewDecision })));
+  });
+
+  it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
+    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
+    const fake = fakeExec(many);
+    const path = snapshotPath(dir, REPO);
+    if (previous) readSharedOpenPrs(opts({ fields: 'number', exec: fake.exec }));
+    const before = previous ? readFileSync(path, 'utf8') : null;
+    clock += 80_000;
+    let failures = 0;
+    const cause = Object.assign(new Error('gh failed'), {
+      stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)',
+    });
+    const exec = (file, argv) => {
+      if (argv[3]?.includes('after:')) { failures++; throw cause; }
+      return fake.exec(file, argv);
+    };
+    let error;
+    try { readSharedOpenPrs(opts({ fields: 'number', exec })); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(PrListUnreadableError);
+    expect(error).toMatchObject({ code: 'pr-list-unreadable', stage: 'page', page: 2, cause });
+    expect(failures).toBe(2);
+    if (previous) expect(readFileSync(path, 'utf8')).toBe(before);
+    else expect(existsSync(path)).toBe(false);
+  });
+
+  it('logs one paged refresh with setting source and payload evidence in an isolated log', () => {
+    const lockRoot = join(dir, 'throttle');
+    mkdirSync(lockRoot, { recursive: true });
+    const { exec } = fakeExec();
+    const o = opts({ fields: 'number', exec, caller: 'snapshot-test',
+      env: { VITEST: '1', WE_GH_THROTTLE_LOCK_ROOT: lockRoot } });
+    readSharedOpenPrs(o);
+    readSharedOpenPrs(o);
+    const entries = readFileSync(ghThrottleLogPath(lockRoot), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(entries.filter(e => e.outcome === 'paged')).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ op: 'pr list (snapshot)', outcome: 'paged', repo: REPO,
+      caller: 'snapshot-test', pages: 1, pageSize: 20, pageSizeSource: 'standard', hydrated: 14, reused: 0, count: 14 });
+    expect(entries[0].bytes).toBeGreaterThan(0);
+    expect(entries[0].ms).toBeGreaterThanOrEqual(0);
+    expect(entries[1].outcome).toBe('snapshot_hit');
   });
 
   it('markPrSnapshotDirty writes the per-repo marker (and the all-repos one for a cwd write)', () => {
@@ -157,7 +250,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('a failed refresh THROWS the gh error (the direct read would hit the same wall — never a double spend)', () => {
+  it('a failed refresh THROWS PrListUnreadableError (the direct read would hit the same wall — never a double spend)', () => {
     const exec = () => { const e = new Error('GraphQL: API rate limit already exceeded for installation ID 1'); e.status = 1; throw e; };
     expect(() => readSharedOpenPrs(opts({ fields: 'number', exec }))).toThrow(/rate limit/);
   });
@@ -233,7 +326,8 @@ it('returns null (the Array|null contract) on a deferral unless the caller opts 
 
 it('marks the snapshot refresh deferrable only when the caller opted in', () => {
   const seen = [];
-  const exec = (_b, _a, o) => { seen.push(o.throttle.deferrable); return '[]'; };
+  const empty = fakeExec([]).exec;
+  const exec = (b, a, o) => { seen.push(o.throttle.deferrable); return empty(b, a); };
   readSharedOpenPrs(opts({ fields: 'number', exec, allowDeferred: true }));
   rmSync(snapshotPath(dir, REPO), { force: true });
   readSharedOpenPrs(opts({ fields: 'number', exec }));
