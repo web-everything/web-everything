@@ -4,8 +4,9 @@
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
 import { readFileSync } from 'node:fs';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, foldVerdictLedger,
-  parseLedgerEvents, validateLedgerEvent, verdictLedgerPath } from './verdict-ledger.mjs';
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, DEFAULT_VERDICT_LEDGER_STORE, EVENT_TYPES, foldVerdictLedger,
+  parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoard, resolveLedgerStoreChoice, validateLedgerEvent,
+  VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
 export const DRAIN_FACTS_SOURCE = 'merge-ai-prs';
 export const EXEMPT_BASIS = 'no escalation signal and no review label';
@@ -68,6 +69,38 @@ const readHome = repo => {
   catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
 };
 
+/** The store the drain's writes land in, resolved as `appendVerdict` resolves it. `dual` and `git` read git: a hold
+ *  that missed git spills to home, and a release can reach git but not home, so a home read would hide the miss. */
+export function drainLedgerReadStore(repo, env = process.env) {
+  const { store, named } = resolveLedgerStoreChoice(undefined, env);
+  if (store === 'home') return 'home';
+  if (!named && store === DEFAULT_VERDICT_LEDGER_STORE && !resolveLedgerBoard(repo, {}, env)) return 'home';
+  return VERDICT_LEDGER_STORES.includes(store) ? 'git' : store;
+}
+
+/** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. A failed
+ *  read throws from the reader, so the recorder writes nothing: an empty snapshot would re-append every hold. */
+export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore } = {}) {
+  const snapshot = new Map();
+  for (const repo of repos) {
+    const key = slug(repo);
+    if (!key || snapshot.has(key)) continue;
+    try {
+      // Home keeps the whole-file read (the recorders filter by slug); the store read filters by the exact repo text.
+      const store = drainLedgerReadStore(repo, env);
+      const read = store === 'home' ? { status: 'ok', rows: readHome(repo) } : await readStore(String(repo).trim(), { store, env });
+      snapshot.set(key, read?.status === 'ok' && Array.isArray(read.rows) ? { rows: read.rows }
+        : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
+    } catch (error) { snapshot.set(key, { error: String(error?.message ?? error).split('\n')[0] }); }
+  }
+  return repo => {
+    const entry = snapshot.get(slug(repo));
+    if (!entry) throw new Error(`ledger not read for ${repo}`);
+    if (entry.error) throw new Error(`ledger unreadable for ${repo}: ${entry.error}`);
+    return entry.rows;
+  };
+}
+
 export function recordDrainLedgerFacts(options = {}) {
   const result = { ok: true, appended: { exempt: 0, restamped: 0, released: 0 }, errors: [] };
   const failed = error => {
@@ -91,7 +124,7 @@ export function recordDrainLedgerFacts(options = {}) {
         planRows({ verdicts: group, repo, events, now: now() }, (kind, build, fields) => {
           try {
             const written = append(build(fields));
-            if (written?.ok !== true) throw new Error(written?.errors?.join('; ') || 'ledger append failed');
+            if (written?.ok !== true || written.ledgerWriteMiss) throw new Error(written?.errors?.join('; ') || (written?.ledgerWriteMiss ? 'ledger write miss' : 'ledger append failed'));
             result.appended[kind]++;
           } catch (error) { failed(error); }
         });

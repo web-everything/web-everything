@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { drainReviewGateFact, planDrainLedgerFacts, recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
+import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
+  recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord } from '../verdict-ledger.mjs';
 import { recordDrainHold } from '../../merge-ai-prs.mjs';
@@ -110,6 +111,62 @@ describe('drain ledger facts', () => {
     expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: () => [hold], append }).appended).toBe(false);
     expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: () => [hold, event('release', { reasonCode: 'review', holdSource: 'drain' })], append }).appended).toBe(true);
     expect(writes).toHaveLength(1);
+  });
+});
+
+describe('drain ledger facts — the recorders read the store their writes land in', () => {
+  const hold = event('hold', { reasonCode: 'review', holdSource: 'drain' });
+  const release = event('release', { reasonCode: 'review', holdSource: 'drain' });
+  const dual = { WE_VERDICT_LEDGER_STORE: 'dual' };
+  const stores = () => {
+    const git = [], home = [];
+    const append = fail => row => appendVerdict(row, { store: 'dual', board: '/board', warn: () => {},
+      gitAppend: a => { if (fail) throw new Error('push refused'); git.push(...a.records); return { status: 'appended' }; },
+      homeAppend: r => { home.push(r); return { ok: true, record: r }; } });
+    const snapshot = () => readDrainLedgerSnapshot([repo], { env: dual, readStore: async () => ({ status: 'ok', rows: [...git] }) });
+    return { git, home, append, snapshot };
+  };
+  it('resolves the read store as the write path does', () => {
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'home' })).toBe('home');
+    expect(drainLedgerReadStore(repo, dual)).toBe('git');
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'git' })).toBe('git');
+    expect(drainLedgerReadStore(repo, { VITEST: 'true' })).toBe('home');
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_BOARD: '/board' })).toBe('git');
+  });
+  it('a hold that misses the shared store is reported and recorded again on the next pass', async () => {
+    const s = stores();
+    const missed = recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(), append: s.append(true) });
+    expect(missed).toMatchObject({ ok: false, appended: false });
+    expect(s.home.map(e => e.type)).toEqual(['hold']);
+    expect(s.git).toEqual([]);
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(), append: s.append(false) }))
+      .toMatchObject({ ok: true, appended: true });
+    expect(s.git.map(e => e.type)).toEqual(['hold']);
+  });
+  it('a hold the shared store shows released is recorded again even when home still shows it held', async () => {
+    const s = stores();
+    s.git.push(hold, release); s.home.push(hold);
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(), append: s.append(false) }).appended).toBe(true);
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release', 'hold']);
+  });
+  it('plans releases from the shared store, so a hold only home saw cannot hide one git still has', async () => {
+    const s = stores(), other = event('hold', { reasonCode: 'other', holdSource: 'drain' });
+    s.git.push(hold); s.home.push(hold, other);
+    const result = recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read: await s.snapshot(), append: s.append(false) });
+    expect(result).toMatchObject({ ok: true, appended: { released: 1 } });
+    expect(s.git.at(-1)).toMatchObject({ type: 'release', reasonCode: 'review' });
+  });
+  it('an unreadable store or an unread repo writes nothing; repos are read once per slug', async () => {
+    const calls = [], writes = [];
+    const read = await readDrainLedgerSnapshot([repo, 'O/R', 'x/y', null], { env: dual,
+      readStore: async r => { calls.push(r); return r === 'x/y' ? { status: 'unreadable', reason: 'no-board', error: 'none' } : { status: 'ok', rows: [] }; } });
+    expect(calls).toEqual([repo, 'x/y']);
+    expect(read('O/R')).toEqual([]);
+    const append = row => { writes.push(row); return { ok: true }; };
+    expect(recordDrainHold({ repo: 'x/y', pr: 1, reason: 'review', read, append }).ok).toBe(false);
+    expect(recordDrainHold({ repo: 'z/w', pr: 1, reason: 'review', read, append }).ok).toBe(false);
+    expect(recordDrainLedgerFacts({ verdicts: [{ ...v, repo: 'x/y' }], read, append }).ok).toBe(false);
+    expect(writes).toEqual([]);
   });
 });
 
