@@ -281,3 +281,14 @@ describe('#4649 real process preflight boundaries', () => {
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 });
+
+describe('group member argv', () => {
+  it('passes numeric and JIT member ids through to delivery', () => {
+    expect(parseDeliverItemRunArgv(['--num=1', '--lane=2', '--session=s', '--group-members=2,xabc123']).groupMembers)
+      .toEqual(['2', 'xabc123']);
+  });
+  it('refuses malformed member ids before a lane is acquired', () => {
+    expect(() => parseDeliverItemRunArgv(['--num=1', '--lane=2', '--session=s', '--group-members=2,../bad']))
+      .toThrow(/group.*member/i);
+  });
+});
