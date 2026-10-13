@@ -2,9 +2,10 @@
 bornAs: xsim499
 kind: story
 size: 3
-status: open
+status: active
 scope: ["we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/record-referral-ruling-io.mjs", "we:scripts/operations/__tests__/record-referral-ruling*.test.mjs", "we:scripts/operations/__tests__/record-referral-ruling-io*.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-13"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "6b4b641a7d59f8fda623db622bc41b243272405e"
 tags: []
@@ -78,6 +79,10 @@ Atomic protection against a concurrently posted operator comment after the final
 
 ## Progress
 
+- Implementation sanity read confirmed the automatic actor still reached the actor-agnostic supersession branches and the sink checked only head movement. Added the focused synthetic #4715 regression and ran it through host heavy admission against the original writer: 20 failed, 5 passed (the failures include missing skips and the same-head late-ruling write).
+- Implemented authenticated operator protection metadata for current-head targets, automatic partition/no-op decisions, historical citation comparison using the existing carry primitives, and a fresh protection snapshot check before post or ledger effects. Unknown proof refuses automatic writes when protection cannot otherwise be established; operator supersession remains on its existing path. Protection binds repository, PR, source head, run and key; registered actor matching follows the validator's case rules.
+- Proof: the focused regression now passes 35 tests through host heavy admission. It covers the reconstructed #4715 equivalent fresh-run finding, exact and numbered selections, block/card/not-real, operator and reviewer carries, unchanged/changed/unknown citations across source/docs/config/data, malformed history, truncated comparisons, missing sources, preview/no-op effects, deduplication and late-ruling refusal. The real operation engine and effect executor confirm that a late operator ruling halts before the planned follow-up; a fresh plan returns no effects. Mixed-selection assertions retain only the eligible key in the posted record and verify the gate keeps both the operator decision and the remaining holds.
+- Regression proof: the existing operator, supersession, disputed, daemon and real-checkout I/O suites passed (100 tests); the ledger failure-handling suite also passed (16 tests). Logs for this delivery session are `/tmp/5963-red.log`, `/tmp/5963-regression.log`, `/tmp/5963-focused-final.log` and `/tmp/5963-ledger.log`. No live PR was mutated. The delivery brief reserves gate commands and commits to the wrapper, so `check:standards` and the commit remain wrapper-owned.
 - Validation repair: the previous scope listed only the broad `we:scripts/operations/__tests__/record-referral-ruling*.test.mjs` test pattern; add the explicit matching `we:scripts/operations/__tests__/record-referral-ruling-io*.test.mjs` pattern for the scoped I/O source. The existing `we:scripts/operations/__tests__/record-referral-ruling-io-real.test.mjs` exercises the reader and card resolution against a real checkout. This clarifies test scope without changing the implementation premise, touch-set estimate or size 3; the five completed preparation sections are preserved.
 - Research: original premise was held finding 230, reported #4715 stand-down at 03:05Z on 2026-10-11: “auto-block also re-blocked an operator not-real (#4)”. That incident is supplied by the card; no production transcript was replayed during preparation.
 - Original scope: only `we:scripts/operations/record-referral-ruling.mjs`, size 1. Corrected scope includes `we:scripts/operations/record-referral-ruling-io.mjs` and matching tests because the current reader discards historical context (`we:scripts/operations/record-referral-ruling-io.mjs:131-137`) and the pre-write read checks only head movement before constructing ledger events (`we:scripts/operations/record-referral-ruling-io.mjs:225-234`).

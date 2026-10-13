@@ -50,6 +50,7 @@ import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
   activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
+  readReferralRecords, readOperatorRulings, carriedBackingHolds,
 } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
@@ -64,9 +65,14 @@ export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
  * The findings still open on `head`: every active referral of a current-head record that the gate leaves
  * pending or blocked. Numbered from 1 in thread order. PURE.
  */
-export function openReferralFindings({ comments, repo, pr, head, body = '', createdAt = '', cardReadable = () => false }) {
+export function openReferralFindings({ comments, repo, pr, head, body = '', createdAt = '', cardReadable = () => false,
+  unchangedFinding = () => null }) {
   const context = { repo, pr, head, body, createdAt, cardReadable };
   const state = mandatoryReferralState(comments, context);
+  // Unlike the gate's current-head hold, automatic writes require sound historical proof too.
+  const protectionMalformed = readReferralRecords(comments).malformed || readOperatorRulings(comments).malformed;
+  const protection = new Map();
+  const policyTargets = [];
   const open = [];
   const ruled = [];
   for (const record of state.records) {
@@ -74,6 +80,9 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
     const s = referralRecordState(record, { ...context, records: state.records, operatorRulings: state.operatorRulings });
     const held = new Set([...s.pending, ...s.blocked]);
     for (const f of activeReferrals(record)) {
+      protection.set(JSON.stringify([record.runId, f.key]), operatorProtection(f, record, state, unchangedFinding));
+      policyTargets.push({ runId: record.runId, key: f.key, seat: f.seat, file: f.finding?.file ?? '',
+        line: Number.isInteger(f.finding?.line) ? f.finding.line : null, summary: f.finding?.summary ?? '' });
       if (!held.has(f.key)) {
         const standing = standingRulings(f, record, state);
         if (standing.length) ruled.push({ runId: record.runId, key: f.key, seat: f.seat, file: f.finding?.file ?? '',
@@ -106,11 +115,67 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
     const standing = [...base.standing, ...blockIds.filter((id) => !base.rulingIds.includes(id)).map((id) => ({ id, result: 'block', source: 'record' }))];
     disputed.push({ ...base, state: 'disputed', rulingIds, standing, blockIds });
   }
-  return { open, ruled, disputed, malformed: state.malformed, pending: state.pending, blocked: state.blocked };
+  const withProtection = (targets) => targets.map((target) => ({ ...target,
+    ...(protection.get(JSON.stringify([target.runId, target.key]))
+      ?? { protectingRulings: [], protectionUnknown: ['missing current-head source record'] }) }));
+  return { open: withProtection(open), ruled: withProtection(ruled), disputed: withProtection(disputed),
+    policyTargets: withProtection(policyTargets), protectionMalformed, malformed: state.malformed, pending: state.pending, blocked: state.blocked };
 }
 
 const view = (f) => ({ file: f?.finding?.file, line: f?.finding?.line, summary: f?.finding?.summary,
   verdict: f?.finding?.verdict, impactIfUnfixed: f?.finding?.impactIfUnfixed });
+
+/** Authenticated, subject-bound operator provenance; broad standing-ruling history is not proof. */
+function operatorProtection(target, record, state, unchangedFinding) {
+  const protectingRulings = [], protectionUnknown = [];
+  const subject = (x) => x.repo === record.repo && x.pr === record.pr;
+  const sourceOf = (o) => state.records.find((r) => subject(r) && r.head === o.head && r.runId === o.runId)
+    ?.referrals.find((f) => f.key === o.key);
+  const operators = state.operatorRulings.filter((o) => subject(o) && OPERATOR_LOGINS.includes(o.actor.toLowerCase()));
+  for (const o of operators) {
+    const source = sourceOf(o);
+    // Without the source we cannot disprove equivalence, even if the serialized keys differ.
+    if (!source) { protectionUnknown.push(`missing source ${o.head}/${o.runId}/${o.key}`); continue; }
+    if (source.key !== target.key && !sameFindingForClearing(view(source), view(target))) continue;
+    if (o.head !== record.head) {
+      let unchanged = null;
+      try { unchanged = unchangedFinding({ repo: record.repo, base: o.head, head: record.head,
+        source: view(source), target: view(target) }); } catch { /* Unknown proof refuses an automatic write. */ }
+      if (unchanged !== true && unchanged !== false) {
+        protectionUnknown.push(`unavailable comparison ${o.head}/${o.runId}/${o.key}`); continue;
+      }
+      if (!unchanged) continue;
+    }
+    protectingRulings.push({ id: operatorRulingId(o), repo: o.repo, pr: o.pr, head: o.head,
+      runId: o.runId, key: o.key, actor: o.actor, result: o.result });
+  }
+  for (const carry of record.carried ?? []) {
+    if (carry.key !== target.key || carry.from.rulingId !== undefined) continue; // Reviewer carries confer no protection.
+    const backing = carriedBackingHolds(carry, { repo: record.repo, pr: record.pr, operatorRulings: state.operatorRulings });
+    if (!backing || !sourceOf(backing)) protectionUnknown.push(`unbacked operator carry ${carry.from.runId}/${carry.from.key}`);
+    else if (!sameFindingForClearing(view(sourceOf(backing)), view(target))) protectionUnknown.push('operator carry source does not match target');
+  }
+  return { protectingRulings, protectionUnknown };
+}
+
+/** Stable diagnostics used by both the operation result and the sink warning channel. */
+export const describePolicySkip = (skip) => `auto-policy skip ${skip.repo}#${skip.pr} head ${skip.head} run ${skip.runId} key ${skip.key}: `
+  + skip.protectingRulings.map((r) => `${r.id} (${r.actor} ${r.result}, ${r.head}/${r.runId}/${r.key})`).join(', ');
+
+/** Preserve open numbering before appending protected ruled/disputed targets for automatic selection. */
+export function automaticPolicyTargets(read) {
+  const targets = [...read.open];
+  for (const target of [...(read.ruled ?? []), ...(read.disputed ?? []), ...(read.policyTargets ?? [])]) {
+    if (targets.some((t) => t.runId === target.runId && t.key === target.key)) continue;
+    if (target.protectingRulings?.length || target.protectionUnknown?.length) targets.push({ ...target, index: targets.length + 1 });
+  }
+  return targets;
+}
+
+/** State relevant to automatic protection, pinned across the read/plan/write boundary. */
+export const policyProtectionSnapshot = (read) => automaticPolicyTargets(read).map((o) => ({ runId: o.runId, key: o.key,
+  protectingRulings: o.protectingRulings, protectionUnknown: o.protectionUnknown }))
+  .sort((a, b) => JSON.stringify([a.runId, a.key]).localeCompare(JSON.stringify([b.runId, b.key])));
 
 /**
  * Every ruling that still stands on `f` (a referral of a current-head record), from any head: the record's own
@@ -208,6 +273,8 @@ export function planOperatorRuling(read, input) {
   if (ruling !== 'card' && read.card) throw new Error('--card applies only to --ruling=card');
   if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; the gate holds it and a ruling cannot repair it');
   const supersedeIds = [...new Set(String(input.supersedes ?? '').split(',').map((x) => x.trim()).filter(Boolean))];
+  if (byPolicy && supersedeIds.length) throw new Error('auto-policy cannot supersede rulings');
+  if (byPolicy && read.protectionMalformed) throw new Error('automatic policy refuses malformed referral history');
   // Disputed findings are ruled targets too: merge them over the ruled list (same finding = same runId + key).
   const ruled = [...(read.ruled ?? []).filter((r) => !(read.disputed ?? []).some((d) => d.runId === r.runId && d.key === r.key)),
     ...(read.disputed ?? [])];
@@ -215,10 +282,24 @@ export function planOperatorRuling(read, input) {
   const describe = (r) => `  ${findingLocation(r)} — ${r.summary}\n    standing: ${r.standing.map((x) => `${x.id} (${x.result})`).join(', ')}`
     + (r.blockIds?.length ? `\n    DISPUTED BLOCK (supersede this one): ${r.blockIds.join(', ')}` : '');
   let selected;
+  let skipped = [];
   let supersedesFor = () => [];
   const autoSupersede = !supersedeIds.length && !selectsOpen(read.open, finding) && (read.disputed ?? []).length
     && selectsOpen(read.disputed, finding);
-  if (autoSupersede) {
+  if (byPolicy) {
+    selected = selectFindings(automaticPolicyTargets(read), finding);
+    for (const target of selected) {
+      if (!Array.isArray(target.protectingRulings) || !Array.isArray(target.protectionUnknown)
+        || (!target.protectingRulings.length && target.protectionUnknown.length)) {
+        throw new Error(`automatic policy protection is unknown for ${target.runId}/${target.key}: ${(target.protectionUnknown ?? ['missing protection evidence']).join('; ')}`);
+      }
+    }
+    skipped = selected.filter((o) => o.protectingRulings.length).map((o) => ({ repo, pr: Number(pr), head: read.head,
+      runId: o.runId, key: o.key, protectingRulings: o.protectingRulings }));
+    selected = selected.filter((o) => !o.protectingRulings.length);
+    if (!selected.length) return { noop: true, record: null, body: null, followUp: null, selected, skipped,
+      open: read.open, disputed: read.disputed ?? [], supersedes: [] };
+  } else if (autoSupersede) {
     // --finding names a disputed finding and no --supersedes: the block it is disputed over is the one to supersede.
     selected = selectFindings(read.disputed, finding);
     supersedesFor = (o) => disputedOf(o)?.blockIds ?? [];
@@ -250,7 +331,8 @@ export function planOperatorRuling(read, input) {
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),
     enabled: input.sendBack !== false && read.followUpEnabled !== false });
-  return { record, body: buildOperatorRulingComment(record), selected, open: read.open, disputed: read.disputed ?? [],
+  return { record, body: buildOperatorRulingComment(record), selected, skipped,
+    ...(byPolicy ? { protectionSnapshot: policyProtectionSnapshot(read) } : {}), open: read.open, disputed: read.disputed ?? [],
     supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
 }
 
@@ -287,10 +369,12 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       reads: ['verdict', 'input.preview'],
       // NOT idempotent: a repeat posts a second comment. The sink re-reads the thread first and skips a
       // byte-identical ruling already present, so a replay after a crash cannot double-post.
-      effects: (view) => (view.input.preview ? [] : [{
+      effects: (view) => (view.input.preview || view.verdict.noop ? [] : [{
         type: OPERATOR_RULING_POST_EFFECT, idempotent: false,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body,
-          rulings: view.verdict.record.rulings.map((r) => ({ key: r.key, result: r.result })),
+          rulings: view.verdict.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result })),
+          skipped: view.verdict.skipped,
+          protectionSnapshot: view.verdict.protectionSnapshot,
           actor: view.verdict.record.actor, channel: view.verdict.record.channel },
       }, ...(view.verdict.followUp ? [{
         type: OPERATOR_RULING_FOLLOW_UP_EFFECT, idempotent: true,
