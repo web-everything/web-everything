@@ -101,6 +101,58 @@ const SKIP_FOCUS_MARKER_RE = /\b(?:it|test|describe)\s*\.\s*(?:skip|only)\s*(?:\
 const TEST_CASE_OPENER_RE = /(?<![.\w])(?:it|test)\s*(?:\.\s*\w+\s*)?\(\s*['"`]/;
 
 /**
+ * A plain JS/TS source file — the only kind whose lines `stripStringsAndComments` may reason about. `.jsx`/`.tsx`
+ * are deliberately EXCLUDED: JSX text (`<p>don't</p>`) is not JS-tokenised, so its apostrophes would pair as
+ * string delimiters and could blank out a real marker; they are scanned raw. Pure.
+ */
+export function isStrippableTestPath(path) {
+  return /\.[cm]?[jt]s$/.test(String(path || ''));
+}
+
+/**
+ * Blank string contents and comments out of ONE added line so a skip/only marker that only appears inside a
+ * fixture string or a comment (`"it.skip('x', …)"`, `// xit(`) stops counting (#5945, live #4717). Pure; it only
+ * deletes characters, never evals or builds a regex from the input. Quotes are kept (`it.skip('x')` →
+ * `it.skip('')` is still a marker).
+ *
+ * A per-added-line scan cannot know the lexical context the line starts in, so it fails closed to the ORIGINAL
+ * line (scanned raw) whenever it cannot be sure: any backtick (a closer of a template opened on an earlier
+ * line, or interpolation), an unterminated quote, a `/` that is not `//` or `/*` (a possible regex literal or
+ * division), an unclosed block comment, a block-comment closer (`*` + `/`) with no opener on the line, or a `${`
+ * (interpolation inside a template body). `scanTestTampering` also scans the line after a backslash-continued
+ * line raw. Still a documented residual (card N1): a line that starts mid-block-comment, mid-template or
+ * mid-continued-string whose opener is NOT visible on this line or the previous added line.
+ * @param {string} line
+ * @returns {string}
+ */
+export function stripStringsAndComments(line) {
+  const s = String(line ?? '');
+  if (s.includes('`') || s.includes('${')) return s;
+  // A `*/` with no `/*` before it closes a block comment opened on an earlier line: the line starts INSIDE a
+  // comment, so an apostrophe in that tail could pair with a later quote and swallow the real code after `*/`.
+  const closer = s.indexOf('*/');
+  if (closer !== -1 && (s.indexOf('/*') === -1 || s.indexOf('/*') > closer)) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== ch) j += s[j] === '\\' ? 2 : 1;
+      if (j >= s.length) return s; // unterminated quote — unknown context, scan raw
+      out += ch + ch;
+      i = j;
+    } else if (ch === '/') {
+      if (s[i + 1] === '/') break; // line comment — drop the rest
+      if (s[i + 1] !== '*') return s; // possible regex literal or division — scan raw
+      const end = s.indexOf('*/', i + 2);
+      if (end === -1) return s; // unclosed block comment — scan raw
+      i = end + 1;
+    } else out += ch;
+  }
+  return out;
+}
+
+/**
  * Parse a unified `git diff` into per-file added/removed CONTENT lines + a `deleted` flag. Pure. Only the diff
  * BODY matters here (not exact line numbers), so this is intentionally minimal: it keys files off the
  * `diff --git a/… b/…` header, notes `deleted file mode`, and buckets `+`/`-` content lines (skipping the
@@ -146,7 +198,14 @@ export function scanTestTampering({ diffText = '' } = {}) {
       findings.push({ path: f.path, kind: 'test-file-removed', detail: 'a test file was deleted' });
       continue; // a delete has no surviving markers/cases to also flag
     }
-    const skipAdds = f.added.filter((l) => SKIP_FOCUS_MARKER_RE.test(l)).length;
+    const jsFile = isStrippableTestPath(f.path); // non-JS files under __tests__/ are scanned raw (#5945 A4)
+    // A line ending in an odd run of backslashes continues a quoted string onto the next added line, which then
+    // starts INSIDE that string — so the line after one is scanned raw. (A continuation whose opener is an
+    // unchanged context line outside the hunk's added lines is the documented residual, N1.)
+    const skipAdds = f.added.filter((l, i) => {
+      const continued = i > 0 && /(?<!\\)(?:\\\\)*\\$/.test(f.added[i - 1]);
+      return SKIP_FOCUS_MARKER_RE.test(jsFile && !continued ? stripStringsAndComments(l) : l);
+    }).length;
     if (skipAdds) findings.push({ path: f.path, kind: 'test-skipped', detail: `${skipAdds} skip/only marker(s) added` });
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
