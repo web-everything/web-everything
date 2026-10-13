@@ -1004,7 +1004,7 @@ export function restackStackedPr(d, {
  * @param {{repo?:string|null, apply?:boolean, defaultBranch?:string, readOpenPrs?:Function,
  *   readRequiredContexts?:Function, readAttributedRequiredChecks?:Function, readHeadCommittedAt?:Function, readComments?:Function,
  *   trigger?:Function, postComment?:Function, clearLabel?:Function, thresholdMs?:number, maxRetriesPerSha?:number,
- *   maxRetriesPerPr?:number, now?:number}} [o]
+ *   maxRetriesPerPr?:number, now?:number}} [o] maxRetriesPerPr caps only ruleset-only candidates across SHAs.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepMissingRunRecovery({
@@ -1040,6 +1040,9 @@ export function sweepMissingRunRecovery({
   // Ruleset-only workflows may target only the default base (merge-gate targets main).
   // Keep the classic/declared population for stacks and unreadable bases; never restack a healthy chain
   // merely because a check that cannot run on its base is absent. The all-absent test is unchanged.
+  const classicCandidateNumbers = new Set(buildMissingRunCandidates(prs, {
+    requiredContexts: requiredContexts ?? null, stalledPartialContexts,
+  }).map(c => c.prNumber));
   const rawCandidates = (Array.isArray(prs) ? prs : []).flatMap(pr => buildMissingRunCandidates([pr], {
     requiredContexts: requiredContexts ?? null,
     stalledPartialContexts: pr?.baseRefName === defaultBranch ? defaultBasePartialContexts : stalledPartialContexts,
@@ -1059,9 +1062,10 @@ export function sweepMissingRunRecovery({
     const comments = readComments(c.prNumber, { repo });
     return {
       ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
-      // A push changes the SHA; neither that nor a new green main may reset this PR-wide budget.
-      // Reuse trusted-marker/refusal handling, without head or main-green scoping.
-      triggerAttemptsForPr: countMissingRunComments(comments, null, { defaultBranch }),
+      // Bound checks discovered only by the ruleset expansion across pushes. Classic/declared candidates
+      // retain their existing per-SHA budget, including all-absent heads and restacks.
+      triggerAttemptsForPr: classicCandidateNumbers.has(c.prNumber)
+        ? null : countMissingRunComments(comments, null, { defaultBranch }),
     };
   });
   const plan = planMissingRunRecoveries({
@@ -1069,6 +1073,7 @@ export function sweepMissingRunRecovery({
   });
   const attemptsByPr = new Map(candidates.map(c => [c.prNumber, c.triggerAttemptsForPr]));
   plan.dispatch = plan.dispatch.filter(d => {
+    if (classicCandidateNumbers.has(d.prNumber)) return true;
     const attempts = attemptsByPr.get(d.prNumber) ?? 0;
     if (attempts < maxRetriesPerPr) return true;
     plan.refusals.push({ ...d, kind: 'missing-run-pr-cap-exhausted', attempts,

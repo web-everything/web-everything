@@ -82,6 +82,64 @@ describe('missing-run recovery — ruleset-only required checks (live #5060)', (
     expect(restack).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['classic partial rollup', 'main', [done('smoke')]],
+    ['all-absent default-base rollup', 'main', []],
+    ['stalled stack', 'lane/parent', []],
+    ['unreadable base', undefined, []],
+  ])('gives a fresh head its per-SHA budget after old markers: %s', (_, baseRefName, statusCheckRollup) => {
+    const { result, trigger, restack } = sweep({
+      pr: { ...PR_5060, headRefOid: 'fresh-head', baseRefName, statusCheckRollup },
+      readComments: () => ['old-head-1', 'old-head-2'].map(headSha => ({
+        viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+      })),
+    });
+    expect(result.dispatch).toHaveLength(1);
+    expect(result.refusals).toEqual([]);
+    expect(baseRefName === 'lane/parent' ? restack : trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it('still enforces the per-SHA budget for classic missing runs', () => {
+    const { result, trigger } = sweep({
+      pr: { ...PR_5060, statusCheckRollup: [done('smoke')] },
+      readComments: () => [1, 2].map(() => ({
+        viewerDidAuthor: true, body: buildMissingRunComment({ headSha: PR_5060.headRefOid }),
+      })),
+    });
+    expect(result.dispatch).toEqual([]);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
+  it.each(['null', 'throws'])('keeps fresh classic heads recoverable when attributed discovery %s', mode => {
+    const { result, trigger } = sweep({
+      pr: { ...PR_5060, statusCheckRollup: [done('smoke')], headRefOid: 'fresh-head' },
+      readAttributedRequiredChecks: () => {
+        if (mode === 'throws') throw new Error('ruleset read unavailable');
+        return null;
+      },
+      readComments: () => ['old-head-1', 'old-head-2'].map(headSha => ({
+        viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+      })),
+    });
+    expect(result.dispatch).toHaveLength(1);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('preserves declared fallback budgets with green main=%s', green => {
+    const { result, trigger } = sweep({
+      pr: { ...PR_5060, headRefOid: 'fresh-head', statusCheckRollup: [{ ...done('smoke'), workflowName: 'CI' }] },
+      readRequiredContexts: () => null, readDeclaredContexts: () => CLASSIC_CONTEXTS,
+      mainRuns: green ? [{ status: 'completed', conclusion: 'success', headSha: 'new-main',
+        updatedAt: '2026-10-13T11:00:00Z' }] : [],
+      readComments: () => ['old-head-1', 'old-head-2'].map(headSha => ({
+        viewerDidAuthor: true, body: buildMissingRunComment({ headSha,
+          mainGreen: { sha: 'old-main', red: false } }),
+      })),
+    });
+    expect(result.dispatch).toHaveLength(1);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses a fork at the real push preflight and bounds repeated attempts', () => {
     const sha = 'a'.repeat(40);
     const exec = vi.fn(() => JSON.stringify({ state: 'open', mergeable: true,

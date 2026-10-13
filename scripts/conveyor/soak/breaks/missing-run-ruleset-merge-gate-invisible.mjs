@@ -71,6 +71,26 @@ export default {
         clearLabel: () => true,
       }));
     }
+    // Review #5152: two historical restacks must not strand a fresh classic/stalled head.
+    const freshHeads = [];
+    for (const [baseRefName, statusCheckRollup] of [['main', [done('smoke')]], ['lane/parent', []]]) {
+      let mutations = 0;
+      const fresh = sweepMissingRunRecovery({
+        repo: ['web-everything', 'web-everything'].join('/'), apply: true, mainRuns: [],
+        now: Date.parse('2026-10-13T11:00:00Z'),
+        readOpenPrs: () => [{ number: 5064, headRefName: 'lane/5064', baseRefName, headRefOid: 'fresh-head',
+          mergeable: 'MERGEABLE', statusCheckRollup }],
+        readRequiredContexts: () => CLASSIC_CONTEXTS,
+        readAttributedRequiredChecks: () => [...CLASSIC_CONTEXTS, 'merge-gate'],
+        readHeadCommittedAt: () => '2026-10-12T21:21:24Z',
+        readComments: () => ['old-head-1', 'old-head-2'].map(headSha => ({
+          viewerDidAuthor: true, body: buildMissingRunComment({ headSha }),
+        })),
+        trigger: () => { mutations++; return { ok: true }; },
+        restack: () => { mutations++; return { ok: true }; }, postComment: () => {}, clearLabel: () => true,
+      });
+      freshHeads.push({ baseRefName, dispatches: fresh.dispatch.length, mutations });
+    }
     let forkReads = 0;
     const forkSha = 'a'.repeat(40);
     const fork = sweepMissingRunRecovery({
@@ -88,13 +108,15 @@ export default {
           head: { sha: forkSha, ref: 'lane/5063', repo: { full_name: 'someone/web-everything' } } });
       } }), postComment: () => {}, clearLabel: () => true,
     });
-    return { ...result, triggered, variants, attempts, successive, fork, forkReads };
+    return { ...result, triggered, variants, attempts, successive, freshHeads, fork, forkReads };
   },
   judge(report) {
     return [
       ...(!report.triggered.includes(5060) ? ['PR #5060 missing ruleset-only merge-gate was not triggered'] : []),
       ...report.variants.filter(v => v.dispatches || v.mutations).map(v => `inapplicable ruleset check mutated ${v.baseRefName}/${v.mergeable}`),
       ...(report.attempts !== 1 || report.successive[1].dispatch.length ? ['missing-run budget reset across SHAs'] : []),
+      ...report.freshHeads.filter(v => v.dispatches !== 1 || v.mutations !== 1)
+        .map(v => `old-SHA markers stranded a fresh classic head on ${v.baseRefName}`),
       ...(report.forkReads !== 1 || report.fork.applied[0]?.ok !== false
         || !report.fork.applied[0]?.error?.includes('fork') ? ['fork was not refused at push preflight'] : []),
     ];
