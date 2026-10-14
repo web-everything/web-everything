@@ -245,6 +245,9 @@ export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, gr
   return { eligible: false, reason: 'not-flaky' };
 }
 
+/** How many times one run may be flake-rerun when a rerun ends without a verdict (the first try plus one retry). */
+export const FLAKE_RERUN_ROUNDS = 2;
+
 /** Plan at most one rerun, preferring the cancelled tip and waiting for all active runs. PURE.
  * @returns {null|{runId:number, sha:string, kind:string, reason:string}}
  */
@@ -256,6 +259,10 @@ export function planMainCiRerun({ runs, tipSha, reruns = {}, flake = null, setti
     && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
     return { runId: newest.databaseId, sha: newest.headSha, kind: 'cancelled-tip', reason: 'latest main run was cancelled' };
   }
+  // A flake rerun that finished with no verdict (cancelled / skipped / infra-only) settled nothing: try it once more, then
+  // leave the hold to the owner. Only runs we ledgered as a flake rerun qualify, and only up to FLAKE_RERUN_ROUNDS tries.
+  const again = runs.find((r) => r.rerunInconclusive === true && Number(r.attempt) > 1 && reruns[r.databaseId]?.kind === 'flake' && (reruns[r.databaseId].rounds ?? 1) < FLAKE_RERUN_ROUNDS);
+  if (again) return { runId: again.databaseId, sha: again.headSha, kind: 'flake', reason: 'inconclusive-rerun', retry: true };
   const run = flake?.eligible && runs.find((r) => r.databaseId === flake.runId);
   if (run && unseen(run.databaseId)) return { runId: run.databaseId, sha: run.headSha, kind: 'flake', reason: flake.reason };
   return null;
@@ -266,14 +273,15 @@ const RED = new Set(['failure', 'timed_out', 'startup_failure']);
 /**
  * One run's verdict about main's code: `green`, `red`, or `ignore` (still running, cancelled by a newer push,
  * skipped, or a failure whose only bad jobs were cancelled / never got a runner — `infraOnly`). A red run
- * with `rerunPending` stays red until its rerun completes. PURE.
+ * with `rerunPending` stays red until its rerun completes, and one whose rerun finished without a verdict
+ * (`rerunInconclusive`: cancelled, skipped, infra-only) stays red until a later run succeeds. PURE.
  */
 export function classifyRun(run) {
   if (String(run?.status ?? '').toLowerCase() !== 'completed') return run?.rerunPending === true ? 'red' : 'ignore';
   const c = String(run?.conclusion ?? '').toLowerCase();
   if (c === 'success') return 'green';
-  if (RED.has(c)) return run?.infraOnly === true ? 'ignore' : 'red';
-  return 'ignore';
+  if (RED.has(c) && run?.infraOnly !== true) return 'red';
+  return run?.rerunInconclusive === true ? 'red' : 'ignore';
 }
 
 const ts = (s) => { const t = Date.parse(s ?? ''); return Number.isFinite(t) ? t : null; };

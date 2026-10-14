@@ -55,6 +55,12 @@ describe('flake rules and cancelled tip priority', () => {
   });
 });
 
+const exhaustRerunRounds = (dir) => {
+  const path = io.ledgerPathIn(dir), ledger = JSON.parse(readFileSync(path));
+  for (const entry of Object.values(ledger._reruns)) entry.rounds = core.FLAKE_RERUN_ROUNDS;
+  writeFileSync(path, JSON.stringify(ledger));
+};
+
 describe('rerun IO and ledger', () => {
   async function fixture(runTest) {
     const dir = mkdtempSync(join(tmpdir(), 'main-red-rerun-'));
@@ -97,6 +103,62 @@ describe('rerun IO and ledger', () => {
     expect(second.decision.reason).toBe('flake-rerun-pending');
     expect(opts.dispatch).not.toHaveBeenCalled();
     expect(opts.rerun).toHaveBeenCalledTimes(1);
+  }));
+  it('keeps the hold when a flake rerun finishes inconclusive, and never lifts it on an older green', async () => fixture(async (opts) => {
+    await io.probeAndOwnMainCi(opts); // reserves + issues the flake rerun of run 2
+    exhaustRerunRounds(opts.dir); // no retry left, so the inconclusive outcome stands
+    const publish = opts.publishState;
+    for (const finished of [
+      { conclusion: 'cancelled' }, { conclusion: 'skipped' }, { conclusion: 'failure', infraOnly: true },
+    ]) {
+      publish.mockClear();
+      const out = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, { ...red, status: 'completed', attempt: 2, ...finished }] }) });
+      expect(out.mainRed, JSON.stringify(finished)).toMatchObject({ red: true, firstRedSha: red.headSha });
+      expect(out.decision.reason, JSON.stringify(finished)).not.toBe('main-green');
+      expect(publish).not.toHaveBeenCalledWith(null);
+      // the rerun finished, so repair ownership is no longer suppressed
+      expect(out.decision.reason, JSON.stringify(finished)).not.toBe('flake-rerun-pending');
+    }
+    // a later success on a newer commit still lifts the hold
+    const next = { ...green, databaseId: 9, headSha: 'beef01234567890', createdAt: '2026-10-14T05:00:00Z' };
+    const lifted = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, { ...red, status: 'completed', attempt: 2, conclusion: 'cancelled' }, next] }) });
+    expect(lifted.decision.reason).toBe('main-green');
+    // only runs the IO layer flagged (flake reruns) are held red; a plain cancelled run still proves nothing
+    expect(core.classifyRun({ ...tip, rerunInconclusive: true })).toBe('red');
+    expect(core.classifyRun(tip)).toBe('ignore');
+  }));
+  it('retries an inconclusive flake rerun once, then leaves the hold to the owner', async () => fixture(async (opts) => {
+    await io.probeAndOwnMainCi(opts);
+    const cancelled = { ...red, status: 'completed', attempt: 2, conclusion: 'cancelled' };
+    const again = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, cancelled] }) });
+    expect(again.rerun).toMatchObject({ runId: 2, kind: 'flake', reason: 'inconclusive-rerun', status: 'issued' });
+    expect(opts.rerun).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(readFileSync(io.ledgerPathIn(opts.dir)))._reruns['2']).toMatchObject({ status: 'issued', rounds: 2 });
+    expect(again.mainRed).toMatchObject({ red: true, firstRedSha: red.headSha });
+    expect(again.decision.reason).toBe('flake-rerun-pending');
+    const spent = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, { ...cancelled, attempt: 3 }] }) });
+    expect(spent.rerun).toBeUndefined();
+    expect(opts.rerun).toHaveBeenCalledTimes(2);
+    expect(spent.mainRed).toMatchObject({ red: true, firstRedSha: red.headSha });
+  }));
+  it('keeps the hold for a manual re-run that no ledger entry knows (missing, unreadable or pruned ledger)', async () => fixture(async (opts) => {
+    // built from plain fields: earlier tests' probes flag the shared `red` fixture in place, which would hide a missing derivation
+    const first = { databaseId: red.databaseId, headSha: red.headSha, createdAt: red.createdAt, status: 'completed', conclusion: 'failure', attempt: 1 };
+    const manual = { ...first, attempt: 2 };
+    const settled = (conclusion, extra = {}) => ({ runs: [green, { ...manual, status: 'completed', conclusion, ...extra }] });
+    for (const readRuns of [() => settled('cancelled'), () => settled('skipped'), () => settled('failure', { infraOnly: true }), () => ({ runs: [green, { ...manual, status: 'in_progress' }] })]) {
+      opts.publishState.mockClear();
+      const out = await io.probeAndOwnMainCi({ ...opts, dryRun: true, readRuns });
+      expect(out.mainRed).toMatchObject({ red: true, firstRedSha: red.headSha });
+      expect(out.decision.reason).not.toBe('main-green');
+    }
+    writeFileSync(io.ledgerPathIn(opts.dir), '{ not json');
+    const corrupt = await io.probeAndOwnMainCi({ ...opts, readRuns: () => settled('cancelled') });
+    expect(corrupt.mainRed).toMatchObject({ red: true, firstRedSha: red.headSha });
+    expect(opts.publishState).not.toHaveBeenCalledWith(null);
+    // an ordinary first-attempt cancelled run, and a manual re-run that passed, still prove what they always did
+    expect((await io.probeAndOwnMainCi({ ...opts, dryRun: true, readRuns: () => ({ runs: [green, { ...first, conclusion: 'cancelled' }] }) })).decision.reason).toBe('main-green');
+    expect((await io.probeAndOwnMainCi({ ...opts, dryRun: true, readRuns: () => ({ runs: [green, { ...manual, conclusion: 'success' }] }) })).decision.reason).toBe('main-green');
   }));
   it('prunes only old reruns on green', async () => fixture(async (opts) => {
     writeFileSync(io.ledgerPathIn(opts.dir), JSON.stringify({ _reruns: { old: { at: 0 }, recent: { at: opts.now } } }));
