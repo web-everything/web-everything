@@ -277,6 +277,7 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
   const run = async (extra, executor, { fixSettings = { strongerModelFromRound: 3 } } = {}) => {
     const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
     const dispatch = vi.fn(() => ({ pr: 42 }));
+    const borrowGate = { consider: vi.fn(() => ({ borrow: true, executor, waitedMinutes: 30 })), clear: vi.fn() };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const result = runReconcileFixDispatch({
@@ -286,10 +287,10 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
         findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
         loadItems: () => [], pickFreeLanes: () => [2], listBuildClaims: () => [], listFixClaims: () => [],
         dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'fixer cap full' }) },
-        borrowGate: { consider: () => ({ borrow: true, executor, waitedMinutes: 30 }), clear: vi.fn() },
+        borrowGate,
         tryResume: () => ({ resumed: false }), tryResumeRound: () => ({ resumed: false }), dispatch,
       });
-      return { result, dispatch };
+      return { result, dispatch, borrowGate };
     } finally { log.mockRestore(); }
   };
   it.each([
@@ -300,12 +301,40 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
     ['ordinary round-3 escalation', { attempts: 2 }],
     ['round-3 repair with no stronger-model rung configured', { attempts: 2 }, { fixSettings: { strongerModelFromRound: 0 } }],
     ['round-2 repair on a stronger-model rung (fix.strongerModelFromRound=2)', { attempts: 1 }, { fixSettings: { strongerModelFromRound: 2 } }],
-    ['red-main fix', { mainFix: true }],
   ])('refuses a codex borrow for a %s and keeps waiting', async (_name, extra, opts) => {
     const { result, dispatch } = await run(extra, 'codex', opts);
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.dispatched).toHaveLength(0);
     expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
+  });
+  it('dispatches a red-main fix past the full fixer cap by default without borrowing, preserving its Claude route', async () => {
+    const previous = process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    try {
+      const { result, dispatch, borrowGate } = await run({ mainFix: true }, 'codex');
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ mainFix: true }));
+      expect(result.dispatched).toHaveLength(1);
+      expect(result.dispatched[0].borrowed).toBeUndefined();
+      expect(borrowGate.consider).not.toHaveBeenCalled();
+      expect(result.refusals).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+      else process.env.WE_MAIN_FIX_PAST_FIX_CAP = previous;
+    }
+  });
+  it('keeps a red-main fix waiting for Claude under a full fixer cap when passing the cap is off', async () => {
+    const previous = process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    process.env.WE_MAIN_FIX_PAST_FIX_CAP = 'off';
+    try {
+      const { result, dispatch } = await run({ mainFix: true }, 'codex');
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.dispatched).toHaveLength(0);
+      expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
+    } finally {
+      if (previous === undefined) delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+      else process.env.WE_MAIN_FIX_PAST_FIX_CAP = previous;
+    }
   });
   it('still lets a table-bearing entry borrow a Claude-class slot, and an ordinary one borrow codex', async () => {
     const claude = await run({ rulingNotAddressed: { rung, route: claudeRoute, matches: [] } }, 'claude');
