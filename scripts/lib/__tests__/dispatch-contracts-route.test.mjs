@@ -15,7 +15,7 @@ function freeze(value) { if (value && typeof value === 'object') { Object.values
 
 describe('story routing', () => {
   it('routes cold builds to the fallback with a cheaper shadow', () => {
-    expect(c.routeDispatch(profile(), { stage: 'story', kind: 'build' })).toMatchObject({ role: c.SUPERVISOR_ROLE, provider: 'claude', model: 'claude-opus-5', tier: 'opus', mode: 'acting', backend: 'claude-native', spotCheck: null, shadow: { provider: 'antigravity', mode: 'shadow' } });
+    expect(c.routeDispatch(profile(), { stage: 'story', kind: 'build' })).toMatchObject({ role: c.SUPERVISOR_ROLE, provider: 'claude', model: 'claude-opus-5-5', tier: 'opus', mode: 'acting', backend: 'claude-native', spotCheck: null, shadow: { provider: 'antigravity', mode: 'shadow' } });
   });
   // #3857 — the standalone STORY_KIND_RUNGS table is folded into workerTierFor (provider-routing.mjs); a
   // non-build story kind's tier is now the SAME table a code-change dispatch's tier is. `investigate` no

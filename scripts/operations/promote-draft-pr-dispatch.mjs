@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file promote-draft-pr-dispatch.mjs
  * @description Draft-first PRs (operator-approved 2026-09-27) — the ONE mechanical pass that acts on
@@ -213,7 +214,7 @@ export function defaultReadCardsOnMain({ repoSlug, prNumber, base = 'main', runG
     }
     // Live #4734 (2026-10-10): a card already RESOLVED on main needs no backlog edit — closing the PR strands
     // nothing. Only a card main still shows as live work blocks the close. Unreadable status → blocks (fail closed).
-    if (cardStatus(text) !== 'resolved') onMain.push(path);
+    if (!isTerminalStatus(cardStatus(text))) onMain.push(path);
   }
   return onMain;
 }

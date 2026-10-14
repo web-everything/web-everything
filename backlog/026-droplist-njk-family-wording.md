@@ -4,7 +4,6 @@ parent: "023"
 status: resolved
 dateOpened: '2026-06-02'
 dateResolved: "2026-06-06"
-dateClosed: '2026-06-03'
 tags:
   - docs
   - droplist

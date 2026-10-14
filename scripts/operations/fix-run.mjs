@@ -35,6 +35,7 @@ import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecu
 import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
@@ -456,6 +457,22 @@ export function parseAcquiredLanePath(stdout) {
   return path;
 }
 
+export function isNothingToRearmRefusal(err) {
+  return [err?.message, err?.stderr, err?.stdout].some((text) => String(text ?? '').includes('nothing to re-arm'));
+}
+
+/** @returns {{mode:'noop'|'fail', source:string}} */
+export function resolveRearmRefusalPolicy(env = process.env) {
+  try {
+    const r = cascadePolicy('fixRearmNothingToRearm', undefined, {
+      env, standard: { mode: 'noop' },
+      envValues: { mode: env?.WE_FIX_REARM_NOTHING_TO_REARM },
+      valid: { mode: (x) => x === 'noop' || x === 'fail' },
+    });
+    return { mode: r.value?.mode === 'fail' ? 'fail' : 'noop', source: r.sources?.mode ?? 'standard' };
+  } catch { return { mode: 'noop', source: 'standard' }; }
+}
+
 /**
  * THE CLI AS A FUNCTION. Exit 1 only when the launch itself threw; "agent made no change" is exit 0.
  * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
@@ -577,7 +594,18 @@ export async function runFixCli(argv = [], {
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
-    const rearm = () => run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+    const rearm = () => {
+      try {
+        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+      } catch (e) {
+        const policy = resolveRearmRefusalPolicy();
+        if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
+          write(`fix-run: PR #${pr} re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source ${policy.source})\n`);
+          return;
+        }
+        throw e;
+      }
+    };
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
     if (pendingRearm.read(launch.repo, pr)?.sha === before) {

@@ -1237,6 +1237,26 @@ describe('runFixCli', () => {
     expect(m2.calls.some((c) => c.includes('push'))).toBe(false);
     expect(m2.owed.sha).toBe(null);
   });
+  it('clears a pending re-arm refusal as pushed without running another agent', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
+    const m = mk(['bbb']);
+    m.owed.sha = 'bbb';
+    const base = m.run.getMockImplementation();
+    const run = vi.fn((cmd, args, opts) => {
+      if (args.some((a) => String(a).includes('rearm-review'))) {
+        throw Object.assign(new Error('Command failed'), { stderr: 'neither review:changes nor review:accepted is live — nothing to re-arm' });
+      }
+      return base(cmd, args, opts);
+    });
+    const write = vi.fn(), appendLoopRow = vi.fn();
+    const out = await runFixCli(argv, { ...m.io, run, write, appendLoopRow });
+    expect(out.code).toBe(0);
+    expect(m.owed.sha).toBe(null);
+    expect(m.pendingRearm.clear).toHaveBeenCalledOnce();
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', outcome: 'pushed' }));
+    expect(write).toHaveBeenCalledWith('fix-run: PR #7 re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source env)\n');
+  });
   it('an unrelated stale marker (a different tip) does not re-arm a no-change run', async () => {
     const m = mk(['aaa', 'aaa']);
     m.owed.sha = 'zzz';

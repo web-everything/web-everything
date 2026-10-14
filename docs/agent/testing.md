@@ -6,6 +6,20 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Model routing retry verification
+
+Codex `modelByTask` resolves model, effort and the optional `retry` array as independent cascade
+leaves. Each retry pair must use a catalogue model and one of its supported efforts; `[]` disables
+same-provider retries. Cover standard, platform, tool and env provenance, invalid pair rejection,
+and the actual launch sequence before Claude fallback. Routing-policy model vetoes must survive
+settings expansion at the launch boundary. Only a definite pre-launch `notApplied` refusal advances
+the chain; an indeterminate or already-started launch must never start a second worker.
+Repair defaults (`operations.fix`, `operations.ci-heal`, `taskTypes.bugfix`) keep `inherit: true`
+at high effort so evidence routing, backend holds and fixer escalation remain effective. Assert the
+Codex retry order through `codex.modelByTask` settings; use an explicit route fixture for launch-boundary tests.
+Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
+per-lens design models still override the helper default.
+
 ## Wrapped worker verification waits
 
 For the 117 S3b regression (2026-10-08), replay the saved StructuredOutput fixtures against both
@@ -29,6 +43,11 @@ Use `isGhDeferred` from `we:scripts/lib/gh-deferred.mjs` before parsing query da
 a deferred response is not an empty PR list. Discovery CLI passes can use `deferGhPass` to skip before
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
+Daemon simulator worlds with independent clocks must each override `WE_GH_THROTTLE_LOCK_ROOT`
+and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A previous world's
+future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.
+Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
+GitHub App shim directories before scanning the host's tool PATH.
 
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
@@ -813,3 +832,18 @@ or failed seal is archived before the active slot is replaced with its sequence 
 existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage alongside transport
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
+
+### Enqueue catch-up ordering
+
+The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
+`duePending` can otherwise undo the selected priority order. Queue fill depth comes from
+`mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
+First acceptance is the earliest structured accepted/clear-human comment across heads;
+include a removal/restore replay, comment pagination, and the ready-time fallback.
+Include an older PR with running checks ahead of a green PR at capacity one, and a window
+that closes during the first wake read then reopens on a later interval. Skipped wakes must
+allow later candidates to run; retained catch-up work reserves room in the next plan.
+Confirmed drain gate skips and revalidation aborts also release room; successful enqueues
+and ambiguous failures consume it. Give each fake child its actual target PR number.
+Also cover a queue that fills while the window is closed and an unreadable next snapshot:
+retained attempts must stay within the latest room, and cannot use a failed snapshot.

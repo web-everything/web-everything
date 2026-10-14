@@ -1,6 +1,8 @@
 /**
  * Single source for Codex model AND effort per task kind. Re-ratified by the operator 2026-10-12:
  * supersedes #3635's "one model, vary effort"; its probe-based evidence remains history.
+ * Operator update 2026-10-13: fix/heal use Sol high with an Astra high pre-launch retry;
+ * documentation and card filing use Sol medium.
  * Operator-supplied published benchmarks: Sol ~75% DeepSWE v1.1 at ~1/5 Astra cost (Vellum,
  * DataCamp, Emergent GPT-6.1 Sol); Astra ~74–75%, but Terminal-Bench Science 68% vs Sol 57%;
  * Luna ~64–67% at ~$0.22/task (tosea, aicatchup GPT-6 Luna). No in-house graduation probe:
@@ -75,7 +77,7 @@ export const CODEX_MODEL_CATALOGUE = Object.freeze({
 
 export const CODEX_TASK_KINDS = Object.freeze([
   'prepare', 'prepare-complex', 'takeover', 'design', 'fix', 'ci-heal', 'build',
-  'worker', 'trivial', 'review', 'review-mandatory',
+  'worker', 'trivial', 'review', 'review-mandatory', 'doc-fix', 'prevention-card', 'prepare-card',
 ]);
 
 // Follow-up: shared taskTier (kind → tier → per-vendor model+effort for Claude AND Codex).
@@ -85,14 +87,15 @@ export const CODEX_MODEL_BY_TASK_DEFAULT = Object.freeze(Object.fromEntries([
   ['prepare-complex', 'gpt-6-astra', 'high'],
   ['takeover', 'gpt-6-astra', 'high'],
   ['design', 'gpt-6-astra', 'high'],
-  ...['fix', 'ci-heal', 'build', 'worker', 'review'].map(kind => [kind, 'gpt-6.1-sol', 'medium']),
+  ...['fix', 'ci-heal'].map(kind => [kind, 'gpt-6.1-sol', 'high', Object.freeze([Object.freeze({ model: 'gpt-6-astra', effort: 'high' })])]),
+  ...['build', 'worker', 'review', 'doc-fix', 'prevention-card', 'prepare-card'].map(kind => [kind, 'gpt-6.1-sol', 'medium']),
   ['trivial', 'gpt-6-luna', 'low'],
   ['review-mandatory', 'gpt-6-astra', 'high'],
-].map(([kind, model, effort]) => [kind, Object.freeze({ model, effort })])));
+].map(([kind, model, effort, retry]) => [kind, Object.freeze({ model, effort, ...(retry ? { retry } : {}) })])));
 
 const ALIASES = Object.freeze({
-  stronger: 'takeover', 'stronger-model': 'takeover', card: 'trivial', 'card-filing': 'trivial',
-  'prevention-card': 'trivial', 'card-rename': 'trivial', conflict: 'trivial', delivery: 'build', heal: 'ci-heal',
+  stronger: 'takeover', 'stronger-model': 'takeover', card: 'prevention-card', 'card-filing': 'prevention-card',
+  'card-rename': 'trivial', conflict: 'trivial', delivery: 'build', heal: 'ci-heal',
 });
 
 /** PURE: classify task complexity without touching policy or IO. */

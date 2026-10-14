@@ -57,9 +57,21 @@ export function countOpenPrsForCap(openPrs, scope = OPEN_PR_CAP_SCOPE_DEFAULTS) 
     else if (scope.excludeAccepted && hasLabel(pr, ACCEPTED_LABEL)) acceptedPrs.push(id);
     else countedPrs.push(id);
   }
-  return { total: openPrs.length, counted: countedPrs.length, cardOnly: cardOnlyPrs.length, accepted: acceptedPrs.length, countedPrs, cardOnlyPrs, acceptedPrs };
+  return { total: openPrs.length, counted: countedPrs.length, cardOnly: cardOnlyPrs.length, accepted: acceptedPrs.length, countedPrs, cardOnlyPrs, acceptedPrs,
+    excludeCardOnly: scope.excludeCardOnly, excludeAccepted: scope.excludeAccepted };
 }
 
 export function formatOpenPrCap(c) {
-  return `${c.counted} open PRs counted (${c.cardOnly} card-only, ${c.accepted} accepted excluded)`;
+  const excluded = [];
+  const included = [];
+  for (const [flag, count, label] of [['excludeCardOnly', 'cardOnly', 'card-only'], ['excludeAccepted', 'accepted', ACCEPTED_LABEL]]) {
+    if (c[flag]) excluded.push(`${c[count]} ${label}`);
+    else included.push(`${label} counted (openPrCap.${flag}=false)`);
+  }
+  const details = [excluded.length ? `not counted: ${excluded.join(', ')}` : '', included.join(', ')].filter(Boolean).join('; ');
+  const multiRepo = new Set(c.countedPrs.map((id) => id.slice(0, id.lastIndexOf('#')))).size > 1;
+  const listed = c.countedPrs.slice(0, 15).map((id) => multiRepo ? id : id.slice(id.lastIndexOf('#'))).join(' ');
+  const remaining = c.countedPrs.length - 15;
+  const counted = listed ? ` — counted: ${listed}${remaining > 0 ? ` … (+${remaining} more)` : ''}` : '';
+  return `${c.counted} of ${c.total} open PRs counted (${details})${counted}`;
 }
