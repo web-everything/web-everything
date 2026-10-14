@@ -3,11 +3,13 @@ bornAs: xobnfjb
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/drain-review-gate-decision-table.test.mjs", "we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs", "we:scripts/lib/__tests__/human-clearance-carry.test.mjs"]
 dateOpened: "2026-10-13"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "550744d9432c01b326c3f5fac594a4452396e068"
+preparedAgainstSha: "9b764e95bf582c1eadaa5132b4fee217ccaf8a3a"
+dateStarted: "2026-10-14"
+dateResolved: "2026-10-14"
 tags: []
 ---
 
@@ -99,3 +101,4 @@ All test runs must use the `run -- npx vitest run` interface of we:scripts/readi
 2026-10-14 re-prepare: stamp stale (2f7ed115 vs main 9b764e95). Re-checked: lines 854-856 still default-trust (`!== false`), no decision-table test file on main, the gate and hold module unchanged since the last stamp. Design/MVP/Test plan unchanged. Re-stamped.
 
 2026-10-14 probation preparation: old premise/scope was a two-file change (we:scripts/merge-ai-prs.mjs and we:scripts/__tests__/merge-ai-prs.test.mjs), despite the body promising a new table and fixture edits. Corrected scope is the source plus its planned matching table test and the two affected existing fixture suites. Evidence: permissive predicate still present at we:scripts/merge-ai-prs.mjs:854; files-only fixture at we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs:546 and carry fixtures at we:scripts/lib/__tests__/human-clearance-carry.test.mjs:308. File search found no proposed table file; the goal is not already delivered. Retain size 3: approximately 5–10 source lines, 120–180 new table/regression lines, 2–4 acceptance fixture lines, and 10–25 carry fixture lines across four files. This is a story, so no estimatedLoc is added. Corrected listing-normalization citations from 1983/1988 to we:scripts/merge-ai-prs.mjs:1987/1992. Corrected the old claim that explicit off defers (it bypasses at we:scripts/lib/drain-workflow-edit-hold.mjs:33), the claim that the gate is pure, and the overstated workflowOnly identity check. Replaced the unstated table expectations with concrete current-policy outcomes and the nondeterministic live-drain proof with injected head-bound regression evidence. Existing preparation stamps are preserved for the runner; no implementation or tests executed during this preparation.
+2026-10-14 build: `filesComplete` now needs `=== true` plus a non-empty `listedHeadSha` matching the acceptance head (we:scripts/merge-ai-prs.mjs); 34-case decision table (with wiring tests for the production listing and both call sites) added (we:scripts/__tests__/drain-review-gate-decision-table.test.mjs), 10 of 34 red without the fix, all green with it; existing tests that passed `files` alone now pass the explicit flags. The live `--dry-run` comparison was not run (needs GitHub reads); production callers already pass the strict flags (pinned by the wiring tests), so live behavior is unchanged.
