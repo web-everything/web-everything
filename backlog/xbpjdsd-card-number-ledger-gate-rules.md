@@ -15,11 +15,11 @@ Slice (c) of epic xdlnylv: the hash-on-main, duplicate-number and bornAs rules l
 
 ## Design
 
-All changes key on `backlog.cardNumbering.mode` (slice (a)). In `rename-before-enqueue` the rules behave
-exactly as today. In `rename-after-land` and `ledger-only` the ledger-aware rules below apply.
+The ledger-aware rules below apply in every mode (slice (a)), including `rename-before-enqueue`: a rollback
+must accept ledger-numbered x-cards already on main. Unledgered cards keep today's refusal/window behavior.
 
 - `strandedHashesOnMain` (we:scripts/check-standards-rules.mjs:2963, called from
-  we:scripts/check-standards.mjs:817): outside `rename-before-enqueue`, an `x<6>` file on `origin/main` is legal when the ledger
+  we:scripts/check-standards.mjs:817): in every mode, an `x<6>` file on `origin/main` is legal when the ledger
   has its row. Without a row it is a warning inside the land window (the existing #2956 commit-time window) and
   an error after it.
 - `duplicateBacklogNums` (we:scripts/check-standards-rules.mjs:2842, called at
@@ -53,7 +53,8 @@ One line per class: either the handling, or `n/a: <why>`.
 
 Rule-level unit tests in the existing check-standards rules suite: ledgered x-card on main passes; unledgered
 x-card errors after the window and warns inside it; ledger number colliding with a numeric file errors; a
-ledger conflict errors; `rename-before-enqueue` keeps today's behaviour byte-for-byte.
+ledger conflict errors; after rollback to `rename-before-enqueue`, ledgered x-cards still pass, while
+unledgered cards retain today's window/error behavior.
 
 ## Proof plan
 
@@ -63,8 +64,9 @@ hash-on-main rule errors. After: clean. Remove the row: the rule errors again. P
 
 ## Done when
 
-- Outside `rename-before-enqueue`, a ledger-numbered x-card on main passes the gate and an unledgered one fails it.
-- In `rename-before-enqueue`, the gate output on current main is unchanged.
+- In every mode, a ledger-numbered x-card on main passes the gate and an unledgered one fails after the window.
+- In `rename-before-enqueue`, the gate output on today's numeric main is unchanged; ledgered x-cards added
+  before a rollback remain accepted.
 
 ## Acceptance
 

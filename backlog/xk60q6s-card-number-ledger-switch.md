@@ -4,7 +4,7 @@ size: 5
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd", "xg7whui"]
-scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
+scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, merge-queue, numbering, ledger]
 ---
@@ -19,7 +19,12 @@ Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering
   - `rename-before-enqueue`: `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch-numbering.mjs:238),
     `sweepQueuedHashCards` (:318), `probeQueuedLand` (:354), `repairHashOnMain` (:200), and the
     `mergeGroupHashRefusals` merge_group refusal (:34-37, called at we:scripts/check-standards.mjs:787-789),
-    exactly as today; the ledger row records the number the rename chose.
+    with ledger-aware rollback guards: before choosing a number, every rename/repair path reads the
+    ledger under `withNumberingLock`. A ledgered x-card retains its assigned number and is excluded
+    from fresh-number allocation; any numeric materialization uses that existing number. Only
+    unledgered cards follow today's allocation path; the ledger row records the number the rename chose.
+    The merge_group refusal accepts ledgered x-cards in this mode too; unreadable or conflicting ledger
+    state fails closed. These guards must ship before the flip, rather than be added during rollback.
   - `rename-after-land` and `ledger-only`: `assignCardNumbers` (slice (a)) runs inside `withNumberingLock`
     just before `mergeStrategy.enqueue` (we:scripts/merge-ai-prs.mjs:6539-6545), or before `mergePr` in
     drain-direct. No commit to the branch; the judged head is unchanged. The merge_group gate refuses an
@@ -30,10 +35,13 @@ Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering
   standard default `rename-after-land` applies. Switching back is a one-line setting change.
 - If the assign fails, the candidate is skipped this pass (`decision = 'skip'`); it is never enqueued without
   its rows.
+- Wire the guards through `numberPendingHashes` (we:scripts/lane-drain.mjs:682), including drain-direct,
+  main repair and branch/queue callers. Ops-ledger assignments override the local hash map and reservations;
+  new allocations exclude every ledger number. Do not defer this safety to slice (e)'s local-map retirement.
 
 ## MVP
 
-Mode-gating of the enqueue path and of the merge_group rule, then the flip.
+Mode-gating, ledger-aware rollback guards on all rename/repair paths, and merge_group checks, then the flip.
 
 ## Edge cases this change must handle
 
@@ -48,15 +56,27 @@ One line per class: either the handling, or `n/a: <why>`.
    to the lower cascade layer and is logged.
 5. **Identity scoping** — rows record the PR number and repo; a PR in another repo writes its own file.
 6. **State over time** — a mode change mid-flight is safe: PRs already renamed land as numeric cards; x-id cards
-   already on main are picked up by the rename batch (slice (f)) or stay x-id under `ledger-only`.
+   already on main retain their ledger numbers in every mode. On rollback, `repairHashOnMain`, branch
+   numbering, queued sweeps and probes must not allocate replacement numbers for them; optional numeric
+   materialization reuses the ledger number. The rename batch (slice (f)) follows the same rule.
 7. **Who wrote it** — only the drain writes rows; a PR cannot add its own row because the ledger is not on the
    PR branch.
 
 ## Test plan
 
-Unit, per mode: `rename-before-enqueue` still calls `prepareBranchBeforeEnqueue` and keeps the #5057 refusal;
+Unit, per mode: `rename-before-enqueue` still calls `prepareBranchBeforeEnqueue` and refuses unledgered x-cards;
 the other two call `assignCardNumbers` and never the branch numbering; the merge_group rule passes a ledgered
 x-card and refuses an unledgered one and an unreadable ledger; an invalid mode value is ignored and logged.
+
+Integration rollback fixture: land ledger-numbered x-cards in both `rename-after-land` and `ledger-only`,
+then select `rename-before-enqueue` through explicit repo/env overrides and lower-layer cascade resolution. Exercise
+`repairHashOnMain`, `prepareBranchBeforeEnqueue`, `sweepQueuedHashCards`, `probeQueuedLand` and merge_group
+checks and drain-direct `numberPendingHashes` with those existing cards plus one new unledgered card.
+Include a stale local-map assignment and reservation that disagree with an existing ops-ledger row.
+Assert existing id-to-number mappings and
+ledger rows are unchanged, no fresh number is allocated for an existing id, any numeric rename uses its
+ledger number, and only the new card receives a fresh number. Repeat after a recovery/retry and with
+unreadable or conflicting ledger state (no rename, allocation or merge).
 
 ## Proof plan
 
@@ -64,12 +84,16 @@ Live, on the next real PR that carries a new card. Before the flip: the drain lo
 commit and a second CI run on a new head. After: `gh pr view <N> --json commits` shows no drain commit, the
 merged head equals the judged head, the ledger has the row, and the daemon log shows
 `policy-cascade · backlog.cardNumbering: mode=rename-after-land (standard)`. Then set the override back to
-`rename-before-enqueue` on one pass and show the branch numbering runs again. Record the CI wall times.
+`rename-before-enqueue` on one pass and show branch numbering runs for a new unledgered card while a
+ledger-numbered x-card already on main keeps its number through repair and queue processing. Record the
+before/after ledger rows, filenames and CI wall times.
 
 ## Done when
 
 - Three consecutive real PRs with new cards land at their judged head with one CI round each.
-- Flipping the setting back to `rename-before-enqueue` restores today's behaviour with no code change.
+- Flipping the setting back to `rename-before-enqueue` restores pre-enqueue numbering for new unledgered
+  cards with no additional code change; already ledger-numbered cards keep their numbers through all
+  repair, queue and merge_group paths, as proved by the rollback integration fixture.
 
 ## Acceptance
 
