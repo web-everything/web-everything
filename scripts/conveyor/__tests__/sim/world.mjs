@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { seedLaneDependencies } from './dependencies.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -347,9 +348,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
 
   // (d, continued) provision N lanes via the REAL scripts/lane-pool.mjs, from the sim clone. `--no-install`
   // is the flag that skips `npm ci`/`npm install` entirely (lane-pool.mjs's own `ensureDeps` call sites are
-  // ALL gated on `!flags['no-install']`) — the deps marker (`.git/.lane-pool-deps`) is the OTHER route
-  // (pre-seed it with the lockfile hash so `depsReady` reads 'ok'), left undocumented-but-available below in
-  // case a future scenario needs `ensureDeps` to actually run without a real `npm ci`.
+  // ALL gated on `!flags['no-install']`). Seed the resulting lanes with the already-installed test dependencies
+  // and the lockfile hash marker too: the rebuild's live smoke uses an ordinary acquire, without --no-install,
+  // and otherwise installs dependencies from the network in these supposedly-hermetic scenarios.
   // #4075 soak harness gap — `provision --acquirable` caps NEW clones per call at
   // `ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT` (4, `we:scripts/lane-pool.mjs`), so `createWorld({lanes: N})` for
   // N > 4 silently provisioned only 4 lanes (found building `breaks/lane-acquire-under-load.mjs`, which needs a
@@ -358,6 +359,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   execFileSync(process.execPath, [join(simClone, 'scripts', 'lane-pool.mjs'), 'provision', `--count=${lanes}`, '--acquirable', `--max-new=${lanes}`, '--no-install'], {
     cwd: simClone, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
   });
+  const wePool = join(lanePoolRoot, 'web-everything');
+  for (const name of readdirSync(wePool)) {
+    if (/^lane-\d+$/.test(name)) seedLaneDependencies(join(wePool, name), nodeModulesSrc);
+  }
 
   // ── git helpers ────────────────────────────────────────────────────────────────────────────────────────
   function withScratchClone(repoKey, fn) {
