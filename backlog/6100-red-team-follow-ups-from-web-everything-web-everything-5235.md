@@ -1,4 +1,5 @@
 ---
+bornAs: x24i64r
 kind: story
 size: 2
 status: open

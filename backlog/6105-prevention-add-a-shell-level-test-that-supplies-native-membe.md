@@ -1,4 +1,5 @@
 ---
+bornAs: xs3192y
 kind: story
 size: 3
 status: open

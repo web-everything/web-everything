@@ -1,22 +1,23 @@
 ---
+bornAs: x5uafak
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/merge-queue-adaptive-batching.mjs", "we:scripts/lib/__tests__/merge-queue-adaptive-batching.test.mjs"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a shell-level test that supplies authoritative native membership and tip and asserts a cancel… (from web-everything/web-everything#5217 review)
+# Prevention — Run the grouping planner against projectBuildQueueRow output in a daemon-level test with a mixed-… (from web-everything/web-everything#5187 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/merge-queue-adaptive-batching.mjs:330` — Add a shell-level test that supplies authoritative native membership and tip and asserts a cancel POST under HEADGREEN. Alternatively, mark the cancel path explicitly inert in the PR text and settings comment, and gate the replay's HEADGREEN column on it. File a backlog item for a deterministic check that every named argument passed to an exported pure function is one it reads.
-2. `we:scripts/lib/merge-queue-adaptive-batching.mjs:340` — Add a bounded-defer rule: after N consecutive lock-timeout defers for the same PR, or a lock older than a cap, fail open and log. Add a test with a never-released lock.
-3. `we:scripts/lib/merge-queue-adaptive-batching.mjs:230` — Before counting a failure, check the queue entry or PR timeline for a removal reason, or the head SHA change. Add a test for a push-ejected PR that must not dequeue its peers.
+1. `we:skills-src/conveyor/build-dispatch-daemon.mjs:720` — Run the grouping planner against `projectBuildQueueRow` output in a daemon-level test with a mixed-repo fixture. Better, have the daemon overlay `rawScope` (or the card's qualified scope) into the grouping rows for repo comparison.
+2. `we:scripts/operations/deliver-item-wrapper.mjs:735` — Add a check:standards rule or lint that flags readFileSync on a lane-relative path inside deliver-item-wrapper unless it is guarded by lstat or O_NOFOLLOW. Always run thrown messages that carry agent-supplied text through sanitizeGroupDropReason.
+3. `we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:4437` — Add a review lens or checklist item: every 'refuses X' or 'only Y' sentence in a docblock needs a negative test that names the refused input.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5217@8e9aeec02b5098f4ede849946f69543bb81bf89e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5187@dd82d7c4267f4c78b930680c751e267f64e71e07
 
 ## Acceptance
 

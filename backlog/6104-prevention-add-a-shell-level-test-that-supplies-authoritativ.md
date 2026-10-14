@@ -1,21 +1,23 @@
 ---
+bornAs: xhpgurh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md"]
+scope: ["we:scripts/lib/merge-queue-adaptive-batching.mjs", "we:scripts/lib/__tests__/merge-queue-adaptive-batching.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Same #xrrmid8 lint, extended so each numbered 'Edge cases' guarantee must cite or map to a named… (from web-everything/web-everything#5207 review)
+# Prevention — Add a shell-level test that supplies authoritative native membership and tip and asserts a cancel… (from web-everything/web-everything#5217 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:53` — Same #xrrmid8 lint, extended so each numbered 'Edge cases' guarantee must cite or map to a named Test plan bullet.
-2. `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:61` — Extend the planned prepared-card standards gate to require explicit guarantee-to-test mappings, including temporal guarantees. Plan named tests in we:scripts/__tests__/lane-drain.test.mjs and we:scripts/__tests__/backlog-stranded-sweep.test.mjs asserting fresh status reads, repeated blocked attempts without commits, and successful resolution after the blocker changes.
+1. `we:scripts/lib/merge-queue-adaptive-batching.mjs:330` — Add a shell-level test that supplies authoritative native membership and tip and asserts a cancel POST under HEADGREEN. Alternatively, mark the cancel path explicitly inert in the PR text and settings comment, and gate the replay's HEADGREEN column on it. File a backlog item for a deterministic check that every named argument passed to an exported pure function is one it reads.
+2. `we:scripts/lib/merge-queue-adaptive-batching.mjs:340` — Add a bounded-defer rule: after N consecutive lock-timeout defers for the same PR, or a lock older than a cap, fail open and log. Add a test with a never-released lock.
+3. `we:scripts/lib/merge-queue-adaptive-batching.mjs:230` — Before counting a failure, check the queue entry or PR timeline for a removal reason, or the head SHA change. Add a test for a push-ejected PR that must not dequeue its peers.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5207@ae82f7d6d4a4ff7bf0a6ffc476a58da77b520435
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5217@8e9aeec02b5098f4ede849946f69543bb81bf89e
 
 ## Acceptance
 

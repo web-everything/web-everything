@@ -1,22 +1,23 @@
 ---
+bornAs: xxr3fph
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Run the grouping planner against projectBuildQueueRow output in a daemon-level test with a mixed-… (from web-everything/web-everything#5187 review)
+# Prevention — Gate the branch on typeof json.reason === 'string' (or also handle json.stopped), and add a summa… (from web-everything/web-everything#5241 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:skills-src/conveyor/build-dispatch-daemon.mjs:720` — Run the grouping planner against `projectBuildQueueRow` output in a daemon-level test with a mixed-repo fixture. Better, have the daemon overlay `rawScope` (or the card's qualified scope) into the grouping rows for repo comparison.
-2. `we:scripts/operations/deliver-item-wrapper.mjs:735` — Add a check:standards rule or lint that flags readFileSync on a lane-relative path inside deliver-item-wrapper unless it is guarded by lstat or O_NOFOLLOW. Always run thrown messages that carry agent-supplied text through sanitizeGroupDropReason.
-3. `we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:4437` — Add a review lens or checklist item: every 'refuses X' or 'only Y' sentence in a docblock needs a negative test that names the refused input.
+1. `we:scripts/lib/enqueue-on-event.mjs:166` — Gate the branch on `typeof json.reason === 'string'` (or also handle `json.stopped`), and add a summarizeFastDrain table test covering every `ok:false` emitter shape (fail(), red-main stop, dup-id sweep result).
+2. `we:scripts/lib/enqueue-on-event.mjs` — Add a deterministic regression test with enough persistently ineligible older candidates to fill the cutoff and an eligible later candidate; assert that the later candidate eventually runs.
+3. `we:scripts/lib/enqueue-on-event.mjs:211` — Add a deterministic two-page reader test asserting that the second request uses the returned cursor and that an eligible candidate from page two reaches the planner.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5187@dd82d7c4267f4c78b930680c751e267f64e71e07
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@e3b5983262bb6a851367b873e8e24bf1e07a6a5c
 
 ## Acceptance
 
