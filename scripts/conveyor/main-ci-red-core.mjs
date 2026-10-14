@@ -390,8 +390,17 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
     const labelled = (pr.labels || []).some((label) => settings.mainCiRedOwnerLabels?.some((name) => name.toLowerCase() === String(label?.name ?? '').toLowerCase()));
     let supersedes = false;
     if (settings.mainCiRedOwnerSupersedeMarker) {
-      const body = String(pr.body ?? '').replace(/<!--|-->/g, '');
-      for (const match of body.matchAll(/^\s*red-main-repair:\s*supersedes\s+(?:lane\/main-fix-([a-f0-9]{7,64})|([a-f0-9]{7,64})|#(\d+))\s*$/gim)) {
+      for (const rawLine of String(pr.body ?? '').split(/\r?\n/)) {
+        let line = rawLine.trim();
+        // Parse a complete declaration as text, optionally inside a paired comment wrapper.
+        // Deleting delimiters throughout the body can splice malformed text into a valid marker.
+        if (line.startsWith('<!--')) {
+          const endLength = line.endsWith('--!>') ? 4 : line.endsWith('-->') ? 3 : 0;
+          if (!endLength) continue;
+          line = line.slice(4, -endLength).trim();
+        }
+        const match = /^red-main-repair:\s*supersedes\s+(?:lane\/main-fix-([a-f0-9]{7,64})|([a-f0-9]{7,64})|#(\d+))$/i.exec(line);
+        if (!match) continue;
         const ref = match[1] || match[2];
         if (ref ? sha.toLowerCase().startsWith(ref.toLowerCase()) : Number(match[3]) !== Number(pr.number) && existing.has(Number(match[3]))) supersedes = true;
       }

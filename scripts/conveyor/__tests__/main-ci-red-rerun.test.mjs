@@ -174,4 +174,23 @@ describe('declared red-main repair owners', () => {
     expect(owners([pr(5270, { body: 'red-main-repair: supersedes #9999' })])).toEqual([]);
     expect(owners([old, { ...old, labels: [{ name: 'red-main-repair' }] }])).toEqual([5269]);
   });
+  it('recognises complete declaration lines and paired comment wrappers', () => {
+    const marker = 'red-main-repair: supersedes lane/main-fix-62da75ed3';
+    for (const body of [marker, `  ${marker}  `, `<!-- ${marker} -->`, `<!-- ${marker} --!>`,
+      `prose\r\n\t<!-- ${marker} -->\r\nmore prose`, `<!--\n${marker}\n-->`]) {
+      expect(owners([pr(5270, { body })]), body).toEqual([5270]);
+    }
+    const old = pr(5269, { headRefName: 'lane/main-fix-62da75ed3' });
+    expect(owners([old, pr(5270, { body: '<!-- red-main-repair: supersedes #5269 --!>' })])).toEqual([5269, 5270]);
+  });
+  it('does not assemble declarations by deleting embedded or unpaired comment delimiters', () => {
+    const marker = 'red-main-repair: supersedes 62da75ed3';
+    for (const body of [`red-main-<!--repair: supersedes 62da75ed3`,
+      `red-main-repair: super-->sedes 62da75ed3`, `red-main-repair: supersedes 62da<!--75ed3`,
+      `<!-- ${marker}`, `${marker} -->`, `${marker} --!>`, `<!-- <!-- ${marker} --> -->`,
+      `prefix <!-- ${marker} -->`, `<!-- ${marker} --> suffix`,
+      `<!-- ${marker} --!> suffix`, `<script>${marker}</script>`]) {
+      expect(owners([pr(5270, { body })]), body).toEqual([]);
+    }
+  });
 });
