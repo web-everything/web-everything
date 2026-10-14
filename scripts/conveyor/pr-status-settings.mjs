@@ -3,6 +3,7 @@ import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
 
 const keys = {
+  acceptedRedTeamStatus: { standard: 'red-team', values: ['red-team', 'ready-to-merge'], env: 'WE_PR_STATUS_ACCEPTED_RED_TEAM' },
   reviewGateSignal: { standard: 'review', values: ['review', 'ci'], env: 'WE_PR_STATUS_REVIEW_GATE_SIGNAL' },
   stackedMainOnlyChecks: { standard: 'waiting-on-base', values: ['waiting-on-base', 'awaiting-ci'], env: 'WE_PR_STATUS_STACKED_MAIN_ONLY' },
   mainOnlyRequiredChecks: { standard: Object.freeze(['merge-gate']), env: 'WE_PR_STATUS_MAIN_ONLY_CHECKS' },

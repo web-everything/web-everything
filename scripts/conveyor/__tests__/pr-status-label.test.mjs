@@ -93,6 +93,39 @@ const verdict = (head = HEAD, outcome = 'accept') => ({ author: BOT, createdAt: 
 const stand = (h = 7) => ({ author: BOT, createdAt: at(h), body: STAND_DOWN_MARKER });
 const human = (h = 8, login = 'chalbert') => ({ author: { login }, createdAt: at(h), body: 'Please continue.' });
 
+describe('accepted PRs in the post-accept red team (#5241, #5258, #5268)', () => {
+  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const labels = ['review:accepted', 'review-status:reviewing', 'review-round:1'];
+  const subject = (extraLabels = [], over = {}) => pr([...labels, ...extraLabels], [], {
+    statusCheckRollup: requiredChecks.map(name => check(name)), ...over,
+  });
+  const reviewStatus = { role: 'review', state: 'reviewing' };
+  it.each([5241, 5258, 5268])('#%i: accepted with a live reviewer is red-team', (number) => {
+    expect(derive({ pr: subject([], { number }), requiredChecks, reviewStatus })).toBe('red-team');
+  });
+  it('keeps a stalled reviewer in red-team', () => {
+    expect(derive({ pr: subject(), requiredChecks, reviewStatus: { role: 'review', state: 'review-stalled' } })).toBe('red-team');
+  });
+  it('respects the explicit ready-to-merge label and the compatibility setting', () => {
+    expect(derive({ pr: subject(['ready-to-merge']), requiredChecks, reviewStatus })).toBe('ready-to-merge');
+    expect(derive({ pr: subject(), requiredChecks, reviewStatus, settings: { acceptedRedTeamStatus: 'ready-to-merge' } })).toBe('ready-to-merge');
+  });
+  it('requires a live running reviewer, not just the persisted review-status label', () => {
+    for (const status of [null, { role: 'draft', state: 'reviewing' }, { role: 'review', state: 'awaiting-ci' }]) {
+      expect(derive({ pr: subject(), requiredChecks, reviewStatus: status })).toBe('ready-to-merge');
+    }
+  });
+  it('required red CI still wins over the live red team', () => {
+    expect(derive({ pr: subject([], { statusCheckRollup: requiredChecks.map(name => check(name, name === 'test' ? 'FAILURE' : 'SUCCESS')) }),
+      requiredChecks, reviewStatus })).toBe('ci-red');
+  });
+  it('recognizes status:red-team and replaces the stale awaiting-review status', () => {
+    expect(PR_STATUS_LABEL_RE.test('status:red-team')).toBe(true);
+    expect(planPrStatusLabel({ state: 'red-team', currentLabels: [...labels, 'status:awaiting-review'] }))
+      .toEqual({ add: 'status:red-team', remove: ['status:awaiting-review'] });
+  });
+});
+
 describe('truthful stage regressions', () => {
   it('#4715: an answered stand-down with stale changes belongs to the fixer', () => {
     const subject = pr(['review:human', 'review-round:5', 'advisory:changes', 'status:needs-you'],
@@ -197,9 +230,14 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
 describe('prStatus settings', () => {
   it('supplies standard values and source metadata', () => {
     const resolved = resolvePrStatusSettings();
-    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'review', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate'] });
+    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'review', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate'], acceptedRedTeamStatus: 'red-team' });
     expect(prStatusSettingValues(resolved)).toEqual(PR_STATUS_SETTING_DEFAULTS);
     for (const setting of Object.values(resolved)) expect(setting.source).toBe('standard');
+  });
+  it('defaults acceptedRedTeamStatus to red-team and accepts the env compatibility override', () => {
+    expect(resolvePrStatusSettings().acceptedRedTeamStatus).toEqual({ value: 'red-team', source: 'standard' });
+    expect(resolvePrStatusSettings({ env: { WE_PR_STATUS_ACCEPTED_RED_TEAM: 'ready-to-merge' } }).acceptedRedTeamStatus)
+      .toEqual({ value: 'ready-to-merge', source: 'env' });
   });
   it('layers standard < platform < repo < env independently and parses comma lists', () => {
     const platform = { prStatus: { reviewGateSignal: 'ci', stackedMainOnlyChecks: 'awaiting-ci', mainOnlyRequiredChecks: ['platform-check'] } };
@@ -209,8 +247,9 @@ describe('prStatus settings', () => {
     const resolved = resolvePrStatusSettings({ platform, repo, env: {
       WE_PR_STATUS_REVIEW_GATE_SIGNAL: 'ci', WE_PR_STATUS_STACKED_MAIN_ONLY: 'waiting-on-base',
       WE_PR_STATUS_MAIN_ONLY_CHECKS: 'merge-gate, custom-check ',
+      WE_PR_STATUS_ACCEPTED_RED_TEAM: 'ready-to-merge',
     } });
-    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'ci', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate', 'custom-check'] });
+    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'ci', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate', 'custom-check'], acceptedRedTeamStatus: 'ready-to-merge' });
     for (const setting of Object.values(resolved)) expect(setting.source).toBe('env');
   });
   it('ignores invalid values and blocks, retaining the last valid layer', () => {

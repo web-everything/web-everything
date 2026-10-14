@@ -16,7 +16,7 @@ import { standDownComments } from './stand-down.mjs';
 
 export const PR_STATUS_PREFIX = 'status:';
 export const PR_STATUS_STATES = Object.freeze([
-  'needs-you', 'ci-red', 'ready-to-merge', 'takeover-running', 'fixing', 'escalated', 'stood-down',
+  'needs-you', 'ci-red', 'red-team', 'ready-to-merge', 'takeover-running', 'fixing', 'escalated', 'stood-down',
   'answered-waiting-fixer', 'sent-back-red-team', 'at-round-limit', 'waiting-on-base', 'awaiting-ci', 'awaiting-review', 'sent-back-review',
 ]);
 const LEGACY_PR_STATUS_STATES = Object.freeze(['awaiting-base']);
@@ -29,6 +29,7 @@ export const PR_STATUS_DESCRIPTIONS = Object.freeze({
   'waiting-on-base': 'Waiting for the base PR to land — auto-managed',
   'awaiting-ci': 'Waiting for CI — auto-managed',
   'awaiting-review': 'A review is owed or running — auto-managed',
+  'red-team': 'Accepted; the post-accept red team is still running — auto-managed',
   'ready-to-merge': 'Accepted with no red required checks; waiting to land — auto-managed',
   'ci-red': 'Required CI is red; waiting for repair — auto-managed',
   escalated: 'Handed to a person; see the operator queue ESCALATIONS — auto-managed',
@@ -111,6 +112,9 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   if (operatorQueueNeedsYou(subject, { humanAt })) return 'needs-you';
   const liveFix = (reviewStatus?.role === 'fix' || reviewStatus?.role === 'ci-heal') && rs !== 'needs-human';
   if (requiredCiRed(subject, l, ciChecks)) return liveFix ? 'fixing' : 'ci-red';
+  if (l.includes('review:accepted') && !l.includes('ready-to-merge')
+    && reviewStatus?.role === 'review' && ['reviewing', 'review-stalled'].includes(rs)
+    && settings.acceptedRedTeamStatus === 'red-team') return 'red-team';
   if (l.includes('review:accepted')) return 'ready-to-merge';
   if (liveFix) return takeoverUnjudged(comments) && reviewStatus.role === 'fix' ? 'takeover-running' : 'fixing';
   const escalated = list.some((r) => (r.kind === 'cap-exhausted' && ESCALATED.has(r.takeover))
