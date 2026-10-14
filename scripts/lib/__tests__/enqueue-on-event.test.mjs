@@ -766,6 +766,38 @@ describe('catch-up handle', () => {
     expect(handle.pending()).toEqual([]);
   });
 
+  it.each([
+    ['catch-up is disabled', (s) => ({ ...s, catchUp: { ...s.catchUp, enabled: false } })],
+    ['enqueue-on-event is disabled', (s) => ({ ...s, enabled: false })],
+  ])('stops catch-up work in the same run once %s during a fast drain', async (_name, change) => {
+    let setting = CATCH_UP_SETTING;
+    const { handle, calls } = catchUpSetup({
+      resolveSetting: () => setting,
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4].map(num => candidate(num, num)) }),
+      drainResult: (num) => { setting = change(CATCH_UP_SETTING); return { considered: 1, toMerge: [], skipReasons: [{ num, reason: 'checks failing' }] }; },
+    });
+    await handle.catchUp();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1']);
+    expect(handle.pending()).toEqual([]);
+  });
+
+  it.each(['tick', 'catchUp'])('%s shrinks retained room when maxQueued is lowered before the next snapshot', async (method) => {
+    let allowed = true;
+    let capacity = 3;
+    const { handle, calls } = catchUpSetup({
+      allowed: () => allowed,
+      readCapacity: () => ({ capacity, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3].map(num => candidate(num, num)) }),
+      readPr: async () => { if (capacity === 3) allowed = false; return READY_PR; },
+    });
+    await handle.catchUp();
+    expect(handle.pending()).toHaveLength(3);
+    capacity = 1;
+    allowed = true;
+    await handle[method]();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1']);
+  });
+
   it('keeps an event on a retained catch-up PR as ordinary event work once catch-up is disabled', async () => {
     let allowed = true;
     let setting = CATCH_UP_SETTING;
