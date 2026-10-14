@@ -10,7 +10,7 @@ describe('merge delivery policy cascade', () => {
     const policy = resolveMergeDeliveryPolicy();
     expect(policy).toMatchObject(STANDARD_MERGE_DELIVERY);
     expect(policy.strategy).toBe('drain-direct');
-    expect(policy.sources).toEqual({ strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' });
+    expect(policy.sources).toEqual({ strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard', 'concurrency.gateReads': 'standard', 'concurrency.enqueue': 'standard' });
     expect(policy.invalid).toEqual([]);
   });
 

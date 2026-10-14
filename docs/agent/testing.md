@@ -29,6 +29,18 @@ Use `isGhDeferred` from `we:scripts/lib/gh-deferred.mjs` before parsing query da
 a deferred response is not an empty PR list. Discovery CLI passes can use `deferGhPass` to skip before
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
+Daemon simulator worlds with independent clocks must each override `WE_GH_THROTTLE_LOCK_ROOT`
+and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A previous world's
+future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.
+Use the clone's routing policy rather than an inherited daemon snapshot, and exclude generated
+GitHub App shim directories before scanning the host's tool PATH.
+
+Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
+directory per invocation and route the binary to their fake. An intentional rate-limit response writes
+cooldown state; sharing that state with another test or the host delays unrelated reads.
+For Node subprocess script paths imported by Vitest's browser environment, use
+`join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
+import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.
 
 ## Standalone probation builds
 
@@ -807,7 +819,6 @@ existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
 
-
 ### Grouped build recovery
 
 Grouped members have no worker run row of their own. Restart adoption must use the lead's
@@ -820,3 +831,18 @@ original dispatch record refuses publication. Member claim edits are wrapper-own
 while unrelated card edits still refuse recovery. Test generated mixed numeric/hash
 `Resolves` lines through the real resolution reader, retaining diff corroboration and
 bornAs alias checks for hashes.
+
+### Enqueue catch-up ordering
+
+The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
+`duePending` can otherwise undo the selected priority order. Queue fill depth comes from
+`mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
+First acceptance is the earliest structured accepted/clear-human comment across heads;
+include a removal/restore replay, comment pagination, and the ready-time fallback.
+Include an older PR with running checks ahead of a green PR at capacity one, and a window
+that closes during the first wake read then reopens on a later interval. Skipped wakes must
+allow later candidates to run; retained catch-up work reserves room in the next plan.
+Confirmed drain gate skips and revalidation aborts also release room; successful enqueues
+and ambiguous failures consume it. Give each fake child its actual target PR number.
+Also cover a queue that fills while the window is closed and an unreadable next snapshot:
+retained attempts must stay within the latest room, and cannot use a failed snapshot.

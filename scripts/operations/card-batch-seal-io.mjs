@@ -8,6 +8,7 @@ import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-b
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
@@ -26,6 +27,16 @@ const readState = path => JSON.parse(readFileSync(path, 'utf8'));
 const holdReleased = state => ['remove-hold', 'ready', 'label-on-green'].includes(state.seal?.step);
 const holdPending = state => Boolean(state.pr) && !state.holdApplied && !holdReleased(state);
 const kindOf = (state, path) => state.kind ?? CARD_BATCH_KINDS.find(kind => path.endsWith(`-${kind}.json`));
+
+/** Valid env override → declared setting → on by default. */
+export function resolveAdoptDescendantHead({ env = process.env, read = readSettings } = {}) {
+  const override = env.WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD;
+  if (override === 'on' || override === 'off') return override;
+  try {
+    const value = read()?.cardBatch?.adoptDescendantHead;
+    return value === 'off' ? 'off' : 'on';
+  } catch { return 'on'; }
+}
 
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
@@ -75,6 +86,56 @@ export async function publishBatch(input, opts = {}) {
     };
     if (state.sealFailure) { retire(); return { action: 'held', state }; }
     if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
+    const restoreProtection = async () => {
+      if (!state.restoreProtection) return;
+      await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
+      const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'isDraft']));
+      if (!view.isDraft) await gh(['pr', 'ready', String(state.pr), '--repo', repo, '--undo']);
+      state.holdApplied = true;
+      delete state.restoreProtection;
+      save();
+    };
+    // Pending protection recovery must run even if a subsequent push is no longer adoptable.
+    await restoreProtection();
+    const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
+      .trim().split(/\s+/)[0];
+    if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
+      await run('git', ['fetch', '--no-tags', remote, `refs/heads/${state.batchRef}`]);
+      let descendant = true;
+      try { await run('git', ['merge-base', '--is-ancestor', state.headSha, advertised]); }
+      catch (error) { if (error.status !== 1) throw error; descendant = false; }
+      if (descendant) {
+        const messages = String(await run('git', ['log', '--format=%B', `${state.headSha}..${advertised}`]));
+        // Card-Batch: is admission's MARKER; only its reconcile path may recover coordinator commits.
+        if (messages.split('\n').some(line => line.startsWith('Card-Batch: '))) descendant = false;
+      }
+      if (descendant) {
+        // Inspect every commit (including merge parents), not just the net diff: a reverted verifier edit
+        // must not cross this boundary. NUL framing preserves paths; only regular top-level cards are safe.
+        const changes = String(await run('git', ['log', '--format=', '--raw', '-z', '--no-renames',
+          '--diff-merges=separate', `${state.headSha}..${advertised}`])).split('\0');
+        if (changes.pop() !== '') descendant = false;
+        for (let i = 0; descendant && i < changes.length; i += 2) {
+          const header = changes[i].trim();
+          const path = changes[i + 1];
+          if (!/^:(?:000000|100644) (?:000000|100644) [0-9a-f]+ [0-9a-f]+ [AMD]$/.test(header)
+            || !/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(path ?? '')) descendant = false;
+        }
+      }
+      if (descendant) {
+        const from = state.headSha;
+        state.adoptedHeads = [...(state.adoptedHeads ?? []), { from, to: advertised, at: new Date(now()).toISOString() }];
+        state.headSha = advertised;
+        delete state.verificationMarker;
+        delete state.verifyUnrun;
+        // Persist protection recovery before any remote effect, including success followed by a local crash.
+        if (state.pr) { state.holdApplied = false; state.restoreProtection = true; }
+        if (state.sealedAt) state.seal = { ...state.seal, step: 'record-sealed' };
+        save();
+        process.stderr.write(`card-batch adopted head ${state.batchRef}: ${from}→${advertised}\n`);
+      }
+    }
+    await restoreProtection();
     let mismatch = await check();
     if (mismatch) return refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });
