@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/queue-prune.mjs", "we:scripts/conveyor/queue.mjs", "we:scripts/conveyor/__tests__/queue-prune.test.mjs", "we:scripts/conveyor/__tests__/queue.test.mjs"]
 dateOpened: "2026-10-06"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "08e0e3039103f7107739bb5b6760e6bff7f3f8de"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "3d002d7c9a82409b68af3915201ba7bc3abce26a"
 tags: []
 ---
 
@@ -15,7 +15,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/queue-prune.mjs:208-215` — Delete the receipt after a successful apply, or reject it when `at` is older than a few minutes. Add a CLI test that applies twice, re-adds the ids, and expects the second apply to be refused.
+1. `we:scripts/conveyor/queue-prune.mjs:214-217` — Delete the receipt after a successful apply, or reject it when `at` is older than a few minutes. Add a CLI test that applies twice, re-adds the ids, and expects the second apply to be refused.
 2. `we:scripts/conveyor/queue.mjs` — A deterministic `import/no-unresolved` lint rule to verify module resolution at build time.
 3. `we:scripts/conveyor/queue.mjs` — Strict coverage thresholds or TDD enforcement for documented failure paths.
 
@@ -23,13 +23,15 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 
 ## Progress
 
-Preparation inspection: the original scope named both queue modules and both existing test suites; the original premise bundled receipt replay prevention, unresolved-import lint, and coverage/TDD enforcement. The receipt defect remains: we:scripts/conveyor/queue-prune.mjs:204-215 hashes the drop class and sorted IDs, writes an `at` value, and checks only the digest. The old line 210 citation identified directory creation, not receipt validation; the corrected locus is we:scripts/conveyor/queue-prune.mjs:208-215. The apply branch at we:scripts/conveyor/queue.mjs:261-270 never consumes the receipt. Re-adding the same IDs restores the same digest.
+Re-inspected for probation preparation on 2026-10-14. The inherited preparation already chose receipt deletion and deferred the broader lint/coverage requests; this pass preserves that goal and scope. Source inspection confirms there is still no receipt consumption in we:scripts/conveyor/queue.mjs:248-270, so this is not already delivered. Existing preparation stamps are left untouched for the runner.
 
-Corrected delivery scope: retain the four declared paths, with receipt lifecycle unit and CLI regressions in we:scripts/conveyor/__tests__/queue-prune.test.mjs and CLI import/roundtrip regression coverage in we:scripts/conveyor/__tests__/queue.test.mjs. The existing bulk CLI case at we:scripts/conveyor/__tests__/queue-prune.test.mjs:213-223 stops after the first successful apply; it does not test replay. These are existing files, not missing suites. No source relocation is needed.
+Preparation inspection: the original scope named both queue modules and both existing test suites; the original premise bundled receipt replay prevention, unresolved-import lint, and coverage/TDD enforcement. The receipt defect remains: we:scripts/conveyor/queue-prune.mjs:205-217 hashes the drop class and sorted IDs, writes an `at` value, and checks only the digest. The inherited preparation cited lines 208-215 for validation; the current validator spans lines 214-217, and directory creation is at line 211; the corrected locus is we:scripts/conveyor/queue-prune.mjs:214-217. The apply branch at we:scripts/conveyor/queue.mjs:261-270 never consumes the receipt. Re-adding the same IDs restores the same digest.
+
+Corrected delivery scope: retain the four declared paths, with receipt lifecycle unit and CLI regressions in we:scripts/conveyor/__tests__/queue-prune.test.mjs and CLI import/roundtrip regression coverage in we:scripts/conveyor/__tests__/queue.test.mjs. The existing bulk CLI case at we:scripts/conveyor/__tests__/queue-prune.test.mjs:213-223 stops after the first successful apply; it does not test replay. These are existing files, not missing suites. No source relocation is needed. The inherited plan proposed a new startup/list smoke test, but we:scripts/conveyor/__tests__/queue.test.mjs:23-28 already throws on unsuccessful CLI startup, and lines 71-74 already parse an empty list response. Strengthen that existing case with response metadata assertions instead of duplicating it. Both source entries retain matching test files in scope.
 
 The broader guard requests remain follow-ups below: we:package.json:28-45 exposes Vitest commands rather than an ESLint build gate, and we:vitest.config.ts:56-70 explicitly distinguishes tooling from the standards coverage planes (with a trust-chain exception); its thresholds already specify 80 at we:vitest.config.ts:116-121. A new repository-wide lint or coverage policy is not a prerequisite for the receipt regression.
 
-Retain size 3: approximately 15 changed lines in we:scripts/conveyor/queue-prune.mjs for receipt cleanup, 15 in we:scripts/conveyor/queue.mjs for lifecycle integration/error handling, 90 in we:scripts/conveyor/__tests__/queue-prune.test.mjs for helper and CLI cases, and 10 in we:scripts/conveyor/__tests__/queue.test.mjs for a CLI startup assertion (about 130 total). This is an estimate, not an implementation diff. Preparation is based on source inspection; no runtime reproduction or test pass is claimed. The runner owns checks and stamping.
+Retain size 3: approximately 15 changed lines in we:scripts/conveyor/queue-prune.mjs for receipt cleanup, 15 in we:scripts/conveyor/queue.mjs for lifecycle integration/error handling, 90 in we:scripts/conveyor/__tests__/queue-prune.test.mjs for helper and CLI cases, and 10 in we:scripts/conveyor/__tests__/queue.test.mjs to strengthen the existing CLI empty-list assertion (about 130 total). This is an estimate, not an implementation diff. Preparation is based on source inspection; no runtime reproduction or test pass is claimed. The runner owns checks and stamping.
 
 ## Design
 
@@ -55,16 +57,13 @@ In we:scripts/conveyor/__tests__/queue-prune.test.mjs, extend the temporary-side
 
 Add receipt helper tests for missing, malformed, and mismatched receipt contents, successful deletion, harmless missing cleanup, and propagated non-ENOENT errors using deterministic filesystem mocks. Add zero-drop consumption and queue-write/cleanup failure tests; assert no success result on either failure and no misleading rollback claim. Do not use timing sleeps or permission-bit failures that vary under elevated users.
 
-In we:scripts/conveyor/__tests__/queue.test.mjs, assert successful startup of the real CLI subprocess and parseable JSON for an isolated list command. Existing add/remove/list roundtrips remain regression coverage; this runtime import check supplements rather than replaces the requested future static lint.
+In we:scripts/conveyor/__tests__/queue.test.mjs:71-74, extend the existing isolated empty-list case to assert `ok: true` and `action: list` alongside its empty queue assertion; the subprocess wrapper already enforces successful startup and JSON parsing. Existing add/remove/list roundtrips remain regression coverage; this runtime import check supplements rather than replaces the requested future static lint.
 
 ## Proof plan
 
-The implementing worker first adds the replay regression and runs it against the unchanged implementation through the host heavy-run queue. Capture the expected failure: the second apply succeeds and removes re-added IDs instead of refusing. After implementation, run both scoped suites through that same queue and capture the passing replay case and refusal assertions. Run the standards gate through admission as well. Commands below are executed from the WE repository; their script and test loci are we:scripts/readiness/heavy-admission.mjs, we:scripts/conveyor/__tests__/queue-prune.test.mjs, and we:scripts/conveyor/__tests__/queue.test.mjs.
+The implementing worker first adds the replay regression and runs it against the unchanged implementation through the host heavy-run queue. Capture the expected failure: the second apply succeeds and removes re-added IDs instead of refusing. After implementation, run both scoped suites through that same queue and capture the passing replay case and refusal assertions. Run the standards gate through admission as well. Verification commands are executed from the WE repository; their script and test loci are we:scripts/readiness/heavy-admission.mjs, we:scripts/conveyor/__tests__/queue-prune.test.mjs, and we:scripts/conveyor/__tests__/queue.test.mjs.
 
-```bash
-node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/conveyor/__tests__/queue-prune.test.mjs scripts/conveyor/__tests__/queue.test.mjs
-node scripts/readiness/heavy-admission.mjs run -- npm run check:standards
-```
+Run Node with we:scripts/readiness/heavy-admission.mjs and arguments `run -- npx vitest run`, followed by the repository-relative forms of both prefixed test paths above. For the standards gate, use the same admission entry point with `run -- npm run check:standards`. No direct Vitest or standards-script invocation bypasses admission.
 
 ## Done when
 
