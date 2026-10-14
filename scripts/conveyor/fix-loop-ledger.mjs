@@ -2,7 +2,8 @@
 import { appendFileSync, mkdirSync, openSync, fstatSync, readSync, closeSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import { computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed } from './main-red-recovery.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
@@ -23,7 +24,7 @@ const readPlatformPreferences = () => {
 const readMainRunsDefault = () => {
   // Like sibling conveyor readers, unit tests never read the live host.
   if (process.env.VITEST) throw new Error('main CI reader disabled under Vitest');
-  return JSON.parse(execFileSync('gh', ['run', 'list', '--repo', 'web-everything/web-everything',
+  return JSON.parse(execRead('gh', ['run', 'list', '--repo', CONSTELLATION_REPOS.we.slug,
     '--branch', 'main', '--workflow', 'CI', '--limit', '60', '--json', 'conclusion,status,updatedAt'],
   { encoding: 'utf8', timeout: 30000 }));
 };
