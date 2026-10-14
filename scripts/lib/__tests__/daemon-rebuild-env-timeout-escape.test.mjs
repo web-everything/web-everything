@@ -29,6 +29,8 @@ const dispatchTimeout = { ...failed[0], name: 'dispatch-dry-run' };
 const interruptedTimeout = { ...failed[0], budgetInterrupted: true,
   detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: scan exceeded its 120000ms budget; b: skipped: rebuild smoke budget exhausted (0ms left)' };
 const smokeResult = { verdict: 'env-timeout', smoke: { results: failed } };
+// lane-pool's own scan give-up sentence (lane-pool.mjs overrunFail), as its `fail()` prints it on stderr.
+const scanText = (ms) => `list --acquirable scan exceeded its ${ms}ms budget at lane-3 (pool "web-everything" under /pool/web-everything) — refusing to return a partial/unsound answer. Raise --scan-timeout-ms / LANE_POOL_LIST_SCAN_TIMEOUT_MS, or check for a hung git (#xn432dz)`;
 
 function context(overrides = {}) {
   return {
@@ -137,9 +139,9 @@ describe('env-timeout hold escape', () => {
   });
 
   it('adopts when a scan give-up reproduces with the same budget on every repo', async () => {
-    const scan = { ...failed[0], detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: scan exceeded its 120000ms budget; b: scan exceeded its 60000ms budget' };
+    const scan = { ...failed[0], detail: `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: exited 1: ✗ ${scanText(60_000)}` };
     const candidate = { verdict: 'env-timeout', smoke: { results: [scan] } };
-    const reordered = { ...scan, detail: 'reconcile-pass dry-run failed for 2/2 repo(s): b: scan exceeded its 60000ms budget; a: scan exceeded its 120000ms budget' };
+    const reordered = { ...scan, detail: `reconcile-pass dry-run failed for 2/2 repo(s): b: exited 1: ✗ ${scanText(60_000)}; a: exited 1: ✗ ${scanText(120_000)}` };
     const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
       smokeSha: vi.fn().mockResolvedValue({ smokeResult: { verdict: 'env-timeout', smoke: { results: [reordered] } } }) });
     expect((await envTimeout.run(ctx)).reason).toBe('env-timeout-adopted-not-worse');
@@ -167,14 +169,11 @@ describe('env-timeout hold escape', () => {
 
   // The printed budget is tree text for scan and lock give-ups (and carries no budget at all for a lock); the gate's
   // own clock (row.ms) is what proves the control really spent the time.
-  const scanRow = { ...dispatchTimeout, detail: 'dispatch dry-run child failed: exited 1: list --acquirable scan exceeded its 120000ms budget' };
-  const lockRow = { ...dispatchTimeout, detail: 'dispatch dry-run child failed: exited 1: gave up waiting for the shared acquirability-scan lock' };
+  const scanRow = { ...dispatchTimeout, name: 'lane-pool-list', detail: `lane-pool list --acquirable failed: exited 1: ✗ ${scanText(120_000)}` };
   it.each([
     ['a kill that took far less time than its printed cap', killRow(120_000), { ...killRow(120_000), ms: 31_000 }, false],
     ['a scan give-up that took far less time than the candidate', scanRow, { ...scanRow, ms: 31_000 }, false],
-    ['a lock give-up that took far less time than the candidate', lockRow, { ...lockRow, ms: 31_000 }, false],
     ['a kill a few seconds short of the candidate (clock jitter)', killRow(120_000), { ...killRow(120_000), ms: 115_000 }, true],
-    ['a lock give-up that waited as long as the candidate', lockRow, { ...lockRow, ms: 125_000 }, true],
     ['a control without a measured time', killRow(120_000), { ...killRow(120_000), ms: undefined }, false],
   ])('equivalent timeout needs the measured time too: %s', async (_label, candidateRow, controlRow, adopted) => {
     const { r, ctx } = await runWith(candidateRow, controlRow);
@@ -191,17 +190,37 @@ describe('env-timeout hold escape', () => {
     ['the candidate carries a real error beside the timeout', mixedDispatch, scanRow, false],
     ['a row carries two timeout signatures', twoSignatures, twoSignatures, false],
     ['both rows are a single timeout', scanRow, scanRow, true],
+    ['both rows are the live kill shape', { ...dispatchTimeout, detail: 'dispatch dry-run child failed: timed out after 750000ms (process group killed)', ms: 750_100 },
+      { ...dispatchTimeout, detail: 'dispatch dry-run child failed: timed out after 750000ms (process group killed)', ms: 750_200 }, true],
   ])('single-unit rows must be one timeout and nothing else: %s', async (_label, candidateRow, controlRow, adopted) => {
     const { r, ctx } = await runWith(candidateRow, controlRow);
     expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
     if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
   });
 
+  // A tree prints the stderr line runBounded quotes, so a real error can sit beside the timeout behind ANY
+  // separator — not only '; '. The detail must be the producer's timeout text and nothing else.
+  it.each([
+    ['newline', '\n'], ['carriage return', '\r'], ['U+2028', String.fromCharCode(0x2028)], ['a plain space', ' '], ['an em dash', ' — '],
+  ])('a real error joined to the timeout by %s is not a timeout, on either side', async (_label, sep) => {
+    const errScan = { ...scanRow, detail: `lane-pool list --acquirable failed: exited 1: TypeError: boom${sep}✗ ${scanText(120_000)}` };
+    const errKill = { ...killRow(120_000), detail: `TypeError: boom${sep}reconcile failed: timed out after 120000ms (process group killed)` };
+    for (const [candidateRow, controlRow] of [[scanRow, errScan], [errScan, scanRow], [killRow(120_000), errKill], [errKill, killRow(120_000)]]) {
+      const { r, ctx } = await runWith(candidateRow, controlRow);
+      expect(r.reason).toBe('smoke-env-timeout');
+      expect(ctx.finalize).not.toHaveBeenCalled();
+    }
+  });
+
   it.each([
     ['a repo the control did not time out on', repoKills(['a', 'b'], 2, 120_000), repoKills(['a'], 2, 120_000), false],
     ['a different repo', repoKills(['a'], 2, 120_000), repoKills(['b'], 2, 120_000), false],
     ['extra repos failing on the control', repoKills(['a'], 2, 120_000), repoKills(['a', 'b'], 2, 120_000), true],
-    ['the same repos with a larger budget', repoKills(['a', 'b'], 2, 120_000), repoKills(['b', 'a'], 2, 150_000), true],
+    ['a single repo with a larger budget', repoKills(['a'], 2, 120_000), repoKills(['a'], 2, 150_000), true],
+    // The kill summary prints only the FIRST repo's budget; the shared deadline can cut a later repo's cap short,
+    // so the control's later repos have no proven budget (the candidate's printed budget bounds all of its own).
+    ['later control repos whose budget the summary hides', repoKills(['a', 'b'], 2, 120_000), repoKills(['a', 'b'], 2, 150_000), false],
+    ['a candidate repo that is not the control summary\'s first', repoKills(['b'], 2, 120_000), repoKills(['a', 'b'], 2, 150_000), false],
   ])('multi-repo reconcile: %s', async (_label, candidateRow, controlRow, adopted) => {
     const { r, ctx } = await runWith(candidateRow, controlRow);
     expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
@@ -210,9 +229,9 @@ describe('env-timeout hold escape', () => {
 
   it('holds when one repo failed for a real error beside a timeout, even if the control shows the timeout', async () => {
     const mixed = { ...failed[0],
-      detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: invalid configuration; b: scan exceeded its 120000ms budget' };
+      detail: `reconcile-pass dry-run failed for 2/2 repo(s): a: invalid configuration; b: exited 1: ✗ ${scanText(120_000)}` };
     const onlyTimeout = { ...failed[0],
-      detail: 'reconcile-pass dry-run failed for 1/2 repo(s): b: scan exceeded its 120000ms budget' };
+      detail: `reconcile-pass dry-run failed for 1/2 repo(s): b: exited 1: ✗ ${scanText(120_000)}` };
     for (const control of [mixed, onlyTimeout]) {
       const { r, ctx } = await runWith(mixed, control);
       expect(r.reason).toBe('smoke-env-timeout');

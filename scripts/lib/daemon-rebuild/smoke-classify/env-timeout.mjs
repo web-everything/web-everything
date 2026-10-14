@@ -27,50 +27,61 @@ function isExecutedTimeoutRow(row) {
   return isExecutedFailureRow(row) && isEnvTimeoutRow(row);
 }
 
-const SIGNATURES = /timed out after \d+ms \(process group killed\)|scan exceeded its \d+ms budget|gave up waiting for the shared acquirability-scan lock/g;
+// Only the producers' own timeout texts count, matched end to end: a tree prints the stderr line runBounded quotes,
+// so a real error can sit beside a timeout behind any separator. Every wildcard class excludes the line breaks JS
+// knows (a negated class would otherwise accept the \n, \r or U+2028 a tree prints). The lock give-up never reaches
+// a smoke row (acquire rewrites it, list waits on no lock), so it is not a timeout here.
+const KILL = /^timed out after (\d+)ms \(process group killed\)$/;
+// lane-pool's scan give-up (lane-pool.mjs overrunFail) as its `fail()` prints it and runBounded quotes it.
+const SCAN = /^(?:exited 1: )?(?:✗ )?list --acquirable scan exceeded its (\d+)ms budget (?:during the ghost-lease reap|at lane-\d+) \(pool "[\w.-]+" under [^)\n\r\p{Zl}\p{Zp}]+\) — refusing to return a partial\/unsound answer\. Raise --scan-timeout-ms \/ LANE_POOL_LIST_SCAN_TIMEOUT_MS, or check for a hung git \(#xn432dz\)$/u;
+const PREFIXED = /^([^:\n\r\p{Zl}\p{Zp}]+): ([\s\S]*)$/u;
+const ONE_CHECK = /^[^:\n\r\p{Zl}\p{Zp}]+ failed: ([\s\S]*)$/u;
 
-// The kind of give-up and the budget a timeout fragment ran out of (0 for a lock give-up); null when the text is
-// not exactly ONE timeout — a '; '-joined aggregate or a second signature means something else failed beside it.
-// A kill is the gate's own clock; scan and lock text is printed by the tree under test.
+// The kind of give-up and the budget a timeout fragment ran out of; null unless the WHOLE text is one timeout.
+// A kill is the gate's own clock; scan text is printed by the tree under test.
 function fragmentBudget(text) {
-  if (text.includes('; ') || (text.match(SIGNATURES) || []).length !== 1) return null;
-  const kill = /timed out after (\d+)ms \(process group killed\)/.exec(text);
+  const kill = KILL.exec(text);
   if (kill) return { kind: 'kill', budget: Number(kill[1]) };
-  const scan = /scan exceeded its (\d+)ms budget/.exec(text);
-  if (scan) return { kind: 'scan', budget: Number(scan[1]) };
-  return { kind: 'lock', budget: 0 };
+  const scan = SCAN.exec(text);
+  return scan ? { kind: 'scan', budget: Number(scan[1]) } : null;
 }
 
 // What a timeout row measured, as unit → {kind, budget it ran out of}. A multi-repo reconcile row is one unit per
 // repo; every other row is a single unit. null when any unit is something other than a timeout (a real error
-// beside a timeout).
-function timeoutProfile(row) {
+// beside a timeout). The kill summary prints only the FIRST repo's budget, and the shared deadline can only shrink
+// a later repo's cap: on the candidate it bounds every repo, on the control it proves only the first (later control
+// repos get NaN, which no comparison accepts).
+function timeoutProfile(row, side) {
   const detail = String(row.detail ?? '');
   const kills = /^reconcile-pass dry-run \(\d+\/\d+ repo\(s\) — (.+)\) failed: (timed out after \d+ms \(process group killed\))$/.exec(detail);
-  if (kills) return new Map(kills[1].split(', ').map((repo) => [repo, fragmentBudget(kills[2])]));
+  if (kills) {
+    const b = fragmentBudget(kills[2]);
+    return new Map(kills[1].split(', ').map((repo, i) => [repo, side === 'control' && i > 0 ? { ...b, budget: NaN } : b]));
+  }
   const mixed = /^reconcile-pass dry-run failed for \d+\/\d+ repo\(s\): (.+)$/.exec(detail);
   if (mixed) {
     const units = new Map();
     for (const part of mixed[1].split('; ')) {
-      const m = /^([^:]+): ((?:timed out after|scan exceeded its|gave up waiting)[\s\S]*)$/.exec(part);
+      const m = PREFIXED.exec(part);
       const budget = m ? fragmentBudget(m[2]) : null;
       if (budget === null) return null;
       units.set(m[1], budget);
     }
     return units;
   }
-  const budget = fragmentBudget(detail);
+  const one = ONE_CHECK.exec(detail);
+  const budget = one ? fragmentBudget(one[1]) : null;
   return budget === null ? null : new Map([['', budget]]);
 }
 
 // Equivalent control = same check, every candidate unit timed out again, and with at least as much time. A control
 // killed at a smaller budget (host load differs, or the shared deadline cut it short) proves nothing; one killed at
 // a larger budget is stronger evidence. Exact equality would reject nearly every load-scaled budget. The printed
-// budget alone is not enough: scan and lock text comes from the tree and a lock prints none, so the gate's own clock
-// must show the control spent about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow).
+// budget alone is not enough: scan text comes from the tree, so the gate's own clock must show the control spent
+// about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow).
 function sameTimeout(candidateRow, controlRow) {
-  const want = timeoutProfile(candidateRow);
-  const got = timeoutProfile(controlRow);
+  const want = timeoutProfile(candidateRow, 'candidate');
+  const got = timeoutProfile(controlRow, 'control');
   const spent = Number(controlRow.ms);
   const took = Number(candidateRow.ms);
   return !!want && !!got && candidateRow.name === controlRow.name
