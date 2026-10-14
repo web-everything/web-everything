@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "5b8aef22535fd6d83a2da930958b698418f3d154"
+preparedAgainstSha: "2e32024faa4011e4c8427e8dec77093c83f8b1d2"
 tags: []
 ---
 
@@ -89,3 +89,4 @@ Guard cases (pass today, must stay green; not RED):
 - 2026-10-13 re-stamp (8652127): in-scope files unchanged since b4676cf; citations still hold; plan unchanged.
 - 2026-10-13 re-prepare (7372a0e): we:scripts/merge-ai-prs.mjs moved (paged open-PR reader, abc01e4e5); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations shifted ~+2/+3 and refreshed: attach :902, fresh re-read :4522, classifyPr arm :1021, merge-site call :4529, head pin :6548. Plan unchanged.
 - 2026-10-14 re-prepare (5b8aef2): we:scripts/merge-ai-prs.mjs moved (bounded parallel gate reads, 1162e00); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations refreshed: attach :904, fresh re-read :4507, classifyPr arm :1023, merge-site call :4514, head pin :6550. Plan unchanged.
+- 2026-10-14 re-stamp (2e32024): in-scope files unchanged since 5b8aef2; citations (attach :904, classifyPr arm :1023, merge-site call :4514, head pin :6550) still hold; plan unchanged.
