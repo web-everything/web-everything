@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { fixLoopConfig, fixLoopState, fixLoopBreaches, readFixLoopRows, appendFixLoopRow,
-  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition } from '../fix-loop-ledger.mjs';
+  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition, fixLoopRedMainLapse, fixLoopSessionRows } from '../fix-loop-ledger.mjs';
 const now = Date.parse('2026-10-05T12:00:00Z'), head = 'a'.repeat(40);
 const row = (extra = {}) => ({ v: 1, at: new Date(now).toISOString(), repo: 'we', pr: 3990, head, kind: 'ci-heal', ...extra });
-const hermeticConfig = env => fixLoopConfig(env, { readPlatform: () => ({}), readRepo: () => ({}) });
+const hermeticConfig = env => fixLoopConfig(env, { readPlatform: () => ({}), readRepo: () => ({}), readMainRuns: () => [] });
 const config = hermeticConfig({});
 const state = (rows, extra = {}) => fixLoopState({ rows, repo: 'we', pr: 3990, head, now, config, ...extra });
 const dirs = [];
@@ -28,9 +28,9 @@ it('caps raw dispatches for a head even when every outcome is discounted and the
     config: { ...config, hold: false } }).action).toBe('dispatch');
 });
 it('config defaults, overrides, and invalid values', () => {
-  expect(config).toEqual({ maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default' });
+  expect(config).toEqual({ maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default', redMainDiscount: 'on', redMainDiscountSource: 'default', redMainWindows: [] });
   expect(hermeticConfig({ WE_FIX_LOOP_MAX_SESSIONS: '5', WE_FIX_LOOP_WINDOW_HOURS: '.5', WE_FIX_LOOP_HOLD: '0' }))
-    .toEqual({ maxSessions: 5, windowHours: .5, hold: false, rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default' });
+    .toEqual({ maxSessions: 5, windowHours: .5, hold: false, rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default', redMainDiscount: 'on', redMainDiscountSource: 'default', redMainWindows: [] });
   for (const value of ['', '0', '-1', 'NaN', 'Infinity', 'bad']) {
     expect(hermeticConfig({ WE_FIX_LOOP_MAX_SESSIONS: value, WE_FIX_LOOP_WINDOW_HOURS: value, WE_FIX_LOOP_HOLD: value === '0' ? 'bad' : value })).toEqual(config);
   }
@@ -41,9 +41,9 @@ it('counts only the same repo, PR, head and window, retaining repeated sessions'
   const rows = [row({ at, session: 'same' }), row({ session: 'same', kind: 'fix' }), row(),
     row({ repo: 'frontierui' }), row({ pr: 399 }), row({ head: 'b'.repeat(40) }),
     row({ at: new Date(now - 6 * 3600000 - 1).toISOString() }), row({ at: new Date(now + 1).toISOString() }), null];
-  expect(state(rows)).toEqual({ count: 3, rawCount: 3, infraFailures: 0, held: true, since: at, sessions: ['same', 'same'] });
+  expect(state(rows)).toEqual({ count: 3, rawCount: 3, redMainDiscounted: 0, infraFailures: 0, held: true, since: at, sessions: ['same', 'same'] });
   expect(state(rows, { config: { ...config, hold: false } }).held).toBe(false);
-  expect(state(rows, { head: 'c'.repeat(40) })).toEqual({ count: 0, rawCount: 0, infraFailures: 0, held: false, since: null, sessions: [] });
+  expect(state(rows, { head: 'c'.repeat(40) })).toEqual({ count: 0, rawCount: 0, redMainDiscounted: 0, infraFailures: 0, held: false, since: null, sessions: [] });
 });
 it('breaches skip missing PRs and moved heads and aggregate repair kinds', () => {
   const rows = [row(), row(), row({ kind: 'fix' })];
@@ -85,7 +85,7 @@ it('kill file and label helpers honor overrides', () => {
 });
 it('stub sessions from the daemon smoke never count as repair attempts (#4194 mixed-state: real heal still owed)', () => {
   const stubs = [row({ session: 'stub-ci-heal' }), row({ session: 'stub-ci-heal' }), row({ session: 'stub-fix' })];
-  expect(state(stubs)).toEqual({ count: 0, rawCount: 0, infraFailures: 0, held: false, since: null, sessions: [] });
+  expect(state(stubs)).toEqual({ count: 0, rawCount: 0, redMainDiscounted: 0, infraFailures: 0, held: false, since: null, sessions: [] });
   expect(fixLoopBreaches({ rows: stubs, prs: [{ repo: 'we', number: 3990, headRefOid: head }], now, config })).toEqual([]);
   // real sessions on the same head still hold
   expect(state([...stubs, row({ session: 'ci-heal-3990' }), row({ session: 'ci-heal-3990' }), row({ session: 'fix-3990' })]).held).toBe(true);
@@ -104,7 +104,7 @@ it('classifies terminal outcomes without treating genuine runs as infrastructure
   expect(classifyFixRunOutcome('fix-run: PR #1 no-change (sandbox); claim released').infra).toBe(false);
 });
 it('discounts infra and only reads the last N terminals for the requested PR', () => {
-  expect(state([row(), row(), row()], { infraFailures: 3 })).toMatchObject({ count: 0, rawCount: 3, infraFailures: 3, held: false });
+  expect(state([row(), row(), row()], { infraFailures: 3 })).toMatchObject({ count: 0, rawCount: 3, redMainDiscounted: 0, infraFailures: 3, held: false });
   expect(state([row(), row(), row()], { infraFailures: 0 }).held).toBe(true);
   const logText = ['fix-run: PR #1 failed (EPERM); claim released', 'noise',
     'fix-run: PR #1 no-change (nothing); claim released', 'fix-run: PR #2 failed (EPERM); claim released',
@@ -132,7 +132,7 @@ it('re-arms once by build or clock and parks visibly after the re-armed run', ()
 it('resolves the re-arm setting default → platform → repo → env with its source', () => {
   const prefs = n => ({ fix: { loopHold: { rearmAfterMinutes: n } } });
   const resolve = (env = {}, platform = {}, repo = {}) => fixLoopConfig(env, {
-    readPlatform: () => platform, readRepo: () => repo,
+    readPlatform: () => platform, readRepo: () => repo, readMainRuns: () => [],
   });
   expect(resolve()).toMatchObject({ rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default' });
   expect(resolve({}, prefs(90))).toMatchObject({ rearmAfterMinutes: 90, rearmAfterMinutesSource: 'platform' });
@@ -173,4 +173,54 @@ it('uses exact infra positions for build triggers and parking, and retries an un
   expect(fixLoopDisposition({ ...args, rows: [infra, ...recent], infraFailures: 1, infraRows: [infra] }).action).toBe('hold');
   expect(fixLoopDisposition({ ...args, rows: [...before, rearm, infra, row({ build })],
     infraFailures: 1, infraRows: [infra] }).action).toBe('park');
+});
+
+const incidentWindows = [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }];
+const incidentRows = ['22:04:33', '22:13:35', '22:28:12', '22:40:50', '22:40:55', '22:52:26'].map((time, i) =>
+  row({ pr: 5195, at: `2026-10-13T${time}Z`, kind: i === 3 ? 'rearm' : i === 5 ? 'park' : 'ci-heal', reason: 'budget' }));
+const incident = (extra = {}) => ({ rows: incidentRows, repo: 'we', pr: 5195, head,
+  now: Date.parse('2026-10-13T23:50:00Z'), config: { ...config, redMainDiscount: 'on', redMainWindows: incidentWindows }, ...extra });
+it('releases #5195 after main recovers without counting its red-main repair sessions', () => {
+  expect(fixLoopDisposition(incident())).toEqual({ action: 'dispatch' });
+  expect(fixLoopRedMainLapse(incident())).toBe(true);
+  expect(fixLoopState(incident())).toMatchObject({ count: 0, rawCount: 0, redMainDiscounted: 4 });
+  expect(fixLoopSessionRows(incident())).toEqual([]);
+});
+it('keeps parks when disabled, unreadable, still red, or independently exhausted', () => {
+  for (const changed of [{ redMainDiscount: 'off' }, { redMainWindows: null },
+    { redMainWindows: [{ ...incidentWindows[0], end: null }] }]) {
+    const args = incident({ config: { ...incident().config, ...changed } });
+    expect(fixLoopDisposition(args).action).toBe('parked');
+    expect(fixLoopRedMainLapse(args)).toBe(false);
+  }
+  const outside = Array.from({ length: 5 }, () => row({ pr: 5195, kind: 'fix', at: '2026-10-13T23:40:00Z' }));
+  const args = incident({ rows: [...incidentRows, ...outside] });
+  expect(fixLoopDisposition(args).action).toBe('park');
+  expect(fixLoopRedMainLapse(args)).toBe(false);
+  expect(fixLoopRedMainLapse(incident({ rows: [] }))).toBe(false);
+});
+it('discounts the raw per-head ceiling beyond the rolling window, but retains outside controls', () => {
+  expect(fixLoopDisposition(incident({ rows: [...incidentRows, incidentRows[0]],
+    now: Date.parse('2026-10-14T12:00:00Z') })).action).toBe('dispatch');
+  expect(fixLoopDisposition(incident({ rows: [...incidentRows,
+    row({ pr: 5195, kind: 'park', reason: 'own failure', at: '2026-10-13T23:40:00Z' })] })).action).toBe('parked');
+});
+it('resolves red-main discount through the cascade and fails closed on read failure', () => {
+  const prefs = value => ({ fix: { loopHold: { redMainDiscount: value } } });
+  const resolve = (env = {}, platform = {}, repo = {}, readMainRuns = () => []) => fixLoopConfig(env, {
+    readPlatform: () => platform, readRepo: () => repo, readMainRuns,
+  });
+  expect(resolve()).toMatchObject({ redMainDiscount: 'on', redMainDiscountSource: 'default', redMainWindows: [] });
+  expect(resolve({}, prefs('off'))).toMatchObject({ redMainDiscount: 'off', redMainDiscountSource: 'platform' });
+  expect(resolve({}, prefs('off'), prefs('on'))).toMatchObject({ redMainDiscount: 'on', redMainDiscountSource: 'repo' });
+  const env = { WE_FIX_LOOP_RED_MAIN_DISCOUNT: 'off' };
+  expect(resolve(env, {}, prefs('on'), () => { throw new Error('must not read'); }))
+    .toMatchObject({ redMainDiscount: 'off', redMainDiscountSource: 'env' });
+  expect(resolve({ WE_FIX_LOOP_RED_MAIN_DISCOUNT: 'invalid' }, {}, prefs('off')).redMainDiscount).toBe('off');
+  expect(resolve({}, {}, {}, () => { throw new Error('unreadable'); }).redMainWindows).toBeNull();
+  expect(resolve({}, {}, {}, () => null).redMainWindows).toBeNull();
+  expect(resolve({}, {}, {}, () => [
+    { status: 'completed', conclusion: 'failure', updatedAt: incidentWindows[0].start },
+    { status: 'completed', conclusion: 'success', updatedAt: incidentWindows[0].end },
+  ]).redMainWindows).toEqual(incidentWindows);
 });

@@ -2,6 +2,8 @@
 import { appendFileSync, mkdirSync, openSync, fstatSync, readSync, closeSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed } from './main-red-recovery.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
 export const FIX_HOLD_LABEL = 'hold:fix';
@@ -18,23 +20,41 @@ const readPlatformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('../lib/delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
 };
+const readMainRunsDefault = () => {
+  // Like sibling conveyor readers, unit tests never read the live host.
+  if (process.env.VITEST) throw new Error('main CI reader disabled under Vitest');
+  return JSON.parse(execFileSync('gh', ['run', 'list', '--repo', 'web-everything/web-everything',
+    '--branch', 'main', '--workflow', 'CI', '--limit', '60', '--json', 'conclusion,status,updatedAt'],
+  { encoding: 'utf8', timeout: 30000 }));
+};
 /** PRs #4992/#4993/#4965, 2026-10-12: a hold must have a bounded re-arm clock. */
-export function fixLoopConfig(env = process.env, { readPlatform = readPlatformPreferences, readRepo = readSettings } = {}) {
+export function fixLoopConfig(env = process.env, { readPlatform = readPlatformPreferences, readRepo = readSettings, readMainRuns = readMainRunsDefault } = {}) {
   let rearmAfterMinutes = 120, rearmAfterMinutesSource = 'default';
+  let redMainDiscount = 'on', redMainDiscountSource = 'default';
   for (const [source, read] of [['platform', readPlatform], ['repo', readRepo], ['env', () => ({
-    fix: { loopHold: { rearmAfterMinutes: env.WE_FIX_LOOP_REARM_AFTER_MINUTES } },
+    fix: { loopHold: { rearmAfterMinutes: env.WE_FIX_LOOP_REARM_AFTER_MINUTES, redMainDiscount: env.WE_FIX_LOOP_RED_MAIN_DISCOUNT } },
   })]]) {
     let raw;
-    try { raw = read()?.fix?.loopHold?.rearmAfterMinutes; } catch { continue; }
+    try { raw = read()?.fix?.loopHold; } catch { continue; }
+    if (['on', 'off'].includes(raw?.redMainDiscount)) { redMainDiscount = raw.redMainDiscount; redMainDiscountSource = source; }
+    raw = raw?.rearmAfterMinutes;
     const value = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
     if (Number.isFinite(value) && value > 0) { rearmAfterMinutes = value; rearmAfterMinutesSource = source; }
+  }
+  let redMainWindows = null;
+  if (redMainDiscount === 'on') {
+    try {
+      const runs = readMainRuns();
+      if (Array.isArray(runs)) redMainWindows = computeMainRedWindows(runs);
+    } catch { /* Unreadable history keeps the existing budgets and terminal holds. */ }
   }
   const max = Number(env.WE_FIX_LOOP_MAX_SESSIONS), hours = Number(env.WE_FIX_LOOP_WINDOW_HOURS);
   return {
     maxSessions: Number.isSafeInteger(max) && max >= 1 ? max : 3,
     windowHours: Number.isFinite(hours) && hours > 0 ? hours : 6,
     hold: env.WE_FIX_LOOP_HOLD !== '0',
-    rearmAfterMinutes, rearmAfterMinutesSource,
+    rearmAfterMinutes, rearmAfterMinutesSource, redMainDiscount, redMainDiscountSource,
+    ...(redMainDiscount === 'on' ? { redMainWindows } : {}),
   };
 }
 /** Rows written by the daemon-live-smoke's stub dispatchers (`stub-ci-heal`, `stub-fix`) are not real sessions:
@@ -47,19 +67,24 @@ function validRow(row) {
     && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at));
 }
 const isSession = row => ['ci-heal', 'fix'].includes(row.kind);
+const hasRedMainDiscount = config => config.redMainDiscount === 'on' && Array.isArray(config.redMainWindows);
+const discountedSession = (row, config) => hasRedMainDiscount(config) && isSession(row)
+  && isWithinRedWindow(Date.parse(row.at), config.redMainWindows);
 function windowRows(rows, now, config) {
   const end = new Date(now).getTime(), start = end - config.windowHours * 3600000;
   return (rows ?? []).filter(row => validRow(row) && isSession(row) && Date.parse(row.at) >= start && Date.parse(row.at) <= end)
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 }
 export function fixLoopSessionRows({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig() }) {
-  return windowRows(rows, now, config).filter(row => row.repo === repo && row.pr === pr && row.head === head);
+  return windowRows(rows, now, config).filter(row => !discountedSession(row, config) && row.repo === repo && row.pr === pr && row.head === head);
 }
 export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0 }) {
   const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
   infraFailures = Number.isFinite(infraFailures) ? Math.max(0, Math.min(matches.length, Math.floor(infraFailures))) : 0;
   const count = matches.length - infraFailures;
-  return { count, rawCount: matches.length, infraFailures, held: config.hold && count >= config.maxSessions,
+  const redMainDiscounted = windowRows(rows, now, config).filter(row => row.repo === repo && row.pr === pr
+    && row.head === head && discountedSession(row, config)).length;
+  return { count, redMainDiscounted, rawCount: matches.length, infraFailures, held: config.hold && count >= config.maxSessions,
     since: matches[0]?.at ?? null, sessions: matches.map(row => row.session).filter(session => typeof session === 'string') };
 }
 
@@ -85,14 +110,17 @@ export function infraFailureCount({ logText, pr, sessions }) {
 export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
-  const controls = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
+  const controls = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime())
+    .filter(row => !discountedSession(row, config) && !(hasRedMainDiscount(config)
+      && !isMainCurrentlyRed(config.redMainWindows) && ['park', 'rearm'].includes(row.kind)
+      && isWithinRedWindow(Date.parse(row.at), config.redMainWindows)));
   if (controls.some(row => row.kind === 'park')) return { action: 'parked' };
   const rearm = controls.find(row => row.kind === 'rearm');
   // Log text is not authenticated launcher evidence. Bound spend independently of
-  // discounts and the rolling window, allowing one extra attempt and a final re-arm.
+  // log-based discounts and the rolling window, allowing one extra attempt and a final re-arm.
   const rawCount = controls.filter(isSession).length;
   if (rawCount >= config.maxSessions + 2) return { action: 'park', reason: 'raw per-head repair session ceiling reached' };
-  const matches = windowRows(rows, now, config).filter(identity);
+  const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
   const state = fixLoopState({ rows, repo, pr, head, now, config, infraFailures });
   const counted = infraRows ? matches.filter(row => !infraRows.includes(row)) : matches.slice(0, matches.length - state.infraFailures);
   const until = new Date(Math.max(Date.parse(counted.at(-1)?.at ?? rearm?.at ?? new Date(now).toISOString()),
@@ -112,6 +140,13 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
   if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change' };
   if (new Date(now).getTime() >= Date.parse(until)) return { action: 'rearm', reason: 're-arm window elapsed' };
   return { action: 'hold', until };
+}
+/** A red-main park may lapse only after recovery and a fresh budget evaluation. Pure. */
+export function fixLoopRedMainLapse({ rows, repo, pr, head, now = Date.now(), config }) {
+  if (!hasRedMainDiscount(config) || isMainCurrentlyRed(config.redMainWindows)) return false;
+  if (!(rows ?? []).some(row => validRow(row) && row.repo === repo && row.pr === pr && row.head === head
+    && row.kind === 'park' && Date.parse(row.at) <= new Date(now).getTime())) return false;
+  return !['park', 'parked'].includes(fixLoopDisposition({ rows, repo, pr, head, now, config }).action);
 }
 export function fixLoopBreaches({ rows, prs, now = Date.now(), config = fixLoopConfig() }) {
   const current = new Map((prs ?? []).map(pr => [`${pr.repo}#${pr.number}`, pr.headRefOid]));
