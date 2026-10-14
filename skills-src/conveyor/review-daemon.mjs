@@ -99,6 +99,7 @@ import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 // PRs — landing it in `runner.mjs` alone would leave #2549/#2578's stray labels uncleaned indefinitely, the
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
+import { sweepHumanSurfaceRepark } from '../../scripts/conveyor/human-surface-repark.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
 // `kind:'convert-advisory'` dispatch entry. Wired as its OWN additive pipeline stage below
@@ -275,6 +276,7 @@ export function runReviewTick({
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
   holdReconcile = sweepReviewHoldLabels,
+  humanSurfaceRepark = sweepHumanSurfaceRepark,
   notifyReferral = notifyReferralHold,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
@@ -321,7 +323,12 @@ export function runReviewTick({
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
-    holdReconcileResults = holdReconcile({ repo }) ?? [];
+    for (const r of humanSurfaceRepark({ repo }) ?? []) holdReconcileResults.push({ ...r, repark: r.repark });
+  } catch (e) {
+    holdReconcileError = String((e && e.message) || e).split('\n')[0];
+  }
+  try {
+    holdReconcileResults.push(...(holdReconcile({ repo }) ?? []));
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];
   }
@@ -1057,6 +1064,7 @@ export function buildCliDaemonEffects({
       // `h.remove`/`h.healed`/`h.flagged` are INDEPENDENT optional fields on one entry (see
       // `sweepReviewHoldLabels`'s own return doc) — never assume any one of them is present.
       for (const h of (result.holdReconcile ?? [])) {
+        if (h.repark) log.error(`review-daemon: ${h.repo}#${h.num} human-surface re-park ${h.repark} at ${String(h.head||'').slice(0,9)} (${(h.files||[]).join(',')})${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.carry) log.error(`review-daemon: ${h.repo}#${h.num} accept carry-forward ${h.carry}${h.detail ? ` — ${h.detail}` : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`); // card xu7kxtt

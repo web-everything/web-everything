@@ -32,6 +32,13 @@ vi.mock('../../../scripts/conveyor/review-hold-reconcile.mjs', async (importOrig
   const actual = await importOriginal();
   return { ...actual, sweepReviewHoldLabels: (...args) => sweepReviewHoldLabelsMock(...args) };
 });
+// Same reasoning for the human-surface re-park sweep (live #5193): its default shells real `gh` reads. Its behavior is
+// proven in scripts/conveyor/__tests__/human-surface-repark.test.mjs; the wiring test below injects its own fake.
+const sweepHumanSurfaceReparkMock = vi.fn(() => []);
+vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepHumanSurfaceRepark: (...args) => sweepHumanSurfaceReparkMock(...args) };
+});
 
 import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
@@ -812,6 +819,18 @@ describe('runReviewTick — real dispatchReview contract (regression, #3876 live
 // sweep's OWN decision logic is proven in scripts/conveyor/__tests__/review-hold-reconcile.test.mjs.
 describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
   const noop = () => ({ dispatch: [], refusals: [] });
+
+  it('runs the human-surface re-park with THIS tick\'s repo and folds its entries ahead of holdReconcile (live #5193)', () => {
+    const humanSurfaceRepark = vi.fn(() => [{ num: 5193, repark: 'reparked', head: 'a'.repeat(40), files: ['.github/workflows/ci.yml'] }]);
+    const holdReconcile = vi.fn(() => [{ num: 7, remove: ['review:pending'] }]);
+    const r = runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      humanSurfaceRepark, holdReconcile, repo: 'web-everything/web-everything',
+    });
+    expect(humanSurfaceRepark).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
+    expect(r.holdReconcile.map((h) => h.num)).toEqual([5193, 7]);
+    expect(r.holdReconcile[0].repark).toBe('reparked');
+  });
 
   it('runs holdReconcile with THIS tick\'s own repo, independent of reconcile\'s plan', () => {
     const holdReconcile = vi.fn(() => []);

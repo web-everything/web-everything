@@ -59,6 +59,8 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
 // #x9xqexm's base-independent third marker. Independent concerns.
@@ -92,6 +94,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
@@ -186,6 +189,20 @@ import {
 } from './lib/reasonless-bounce.mjs';
 
 /**
+ * Whether the merge gate's human-only `review-acceptance` hold applies at `headSha` — the same rule as
+ * merge-gate-ci.mjs#workflowEditFact (not imported: that module pulls in merge-ai-prs.mjs, a cycle). Read at the exact
+ * head; an unreadable change list is `false`, so `clear-human` keeps refusing a label-less PR (fail closed). Live
+ * #5193: the gate demanded a clear-human ceremony on a PR with no `review:human`, and the ceremony refused.
+ */
+export function defaultReadHumanOnlyHold({ headSha, baseRefName, comments, exec = execFileSync, cwd = process.cwd() }) {
+  const read = readPinnedChangedFiles({ headSha, base: baseRefName || 'main', cwd, exec });
+  if (!Array.isArray(read.files)) return false;
+  const hold = workflowEditHold({ files: read.files, expectedCount: read.files.length });
+  return hold.hold === true && hold.humanOnly === true
+    && parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase();
+}
+
+/**
  * we:scripts/review-set-label.mjs#REVIEW_LABEL_TARGETS — the CLOSED set of label-swap targets `decideSetLabel`
  * understands. Exported so anything that must be TOTAL over the targets (the comment-size projection below, and
  * its enum-totality test) enumerates this one list instead of hardcoding a member — PR #1056 review, M2: the
@@ -247,7 +264,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, humanOnlyHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
@@ -257,7 +274,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -292,7 +309,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // a barrier.
   if (to === 'clear-human') {
     // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
-    if (!isHuman && !isHeldMechanical) {
+    if (!isHuman && !isHeldMechanical && !humanOnlyHold) {
       return {
         allowed: false,
         addLabel: '',
@@ -327,7 +344,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
         ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
-      reason: 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
+      reason: humanOnlyHold && !isHuman && !isHeldMechanical
+        ? 'merge-gate human-only hold at the live head cleared via --to=clear-human'
+        : 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
     };
   }
 
@@ -929,6 +948,7 @@ export function runReviewLabelCli({
   successResult,
   refusalResult,
   allowClearHuman = false,
+  readHumanOnlyHold = defaultReadHumanOnlyHold,
   // The findings write-up, so this function can REFUSE an empty bounce (see the `--to=changes` guard below).
   // The rendered comment still gets its body from the caller's `buildComment` closure — this is the same text,
   // handed over separately so the refusal lives with the other pre-flight validation instead of in one CLI
@@ -1131,6 +1151,7 @@ export function runReviewLabelCli({
   let currentLabels;
   let headSha = '';
   let headRefName = '';
+  let baseRefName = '';
   let prState = '';
   let prBody = '';
   let prTitle = '';
@@ -1149,6 +1170,7 @@ export function runReviewLabelCli({
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
     // one more json field, no extra hop.
     headRefName = typeof parsed.headRefName === 'string' ? parsed.headRefName : '';
+    baseRefName = typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '';
     prState = typeof parsed.state === 'string' ? parsed.state : '';
     // #2844 — the PR body carries the `authored-by-actor` stamp pr-land wrote at open. Same gh call, one more
     // json field, no extra hop — the same "ride the existing read" pattern #2953 used for `state`.
@@ -1269,12 +1291,18 @@ export function runReviewLabelCli({
   const restampAcrossHold = to === 'restamp' && !guardedRestamp
     && hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical) && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
+  // Live #5193: the merge gate's human-only hold demands a clear-human ceremony even when no `review:human` label was
+  // ever set. Asked only for that label-less case, at the head this verdict stamps.
+  const humanOnlyHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
+    && readHumanOnlyHold({ headSha, baseRefName, comments: prComments }) === true;
   let decision = decideSetLabel({
     to,
     currentLabels,
     findingCount: bounceEvidence.findingCount,
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
+    humanOnlyHold,
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
