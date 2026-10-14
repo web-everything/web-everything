@@ -469,6 +469,54 @@ export function classifyGhRead(argvRaw) {
   return false;
 }
 
+/** Memo-only GraphQL query allowlist; never changes identity routing or budget/write gates. */
+export function isGhGraphqlReadQuery(args) {
+  if (!Array.isArray(args) || args[0] !== 'api' || args[1] !== 'graphql') return false;
+  let query = null;
+  const fields = new Set(['-f', '-F', '--field', '--raw-field']);
+  const values = new Set(['--jq', '-q', '--cache', '-H', '--header']);
+  const switches = new Set(['--paginate', '-i', '--include']);
+  for (let i = 2; i < args.length; i++) {
+    if (typeof args[i] !== 'string') return false;
+    const equals = args[i].indexOf('=');
+    const flag = equals < 0 ? args[i] : args[i].slice(0, equals);
+    if (switches.has(flag)) {
+      if (equals >= 0) return false;
+      continue;
+    }
+    if (!fields.has(flag) && !values.has(flag)) return false;
+    const value = equals < 0 ? args[++i] : args[i].slice(equals + 1);
+    if (typeof value !== 'string' || !value || value.startsWith('-')) return false;
+    if (fields.has(flag)) {
+      const separator = value.indexOf('=');
+      if (separator <= 0) return false;
+      if (value.slice(0, separator) === 'query') {
+        if (query !== null) return false;
+        query = value.slice(separator + 1);
+      }
+    }
+  }
+  if (query === null) return false;
+  // Remove comments and strings together so '#' and braces inside strings cannot hide an operation.
+  const text = query.replace(/"""(?:\\[\s\S]|(?!""")[\s\S])*"""|"(?:\\[\s\S]|[^"\\])*"|#[^\r\n]*/g, ' ').trim();
+  if (!/^(?:query\b|\{)/.test(text)) return false;
+  // Only document-level operation keywords count: names/fields can legally be 'mutation'.
+  const stack = [];
+  let operationStart = true;
+  for (const token of text.match(/[A-Za-z_][A-Za-z_0-9]*|[{}()[\]]/g) || []) {
+    if (!stack.length && operationStart) {
+      if (token === 'mutation' || token === 'subscription') return false;
+      operationStart = false;
+    }
+    if (['{', '(', '['].includes(token)) stack.push(token);
+    else if (['}', ')', ']'].includes(token)) {
+      if (stack.pop() !== { '}': '{', ')': '(', ']': '[' }[token]) return false;
+      if (!stack.length && token === '}') operationStart = true;
+    }
+  }
+  return stack.length === 0;
+}
+
 /**
  * Is this `gh` call answered from local state alone (no GitHub request)? `gh auth token` reads the stored login
  * from the local keyring/hosts file. Such a call spends no budget, so the shared budget-block gate must never
@@ -1616,7 +1664,7 @@ export function runGhSync(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   const env = throttle.env || process.env;
   const dir = env[WE_GH_READ_MEMO_DIR];
-  if (!dir || throttle.exec || execOpts.input !== undefined || isGhLocalOnly(args) || !classifyGhRead(args)) {
+  if (!dir || throttle.exec || execOpts.input !== undefined || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))) {
     return runGhSyncUnmemoized(args, opts);
   }
   const memoArgs = ghReadMemoArgs(args);

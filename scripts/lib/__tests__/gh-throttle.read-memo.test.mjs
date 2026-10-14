@@ -65,6 +65,49 @@ describe('smoke-scoped gh read memo', () => {
     expect(f.entries()).toHaveLength(0);
   });
 
+  it.each([
+    ['-f', 'query=query { repository(owner:"example", name:"project") { name } }'],
+    ['-F', 'query=  # read only\n{ viewer { login } }', '--paginate'],
+    ['--field', 'query=query($name:String!){repository(name:$name){name}}', '--raw-field', 'name=project', '--jq', '.data', '--cache', '1h', '-H', 'Accept: application/json', '--include'],
+    ['--raw-field=query={ viewer { login } }', '-q', '.data', '-i', '--header=Accept: application/json'],
+  ])('memoises GraphQL queries without changing classification: %j', (...flags) => {
+    const f = fixture();
+    const args = ['api', 'graphql', ...flags];
+    expect(gh.classifyGhRead(args)).toBe(false);
+    expect(gh.isGhGraphqlReadQuery(args)).toBe(true);
+    gh.runGhSync(args, f.opts);
+    gh.runGhSync(args, f.opts);
+    expect(f.count()).toBe(1);
+  });
+
+  it.each([
+    ['-f', 'query=mutation { addComment(input:{body:"hi"}) { clientMutationId } }'],
+    ['-f', 'query= # comment\nsubscription { viewer { login } }'],
+    ['-f', 'query=query { viewer { login } } mutation { deleteIssue(input:{id:"1"}) { clientMutationId } }'],
+    ['-f', 'query={ viewer { login } } subscription { viewer { login } }'],
+    ['-f', 'query=query { viewer { login } }', '--method', 'POST'],
+    ['-f', 'query=query { viewer { login } }', '--unknown'],
+    ['-f', 'query=query { viewer { login } }', '--input', 'body.json'],
+    ['-f', 'query=query { viewer { login } }', '-q'],
+    ['-f', 'query=queryish { viewer { login } }'],
+    ['-f', 'name=project'],
+  ])('does not memoise ambiguous or non-read GraphQL calls: %j', (...flags) => {
+    const f = fixture();
+    const args = ['api', 'graphql', ...flags];
+    expect(gh.classifyGhRead(args)).toBe(false);
+    gh.runGhSync(args, f.opts);
+    gh.runGhSync(args, f.opts);
+    expect(f.count()).toBe(2);
+    expect(f.entries()).toHaveLength(0);
+    expect(gh.isGhGraphqlReadQuery(args)).toBe(false);
+  });
+
+  it('ignores operation words inside query fields, strings and comments', () => {
+    expect(gh.isGhGraphqlReadQuery(['api', 'graphql', '-f',
+      'query= # mutation\nquery { mutation subscription search(query:"mutation { }") { name } } # subscription',
+    ])).toBe(true);
+  });
+
   it('leaves calls unchanged when unset', () => {
     const f = fixture(false);
     gh.runGhSync(read, f.opts);
