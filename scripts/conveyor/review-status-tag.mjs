@@ -51,6 +51,8 @@ export const LEGACY_REVIEW_STATUS_DEFAULT = true;
 // No network from the label writer; the planner owns the live required-check read.
 const readCachedRequiredChecks = ({ repo }) => getRequiredStatusChecks({
   repo,
+  // The planner refreshes the cache. Preserve declared/unavailable provenance even after its TTL expires.
+  ttlMs: Infinity,
   readChecks: () => { throw new Error('required-status-checks: cache-only read in the status tagger'); },
 });
 
@@ -285,7 +287,11 @@ export function tagReviewStatus({
   const applyPrStatus = () => {
     if (!Array.isArray(planRows)) return;
     if (requiredChecks === undefined) {
-      try { requiredChecks = readRequiredChecks({ repo }).checks; } catch { /* Pure core retains its fallback. */ }
+      requiredChecks = null; // Unknown requirements must never filter a CI refusal into a review signal.
+      try {
+        const result = readRequiredChecks({ repo });
+        if (['live', 'cache', 'stale-cache'].includes(result?.source)) requiredChecks = result.checks ?? null;
+      } catch { /* Keep requirements unknown; the pure core still recognises fallback failures. */ }
     }
     if (prStatusSettings === undefined) {
       try { prStatusSettings = prStatusSettingValues(loadStatusSettings()); } catch { /* Pure core retains its defaults. */ }

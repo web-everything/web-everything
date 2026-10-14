@@ -69,9 +69,12 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
 
 /** PURE: classify a planner refusal using only this caller's required checks. */
 function reviewCiWait(row, { pr, defaultBranch, requiredChecks, settings }) {
-  if (!Array.isArray(row.ci?.affected)) return 'awaiting-ci';
+  if (!['required-checks-not-successful', 'required-review-gate-conflict'].includes(row.ci?.reason)
+    || !Array.isArray(row.ci?.affected) || !row.ci.affected.length
+    || !Array.isArray(requiredChecks) || !requiredChecks.length
+    || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return 'awaiting-ci';
   const affected = row.ci.affected.filter(check =>
-    (!Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.includes(check?.name))
+    requiredChecks.includes(check?.name)
     && (settings.reviewGateSignal !== 'review' || check?.name !== 'review-gate'));
   if (!affected.length) return 'awaiting-review';
   if (pr.baseRefName && pr.baseRefName !== defaultBranch
@@ -98,13 +101,15 @@ export function takeoverUnjudged(comments) {
 
 /**
  * PURE: the ONE `status:*` state for a PR, or null when none applies.
- * @param {{pr?:object, labels?:Array, reviewStatus?:{role?:string,state?:string}|null, rows?:Array<object>, defaultBranch?:string, humanAt?:number, requiredChecks?:string[], settings?:object}} o
+ * @param {{pr?:object, labels?:Array, reviewStatus?:{role?:string,state?:string}|null, rows?:Array<object>, defaultBranch?:string, humanAt?:number, requiredChecks?:string[]|null, settings?:object}} o
  *   `rows` = this tick's planner rows for the PR (dispatch rows, refusals, notes).
+ *   `requiredChecks: null` means unknown; CI refusals stay conservative, known fallback failures stay red.
  */
 export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows = [], defaultBranch = 'main', humanAt, requiredChecks = FALLBACK_REQUIRED_STATUS_CHECKS, settings = PR_STATUS_SETTING_DEFAULTS } = {}) {
   settings = { ...PR_STATUS_SETTING_DEFAULTS, ...settings };
-  const ciChecks = settings.reviewGateSignal === 'review' && Array.isArray(requiredChecks)
-    ? requiredChecks.filter(name => name !== 'review-gate') : requiredChecks;
+  const redChecks = requiredChecks ?? FALLBACK_REQUIRED_STATUS_CHECKS;
+  const ciChecks = settings.reviewGateSignal === 'review' && Array.isArray(redChecks)
+    ? redChecks.filter(name => name !== 'review-gate') : redChecks;
   const l = names(labels ?? pr?.labels);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const rs = reviewStatus?.state ?? null;

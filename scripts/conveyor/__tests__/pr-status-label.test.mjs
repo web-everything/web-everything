@@ -1,6 +1,20 @@
 // One `status:*` label per PR — what it is waiting on (operator ask 2026-10-10: #4708/#4689/#4631 sat at the
 // round cap and their labels did not show it).
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+vi.mock('../../lib/proc-read.mjs', async (importOriginal) => ({
+  ...await importOriginal(),
+  readGh: vi.fn(() => { throw new Error('unexpected network read'); }),
+}));
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal(),
+  spawnSync: vi.fn(() => { throw new Error('unexpected network spawn'); }),
+}));
+import { readGh } from '../../lib/proc-read.mjs';
+import { spawnSync } from 'node:child_process';
+import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, operatorQueueNeedsYou } from '../pr-status-label.mjs';
 import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
 import { evaluatePr } from '../../operations/operator-queue.mjs';
@@ -197,6 +211,27 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
   const row = (affected) => ({ kind: 'review-ci', ci: { reason: 'required-checks-not-successful', affected } });
   const reviewRow = { kind: 'review-ci', ci: { reason: 'required-review-gate-conflict', affected: [{ name: 'review-gate', reason: 'failure' }] } };
   const subject = (over = {}) => pr(['review:pending'], [], { statusCheckRollup: [...green(), ...Array.from({ length: 3 }, () => check('review-gate', 'FAILURE'))], ...over });
+  it.each([
+    ['missing-head', { headSha: null }, 'awaiting-ci'],
+    ['unknown-required-set', { requiredChecks: [] }, 'awaiting-ci'],
+    ['required-checks-not-successful', { checks: [] }, 'waiting-on-base'],
+    ['required-review-gate-conflict', { requiredChecks: ['review-gate'], checks: [] }, 'awaiting-review'],
+    ['required-checks-successful', {}, 'awaiting-ci'],
+  ])('classifies the gate reason %s conservatively', (reason, overrides, expected) => {
+    const ci = reviewCiGate({ headSha: HEAD, requiredChecks: ['merge-gate'],
+      checks: [{ name: 'merge-gate', status: 'completed', conclusion: 'success' }], ...overrides });
+    expect(ci.reason).toBe(reason);
+    expect(derive({ pr: subject({ baseRefName: 'lane/base', statusCheckRollup: green() }),
+      requiredChecks, rows: [{ kind: 'review-ci', ci }] })).toBe(expected);
+  });
+  it.each(['missing-head', 'unknown-required-set', 'future-refusal', undefined,
+    'required-checks-not-successful', 'required-review-gate-conflict'])('empty affected rows for %s retain the CI wait', reason => {
+    expect(derive({ pr: subject(), requiredChecks,
+      rows: [{ kind: 'review-ci', ci: { reason, affected: [] } }] })).toBe('awaiting-ci');
+  });
+  it.each([null, [], [''], [null]].map(checks => [checks]))('an unknown or malformed required set %j retains the CI wait', checks => {
+    expect(derive({ pr: subject(), requiredChecks: checks, rows: [reviewRow] })).toBe('awaiting-ci');
+  });
   it('#5241: review-gate failures are review signals, including when required by repository policy', () => {
     for (const rows of [[reviewRow], [{ kind: 'review' }]]) {
       for (const checks of [requiredChecks, [...requiredChecks, 'review-gate']]) {
@@ -348,13 +383,13 @@ describe('status tagger resolves required checks and settings at the IO boundary
   const run = (options = {}) => tagReviewStatus({ pr: 7, repo: 'web-everything/web-everything', agents: [],
     currentLabels: ['review:pending'], prState: pr(['review:pending'], [], { statusCheckRollup: [check('merge-gate', 'FAILURE'), check('review-gate', 'FAILURE')] }),
     provider: { ensureLabel: () => {}, setLabels: () => {} }, readFixClaim: () => null,
-    planRows: [{ kind: 'review-ci', ci: { affected: [{ name: 'review-gate', reason: 'failure' }] } }], ...options });
+    planRows: [{ kind: 'review-ci', ci: { reason: 'required-review-gate-conflict', affected: [{ name: 'review-gate', reason: 'failure' }] } }], ...options });
   it('reads the live required set and projects resolved settings into the reducer', () => {
     const calls = [];
-    expect(run({ readRequiredChecks: (args) => { calls.push(args); return { checks: ['merge-gate'] }; },
+    expect(run({ readRequiredChecks: (args) => { calls.push(args); return { checks: ['merge-gate'], source: 'live' }; },
       loadStatusSettings: () => resolvePrStatusSettings() }).prStatus).toBe('status:ci-red');
     expect(calls).toEqual([{ repo: 'web-everything/web-everything' }]);
-    expect(run({ readRequiredChecks: () => ({ checks: ['review-gate'] }),
+    expect(run({ readRequiredChecks: () => ({ checks: ['review-gate'], source: 'live' }),
       loadStatusSettings: () => resolvePrStatusSettings({ env: { WE_PR_STATUS_REVIEW_GATE_SIGNAL: 'ci' } }) }).prStatus).toBe('status:ci-red');
   });
   it('honors explicit values without invoking readers and falls back when readers throw', () => {
@@ -363,9 +398,66 @@ describe('status tagger resolves required checks and settings at the IO boundary
     const reader = () => { reads++; return unexpected(); };
     expect(run({ requiredChecks: ['review-gate'], prStatusSettings: { reviewGateSignal: 'review' }, readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBe('status:awaiting-review');
     expect(reads).toBe(0);
-    expect(run({ readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBe('status:awaiting-review');
+    expect(run({ readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBe('status:awaiting-ci');
     expect(reads).toBe(2);
     expect(run({ planRows: null, readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBeUndefined();
     expect(reads).toBe(2);
+  });
+  it.each(['fallback', 'declared', 'unavailable', 'unexpected', undefined])('does not trust required-check source %s', source => {
+    for (const baseRefName of ['main', 'lane/base']) {
+      for (const name of ['merge-gate', 'review-gate']) {
+        expect(run({ prState: pr(['review:pending'], [], { baseRefName, statusCheckRollup: [check('test')] }),
+          planRows: [{ kind: 'review-ci', ci: { reason: 'required-checks-not-successful', affected: [{ name, reason: 'missing' }] } }],
+          readRequiredChecks: () => ({ checks: ['test'], source }),
+        }).prStatus).toBe('status:awaiting-ci');
+      }
+    }
+  });
+  it.each(['live', 'cache', 'stale-cache'])('uses authoritative source %s for main and stacked waits', source => {
+    for (const [baseRefName, expected] of [['main', 'status:awaiting-ci'], ['lane/base', 'status:waiting-on-base']]) {
+      expect(run({ prState: pr(['review:pending'], [], { baseRefName, statusCheckRollup: [check('test')] }),
+        planRows: [{ kind: 'review-ci', ci: { reason: 'required-checks-not-successful', affected: [{ name: 'merge-gate', reason: 'missing' }] } }],
+        readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source }),
+      }).prStatus).toBe(expected);
+    }
+  });
+  it('keeps known required failures red when the required-check read is untrusted', () => {
+    expect(run({ prState: pr(['review:pending'], [], { statusCheckRollup: [check('test', 'FAILURE')] }),
+      readRequiredChecks: () => ({ source: 'fallback', checks: ['test'] }),
+    }).prStatus).toBe('status:ci-red');
+  });
+  it.each([
+    ['cache miss', null, 'status:awaiting-ci'],
+    ['fresh live cache', { source: 'live', checks: ['test', 'merge-gate'], fetchedAtMs: Date.now() }, 'status:waiting-on-base'],
+    ['expired live cache', { source: 'live', checks: ['test', 'merge-gate'], fetchedAtMs: 0 }, 'status:waiting-on-base'],
+    ['legacy cache', { checks: ['test', 'merge-gate'], fetchedAtMs: 0 }, 'status:waiting-on-base'],
+    ['fresh declared cache', { source: 'declared', checks: ['test'], fetchedAtMs: Date.now() }, 'status:awaiting-ci'],
+    ['expired declared cache', { source: 'declared', checks: ['test'], fetchedAtMs: 0 }, 'status:awaiting-ci'],
+    ['expired unavailable cache', { source: 'unavailable', checks: [], fetchedAtMs: 0 }, 'status:awaiting-ci'],
+    ['malformed live cache', { source: 'live', checks: [''], fetchedAtMs: 0 }, 'status:awaiting-ci'],
+  ])('does not fetch required checks with %s using the default reader', (_name, entry, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'status-tagger-cold-cache-'));
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(dir);
+    readGh.mockClear();
+    spawnSync.mockClear();
+    try {
+      if (entry) {
+        mkdirSync(join(dir, 'reports'));
+        writeFileSync(join(dir, 'reports', '.required-status-checks-cache.json'),
+          JSON.stringify({ entries: { 'web-everything/web-everything@main': entry } }));
+      }
+      const result = tagReviewStatusIo({ pr: 5267, repo: 'web-everything/web-everything', agents: [],
+        currentLabels: ['review:pending'], prState: pr(['review:pending'], [], { baseRefName: 'lane/enqueue-verify' }),
+        planRows: [{ kind: 'review-ci', ci: { reason: 'required-checks-not-successful', affected: [{ name: 'merge-gate', reason: 'missing' }] } }],
+        provider: { ensureLabel: () => {}, setLabels: () => {} }, readFixClaim: () => null,
+        prStatusSettings: PR_STATUS_SETTING_DEFAULTS, excuseMergeGate: subject => subject,
+      });
+      expect(readGh).not.toHaveBeenCalled();
+      expect(spawnSync).not.toHaveBeenCalled();
+      expect(result.prStatus).toBe(expected);
+    } finally {
+      cwd.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
