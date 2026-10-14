@@ -833,6 +833,19 @@ existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
 
+### Grouped build recovery
+
+Grouped members have no worker run row of their own. Restart adoption must use the lead's
+PID, session liveness or bound resume marker, using the single-card liveness classifier.
+Only the lead resumes or settles that worker; the daemon's grouped retirement path owns
+member cleanup. Probe real member claim files with a dead daemon PID and a live lead,
+including session and resumed-worker evidence. Recovery carries the durable dispatch's
+full member list through resumability, resume argv and wrapper publication; a missing
+original dispatch record refuses publication. Member claim edits are wrapper-owned,
+while unrelated card edits still refuse recovery. Test generated mixed numeric/hash
+`Resolves` lines through the real resolution reader, retaining diff corroboration and
+bornAs alias checks for hashes.
+
 ### Enqueue catch-up ordering
 
 The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
