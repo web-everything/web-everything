@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -248,9 +249,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const toolsDir = join(root, 'tools');
   mkdirSync(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy']);
-  for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
-    // The fake gh already owns this command. Never enumerate a host's credential/shim state.
-    if (dir.split('/').includes('github-app-token')) continue;
+  for (const dir of toolPathDirs()) {
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -260,7 +259,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    ...isolatedProcessEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
@@ -272,6 +271,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
     LANE_POOL_ROOT: lanePoolRoot,
+    // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
+    // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
+    // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,
@@ -327,10 +330,6 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
-  delete env.WE_GITHUB_APP_ID;
-  delete env.WE_GITHUB_APP_INSTALLATION_ID;
-  delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
-  delete env.GITHUB_TOKEN;
   // This world runs the checkout's policy, not the launching daemon's possibly newer last-good snapshot.
   // Keep an explicit undefined so agent actions spreading process.env before this env cannot restore it;
   // Node omits undefined env entries when spawning the child.

@@ -41,7 +41,7 @@ describe('open PR cap scope', () => {
 
   const rows = [pr(1, ['backlog/a.md']), pr(2, ['src/a.js'], ['review:accepted']), pr(3, ['backlog/b.md'], ['review:accepted']), pr(4, ['backlog/c.md', 'src/b.js']), pr(5, [])];
   it('excludes card-only first, accepted second, and counts mixed and empty diffs', () => {
-    expect(countOpenPrsForCap(rows)).toEqual({ total: 5, counted: 2, cardOnly: 2, accepted: 1, countedPrs: ['we#4', 'we#5'], cardOnlyPrs: ['we#1', 'we#3'], acceptedPrs: ['we#2'] });
+    expect(countOpenPrsForCap(rows)).toEqual({ total: 5, counted: 2, cardOnly: 2, accepted: 1, excludeCardOnly: true, excludeAccepted: true, countedPrs: ['we#4', 'we#5'], cardOnlyPrs: ['we#1', 'we#3'], acceptedPrs: ['we#2'] });
   });
   it('each switch restores its population, without double counting', () => {
     expect(countOpenPrsForCap(rows, { excludeCardOnly: false, excludeAccepted: true })).toMatchObject({ counted: 3, cardOnly: 0, accepted: 2, countedPrs: ['we#1', 'we#4', 'we#5'] });
@@ -49,6 +49,32 @@ describe('open PR cap scope', () => {
     expect(countOpenPrsForCap(rows, { excludeCardOnly: false, excludeAccepted: false })).toMatchObject({ counted: 5, cardOnly: 0, accepted: 0 });
   });
   it('formats the count and exclusions', () => {
-    expect(formatOpenPrCap(countOpenPrsForCap(rows))).toBe('2 open PRs counted (2 card-only, 1 accepted excluded)');
+    expect(formatOpenPrCap(countOpenPrsForCap(rows))).toBe('2 of 5 open PRs counted (not counted: 2 card-only, 1 review:accepted) — counted: #4 #5');
+  });
+  it.each([
+    [{ excludeCardOnly: false, excludeAccepted: true }, '3 of 5 open PRs counted (not counted: 2 review:accepted; card-only counted (openPrCap.excludeCardOnly=false)) — counted: #1 #4 #5'],
+    [{ excludeCardOnly: true, excludeAccepted: false }, '3 of 5 open PRs counted (not counted: 2 card-only; review:accepted counted (openPrCap.excludeAccepted=false)) — counted: #2 #4 #5'],
+    [{ excludeCardOnly: false, excludeAccepted: false }, '5 of 5 open PRs counted (card-only counted (openPrCap.excludeCardOnly=false), review:accepted counted (openPrCap.excludeAccepted=false)) — counted: #1 #2 #3 #4 #5'],
+  ])('names disabled exclusions for scope %j', (scope, expected) => {
+    const result = countOpenPrsForCap(rows, scope);
+    expect(result).toMatchObject(scope);
+    expect(formatOpenPrCap(result)).toBe(expected);
+  });
+  it('caps the counted list at 15, reporting only the remaining counted PRs', () => {
+    const openPrs = Array.from({ length: 17 }, (_, i) => pr(i + 1, ['src/a.js']));
+    openPrs.push(pr(18, ['backlog/a.md']));
+    const listed = Array.from({ length: 15 }, (_, i) => `#${i + 1}`).join(' ');
+    expect(formatOpenPrCap(countOpenPrsForCap(openPrs.slice(0, 15)))).toBe(`15 of 15 open PRs counted (not counted: 0 card-only, 0 review:accepted) — counted: ${listed}`);
+    expect(formatOpenPrCap(countOpenPrsForCap(openPrs))).toBe(`17 of 18 open PRs counted (not counted: 1 card-only, 0 review:accepted) — counted: ${listed} … (+2 more)`);
+  });
+  it('keeps repo prefixes only when counted PRs span repos, including beyond the cap', () => {
+    const openPrs = Array.from({ length: 15 }, (_, i) => ({ ...pr(i + 1, ['src/a.js']), repo: 'owner/one' }));
+    const excluded = { ...pr(20, ['backlog/a.md']), repo: 'owner/two' };
+    expect(formatOpenPrCap(countOpenPrsForCap([openPrs[0], excluded]))).toBe('1 of 2 open PRs counted (not counted: 1 card-only, 0 review:accepted) — counted: #1');
+    const listed = openPrs.map((p) => `${p.repo}#${p.number}`).join(' ');
+    expect(formatOpenPrCap(countOpenPrsForCap([...openPrs, { ...pr(1, ['src/a.js']), repo: 'owner/two' }]))).toBe(`16 of 16 open PRs counted (not counted: 0 card-only, 0 review:accepted) — counted: ${listed} … (+1 more)`);
+  });
+  it('omits the counted list when no PRs are counted', () => {
+    expect(formatOpenPrCap(countOpenPrsForCap([]))).toBe('0 of 0 open PRs counted (not counted: 0 card-only, 0 review:accepted)');
   });
 });
