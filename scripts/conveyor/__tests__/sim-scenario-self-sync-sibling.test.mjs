@@ -45,10 +45,13 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
+import { DEFAULT_GH_POINTS_BUDGET_PER_MIN, ghPointsBudgetStatePath } from '../../lib/gh-throttle.mjs';
 
 function headOfClone(cloneRoot) {
   return execFileSync('git', ['-C', cloneRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -178,6 +181,25 @@ function a3Def() {
     daemons: ['review', 'fix-dispatch'],
     lanes: 2,
     setup(w) {
+      // The live smoke acquires without --no-install. Prove every provisioned lane is already ready,
+      // so a backlog-only rebuild exercises the real smoke without downloading dependencies mid-tick.
+      const seededLanes = [];
+      for (const pool of readdirSync(w.lanePoolRoot, { withFileTypes: true })) {
+        if (!pool.isDirectory()) continue;
+        const poolDir = join(w.lanePoolRoot, pool.name);
+        for (const lane of readdirSync(poolDir, { withFileTypes: true })) {
+          if (!lane.isDirectory() || !/^lane-\d+$/.test(lane.name)) continue;
+          const laneRoot = join(poolDir, lane.name);
+          const hash = createHash('sha256').update(readFileSync(join(laneRoot, 'package-lock.json'))).digest('hex');
+          expect(readFileSync(join(laneRoot, '.git', '.lane-pool-deps'), 'utf8').trim()).toBe(hash);
+          expect(realpathSync(join(laneRoot, 'node_modules'))).toBe(realpathSync(join(w.simCloneRoot, 'node_modules')));
+          expect(execFileSync('git', ['-C', laneRoot, 'status', '--porcelain', '--untracked-files=all'], {
+            encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+          }).trim()).toBe('');
+          seededLanes.push(laneRoot);
+        }
+      }
+      expect(seededLanes).toHaveLength(2);
       return { w };
     },
     play: [
@@ -201,6 +223,38 @@ function a3Def() {
 }
 
 describe('#3383 daemon scenario simulator — self-sync sibling scenarios (I-15/I-18)', () => {
+  it('keeps a previous world\'s exhausted future throttle window out of a fresh daemon tick', async () => {
+    const inheritedRoot = mkdtempSync(join(tmpdir(), 'sim-inherited-throttle-'));
+    const inheritedState = ghPointsBudgetStatePath(inheritedRoot);
+    const poisoned = JSON.stringify({ windowStartMs: Date.now() + 60 * 60_000, spent: DEFAULT_GH_POINTS_BUDGET_PER_MIN });
+    writeFileSync(inheritedState, poisoned);
+    const previousRoot = process.env.WE_GH_THROTTLE_LOCK_ROOT;
+    process.env.WE_GH_THROTTLE_LOCK_ROOT = inheritedRoot;
+    try {
+      await runScenario(scenario('self-sync-independent-throttle-clock', {
+        repos: ['we'], daemons: ['fix-dispatch'], lanes: 1,
+        setup(w) {
+          // Fail immediately on a shared store instead of waiting out its production backoff.
+          expect(w.env.WE_GH_THROTTLE_LOCK_ROOT).not.toBe(inheritedRoot);
+          return { w };
+        },
+        play: ['tick fix-dispatch'],
+        expect(s, { w }) {
+          expect(s.ticks('fix-dispatch')[0].error).toBeNull();
+          expect(w.gh.calls().length).toBeGreaterThan(0);
+          const ownState = JSON.parse(readFileSync(ghPointsBudgetStatePath(w.env.WE_GH_THROTTLE_LOCK_ROOT), 'utf8'));
+          expect(ownState.spent).toBeGreaterThan(0);
+          expect(ownState.windowStartMs).toBeLessThan(Date.now() + 60_000);
+          expect(readFileSync(inheritedState, 'utf8')).toBe(poisoned);
+        },
+      }), { timeoutMs: 60_000 });
+    } finally {
+      if (previousRoot === undefined) delete process.env.WE_GH_THROTTLE_LOCK_ROOT;
+      else process.env.WE_GH_THROTTLE_LOCK_ROOT = previousRoot;
+      rmSync(inheritedRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('A1: fix-dispatch restarts within one tick on boot-HEAD drift from a sibling daemon self-syncing first (I-15)', async () => {
     await runScenario(a1Def(), { timeoutMs: 180_000 });
   }, 180_000);
