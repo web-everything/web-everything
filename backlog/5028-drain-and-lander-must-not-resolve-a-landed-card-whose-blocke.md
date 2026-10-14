@@ -3,7 +3,7 @@ bornAs: xnaqr9r
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/lib/drain-followup-job.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/backlog-stranded-sweep.test.mjs"]
+scope: ["we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/backlog-stranded-sweep.mjs", "we:scripts/lib/drain-followup-job.mjs", "we:scripts/lib/__tests__/drain-followup-job.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/backlog-stranded-sweep.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-14"
 preparedAgainstSha: "28a7885f13a2b484c774da401bacb1883a020c89"
