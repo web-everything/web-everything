@@ -3,9 +3,11 @@ bornAs: xobnfjb
 kind: story
 size: 3
 parent: "4075"
-status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+status: resolved
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/drain-review-gate-decision-table.test.mjs", "we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs", "we:scripts/lib/__tests__/human-clearance-carry.test.mjs"]
 dateOpened: "2026-10-13"
+dateStarted: "2026-10-14"
+dateResolved: "2026-10-14"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "7372a0e0a8a7b6ccca4ffffdadaf665980314880"
 tags: []
@@ -74,3 +76,4 @@ With the new test file present, `git stash` the one-line fix in we:scripts/merge
 
 2026-10-13 prepare: premise check — still no decision-table test (existing coverage in we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs:596-690 and the replay test is spot cases only) and lines 850-852 still default-trust. Card cites 845/850; code is now at 836/850. Goal unchanged.
 2026-10-13 re-prepare: stamp was stale (preparedAgainstSha e1320124 vs main 7372a0e0). Re-checked against current main: the gate and lines 850-852 are unchanged; only the two caller citations moved (5288/5674 → 5314/5700), corrected in Design. Re-stamped.
+2026-10-14 build: `filesComplete` now needs `=== true` plus a non-empty `listedHeadSha` matching the acceptance head (we:scripts/merge-ai-prs.mjs); 34-case decision table (with wiring tests for the production listing and both call sites) added (we:scripts/__tests__/drain-review-gate-decision-table.test.mjs), 10 of 34 red without the fix, all green with it; existing tests that passed `files` alone now pass the explicit flags. The live `--dry-run` comparison was not run (needs GitHub reads); production callers already pass the strict flags (pinned by the wiring tests), so live behavior is unchanged.

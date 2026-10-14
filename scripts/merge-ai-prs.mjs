@@ -851,9 +851,11 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   }
   // Exact-head ceremony only: inspect the SAME acceptance reader's SHA before carry-forward can rebind it.
   let files = readOptions?.files;
-  let filesComplete = Array.isArray(files) && readOptions?.filesComplete !== false
-    && (readOptions?.listedHeadSha === undefined || (!!readOptions.listedHeadSha
-      && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase())));
+  // A listing is trusted only with explicit completeness AND a head it was read at (#6021): an omitted flag or SHA
+  // (the files-only shape) is unknown evidence and takes the pinned read below, never a default-trusted listing.
+  let filesComplete = Array.isArray(files) && readOptions?.filesComplete === true
+    && typeof readOptions.listedHeadSha === 'string' && !!readOptions.listedHeadSha
+    && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase());
   if (!filesComplete && readOptions?.workflowEditSetting !== 'off' && readOptions?.local) {
     const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
       base: readOptions.defaultBranch ?? 'main', cwd: readOptions.cwd ?? process.cwd(),
