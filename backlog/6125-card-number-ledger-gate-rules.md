@@ -45,7 +45,8 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
   is a warning, never an error, and a later reviewed PR trims it.
 - `duplicateBornAs` (we:scripts/check-standards-rules.mjs:2882): an x-named card needs no `bornAs`; a seed row
   that disagrees with a card's `bornAs` is an error. For an allowlisted id, the seed row must carry the
-  entry's `canonical` number; the alias card sharing that `bornAs` is not a disagreement.
+  entry's `canonical` number, or, when the entry is stale, the number of the one listed card still carrying
+  the id (slice (a)'s seed rule); the alias card sharing that `bornAs` is not a disagreement.
 - `handNumberedNewItems` (we:scripts/check-standards-rules.mjs:3012): unchanged. Hand-picked numbers stay
   forbidden.
 - The gate reads the ledger fetched by CI (slice (b), 6124 wiring, hence blockedBy). Outside merge_group,
@@ -106,7 +107,8 @@ Required tests in `we:scripts/__tests__/check-standards-rules.test.mjs`:
   id, an unlisted shared `bornAs`, a rename of a listed card to an unlisted number, and an allowlist entry
   added only in the tree under check. A PR deleting one card of a pair passes with a stale-entry warning. A body-text `bornAs:` line (card 4658 shape) never
   counts as a duplicate. The seed row for an allowlisted id passes `duplicateBornAs` at `canonical` and
-  errors at the alias number.
+  errors at the alias number while both cards carry the id; with the canonical card deleted (stale entry),
+  a row at the remaining card's number passes.
 - **Capability (Red today)** — `unreadableLedgerInMergeGroupErrors` and `unreadableLedgerOutsideMergeGroupWarns`: paired context tests
   for failed fetch with stale ref, deleted/renamed ledger file, missing history, authentication failure,
   over-cap/truncated read, and a missing or invalid base trust root (including a malformed quarantine or
