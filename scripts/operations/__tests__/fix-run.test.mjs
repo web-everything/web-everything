@@ -5,12 +5,13 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createFixBorrowGate } from '../../lib/fix-slot-borrow.mjs';
+import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor } from '../../lib/fix-slot-borrow.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
+import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
+import { parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -104,13 +105,113 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  // card 5947 (live #5045, 2026-10-13): CI context and durable outcomes precede lane acquisition.
+  it('launches a ci-heal without a finding and records no-change as real repair evidence', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const readComments = vi.fn(async () => []), appendLoopRow = vi.fn();
+    const readCiHeal = vi.fn(() => ({ title: 'CI red', body: 'B', checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/42' }],
+      jobs: [{ name: 'unit', log: '2026-10-13T13:19:27.2719622Z FAIL  scripts/conveyor/soak/__tests__/shard-files.test.mjs > coverage\nAssertionError: expected 0.796875 to be greater than 0.8' }] }));
+    expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, readComments, readCiHeal, appendLoopRow })).code).toBe(0);
+    expect(readComments).not.toHaveBeenCalled();
+    const prompt = m.spawn.mock.calls[0][0].prompt;
+    for (const text of ['## CI FAILURE CONTEXT (fetched by the launcher)', 'scripts/conveyor/soak/__tests__/shard-files.test.mjs', 'AssertionError: expected 0.796875 to be greater than 0.8']) expect(prompt).toContain(text);
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', head: 'aaa', outcome: 'no-change', infra: false }));
+  });
+  it.each(['ci-heal', 'fix'])('records a pre-lane %s refusal against the PR head', async repairKind => {
+    const m = mk([]), recordRouted = vi.fn(() => ({})), appendLoopRow = vi.fn(), writeErr = vi.fn();
+    const head = 'a'.repeat(40);
+    const run = (cmd, args, opts) => cmd === 'gh' ? JSON.stringify({ title: 'T', headRefOid: head }) : m.run(cmd, args, opts);
+    expect((await runFixCli([...argv, `--repair-kind=${repairKind}`], { ...m.io, run, readComments: async () => [],
+      readCiHeal: () => ({ checks: [], jobs: [] }), recordRouted, appendLoopRow, writeErr })).code).toBe(1);
+    const reason = repairKind === 'ci-heal' ? 'no-ci-failure:' : 'no-finding:';
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({ head, outcome: 'failed', reason: expect.stringContaining(reason) }));
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', session: 'fix-7', head, infra: true }));
+    expect(m.calls.some(c => c.includes('acquire'))).toBe(false);
+    expect(writeErr.mock.calls.flat().join('')).toContain(reason);
+  });
+  it('two pre-lane CI refusals make the next routed repair choose Claude', async () => {
+    const m = mk([]), head = 'a'.repeat(40), store = ledger(), rows = [];
+    const run = (cmd, args, opts) => cmd === 'gh' ? JSON.stringify({ headRefOid: head }) : m.run(cmd, args, opts);
+    const io = { ...m.io, run, readCiHeal: () => ({ checks: [] }), appendLoopRow: row => rows.push(row),
+      recordRouted: entry => recordRoutedOutcome({ ...entry, store, readClaim: () => null }) };
+    const routed = () => chooseFixExecutor({ launcherAvailable: true,
+      codexUnproductive: consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head }) });
+    expect(routed().executor).toBe('codex');
+    await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+    expect(routed().executor).toBe('codex');
+    await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+    expect(routed().executor).toBe('claude');
+    expect(rows).toHaveLength(2);
+    expect(rows.every(row => row.infra && row.head === head)).toBe(true);
+    expect(m.spawn).not.toHaveBeenCalled();
+  });
+  it('launches with empty job logs and treats ledger write errors as best effort', async () => {
+    const m = mk(['aaa', 'aaa']), writeErr = vi.fn(), releaseClaim = vi.fn(async () => ({ released: [] }));
+    const run = (cmd, args, opts) => {
+      if (cmd === 'gh' && args.includes('title,body,statusCheckRollup')) return JSON.stringify({ title: 'T', statusCheckRollup: [
+        { name: 'unit', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/42' },
+      ] });
+      if (cmd === 'gh' && args[0] === 'api') throw new Error('404');
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, run, releaseClaim, writeErr,
+      readComments: async () => [], appendLoopRow: () => { throw new Error('disk full'); } })).code).toBe(0);
+    expect(m.spawn.mock.calls[0][0].prompt).toContain('https://github.com/o/r/actions/runs/1/job/42');
+    expect(releaseClaim).toHaveBeenCalled();
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('disk full'));
+  });
+  it('refuses an invalid repair-kind', async () => {
+    const m = mk([]), writeErr = vi.fn();
+    expect(() => parseFixRunArgv([...argv, '--repair-kind=x'])).toThrow(/--repair-kind/);
+    expect((await runFixCli([...argv, '--repair-kind=x'], { ...m.io, writeErr })).code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(writeErr.mock.calls.flat().join('')).toContain('--repair-kind');
+  });
   it.each([[[]], [['--task-kind=takeover', '--model=x', '--effort=high']]])('forwards fix task routing and explicit pins %j', async flags => {
     const m = mk(['aaa', 'bbb']);
     await runFixCli([...argv, ...flags], m.io);
     expect(m.spawn.mock.calls[0][0]).toMatchObject(flags.length
       ? { taskKind: 'takeover', model: 'x', effort: 'high' } : { taskKind: 'fix' });
+  });
+  it.each([[[]], [['--task-kind=takeover', '--model=x', '--effort=high']]])('keeps ci-heal accounting separate from task routing %j', async flags => {
+    const m = mk(['aaa', 'aaa']);
+    await runFixCli([...argv, '--repair-kind=ci-heal', ...flags], {
+      ...m.io, readCiHeal: () => ({ checks: [{ name: 'unit' }], jobs: [] }),
+    });
+    expect(m.spawn.mock.calls[0][0]).toMatchObject({
+      taskKind: flags.length ? 'takeover' : 'fix', usageTaskKind: 'ci-heal',
+      ...(flags.length ? { model: 'x', effort: 'high' } : {}),
+    });
+  });
+  it('routes ci-heal through the real Codex provider using fix overrides while recording ci-heal', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fix-accounting-'));
+    try {
+      vi.stubEnv('WE_CODEX_USAGE_LEDGER', join(root, 'ledger'));
+      vi.stubEnv('CODEX_HOME', join(root, 'missing'));
+      vi.stubEnv('WE_CODEX_MODEL_BY_TASK', JSON.stringify({
+        fix: { model: 'gpt-6-astra', effort: 'high' },
+        'ci-heal': { model: 'gpt-6.1-sol', effort: 'medium' },
+      }));
+      const m = mk(['aaa', 'aaa']);
+      const spawnCodex = vi.fn(async () => ({ stdout: '', code: 0 }));
+      const provider = resolveDeliveryAgentProvider('codex');
+      const result = await runFixCli([...argv, '--repair-kind=ci-heal'], {
+        ...m.io, spawnCodex, readCiHeal: () => ({ checks: [{ name: 'unit' }], jobs: [] }),
+        resolveProvider: () => ({ spawn: (request, io) => provider.spawn(request, {
+          ...io, resolveReportsDir: () => join(root, 'reports'), denyPaths: [join(root, 'primary', '**')],
+          recordCpu: () => {}, recordScorecard: () => {}, writeThreadId: () => {},
+        }) }),
+      });
+      expect(result.code).toBe(0);
+      const [args] = spawnCodex.mock.calls[0];
+      expect(args[args.indexOf('-m') + 1]).toBe('gpt-6-astra');
+      expect(args).toContain('model_reasoning_effort=high');
+      expect(JSON.parse(readFileSync(join(root, 'ledger'), 'utf8'))).toMatchObject({
+        taskKind: 'ci-heal', model: 'gpt-6-astra', effort: 'high', caller: 'fix-run.mjs',
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('captures JSONL through the real provider spawn seam even when the provider returns nothing', async () => {
     const m = mk(['aaa', 'aaa']);
@@ -208,7 +309,7 @@ describe('runFixCli', () => {
     } else {
       expect(m.calls.some(c => c.includes('fetch') || c.includes('merge'))).toBe(false);
     }
-    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable', '--repo=o/r']);
+    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable,headRefOid', '--repo=o/r']);
   });
   it('uses the supplied commit message with the shared provider trailer outside the lane', async () => {
     const m = mk(['aaa', 'bbb']);
@@ -381,7 +482,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(args).toContain('title,body,baseRefName,mergeable');
+        expect(args).toContain('title,body,baseRefName,mergeable,headRefOid');
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
       }
@@ -1175,6 +1276,26 @@ describe('runFixCli', () => {
     expect(m2.calls.some((c) => c.includes('push'))).toBe(false);
     expect(m2.owed.sha).toBe(null);
   });
+  it('clears a pending re-arm refusal as pushed without running another agent', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
+    const m = mk(['bbb']);
+    m.owed.sha = 'bbb';
+    const base = m.run.getMockImplementation();
+    const run = vi.fn((cmd, args, opts) => {
+      if (args.some((a) => String(a).includes('rearm-review'))) {
+        throw Object.assign(new Error('Command failed'), { stderr: 'neither review:changes nor review:accepted is live — nothing to re-arm' });
+      }
+      return base(cmd, args, opts);
+    });
+    const write = vi.fn(), appendLoopRow = vi.fn();
+    const out = await runFixCli(argv, { ...m.io, run, write, appendLoopRow });
+    expect(out.code).toBe(0);
+    expect(m.owed.sha).toBe(null);
+    expect(m.pendingRearm.clear).toHaveBeenCalledOnce();
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', outcome: 'pushed' }));
+    expect(write).toHaveBeenCalledWith('fix-run: PR #7 re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source env)\n');
+  });
   it('an unrelated stale marker (a different tip) does not re-arm a no-change run', async () => {
     const m = mk(['aaa', 'aaa']);
     m.owed.sha = 'zzz';
@@ -1289,5 +1410,35 @@ describe('fix-run as a CLI entry (red before: exit 13, unsettled top-level await
     catch (e) { code = e.status; stderr = String(e.stderr); }
     expect(code).toBe(1);
     expect(stderr).toMatch(/missing required flag/);
+  });
+});
+
+describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
+  it('collapses stale checks, reads at most four job APIs and tolerates individual failures', async () => {
+    const checks = [{ name: 'stale', conclusion: 'FAILURE' }, { name: 'stale', conclusion: 'SUCCESS' },
+      ...Array.from({ length: 6 }, (_, i) => ({ name: `check-${i}`, conclusion: i === 1 ? 'timed_out' : 'failure', detailsUrl: `https://github.com/o/r/actions/runs/1/job/${i + 1}` }))];
+    const run = vi.fn((cmd, args) => {
+      if (args.includes('view')) return JSON.stringify({ title: 'T', body: 'B', statusCheckRollup: checks });
+      if (args[1].endsWith('/1/logs')) throw new Error('404');
+      return '\u001b[31m2026-10-13T13:19:27.2719622Z FAIL  a.test.mjs > test\u001b[0m\n2026-10-13T13:19:28Z Error: broken';
+    });
+    const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7, run });
+    expect(inputs.checks).toHaveLength(6);
+    expect(inputs.jobs).toHaveLength(4);
+    expect(inputs.jobs[0].log).toBe('');
+    expect(inputs.jobs[1].log).toBe('FAIL  a.test.mjs > test\nError: broken');
+    expect(run.mock.calls.filter(([, args]) => args[0] === 'api').map(([, args]) => args[1]))
+      .toEqual([1, 2, 3, 4].map(id => `repos/o/r/actions/jobs/${id}/logs`));
+    expect(run.mock.calls[0][1]).toContain('title,body,statusCheckRollup');
+    const context = renderCiHealContext(inputs);
+    expect(context).toContain('a.test.mjs');
+    expect(context).toContain('Error: broken');
+    expect(context.indexOf('### Failed log\ncheck-1')).toBeGreaterThan(0);
+  });
+  it('bounds context and still supplies check links with empty logs', () => {
+    const inputs = { title: 'T', body: 'b'.repeat(8000), checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/job/1' }], jobs: [] };
+    expect(renderCiHealContext(inputs)).toContain('https://github.com/o/r/job/1');
+    expect(renderCiHealContext(inputs)).not.toContain('b'.repeat(4001));
+    expect(renderCiHealContext({ ...inputs, jobs: [{ name: 'unit', log: 'line'.repeat(10000) }] }).length).toBeLessThanOrEqual(16020);
   });
 });
