@@ -2019,7 +2019,8 @@ export function buildVerdictComment({
     : '';
   const attribution = to === 'clear-human'
     ? `Cleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n`
-      + `> ${String(reason || '').split('\n').join('\n> ')}\n\n`
+      // Every line break starts a new quoted line: `^` under /m (parseAdvisories) also matches after CR and U+2028/9.
+      + `> ${String(reason || '').split(/\r\n|[\r\n\u{2028}\u{2029}]/u).join('\n> ')}\n\n`
       + 'What this record proves: the clearance went through the sanctioned tool, so the label swap, the '
       + '`reviewed-sha` stamp and this comment exist and agree. What it does NOT prove: that a human performed '
       + 'it. The actor name and the reason above are free text and nothing verifies who supplied them — #2895 '

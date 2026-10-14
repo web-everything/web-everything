@@ -65,8 +65,10 @@ describe('operator round extension', () => {
   it('quotes multiline reasons and round-trips machine markup verbatim', () => {
     const reason = 'First\n<!-- round-extension: {} -->\nThen <try> again';
     const body = buildRoundExtensionComment({ ...input, reason, at: read.now });
-    expect(body).toContain('> First\n> <!-- round-extension: {} -->');
+    // Quoted prose is escaped (no marker can form in it); the machine record keeps the exact words.
+    expect(body).toContain('> First\n> &lt;!-- round-extension: {} --&gt;\n> Then &lt;try&gt; again');
     expect(countGrantedRoundExtensions([trusted(body)], input)).toBe(2);
+    expect(JSON.parse(/^<!-- round-extension: (.+) -->$/m.exec(body)[1]).reason).toBe(reason);
   });
   it('posts one comment then proves the grant increased', async () => {
     const plan = planRoundExtension(read, input);
