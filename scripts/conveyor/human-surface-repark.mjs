@@ -12,6 +12,7 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
 const errorText = e => String(e?.message ?? e).split('\n')[0];
+const commentKey = c => c?.id ?? JSON.stringify([c?.body, c?.createdAt, c?.author?.login]);
 
 /** Pure decision over a live head and its complete comment thread. */
 export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha, comments = [], surfaces = 'narrow' } = {}) {
@@ -61,6 +62,11 @@ export function sweepHumanSurfaceRepark({
       state = fresh;
       if (state.state !== 'OPEN') throw new Error('PR is not open');
       if (!Array.isArray(state.labels)) throw new Error('labels read returned no array');
+      // Keep the complete thread's order: a truncated fresh prefix must not resurrect
+      // superseded clearance. Update known comments in place and append new ceremonies.
+      const observedComments = new Map(comments.map(c => [commentKey(c), c]));
+      for (const c of Array.isArray(state.comments) ? state.comments : []) observedComments.set(commentKey(c), c);
+      comments = [...observedComments.values()];
       surfaces = resolveSurfaces();
     } catch (e) {
       results.push({ num, skipped: `live re-read failed: ${errorText(e)}` });

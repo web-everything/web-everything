@@ -67,6 +67,64 @@ describe('human surface re-park sweep', () => {
     expect(f.run()).toEqual([]);
     expect(f.calls).toEqual([]);
   });
+  it.each([false, true])('preserves a concurrent clear-human ceremony (dryRun=%s)', dryRun => {
+    const f = fixture();
+    const readComments = vi.fn(() => {
+      // The operator clears this unchanged head after the comments read.
+      f.provider.readPrState.mockReturnValue({ ...f.state, comments: [clearance(head)] });
+      return [];
+    });
+    expect(f.run({ readComments, dryRun })).toEqual([]);
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(f.provider.readPrState).toHaveBeenCalledTimes(2);
+    expect(f.calls).toEqual([]);
+  });
+  it('preserves clearance from the dedicated comments read when the state has no clearance', () => {
+    const f = fixture();
+    // The state's first page can end at an older plain acceptance.
+    const olderAcceptance = {
+      author: { login: 'web-everything' }, body: buildReviewedShaMarker(head),
+    };
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [olderAcceptance] });
+    expect(f.run({ readComments: () => [olderAcceptance, clearance(head)] })).toEqual([]);
+    expect(f.calls).toEqual([]);
+  });
+  it('ignores an untrusted clearance in the fresh state', () => {
+    const f = fixture();
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [{ ...clearance(head), author: { login: 'outsider' } }] });
+    expect(f.run()[0].repark).toBe('reparked');
+    expect(f.calls.map(c => c[0])).toEqual(['comment', 'labels']);
+  });
+  it('does not resurrect clearance from a truncated fresh prefix after a newer plain acceptance', () => {
+    const f = fixture();
+    const oldClearance = clearance('b'.repeat(40));
+    const acceptance = { author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [oldClearance] });
+    expect(f.run({ readComments: () => [oldClearance, acceptance] })[0].repark).toBe('reparked');
+    expect(f.calls.map(c => c[0])).toEqual(['comment', 'labels']);
+  });
+  it('observes an edited comment without moving it past newer acceptance', () => {
+    const f = fixture();
+    const oldClearance = { id: 'C_old', ...clearance('b'.repeat(40)) };
+    const acceptance = { id: 'C_new', author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [{ ...oldClearance, ...clearance(head) }] });
+    expect(f.run({ readComments: () => [oldClearance, acceptance] })[0].repark).toBe('reparked');
+  });
+  it('observes clearance added by editing an existing comment', () => {
+    const f = fixture();
+    const oldAcceptance = { id: 'C_existing', author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [{ id: 'C_existing', ...clearance(head) }] });
+    expect(f.run({ readComments: () => [oldAcceptance] })).toEqual([]);
+    expect(f.calls).toEqual([]);
+  });
+  it('observes a new ceremony with the same body as an older, superseded clearance', () => {
+    const f = fixture();
+    const oldClearance = { id: 'C_old', ...clearance(head) };
+    const acceptance = { id: 'C_accept', author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    f.provider.readPrState.mockReturnValue({ ...f.state, comments: [oldClearance, acceptance, { id: 'C_new', ...clearance(head) }] });
+    expect(f.run({ readComments: () => [oldClearance, acceptance] })).toEqual([]);
+    expect(f.calls).toEqual([]);
+  });
   it('skips incomplete comments', () => {
     const f = fixture();
     expect(f.run({ readComments: () => null })).toEqual([{ num: 7, skipped: 'live re-read failed: comments read returned no array' }]);
