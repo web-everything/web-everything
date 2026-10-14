@@ -50,6 +50,7 @@ import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mj
 import { readMainRedPriority } from './main-red-priority.mjs';
 import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-manifest.mjs';
 import { parseVerdictComment } from './review-log-claims.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
@@ -229,9 +230,8 @@ export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String
  * recently, which is why missing times sort last in {@link planCatchUp}. First acceptance comes from
  * the structured verdict comments (all heads); paginate comments so a long pre-review thread does not hide it.
  */
-const commentsFields = `nodes{body createdAt} pageInfo{hasNextPage endCursor}`;
 export function readyAtQuery(nums) {
-  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}} comments(first:100){${commentsFields}}}`;
+  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}}}`;
   return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${nums.map(one).join(' ')}}}`;
 }
 
@@ -267,7 +267,7 @@ function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
  * when each got its label and first acceptance (ready-time fallback when acceptance is unreadable). Never rejects.
  * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
  */
-export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile }) {
+export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile, readComments = readCompletePrComments }) {
   const [owner, name] = String(repo ?? '').split('/');
   if (!owner || !name) return { ok: false, error: `not an owner/name repo: ${JSON.stringify(repo)}` };
   const prs = [];
@@ -296,25 +296,14 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     if (times.ok) for (const p of batch) {
       const record = times.repository[`p${p.num}`];
       p.readyAt = latestReadyAt(record?.timelineItems);
-      let comments = record?.comments;
-      const dates = [];
-      const cursors = new Set();
-      while (comments) {
-        for (const comment of comments.nodes || []) {
+      try {
+        const dates = (await readComments(p.num, { repo })).flatMap((comment) => {
           const verdict = parseVerdictComment(comment);
           const date = Date.parse(comment.createdAt);
-          if (['accepted', 'clear-human'].includes(verdict?.kind) && Number.isFinite(date)) dates.push(date);
-        }
-        if (!comments.pageInfo?.hasNextPage) break;
-        const next = comments.pageInfo.endCursor;
-        if (!next || cursors.has(next)) break;
-        cursors.add(next);
-        const page = await ghGraphql({ owner, name, env, execFileImpl, cursor: next,
-          query: `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){p${p.num}:pullRequest(number:${p.num}){comments(first:100,after:$cursor){${commentsFields}}}}}` });
-        if (!page.ok) break;
-        comments = page.repository[`p${p.num}`]?.comments;
-      }
-      if (dates.length) p.firstAcceptedAt = Math.min(...dates);
+          return ['accepted', 'clear-human'].includes(verdict?.kind) && Number.isFinite(date) ? [date] : [];
+        });
+        if (dates.length) p.firstAcceptedAt = Math.min(...dates);
+      } catch { /* Keep the ready-time fallback when the complete thread is unreadable. */ }
     }
   }
   return { ok: true, prs, queued };

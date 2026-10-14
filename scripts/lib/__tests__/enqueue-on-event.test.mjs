@@ -11,6 +11,7 @@ import {
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
@@ -363,7 +364,7 @@ describe('planCatchUp', () => {
 describe('readCatchUpCandidates', () => {
   it('considers a ready candidate after a full page of drafts', async () => {
     const calls = [];
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, args, _opts, cb) => {
       calls.push(args);
       const repository = calls.length === 1
         ? { pullRequests: {
@@ -389,7 +390,7 @@ describe('readCatchUpCandidates', () => {
 
   it('refuses a partial listing when a later page fails', async () => {
     let calls = 0;
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, _args, _opts, cb) => {
       if (++calls === 1) cb(null, JSON.stringify({ data: { repository: {
         pullRequests: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'next' } },
       } } }));
@@ -401,7 +402,7 @@ describe('readCatchUpCandidates', () => {
 
   it('bounds ready-time reads across pages and preserves successful batches on a time-read failure', async () => {
     const calls = [];
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, args, _opts, cb) => {
       calls.push(args);
       const n = calls.length;
       if (n <= 2) {
@@ -425,7 +426,7 @@ describe('readCatchUpCandidates', () => {
 
   it.each([null, 'same'])('refuses a missing or repeated continuation cursor (%s)', async (cursor) => {
     let calls = 0;
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, _args, _opts, cb) => {
       calls += 1;
       cb(null, JSON.stringify({ data: { repository: { pullRequests: {
         nodes: [], pageInfo: { hasNextPage: true, endCursor: cursor },
@@ -436,7 +437,7 @@ describe('readCatchUpCandidates', () => {
   });
 
   it('refuses a listing without pagination metadata', async () => {
-    expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+    expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, _args, _opts, cb) => {
       cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [] } } } }));
     } })).toEqual({ ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' });
   });
@@ -445,7 +446,7 @@ describe('readCatchUpCandidates', () => {
     const env = { TEST: 'yes' };
     const ready = (createdAt, name = 'ready-to-merge') => ({ createdAt, label: { name } });
     const calls = [];
-    const result = await readCatchUpCandidates({ repo: REPO, env, execFileImpl: (...args) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], env, execFileImpl: (...args) => {
       calls.push(args.slice(0, 3));
       const data = calls.length === 1
         ? { repository: {
@@ -471,7 +472,7 @@ describe('readCatchUpCandidates', () => {
 
   it('keeps the listing when the ready-time read fails (readyAt null, sorted last)', async () => {
     let n = 0;
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_c, _a, _o, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_c, _a, _o, cb) => {
       n += 1;
       if (n === 1) cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ number: 7, isDraft: false, isInMergeQueue: false }], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } }));
       else cb(new Error('HTTP 502'));
@@ -480,7 +481,7 @@ describe('readCatchUpCandidates', () => {
   });
 
   it('treats a null merge queue as empty', async () => {
-    expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => cb(null,
+    expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, _args, _opts, cb) => cb(null,
       JSON.stringify({ data: { repository: { pullRequests: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } })),
     })).toEqual({ ok: true, prs: [], queued: 0 });
   });
@@ -490,12 +491,12 @@ describe('readCatchUpCandidates', () => {
     [new Error('exec failed\nextra'), '', 'exec failed'],
     [null, 'invalid JSON', expect.any(String)],
   ])('reports read failure without rejection', async (error, stdout, message) => {
-    expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => cb(error, stdout) }))
+    expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_cmd, _args, _opts, cb) => cb(error, stdout) }))
       .toEqual({ ok: false, error: message });
   });
 
   it('handles a synchronous exec exception', async () => {
-    expect(await readCatchUpCandidates({ repo: REPO, execFileImpl: () => { throw new Error('spawn failed'); } }))
+    expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: () => { throw new Error('spawn failed'); } }))
       .toEqual({ ok: false, error: 'spawn failed' });
   });
 });
@@ -680,17 +681,20 @@ describe('catch-up fill and stable acceptance ordering', () => {
 
   it('retains first acceptance across heads and restore, and falls back to ready time', async () => {
     const at = t => Date.parse(`2026-10-13T${t}:00Z`);
-    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: (num, { repo }) => {
+      expect(repo).toBe(REPO);
+      return num === 5027 ? [] : [
+        { body: '✅ review — accepted\n<!-- reviewed-sha: original -->', createdAt: `2026-10-13T${num === 5025 ? '16:49' : '17:00'}:00Z` },
+        ...(num === 5025 ? [{ body: '✅ review — `review:human` cleared via the sanctioned path\n<!-- reviewed-sha: restored -->', createdAt: '2026-10-13T19:11:00Z' }] : []),
+      ];
+    }, execFileImpl: (_cmd, _args, _opts, cb) => {
       const query = _args.find(a => a.startsWith('query='));
       const repository = query.includes('pullRequests(') ? {
         pullRequests: { nodes: [5025, 5026, 5027].map(number => ({ number })), pageInfo: { hasNextPage: false } },
         mergeQueue: { entries: { totalCount: 0 } },
       } : Object.fromEntries([5025, 5026, 5027].map(num => [`p${num}`, {
         timelineItems: { nodes: [{ createdAt: `2026-10-13T${num === 5025 ? '19:11' : num === 5026 ? '17:00' : '18:00'}:00Z`, label: { name: 'ready-to-merge' } }] },
-        comments: { nodes: num === 5027 ? [] : [
-          { body: '✅ review — accepted\n<!-- reviewed-sha: original -->', createdAt: `2026-10-13T${num === 5025 ? '16:49' : '17:00'}:00Z` },
-          ...(num === 5025 ? [{ body: '✅ review — `review:human` cleared via the sanctioned path\n<!-- reviewed-sha: restored -->', createdAt: '2026-10-13T19:11:00Z' }] : []),
-        ], pageInfo: { hasNextPage: false } },
+
       }]));
       cb(null, JSON.stringify({ data: { repository } }));
     } });
@@ -704,26 +708,40 @@ describe('catch-up fill and stable acceptance ordering', () => {
 
 it('reads an acceptance beyond the first comments page', async () => {
   let calls = 0;
-  const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
-    calls++;
-    const repository = calls === 1 ? {
-      pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
-      mergeQueue: { entries: { totalCount: 0 } },
-    } : { p42: {
-      timelineItems: { nodes: [] },
-      comments: calls === 2 ? {
-        nodes: Array.from({ length: 100 }, () => ({ body: 'ordinary comment', createdAt: '2026-10-01' })),
-        pageInfo: { hasNextPage: true, endCursor: 'comments-next' },
-      } : {
-        nodes: [{ body: '✅ review — `review:human` cleared via the sanctioned path', createdAt: '2026-10-02' }],
-        pageInfo: { hasNextPage: false },
-      },
-    } };
-    if (calls === 3) expect(args).toContain('cursor=comments-next');
-    cb(null, JSON.stringify({ data: { repository } }));
-  } });
-  expect(calls).toBe(3);
+  const result = await readCatchUpCandidates({ repo: REPO,
+    readComments: (number, opts) => readCompletePrComments(number, { ...opts, exec: (cmd, args) => {
+      expect(cmd).toBe('gh');
+      expect(args).toContain('--paginate');
+      expect(args).toContain(`repos/${REPO}/issues/42/comments`);
+      // gh --paginate emits all pages through the shared reader's TSV projection.
+      return Array.from({ length: 100 }, () => 'ordinary comment\t2026-10-01\tbot').join('\n') +
+        '\n✅ review — `review:human` cleared via the sanctioned path\t2026-10-02\tbot\n';
+    } }),
+    execFileImpl: (_cmd, args, _opts, cb) => {
+      calls++;
+      const repository = calls === 1 ? {
+        pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
+        mergeQueue: { entries: { totalCount: 0 } },
+      } : { p42: { timelineItems: { nodes: [] } } };
+      expect(args.find(a => a.startsWith('query='))).not.toContain('comments(');
+      cb(null, JSON.stringify({ data: { repository } }));
+    },
+  });
+  expect(calls).toBe(2);
   expect(result.prs[0].firstAcceptedAt).toBe(Date.parse('2026-10-02'));
+});
+
+it('keeps ready time when the complete comment read fails', async () => {
+  const result = await readCatchUpCandidates({ repo: REPO,
+    readComments: (number, opts) => readCompletePrComments(number, { ...opts, exec: () => { throw new Error('HTTP 502'); } }),
+    execFileImpl: (_cmd, args, _opts, cb) => {
+      const repository = args.includes(`query=${CATCH_UP_QUERY}`) ? {
+        pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
+      } : { p42: { timelineItems: { nodes: [{ createdAt: '2026-10-02', label: { name: 'ready-to-merge' } }] } } };
+      cb(null, JSON.stringify({ data: { repository } }));
+    },
+  });
+  expect(result).toEqual({ ok: true, queued: 0, prs: [candidate(42, Date.parse('2026-10-02'))] });
 });
 
 it('uses oldest-ready fallback when acceptance history cannot be read', async () => {
