@@ -111,8 +111,32 @@ export function foldPrecedents(events, { operatorLogins = ['chalbert'], trustedS
   return records;
 }
 
+// Evidence time of a citation: [authored, revised]. A comment source is [commentId, createdAt, updatedAt];
+// a source-less event is a direct recording stamped with its occurrence time.
+function evidenceTime(ev) {
+  try {
+    const source = JSON.parse(ev.source ?? '');
+    if (Array.isArray(source) && source.length === 3) return [Date.parse(source[1]), Date.parse(source[2])];
+  } catch { /* not a comment source */ }
+  return [Date.parse(ev.at), Date.parse(ev.at)];
+}
+const strictlyNewer = (a, b) => {
+  const [aAuthored, aRevised] = evidenceTime(a), [bAuthored, bRevised] = evidenceTime(b);
+  if (!Number.isFinite(aAuthored) || !Number.isFinite(bAuthored)) return false;
+  if (aAuthored !== bAuthored) return aAuthored > bAuthored;
+  return Number.isFinite(aRevised) && Number.isFinite(bRevised) && aRevised > bRevised;
+};
+
+// Latest evidence per seat wins. Log order only breaks ties: a re-backfilled edit of an OLDER comment is
+// stored after a newer verdict, so append order alone would let stale evidence replace it.
 export function foldCitations(events) {
-  return [...new Map(events.filter((ev) => ev.kind === 'citation').map((ev) => [ev.id, ev])).values()];
+  const latest = new Map();
+  for (const ev of events) {
+    if (ev.kind !== 'citation') continue;
+    const prior = latest.get(ev.id);
+    if (!prior || !strictlyNewer(prior, ev)) latest.set(ev.id, ev);
+  }
+  return [...latest.values()];
 }
 
 export function globToRegExp(glob) {

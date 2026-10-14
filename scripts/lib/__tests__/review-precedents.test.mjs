@@ -63,6 +63,19 @@ describe('records and events', () => {
     expect(p.precedentEventId(first)).toBe(JSON.stringify([first.id, '', first.ids, at]));
     expect(p.foldCitations([first, { ...first, verdict: 'changes' }])).toEqual([{ ...first, verdict: 'changes' }]);
   });
+  it('folds citations by evidence time, so a late-stored older comment never replaces a newer verdict', () => {
+    const source = (comment, created, updated) => JSON.stringify([comment, created, updated]);
+    const base = { repo: REPO, pr: 1, head: 'abcdef1', ids: [seeds[0].id], seat: 'panel', at };
+    const accept = p.citationEvent({ ...base, verdict: 'accept', source: source(2, '2026-10-13T11:00:00Z', '2026-10-13T11:00:00Z') });
+    const staleEdit = p.citationEvent({ ...base, verdict: 'changes', source: source(1, '2026-10-13T10:00:00Z', '2026-10-13T12:00:00Z') });
+    expect(p.foldCitations([accept, staleEdit])).toEqual([accept]);
+    const revised = p.citationEvent({ ...base, verdict: 'changes', source: source(2, '2026-10-13T11:00:00Z', '2026-10-13T13:00:00Z') });
+    expect(p.foldCitations([revised, accept])).toEqual([revised]);
+    // A direct (source-less) recording is ordered by its occurrence time.
+    const live = p.citationEvent({ ...base, verdict: 'block', at: '2026-10-13T10:30:00Z' });
+    expect(p.foldCitations([accept, live])).toEqual([accept]);
+    expect(p.foldCitations([live, staleEdit])).toEqual([live]);
+  });
 });
 
 describe('recorded operator capture', () => {

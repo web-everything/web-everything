@@ -166,4 +166,24 @@ describe('settings and drafting', () => {
     const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
     expect(io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.seat, e.verdict])).toEqual([['advisory', 'advisory'], ['panel', 'changes']]);
   });
+  it('keeps the newer verdict when an older comment is edited and backfilled again', () => {
+    const cite = verdict => `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: abcdef987 -->`;
+    const older = { ...comment(cite('🔁 review — changes requested'), AUTOMATION_LOGINS[0]), id: 1, createdAt: '2026-10-13T10:00:00Z', updatedAt: '2026-10-13T10:00:00Z' };
+    const newer = { ...comment(cite('✅ review — accepted'), AUTOMATION_LOGINS[0]), id: 2, createdAt: '2026-10-13T11:00:00Z', updatedAt: '2026-10-13T11:00:00Z' };
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const backfill = comments => io.appendPrecedentEvents({ repo, events: io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, comments }, at }), stage });
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => e.verdict);
+    backfill([older, newer]);
+    expect(panel()).toEqual(['accept']);
+    // Editing the older comment changes its revision, so the backfill stores it again after the newer verdict.
+    const edited = { ...older, body: `${older.body}\ntypo fixed`, updatedAt: '2026-10-13T12:00:00Z' };
+    expect(backfill([edited, newer]).rows).toBe(1);
+    expect(panel()).toEqual(['accept']);
+    // A later revision of the SAME comment still replaces its earlier revision.
+    const reworded = { ...newer, body: cite('🔁 review — changes requested'), updatedAt: '2026-10-13T13:00:00Z' };
+    expect(backfill([edited, reworded]).rows).toBe(1);
+    expect(panel()).toEqual(['changes']);
+  });
 });

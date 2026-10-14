@@ -183,7 +183,8 @@ export function recordCitationsFromComments({ repo, pr, info, at }) {
     const head = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? info.headRefOid;
     const source = comment.id ?? comment.url ?? comment.createdAt;
     events.push(citationEvent({ repo, pr, head, ids, seat: verdict === 'advisory' ? 'advisory' : 'panel', verdict, at,
-      source: source == null ? '' : JSON.stringify([source, comment.updatedAt ?? comment.createdAt ?? '']) }));
+      // [comment, authored, revised]: the fold orders by authored time, so an edit never makes old evidence newest.
+      source: source == null ? '' : JSON.stringify([source, comment.createdAt ?? '', comment.updatedAt ?? comment.createdAt ?? '']) }));
   }
   return events;
 }
