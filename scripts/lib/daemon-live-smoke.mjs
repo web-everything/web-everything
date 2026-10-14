@@ -884,8 +884,8 @@ export async function runLiveSmoke({
         }
       };
       try {
-        const checkEnv = memoDir && ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
-          ? { ...env, [WE_GH_READ_MEMO_DIR]: memoDir } : env;
+        const checkEnv = ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
+          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`, ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}) } : env;
         result = await check.run({ ...ctx, env: checkEnv, runChild: trackedRunChild });
       } catch (e) {
         result = { ok: false, detail: `threw: ${firstLine(e)}` };

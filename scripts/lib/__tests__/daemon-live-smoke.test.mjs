@@ -545,10 +545,14 @@ describe('smoke read memo', () => {
       if (opts.env?.WE_GH_READ_MEMO_DIR) expect(existsSync(opts.env.WE_GH_READ_MEMO_DIR)).toBe(true);
       return runChild(cmd, args, opts);
     };
-    await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: enabled }, runChild: recording });
+    await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: enabled, GH_CALLER: 'caller-smoke' }, runChild: recording });
     const dryRuns = calls.filter(({ args }) => args[0] === 'scripts/conveyor/reconcile-pass.mjs'
       || args[0] === '--input-type=module' && args[2] === DISPATCH_DRY_RUN_SCRIPT);
     expect(dryRuns.length).toBeGreaterThan(1);
+    for (const call of dryRuns) {
+      const checkName = call.args[0] === 'scripts/conveyor/reconcile-pass.mjs' ? 'reconcile-dry-run' : 'dispatch-dry-run';
+      expect(call.env.GH_CALLER).toBe(`rebuild-smoke:${checkName}`);
+    }
     const dirs = dryRuns.map(({ env }) => env.WE_GH_READ_MEMO_DIR);
     if (enabled === '1') {
       expect(typeof dirs[0]).toBe('string');
@@ -557,6 +561,7 @@ describe('smoke read memo', () => {
     } else expect(dirs.every((dir) => dir === undefined)).toBe(true);
     for (const call of calls.filter((call) => !dryRuns.includes(call))) {
       expect(call.env?.WE_GH_READ_MEMO_DIR).toBeUndefined();
+      expect(call.env?.GH_CALLER).toBe('caller-smoke');
     }
     expect(dryRuns[0].args[0]).toBe('scripts/conveyor/reconcile-pass.mjs');
   });
