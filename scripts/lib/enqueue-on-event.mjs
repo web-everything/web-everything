@@ -22,13 +22,16 @@
  *   a full pass never run at the same time in one clone.
  *
  * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number,
- *   catchUp: { enabled: boolean, intervalMinutes: number, maxQueued: number, order: string } }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10, maxQueued:12, order:"priority-then-first-accept"}}` → platform
+ *   catchUp: { enabled: boolean, intervalMinutes: number, maxQueued: number, missSmellAfter: number, order: string } }`, resolved through the shared
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10, maxQueued:12, missSmellAfter:3, order:"priority-then-first-accept"}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
  *   debounceSeconds: wait this long after the PR's LAST eligible event before running (check suites finish in a
  *   burst, and GitHub's mergeable state lags the last check by a few seconds).
+ *
+ *   missSmellAfter: positive integer (standard 3); every threshold of consecutive admission misses logs
+ *   SMELL enqueue-not-entering. Enqueue claims are re-read from GitHub; misses retry next catch-up.
  *
  *   catchUp: when both enabled flags are true, list ready PRs on start and every intervalMinutes (1–240),
  *   priority class, build.priority list, then first acceptance (ready-time fallback); capped by maxQueued minus queued PRs; use the same fast-drain path. WHY: an
@@ -54,7 +57,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, maxQueued: 12, order: 'priority-then-first-accept' }) });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, maxQueued: 12, missSmellAfter: 3, order: 'priority-then-first-accept' }) });
 /** A fast drain that runs longer than this is stopped (SIGTERM); the PR rides the next full pass. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -66,6 +69,7 @@ const CATCH_UP_VALID = {
   enabled: (v) => typeof v === 'boolean',
   intervalMinutes: validInterval,
   maxQueued: (v) => Number.isInteger(v) && v >= 1,
+  missSmellAfter: (v) => Number.isInteger(v) && v >= 1,
   order: (v) => ['priority-then-first-accept', 'oldest-ready'].includes(v),
 };
 const VALID = {
@@ -76,7 +80,7 @@ const VALID = {
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, maxQueued:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, maxQueued:number, missSmellAfter:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -109,11 +113,11 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // The cascade rejects values outside the union before the per-leaf type check can see them.
   for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|maxQueued|order)=.*)$/.exec(invalid);
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|maxQueued|missSmellAfter|order)=.*)$/.exec(invalid);
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -178,6 +182,10 @@ export function summarizeFastDrain(json, num) {
   const hit = (list) => (Array.isArray(list) ? list.find((x) => Number(x?.num) === Number(num)) : null);
   const failed = hit(json.failed);
   if (failed) return `failed: ${String(failed.detail || failed.reason || failed.error || '').slice(0, 200)}`;
+  const outcome = hit(json.enqueueOutcomes);
+  if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${outcome.kind}: ${outcome.reason || ''}`.slice(0, 200);
+  if (outcome?.outcome === 'enqueued') return `passed every drain gate — enqueued${outcome.already ? ' (already queued)' : ''}`;
+  if (Array.isArray(json.enqueueOutcomes) && hit(json.toMerge)) return 'not enqueued: no enqueue outcome recorded';
   const aborted = hit(json.revalidationAborted);
   if (aborted) return `not enqueued: ${String(aborted.reason || aborted.detail || '').slice(0, 200)}`;
   // An enqueued PR is also listed in skipReasons ("ready-not-reached": queued, not merged), so toMerge wins over it.
@@ -228,6 +236,23 @@ export function readPrForWake({ repo, num, env = process.env, execFileImpl = exe
       try { res(JSON.parse(String(stdout || 'null'))); } catch { res(null); }
     });
   });
+}
+
+/** Read GitHub's actual queue membership and latest admission/removal evidence. Never throws. */
+export async function readMergeQueueMembership({ repo, num, env = process.env, execFileImpl = execFile } = {}) {
+  try {
+    const [owner, name] = String(repo || '').split('/');
+    if (!owner || !name || !Number.isInteger(Number(num)) || Number(num) < 1) return { ok: false, error: 'invalid repo or PR number' };
+    const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){pullRequest(number:${Number(num)}){
+      isInMergeQueue mergeQueueEntry{state position}
+      timelineItems(last:5,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename
+        ... on RemovedFromMergeQueueEvent{reason createdAt} ... on AddedToMergeQueueEvent{createdAt}}}}}}`;
+    const result = await ghGraphql({ query, owner, name, env, execFileImpl });
+    if (!result.ok) return result;
+    const pr = result.repository.pullRequest;
+    if (typeof pr?.isInMergeQueue !== 'boolean') return { ok: false, error: 'no pullRequest isInMergeQueue in the GraphQL answer' };
+    return { ok: true, inQueue: pr.isInMergeQueue, entry: pr.mergeQueueEntry ?? null, lastEvents: pr.timelineItems?.nodes || [] };
+  } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
 }
 
 export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
@@ -379,7 +404,7 @@ const lastJsonLine = (s) => {
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readCandidates?:Function, readCapacity?:Function, readPriorities?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readMembership?:Function, readCandidates?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
@@ -388,8 +413,10 @@ export function createEnqueueOnEvent({
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
+  readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   timeoutMs = FAST_DRAIN_TIMEOUT_MS, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
+  const misses = new Map();
   let pending = new Map();
   let running = null; // the serialized tick/catch-up promise
   let runningCatchUpOnly = false;
@@ -502,13 +529,44 @@ export function createEnqueueOnEvent({
       const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild: (c) => { child = c; } });
       child = null;
       const json = lastJsonLine(r.stdout);
-      const what = r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
-      if (p.catchUp && !r.error && fastDrainUsedNoRoom(json, p.num)) {
+      let what = r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
+      const summary = what;
+      let verified = null;
+      let missed = what.startsWith('not enqueued:');
+      if (what.startsWith('passed every drain gate — enqueued')) {
+        let membership;
+        try { membership = await readMembership({ repo: p.repo, num: p.num }); }
+        catch (e) { membership = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+        if (!membership?.ok) what += ` (unverified: ${membership?.error || 'membership unreadable'})`;
+        else if (membership.inQueue) {
+          verified = true;
+          misses.delete(p.num);
+          what += ` (verified: isInMergeQueue=true${membership.entry?.position != null ? `, position ${membership.entry.position}` : ''}${membership.entry?.state ? `, state ${membership.entry.state}` : ''})`;
+        } else {
+          verified = false;
+          missed = true;
+          const events = (membership.lastEvents || []).map(e => `${e.__typename}${e.createdAt ? ` at ${e.createdAt}` : ''}${e.reason ? `: ${e.reason}` : ''}`).join('; ') || 'no AddedToMergeQueue event';
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${events}; fast-drain stderr: ${stderr}) — retrying on the next catch-up`;
+        }
+      }
+      if (missed) {
+        const count = (misses.get(p.num) || 0) + 1;
+        misses.set(p.num, count);
+        const threshold = s.catchUp?.missSmellAfter ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missSmellAfter;
+        if (count % threshold === 0) log(`enqueue-on-event: SMELL enqueue-not-entering — #${p.num} missed the merge queue ${count} catch-up(s) in a row (last: ${what}); check the fast drain's enqueueOutcomes / adaptive batching state`);
+      }
+      if (p.catchUp && summary.startsWith('not enqueued: batching-deferred:')) {
+        let dropped = 0;
+        pending = new Map(pending);
+        for (const [key, entry] of pending) if (entry.catchUp) { pending.delete(key); dropped++; }
+        log(`enqueue-on-event: catch-up stopping this round — batching deferred #${p.num} (${summary.slice('not enqueued: batching-deferred:'.length).trim()}); ${dropped} PR(s) retried at the next catch-up`);
+      } else if (p.catchUp && !r.error && fastDrainUsedNoRoom(json, p.num)) {
         catchUpRoom++;
         refillCatchUp();
       }
       log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what}`);
-      ran.push({ ...metadata, num: p.num, code: r.code, what });
+      ran.push({ ...metadata, num: p.num, code: r.code, what, verified });
     }
     return ran;
   }
@@ -532,6 +590,7 @@ export function createEnqueueOnEvent({
     idle() { return running ? running.then(() => undefined, () => undefined) : Promise.resolve(); },
     /** Stop the in-flight fast drain (the daemon calls this on its own exit, like it stops its pass child). */
     kill() { if (child) { try { child.kill('SIGTERM'); } catch { /* gone */ } } },
+    misses: () => new Map(misses),
     pending: () => [...pending.values()],
     setting: () => setting,
     lastCatchUpAt: () => lastCatchUpAt,

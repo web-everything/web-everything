@@ -80,6 +80,11 @@ import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
 import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
+import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
+export { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
+import { WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
+import { WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS } from './pr-snapshot.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -233,6 +238,22 @@ export function resolveIoBoundLoadScale(env = process.env) {
   } catch { return { enabled: true, source: 'standard' }; }
 }
 
+/** Share repeated dry-run reads within one smoke.
+ * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
+ * @returns {{enabled:boolean, source:string}} */
+export function resolveSmokeReadMemo(env = process.env) {
+  try {
+    const v = env?.WE_SMOKE_READ_MEMO;
+    const r = cascadePolicy('rebuildSmokeReadMemo', readDeclaredSettings().settings.rebuildSmokeReadMemo, {
+      env, standard: { enabled: true },
+      envValues: { enabled: v === '0' ? false : v === '1' ? true : undefined },
+      valid: { enabled: (x) => typeof x === 'boolean' },
+    });
+    return { enabled: r.value?.enabled !== false, source: r.sources?.enabled ?? 'standard' };
+  } catch { return { enabled: true, source: 'standard' }; }
+}
+
+
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // #4044: a crashed node child's first stderr line is only the stack LOCATION (`node:internal/modules/cjs/
 // loader:1227`) — the live 08:14 ET smoke-rejected alert carried nothing else, hiding that the gh shim's baked
@@ -324,11 +345,11 @@ async function checkLanePoolList(ctx) {
     // `env` here is a no-op in production (the default `env = process.env` at `runLiveSmoke`'s own boundary
     // already IS the real ambient env), so this only changes behavior for a caller that deliberately passed a
     // different one — exactly the case that was silently being dropped.
-    const out = await runChild('node', ['scripts/lane-pool.mjs', 'list', '--acquirable', '--no-cache', '--limit=1', '--json'], {
+    const out = await runChild('node', ['scripts/lane-pool.mjs', 'list', '--acquirable', ...(ctx.dryRun?.lanePoolListCache ? [] : ['--no-cache']), '--limit=1', '--json'], {
       cwd: root, timeoutMs: capMs, env,
     });
     JSON.parse(out);
-    return { ok: true, detail: 'lane-pool list --acquirable --no-cache --limit=1 ok' };
+    return { ok: true, detail: `lane-pool list --acquirable ${ctx.dryRun?.lanePoolListCache ? '' : '--no-cache '}--limit=1 ok` };
   } catch (e) {
     const detail = `lane-pool list --acquirable failed: ${firstLine(e)}`;
     return busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs, ctx })
@@ -531,12 +552,14 @@ const DISPATCH_DRY_RUN_LINES = [
   "  }",
   "}",
   "function record(kind, pr, fn) {",
-  "  try { fn(); results.push({ kind, pr: pr === undefined ? null : pr, ok: true }); }",
-  "  catch (e) { results.push({ kind, pr: pr === undefined ? null : pr, ok: false, error: String((e && e.message) || e) }); }",
+  "  const start = Date.now();",
+  "  try { fn(); results.push({ kind, pr: pr === undefined ? null : pr, ms: Date.now() - start, ok: true }); }",
+  "  catch (e) { results.push({ kind, pr: pr === undefined ? null : pr, ms: Date.now() - start, ok: false, error: String((e && e.message) || e) }); }",
   "}",
   "async function recordAsync(kind, pr, fn) {",
-  "  try { await fn(); results.push({ kind, pr: pr === undefined ? null : pr, ok: true }); }",
-  "  catch (e) { results.push({ kind, pr: pr === undefined ? null : pr, ok: false, error: String((e && e.message) || e) }); }",
+  "  const start = Date.now();",
+  "  try { await fn(); results.push({ kind, pr: pr === undefined ? null : pr, ms: Date.now() - start, ok: true }); }",
+  "  catch (e) { results.push({ kind, pr: pr === undefined ? null : pr, ms: Date.now() - start, ok: false, error: String((e && e.message) || e) }); }",
   "}",
   "",
   "// 1. review — direct dispatchReview call. review-dispatch never derives an item/scope, so any positive PR",
@@ -661,12 +684,13 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
   if (!Array.isArray(parsed) || !parsed.length) {
     return { ok: false, detail: 'dispatch dry-run reported no rows — refusing to treat "nothing ran" as a pass' };
   }
+  const timings = parsed.map((r) => `${r.kind} ${Number.isFinite(r.ms) ? (r.ms < 1000 ? `${r.ms}ms` : `${Math.round(r.ms / 100) / 10}s`) : 'unknown'}`).join(', ');
   const failures = parsed.filter((r) => !r.ok);
   if (failures.length) {
     const detail = failures.map((f) => `${f.kind}${f.pr != null ? ` PR #${f.pr}` : ''}: ${f.error}`).join('; ');
-    return { ok: false, detail: `dispatch dry-run failed (${failures.length}/${parsed.length}): ${detail}` };
+    return { ok: false, detail: `dispatch dry-run failed (${failures.length}/${parsed.length}): ${detail} — ${timings}` };
   }
-  return { ok: true, detail: `dispatch dry-run ok — ${parsed.map((r) => r.kind).join(', ')}` };
+  return { ok: true, detail: `dispatch dry-run ok — ${timings}` };
 }
 
 /**
@@ -789,6 +813,7 @@ export async function runLiveSmoke({
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
+  makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -803,75 +828,101 @@ export async function runLiveSmoke({
   } catch { shadowArgs = { gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke', oldVerdict: null, oldReason: 'load probe failed', env }; }
   const admission = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs });
   const budgets = resolveSmokeBudgets(env, { ...host, admission });
+  const readMemo = resolveSmokeReadMemo(env);
+  const dryRun = resolveSmokeDryRun(env);
   try { // The I/O-bound rule's source, once per smoke, next to the shadow line (silent under test).
     if (isDecision(admission) && !process.env.VITEST) {
       const io = resolveIoBoundLoadScale(env);
       console.error(`daemon-live-smoke: io-bound-load-scale ${JSON.stringify({ ...io, verdict: admission.verdict, reconcileMs: budgets.reconcileMs, dispatchDryRunMs: budgets.dispatchDryRunMs })}`);
     }
+    if (!process.env.VITEST) {
+      console.error(`daemon-live-smoke: smoke-read-memo ${JSON.stringify(readMemo)}`);
+      console.error(`daemon-live-smoke: smoke-dry-run ${JSON.stringify(dryRun)}`);
+    }
   } catch { /* logging never changes the smoke */ }
-  const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
-  const ghChildEnv = ghDispatchedSessionEnv(env);
-  // xp4lw2v — the porcelain snapshot BEFORE any check below runs, best-effort (never throws, never blocks the
-  // rest of the smoke on a failed read): {@link checkTreeStaysClean} uses it to report pre-existing dirt
-  // distinctly from dirt its own checks introduced. `null` on any failure — the check then treats every dirty
-  // path found afterward as unclassified rather than guessing.
-  let beforePorcelain = null;
+  let memoDir = null;
   try {
-    beforePorcelain = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
-  } catch { /* best-effort — see comment above */ }
-  // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
-  // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
-  // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
-  const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy };
-  const results = [];
-  for (const check of SMOKE_CHECKS) {
-    const startedAt = clock();
-    let result;
-    if (checkCodeUnchanged({ check, changedFiles, root, closureOf })) {
-      results.push({
-        name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
-        detail: 'code unchanged since the last live-verified build — not re-run (#4044)',
-      });
-      continue;
+    if (readMemo.enabled) memoDir = makeReadMemoDir();
+  } catch { /* Optional acceleration: run every check without a memo if tmp storage is unavailable. */ }
+  try {
+    const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
+    if ([WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS].some(key => key in env)) {
+      env = { ...env };
+      delete env[WE_GH_READ_MEMO_DIR];
+      delete env[WE_PR_SNAPSHOT_SAMPLE];
+      delete env[WE_PR_SNAPSHOT_STALE_OK_MS];
     }
-    const childFailures = [];
-    let childCalls = 0;
-    let bootOutputsOk = true;
-    const trackedRunChild = async (cmd, args, opts) => {
-      childCalls++;
-      const start = clock();
-      const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
-      try {
-        const out = await runChild(cmd, args, opts);
-        if (check.name === 'daemon-entries-boot') {
-          try { bootOutputsOk &&= !!JSON.parse(out)?.ok; } catch { bootOutputsOk = false; }
-        }
-        return out;
-      }
-      catch (e) {
-        childFailures.push({ ok: false, ms: clock() - start, mayBeTransient: check.mayBeTransient !== false,
-          detail: `child failed: ${firstLine(e)}`,
-          budgetSkipped: outOfBudget && /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(firstLine(e)) });
-        throw e;
-      }
-    };
+    const ghChildEnv = ghDispatchedSessionEnv(env);
+    // xp4lw2v — the porcelain snapshot BEFORE any check below runs, best-effort (never throws, never blocks the
+    // rest of the smoke on a failed read): {@link checkTreeStaysClean} uses it to report pre-existing dirt
+    // distinctly from dirt its own checks introduced. `null` on any failure — the check then treats every dirty
+    // path found afterward as unclassified rather than guessing.
+    let beforePorcelain = null;
     try {
-      result = await check.run({ ...ctx, runChild: trackedRunChild });
-    } catch (e) {
-      result = { ok: false, detail: `threw: ${firstLine(e)}` };
+      beforePorcelain = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
+    } catch { /* best-effort — see comment above */ }
+    // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
+    // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
+    // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
+    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
+    const results = [];
+    for (const check of SMOKE_CHECKS) {
+      const startedAt = clock();
+      let result;
+      if (checkCodeUnchanged({ check, changedFiles, root, closureOf })) {
+        results.push({
+          name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
+          detail: 'code unchanged since the last live-verified build — not re-run (#4044)',
+        });
+        continue;
+      }
+      const childFailures = [];
+      let childCalls = 0;
+      let bootOutputsOk = true;
+      const trackedRunChild = async (cmd, args, opts) => {
+        childCalls++;
+        const start = clock();
+        const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
+        try {
+          const out = await runChild(cmd, args, opts);
+          if (check.name === 'daemon-entries-boot') {
+            try { bootOutputsOk &&= !!JSON.parse(out)?.ok; } catch { bootOutputsOk = false; }
+          }
+          return out;
+        }
+        catch (e) {
+          childFailures.push({ ok: false, ms: clock() - start, mayBeTransient: check.mayBeTransient !== false,
+            detail: `child failed: ${firstLine(e)}`,
+            budgetSkipped: outOfBudget && /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(firstLine(e)) });
+          throw e;
+        }
+      };
+      try {
+        const checkEnv = ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
+          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`, ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}),
+            ...(dryRun.prSample ? { [WE_PR_SNAPSHOT_SAMPLE]: String(dryRun.prSample) } : {}),
+            ...(dryRun.snapshotStaleOkMs ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(dryRun.snapshotStaleOkMs) } : {}) } : env;
+        result = await check.run({ ...ctx, env: checkEnv, runChild: trackedRunChild });
+      } catch (e) {
+        result = { ok: false, detail: `threw: ${firstLine(e)}` };
+      }
+      // Reconcile aggregates child failures only; other checks can parse a successful child's output into a
+      // code failure. Never hide that output just because a later child was refused by the budget wrapper.
+      const budgetInterrupted = !result.ok && childFailures.some((r) => r.budgetSkipped)
+        && (check.name === 'reconcile-dry-run' || childFailures.length === childCalls
+          || (check.name === 'daemon-entries-boot' && bootOutputsOk))
+        && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
+          || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
+      results.push({ name: check.name, ms: clock() - startedAt, ...result,
+        ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
     }
-    // Reconcile aggregates child failures only; other checks can parse a successful child's output into a
-    // code failure. Never hide that output just because a later child was refused by the budget wrapper.
-    const budgetInterrupted = !result.ok && childFailures.some((r) => r.budgetSkipped)
-      && (check.name === 'reconcile-dry-run' || childFailures.length === childCalls
-        || (check.name === 'daemon-entries-boot' && bootOutputsOk))
-      && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
-        || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
-    results.push({ name: check.name, ms: clock() - startedAt, ...result,
-      ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
+    return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
+      ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
+  } finally {
+    if (memoDir) {
+      try { rmSync(memoDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
   }
-  return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
-    ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
 }
 
 // ── Transient vs. code classification (Module D) — see the file header for the full rationale. ──
