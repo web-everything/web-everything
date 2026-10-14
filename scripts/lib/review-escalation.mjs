@@ -1972,41 +1972,47 @@ export function isAcceptRecordBody(body) {
 /** The headings whose producers stamp a human clearance (clear-human, a restamp or carry of one); never a plain accept. */
 const CLEARANCE_HEADINGS = ACCEPT_RECORD_HEADINGS.filter((h) => h !== '✅ review — accepted');
 const CLEARED_HUMAN_LINE_RE = new RegExp(`^<!--\\s*${CLEARED_HUMAN_MARKER}:\\s*([^>]*?)\\s*-->$`);
-const MARKER_LINE_RE = /^<!--.*-->$/;
+const REVIEWED_SHA_LINE_RE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*[0-9a-fA-F]{7,40}\\s*-->$`);
+/** Exactly ONE `<!-- … -->` comment filling the line: `<!-- a --> visible text <!-- b -->` is not a marker line. */
+const MARKER_LINE_RE = /^<!--(?:(?!-->).)*-->$/;
 const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
+/** Per line: is it a fence line or inside a fenced code block? An unclosed fence runs to the end (fail closed). */
+function fencedLines(lines) {
+  let fence = null; // { char, len } while inside a fenced code block
+  return lines.map((line) => {
+    const f = FENCE_LINE_RE.exec(line);
+    if (!f) return fence !== null;
+    if (!fence) fence = { char: f[1][0], len: f[1].length };
+    else if (f[1][0] === fence.char && f[1].length >= fence.len && line.trim() === f[1]) fence = null;
+    return true;
+  });
+}
 
 /**
  * Pure: is this comment a human clearance AUTHORED in the sanctioned shape, not one quoted inside other prose (PR #5237
- * operator send-back, 2026-10-14)? Either:
- *   - it opens (first non-blank line, column 0) with a clearance-stamping heading ({@link CLEARANCE_HEADINGS}) and
- *     carries the `cleared-human` marker on a line of its own, at column 0, outside any code fence (as
- *     `buildVerdictComment` / `buildCarryRecordBody` write it), or the legacy prose attribution `CLEARED_HUMAN_PROSE_RE`
- *     (anchored to the start of the body under the clear-human heading); or
- *   - it is a bare marker record: every non-blank line is a whole `<!-- … -->` marker line at column 0 (no prose
- *     around it, so nothing is being quoted).
- * A blockquote (`> `), an indented block, a fence, prose before the heading or the marker mid-line all fail.
+ * operator send-back, 2026-10-14)? Exactly as its producers write it (`buildVerdictComment` clear-human / a restamp
+ * carrying one, `buildCarryRecordBody`): the first non-blank line is a clearance-stamping heading at column 0
+ * ({@link CLEARANCE_HEADINGS}), and the body ENDS with its marker block (consecutive whole-line markers, one comment per
+ * line, column 0, outside any fence) holding the `cleared-human` marker. The legacy prose attribution
+ * (`CLEARED_HUMAN_PROSE_RE`, anchored under the heading) counts only with a `reviewed-sha` marker in that same block.
+ * Anything else fails: a bare marker-only body (no producer writes one), a blockquote, an indented block, a fence, prose
+ * before the heading, a marker mid-line or with visible text around it, or text after the marker block (a raw paste of
+ * a clearance followed by "revoked").
  */
 export function isSanctionedClearanceBody(body) {
   const lines = bodyLines(body);
-  const nonBlank = lines.filter((l) => l.trim() !== '');
-  if (!nonBlank.length) return false;
-  const bare = nonBlank.every((l) => MARKER_LINE_RE.test(l));
-  if (!bare && !CLEARANCE_HEADINGS.includes(nonBlank[0].trimEnd())) return false;
-  if (!bare) {
-    CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
-    if (CLEARED_HUMAN_PROSE_RE.exec(String(body)) !== null) return true;
-  }
-  let fence = null; // { char, len } while inside a fenced code block
-  for (const line of lines) {
-    const f = FENCE_LINE_RE.exec(line);
-    if (f) {
-      if (!fence) fence = { char: f[1][0], len: f[1].length };
-      else if (f[1][0] === fence.char && f[1].length >= fence.len && line.trim() === f[1]) fence = null;
-      continue;
-    }
-    if (!fence && CLEARED_HUMAN_LINE_RE.test(line)) return true;
-  }
-  return false;
+  const first = lines.find((l) => l.trim() !== '');
+  if (first === undefined || !CLEARANCE_HEADINGS.includes(first.trimEnd())) return false;
+  const fenced = fencedLines(lines);
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === '') end--;
+  let start = end;
+  while (start > 0 && !fenced[start - 1] && MARKER_LINE_RE.test(lines[start - 1])) start--;
+  const tail = lines.slice(start, end);
+  if (tail.some((l) => CLEARED_HUMAN_LINE_RE.test(l))) return true;
+  CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
+  return CLEARED_HUMAN_PROSE_RE.exec(String(body)) !== null && tail.some((l) => REVIEWED_SHA_LINE_RE.test(l));
 }
 
 /** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */

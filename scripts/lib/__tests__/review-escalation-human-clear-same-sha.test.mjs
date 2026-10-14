@@ -87,6 +87,12 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     ['raw lines after prose', `Re-posting for the record (still revoked):\n${block}`],
     ['indented block', block.split('\n').map(l => `    ${l}`).join('\n')],
     ['heading kept, markers only inside a fence', `${CLEAR_HEADING}\n\nThis was revoked:\n\n\`\`\`\n<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->\n\`\`\`\n<!-- reviewed-sha: ${X} -->`],
+    // Self-review round: a bare marker-only body (invisible on GitHub, so the likeliest re-post) is no producer's shape.
+    ['bare markers only', `<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->`],
+    ['visible text between markers on one line', `${CLEAR_HEADING}\n<!-- q --> Revoked, the old block follows: <!-- /q -->\n<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert --> REVOKED <!-- x -->`],
+    ['raw paste at the top, revocation after it', `${block}\n\nThe clearance above is REVOKED.`],
+    ['legacy prose paste, revocation after it', `${CLEAR_HEADING}\n\nCleared by chalbert via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n<!-- reviewed-sha: ${X} -->\n\nREVOKED.`],
+    ['unclosed fence around the marker block', `${CLEAR_HEADING}\n\nRevoked:\n\`\`\`\n<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->`],
   ])('a quoted full clearance after a revocation does not revive it (%s)', (_kind, body) => {
     const quote = say(body, 'chalbert');
     const revoked = say('🔁 review — changes requested\n\n1. not yet');
@@ -98,7 +104,10 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
   it('a NEW clear-human ceremony after the revocation does clear again', () => {
     const revoked = say('🔁 review — changes requested\n\n1. not yet');
     expect(parseLatestHumanClearedSha([clear(X), revoked, clear(X), accept(X)], { sameShaCarries: true })).toBe(X);
-    expect(parseLatestHumanClearedSha([clear(X), revoked, say(`<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->`, 'web-everything')], { sameShaCarries: false })).toBe(X);
+    expect(parseLatestHumanClearedSha([clear(X), revoked, clear(X)], { sameShaCarries: false })).toBe(X);
+    // The legacy prose attribution (no cleared-human marker) still clears with its reviewed-sha marker block at the end.
+    const legacy = say(`${CLEAR_HEADING}\n\nCleared by chalbert via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n<!-- reviewed-sha: ${X} -->`, 'web-everything');
+    expect(parseLatestHumanClearedSha([clear(X), revoked, legacy], { sameShaCarries: false })).toBe(X);
   });
   it('carries across a plain re-stamp and a machine note that carry the marker', () => {
     const restamp = say(`📌 review — acceptance re-stamped after a rebase (no new review)\n${quote}`, 'web-everything');
