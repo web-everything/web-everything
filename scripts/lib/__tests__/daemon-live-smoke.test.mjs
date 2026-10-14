@@ -37,7 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo,
+  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
 
 import { readDeclaredSettings } from '../settings-files.mjs';
@@ -2032,5 +2032,44 @@ describe('GitHub environment probe boundaries — pure helpers and injected exte
     expect(result.verdict).toBe('transient');
     expect(result.attempts).toBe(5);
     expect(sleep.mock.calls).toEqual([[10], [20], [10], [10]]);
+  });
+});
+
+
+describe('smoke dry-run settings', () => {
+  const standard = { prSample: 12, snapshotStaleOkMs: 900000, lanePoolListCache: true };
+  const sources = layer => Object.fromEntries(Object.keys(standard).map(key => [key, layer]));
+  it('resolves standard defaults and tolerates unreadable settings', () => {
+    readDeclaredSettings.mockReturnValueOnce({ settings: {} });
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('standard') });
+    readDeclaredSettings.mockImplementationOnce(() => { throw Error('unreadable'); });
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('standard') });
+  });
+  it('resolves tool settings, env overrides, and zero/off with sources', () => {
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('tool') });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: '5', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '1000', WE_SMOKE_LANE_POOL_LIST_CACHE: 'off' }))
+      .toEqual({ prSample: 5, snapshotStaleOkMs: 1000, lanePoolListCache: false, sources: sources('env') });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: '0', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '0', WE_SMOKE_LANE_POOL_LIST_CACHE: 'on' }))
+      .toEqual({ prSample: 0, snapshotStaleOkMs: 0, lanePoolListCache: true, sources: sources('env') });
+    readDeclaredSettings.mockReturnValueOnce({ settings: { rebuildSmokeDryRun: { prSample: 7 } } });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: 'bad', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '-1', WE_SMOKE_LANE_POOL_LIST_CACHE: 'invalid' }))
+      .toEqual({ ...standard, prSample: 7, sources: { ...sources('standard'), prSample: 'tool' } });
+  });
+  it.each(['on', 'off'])('scopes snapshot knobs to the two dry-run children and lists lanes with cache %s', async mode => {
+    const calls = [];
+    const defaults = withNewCheckDefaults(async () => '');
+    await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_LANE_POOL_LIST_CACHE: mode,
+      WE_SMOKE_PR_SAMPLE: mode === 'on' ? '12' : '0', WE_SMOKE_SNAPSHOT_STALE_OK_MS: mode === 'on' ? '900000' : '0' },
+      runChild: async (cmd, args, opts) => { calls.push({ args, env: opts.env }); return defaults(cmd, args, opts); } });
+    const dryRuns = calls.filter(({ args }) => args[0] === 'scripts/conveyor/reconcile-pass.mjs'
+      || args[0] === '--input-type=module' && args[2] === DISPATCH_DRY_RUN_SCRIPT);
+    expect(dryRuns.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      const enabled = mode === 'on' && dryRuns.includes(call);
+      expect(call.env?.WE_PR_SNAPSHOT_SAMPLE).toBe(enabled ? '12' : undefined);
+      expect(call.env?.WE_PR_SNAPSHOT_STALE_OK_MS).toBe(enabled ? '900000' : undefined);
+    }
+    const listing = calls.find(({ args }) => args[0] === 'scripts/lane-pool.mjs' && args[1] === 'list');
+    expect(listing.args).toEqual(['scripts/lane-pool.mjs', 'list', '--acquirable', ...(mode === 'off' ? ['--no-cache'] : []), '--limit=1', '--json']);
   });
 });

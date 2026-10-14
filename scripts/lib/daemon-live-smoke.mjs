@@ -82,6 +82,7 @@ import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
+import { WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS } from './pr-snapshot.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -250,6 +251,27 @@ export function resolveSmokeReadMemo(env = process.env) {
   } catch { return { enabled: true, source: 'standard' }; }
 }
 
+/** Smoke-only read bounds: standard → platform → declared tool settings → env. Never throws. */
+export function resolveSmokeDryRun(env = process.env) {
+  const standard = { prSample: 12, snapshotStaleOkMs: 900000, lanePoolListCache: true };
+  try {
+    let tool;
+    try { tool = readDeclaredSettings().settings?.rebuildSmokeDryRun; } catch { /* use lower layers */ }
+    const integer = value => /^\d+$/.test(String(value ?? '')) ? Number(value) : undefined;
+    const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
+    const cache = env?.WE_SMOKE_LANE_POOL_LIST_CACHE;
+    const r = cascadePolicy('rebuildSmokeDryRun', tool, {
+      env, standard,
+      envValues: { prSample: integer(env?.WE_SMOKE_PR_SAMPLE), snapshotStaleOkMs: integer(env?.WE_SMOKE_SNAPSHOT_STALE_OK_MS),
+        lanePoolListCache: cache === 'on' ? true : cache === 'off' ? false : undefined },
+      valid: { prSample: nonnegative, snapshotStaleOkMs: nonnegative, lanePoolListCache: value => typeof value === 'boolean' },
+    });
+    return { ...r.value, sources: r.sources };
+  } catch {
+    return { ...standard, sources: { prSample: 'standard', snapshotStaleOkMs: 'standard', lanePoolListCache: 'standard' } };
+  }
+}
+
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // #4044: a crashed node child's first stderr line is only the stack LOCATION (`node:internal/modules/cjs/
 // loader:1227`) — the live 08:14 ET smoke-rejected alert carried nothing else, hiding that the gh shim's baked
@@ -341,11 +363,11 @@ async function checkLanePoolList(ctx) {
     // `env` here is a no-op in production (the default `env = process.env` at `runLiveSmoke`'s own boundary
     // already IS the real ambient env), so this only changes behavior for a caller that deliberately passed a
     // different one — exactly the case that was silently being dropped.
-    const out = await runChild('node', ['scripts/lane-pool.mjs', 'list', '--acquirable', '--no-cache', '--limit=1', '--json'], {
+    const out = await runChild('node', ['scripts/lane-pool.mjs', 'list', '--acquirable', ...(ctx.dryRun?.lanePoolListCache ? [] : ['--no-cache']), '--limit=1', '--json'], {
       cwd: root, timeoutMs: capMs, env,
     });
     JSON.parse(out);
-    return { ok: true, detail: 'lane-pool list --acquirable --no-cache --limit=1 ok' };
+    return { ok: true, detail: `lane-pool list --acquirable ${ctx.dryRun?.lanePoolListCache ? '' : '--no-cache '}--limit=1 ok` };
   } catch (e) {
     const detail = `lane-pool list --acquirable failed: ${firstLine(e)}`;
     return busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs, ctx })
@@ -824,19 +846,25 @@ export async function runLiveSmoke({
   const admission = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs });
   const budgets = resolveSmokeBudgets(env, { ...host, admission });
   const readMemo = resolveSmokeReadMemo(env);
+  const dryRun = resolveSmokeDryRun(env);
   try { // The I/O-bound rule's source, once per smoke, next to the shadow line (silent under test).
     if (isDecision(admission) && !process.env.VITEST) {
       const io = resolveIoBoundLoadScale(env);
       console.error(`daemon-live-smoke: io-bound-load-scale ${JSON.stringify({ ...io, verdict: admission.verdict, reconcileMs: budgets.reconcileMs, dispatchDryRunMs: budgets.dispatchDryRunMs })}`);
     }
-    if (!process.env.VITEST) console.error(`daemon-live-smoke: smoke-read-memo ${JSON.stringify(readMemo)}`);
+    if (!process.env.VITEST) {
+      console.error(`daemon-live-smoke: smoke-read-memo ${JSON.stringify(readMemo)}`);
+      console.error(`daemon-live-smoke: smoke-dry-run ${JSON.stringify(dryRun)}`);
+    }
   } catch { /* logging never changes the smoke */ }
   const memoDir = readMemo.enabled ? mkdtempSync(join(tmpdir(), 'smoke-read-memo-')) : null;
   try {
     const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
-    if (WE_GH_READ_MEMO_DIR in env) {
+    if ([WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS].some(key => key in env)) {
       env = { ...env };
       delete env[WE_GH_READ_MEMO_DIR];
+      delete env[WE_PR_SNAPSHOT_SAMPLE];
+      delete env[WE_PR_SNAPSHOT_STALE_OK_MS];
     }
     const ghChildEnv = ghDispatchedSessionEnv(env);
     // xp4lw2v — the porcelain snapshot BEFORE any check below runs, best-effort (never throws, never blocks the
@@ -850,7 +878,7 @@ export async function runLiveSmoke({
     // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
     // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
     // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
-    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy };
+    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
     const results = [];
     for (const check of SMOKE_CHECKS) {
       const startedAt = clock();
@@ -885,7 +913,9 @@ export async function runLiveSmoke({
       };
       try {
         const checkEnv = ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
-          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`, ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}) } : env;
+          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`, ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}),
+            ...(dryRun.prSample ? { [WE_PR_SNAPSHOT_SAMPLE]: String(dryRun.prSample) } : {}),
+            ...(dryRun.snapshotStaleOkMs ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(dryRun.snapshotStaleOkMs) } : {}) } : env;
         result = await check.run({ ...ctx, env: checkEnv, runChild: trackedRunChild });
       } catch (e) {
         result = { ok: false, detail: `threw: ${firstLine(e)}` };
