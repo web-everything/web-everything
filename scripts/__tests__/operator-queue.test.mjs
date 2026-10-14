@@ -232,7 +232,7 @@ describe('main', () => {
       });
       expect(execFileSync).toHaveBeenLastCalledWith('gh', [
         'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
-        'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
+        'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,comments',
       ], expect.objectContaining({ encoding: 'utf8' }));
       expect(execFileSync.mock.calls.filter(([, args]) =>
         args[args.indexOf('--repo') + 1] === 'owner/broken').length).toBeGreaterThan(1);
@@ -284,7 +284,7 @@ describe('main', () => {
     execFileSync.mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n'], { sleep: vi.fn(), unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
-      'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
+      'NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):', '(none)',
       'RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:', '(none)',
       'PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):', 'o/n#43  Ready for review',
       'UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:', '(none)',
@@ -300,7 +300,7 @@ describe('main', () => {
     execFileSync.mockReset().mockReturnValue('[]');
     main([], { unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
-      'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
+      'NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):', '(none)',
       'RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:', '(none)',
       'PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):', '(none)',
       'UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:', '(none)',
