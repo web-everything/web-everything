@@ -2,6 +2,8 @@
   "$comment": "Ordered operator build priority: card numbers, bornAs/x-ids, or parent ids (inherited by descendants). Lifts ready cards after P0 without bypassing blockers or build clearance. Cascade: standard [] → platform build.priority → this tool setting → WE_BUILD_PRIORITY (comma-separated; empty clears).",
   "build": {
     "priority": [
+      "x0dcjec",
+      "xstapna",
       "6031",
       "5694",
       "4674",

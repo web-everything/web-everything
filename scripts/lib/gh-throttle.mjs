@@ -176,7 +176,7 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -467,6 +467,54 @@ export function classifyGhRead(argvRaw) {
     return methods.every((m) => m === 'GET' || m === 'HEAD');
   }
   return false;
+}
+
+/** Memo-only GraphQL query allowlist; never changes identity routing or budget/write gates. */
+export function isGhGraphqlReadQuery(args) {
+  if (!Array.isArray(args) || args[0] !== 'api' || args[1] !== 'graphql') return false;
+  let query = null;
+  const fields = new Set(['-f', '-F', '--field', '--raw-field']);
+  const values = new Set(['--jq', '-q', '--cache', '-H', '--header']);
+  const switches = new Set(['--paginate', '-i', '--include']);
+  for (let i = 2; i < args.length; i++) {
+    if (typeof args[i] !== 'string') return false;
+    const equals = args[i].indexOf('=');
+    const flag = equals < 0 ? args[i] : args[i].slice(0, equals);
+    if (switches.has(flag)) {
+      if (equals >= 0) return false;
+      continue;
+    }
+    if (!fields.has(flag) && !values.has(flag)) return false;
+    const value = equals < 0 ? args[++i] : args[i].slice(equals + 1);
+    if (typeof value !== 'string' || !value || value.startsWith('-')) return false;
+    if (fields.has(flag)) {
+      const separator = value.indexOf('=');
+      if (separator <= 0) return false;
+      if (value.slice(0, separator) === 'query') {
+        if (query !== null) return false;
+        query = value.slice(separator + 1);
+      }
+    }
+  }
+  if (query === null) return false;
+  // Remove comments and strings together so '#' and braces inside strings cannot hide an operation.
+  const text = query.replace(/"""(?:\\[\s\S]|(?!""")[\s\S])*"""|"(?:\\[\s\S]|[^"\\])*"|#[^\r\n]*/g, ' ').trim();
+  if (!/^(?:query\b|\{)/.test(text)) return false;
+  // Only document-level operation keywords count: names/fields can legally be 'mutation'.
+  const stack = [];
+  let operationStart = true;
+  for (const token of text.match(/[A-Za-z_][A-Za-z_0-9]*|[{}()[\]]/g) || []) {
+    if (!stack.length && operationStart) {
+      if (token === 'mutation' || token === 'subscription') return false;
+      operationStart = false;
+    }
+    if (['{', '(', '['].includes(token)) stack.push(token);
+    else if (['}', ')', ']'].includes(token)) {
+      if (stack.pop() !== { '}': '{', ')': '(', ']': '[' }[token]) return false;
+      if (!stack.length && token === '}') operationStart = true;
+    }
+  }
+  return stack.length === 0;
 }
 
 /**
@@ -1568,6 +1616,35 @@ export function recordGhCallLogEntry(logPath, entry) {
 
 // ── the transparent, importable, drop-in replacement for `execFileSync('gh', args, opts)` ───────────────────
 
+export const WE_GH_READ_MEMO_DIR = 'WE_GH_READ_MEMO_DIR';
+
+function ghReadMemoContext(execOpts, throttle, env) {
+  // The executor inherits process.env unless opts.env is explicit; throttle.env configures gates only.
+  const childEnv = execOpts.env || process.env;
+  const cwd = resolve(execOpts.cwd || process.cwd());
+  const bin = throttle.bin || 'gh';
+  const probeBin = bin.includes('/') ? resolve(cwd, bin) : bin;
+  const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(cwd, path)).join(delimiter) };
+  // The App shim can choose a credential from its caller map even when a token was supplied.
+  const callerSelectsAuth = (!bin.includes('/') && !childEnv.PATH) || ghBinIsWeShim(probeBin, probeEnv);
+  const contextEnv = bag => Object.fromEntries(Object.keys(bag).sort()
+    .filter(key => (key !== 'GH_CALLER' || callerSelectsAuth) && key !== WE_GH_READ_MEMO_DIR
+      && (/^(?:GH_|GITHUB_|GIT_|WE_GH_|WE_GITHUB_)/.test(key) || ['HOME', 'XDG_CONFIG_HOME', 'PATH'].includes(key)))
+    .map(key => [key, bag[key]]));
+  // Hash all credential material: ghAuthIdentity deliberately groups unknown App tokens into one bucket.
+  return createHash('sha256').update(JSON.stringify({
+    identity: ghAuthIdentity(childEnv), cwd,
+    bin: throttle.bin || 'gh', childEnv: contextEnv(childEnv), configEnv: contextEnv(env),
+    personalRoute: throttle.personalRoute, personalToken: throttle.personalToken,
+  })).digest('hex');
+}
+
+function ghReadMemoHasFileInput(args) {
+  return args.some((arg, i) => arg === '--input' || arg.startsWith('--input=')
+    || ((args[i - 1] === '-F' || args[i - 1] === '--field' || arg.startsWith('-F') || arg.startsWith('--field='))
+      && /=@/.test(arg)));
+}
+
 /**
  * Run `gh` with `args`, gated by the concurrency semaphore and retried with bounded backoff on a rate-limit-
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
@@ -1601,8 +1678,57 @@ export function recordGhCallLogEntry(logPath, entry) {
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
+ * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
+  const { throttle = {}, ...execOpts } = opts;
+  const env = throttle.env || process.env;
+  const dir = env[WE_GH_READ_MEMO_DIR];
+  if (!dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
+      || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))
+      // Personal routing can fall back to another identity as budget/access state changes.
+      || (classifyGhRead(args) && (throttle.personalRoute ?? resolvePersonalRouteEnabled(env)))) {
+    return runGhSyncUnmemoized(args, opts);
+  }
+  let key, path;
+  try {
+    const context = ghReadMemoContext(execOpts, throttle, env);
+    // Exact argv preserves conditional validators: 304 for one ETag is not a 200 body for another.
+    key = createHash('sha256').update(JSON.stringify({ args, context })).digest('hex');
+    path = join(dir, `${key}.json`);
+  } catch { return runGhSyncUnmemoized(args, opts); } // Unsupported context disables optional memoization.
+  const encoding = execOpts.encoding && execOpts.encoding !== 'buffer' ? execOpts.encoding : null;
+  try {
+    const entry = JSON.parse(readFileSync(path, 'utf8'));
+    if (entry.key === key && JSON.stringify(entry.args) === JSON.stringify(args) && typeof entry.stdout === 'string'
+        && Buffer.isEncoding(entry.encoding)
+        && (entry.encoding !== 'base64' || Buffer.from(entry.stdout, 'base64').toString('base64') === entry.stdout)) {
+      const bytes = Buffer.from(entry.stdout, entry.encoding);
+      const result = encoding ? bytes.toString(encoding) : bytes;
+      const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
+      recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
+        outcome: 'memo_hit', op: throttle.op || args.slice(0, 2).join(' '), caller: deriveGhCaller(throttle, env), points: 0,
+      });
+      return result;
+    }
+  } catch { /* Unreadable entries are misses. */ }
+
+  const result = runGhSyncUnmemoized(args, opts);
+  if (isGhDeferred(result) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    // The smoke owns directory creation/removal. A late reader must never resurrect it.
+    writeFileSync(tmp, JSON.stringify({ key, args, stdout: Buffer.isBuffer(result) ? result.toString('base64') : result,
+      encoding: Buffer.isBuffer(result) ? 'base64' : encoding || 'utf8' }), { mode: 0o600, flag: 'wx' });
+    renameSync(tmp, path);
+  } catch { /* Memo storage must not fail a successful read. */ }
+  finally {
+    try { unlinkSync(tmp); } catch { /* Renamed or never created. */ }
+  }
+  return result;
+}
+
+function runGhSyncUnmemoized(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
   if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
