@@ -40,18 +40,21 @@ function fixture() {
       mkTempDir: () => mkdtempSync(join(root, 'juror-')),
       exec: (bin, args) => {
         calls.push({ bin, args, after: mutated });
-        if (options.unreadable && args.includes(options.unreadable)) throw new Error('unreadable fixture');
+        if (options.unreadable && args.includes(options.unreadable)
+          && (!options.unreadablePhase || options.unreadablePhase === (mutated ? 'after' : 'before'))) throw new Error('unreadable fixture');
+        if (options.failedDiff && args.includes('diff')) throw new Error('failed HEAD diff fixture');
         return execFileSync(bin, bin === 'git' ? ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args] : args,
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       },
       spawnJudge: async ({ cwd }) => {
         act(cwd);
         mutated = true;
+        if (options.spawnError) throw new Error('failed without transcript');
         const t = join(root, 'transcript.jsonl');
-        writeFileSync(t, transcript(steps(cwd)));
+        writeFileSync(t, options.transcriptText ?? transcript(steps(cwd)));
         return { value: { summary: 'review', findings: [] }, sessionId: 'own-id', transcriptFile: t };
       },
-      readFile: (p) => readFileSync(p, 'utf8'),
+      readFile: (p) => { if (options.unreadableTranscript) throw new Error('unreadable transcript'); return readFileSync(p, 'utf8'); },
       removeDir: (p) => rmSync(p, { recursive: true, force: true }),
     },
   });
@@ -60,6 +63,105 @@ function fixture() {
 const touchedReason = 'change outside the juror lane touched by the juror: this checkout';
 
 describe('shared checkouts correlate changes with every transcript tool update', () => {
+  it.each(['command', 'relative command', 'concatenated command', 'unknown tool', 'unnamed tool', 'malformed JSON', 'scalar JSON', 'deep object', 'deep array', 'NUL', 'symlink dot-dot'])
+    ('errored tool with %s parameters cannot hide a shared change', async (kind) => {
+      const fx = fixture();
+      const out = await fx.run(() => writeFileSync(join(fx.shared, 'file.txt'), 'partial side effect\n'), () => {
+        let parameters = { CommandLine: `echo x > '${join(fx.shared, 'file.txt')}'` };
+        let tool_name = 'run_command';
+        if (kind === 'relative command') parameters = { CommandLine: 'echo x > ../shared/file.txt' };
+        if (kind === 'concatenated command') parameters = { CommandLine: `echo x > '${fx.root}/sh''ared/file.txt'` };
+        if (kind === 'unknown tool') tool_name = 'future_tool';
+        if (kind === 'unnamed tool') tool_name = undefined;
+        if (kind === 'malformed JSON') parameters = '{broken';
+        if (kind === 'scalar JSON') parameters = '42';
+        if (kind === 'deep object') parameters = { a: { b: { c: { d: { AbsolutePath: join(fx.shared, 'file.txt') } } } } };
+        if (kind === 'deep array') parameters = [[[[[join(fx.shared, 'file.txt')]]]]];
+        if (kind === 'NUL') parameters = { AbsolutePath: `${fx.shared}\0/file.txt` };
+        if (['malformed JSON', 'scalar JSON', 'deep object', 'deep array', 'NUL', 'symlink dot-dot'].includes(kind)) tool_name = 'view_file';
+        if (kind === 'symlink dot-dot') {
+          symlinkSync(fx.extra, join(fx.home, 'alias'));
+          parameters = { AbsolutePath: `${fx.home}/alias/../shared/file.txt` };
+        }
+        return [tool('', { status: 'TOOL_ERROR', tool_name, tool_info: { parameters } })];
+      });
+      expect(out.status).toBe('voided');
+      expect(out.reasons).toEqual([touchedReason]);
+    });
+
+  it.each(['control files', 'unreadable before', 'unreadable after', 'unreadable before and after', 'failed HEAD diff'])
+    ('parent-path access voids when shared changes are unknown: %s', async (kind) => {
+      const fx = fixture();
+      const out = await fx.run(() => {
+        if (kind === 'control files') writeFileSync(join(fx.shared, '.gitattributes'), '*.txt filter=hostile\n');
+        if (kind === 'failed HEAD diff') {
+          writeFileSync(join(fx.shared, 'file.txt'), 'new HEAD\n');
+          commit(fx.shared);
+        }
+      }, () => [tool(fx.root, { status: 'TOOL_ERROR' })], {
+        unreadable: kind.startsWith('unreadable') ? fx.shared : undefined,
+        unreadablePhase: kind === 'unreadable before' ? 'before' : kind === 'unreadable after' ? 'after' : undefined,
+        failedDiff: kind === 'failed HEAD diff',
+      });
+      expect(out.status).toBe('voided');
+      expect(out.reasons).toContain(touchedReason);
+      if (kind === 'control files') expect(fx.calls.filter(({ args, after }) => after && args.includes(fx.shared))).toEqual([]);
+    });
+
+  it.each(['spawnError', 'unreadableTranscript'])('shared changes fail closed without attribution evidence: %s', async (kind) => {
+    const fx = fixture();
+    const out = await fx.run(() => writeFileSync(join(fx.shared, 'file.txt'), 'changed\n'), undefined, { [kind]: true });
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toContain(touchedReason);
+  });
+
+  it.each(['', '{truncated'])('an empty or truncated transcript cannot hide a shared change (%j)', async (transcriptText) => {
+    const fx = fixture();
+    const out = await fx.run(() => writeFileSync(join(fx.shared, 'file.txt'), 'changed\n'), undefined, { transcriptText });
+    expect(out.reasons).toContain(touchedReason);
+    expect(out.status).toBe('voided');
+  });
+
+  it('opaque errored parameters alone do not imply a shared change', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: '{broken' } })]);
+    expect(out.status).toBe('ok');
+    expect(out.reasons).toEqual([]);
+  });
+
+  it('later read-only updates inherit their tool name without losing concurrent-reset tolerance', async () => {
+    const fx = fixture();
+    const out = await fx.run(() => {
+      writeFileSync(join(fx.shared, 'file.txt'), 'new main\n');
+      commit(fx.shared);
+    }, (cwd) => [
+      tool(join(cwd, 'file.txt'), { state: 'ACTIVE' }),
+      tool('', { tool_name: undefined, tool_info: { output: 'read completed' } }),
+    ]);
+    expect(out.status).toBe('ok');
+    expect(out.reasons).toEqual([]);
+  });
+
+  it('opaque errored command text conservatively attributes a concurrent shared reset', async () => {
+    const fx = fixture();
+    const out = await fx.run(() => {
+      writeFileSync(join(fx.shared, 'file.txt'), 'new main\n');
+      commit(fx.shared);
+    }, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'echo denied' } } })]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toEqual([touchedReason]);
+  });
+
+  it.each(['escaping', 'looping'])('a changed tracked %s symlink cannot erase shared-change attribution', async (kind) => {
+    const fx = fixture();
+    const out = await fx.run(() => {
+      rmSync(join(fx.shared, 'file.txt'));
+      symlinkSync(kind === 'looping' ? 'file.txt' : join(fx.home, 'external.txt'), join(fx.shared, 'file.txt'));
+    }, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: { CommandLine: `ln -s external '${fx.shared}/file.txt'` } } })]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toEqual([touchedReason]);
+  });
+
   it('a shared HEAD reset and tracked edit do not void a juror reading only its lane', async () => {
     const fx = fixture();
     const out = await fx.run(() => {

@@ -16,7 +16,8 @@
  *      shared; the daemon resets its checkout to origin/main every 10-40 minutes. Their HEAD/status/content changes
  *      void only when a changed path overlaps a path named by ANY transcript tool update (including errored calls).
  *      Changed git control files or unreadable snapshots mean unknown changes: void only if the juror touched that
- *      checkout, and never run git after detecting changed control files.
+ *      checkout, and never run git after detecting changed control files. Missing/opaque attribution evidence
+ *      conservatively touches watched checkouts; non-read tool strings are opaque because shell syntax can hide paths.
  *   3. ITS OWN TRANSCRIPT. Any tool call that is not one of the read-only tools ({@link READ_ONLY_AGY_TOOLS}) and did
  *      not end in an error voids the seat, wherever it pointed — this is the check that catches a write (or a network
  *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed. A
@@ -300,21 +301,48 @@ function conversationIds(transcriptText, sessionId) {
   return [...new Set(ids.filter((id) => typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..'))];
 }
 
-/** Collect paths from EVERY tool update, even denied calls and later updates with different parameters. */
-function touchedPaths(transcriptText, cwd, home) {
+/**
+ * Collect paths from EVERY tool update, even denied calls and later updates with different parameters.
+ * Opaque parameters or missing transcript evidence conservatively touch every watched checkout. Non-read tool
+ * strings can hide targets in shell quoting, relative paths or expansion; they are opaque attribution evidence.
+ */
+function touchedPaths(transcriptText, cwd, home, watched) {
   const paths = [];
-  for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
+  const roots = watched.map((dir) => canonicalPath(dir) ?? resolve(dir));
+  const touchAll = () => paths.push(...roots);
+  const text = String(transcriptText ?? '');
+  const events = parseJsonlEvents(text);
+  const names = new Map();
+  // Parsing a truncated line must not silently erase the only evidence of a partial side effect.
+  if (!events.length || text.split('\n').some((line) => {
+    if (!line.trim()) return false;
+    try { return !JSON.parse(line); } catch { return true; }
+  })) touchAll();
+  for (const event of events) {
     const step = event?.event === 'step_update' ? event.step_update : null;
     if (step?.step_type !== 'tool') continue;
     let params = step.tool_info?.parameters;
-    if (typeof params === 'string') { try { params = JSON.parse(params); } catch { continue; } }
+    const key = step.step_index == null ? null : JSON.stringify([step.conversation_id ?? null, step.step_index]);
+    const name = step.tool_name ?? step.tool_info?.name ?? (key == null ? undefined : names.get(key));
+    if (key != null && typeof name === 'string') names.set(key, name);
+    const readOnly = READ_ONLY_AGY_TOOLS.includes(name);
+    if (params == null && readOnly) continue;
+    if (typeof params === 'string') { try { params = JSON.parse(params); } catch { touchAll(); continue; } }
+    if (!params || typeof params !== 'object') { touchAll(); continue; }
+    // The same depth bound as pathLeaves; its sentinel must fail closed here too. Inspect ALL string values
+    // for commands, including CommandLine and future parameter names, rather than trying to parse shell syntax.
+    const strings = pathLeaves(params, true);
+    if (strings.some((s) => s.includes('\0')) || (!readOnly && strings.length)) touchAll();
     for (let p of pathLeaves(params, Array.isArray(params))) {
-      if (p.includes('\0')) continue;
-      if (/^file:\/\//i.test(p)) { try { p = fileURLToPath(p); } catch { continue; } }
+      if (p.includes('\0')) { touchAll(); continue; }
+      // fileURLToPath and resolve both collapse `..` before symlinks are followed. Keep uncertainty instead.
+      if (p.split('/').includes('..') || /%2e/i.test(p)) { touchAll(); continue; }
+      if (/^file:\/\//i.test(p)) { try { p = fileURLToPath(p); } catch { touchAll(); continue; } }
       else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) continue;
       if (p === '~' || p.startsWith('~/')) p = join(home, p.slice(2));
       const real = canonicalPath(resolve(cwd, p));
       if (real) paths.push(real);
+      else touchAll();
     }
   }
   return [...new Set(paths)];
@@ -326,7 +354,7 @@ const overlaps = (a, b) => inside(a, b) || inside(b, a);
 /** Shared changes are attributable only when a changed path overlaps a transcript path. */
 function sharedChangeTouched(dir, before, after, touched, exec) {
   const root = canonicalPath(dir) ?? resolve(dir);
-  const checkoutTouched = touched.some((p) => inside(p, root));
+  const checkoutTouched = touched.some((p) => overlaps(p, root));
   // Missing/unreadable snapshots (including control changes) leave the changed set unknown.
   if (!before || before.unreadable || !after || after.unreadable) return checkoutTouched;
   const paths = new Set([...Object.keys(before.contents ?? {}), ...Object.keys(after.contents ?? {})]);
@@ -339,8 +367,11 @@ function sharedChangeTouched(dir, before, after, touched, exec) {
     } catch { return checkoutTouched; }
   }
   return changed.some((p) => {
+    const lexical = resolve(root, p);
     const real = canonicalPath(resolve(dir, p));
-    return real && inside(real, root) && touched.some((t) => overlaps(real, t));
+    // A tracked pathname is still changed when replaced by an escaping/broken symlink. Canonicalization must
+    // not erase that evidence; match its checkout location as well as its current target.
+    return inside(lexical, root) && touched.some((t) => overlaps(lexical, t) || (real && overlaps(real, t)));
   });
 }
 
@@ -457,7 +488,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     } else if (!spawnError) {
       reasons.push('no transcript — escape check incomplete');
     }
-    const touched = touchedPaths(transcriptText, jurorLane, home);
+    const touched = touchedPaths(transcriptText, jurorLane, home, watched);
     for (const dir of watched) {
       if (dir === resolve(laneCwd)) {
         if (controlChanged.has(dir)) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
