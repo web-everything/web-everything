@@ -1,0 +1,7 @@
+{
+  "ghThrottle": {
+    "maxHoldSeconds": 90,
+    "reapGraceSeconds": 15,
+    "perCallerMax": 4
+  }
+}
