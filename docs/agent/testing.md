@@ -1,5 +1,20 @@
 # Testing — Three-Tier Strategy
 
+## Codex usage accounting
+
+Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
+seat appends through `scripts/lib/codex-usage-ledger.mjs`. The default ledger is
+`<daemonConveyorStateRoot>/codex-usage.jsonl`; `WE_CODEX_USAGE_LEDGER` overrides the file.
+Direct CLI attribution flags are `--caller`, `--repo`, `--pr`, `--card`, and
+`--usage-task-kind` (an accounting label that preserves model routing).
+Redirect the ledger to a temporary file in tests. Append/probe failures must preserve the launch's result
+or original error. Unknown tokens, quota, and file changes stay null; quota resets have no delta.
+Quota is sampled from the newest persisted Codex rollout observations, so ephemeral runs may
+have no fresh observation and concurrent runs can contribute to the observed bucket delta.
+`node scripts/codex-usage-report.mjs --since=24h` (or `--json`) reads without launching Codex.
+Cached input is a subset of input; reasoning is a subset of output when reported, not additive spend.
+
+
 > Tier-1 reference. Read when writing or changing tests.
 
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:

@@ -162,6 +162,7 @@ import {
 // #3580 — the REAL Codex implementation of the `DeliveryAgentProvider` port below. Its own file header carries
 // the full live-verification trail (which flags, which invocation blocks, and what replaces the Claude-only
 // `guard-lane.mjs`/`guard-bash.mjs` hooks); `CODEX_PROVIDER` further down is the thin composition of these.
+import { withCodexUsage } from '../lib/codex-usage-ledger.mjs';
 import {
   buildCodexDeliveryArgv, defaultSpawnCodexAgent, parseCodexThreadId, readCodexThreadId, writeCodexThreadId,
   defaultDeliveryDenyPaths, assertDenyPathsUsable, recordCodexTurnUsage,
@@ -1256,7 +1257,7 @@ const CODEX_PROVIDER = {
   // what this spawns without a real `codex` process or a real filesystem.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', size, epic, decision, care, mandatoryLens,
+      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1334,11 +1335,11 @@ const CODEX_PROVIDER = {
       // preserves. `resourceUsage` is threaded through to the `agent.turn` span — honestly `null` on real Node
       // today (no `ChildProcess#resourceUsage()` exists; see `spawn-to-completion.mjs`'s own header), kept only
       // for forward compatibility.
-      const spawned = (await spawnAgent(argv, {
+      const spawned = (await withCodexUsage({ model, effort, taskKind, caller, repo, pr, card: item, cwd: lanePath }, () => spawnAgent(argv, {
         cwd: lanePath,
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,
-      })) || {};
+      }))) || {};
       stdout = spawned.stdout;
       recordCpu(spawned.resourceUsage);
     } catch (e) {
