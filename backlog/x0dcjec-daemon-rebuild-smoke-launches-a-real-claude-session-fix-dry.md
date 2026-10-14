@@ -1,9 +1,10 @@
 ---
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/operations/worker-wrapper-launch.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs"]
 dateOpened: "2026-10-14"
+dateResolved: "2026-10-14"
 tags: []
 ---
 

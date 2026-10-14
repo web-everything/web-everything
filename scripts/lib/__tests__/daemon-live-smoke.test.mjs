@@ -1029,6 +1029,22 @@ const dispatchDryRunCheck = SMOKE_CHECKS.find((c) => c.name === 'dispatch-dry-ru
 const treeStaysCleanCheck = SMOKE_CHECKS.find((c) => c.name === 'tree-stays-clean').run;
 
 describe('dispatch-dry-run — injected runChild', () => {
+  it.each([{}, { WE_WORKER_WRAPPER: 'on' }])('forces stub spawning unless real smoke workers are allowed: %j', async (env) => {
+    const runChild = vi.fn(async () => '[{"kind":"fix","pr":900002,"ok":true}]');
+    expect((await dispatchDryRunCheck({ root: '/x', budgets: { dispatchDryRunMs: 1000 }, runChild, env })).ok).toBe(true);
+    const childEnv = runChild.mock.calls[0][2].env;
+    expect(childEnv.WE_WORKER_WRAPPER).toBe('off');
+    expect(childEnv.WE_FIX_LOOP_LEDGER).toMatch(/ledger\.jsonl$/);
+    expect(env.WE_WORKER_WRAPPER).not.toBe('off');
+  });
+
+  it.each([undefined, 'on', 'off'])('keeps the wrapper choice with deliberate real-worker opt-in: %s', async (wrapper) => {
+    const env = { WE_SMOKE_ALLOW_REAL_WORKER: '1', ...(wrapper ? { WE_WORKER_WRAPPER: wrapper } : {}) };
+    const runChild = vi.fn(async () => '[{"kind":"fix","pr":900002,"ok":true}]');
+    await dispatchDryRunCheck({ root: '/x', budgets: { dispatchDryRunMs: 1000 }, runChild, env });
+    expect(runChild.mock.calls[0][2].env.WE_WORKER_WRAPPER).toBe(wrapper);
+  });
+
   it('every row passing → ok:true', async () => {
     const runChild = vi.fn(async (cmd, args) => {
       if (cmd === 'node' && args[0] === '--input-type=module') {
@@ -1136,6 +1152,20 @@ describe('dispatch-dry-run — injected runChild', () => {
     const dispatchRow = smoke.results.find((r) => r.name === 'dispatch-dry-run');
     expect(dispatchRow.skipped).toBeUndefined();
     expect(runChild.mock.calls.some(([cmd, args]) => cmd === 'node' && args[0] === '--input-type=module')).toBe(true);
+  });
+});
+
+describe('checkFilled — captured dry-run prompt', () => {
+  it.each([null, undefined, '', '   '])('refuses a missing prompt: %j', (prompt) => {
+    expect(() => liveSmoke.checkFilled(prompt, 'fix PR #900002', s => s, [])).toThrow(
+      'fix PR #900002: no prompt captured (the stub spawner was never called — a real worker may have been launched)',
+    );
+  });
+  it('accepts a filled prompt and still refuses required placeholders', () => {
+    expect(() => liveSmoke.checkFilled('Fix the issue.', 'fix', s => s.trim(), ['SCOPE'])).not.toThrow();
+    expect(() => liveSmoke.checkFilled('Fix {{ SCOPE }}.', 'fix', s => s.trim(), ['SCOPE'])).toThrow(/required placeholder/);
+    expect(() => liveSmoke.checkFilled('Docs mention {{OTHER}}.', 'fix', s => s, ['SCOPE'])).not.toThrow();
+    expect(DISPATCH_DRY_RUN_SCRIPT).toContain(liveSmoke.checkFilled.toString());
   });
 });
 
@@ -1259,7 +1289,7 @@ describe('tree-stays-clean — injected runChild', () => {
 });
 
 describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix a6cbfced4 shape (direct dispatch calls only — no GitHub reads)', () => {
-  it('fails ci-heal-worst-case on a tree where a6cbfced4 is reverted (SCOPE required again), and passes on the real tree', () => {
+  it('fails ci-heal-worst-case on a tree where a6cbfced4 is reverted (SCOPE required again), and passes on the real tree', async () => {
     const REPO_ROOT = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
     // Both sides run from temp copies: the real checkout may itself be a `lane-N` clone, which the dispatch
     // functions refuse to start from (`assertNotALaneCheckout`). Only the dirs the dispatch graph reads are
@@ -1295,11 +1325,12 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       const preFixCiHealOrdinary = preFixRows.find((r) => r.kind === 'ci-heal-ordinary');
       expect(preFixCiHealOrdinary.ok).toBe(true);
 
-      const realOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], { cwd: realRoot, encoding: 'utf8', env: childEnv });
-      const realRows = JSON.parse(realOut);
-      expect(realRows.length).toBeGreaterThan(0);
-      const failures = realRows.filter((r) => !r.ok);
-      expect(failures).toEqual([]);
+      // Exercise the check's actual child env even when the caller explicitly enabled wrapping.
+      const result = await dispatchDryRunCheck({ root: realRoot, budgets: { dispatchDryRunMs: 60_000 },
+        env: { ...childEnv, WE_WORKER_WRAPPER: 'on', WE_SMOKE_ALLOW_REAL_WORKER: '0' },
+        runChild: (_cmd, args, opts) => execFileSync(process.execPath, args, { cwd: opts.cwd, env: opts.env, encoding: 'utf8', timeout: opts.timeoutMs }),
+      });
+      expect(result).toEqual({ ok: true, detail: expect.stringContaining('dispatch dry-run ok') });
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
       rmSync(realRoot, { recursive: true, force: true });

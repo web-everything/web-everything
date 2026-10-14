@@ -80,6 +80,7 @@ import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
 import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { resolveSmokeRealWorker } from './smoke-real-worker.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -494,6 +495,22 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
 // `import ... from '<path>'` lines: static specifiers inside this file's own string literals were read as THIS
 // module's imports by the repo's import-graph scanner (`we:scripts/operations/__tests__/import-graph.mjs`),
 // which then resolved them against `scripts/lib/` and failed.
+/** Validate the stub's captured prompt; self-contained so the dry-run child embeds this same function. */
+export function checkFilled(promptText, label, canonicalize, requiredNames) {
+  const text = String(promptText ?? '');
+  if (!text.trim()) {
+    throw new Error(label + ': no prompt captured (the stub spawner was never called — a real worker may have been launched)');
+  }
+  const tokenRe = /\{\{\s*([^{}\n]*?)\s*\}\}/g;
+  let m;
+  while ((m = tokenRe.exec(text)) !== null) {
+    const canon = canonicalize(m[1]);
+    if (canon && requiredNames.includes(canon)) {
+      throw new Error(label + ': required placeholder {{' + canon + '}} left unfilled in the filled prompt (matched ' + m[0] + ')');
+    }
+  }
+}
+
 const DISPATCH_DRY_RUN_LINES = [
   // Split so neither this file's closure scanner (`import-closure.mjs`: a non-literal dynamic import marks the
   // closure incomplete, which would disable skip-unchanged for every check) nor the import-graph scanner reads it.
@@ -510,7 +527,6 @@ const DISPATCH_DRY_RUN_LINES = [
   "const noopAcquire = () => ({ ok: true });",
   "const noopRelease = () => ({ released: true });",
   "const skipStaleness = () => ({ fresh: true, behind: 0 });",
-  "const TOKEN_RE = /\\{\\{\\s*([^{}\\n]*?)\\s*\\}\\}/g;",
   "",
   "// Every brief's own prose legitimately says things like 'fills the {{PLACEHOLDERS}} below' as documentation",
   "// (fillBrief/fillReviewBrief both report such tokens as non-fatal 'unknown', by design — see their own",
@@ -519,17 +535,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "// fillBrief/fillReviewBrief already throw before returning when a required name has no value, so a required",
   "// name surviving unfilled in a prompt that was actually returned is a defense-in-depth signal that their own",
   "// throw-on-missing contract was silently bypassed, never a benign documentation string.",
-  "function checkFilled(promptText, label, canonicalize, requiredNames) {",
-  "  const text = String(promptText || '');",
-  "  let m;",
-  "  TOKEN_RE.lastIndex = 0;",
-  "  while ((m = TOKEN_RE.exec(text)) !== null) {",
-  "    const canon = canonicalize(m[1]);",
-  "    if (canon && requiredNames.includes(canon)) {",
-  "      throw new Error(label + ': required placeholder {{' + canon + '}} left unfilled in the filled prompt (matched ' + m[0] + ')');",
-  "    }",
-  "  }",
-  "}",
+  checkFilled.toString(),
   "function record(kind, pr, fn) {",
   "  try { fn(); results.push({ kind, pr: pr === undefined ? null : pr, ok: true }); }",
   "  catch (e) { results.push({ kind, pr: pr === undefined ? null : pr, ok: false, error: String((e && e.message) || e) }); }",
@@ -542,9 +548,11 @@ const DISPATCH_DRY_RUN_LINES = [
   "// 1. review — direct dispatchReview call. review-dispatch never derives an item/scope, so any positive PR",
   "// number is legal input to it; the PR need not exist for the brief to fill (no gh read happens here).",
   "record('review', 900001, () => {",
-  "  const spawn = () => 'stub-review-900001';",
-  "  const r = dispatchReview({ pr: 900001, repo: WE_SLUG, spawnAgent: spawn, extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude' });",
-  "  checkFilled(r.prompt, 'review PR #900001', canonicalReviewPlaceholder, REVIEW_BRIEF_PLACEHOLDERS);",
+  "  let captured = null;",
+  "  const spawn = (argv) => { captured = argv[argv.length - 1]; return 'stub-review-900001'; };",
+  "  // A synthetic PR has no live CI; this check exercises brief filling and the injected spawner.",
+  "  dispatchReview({ pr: 900001, repo: WE_SLUG, spawnAgent: spawn, ciGate: () => ({ allowed: true }), extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude' });",
+  "  checkFilled(captured, 'review PR #900001', canonicalReviewPlaceholder, REVIEW_BRIEF_PLACEHOLDERS);",
   "});",
   "",
   "// 2. fix — direct dispatchFix call: an item-less PR with a NON-EMPTY diff-derived scope, the one legal shape",
@@ -644,8 +652,11 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
   // stub sessions from counting as real repair attempts on live PRs (#4194: 3 stub rows => fix-loop-hold).
   const ledgerDir = mkdtempSync(join(tmpdir(), 'smoke-fix-loop-'));
   try {
+    const childEnv = { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl') };
+    // Injected spawners must own every dry-run launch unless real workers were deliberately enabled.
+    if (!resolveSmokeRealWorker({ env }).allowSentinel) childEnv.WE_WORKER_WRAPPER = 'off';
     out = await runChild('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
-      cwd: root, timeoutMs: budgets.dispatchDryRunMs, env: { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl') },
+      cwd: root, timeoutMs: budgets.dispatchDryRunMs, env: childEnv,
     });
   } catch (e) {
     return { ok: false, detail: `dispatch dry-run child failed: ${failureLine(e)}` };
