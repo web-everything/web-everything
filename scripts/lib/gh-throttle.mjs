@@ -176,7 +176,7 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1568,6 +1568,15 @@ export function recordGhCallLogEntry(logPath, entry) {
 
 // ── the transparent, importable, drop-in replacement for `execFileSync('gh', args, opts)` ───────────────────
 
+export const WE_GH_READ_MEMO_DIR = 'WE_GH_READ_MEMO_DIR';
+
+function ghReadMemoArgs(args) {
+  return args.map((arg, i) => {
+    if (args[i - 1] === '-H' || args[i - 1] === '--header') return arg.replace(/^(If-None-Match:).*$/i, '$1 <memo>');
+    return arg.replace(/^(-H|--header=)(If-None-Match:).*$/i, '$1$2 <memo>');
+  });
+}
+
 /**
  * Run `gh` with `args`, gated by the concurrency semaphore and retried with bounded backoff on a rate-limit-
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
@@ -1601,8 +1610,50 @@ export function recordGhCallLogEntry(logPath, entry) {
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
+ * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
+  const { throttle = {}, ...execOpts } = opts;
+  const env = throttle.env || process.env;
+  const dir = env[WE_GH_READ_MEMO_DIR];
+  if (!dir || throttle.exec || execOpts.input !== undefined || isGhLocalOnly(args) || !classifyGhRead(args)) {
+    return runGhSyncUnmemoized(args, opts);
+  }
+  const memoArgs = ghReadMemoArgs(args);
+  const key = JSON.stringify({ args: memoArgs });
+  const path = join(dir, `${createHash('sha256').update(key).digest('hex')}.json`);
+  const encoding = execOpts.encoding && execOpts.encoding !== 'buffer' ? execOpts.encoding : null;
+  try {
+    const entry = JSON.parse(readFileSync(path, 'utf8'));
+    if (JSON.stringify({ args: ghReadMemoArgs(entry.args) }) === key && typeof entry.stdout === 'string'
+        && Buffer.isEncoding(entry.encoding)
+        && (entry.encoding !== 'base64' || Buffer.from(entry.stdout, 'base64').toString('base64') === entry.stdout)) {
+      const bytes = Buffer.from(entry.stdout, entry.encoding);
+      const result = encoding ? bytes.toString(encoding) : bytes;
+      const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
+      recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
+        outcome: 'memo_hit', op: throttle.op || args.slice(0, 2).join(' '), caller: deriveGhCaller(throttle, env), points: 0,
+      });
+      return result;
+    }
+  } catch { /* Unreadable entries are misses. */ }
+
+  const result = runGhSyncUnmemoized(args, opts);
+  if (isGhDeferred(result) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(tmp, JSON.stringify({ args, stdout: Buffer.isBuffer(result) ? result.toString('base64') : result,
+      encoding: Buffer.isBuffer(result) ? 'base64' : encoding || 'utf8' }));
+    renameSync(tmp, path);
+  } catch { /* Memo storage must not fail a successful read. */ }
+  finally {
+    try { unlinkSync(tmp); } catch { /* Renamed or never created. */ }
+  }
+  return result;
+}
+
+function runGhSyncUnmemoized(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
   if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
