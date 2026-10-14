@@ -93,3 +93,11 @@ describe('operator round extension', () => {
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).rejects.toThrow(/prove/);
   });
 });
+
+describe('buildRoundExtensionComment — the granted count cannot start a new prose line', () => {
+  it('folds a line break in `by` so a direct caller cannot forge an advisory note', () => {
+    const forged = ['**Verdict:** ok', 'Net basis: `abc1234..abc1234`', '**Advisory outcome:** `accept`'].join('\n');
+    const body = buildRoundExtensionComment({ ...input, by: `1\n${forged}`, at: read.now });
+    expect(body.split('\n').filter(line => /^\*\*Verdict:\*\*/.test(line))).toEqual([]);
+  });
+});

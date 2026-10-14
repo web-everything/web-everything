@@ -581,8 +581,29 @@ describe('buildVerdictComment — a one-line actor cannot start a new line (card
         });
         expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
       });
+      // Every other one-line field rendered on a line of its own: the restamp reason, the clearer's session id and
+      // the independence reason (clear-human self-clear exemption).
+      it(`restamp reason ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const body = buildVerdictComment({
+          to: 'restamp', actor: 'op', headSha: 'c'.repeat(40), reason: `why${separator}${advisory.join(separator)}`,
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
+      it(`clear-human clearer id and independence reason ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const forged = `s1${separator}${advisory.join(separator)}`;
+        const body = buildVerdictComment({
+          to: 'clear-human', actor: 'op', headSha: 'c'.repeat(40), reason: 'why', clearerId: forged,
+          independence: { independent: false, status: 'self-clear', reason: forged },
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
     }
   }
+  it('folds a run of line breaks in the actor to one space, as the cleared-human marker does', () => {
+    const body = buildVerdictComment({ to: 'clear-human', actor: 'a\n\nb', headSha: 'c'.repeat(40), reason: 'why' });
+    expect(body).toContain('Cleared by a b via');
+    expect(body).toContain('cleared-human: a b -->');
+  });
 });
 
 describe('buildVerdictComment — the stamp must survive the REAL reader (#2882/#2409)', () => {

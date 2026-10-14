@@ -25,7 +25,7 @@ export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reaso
   const oneLine = (value) => prose(value).replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');
   return [
     ROUND_EXTENSION_MARKER, '',
-    `Operator @${oneLine(actor)} granted +${by} auto-repair round(s) via ${oneLine(channel)}`, '',
+    `Operator @${oneLine(actor)} granted +${oneLine(by)} auto-repair round(s) via ${oneLine(channel)}`, '',
     ...prose(reason).split(/\r\n|[\r\n\u2028\u2029]/).map((line) => `> ${line}`), '',
     `<!-- round-extension: ${json} -->`,
   ].join('\n');

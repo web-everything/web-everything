@@ -1963,7 +1963,9 @@ export function buildVerdictComment({
       buildReviewedContributionMarker(reviewedDiff),
       to === 'clear-human' ? buildClearedHumanMarker(actor)
         : carriesHumanClearance ? buildClearedHumanMarker(humanClearance.actor) : '',
-      buildClearerActorMarker(clearerId),
+      // The shared marker builder refuses only `\n`; a CR or U+2028/9 in the id would still end the marker's line
+      // early, so the id is refused (no marker, like an unusable id) before it reaches that builder.
+      buildClearerActorMarker(/[\r\n\p{Zl}\p{Zp}]/u.test(String(clearerId)) ? '' : clearerId),
     ].filter(Boolean).join('\n')
     : '';
   // #2844 — the independence line. Printed ONLY when the bar was not met, so a clean record stays terse.
@@ -1975,19 +1977,23 @@ export function buildVerdictComment({
   // under the same ⚠️ as an accept whose independence merely could not be checked. Everything else that failed
   // the bar keeps the ⚠️ wording. On `--to=accepted` a proven self-clear never reaches here at all — the CLI
   // refuses it before any write — so that combination only ever renders in the size projection.
+  // A value rendered inside a prose line: every line break (`^` under /m in parseAdvisories also matches after CR and
+  // U+2028/9) would start a new line a plain-prose reader treats as its own, so fold each run into one space and trim,
+  // the same normalization `buildClearedHumanMarker` applies to the actor it stamps.
+  const oneLine = (value) => String(value).replace(/(?:\r\n|[\r\n\u{2028}\u{2029}])+/gu, ' ').trim();
   const humanCeremonyExemption = to === 'clear-human' && independence
     && independence.status === INDEPENDENCE.SELF_CLEAR;
   const independenceNote = !(stampsAcceptance && independence && independence.independent === false)
     ? ''
     : humanCeremonyExemption
       ? '\n\n🧑 Cleared by the HUMAN CEREMONY, not by an established-independent agent (#2844). The clearing '
-        + `actor is this PR's own author (${clearerId}) — a subagent inherits its parent's session id, so the `
+        + `actor is this PR's own author (${oneLine(clearerId)}) — a subagent inherits its parent's session id, so the `
         + 'operator clearing a PR their own session opened reads as a self-clear at the session level. '
         + '`--to=clear-human` is EXEMPT from the self-clear refusal that binds `--to=accepted`, because it '
         + 'carries a stronger signal than a session id: it is refused unless the PR carries `review:human`, and '
         + 'it requires the explicit actor and the quoted reason above. Read this as "a human ceremony cleared '
         + 'it", NOT as "an independent reviewer cleared it".'
-      : `\n\n⚠️ Independence NOT established for this clearance (#2844): ${independence.reason}. `
+      : `\n\n⚠️ Independence NOT established for this clearance (#2844): ${oneLine(independence.reason)}. `
         + 'This record does not show that a party other than the author cleared it.';
   const text = String(typeof body === 'string' ? body : '').trim();
   const heading = to === 'clear-human'
@@ -2009,9 +2015,6 @@ export function buildVerdictComment({
   // which comment actually granted it. This is the sentence #2572 lacked, which is what let the anti-test-
   // gaming gate see "latest accept-shaped comment has no cleared-human marker" and re-park review:human on a
   // PR a human had just cleared minutes earlier.
-  // The actor is rendered inside a prose line: every line break (`^` under /m in parseAdvisories also matches after
-  // CR and U+2028/9) would start a new line a plain-prose reader treats as its own, so fold them all into spaces.
-  const oneLine = (value) => String(value).replace(/\r\n|[\r\n\u{2028}\u{2029}]/gu, ' ');
   const carriedClearanceNote = carriesHumanClearance
     ? ` The HUMAN clearance ${oneLine(humanClearance.actor)} granted (reviewed-sha ${String(humanClearance.sha).slice(0, 12)}…) `
       + (channel === 'ci-heal'
@@ -2073,7 +2076,7 @@ export function buildVerdictComment({
     heading,
     '',
     attribution + independenceNote,
-    ...(to === 'restamp' && reason ? ['', String(reason)] : []),
+    ...(to === 'restamp' && reason ? ['', oneLine(reason)] : []),
     ...(text ? ['', text] : []),
   ].join('\n'));
   return marker ? `${prose}\n\n${marker}` : prose;
