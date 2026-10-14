@@ -10,6 +10,7 @@ import { resolve } from 'node:path';
 import micromatch from 'micromatch';
 import integrationConfig from '../../vitest.integration.config';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
+import integrationConfig from '../../vitest.integration.config';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
 
 describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () => {
@@ -80,5 +81,20 @@ describe('every vitest config applies the shared ceiling', () => {
     for (const file of [...scenarios, ...scanners]) {
       expect(poolFor(file), file).toBe('forks');
     }
+  });
+
+  it('queues Rust repository scans with daemon scenarios in the single fork', () => {
+    const files = [
+      'scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs',
+      'scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs',
+      'scripts/__tests__/rust-scan-locus-prefix-parity.test.mjs',
+      'scripts/__tests__/rust-scan-citation-check-parity.test.mjs',
+      'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs',
+    ];
+    for (const file of files) {
+      expect(integrationConfig.test.include).toContain(file);
+      expect(integrationConfig.test.poolMatchGlobs).toContainEqual([file, 'forks']);
+    }
+    expect(integrationConfig.test.poolOptions.forks.singleFork).toBe(true);
   });
 });
