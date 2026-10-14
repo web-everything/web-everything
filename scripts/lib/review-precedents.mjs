@@ -111,21 +111,32 @@ export function foldPrecedents(events, { operatorLogins = ['chalbert'], trustedS
   return records;
 }
 
-// Evidence time of a citation: [authored, revised]. A comment source is [commentId, createdAt, updatedAt];
-// a source-less event is a direct recording stamped with its occurrence time.
-function evidenceTime(ev) {
+const commentSource = (ev) => {
   try {
     const source = JSON.parse(ev.source ?? '');
-    if (Array.isArray(source) && source.length === 3) return [Date.parse(source[1]), Date.parse(source[2])];
-  } catch { /* not a comment source */ }
-  return [Date.parse(ev.at), Date.parse(ev.at)];
+    return Array.isArray(source) && (source.length === 2 || source.length === 3) ? source : null;
+  } catch { return null; }
+};
+const timeOf = (value) => { const ms = Date.parse(value); return Number.isFinite(ms) ? ms : -Infinity; };
+
+// Evidence time of a citation: [authored, revised]. A comment source is [commentId, createdAt, updatedAt]
+// (legacy rows: [commentId, time]); a source-less event is a direct recording stamped with its occurrence time.
+// An untimed row sorts oldest, so the order stays total and older evidence can never leapfrog through it.
+function evidenceTime(ev) {
+  const source = commentSource(ev);
+  if (source) return [timeOf(source[1]), timeOf(source.at(-1))];
+  return [timeOf(ev.at), timeOf(ev.at)];
 }
 const strictlyNewer = (a, b) => {
   const [aAuthored, aRevised] = evidenceTime(a), [bAuthored, bRevised] = evidenceTime(b);
-  if (!Number.isFinite(aAuthored) || !Number.isFinite(bAuthored)) return false;
-  if (aAuthored !== bAuthored) return aAuthored > bAuthored;
-  return Number.isFinite(aRevised) && Number.isFinite(bRevised) && aRevised > bRevised;
+  return aAuthored !== bAuthored ? aAuthored > bAuthored : aRevised > bRevised;
 };
+
+/** The comment a sourced citation came from, per seat; null for a direct recording. */
+export function citationCommentKey(ev) {
+  const source = ev?.kind === 'citation' ? commentSource(ev) : null;
+  return source ? JSON.stringify([ev.id, source[0]]) : null;
+}
 
 // Latest evidence per seat wins. Log order only breaks ties: a re-backfilled edit of an OLDER comment is
 // stored after a newer verdict, so append order alone would let stale evidence replace it.

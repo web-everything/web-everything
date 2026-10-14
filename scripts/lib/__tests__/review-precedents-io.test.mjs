@@ -186,4 +186,20 @@ describe('settings and drafting', () => {
     expect(backfill([edited, reworded]).rows).toBe(1);
     expect(panel()).toEqual(['changes']);
   });
+  it('keeps a reverted edit current when the comment reader returns no revision time', () => {
+    // The production reader (pr-comments-list.mjs) returns body, createdAt, author and id only — no updatedAt.
+    const cite = verdict => `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: ABCDEF987 -->`;
+    const original = { body: cite('✅ review — accepted'), author: { login: AUTOMATION_LOGINS[0] }, createdAt: '2026-10-13T10:00:00Z', id: 'IC_1' };
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const backfill = body => io.appendPrecedentEvents({ repo, events: io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, headRefOid: 'abcdef9870000000000000000000000000000000', comments: [{ ...original, body }] }, at }), stage });
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.head, e.verdict]);
+    expect(backfill(original.body).rows).toBe(1);
+    expect(backfill(cite('🔁 review — changes requested')).rows).toBe(1);
+    expect(backfill(original.body).rows).toBe(1);
+    expect(backfill(original.body).rows).toBe(0);
+    // The short, upper-case reviewed-sha resolves to the PR head, so every revision folds into one seat.
+    expect(panel()).toEqual([['abcdef9870000000000000000000000000000000', 'accept']]);
+  });
 });

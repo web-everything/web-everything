@@ -14,7 +14,7 @@ import { readSettings } from './settings-files.mjs';
 import {
   parsePrecedentLog, precedentEventId, foldPrecedents, foldCitations,
   resolvePrecedentSettings, formatPrecedentSettings, captureFromComment,
-  scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent,
+  scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent, citationCommentKey,
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
@@ -74,6 +74,7 @@ export function appendPrecedentEvents({
     } catch (cause) { throw new TypeError('invalid precedent event', { cause }); }
   });
   const ids = lines.map(line => precedentEventId(JSON.parse(line)));
+  const commentKeys = lines.map(line => citationCommentKey(JSON.parse(line)));
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -83,10 +84,17 @@ export function appendPrecedentEvents({
         board, branch, message: `review-precedents: append ${repo}`,
         files: [{ path: precedentGitPath(repo), content: ({ existing }) => {
           const base = existing ?? '';
-          const seen = new Set(parsePrecedentLog(base, trust).events.map(precedentEventId));
+          const stored = parsePrecedentLog(base, trust).events;
+          const seen = new Set(stored.map(precedentEventId));
+          // A comment's current revision is its LAST stored row. Compare a backfilled comment against that row
+          // only: an edit reverted to an earlier verdict must be stored again, or the stale middle edit stays current.
+          const current = new Map();
+          for (const ev of stored) { const key = citationCommentKey(ev); if (key) current.set(key, precedentEventId(ev)); }
           const fresh = lines.filter((line, index) => {
-            if (seen.has(ids[index])) return false;
+            const key = commentKeys[index];
+            if (key ? current.get(key) === ids[index] : seen.has(ids[index])) return false;
             seen.add(ids[index]);
+            if (key) current.set(key, ids[index]);
             return true;
           });
           rows = fresh.length;
@@ -180,7 +188,10 @@ export function recordCitationsFromComments({ repo, pr, info, at }) {
     if (!verdict) continue;
     const ids = extractCitations(body);
     if (!ids.length) continue;
-    const head = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? info.headRefOid;
+    // One spelling per head, so a short or upper-case reviewed-sha folds into the same seat as the full one.
+    const reviewed = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1]?.toLowerCase();
+    const prHead = String(info.headRefOid ?? '').toLowerCase();
+    const head = !reviewed ? info.headRefOid : prHead.startsWith(reviewed) ? prHead : reviewed;
     const source = comment.id ?? comment.url ?? comment.createdAt;
     events.push(citationEvent({ repo, pr, head, ids, seat: verdict === 'advisory' ? 'advisory' : 'panel', verdict, at,
       // [comment, authored, revised]: the fold orders by authored time, so an edit never makes old evidence newest.

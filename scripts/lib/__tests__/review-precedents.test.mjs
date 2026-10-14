@@ -75,6 +75,12 @@ describe('records and events', () => {
     const live = p.citationEvent({ ...base, verdict: 'block', at: '2026-10-13T10:30:00Z' });
     expect(p.foldCitations([accept, live])).toEqual([accept]);
     expect(p.foldCitations([live, staleEdit])).toEqual([live]);
+    // An untimed row never lets older evidence leapfrog a newer verdict stored before it.
+    const untimed = p.citationEvent({ ...base, verdict: 'block', source: source(3, '', '') });
+    expect(p.foldCitations([accept, untimed, staleEdit])).toEqual([accept]);
+    // A legacy [comment, time] source is ordered by its comment time, not by ingestion.
+    const legacy = p.citationEvent({ ...base, verdict: 'changes', at: '2026-10-14T00:00:00Z', source: JSON.stringify([1, '2026-10-13T10:00:00Z']) });
+    expect(p.foldCitations([accept, legacy])).toEqual([accept]);
   });
 });
 
