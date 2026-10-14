@@ -21,6 +21,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
@@ -347,9 +348,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
 
   // (d, continued) provision N lanes via the REAL scripts/lane-pool.mjs, from the sim clone. `--no-install`
   // is the flag that skips `npm ci`/`npm install` entirely (lane-pool.mjs's own `ensureDeps` call sites are
-  // ALL gated on `!flags['no-install']`) — the deps marker (`.git/.lane-pool-deps`) is the OTHER route
-  // (pre-seed it with the lockfile hash so `depsReady` reads 'ok'), left undocumented-but-available below in
-  // case a future scenario needs `ensureDeps` to actually run without a real `npm ci`.
+  // ALL gated on `!flags['no-install']`). Later live-smoke acquires do NOT pass that flag, so seed their
+  // dependency readiness too: reuse this checkout's installed modules, just like the daemon clone above,
+  // and record the lane's lockfile hash in `.git/.lane-pool-deps` (the `depsReady` contract). Otherwise a
+  // rebuild tick runs a real `npm ci`, making these hermetic scenarios depend on the registry and exceed
+  // their timeout under CI load.
   // #4075 soak harness gap — `provision --acquirable` caps NEW clones per call at
   // `ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT` (4, `we:scripts/lane-pool.mjs`), so `createWorld({lanes: N})` for
   // N > 4 silently provisioned only 4 lanes (found building `breaks/lane-acquire-under-load.mjs`, which needs a
@@ -358,6 +361,24 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   execFileSync(process.execPath, [join(simClone, 'scripts', 'lane-pool.mjs'), 'provision', `--count=${lanes}`, '--acquirable', `--max-new=${lanes}`, '--no-install'], {
     cwd: simClone, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
   });
+  if (existsSync(nodeModulesSrc)) {
+    for (const pool of readdirSync(lanePoolRoot, { withFileTypes: true })) {
+      if (!pool.isDirectory()) continue;
+      const poolDir = join(lanePoolRoot, pool.name);
+      for (const lane of readdirSync(poolDir, { withFileTypes: true })) {
+        if (!lane.isDirectory() || !/^lane-\d+$/.test(lane.name)) continue;
+        const laneRoot = join(poolDir, lane.name);
+        symlinkSync(nodeModulesSrc, join(laneRoot, 'node_modules'), 'dir');
+        // `node_modules/` in .gitignore excludes directories, not our symlink. Match the daemon clone's
+        // exclude above so list/acquire still sees clean lanes and git clean preserves the shared modules.
+        appendFileSync(join(laneRoot, '.git', 'info', 'exclude'), '\nnode_modules\n');
+        const lock = join(laneRoot, 'package-lock.json');
+        const manifest = existsSync(lock) ? lock : join(laneRoot, 'package.json');
+        const hash = createHash('sha256').update(readFileSync(manifest)).digest('hex');
+        writeFileSync(join(laneRoot, '.git', '.lane-pool-deps'), hash);
+      }
+    }
+  }
 
   // ── git helpers ────────────────────────────────────────────────────────────────────────────────────────
   function withScratchClone(repoKey, fn) {

@@ -45,7 +45,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
@@ -178,6 +179,25 @@ function a3Def() {
     daemons: ['review', 'fix-dispatch'],
     lanes: 2,
     setup(w) {
+      // The live smoke acquires without --no-install. Prove every provisioned lane is already ready,
+      // so a backlog-only rebuild exercises the real smoke without downloading dependencies mid-tick.
+      const seededLanes = [];
+      for (const pool of readdirSync(w.lanePoolRoot, { withFileTypes: true })) {
+        if (!pool.isDirectory()) continue;
+        const poolDir = join(w.lanePoolRoot, pool.name);
+        for (const lane of readdirSync(poolDir, { withFileTypes: true })) {
+          if (!lane.isDirectory() || !/^lane-\d+$/.test(lane.name)) continue;
+          const laneRoot = join(poolDir, lane.name);
+          const hash = createHash('sha256').update(readFileSync(join(laneRoot, 'package-lock.json'))).digest('hex');
+          expect(readFileSync(join(laneRoot, '.git', '.lane-pool-deps'), 'utf8').trim()).toBe(hash);
+          expect(realpathSync(join(laneRoot, 'node_modules'))).toBe(realpathSync(join(w.simCloneRoot, 'node_modules')));
+          expect(execFileSync('git', ['-C', laneRoot, 'status', '--porcelain', '--untracked-files=all'], {
+            encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+          }).trim()).toBe('');
+          seededLanes.push(laneRoot);
+        }
+      }
+      expect(seededLanes).toHaveLength(2);
       return { w };
     },
     play: [
