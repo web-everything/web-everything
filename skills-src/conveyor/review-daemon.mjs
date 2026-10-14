@@ -251,6 +251,19 @@ export function describeReconcileError(e) {
 }
 
 /**
+ * The tick's review-hold sweeps: the human-surface re-park (live #5193 — an accepted PR whose head touches a
+ * human-only surface goes back to `review:human`) runs first, then the stray-label reconcile. A re-park failure is
+ * its own entry and never stops the reconcile.
+ */
+export function sweepReviewHolds(opts) {
+  let repark;
+  try { repark = sweepHumanSurfaceRepark(opts) ?? []; } catch (e) {
+    repark = [{ num: 0, repark: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] }];
+  }
+  return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
+}
+
+/**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
  * runner.mjs's own mechanical pass ran (see the file header for what's deliberately NOT replicated). Every
@@ -275,8 +288,7 @@ export function runReviewTick({
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
-  holdReconcile = sweepReviewHoldLabels,
-  humanSurfaceRepark = sweepHumanSurfaceRepark,
+  holdReconcile = sweepReviewHolds,
   notifyReferral = notifyReferralHold,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
@@ -323,12 +335,7 @@ export function runReviewTick({
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
-    for (const r of humanSurfaceRepark({ repo }) ?? []) holdReconcileResults.push({ ...r, repark: r.repark });
-  } catch (e) {
-    holdReconcileError = String((e && e.message) || e).split('\n')[0];
-  }
-  try {
-    holdReconcileResults.push(...(holdReconcile({ repo }) ?? []));
+    holdReconcileResults = holdReconcile({ repo }) ?? [];
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];
   }
