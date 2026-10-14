@@ -14,6 +14,7 @@ import { OWNER_INSTALLATIONS } from '../github-app-installations.mjs';
 import {
   GITHUB_APP_ROLES, resolveDeliveryIdentity, resolveRequestedRole, roleForCaller, buildIdentityChain,
   roleCachePath, resolveBotLogins, roleOfBotLogin, ROLE_REQUIRED_PERMISSIONS, shimRoleTable,
+  resolveKeyRef, readDeliveryIdentity, KEY_DIR_ENV,
 } from '../github-app-identity.mjs';
 import { ensureFreshGithubAppEnv } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
@@ -100,6 +101,67 @@ describe('buildIdentityChain — role → worker → today\'s App', () => {
     expect(o.candidates.map((x) => x.role)).toEqual(['legacy']);
     expect(o.skipped).toEqual([{ role: 'observer', reason: 'unconfigured' }, { role: 'worker', reason: 'unconfigured' }]);
     expect(o.loud).toBe(true);
+  });
+});
+
+// Operator rule 2026-10-13: no host-local path is ever committed. A role's key is committed by NAME and resolved on
+// the host through WE_GITHUB_APP_KEY_DIR; an unset dir or a missing file is a LOUD fallback.
+describe('key by name — resolved on the host, never a committed path', () => {
+  const NAMED = { ...REVIEWER, key: { name: 'plateau-reviewer' } };
+  it('accepts {name} and refuses a name that could escape the key dir', () => {
+    expect(resolveDeliveryIdentity({ tool: { reviewer: NAMED } }).roles.reviewer.key).toEqual({ name: 'plateau-reviewer' });
+    for (const bad of ['../x', 'a/b', '', '.hidden', 'a..b']) {
+      const id = resolveDeliveryIdentity({ tool: { reviewer: { ...NAMED, key: { name: bad } } } });
+      expect(id.roles.reviewer).toBeNull();
+      expect(id.invalid).toContain('tool.reviewer');
+    }
+  });
+  it('resolves <dir>/<name>.pem, expanding a leading ~ / $HOME / ${HOME} from HOME (launchd does not expand it)', () => {
+    expect(resolveKeyRef({ name: 'k' }, { [KEY_DIR_ENV]: '/keys/' })).toEqual({ file: '/keys/k.pem', name: 'k' });
+    for (const d of ['~/s', '$HOME/s', '${HOME}/s']) expect(resolveKeyRef({ name: 'k' }, { [KEY_DIR_ENV]: d, HOME: '/h' }).file).toBe('/h/s/k.pem');
+    expect(resolveKeyRef({ name: 'k' }, { [KEY_DIR_ENV]: '$HOME/s' })).toBeNull();
+    expect(resolveKeyRef({ name: 'k' }, {})).toBeNull();
+    expect(resolveKeyRef({ file: '/f.pem' }, {})).toEqual({ file: '/f.pem' });
+  });
+  it('dir set: the role App is the first candidate, keyed by the resolved file', () => {
+    const identity = resolveDeliveryIdentity({ tool: { reviewer: NAMED } });
+    const c = buildIdentityChain({ requestedRole: 'reviewer', identity, env: { [KEY_DIR_ENV]: '/keys' }, cachePath: '/c/web-everything.json' });
+    expect(c.candidates[0]).toMatchObject({ role: 'reviewer', appId: '900001', privateKeyPath: '/keys/plateau-reviewer.pem' });
+    expect(c.skipped).toEqual([{ role: 'worker', reason: 'unconfigured' }]); // the next link, not a fallback: reviewer is first
+  });
+  it('dir unset: the role is skipped as key-dir-unset — a loud fallback, never silent', () => {
+    const identity = resolveDeliveryIdentity({ tool: { reviewer: NAMED } });
+    const c = buildIdentityChain({ requestedRole: 'reviewer', identity, env: {}, cachePath: '/c/web-everything.json' });
+    expect(c.candidates.map((x) => x.role)).toEqual(['legacy']);
+    expect(c.skipped).toEqual([{ role: 'reviewer', reason: 'key-dir-unset' }, { role: 'worker', reason: 'unconfigured' }]);
+    expect(c.loud).toBe(true);
+  });
+  it('the dry-run CLI: reviewer App with the dir set, a loud FALLBACK without it or with the file missing (never reads the key)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'keydir-'));
+    writeFileSync(join(dir, 'plateau-reviewer.pem'), 'not-a-key');
+    const run = (extra) => spawnSync(process.execPath, [join(process.cwd(), 'scripts/lib/github-app-identity.mjs'), '--caller=review-daemon.mjs'],
+      { encoding: 'utf8', env: { ...process.env, WE_DELIVERY_IDENTITY: JSON.stringify({ reviewer: NAMED }), [KEY_DIR_ENV]: '', ...extra } }).stdout;
+    expect(run({ [KEY_DIR_ENV]: dir })).toMatch(/→ reviewer App 900001 {2}\[reviewer:900001 → legacy\]/);
+    expect(run({})).toMatch(/today's App {2}FALLBACK \(reviewer: key-dir-unset, worker: unconfigured\)/);
+    expect(run({ [KEY_DIR_ENV]: join(dir, 'nope') })).toMatch(/FALLBACK \(reviewer: key-unreadable/);
+  });
+});
+
+describe('WE_DELIVERY_IDENTITY=none — the pin (operator kill switch; the hermetic test default)', () => {
+  it('ignores the platform and repo layers; an explicit env JSON layer still applies', () => {
+    const none = resolveDeliveryIdentity({ platform: { merger: MERGER }, tool: { reviewer: REVIEWER }, env: { WE_DELIVERY_IDENTITY: 'none' } });
+    expect(none.anyConfigured).toBe(false);
+    for (const r of GITHUB_APP_ROLES) expect(none.sources[r]).toBe('pinned-none');
+    const withEnv = resolveDeliveryIdentity({ tool: { reviewer: REVIEWER }, env: { WE_DELIVERY_IDENTITY: JSON.stringify({ worker: WORKER }) }, pinned: true });
+    expect(withEnv.roles.reviewer).toBeNull();
+    expect(withEnv.roles.worker.appId).toBe('900003');
+  });
+  it('pins every read of the REAL repo settings (this suite runs pinned), but not an injected reader', () => {
+    expect(process.env.WE_DELIVERY_IDENTITY).toBe('none');
+    // The repo now carries a reviewer role block; pinned, a read with an explicit (unpinned) env still sees none.
+    expect(readDeliveryIdentity({ env: {} }).anyConfigured).toBe(false);
+    const injected = readDeliveryIdentity({ env: {}, read: () => ({ delivery: { identity: { reviewer: REVIEWER } } }) });
+    expect(injected.roles.reviewer.appId).toBe('900001');
   });
 });
 
