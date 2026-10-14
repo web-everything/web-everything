@@ -74,7 +74,7 @@ function fixture(options = {}, responses = {}) {
   const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec, identity, mode: { mode: 'mirror', source: 'tool' }, log, appendLog, ...options });
   return { result, calls, log, appendLog, posts: calls.filter(a => a.includes('POST')), puts: calls.filter(a => a.includes('PUT')) };
 }
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); fsHook.beforeWrite = null; });
 
 describe('native review policy and mapping', () => {
   it('declares frozen modes and states', () => {
@@ -481,6 +481,28 @@ describe('a stale verdict never overwrites a newer one on the same head', () => 
     expect(a.reason).toMatch(/dismissed \d+/);
   });
 
+  // Self-review must-fix: the approval A read before its write was dismissed by another run meanwhile.
+  it('A=changes (no hold) paused before posting; a human hold dismisses our approval and is cleared meanwhile: A never restores it', () => {
+    const gh = fakeGithub({ labels: ['review:changes'] });
+    gh.reviews.push(review(5, 'APPROVED'));
+    let fired = false;
+    const paused = (argv) => {
+      if (!fired && argv.includes('POST')) {
+        fired = true;
+        gh.labels = ['review:accepted', 'review:human'];
+        mirror(gh, 'accepted', { labels: ['review:changes', 'review:human'] });
+        gh.labels = ['review:accepted'];
+        mirror({ ...gh, exec: a => (a.includes('graphql') ? 'User chalbert' : gh.exec(a)) }, 'clear-human', { labels: ['review:accepted', 'review:human'], reviewerExec: () => ({ reason: 'none' }) });
+      }
+      return gh.exec(argv);
+    };
+    const a = mirror({ ...gh, exec: paused }, 'changes', { labels: ['review:accepted'] });
+    expect(gh.reviews.find(r => r.id === 5).state).toBe('DISMISSED');
+    expect(gh.reviews.filter(r => r.state === 'APPROVED')).toHaveLength(0);
+    expect(gh.standing()).toBe('none');
+    expect(a.reason).toContain('no APPROVE');
+  });
+
   it('a reconcile never originates an approval no reviewer run posted (an accept under the worker token)', () => {
     const gh = fakeGithub({ labels: liveLabelsFor('changes') });
     let fired = false;
@@ -502,6 +524,9 @@ describe('a stale verdict never overwrites a newer one on the same head', () => 
     const login = 'plateau-reviewer[bot]';
     const base = { head, reviewerLogin: login, sawHuman: false };
     expect(approvalRestorable({ ...base, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'APPROVED'), review(6, 'CHANGES_REQUESTED')] })).toBe(true);
+    // Dismissed since the read: restored only when this run dismissed it itself.
+    expect(approvalRestorable({ ...base, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'DISMISSED')] })).toBe(false);
+    expect(approvalRestorable({ ...base, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'DISMISSED')], dismissedByRun: [5] })).toBe(true);
     expect(approvalRestorable({ ...base, seenReviews: [], reviews: [review(6, 'APPROVED'), review(7, 'CHANGES_REQUESTED')] })).toBe(true);
     expect(approvalRestorable({ ...base, sawHuman: true, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'APPROVED')] })).toBe(false);
     expect(approvalRestorable({ ...base, seenReviews: [review(4, 'APPROVED'), review(5, 'DISMISSED')], reviews: [review(4, 'APPROVED'), review(5, 'DISMISSED')] })).toBe(false);

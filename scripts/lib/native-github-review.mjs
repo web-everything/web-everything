@@ -291,16 +291,20 @@ function latestOpinionated(reviews) {
 /**
  * May a reconcile post APPROVE (red team on 5257ced00, #5223)? Only to RESTORE the reviewer App's approval on `head`:
  * the one that was its latest opinionated review when this run read the history (`seenReviews`), or one a concurrent
- * run posted after that read. A reconcile never originates an approval. A run that saw `review:human` never restores
- * one: `clear-human` is the only verdict that lifts that hold, so a human-free `review:accepted` it later reads is the
- * operator's clearance, whose native approval is the operator's own ({@link planNativeReview}). Pure.
+ * run posted after that read. A reconcile never originates an approval. That prior approval must still stand in the
+ * FRESH history (`reviews`), unless this run itself dismissed it (`dismissedByRun`): one another run dismissed meanwhile
+ * (e.g. an accept under `review:human`) is that run's ruling, never restored. A run that saw `review:human` never
+ * restores one: `clear-human` is the only verdict that lifts that hold, so a human-free `review:accepted` it later reads
+ * is the operator's clearance, whose native approval is the operator's own ({@link planNativeReview}). Pure.
  */
-export function approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman }) {
+export function approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman, dismissedByRun = [] }) {
   if (sawHuman || !reviewerLogin) return false;
   const own = list => (list ?? []).filter(review => isReviewerBotUser(review?.user, reviewerLogin));
   const seen = own(seenReviews);
+  const fresh = own(reviews);
   const prior = latestOpinionated(seen);
-  if (prior?.commit_id === head && prior.state === 'APPROVED') return true;
+  if (prior?.commit_id === head && prior.state === 'APPROVED'
+    && (dismissedByRun.includes(prior.id) || fresh.some(review => review.id === prior.id && review.state === 'APPROVED'))) return true;
   const seenIds = new Set(seen.map(review => review.id));
   return own(reviews).some(review => !seenIds.has(review.id) && review.commit_id === head && review.state === 'APPROVED');
 }
@@ -548,8 +552,10 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     const left = [];
     const errors = [];
     let dismissed = 0;
+    const tried = [];
     for (const id of entry.ids) {
       if (!standing.has(id)) continue;
+      tried.push(id);
       try { dismiss(run, endpoint, id, entry.verdict, entry.head); dismissed++; }
       catch (error) { left.push(id); errors.push(`dismissal ${id}: ${failureReason(error)}`); }
     }
@@ -558,7 +564,7 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     let settled = null;
     if (dismissed) {
       try {
-        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join(), seenReviews: reviews, sawHuman });
+        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join(), seenReviews: reviews, sawHuman, dismissedByRun: tried });
       } catch (error) { settled = { outcome: 'failed', reason: `verdict unconfirmed after write: ${failureReason(error)}` }; }
     }
     if (settled) record({ ...line, outcome: settled.outcome, dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
@@ -579,7 +585,7 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
  * when the labels hold none (pending, human) or the head moved, dismiss our standing reviews they do not endorse.
  * Returns what it did. Throws on a failed read or write.
  */
-function reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman }) {
+function reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman, dismissedByRun }) {
   // The same refusals as the mirror's own write: never on a closed PR, never a verdict on the App's own PR.
   if (live.state !== 'open') return ['nothing: pr-not-open'];
   const names = labelNames(live.labels);
@@ -589,7 +595,7 @@ function reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenRevie
   const actions = [];
   if (want && live.head === head && !isReviewerBotUser({ login: live.author, type: live.authorType }, reviewerLogin)) {
     if (findExistingNativeReview({ reviews, head, event: want.event, reviewerLogin })) return [];
-    if (want.event !== 'APPROVE' || approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman })) {
+    if (want.event !== 'APPROVE' || approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman, dismissedByRun })) {
       run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${head}`, '-f', `event=${want.event}`, '-f', `body=${nativeReviewBody({ ...want, head })}`]);
       return [`posted ${want.event}`];
     }
@@ -609,9 +615,9 @@ const SETTLE_ROUNDS = 3;
  * labels. Returns null when it does, else `{outcome, reason}`. Every write by any run is followed by its own re-read,
  * so the last writer always leaves GitHub on the live label. An approval is only ever restored, never originated
  * ({@link approvalRestorable}: `seenReviews` is the history this run read before writing, `sawHuman` whether its own
- * view held `review:human`).
+ * view held `review:human`, `dismissedByRun` the review ids this run tried to dismiss).
  */
-function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent, seenReviews, sawHuman }) {
+function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent, seenReviews, sawHuman, dismissedByRun = [] }) {
   let seen = null;
   const actions = [];
   // Up to SETTLE_ROUNDS reconciles, each followed by a fresh read; the last read only judges.
@@ -623,7 +629,7 @@ function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent, se
     if (key === seen) return { outcome: 'superseded', reason: `verdict-superseded after write (live=${key}); reconciled: ${actions.join(', ') || 'nothing to change'}` };
     if (round === SETTLE_ROUNDS) return { outcome: 'failed', reason: `verdict-superseded after write; labels kept moving (last live=${key}); reconciled: ${actions.join(', ')}` };
     seen = key;
-    actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman }));
+    actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman, dismissedByRun }));
   }
 }
 
@@ -764,7 +770,7 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
     // A failed POST or dismissal may still have landed on GitHub, so any attempted write is re-checked.
     if (writer && (attempted || ids.length)) {
       try {
-        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent, seenReviews: reviews, sawHuman });
+        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent, seenReviews: reviews, sawHuman, dismissedByRun: writer ? ids : [] });
         if (settled) return finish(settled.outcome, [reason, settled.reason].filter(Boolean).join('; '), extra);
       } catch (error) {
         return finish('failed', [reason, `verdict unconfirmed after write: ${failureReason(error)}`].filter(Boolean).join('; '), { ...extra, dismissal: plan.dismiss.length ? 'failed' : undefined });
