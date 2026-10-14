@@ -480,9 +480,9 @@ jobs:
     needs: daemon-soak-scope
     if: needs.daemon-soak-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # No measured per-shard p95 yet (this split is new) — sized generously pending a first-run sample, same
-    # ~3x-p95 method `test-shard` used once IT had data (see that job's own timeout comment above).
-    timeout-minutes: 15
+    # Measured 2026-10-14 (PR #5260 run): balanced shards run ~10-13 min wall; stale stored timings had left
+    # shard 3 at ~16 min (cancelled at the old 15-min cap, on main too). 20 keeps headroom for runner variance.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
