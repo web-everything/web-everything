@@ -15,6 +15,7 @@ import {
   parsePrecedentLog, precedentEventId, foldPrecedents, foldCitations,
   resolvePrecedentSettings, formatPrecedentSettings, captureFromComment,
   scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent, citationCommentKey,
+  currentCommentCitations, citationRetractions,
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
@@ -60,10 +61,17 @@ const defaultSleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4))
 
 export function appendPrecedentEvents({
   board, repo, events, branch = PRECEDENT_TRANSPORT_BRANCH, attempts = 5,
-  sleep = defaultSleep, onRetry, stage = stageOnTransportBranch, ...seams
+  sleep = defaultSleep, onRetry, stage = stageOnTransportBranch, citationSnapshot, ...seams
 } = {}) {
   assertPushRef(branch, PRECEDENT_PUSH_REF);
-  if (!Array.isArray(events) || !events.length) throw new TypeError('events must be a non-empty array');
+  // citationSnapshot: { pr, at } marks `events` as EVERY citation one PR's complete thread yields now (it may be
+  // empty), so stored comments missing from it are withdrawn against the tip this append races.
+  if (citationSnapshot !== undefined && (!Number.isSafeInteger(citationSnapshot?.pr) || citationSnapshot.pr < 1
+    || typeof citationSnapshot.at !== 'string')) throw new TypeError('citationSnapshot must be { pr, at }');
+  if (!Array.isArray(events) || (!events.length && !citationSnapshot)) throw new TypeError('events must be a non-empty array');
+  if (citationSnapshot && events.some(event => event?.kind !== 'citation' || event.repo !== repo || event.pr !== citationSnapshot.pr)) {
+    throw new TypeError('a citation snapshot holds only that PR\'s citation events');
+  }
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw new TypeError('attempts must be a positive integer');
   const lines = events.map(event => {
     try {
@@ -73,8 +81,7 @@ export function appendPrecedentEvents({
       return line;
     } catch (cause) { throw new TypeError('invalid precedent event', { cause }); }
   });
-  const ids = lines.map(line => precedentEventId(JSON.parse(line)));
-  const commentKeys = lines.map(line => citationCommentKey(JSON.parse(line)));
+  const parsedEvents = lines.map(line => JSON.parse(line));
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -88,17 +95,17 @@ export function appendPrecedentEvents({
           const seen = new Set(stored.map(precedentEventId));
           // A comment's current revision is its LAST stored row. Compare a backfilled comment against that row
           // only: an edit reverted to an earlier verdict must be stored again, or the stale middle edit stays current.
-          const current = new Map();
-          for (const ev of stored) { const key = citationCommentKey(ev); if (key) current.set(key, precedentEventId(ev)); }
-          const fresh = lines.filter((line, index) => {
-            const key = commentKeys[index];
-            if (key ? current.get(key) === ids[index] : seen.has(ids[index])) return false;
-            seen.add(ids[index]);
-            if (key) current.set(key, ids[index]);
+          const current = new Map([...currentCommentCitations(stored)].map(([key, ev]) => [key, precedentEventId(ev)]));
+          const withdrawn = citationSnapshot ? citationRetractions(stored, parsedEvents, { repo, ...citationSnapshot }) : [];
+          const fresh = [...parsedEvents, ...withdrawn].filter(ev => {
+            const key = citationCommentKey(ev), id = precedentEventId(ev);
+            if (key ? current.get(key) === id : seen.has(id)) return false;
+            seen.add(id);
+            if (key) current.set(key, id);
             return true;
-          });
+          }).map(ev => JSON.stringify(ev));
           rows = fresh.length;
-          duplicates = lines.length - rows;
+          duplicates = Math.max(0, lines.length + withdrawn.length - rows);
           return rows ? `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n` : base;
         } }],
         allowRef: PRECEDENT_PUSH_REF,

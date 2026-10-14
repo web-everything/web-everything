@@ -82,6 +82,19 @@ describe('records and events', () => {
     const legacy = p.citationEvent({ ...base, verdict: 'changes', at: '2026-10-14T00:00:00Z', source: JSON.stringify([1, '2026-10-13T10:00:00Z']) });
     expect(p.foldCitations([accept, legacy])).toEqual([accept]);
   });
+  it('folds a withdrawn comment out, so the seat falls back to the next comment that still cites', () => {
+    const source = (comment, time) => JSON.stringify([comment, time, time]);
+    const base = { repo: REPO, pr: 1, head: 'abcdef1', seat: 'panel', at };
+    const older = p.citationEvent({ ...base, ids: [seeds[0].id], verdict: 'changes', source: source(1, '2026-10-13T10:00:00Z') });
+    const newer = p.citationEvent({ ...base, ids: [seeds[1].id], verdict: 'accept', source: source(2, '2026-10-13T11:00:00Z') });
+    const [withdrawn] = p.citationRetractions([older, newer], [older], { repo: REPO, pr: 1, at });
+    expect(withdrawn).toMatchObject({ id: newer.id, ids: [], verdict: '', source: newer.source });
+    expect(p.citationRetractions([older, newer, withdrawn], [older], { repo: REPO, pr: 1, at })).toEqual([]);
+    expect(p.citationRetractions([older, newer], [older], { repo: REPO, pr: 2, at })).toEqual([]);
+    expect(p.foldCitations([older, newer, withdrawn])).toEqual([older]);
+    expect(p.foldCitations([older, withdrawn, newer])).toEqual([newer]);
+    expect(p.foldCitations([newer, withdrawn])).toEqual([]);
+  });
 });
 
 describe('recorded operator capture', () => {

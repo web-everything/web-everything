@@ -3,12 +3,12 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-  loadPrecedentSettings, readPrecedents, appendPrecedentEvents, readPrInfo,
+  loadPrecedentSettings, readPrecedents, readPrecedentLog, appendPrecedentEvents, readPrInfo,
   capturePrecedents, draftPatternWithModel, recordCitationsFromComments,
 } from './lib/review-precedents-io.mjs';
 import {
   precedentEvent, statusEvent, withPrecedents, matchPrecedents,
-  precedentAgreement, formatPrecedentSettings,
+  precedentAgreement, formatPrecedentSettings, citationRetractions,
 } from './lib/review-precedents.mjs';
 import { createReviewPrReader } from './operations/review-pr-io.mjs';
 import { shapeReadFinding, buildReviewJudgeRequest } from './operations/review-pr.mjs';
@@ -150,9 +150,15 @@ async function main() {
     const pr = prNumber();
     const info = readPrInfo({ repo, pr });
     readLibrary(); // Refuse unknown transport state even for a backfill preview.
+    const log = readPrecedentLog({ board, repo });
+    if (log.status !== 'ok') throw Object.assign(new Error(`precedent transport unreadable: ${log.error}`), { exitCode: 2 });
     const events = recordCitationsFromComments({ repo, pr, info, at });
-    const appended = write(events);
-    print({ mode: flags.apply ? 'apply' : 'preview', events, appended }, [`${mode}: ${events.length} citation events`, ...events.map(event => `${event.id} · ${event.verdict} · ${event.ids.join(', ')}`)]);
+    // The thread is complete, so a stored comment it no longer yields is withdrawn (re-computed on the append tip).
+    const withdrawn = citationRetractions(log.events, events, { repo, pr, at });
+    const appended = flags.apply ? appendPrecedentEvents({ board, repo, events, citationSnapshot: { pr, at } }) : null;
+    print({ mode: flags.apply ? 'apply' : 'preview', events, withdrawn, appended }, [`${mode}: ${events.length} citation events, ${withdrawn.length} withdrawn`,
+      ...events.map(event => `${event.id} · ${event.verdict} · ${event.ids.join(', ')}`),
+      ...withdrawn.map(event => `${event.id} · withdrawn · ${event.source}`)]);
   } else if (command === 'report') {
     const { precedents, citations } = readLibrary();
     const decisions = [...precedents.values()].map(record => ({ id: record.id, repo: record.source.repo, pr: record.source.pr, head: record.source.head, decision: record.decision }));

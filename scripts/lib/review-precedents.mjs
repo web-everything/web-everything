@@ -138,16 +138,44 @@ export function citationCommentKey(ev) {
   return source ? JSON.stringify([ev.id, source[0]]) : null;
 }
 
-// Latest evidence per seat wins. Log order only breaks ties: a re-backfilled edit of an OLDER comment is
-// stored after a newer verdict, so append order alone would let stale evidence replace it.
-export function foldCitations(events) {
+// Keep, per key, the row with the latest evidence. Log order only breaks ties: a re-backfilled edit of an
+// OLDER comment is stored after a newer verdict, so append order alone would let stale evidence replace it.
+function latestBy(rows, keyOf) {
   const latest = new Map();
-  for (const ev of events) {
-    if (ev.kind !== 'citation') continue;
-    const prior = latest.get(ev.id);
-    if (!prior || !strictlyNewer(prior, ev)) latest.set(ev.id, ev);
+  for (const row of rows) {
+    const key = keyOf(row.ev);
+    const prior = latest.get(key);
+    if (!prior || !strictlyNewer(prior.ev, row.ev)) latest.set(key, row);
   }
-  return [...latest.values()];
+  return latest;
+}
+const citationRows = events => events.flatMap((ev, index) => ev?.kind === 'citation' ? [{ ev, index }] : []);
+
+/** Each comment's current row, keyed by citationCommentKey (sourced citations only). */
+export function currentCommentCitations(events) {
+  const sourced = citationRows(events).filter(row => citationCommentKey(row.ev));
+  return new Map([...latestBy(sourced, citationCommentKey)].map(([key, row]) => [key, row.ev]));
+}
+
+/**
+ * Withdrawal rows for one PR's backfill. `snapshot` is every citation the PR's COMPLETE thread yields now; a
+ * stored comment that still counts but yields nothing (its last citation removed, its verdict changed seat, or
+ * the comment deleted) gets a row with no ids that withdraws it.
+ */
+export function citationRetractions(stored, snapshot, { repo, pr, at }) {
+  const produced = new Set(snapshot.map(citationCommentKey).filter(Boolean));
+  return [...currentCommentCitations(stored)].filter(([key, ev]) => ev.repo === repo && ev.pr === pr && ev.ids.length && !produced.has(key))
+    .map(([, ev]) => citationEvent({ repo, pr, head: ev.head, ids: [], seat: ev.seat, verdict: '', at, source: ev.source }));
+}
+
+// A comment counts through its latest row only, and a row with no ids withdraws it. Then the latest evidence
+// per seat wins, so a seat falls back to the next comment that still cites when a newer one is withdrawn.
+export function foldCitations(events) {
+  const rows = citationRows(events);
+  const byComment = latestBy(rows.filter(row => citationCommentKey(row.ev)), citationCommentKey);
+  const counted = [...rows.filter(row => !citationCommentKey(row.ev)), ...byComment.values()]
+    .filter(row => row.ev.ids.length).sort((a, b) => a.index - b.index);
+  return [...latestBy(counted, ev => ev.id).values()].map(row => row.ev);
 }
 
 export function globToRegExp(glob) {

@@ -186,6 +186,33 @@ describe('settings and drafting', () => {
     expect(backfill([edited, reworded]).rows).toBe(1);
     expect(panel()).toEqual(['changes']);
   });
+  it('withdraws a comment whose citations were removed or which was deleted, restoring the older attribution', () => {
+    const cite = (verdict, id = seeds[0].id) => `${verdict}\n${id ? `[precedent:${id}]\n` : ''}<!-- reviewed-sha: abcdef987 -->`;
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const older = { ...automation, id: 'IC_1', createdAt: '2026-10-13T10:00:00Z', body: cite('🔁 review — changes requested') };
+    const newer = { ...automation, id: 'IC_2', createdAt: '2026-10-13T11:00:00Z', body: cite('✅ review — accepted', seeds[1].id) };
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const backfill = comments => io.appendPrecedentEvents({ repo, stage, citationSnapshot: { pr: 9, at },
+      events: io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, comments }, at }) });
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.verdict, e.ids]);
+    expect(backfill([older, newer]).rows).toBe(2);
+    expect(panel()).toEqual([['accept', [seeds[1].id]]]);
+    // The newer comment loses its last citation: its attribution is withdrawn and the older one is current again.
+    const uncited = { ...newer, body: cite('✅ review — accepted', null) };
+    expect(backfill([older, uncited]).rows).toBe(1);
+    expect(panel()).toEqual([['changes', [seeds[0].id]]]);
+    expect(backfill([older, uncited]).rows).toBe(0);
+    // Citing again after the withdrawal is stored again.
+    expect(backfill([older, newer]).rows).toBe(1);
+    expect(panel()).toEqual([['accept', [seeds[1].id]]]);
+    // A deleted comment (absent from the complete thread) is withdrawn too, even when nothing else cites.
+    expect(backfill([newer]).rows).toBe(1);
+    expect(backfill([]).rows).toBe(1);
+    expect(panel()).toEqual([]);
+    expect(backfill([]).rows).toBe(0);
+  });
   it('keeps a reverted edit current when the comment reader returns no revision time', () => {
     // The production reader (pr-comments-list.mjs) returns body, createdAt, author and id only — no updatedAt.
     const cite = verdict => `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: ABCDEF987 -->`;
