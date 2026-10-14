@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
 import { collectRunClosure, decideSkipRebuild } from '../daemon-rebuild/skip-unrelated.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
 
 function fixture(contents) {
   const root = resolve('run-closure-fixture');
@@ -25,6 +26,49 @@ function fixture(contents) {
 }
 
 describe('collectRunClosure filesystem reads', () => {
+  it('parses shared sources once across spawn hops and preserves their dependency metadata', () => {
+    const f = fixture({
+      'scripts/daemon.mjs': "import './shared.mjs';\nspawn(process.execPath, ['./worker.mjs']);\n",
+      'scripts/shared.mjs': "import 'a-package';\nexport const config = 'settings.json';\n",
+      'scripts/worker.mjs': "import './shared.mjs';\nspawn(process.execPath, ['./grandchild.mjs']);\n",
+      'scripts/grandchild.mjs': "import './shared.mjs';\n",
+    });
+    const parserReads = new Map();
+    let passes = 0;
+    const closure = collectRunClosure({
+      ...f.options,
+      importClosure(options) {
+        passes++;
+        return collectImportClosure({
+          ...options,
+          readFile(path) {
+            parserReads.set(path, (parserReads.get(path) || 0) + 1);
+            return options.readFile(path);
+          },
+        });
+      },
+    });
+    expect(passes).toBe(3);
+    expect([...parserReads.values()]).toEqual(Array(f.files.size).fill(1));
+    expect(closure.complete).toBe(true);
+    expect(closure.bareDeps).toBe(true);
+    expect(closure.jsonNames.has('settings.json')).toBe(true);
+    expect(closure.files.has('scripts/grandchild.mjs')).toBe(true);
+    expect(decideSkipRebuild({ closure, changedFiles: ['config/settings.json'] }).skip).toBe(false);
+  });
+
+  it('preserves incomplete dynamic imports across later spawn hops', () => {
+    const f = fixture({
+      'scripts/daemon.mjs': "await import(target);\nspawn(process.execPath, ['./worker.mjs']);\n",
+      'scripts/worker.mjs': "spawn(process.execPath, ['./grandchild.mjs']);\n",
+      'scripts/grandchild.mjs': 'export {};\n',
+    });
+    const closure = collectRunClosure(f.options);
+    expect(closure.files.has('scripts/grandchild.mjs')).toBe(true);
+    expect(closure.complete).toBe(false);
+    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(false);
+  });
+
   it('reads each source and checks each path once across imports and multiple spawn hops', () => {
     const f = fixture({
       'scripts/daemon.mjs': "import './shared.mjs';\nspawn(process.execPath, ['./worker.mjs']);\n",

@@ -149,6 +149,7 @@ export function collectRunClosure({
   // hops and the spawn scan; a new invocation gets fresh caches so later tree moves remain visible.
   const sources = new Map();
   const presence = new Map();
+  const parsed = new Map();
   const readOnce = (path) => {
     if (!sources.has(path)) sources.set(path, readFile(path));
     return sources.get(path);
@@ -157,7 +158,7 @@ export function collectRunClosure({
     if (!presence.has(path)) presence.set(path, exists(path));
     return presence.get(path);
   };
-  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce });
+  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce, parsed });
   const walked = new Set(entries);
   let closure = imports();
   if (!closure) return null;
