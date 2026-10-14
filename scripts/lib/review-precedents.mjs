@@ -74,9 +74,9 @@ export function readEvent({ repo, pr, at }) {
   return { kind: 'read', id: `read:${repo}#${pr}`, repo, pr, at };
 }
 
-/** The newest read mark stored for one PR, as epoch ms; -Infinity when none. */
-export function latestReadAt(events, { repo, pr }) {
-  return events.reduce((latest, ev) => ev?.kind === 'read' && ev.repo === repo && ev.pr === pr
+/** The newest read mark stored for one PR, as epoch ms, ignoring marks after `notAfter`; -Infinity when none. */
+export function latestReadAt(events, { repo, pr, notAfter = Infinity }) {
+  return events.reduce((latest, ev) => ev?.kind === 'read' && ev.repo === repo && ev.pr === pr && Date.parse(ev.at) <= notAfter
     ? Math.max(latest, Date.parse(ev.at)) : latest, -Infinity);
 }
 

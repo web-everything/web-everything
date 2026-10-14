@@ -57,25 +57,33 @@ export class PrecedentAppendExhaustedError extends Error {
   }
 }
 
+const READ_MARK_SKEW_MS = 10 * 60 * 1000;
 const defaultSleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 export function appendPrecedentEvents({
   board, repo, events, branch = PRECEDENT_TRANSPORT_BRANCH, attempts = 5,
-  sleep = defaultSleep, onRetry, stage = stageOnTransportBranch, citationSnapshot, ...seams
+  sleep = defaultSleep, onRetry, stage = stageOnTransportBranch, citationSnapshot, now = Date.now, ...seams
 } = {}) {
   assertPushRef(branch, PRECEDENT_PUSH_REF);
   // citationSnapshot: { pr, at } marks `events` as EVERY citation one PR's complete thread yields now (it may be
-  // empty), so stored comments missing from it are withdrawn against the tip this append races.
+  // empty), so stored comments missing from it are withdrawn against the tip this append races. With
+  // { pr, at, info } (the PR read) the events are derived on each tip instead, so a comment keeps the head the tip
+  // recorded for it even when another backfill appended between this one's log read and its append.
   if (citationSnapshot !== undefined && (!Number.isSafeInteger(citationSnapshot?.pr) || citationSnapshot.pr < 1
-    || typeof citationSnapshot.at !== 'string' || !Number.isFinite(Date.parse(citationSnapshot.at)))) {
-    throw new TypeError('citationSnapshot must be { pr, at } with a timed at');
+    || typeof citationSnapshot.at !== 'string' || !Number.isFinite(Date.parse(citationSnapshot.at))
+    || (citationSnapshot.info !== undefined && (typeof citationSnapshot.info !== 'object' || citationSnapshot.info === null)))) {
+    throw new TypeError('citationSnapshot must be { pr, at, info? } with a timed at');
   }
-  if (!Array.isArray(events) || (!events.length && !citationSnapshot)) throw new TypeError('events must be a non-empty array');
-  if (citationSnapshot && events.some(event => event?.kind !== 'citation' || event.repo !== repo || event.pr !== citationSnapshot.pr)) {
+  const deriveFrom = citationSnapshot?.info;
+  const derive = stored => recordCitationsFromComments({ repo, pr: citationSnapshot.pr, info: deriveFrom, at: citationSnapshot.at, stored });
+  if (deriveFrom && events !== undefined) throw new TypeError('a citation snapshot with info derives its own events');
+  if (deriveFrom) derive([]); // A bad PR read fails here, once, not on every retry.
+  else if (!Array.isArray(events) || (!events.length && !citationSnapshot)) throw new TypeError('events must be a non-empty array');
+  if (citationSnapshot && !deriveFrom && events.some(event => event?.kind !== 'citation' || event.repo !== repo || event.pr !== citationSnapshot.pr)) {
     throw new TypeError('a citation snapshot holds only that PR\'s citation events');
   }
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw new TypeError('attempts must be a positive integer');
-  const lines = events.map(event => {
+  const lines = (deriveFrom ? [] : events).map(event => {
     try {
       const line = JSON.stringify(event);
       const parsed = parsePrecedentLog(line, trust);
@@ -96,17 +104,20 @@ export function appendPrecedentEvents({
           const stored = parsePrecedentLog(base, trust).events;
           // A snapshot whose read began before the newest read mark on this tip is stale as a whole: the newer read
           // may have stored nothing (every row unchanged), so no row-level rank could tell its rows are older.
+          // A mark ahead of this host's clock (a skewed writer) is ignored, or it would refuse every honest read.
           const readAt = citationSnapshot ? Date.parse(citationSnapshot.at) : NaN;
-          const lastRead = citationSnapshot ? latestReadAt(stored, { repo, pr: citationSnapshot.pr }) : -Infinity;
+          const lastRead = citationSnapshot ? latestReadAt(stored, { repo, pr: citationSnapshot.pr, notAfter: now() + READ_MARK_SKEW_MS }) : -Infinity;
+          const snapshotEvents = deriveFrom ? derive(stored) : parsedEvents;
           stale = readAt < lastRead;
-          if (stale) { rows = 0; duplicates = lines.length; return base; }
+          if (stale) { rows = 0; duplicates = snapshotEvents.length; return base; }
           const seen = new Set(stored.map(precedentEventId));
           // Compare a backfilled comment against its CURRENT row only: an edit reverted to an earlier verdict must
           // be stored again, or the stale middle edit stays current. A row that would not become current (a stale
           // read landing after a newer read's row or withdrawal) is dropped, so it can never restore that row.
           const current = currentCommentCitations(stored);
-          const withdrawn = citationSnapshot ? citationRetractions(stored, parsedEvents, { repo, ...citationSnapshot }) : [];
-          const fresh = [...parsedEvents, ...withdrawn].filter(ev => {
+          const withdrawn = citationSnapshot
+            ? citationRetractions(stored, snapshotEvents, { repo, pr: citationSnapshot.pr, at: citationSnapshot.at }) : [];
+          const fresh = [...snapshotEvents, ...withdrawn].filter(ev => {
             const key = citationCommentKey(ev), id = precedentEventId(ev), prior = key ? current.get(key) : null;
             if (key ? prior && (precedentEventId(prior) === id || !citationSupersedes(ev, prior)) : seen.has(id)) return false;
             seen.add(id);
@@ -114,7 +125,7 @@ export function appendPrecedentEvents({
             return true;
           }).map(ev => JSON.stringify(ev));
           rows = fresh.length;
-          duplicates = Math.max(0, lines.length + withdrawn.length - rows);
+          duplicates = Math.max(0, snapshotEvents.length + withdrawn.length - rows);
           // The read mark is not a counted row; it is written whenever this read is the newest, changed or not.
           const out = readAt > lastRead ? [...fresh, JSON.stringify(readEvent({ repo, pr: citationSnapshot.pr, at: citationSnapshot.at }))] : fresh;
           return out.length ? `${base}${base && !base.endsWith('\n') ? '\n' : ''}${out.join('\n')}\n` : base;

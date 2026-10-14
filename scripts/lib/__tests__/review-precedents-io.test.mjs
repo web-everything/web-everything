@@ -270,6 +270,24 @@ describe('settings and drafting', () => {
     expect(panel()).toEqual([['advisory', 'bbbbbbb2']]);
     expect(() => apply({ at: 'not-a-time', events: [] })).toThrow(TypeError);
   });
+  it('derives a snapshot on the tip it appends to, so a backfill landing first keeps the comment on its head', () => {
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const advisory = { ...automation, id: 'IC_2', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.verdict, e.head]);
+    const apply = (at, headRefOid, extra = {}) => io.appendPrecedentEvents({ repo, stage, ...extra,
+      citationSnapshot: { pr: 9, at, info: { ...info, headRefOid, comments: [advisory] } } });
+    // Both read the empty log; the older read (head aaaaaaa1) lands first, then the newer one (head bbbbbbb2).
+    expect(apply('2026-10-13T12:00:00Z', 'aaaaaaa1').rows).toBe(1);
+    expect(apply('2026-10-13T13:00:00Z', 'bbbbbbb2')).toMatchObject({ status: 'appended', rows: 0 });
+    expect(panel()).toEqual([['advisory', 'aaaaaaa1']]);
+    // A read mark ahead of this host's clock never refuses an honest read.
+    expect(apply('2099-01-01T00:00:00Z', 'aaaaaaa1').rows).toBe(0);
+    expect(apply('2026-10-13T14:00:00Z', 'aaaaaaa1', { now: () => Date.parse('2026-10-13T14:00:00Z') }).status).toBe('appended');
+    expect(() => io.appendPrecedentEvents({ repo, stage, events: [], citationSnapshot: { pr: 9, at: '2026-10-13T15:00:00Z', info } })).toThrow(TypeError);
+  });
   it('keeps a comment on the head it was first recorded on after the PR head moves', () => {
     const automation = { author: { login: AUTOMATION_LOGINS[0] } };
     const advisory = { ...automation, id: 'IC_9', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };

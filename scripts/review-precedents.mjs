@@ -155,7 +155,9 @@ async function main() {
     const events = recordCitationsFromComments({ repo, pr, info, at, stored: log.events });
     // The thread is complete, so a stored comment it no longer yields is withdrawn (re-computed on the append tip).
     const withdrawn = citationRetractions(log.events, events, { repo, pr, at });
-    const appended = flags.apply ? appendPrecedentEvents({ board, repo, events, citationSnapshot: { pr, at } }) : null;
+    // The append derives the events again on the tip it races, so a backfill landing in between cannot move a head.
+    const appended = flags.apply ? appendPrecedentEvents({ board, repo, citationSnapshot: { pr, at, info } }) : null;
+    if (appended?.status === 'stale-snapshot') console.error('warning: a newer backfill of this PR already landed; this read was refused and wrote nothing');
     print({ mode: flags.apply ? 'apply' : 'preview', events, withdrawn, appended }, [`${mode}: ${events.length} citation events, ${withdrawn.length} withdrawn`,
       ...events.map(event => `${event.id} · ${event.verdict} · ${event.ids.join(', ')}`),
       ...withdrawn.map(event => `${event.id} · withdrawn · ${event.source}`)]);
