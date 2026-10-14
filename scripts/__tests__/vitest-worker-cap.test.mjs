@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
+import integrationConfig from '../../vitest.integration.config';
 
 describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () => {
   it('defaults to a ceiling of 4: 12 or 24 cores, cap 2 -> 4', () => {
@@ -54,7 +55,7 @@ describe('every vitest config applies the shared ceiling', () => {
   const read = (f) => readFileSync(resolve(process.cwd(), f), 'utf8');
   it.each([
     ['vitest.config.ts', 'maxThreads: maxTestWorkers'],
-    ['vitest.integration.config.ts', 'maxThreads: maxTestWorkers'],
+    ['vitest.integration.config.ts', 'maxForks: maxTestWorkers'],
     ['vitest.maas-conformance.config.ts', 'maxThreads: maxTestWorkers'],
     ['vitest.soak.config.ts', 'maxForks: maxTestWorkers'],
   ])('%s', (file, needle) => {
@@ -63,7 +64,24 @@ describe('every vitest config applies the shared ceiling', () => {
     expect(src).toContain(needle);
   });
 
-  it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
-    expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  it('keeps the integration fork range valid even when the shared ceiling is one worker', () => {
+    const { minForks, maxForks } = integrationConfig.test.poolOptions.forks;
+    const lowestCeiling = resolveMaxTestWorkers({}, 1);
+    expect(minForks).toBeGreaterThanOrEqual(1);
+    expect(minForks).toBeLessThanOrEqual(lowestCeiling);
+    expect(minForks).toBeLessThanOrEqual(maxForks);
+  });
+
+  it('keeps the integration config off singleFork (a fully serial tier overran the 20-minute CI job budget)', () => {
+    const src = read('vitest.integration.config.ts');
+    expect(src).toMatch(/forks:\s*\{\s*singleFork: false/);
+    expect(src).not.toMatch(/singleFork:\s*true/);
+  });
+
+  it('runs the integration files in one pool so serial simulator forks do not contend with threads', () => {
+    const src = read('vitest.integration.config.ts');
+    expect(src).toContain("pool: 'forks'");
+    expect(src).not.toContain('poolMatchGlobs:');
+    expect(src).not.toMatch(/threads:\s*\{/);
   });
 });
