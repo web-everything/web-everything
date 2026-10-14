@@ -29,7 +29,8 @@
  *
  * SMOKE ONLY: WE_PR_SNAPSHOT_SAMPLE caps the returned projection to the oldest PRs.
  * WE_PR_SNAPSHOT_STALE_OK_MS serves snapshots within that age despite TTL/dirty marks; beyond the normal
- * TTL it schedules one detached refresh per repo/process. Unset controls preserve normal reads.
+ * TTL it schedules one detached refresh per repo/process. Marked rebuild-smoke dry-run children inherit
+ * unset controls from their own tree's rebuildSmokeDryRun settings; other processes preserve normal reads.
  *
  * COST: refreshes use small GraphQL pages configured by `prListPaging` (see pr-list-paged.mjs), without
  * comments/body/files. Per-PR `gh pr view` hydrates those heavy fields only when their cached identity or age
@@ -37,6 +38,7 @@
  */
 import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
+import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
 import { listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -61,7 +63,31 @@ export const WE_PR_SNAPSHOT_SAMPLE = 'WE_PR_SNAPSHOT_SAMPLE';
 export const WE_PR_SNAPSHOT_STALE_OK_MS = 'WE_PR_SNAPSHOT_STALE_OK_MS';
 const refreshStarted = new Set();
 let sampleLogged = false;
+let candidateDefaultsLogged = false;
 const positiveInteger = value => /^\d+$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 0;
+
+function isSmokeDryRunChild() {
+  return /(?:^|[/\\])scripts[/\\]conveyor[/\\]reconcile-pass\.mjs$/.test(process.argv[1] ?? '')
+    || process.execArgv.some(arg => arg === '-e' || arg === '--eval' || arg.startsWith('--eval='));
+}
+
+function candidateSmokeEnv(env, smokeChild) {
+  if (!env.WE_SMOKE_LIVE_CLONE || !smokeChild) return env;
+  const sampleUnset = env[WE_PR_SNAPSHOT_SAMPLE] === undefined;
+  const staleUnset = env[WE_PR_SNAPSHOT_STALE_OK_MS] === undefined;
+  if (!sampleUnset && !staleUnset) return env;
+  const settings = resolveSmokeDryRun(env);
+  const effective = { ...env,
+    ...(sampleUnset ? { [WE_PR_SNAPSHOT_SAMPLE]: String(settings.prSample) } : {}),
+    ...(staleUnset ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(settings.snapshotStaleOkMs) } : {}),
+  };
+  if (!candidateDefaultsLogged) {
+    candidateDefaultsLogged = true;
+    const sources = `prSample=${sampleUnset ? settings.sources.prSample : 'env'}, snapshotStaleOkMs=${staleUnset ? settings.sources.snapshotStaleOkMs : 'env'}`;
+    console.error(`pr-snapshot: rebuild-smoke candidate defaults — sample ${positiveInteger(effective[WE_PR_SNAPSHOT_SAMPLE])}, staleOk ${positiveInteger(effective[WE_PR_SNAPSHOT_STALE_OK_MS])} (source ${sources})`);
+  }
+  return effective;
+}
 
 function smokeProjection(snap, fields, env) {
   const sample = positiveInteger(env[WE_PR_SNAPSHOT_SAMPLE]);
@@ -167,7 +193,9 @@ function logHit(env, caller, repo) {
 /**
  * The shared open-PR read. Returns the projected PR array, or `null` when not applicable (see the file header).
  * @param {{repo:string|null, fields:string|string[], env?:NodeJS.ProcessEnv, nowMs?:number, exec?:Function,
- *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object, spawnRefresh?:Function}} o
+ *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object, spawnRefresh?:Function,
+ *   smokeChild?:boolean}} o
+ *   `smokeChild`: defaults to the reconcile CLI or Node eval launch; with WE_SMOKE_LIVE_CLONE, fills unset smoke controls.
  *   `allowDeferred`: opt in to receiving the truthy `{outcome:'deferred-low-budget'}` object (the caller MUST
  *   check `isGhDeferred`); by default a deferral returns `null`, keeping the `Array|null` contract for every reader.
  * @returns {Array<object>|null}
@@ -175,12 +203,13 @@ function logHit(env, caller, repo) {
 export function readSharedOpenPrs({
   repo, fields, env = process.env, now = () => Date.now(), exec,
   dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false,
-  paging = null, spawnRefresh = null,
+  paging = null, spawnRefresh = null, smokeChild = isSmokeDryRunChild(),
 } = {}) {
   if (!prSnapshotEnabled(env) && !dir) return null;
   if (!snapshotKey(repo)) return null;
   const want = normalizeFields(fields);
   if (!want.length || !want.every((f) => SNAPSHOT_FIELDS.includes(f))) return null;
+  env = candidateSmokeEnv(env, smokeChild);
   const root = dir || prSnapshotDir(env);
   const path = snapshotPath(root, repo);
   const ttl = ttlMs != null ? ttlMs : resolveTtlMs(env);
