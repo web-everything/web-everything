@@ -601,7 +601,7 @@ export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, drif
     //    (cross-checking `preparedAgainstSha`) is a possible future hardening, not this MVP's job.
     //    A prepare-item launch creates this stamp: exempt ONLY that kind from this gate,
     //    leaving size, overlap, pause and lane admission unchanged.
-    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && ((item.operatorTask === true && preparePolicy.operatorTask?.enabled === false) || !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate)))) {
+    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && ((item.preparedBy === 'operator-filing' && preparePolicy.operatorTask?.enabled === false) || !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate)))) {
       held.push({ num, reason: 'needs-prepare' });
       continue;
     }
@@ -1005,7 +1005,7 @@ async function main(argv) {
       // reads as unprepared under the live default policy, held `needs-prepare` rather than launching blind on
       // a card nobody has actually prepared).
       preparedDate: it?.preparedDate,
-      operatorTask: it?.operatorTask,
+      preparedBy: it?.preparedBy,
       // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
       preparedAgainstSha: it?.preparedAgainstSha,
       rawScope: Array.isArray(it?.scope) ? it.scope : undefined,

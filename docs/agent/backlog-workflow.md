@@ -1245,7 +1245,8 @@ standard defaults to platform build preferences to tool settings; policy logs id
 each leaf's source. `maxPriority` is the highest allowed class (P0 permits P0–P4;
 P1 permits P1–P4). Disabled filing retains the brief and operator marker but adds no
 prepare stamp. Disabled build admission holds previously stamped operator cards for
-prepare too. A real `prepare-stamp` clears the operator filing marker, replacing its
+prepare too: a filing stamp carries `preparedBy: "operator-filing"`. A real `prepare-stamp` clears that
+marker (and keeps `operatorTask: true`, which still gates post-build steps), replacing its
 fast-path admission so the card can build after preparation while disabled.
 
 ### Operator card post-build steps
@@ -1260,8 +1261,8 @@ fill would otherwise rewrite it as a brief placeholder.
 Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
 an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
 the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
-requests it. The fields alone never add a step: the card must also carry `operatorTask: true`, and
-`build.operatorTask.enabled` must be true. Cards without enabled post-build steps retain their existing brief
+requests it. The fields alone never add a step: the card must also carry `operatorTask: true` (filing and
+the standards gate refuse these fields without it), and `build.operatorTask.enabled` must be true. Cards without enabled post-build steps retain their existing brief
 and provider route.
 
 The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent

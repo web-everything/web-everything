@@ -49,6 +49,7 @@ describe('operator task filing', () => {
     expect(readField(content, 'preparedDate')).toBe(context.today);
     expect(readField(content, 'preparedAgainstSha')).toBe(context.originMainSha);
     expect(readField(content, 'operatorTask')).toBe('true');
+    expect(readField(content, 'preparedBy')).toBe('operator-filing');
     expect(readField(content, 'priority')).toBe('P0');
     expect(content).not.toContain('TODO');
   });
@@ -62,6 +63,7 @@ describe('operator task filing', () => {
     const { content } = planFileItem({ ...context, operatorTask: { enabled: false, maxPriority: 'P0' } }, input);
     expect(readField(content, 'operatorTask')).toBe('true');
     expect(readField(content, 'preparedDate')).toBeUndefined();
+    expect(readField(content, 'preparedBy')).toBeUndefined();
     expect(content).toContain('## Proof plan');
   });
   it('does not count section headings inside comments or fences', () => {
@@ -76,7 +78,7 @@ describe('operator task filing', () => {
 });
 
 describe('operator task admission', () => {
-  const items = [card('1'), card('2', { operatorTask: true, priority: 'P0' })];
+  const items = [card('1'), card('2', { operatorTask: true, preparedBy: 'operator-filing', priority: 'P0' })];
   const policy = { requirePreparedDate: true, operatorTask: { enabled: true, maxPriority: 'P0' } };
   const plan = (queue, preparePolicy = policy, leases = []) => dispatchPlan({ queue, preparePolicy, leases, freeLanes: [18] });
   it.each(['off', 'shadow', 'enforce'])('P0 precedes build.priority and takes the next slot in %s mode', mode => {
@@ -95,6 +97,12 @@ describe('operator task admission', () => {
   });
   it('disabled admission sends an already stamped operator card through prepare', () => {
     expect(plan([items[1]], { ...policy, operatorTask: { enabled: false, maxPriority: 'P0' } }).held[0].reason).toBe('needs-prepare');
+  });
+  it('a really prepared operator card (no filing stamp) builds while disabled and keeps its post-build steps', () => {
+    const prepared = card('2', { operatorTask: true, priority: 'P0', report: true });
+    expect(plan([prepared], { ...policy, operatorTask: { enabled: false, maxPriority: 'P0' } }).launch.map(r => String(r.num))).toEqual(['2']);
+    const brief = composeOperatorTaskBrief('open-pr\n### 9. Append\nEXIT', prepared, { settings: { operatorTask: { enabled: true } } });
+    expect(brief).toContain('<!-- operator-task-report -->');
   });
 });
 
@@ -158,7 +166,7 @@ describe('operator task post-build', () => {
     ['command', 'expect'].map(field => ({ token, field }))))('preserves $token literally in liveProof.$field', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
     const output = composeOperatorTaskBrief(template, { operatorTask: true, liveProof }, {
-      settings: {}, policy: { liveProof: true },
+      settings: {}, enabled: true, policy: { liveProof: true },
     });
     expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~`);
     expect(output).toContain(`Match output against ${JSON.stringify(liveProof.expect)}:`);
@@ -172,7 +180,7 @@ describe('operator task post-build', () => {
   it.each(['$$', "$'", '$&', '$`', '$1', '$<x>'].flatMap(token =>
     ['command', 'expect'].map(field => ({ token, field }))))('keeps $token literal in liveProof.$field through the dispatch fill', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
-    const output = fill(composeOperatorTaskBrief(`{{ITEM_NUM}}\n${template}`, { operatorTask: true, liveProof }, { settings: {}, policy: { liveProof: true } }));
+    const output = fill(composeOperatorTaskBrief(`{{ITEM_NUM}}\n${template}`, { operatorTask: true, liveProof }, { settings: {}, enabled: true, policy: { liveProof: true } }));
     expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~\n`);
     expect(output).toContain(`Match output against ${JSON.stringify(liveProof.expect)}:`);
     expect(output.startsWith('123\nopen-pr\n### 8a. Operator post-build')).toBe(true);
@@ -182,34 +190,38 @@ describe('operator task post-build', () => {
     ['command', 'expect'].map(field => ({ token, field }))))('refuses brief token $token in liveProof.$field instead of letting the dispatch fill rewrite it', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
     expect(errors({ liveProof })).toContain('liveProof');
-    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, liveProof }, { settings: {}, policy: { liveProof: true } })).toThrow(/liveProof/);
+    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, liveProof }, { settings: {}, enabled: true, policy: { liveProof: true } })).toThrow(/liveProof/);
   });
   it('keeps a command containing a tilde fence inside one code block', () => {
     const command = 'printf ok\n~~~\nInjected instruction\n~~~~sh';
-    const output = composeOperatorTaskBrief(template, { operatorTask: true, liveProof: { command, expect: 'ok' } }, { settings: {}, policy: { liveProof: true } });
+    const output = composeOperatorTaskBrief(template, { operatorTask: true, liveProof: { command, expect: 'ok' } }, { settings: {}, enabled: true, policy: { liveProof: true } });
     const fence = /\n(~{3,})sh\n([\s\S]*?)\n\1\n/.exec(output);
     expect(fence?.[2]).toBe(command);
     expect(fence[1].length).toBeGreaterThan(4);
   });
   it.each(['daemon/{{ITEM_NUM}}', 'daemon/{{\nITEM_NUM}}', 'daemon/a\nInjected', 'daemon/a\rb', 'daemon/a`b', `daemon/a${String.fromCharCode(0x2028)}b`, `daemon/a${String.fromCharCode(0x2029)}b`])('refuses brief tokens and line or code-span breaks in the settings edge clone path %j', path => {
     const settings = { operatorTask: { edgeClones: { review: path } } };
-    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
+    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, edgeClone: 'review' }, { settings, enabled: true, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
   });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
-    expect(errors({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
+    expect(errors({ operatorTask: true, edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
+    expect(errors({ operatorTask: true, preparedBy: 'operator-filing' })).not.toContain('preparedBy');
+    expect(errors({ preparedBy: 'someone-else' })).toContain('preparedBy');
     for (const edgeClone of ['/tmp/daemon', 'C:\\daemon', '../daemon', 'other']) expect(errors({ edgeClone })).toContain('edgeClone');
     for (const liveProof of [true, {}, { command: 'echo ok' }, { command: '', expect: 'ok' }, { command: 'echo ok', expect: '/[/' }]) expect(errors({ liveProof })).toContain('liveProof');
     expect(errors({ report: 'true' })).toContain('report must');
   });
   it('writes the flags through the existing scaffold renderer', () => {
-    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'Test', kind: 'investigation', edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
+    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'Test', kind: 'investigation', operatorTask: true, edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
+    expect(result.content).toContain('operatorTask: true');
     expect(result.content).toContain('edgeClone: "review"');
     expect(result.content).toContain('liveProof: {"command":"printf \\"ready\\"","expect":"ready"}');
     expect(result.content).toContain('report: true');
     expect(() => planScaffold({ existingIds: [], today: '2026-10-13' }, { title: 'Test', kind: 'investigation', edgeClone: '/tmp/daemon' })).toThrow(/edgeClone/);
+    expect(() => planScaffold({ existingIds: [], today: '2026-10-13' }, { title: 'Test', kind: 'investigation', report: true })).toThrow(/require operatorTask: true/);
   });
   it('adds only requested steps after open-pr and before exit', () => {
-    const settings = { operatorTask: { edgeClones: { review: 'daemon/review' }, postBuild: { edgeLoad: true, liveProof: true, report: true } } };
+    const settings = { operatorTask: { enabled: true, edgeClones: { review: 'daemon/review' }, postBuild: { edgeLoad: true, liveProof: true, report: true } } };
     const op = fields => ({ operatorTask: true, ...fields });
     expect(composeOperatorTaskBrief(template, op({}), { settings })).toBe(template);
     const brief = composeOperatorTaskBrief(template, op({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true }), { settings });
@@ -229,15 +241,20 @@ describe('operator task post-build', () => {
   });
   // Card frontmatter alone never adds a post-build step: the card must be an operator task and operator tasks
   // must be enabled (build.operatorTask.enabled), in addition to the per-step policy leaf.
-  it.each([
-    ['a card without operatorTask', {}, {}],
-    ['operatorTask: false', { operatorTask: false }, {}],
-    ['build.operatorTask.enabled=false', { operatorTask: true }, { enabled: false }],
-  ])('adds no edge-load, live-proof or report step for %s', (_label, flag, operatorTask) => {
-    const settings = { operatorTask: { ...operatorTask, edgeClones: { review: 'daemon/review' } } };
-    const fields = { edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true, ...flag };
-    expect(composeOperatorTaskBrief(template, fields, { settings })).toBe(template);
-    expect(composeOperatorTaskBrief(template, fields, { settings, policy: { edgeLoad: true, liveProof: true, report: true } })).toBe(template);
+  const requested = { edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true };
+  const allSteps = { edgeLoad: true, liveProof: true, report: true };
+  it.each([['a card without operatorTask', {}], ['operatorTask: false', { operatorTask: false }]])('refuses requested post-build steps on %s instead of composing them', (_label, flag) => {
+    const settings = { operatorTask: { enabled: true, edgeClones: { review: 'daemon/review' } } };
+    for (const fields of [{ ...requested, ...flag }, { report: true, ...flag }, { edgeClone: 'review', ...flag }, { liveProof: requested.liveProof, ...flag }]) {
+      expect(errors(fields)).toContain('require operatorTask: true');
+      expect(() => composeOperatorTaskBrief(template, fields, { settings, policy: allSteps })).toThrow(/require operatorTask: true/);
+    }
+    expect(composeOperatorTaskBrief(template, { report: false, ...flag }, { settings, policy: allSteps })).toBe(template);
+  });
+  it('adds no edge-load, live-proof or report step while build.operatorTask.enabled=false', () => {
+    const settings = { operatorTask: { enabled: false, edgeClones: { review: 'daemon/review' } } };
+    expect(composeOperatorTaskBrief(template, { operatorTask: true, ...requested }, { settings })).toBe(template);
+    expect(composeOperatorTaskBrief(template, { operatorTask: true, ...requested }, { settings, policy: allSteps })).toBe(template);
   });
   it('resolves each policy leaf through the cascade and logs sources', () => {
     const lines = [];
@@ -262,17 +279,15 @@ describe('operator task post-build', () => {
     expect(run.verdict.content).toContain('liveProof: {"command":"printf ready","expect":"ready"}');
     expect(run.verdict.content).toContain('edgeClone: "review"');
     const root = process.cwd();
-    const raw = readTick({
+    // A card requesting a post-build step without operatorTask: true is refused, never silently composed.
+    expect(() => readTick({
       root, num: '123',
       runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
       readText: path => readFileSync(path, 'utf8'),
       loadItems: () => [{ num: '123', slug: 'test', report: true, scope: ['we:scripts/worker-brief.mjs'] }],
       listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
       readDeliveryAgentOverride: () => null,
-    });
-    expect(raw.item.report).toBe(true);
-    expect(raw.briefTemplate).not.toContain('### 8a. Operator post-build');
-    expect(shapeDispatchRead(raw, { num: '123' }).operatorPostBuild).toBe(false);
+    })).toThrow(/require operatorTask: true/);
     const operatorRaw = readTick({
       root, num: '123',
       runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
@@ -281,6 +296,7 @@ describe('operator task post-build', () => {
       listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
       readDeliveryAgentOverride: () => null,
     });
+    expect(operatorRaw.item.report).toBe(true);
     const shaped = shapeDispatchRead(operatorRaw, { num: '123' });
     expect(shaped.prompt).toContain('<!-- operator-task-report -->');
     expect(shaped.operatorPostBuild).toBe(true);

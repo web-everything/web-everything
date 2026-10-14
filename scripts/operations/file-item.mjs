@@ -56,7 +56,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
-import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS, OPERATOR_FILING_STAMP } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -84,6 +84,8 @@ export function planFileItem(read, input) {
   if (!/^[a-f0-9]{40,64}$/.test(read.originMainSha ?? '')) throw new Error('file-item: cannot stamp without origin/main tip');
   verdict.content = setFrontmatterField(verdict.content, 'preparedDate', JSON.stringify(read.today));
   verdict.content = setFrontmatterField(verdict.content, 'preparedAgainstSha', JSON.stringify(read.originMainSha));
+  // Marks the stamp as filing admission; a real prepare-stamp clears it and keeps operatorTask.
+  verdict.content = setFrontmatterField(verdict.content, 'preparedBy', JSON.stringify(OPERATOR_FILING_STAMP));
   return verdict;
 }
 

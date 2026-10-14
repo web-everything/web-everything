@@ -597,8 +597,9 @@ function prepareStamp() {
   const status = curStatus || 'open';
   let after = status === 'open' ? setFrontmatterField(before, 'status', 'open', { after: ['kind', 'size'] }) : before;
   if (after == null) die(`#${idFromName(file)} — could not splice frontmatter (no frontmatter block?)`);
-  // A real prepare replaces operator filing admission, including when its fast path is disabled.
-  after = removeFrontmatterField(after, 'operatorTask');
+  // A real prepare replaces operator filing admission, including when its fast path is disabled. operatorTask
+  // stays: it still gates the card's post-build steps.
+  after = removeFrontmatterField(after, 'preparedBy');
   const today = localToday();
   after = setFrontmatterField(after, 'preparedDate', `"${today}"`, { after: ['status', 'dateStarted', 'dateOpened'] });
   const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: DIR, encoding: 'utf8' }).trim();

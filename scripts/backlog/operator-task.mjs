@@ -2,9 +2,14 @@
 export const EDGE_CLONE_NAMES = Object.freeze(['review', 'fix', 'control', 'drain', 'health-watch']);
 // Same shape as dispatch-lane BRIEF_TOKEN_RE: the composed brief is filled again, which would rewrite or refuse it.
 export const BRIEF_TOKEN_SHAPE = /\{\{\s*[^{}\n]*?\s*\}\}/;
+// `preparedBy` value written by an operator filing stamp; a real prepare-stamp removes it.
+export const OPERATOR_FILING_STAMP = 'operator-filing';
 export function validateOperatorTask(item) {
   const errors = [];
   if (item.operatorTask !== undefined && typeof item.operatorTask !== 'boolean') errors.push('operatorTask must be a boolean');
+  if (item.preparedBy !== undefined && item.preparedBy !== OPERATOR_FILING_STAMP) errors.push(`preparedBy must be "${OPERATOR_FILING_STAMP}"`);
+  // Post-build fields never take effect without the flag, so refuse them rather than ignore them silently.
+  if (item.operatorTask !== true && (item.edgeClone !== undefined || item.liveProof !== undefined || item.report === true)) errors.push('edgeClone, liveProof and report require operatorTask: true');
   if (item.edgeClone !== undefined && !EDGE_CLONE_NAMES.includes(item.edgeClone)) errors.push('edgeClone must be a daemon name: ' + EDGE_CLONE_NAMES.join(', ') + '; paths are refused');
   if (item.report !== undefined && typeof item.report !== 'boolean') errors.push('report must be a boolean');
   if (item.liveProof !== undefined) {
