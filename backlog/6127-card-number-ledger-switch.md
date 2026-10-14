@@ -1,10 +1,11 @@
 ---
+bornAs: xk60q6s
 kind: story
 size: 5
-parent: "xdlnylv"
+parent: "6122"
 status: open
 humanGate: { kind: review, what: "Operator must link approval of the replacement #5057 merge-group invariant in the epic decision note before this switch can dispatch." }
-blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd", "xg7whui"]
+blockedBy: ["6121", "6124", "6125", "6126"]
 scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, merge-queue, numbering, ledger]
@@ -12,7 +13,7 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Switch the card-numbering mode to rename-after-land (no code path removed)
 
-Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to `rename-after-land`. The pre-enqueue rename is turned off for the merge queue, not deleted. This slice stays human-gated until the epic links operator approval of the replacement #5057 invariant.
+Slice (d) of epic 6122: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to `rename-after-land`. The pre-enqueue rename is turned off for the merge queue, not deleted. This slice stays human-gated until the epic links operator approval of the replacement #5057 invariant.
 
 ## Design
 

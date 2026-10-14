@@ -1,9 +1,10 @@
 ---
+bornAs: xy5r0uf
 kind: story
 size: 5
-parent: "xdlnylv"
+parent: "6122"
 status: open
-blockedBy: ["x5qtv82"]
+blockedBy: ["6121"]
 scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__fixtures__/card-ledger-fixtures.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/__tests__/backlog-card-number.test.ts", "we:src/_data/__tests__/backlogRedirects.test.ts", "we:scripts/__tests__/ci-card-ledger-fetch.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, renderer]
@@ -11,7 +12,7 @@ tags: [backlog, numbering, ledger, renderer]
 
 # Backlog readers and renderers resolve card numbers through the ledger
 
-Slice (b) of epic xdlnylv: one resolver (id to number, number to id, x-id fallback) used by the 11ty loader, the backlog pages and redirects, and we:scripts/backlog.mjs.
+Slice (b) of epic 6122: one resolver (id to number, number to id, x-id fallback) used by the 11ty loader, the backlog pages and redirects, and we:scripts/backlog.mjs.
 
 ## Design
 

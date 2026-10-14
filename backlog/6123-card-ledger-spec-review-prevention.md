@@ -1,4 +1,5 @@
 ---
+bornAs: xpr5245
 kind: story
 size: 3
 status: open
@@ -55,7 +56,7 @@ Idempotency key: advisory-prevention-key:web-everything/web-everything#5245@9e8b
   - every security guarantee has a named test per reader (ESM and CJS mirrors alike), and its test file is
     in `scope`.
 
-The direct ledger prevention tests are already required by x5qtv82, xy5r0uf and xbpjdsd; this card adds the
+The direct ledger prevention tests are already required by 6121, 6124 and 6125; this card adds the
 reusable authoring guard so those omissions do not recur. It does not depend on their implementation.
 
 ## MVP

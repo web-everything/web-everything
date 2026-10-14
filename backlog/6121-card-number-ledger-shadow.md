@@ -1,7 +1,8 @@
 ---
+bornAs: x5qtv82
 kind: story
 size: 5
-parent: "xdlnylv"
+parent: "6122"
 status: open
 scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/backlog/card-ledger-checkpoint.mjs", "we:scripts/backlog/card-ledger-signing-key.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/git-transport-branch.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
 dateOpened: "2026-10-13"
@@ -10,7 +11,7 @@ tags: [backlog, drain, numbering, ledger, shadow]
 
 # Card-number ledger store and assign-at-land, in shadow
 
-Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-numbers, written by the drain at land, running beside today's rename numbering and checked against it.
+Slice (a) of epic 6122: an append-only id-to-number ledger on ops/card-numbers, written by the drain at land, running beside today's rename numbering and checked against it.
 
 ## Design
 
@@ -85,7 +86,7 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
     file and recomputes every `num` (and re-runs the idempotency and uniqueness checks); a number computed
     before the refusal is never re-appended.
   - Row: `{"id","num","pr","at","by":"drain","kind":"assign"|"seed"|"shadow"}`.
-- Policy `backlog.cardNumbering.mode` (epic xdlnylv, "Card naming policy"), resolved through `cascadePolicy`
+- Policy `backlog.cardNumbering.mode` (epic 6122, "Card naming policy"), resolved through `cascadePolicy`
   (we:scripts/lib/policy-cascade.mjs) with its source logged. Declared values: `rename-before-enqueue`,
   `rename-after-land` (standard default), `ledger-only`. This slice adds a repo override in
   we:scripts/settings/card-numbering.json pinning `rename-before-enqueue`, so behaviour does not change until

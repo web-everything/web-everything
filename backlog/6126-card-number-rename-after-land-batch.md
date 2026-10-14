@@ -1,9 +1,10 @@
 ---
+bornAs: xg7whui
 kind: story
 size: 5
-parent: "xdlnylv"
+parent: "6122"
 status: open
-blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd"]
+blockedBy: ["6121", "6124", "6125"]
 scope: ["we:scripts/card-rename-batch.mjs", "we:scripts/lane-drain.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/card-rename-batch.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, merge-queue, numbering, ledger]
@@ -11,7 +12,7 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Batched rename-after-land job for ledger-numbered cards
 
-Slice (f) of epic xdlnylv: in mode rename-after-land, a batch job opens one PR on a set cadence that renames landed x-id cards to their ledger NNN and rewrites references, landing through the merge queue. Idempotent; reuses the rename core in we:scripts/lane-drain.mjs.
+Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a set cadence that renames landed x-id cards to their ledger NNN and rewrites references, landing through the merge queue. Idempotent; reuses the rename core in we:scripts/lane-drain.mjs.
 
 ## Design
 
@@ -118,7 +119,7 @@ Unreadable introducing history/signatures and duplicate identities abort without
 
 ## Proof plan
 
-This slice lands BEFORE slice (d) (xk60q6s lists it in `blockedBy`), while the repo override still pins
+This slice lands BEFORE slice (d) (6127 lists it in `blockedBy`), while the repo override still pins
 `rename-before-enqueue`, so real main has no ledgered x-id cards yet. Its proof therefore runs against a
 fixture, never real main, and the live landed batch is slice (d)'s proof:
 

@@ -1,4 +1,5 @@
 ---
+bornAs: xdlnylv
 kind: epic
 status: open
 scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lane-drain.mjs", "we:scripts/check-standards.mjs", "we:scripts/check-standards-rules.mjs", "we:src/_data/backlog.js", "we:scripts/backlog.mjs"]
@@ -38,7 +39,7 @@ In mode `rename-before-enqueue`, new unledgered cards still require pre-enqueue 
 already landed in another mode remain legal on rollback and must never receive a replacement number.
 
 **Approval source:** pending. No verifiable comment or issue URL is present for this replacement invariant.
-Slice (d), xk60q6s, retains its `humanGate` until the operator's approval is linked here. The quote previously
+Slice (d), 6127, retains its `humanGate` until the operator's approval is linked here. The quote previously
 recorded without a source is insufficient to clear that gate. This PR does not record a human verdict.
 
 ## Card naming policy — `backlog.cardNumbering.mode`
@@ -153,14 +154,14 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 
 | Slice | Card | Size | blockedBy |
 |---|---|---|---|
-| (a) ledger store and assign-at-land, in shadow | x5qtv82 | 5 | — |
-| (b) readers and renderers use the ledger | xy5r0uf | 5 | x5qtv82 |
-| (c) check-standards rules accept ledger-numbered x-id file names | xbpjdsd | 3 | x5qtv82, xy5r0uf |
-| (f) batched rename-after-land job (cadence setting, merge queue, idempotent) | xg7whui | 5 | x5qtv82, xy5r0uf, xbpjdsd |
-| (d) switch: flip `backlog.cardNumbering.mode` to `rename-after-land`; removes no code path | xk60q6s | 5 | x5qtv82, xy5r0uf, xbpjdsd, xg7whui |
-| (e) policy docs, retire the local hash ledger, optional by-number lookup | x2cdum4 | 3 | xk60q6s |
+| (a) ledger store and assign-at-land, in shadow | 6121 | 5 | — |
+| (b) readers and renderers use the ledger | 6124 | 5 | 6121 |
+| (c) check-standards rules accept ledger-numbered x-id file names | 6125 | 3 | 6121, 6124 |
+| (f) batched rename-after-land job (cadence setting, merge queue, idempotent) | 6126 | 5 | 6121, 6124, 6125 |
+| (d) switch: flip `backlog.cardNumbering.mode` to `rename-after-land`; removes no code path | 6127 | 5 | 6121, 6124, 6125, 6126 |
+| (e) policy docs, retire the local hash ledger, optional by-number lookup | 6128 | 3 | 6127 |
 
-Review prevention is tracked separately in xpr5245 (spec dependency/scope integrity and security evidence).
+Review prevention is tracked separately in 6123 (spec dependency/scope integrity and security evidence).
 
 ## Estimated saving
 

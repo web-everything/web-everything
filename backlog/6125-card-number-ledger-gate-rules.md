@@ -1,9 +1,10 @@
 ---
+bornAs: xbpjdsd
 kind: story
 size: 3
-parent: "xdlnylv"
+parent: "6122"
 status: open
-blockedBy: ["x5qtv82", "xy5r0uf"]
+blockedBy: ["6121", "6124"]
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/lib/duplicate-bornas-added.mjs", "we:scripts/__tests__/check-standards-rules.test.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/lib/__tests__/duplicate-bornas-added.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, gate]
@@ -11,7 +12,7 @@ tags: [backlog, numbering, ledger, gate]
 
 # check-standards accepts x-id card file names that the ledger has numbered
 
-Slice (c) of epic xdlnylv: the hash-on-main, duplicate-number and bornAs rules learn the ledger, so a ledger-numbered x-id card on main is legal and an unledgered one is caught.
+Slice (c) of epic 6122: the hash-on-main, duplicate-number and bornAs rules learn the ledger, so a ledger-numbered x-id card on main is legal and an unledgered one is caught.
 
 ## Design
 
@@ -35,7 +36,7 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
   that disagrees with a card's `bornAs` is an error.
 - `handNumberedNewItems` (we:scripts/check-standards-rules.mjs:3012): unchanged. Hand-picked numbers stay
   forbidden.
-- The gate reads the ledger fetched by CI (slice (b), xy5r0uf wiring, hence blockedBy). Outside merge_group,
+- The gate reads the ledger fetched by CI (slice (b), 6124 wiring, hence blockedBy). Outside merge_group,
   offline/unreadable means warn and skip only the ledger-dependent checks, never "all clear"; duplicate
   file identities still error. Inside merge_group, unreadable (including failed fetch, missing history,
   truncation/over-cap or failed authentication) is an error, with no window exemption, only when the group
