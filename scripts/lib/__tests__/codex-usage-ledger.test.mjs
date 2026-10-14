@@ -8,6 +8,10 @@ import { aggregateCodexUsage, readCodexUsageReport, parseSince, formatCodexUsage
 import * as procRead from '../proc-read.mjs';
 import * as fs from 'node:fs';
 
+// Native ESM namespace exports are non-configurable. Keep real filesystem behavior
+// behind a mock module so spies also observe the ledger's named fs imports.
+vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+
 afterEach(() => vi.restoreAllMocks());
 
 // Exercise the real snapshot and filesystem without writing a Git directory.
