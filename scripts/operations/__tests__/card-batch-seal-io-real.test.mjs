@@ -52,7 +52,8 @@ it('reads the remote head, seals red without promotion, and admits a successor w
       writeFileSync(path, JSON.stringify({ ...next.state, headSha: baseSha }));
       calls.length = 0;
       expect(await publishBatch(input, { stateDir, policy, exec })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
-      expect(calls).toHaveLength(1);
+      // Only local git reads ran (the descendant probe found a coordinator commit, so nothing was adopted).
+      expect(calls.every(call => call[0] === 'git')).toBe(true);
     } finally { rmSync(stateDir, { recursive: true, force: true }); }
   });
 }, 30000);
@@ -61,3 +62,53 @@ it('satisfies the operation IO fidelity ratchet with a static, used real-repo ha
   expect(findIoModulesWithoutFidelityTest({ ioModules: ['card-batch-seal'], allowlist: [], baseline: [],
     tests: [{ file: 'card-batch-seal-io-real.test.mjs', content: readFileSync(new URL(import.meta.url), 'utf8') }] }).errors).toEqual([]);
 });
+
+it.each(['card repair', 'verifier edit', 'reverted verifier edit', 'merged verifier edit'])('checks every real descendant commit before adopting: %s', async variant => {
+  await withNarrowClone(async ctx => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'seal-adopt-real-'));
+    try {
+      const base = ctx.commit({ 'scripts/operations/run.mjs': '// trusted\n' });
+      ctx.git(['push', '--quiet', 'origin', 'main']);
+      const ref = 'lane/card-batch-prevention-1';
+      ctx.seedOriginBranch(ref, variant === 'card repair'
+        ? { 'backlog/123-card.md': '# repaired\n' } : { 'scripts/operations/run.mjs': '// foreign\n' });
+      if (variant === 'reverted verifier edit') {
+        ctx.seedOriginBranch(ref, { 'scripts/operations/run.mjs': '// trusted\n' }, ref);
+      }
+      if (variant === 'merged verifier edit') {
+        // Second parent carries the foreign edit; first parent is the recorded trusted head.
+        const tree = ctx.git(['rev-parse', `${ref}^{tree}`], { cwd: ctx.origin }).trim();
+        const foreign = ctx.git(['rev-parse', ref], { cwd: ctx.origin }).trim();
+        const merge = ctx.git(['commit-tree', tree, '-p', base, '-p', foreign, '-m', 'merge repair'], { cwd: ctx.origin }).trim();
+        ctx.git(['update-ref', `refs/heads/${ref}`, merge], { cwd: ctx.origin });
+      }
+      const path = join(stateDir, 'org-repo-prevention.json');
+      writeFileSync(path, JSON.stringify({ batchRef: ref, seq: 1, headSha: base, openedAt: 0,
+        members: [{ cardId: '123', source: { repo: 'org/repo', pr: 1 } }] }));
+      const lane = join(stateDir, 'lane');
+      ctx.git(['clone', '--quiet', ctx.origin, lane]);
+      const calls = [];
+      const exec = (cmd, args, options) => {
+        calls.push([cmd, ...args]);
+        if (cmd === 'git') return batchExec(cmd, args, options);
+        if (cmd === 'gh') return '';
+        if (args[1] === 'acquire') return JSON.stringify({ path: lane, lane: 3, holder: 'test' });
+        if (args[1] === 'verify') return JSON.stringify({ verdict: { ok: false, failed: 1, blocking: ['fixture red'] } });
+        if (args[1] === 'open-pr') return JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 10 } }] } } });
+        return '';
+      };
+      const result = await publishBatch({ statePath: path, laneDir: ctx.clone }, {
+        stateDir, exec, env: {}, policy: loadCardBatchPolicy({ prevention: { maxCards: 1 } }),
+      });
+      if (variant === 'card repair') {
+        expect(result.action).toBe('held');
+        expect(result.state.adoptedHeads[0].from).toBe(base);
+        expect(ctx.git(['rev-parse', 'HEAD'], { cwd: lane }).trim()).toBe(result.state.headSha);
+      } else {
+        expect(result).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+        expect(calls.every(call => call[0] === 'git')).toBe(true);
+        expect(JSON.parse(readFileSync(path, 'utf8')).headSha).toBe(base);
+      }
+    } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+}, 30000);
