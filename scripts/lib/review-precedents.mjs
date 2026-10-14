@@ -119,18 +119,23 @@ const commentSource = (ev) => {
 };
 const timeOf = (value) => { const ms = Date.parse(value); return Number.isFinite(ms) ? ms : -Infinity; };
 
-// Evidence time of a citation: [authored, revised]. A comment source is [commentId, createdAt, updatedAt]
+// Evidence time of a citation: [authored, revised, read]. A comment source is [commentId, createdAt, updatedAt]
 // (legacy rows: [commentId, time]); a source-less event is a direct recording stamped with its occurrence time.
+// `read` is the row's `at`, taken before its thread read: the comment reader returns no updatedAt, so two reads
+// of one comment differ only by it, and a stale read stored last must never replace a newer read's row.
 // An untimed row sorts oldest, so the order stays total and older evidence can never leapfrog through it.
 function evidenceTime(ev) {
   const source = commentSource(ev);
-  if (source) return [timeOf(source[1]), timeOf(source.at(-1))];
-  return [timeOf(ev.at), timeOf(ev.at)];
+  if (source) return [timeOf(source[1]), timeOf(source.at(-1)), timeOf(ev.at)];
+  return [timeOf(ev.at), timeOf(ev.at), timeOf(ev.at)];
 }
 const strictlyNewer = (a, b) => {
-  const [aAuthored, aRevised] = evidenceTime(a), [bAuthored, bRevised] = evidenceTime(b);
-  return aAuthored !== bAuthored ? aAuthored > bAuthored : aRevised > bRevised;
+  const aTime = evidenceTime(a), bTime = evidenceTime(b);
+  const index = aTime.findIndex((value, i) => value !== bTime[i]);
+  return index >= 0 && aTime[index] > bTime[index];
 };
+/** True when `candidate`, stored after `current`, becomes the current row (log order breaks a full tie). */
+export const citationSupersedes = (candidate, current) => !strictlyNewer(current, candidate);
 
 /** The comment a sourced citation came from, per seat; null for a direct recording. */
 export function citationCommentKey(ev) {

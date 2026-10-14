@@ -94,6 +94,11 @@ describe('records and events', () => {
     expect(p.foldCitations([older, newer, withdrawn])).toEqual([older]);
     expect(p.foldCitations([older, withdrawn, newer])).toEqual([newer]);
     expect(p.foldCitations([newer, withdrawn])).toEqual([]);
+    // Two reads of one comment revision rank by read time, so a stale read stored last never restores it.
+    const later = '2026-10-14T00:00:00Z';
+    const [laterWithdrawn] = p.citationRetractions([older, newer], [older], { repo: REPO, pr: 1, at: later });
+    expect(p.foldCitations([older, laterWithdrawn, newer])).toEqual([older]);
+    expect(p.foldCitations([older, laterWithdrawn, { ...newer, at: '2026-10-14T01:00:00Z' }])).toEqual([{ ...newer, at: '2026-10-14T01:00:00Z' }]);
   });
   it('never withdraws a row a stale snapshot could not have seen', () => {
     const source = (comment, time) => JSON.stringify([comment, time, time]);

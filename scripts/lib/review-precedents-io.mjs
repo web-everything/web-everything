@@ -15,7 +15,7 @@ import {
   parsePrecedentLog, precedentEventId, foldPrecedents, foldCitations,
   resolvePrecedentSettings, formatPrecedentSettings, captureFromComment,
   scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent, citationCommentKey,
-  currentCommentCitations, citationRetractions,
+  currentCommentCitations, citationRetractions, citationSupersedes,
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
@@ -93,15 +93,16 @@ export function appendPrecedentEvents({
           const base = existing ?? '';
           const stored = parsePrecedentLog(base, trust).events;
           const seen = new Set(stored.map(precedentEventId));
-          // A comment's current revision is its LAST stored row. Compare a backfilled comment against that row
-          // only: an edit reverted to an earlier verdict must be stored again, or the stale middle edit stays current.
-          const current = new Map([...currentCommentCitations(stored)].map(([key, ev]) => [key, precedentEventId(ev)]));
+          // Compare a backfilled comment against its CURRENT row only: an edit reverted to an earlier verdict must
+          // be stored again, or the stale middle edit stays current. A row that would not become current (a stale
+          // read landing after a newer read's row or withdrawal) is dropped, so it can never restore that row.
+          const current = currentCommentCitations(stored);
           const withdrawn = citationSnapshot ? citationRetractions(stored, parsedEvents, { repo, ...citationSnapshot }) : [];
           const fresh = [...parsedEvents, ...withdrawn].filter(ev => {
-            const key = citationCommentKey(ev), id = precedentEventId(ev);
-            if (key ? current.get(key) === id : seen.has(id)) return false;
+            const key = citationCommentKey(ev), id = precedentEventId(ev), prior = key ? current.get(key) : null;
+            if (key ? prior && (precedentEventId(prior) === id || !citationSupersedes(ev, prior)) : seen.has(id)) return false;
             seen.add(id);
-            if (key) current.set(key, id);
+            if (key) current.set(key, ev);
             return true;
           }).map(ev => JSON.stringify(ev));
           rows = fresh.length;

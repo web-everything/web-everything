@@ -213,6 +213,38 @@ describe('settings and drafting', () => {
     expect(panel()).toEqual([]);
     expect(backfill([]).rows).toBe(0);
   });
+  it('never lets a stale snapshot restore what a newer snapshot withdrew or replaced', () => {
+    // The production reader returns no updatedAt, so two reads of one comment differ only by their snapshot time.
+    const cite = (verdict, id = seeds[0].id) => `${verdict}\n${id ? `[precedent:${id}]\n` : ''}<!-- reviewed-sha: abcdef987 -->`;
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const older = { ...automation, id: 'IC_1', createdAt: '2026-10-13T10:00:00Z', body: cite('🔁 review — changes requested') };
+    const newer = { ...automation, id: 'IC_2', createdAt: '2026-10-13T11:00:00Z', body: cite('✅ review — accepted', seeds[1].id) };
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const backfill = (comments, at) => io.appendPrecedentEvents({ repo, stage, citationSnapshot: { pr: 9, at },
+      events: io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, comments }, at }) });
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.verdict, e.ids]);
+    const [t1, stale, t3, t4] = ['12:00', '13:00', '14:00', '15:00'].map(time => `2026-10-13T${time}:00Z`);
+    expect(backfill([older, newer], t1).rows).toBe(2);
+    // A newer read sees the newer comment's last citation removed and withdraws it.
+    expect(backfill([older, { ...newer, body: cite('✅ review — accepted', null) }], t3).rows).toBe(1);
+    expect(panel()).toEqual([['changes', [seeds[0].id]]]);
+    // A read that began before that removal lands after it: it stores nothing and restores nothing.
+    expect(backfill([older, newer], stale).rows).toBe(0);
+    expect(panel()).toEqual([['changes', [seeds[0].id]]]);
+    // A newer read that cites again is still stored.
+    expect(backfill([older, newer], t4).rows).toBe(1);
+    expect(panel()).toEqual([['accept', [seeds[1].id]]]);
+    // The same holds for a deleted comment and for a stale read of an edited verdict.
+    expect(backfill([older], '2026-10-13T17:00:00Z').rows).toBe(1);
+    expect(backfill([older, newer], '2026-10-13T16:00:00Z').rows).toBe(0);
+    expect(panel()).toEqual([['changes', [seeds[0].id]]]);
+    const reworded = { ...older, body: cite('✅ review — accepted') };
+    expect(backfill([reworded], '2026-10-13T19:00:00Z').rows).toBe(1);
+    expect(backfill([older], '2026-10-13T18:00:00Z').rows).toBe(0);
+    expect(panel()).toEqual([['accept', [seeds[0].id]]]);
+  });
   it('keeps a comment on the head it was first recorded on after the PR head moves', () => {
     const automation = { author: { login: AUTOMATION_LOGINS[0] } };
     const advisory = { ...automation, id: 'IC_9', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };
