@@ -8,7 +8,8 @@ import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdop
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n' } = {}) {
+function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n',
+  descendantChanges = ':100644 100644 abc def M\0backlog/123-card.md\0' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'batch-seal-')); dirs.push(dir);
   const statePath = join(dir, 'org-repo-prevention.json');
   const state = { batchRef: 'lane/card-batch-prevention-1', seq: 1, headSha: 'a'.repeat(40), openedAt: 0,
@@ -20,7 +21,7 @@ function fixture({ maxCards = 2, red = false, descendant = false, descendantMess
     calls.push([cmd, ...args]);
     if (args[0] === 'ls-remote') return state.headSha + '\tref';
     if (args[0] === 'merge-base' && !descendant) throw Object.assign(new Error('not an ancestor'), { status: 1 });
-    if (args[0] === 'log') return descendantMessages;
+    if (args[0] === 'log') return args.includes('--raw') ? descendantChanges : descendantMessages;
     if (args[0] === 'rev-parse') return args[1] === '--absolute-git-dir' ? join(dir, '.git') : state.headSha;
     if (args[1] === 'acquire') return JSON.stringify({ path: dir, lane: 3, holder: 'holder' });
     if (args[1] === 'verify') {
@@ -30,6 +31,7 @@ function fixture({ maxCards = 2, red = false, descendant = false, descendantMess
     if (args[1] === 'open-pr') return JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 9 } }] } } });
     if (args[1] === 'view') return JSON.stringify({ isDraft: draft });
     if (args[1] === 'ready') draft = false;
+    if (args.includes('--undo')) draft = true;
     return '';
   });
   const policy = loadCardBatchPolicy({ prevention: { maxCards, maxAgeMinutes: 1 } });
@@ -100,14 +102,15 @@ it('adopts a descendant remote head, journals it and verifies the new head befor
     expect(f.read()).toMatchObject({ headSha: f.state.headSha, members: f.state.members,
       adoptedHeads: [previous, { from, to: f.state.headSha, at: new Date(1000).toISOString() }],
       verificationMarker: { sha: f.state.headSha, status: 'green' } });
-    expect(exec.mock.calls.slice(0, 5).map(([, args]) => args)).toEqual([
+    expect(exec.mock.calls.slice(0, 6).map(([, args]) => args)).toEqual([
       ['ls-remote', '--refs', 'upstream', `refs/heads/${f.state.batchRef}`],
       ['fetch', '--no-tags', 'upstream', `refs/heads/${f.state.batchRef}`],
       ['merge-base', '--is-ancestor', from, f.state.headSha],
       ['log', '--format=%B', `${from}..${f.state.headSha}`],
+      ['log', '--format=', '--raw', '-z', '--no-renames', '--diff-merges=separate', `${from}..${f.state.headSha}`],
       ['ls-remote', '--refs', 'upstream', `refs/heads/${f.state.batchRef}`],
     ]);
-    expect(exec.mock.calls.slice(0, 5).every(([, , options]) => options.cwd === f.dir)).toBe(true);
+    expect(exec.mock.calls.slice(0, 6).every(([, , options]) => options.cwd === f.dir)).toBe(true);
     expect(f.calls.findIndex(call => call.includes('verify'))).toBeLessThan(f.calls.findIndex(call => call.includes('ready')));
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining(`${f.state.batchRef}: ${from}→${f.state.headSha}`));
@@ -361,4 +364,61 @@ it('reverifies an adopted head when resuming a seal that already verified the ol
   expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');
   expect(f.calls.filter(call => call.includes('verify'))).toHaveLength(2);
   expect(f.read().verificationMarker.sha).toBe(f.state.headSha);
+});
+
+it.each([
+  ['verifier edit', ':100644 100644 abc def M\0scripts/operations/run.mjs\0'],
+  ['edit reverted later', ':100644 100644 abc def M\0scripts/operations/run.mjs\0\n:100644 100644 def abc M\0scripts/operations/run.mjs\0'],
+  ['card symlink', ':100644 120000 abc def T\0backlog/123-card.md\0'],
+  ['executable card', ':100644 100755 abc def M\0backlog/123-card.md\0'],
+  ['rename out of backlog', ':100644 000000 abc 000 D\0backlog/123-card.md\0:000000 100644 000 def A\0scripts/operations/run.mjs\0'],
+  ['nested path', ':000000 100644 000 def A\0backlog/sub/123-card.md\0'],
+  ['newline path', ':100644 100644 abc def M\0backlog/123-card\n.md\0'],
+])('refuses adoption of %s before acquiring or executing the checkout', async (_name, descendantChanges) => {
+  const f = fixture({ descendant: true, descendantChanges });
+  f.state.headSha = 'b'.repeat(40);
+  expect(await publishBatch(f.input, f.opts)).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+  expect(f.read().headSha).toBe('a'.repeat(40));
+  expect(f.calls.every(call => call[0] === 'git')).toBe(true);
+});
+
+it.each(['remove-hold', 'ready'])('restores hold and draft before adopted verification after %s', async crashAt => {
+  const f = fixture({ maxCards: 1, descendant: true });
+  await expect(publishBatch(f.input, { ...f.opts, crashAt })).rejects.toThrow('crash');
+  f.state.headSha = 'b'.repeat(40);
+  const start = f.calls.length;
+  const exec = (cmd, args, options) => {
+    if (args[1] === 'verify') {
+      const retry = f.calls.slice(start);
+      expect(retry.some(call => call.includes('--add-label'))).toBe(true);
+      expect(retry.some(call => call.includes('--undo'))).toBe(crashAt === 'ready');
+      expect(retry.some(call => call.includes('--remove-label') || (call.includes('ready') && !call.includes('--undo')))).toBe(false);
+      return JSON.stringify({ verdict: { ok: false, failed: 1, blocking: ['red adopted head'] } });
+    }
+    return f.exec(cmd, args, options);
+  };
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
+});
+
+it.each(['--add-label', '--undo'])('recovers a failed %s before refusing subsequent unsafe drift', async failedEffect => {
+  const f = fixture({ maxCards: 1, descendant: true });
+  await expect(publishBatch(f.input, { ...f.opts, crashAt: 'ready' })).rejects.toThrow('crash');
+  f.state.headSha = 'b'.repeat(40);
+  const exec = (cmd, args, options) => {
+    if (args.includes(failedEffect)) throw Error('protection unavailable');
+    return f.exec(cmd, args, options);
+  };
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('protection unavailable');
+  expect(f.read().restoreProtection).toBe(true);
+  f.state.headSha = 'c'.repeat(40);
+  const start = f.calls.length;
+  const unsafe = (cmd, args, options) => args.includes('--raw')
+    ? ':100644 100644 abc def M\0scripts/operations/run.mjs\0' : f.exec(cmd, args, options);
+  expect(await publishBatch(f.input, { ...f.opts, exec: unsafe })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+  const retry = f.calls.slice(start);
+  expect(retry[0]).toContain('--add-label');
+  expect(retry.some(call => call.includes('--undo'))).toBe(true);
+  expect(retry.some(call => call.includes('verify') || call.includes('acquire'))).toBe(false);
+  expect(f.read().restoreProtection).toBeUndefined();
+  expect(f.read().holdApplied).toBe(true);
 });
