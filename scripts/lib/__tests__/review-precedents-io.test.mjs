@@ -288,6 +288,26 @@ describe('settings and drafting', () => {
     expect(apply('2026-10-13T14:00:00Z', 'aaaaaaa1', { now: () => Date.parse('2026-10-13T14:00:00Z') }).status).toBe('appended');
     expect(() => io.appendPrecedentEvents({ repo, stage, events: [], citationSnapshot: { pr: 9, at: '2026-10-13T15:00:00Z', info } })).toThrow(TypeError);
   });
+  it('never lets a row stamped by a clock that ran ahead freeze a comment', () => {
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const cited = verdict => ({ ...automation, id: 'IC_1', createdAt: '2026-10-13T10:00:00Z', body: `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: abcdef987 -->` });
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const clock = { now: () => Date.parse('2026-10-13T20:00:00Z') };
+    const panel = () => io.readPrecedents({ board: '.', repo, run, ...clock }).citations.map(e => e.verdict);
+    const apply = (at, comments, extra = clock) => io.appendPrecedentEvents({ repo, stage, ...extra,
+      citationSnapshot: { pr: 9, at, info: { ...info, comments } } });
+    // A writer whose clock reads 2099 stores an accept.
+    expect(apply('2099-01-01T00:00:00Z', [cited('✅ review — accepted')], { now: () => Date.parse('2099-01-01T00:00:00Z') }).rows).toBe(1);
+    // An honest newer read of the edited verdict still replaces it, and a read of the deleted comment withdraws it.
+    expect(apply('2026-10-13T20:00:00Z', [cited('🔁 review — changes requested')]).rows).toBe(1);
+    expect(panel()).toEqual(['changes']);
+    stored = '';
+    expect(apply('2099-01-01T00:00:00Z', [cited('✅ review — accepted')], { now: () => Date.parse('2099-01-01T00:00:00Z') }).rows).toBe(1);
+    expect(apply('2026-10-13T20:00:00Z', []).rows).toBe(1);
+    expect(panel()).toEqual([]);
+  });
   it('keeps a comment on the head it was first recorded on after the PR head moves', () => {
     const automation = { author: { login: AUTOMATION_LOGINS[0] } };
     const advisory = { ...automation, id: 'IC_9', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };

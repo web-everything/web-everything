@@ -74,10 +74,19 @@ export function readEvent({ repo, pr, at }) {
   return { kind: 'read', id: `read:${repo}#${pr}`, repo, pr, at };
 }
 
-/** The newest read mark stored for one PR, as epoch ms, ignoring marks after `notAfter`; -Infinity when none. */
-export function latestReadAt(events, { repo, pr, notAfter = Infinity }) {
-  return events.reduce((latest, ev) => ev?.kind === 'read' && ev.repo === repo && ev.pr === pr && Date.parse(ev.at) <= notAfter
+/** The newest read mark stored for one PR, as epoch ms; -Infinity when none. */
+export function latestReadAt(events, { repo, pr }) {
+  return events.reduce((latest, ev) => ev?.kind === 'read' && ev.repo === repo && ev.pr === pr
     ? Math.max(latest, Date.parse(ev.at)) : latest, -Infinity);
+}
+
+const EPOCH = '1970-01-01T00:00:00.000Z';
+/**
+ * Read view of the log for ranking: a citation or read mark stamped after `notAfter` (a writer whose clock ran
+ * ahead) reads as stamped at the epoch, so it ranks oldest, never refuses a newer read, and can be withdrawn.
+ */
+export function clampFutureStamps(events, notAfter) {
+  return events.map(ev => (ev?.kind === 'citation' || ev?.kind === 'read') && Date.parse(ev.at) > notAfter ? { ...ev, at: EPOCH } : ev);
 }
 
 export function precedentEventId(ev) {

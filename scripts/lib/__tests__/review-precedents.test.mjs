@@ -109,6 +109,10 @@ describe('records and events', () => {
     expect(p.latestReadAt(parsed.events, { repo: REPO, pr: 1 })).toBe(Date.parse(marks[1].at));
     expect(p.latestReadAt(parsed.events, { repo: REPO, pr: 3 })).toBe(-Infinity);
     expect(() => p.readEvent({ repo: REPO, pr: 1, at: 'later' })).toThrow();
+    // A stamp after the host's clock reads as the epoch; the rest are untouched.
+    const clamped = p.clampFutureStamps(parsed.events, Date.parse(marks[1].at));
+    expect(clamped.map(ev => ev.at)).toEqual([marks[0].at, marks[1].at, '1970-01-01T00:00:00.000Z']);
+    expect(p.latestReadAt(clamped, { repo: REPO, pr: 2 })).toBe(0);
   });
   it('never withdraws a row a stale snapshot could not have seen', () => {
     const source = (comment, time) => JSON.stringify([comment, time, time]);

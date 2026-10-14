@@ -15,7 +15,7 @@ import {
   parsePrecedentLog, precedentEventId, foldPrecedents, foldCitations,
   resolvePrecedentSettings, formatPrecedentSettings, captureFromComment,
   scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent, citationCommentKey,
-  currentCommentCitations, citationRetractions, citationSupersedes, readEvent, latestReadAt,
+  currentCommentCitations, citationRetractions, citationSupersedes, readEvent, latestReadAt, clampFutureStamps,
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
@@ -57,7 +57,7 @@ export class PrecedentAppendExhaustedError extends Error {
   }
 }
 
-const READ_MARK_SKEW_MS = 10 * 60 * 1000;
+const FUTURE_STAMP_SKEW_MS = 10 * 60 * 1000;
 const defaultSleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 export function appendPrecedentEvents({
@@ -101,16 +101,18 @@ export function appendPrecedentEvents({
         board, branch, message: `review-precedents: append ${repo}`,
         files: [{ path: precedentGitPath(repo), content: ({ existing }) => {
           const base = existing ?? '';
-          const stored = parsePrecedentLog(base, trust).events;
+          const raw = parsePrecedentLog(base, trust).events;
+          // Rank on a view where stamps ahead of this host's clock (a skewed writer) read as the epoch, or one bad
+          // clock would freeze a comment's row and refuse every honest read until that time passes.
+          const stored = clampFutureStamps(raw, now() + FUTURE_STAMP_SKEW_MS);
           // A snapshot whose read began before the newest read mark on this tip is stale as a whole: the newer read
           // may have stored nothing (every row unchanged), so no row-level rank could tell its rows are older.
-          // A mark ahead of this host's clock (a skewed writer) is ignored, or it would refuse every honest read.
           const readAt = citationSnapshot ? Date.parse(citationSnapshot.at) : NaN;
-          const lastRead = citationSnapshot ? latestReadAt(stored, { repo, pr: citationSnapshot.pr, notAfter: now() + READ_MARK_SKEW_MS }) : -Infinity;
+          const lastRead = citationSnapshot ? latestReadAt(stored, { repo, pr: citationSnapshot.pr }) : -Infinity;
           const snapshotEvents = deriveFrom ? derive(stored) : parsedEvents;
           stale = readAt < lastRead;
           if (stale) { rows = 0; duplicates = snapshotEvents.length; return base; }
-          const seen = new Set(stored.map(precedentEventId));
+          const seen = new Set(raw.map(precedentEventId));
           // Compare a backfilled comment against its CURRENT row only: an edit reverted to an earlier verdict must
           // be stored again, or the stale middle edit stays current. A row that would not become current (a stale
           // read landing after a newer read's row or withdrawal) is dropped, so it can never restore that row.
@@ -153,10 +155,11 @@ export function loadPrecedentSettings({ env = process.env, settings = readSettin
   return resolved;
 }
 
-export function readPrecedents({ board, repo, run } = {}) {
+export function readPrecedents({ board, repo, run, now = Date.now } = {}) {
   const result = readPrecedentLog({ board, repo, run });
   if (result.status !== 'ok') return result;
-  return { status: 'ok', precedents: foldPrecedents(result.events, trust), citations: foldCitations(result.events), malformed: result.malformed };
+  return { status: 'ok', precedents: foldPrecedents(result.events, trust),
+    citations: foldCitations(clampFutureStamps(result.events, now() + FUTURE_STAMP_SKEW_MS)), malformed: result.malformed };
 }
 
 const defaultExec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
