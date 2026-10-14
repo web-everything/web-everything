@@ -402,21 +402,40 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
       }); } catch { names = []; }
       const claims = [];
       const entries = [];
+      const owner = new Map();
+      const claimName = (id) => join(dir, `${base}.claim-${process.pid}-at${Math.floor(now())}-${id}.${randomUUID()}`);
       for (const name of names) {
-        const claim = join(dir, `${base}.claim-${process.pid}-at${Math.floor(now())}-${entryId(name)}.${randomUUID()}`);
+        const id = entryId(name);
+        const claim = claimName(id);
         try { renameSync(join(dir, name), claim); } catch { continue; }
         let text = '';
         try { text = readFileSync(claim, 'utf8'); } catch { text = ''; }
-        claims.push({ claim, length: text.length });
+        const held = { claim, id, length: text.length, lost: false };
+        claims.push(held);
         for (const line of text.split('\n')) {
           if (!line.trim()) continue;
-          try { entries.push(JSON.parse(line)); } catch { /* A torn line is dropped. */ }
+          try { const entry = JSON.parse(line); entries.push(entry); owner.set(entry, held); } catch { /* A torn line is dropped. */ }
         }
       }
       return {
         entries,
+        /**
+         * Re-claim `entry`'s file under a fresh name, so its age starts again, and report whether this drainer still
+         * owns it. A drain that outlived {@link QUEUE_CLAIM_STALE_MS} (slow gh calls, a sleeping laptop) may have been
+         * taken over while its pid was alive: the rename then fails, and the caller must leave the entry to the new
+         * owner instead of writing for it or re-queuing it. Exactly one of two racing renames of a name succeeds.
+         */
+        hold(entry) {
+          const held = owner.get(entry);
+          if (!held) return true;
+          if (held.lost) return false;
+          const next = claimName(held.id);
+          try { renameSync(held.claim, next); held.claim = next; return true; }
+          catch { held.lost = true; return false; }
+        },
         done() {
-          for (const { claim, length } of claims) {
+          for (const { claim, length, lost } of claims) {
+            if (lost) continue;
             try {
               const late = readFileSync(claim, 'utf8').slice(length);
               if (late.trim()) append(late.endsWith('\n') ? late : `${late}\n`);
@@ -556,10 +575,13 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
   let claimed;
   try { claimed = queue.claim(); } catch { return; }
   const retry = [];
+  // False once another drainer took this entry's claim over: it is theirs to process and re-queue, never ours too.
+  const held = (entry) => { try { return claimed?.hold?.(entry) ?? true; } catch { return false; } };
   for (const entry of claimed?.entries ?? []) {
     if (!validQueueEntry(entry)) continue;
+    if (!held(entry)) continue;
     // This token is the reviewer App's installation for `owner` only.
-    if (entry.repo.split('/')[0].toLowerCase() !== owner) { retry.push(entry); continue; }
+    if (entry.repo.split('/')[0].toLowerCase() !== owner) { retry.push({ entry, from: entry }); continue; }
     const endpoint = `repos/${entry.repo}/pulls/${entry.pr}`;
     // An entry queued for a decisive review that did not land carries its event, so its ledger line still counts.
     const line = { repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: entry.event ?? null };
@@ -574,7 +596,7 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
       sawHuman = entry.human === true || entry.verdict === 'clear-human' || labelNames(labels).includes('review:human');
       reviews = readReviews(run, endpoint);
     } catch (error) {
-      retry.push(attempt);
+      retry.push({ entry: attempt, from: entry });
       record({ ...line, outcome: 'failed', dismissal: 'failed', reason: `queued dismissal: ${failureReason(error)}` });
       continue;
     }
@@ -604,11 +626,13 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     const next = { ...attempt };
     delete next.unsettled;
     delete next.event;
-    if (left.length || unsettled) retry.push({ ...next, ids: left.length ? left : entry.ids, ...(unsettled ? { unsettled: true, ...(entry.event ? { event: entry.event } : {}) } : {}) });
+    if (left.length || unsettled) retry.push({ entry: { ...next, ids: left.length ? left : entry.ids, ...(unsettled ? { unsettled: true, ...(entry.event ? { event: entry.event } : {}) } : {}) }, from: entry });
     if (settled) record({ ...line, outcome: drainedOutcome(settled, entry.event), dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
     else if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
   }
-  for (const entry of retry) {
+  for (const { entry, from } of retry) {
+    // An entry processed past the stale window may have been taken over meanwhile: the new owner re-queues it.
+    if (!held(from)) continue;
     if ((Number(entry.attempts) || 0) >= QUEUE_MAX_ATTEMPTS) {
       record({ repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: null, outcome: 'failed', dismissal: 'failed', reason: `queued dismissal given up after ${entry.attempts} attempts` });
       continue;

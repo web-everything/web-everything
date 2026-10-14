@@ -849,6 +849,41 @@ describe('reviewer token and dismissal queue IO', () => {
     first.done();
     expect(readdirSync(dir)).toEqual([]);
   });
+  // Self-review of the fix above: a LIVE drainer whose drain outlives the stale window is taken over, and must notice.
+  it('hold() refreshes a claim, and tells a drainer that was taken over to leave the entry to the new owner', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    let clock = Date.now();
+    const q = fileDismissalQueue(join(dir, 'q.jsonl'), { alive: () => true, now: () => clock });
+    q.append({ a: 1 });
+    q.append({ a: 2 });
+    const first = q.claim();
+    const [e1, e2] = first.entries;
+    clock += QUEUE_CLAIM_STALE_MS - 1000;
+    expect(first.hold(e1)).toBe(true); // refreshed: its age starts again
+    expect(q.claim().entries).toEqual([]);
+    clock += 1500; // e2's claim is now stale, e1's refreshed one is not
+    const takeover = q.claim();
+    expect(takeover.entries).toEqual([{ a: 2 }]);
+    expect(first.hold(e2)).toBe(false);
+    expect(first.hold(e2)).toBe(false);
+    expect(first.hold(e1)).toBe(true);
+    expect(takeover.hold(takeover.entries[0])).toBe(true);
+    first.done(); // removes only what it still owns
+    expect(q.claim().entries).toEqual([]);
+    takeover.done();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+  it('a drain taken over mid-way neither writes for nor re-queues an entry it no longer owns', () => {
+    const gh = fakeGithub();
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const elsewhere = { v: 1, repo: 'elsewhere/repo', pr: 9, head, verdict: 'clear-human', ids: [1] };
+    const ours = { v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [7] };
+    const owned = new Map([[elsewhere, [true, false]], [ours, [false]]]); // lost after its processing / before it
+    const queue = { append: vi.fn(() => true), claim: () => ({ entries: [elsewhere, ours], hold: (e) => owned.get(e).shift() ?? false, done: () => {} }) };
+    mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'advisory', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, queue });
+    expect(gh.reviews.find(r => r.id === 7).state).toBe('CHANGES_REQUESTED');
+    expect(queue.append).not.toHaveBeenCalled();
+  });
   // CI on 8638c5344: the mint child's `import(<env var>)` marked every daemon closure reaching this module incomplete.
   it('keeps every daemon import closure that reaches this module complete (no non-literal dynamic import)', () => {
     const root = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
