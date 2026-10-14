@@ -124,6 +124,24 @@ export function isExternalOnlyFailure(failed) {
  *  ticks the way it did before this fix; it is still worth knowing about (it delays adopting new code). */
 export const SLOW_SMOKE_ALERT_MS = 60_000;
 
+/** Slow pass rows from the live smoke's final timing suffix, preserving its display text/order. */
+function smokePassTimings(results) {
+  const passes = {};
+  for (const row of results || []) {
+    if (typeof row?.detail !== 'string' || typeof row?.name !== 'string') continue;
+    const separator = row.detail.lastIndexOf('— ');
+    if (separator < 0) continue;
+    const slow = row.detail.slice(separator + 2).split(',').map(value => value.trim()).filter(value => {
+      const match = /^([a-zA-Z0-9_-]+) (\d+(?:\.\d+)?)(ms|s)$/.exec(value);
+      if (!match) return false;
+      const ms = Number(match[2]) * (match[3] === 's' ? 1000 : 1);
+      return Number.isFinite(ms) && ms >= 1000;
+    }).slice(0, 6);
+    if (slow.length) Object.defineProperty(passes, row.name, { value: slow.join(', '), enumerable: true, configurable: true });
+  }
+  return Object.keys(passes).length ? { passes } : {};
+}
+
 /** Backoff before an external-only rejection is re-smoked: base * 2^(attempts-1), capped. Env-tunable. */
 export function rejectRetryDelayMs(env, attempts) {
   const base = Number(env?.WE_DAEMON_REJECT_RETRY_BASE_MS) || 5 * 60_000;
@@ -430,12 +448,14 @@ export async function smokeAndAdopt({
       ...(smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`),
       ...(dispatch?.result?.ms != null ? [`dispatch-smoke:${dispatch.result.ms}ms`] : []),
     ].join(' ');
-    log.error?.(`daemon-rebuild: smoke-timings ${JSON.stringify({ ms, ...(label ? { candidate: label } : {}), checks })}`);
+    const passTimings = smokePassTimings(smokeResult?.smoke?.results);
+    log.error?.(`daemon-rebuild: smoke-timings ${JSON.stringify({ ms, ...(label ? { candidate: label } : {}), checks, ...passTimings })}`);
     if (ms >= SLOW_SMOKE_ALERT_MS) {
       alert('smoke-slow', {
         ms,
         ...(label ? { candidate: label } : {}),
         checks,
+        ...passTimings,
       });
     }
     if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null && (!dispatch || dispatch.result.ok)
