@@ -26,7 +26,7 @@ const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.detail
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());
 /** Could this comment hold a clearance? Anything but a known machine note or the trusted approval-prevention notice. */
 const holdsClearance = c => !isKnownMachineBody(c?.body)
-  && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.startsWith('<!-- approval-prevention-filed:'));
+  && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.trimStart().startsWith('<!-- approval-prevention-filed:'));
 /**
  * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation
  * that quotes the marker is the latest record too, and it is not a clearance: null, so nothing is restored or
@@ -174,13 +174,29 @@ export function readPrComments({ repo, pr, runGh = runGhSync }) {
  * PR #5237 round 5: after a post-write head move, has a NEWER acceptance been recorded for the live head (a push and
  * a fresh clear-human landing during the restoration)? Then `review:accepted` is that acceptance's label, not ours,
  * and the rollback must leave it. It must be the latest acceptance record, trusted, name both live heads, be newer
- * than the record we restored from, and have no comment after it that could hold it. Anything unreadable is false.
+ * than the record we restored from, and have no comment after it that could hold it. A label decision leaves no
+ * comment, so no `review:accepted` removal and no hold label may follow it either, and no hold label may stand now
+ * (`labels`: the live labels after our write). Anything unreadable is false.
  */
-export function newerAcceptanceOnHead({ comments, record, prHead, refHead } = {}) {
-  if (!Array.isArray(comments)) return false;
+export function newerAcceptanceOnHead({ comments, events, labels, record, prHead, refHead } = {}) {
+  if (!Array.isArray(comments) || !Array.isArray(events) || !Array.isArray(labels)) return false;
   const latest = latestAcceptance(comments);
-  return !!latest && sameHead(latest, prHead, refHead) && Date.parse(latest.at) > Date.parse(record?.at)
-    && !comments.slice(latest.index + 1).some(holdsClearance);
+  if (!latest || !sameHead(latest, prHead, refHead) || !(Date.parse(latest.at) > Date.parse(record?.at))) return false;
+  if (comments.slice(latest.index + 1).some(holdsClearance)) return false;
+  if (names(labels).some(l => holds.includes(l))) return false;
+  return !events.some(e => ((e.event === 'unlabeled' && e.label?.name === 'review:accepted')
+    || (e.event === 'labeled' && holds.includes(e.label?.name)))
+    && !(Date.parse(at(e)) < Date.parse(latest.at)));
+}
+
+/** Read the live thread, events and labels, then {@link newerAcceptanceOnHead}; any read failure or throw is false. */
+function readNewerAcceptanceOnHead({ repo, pr, runGh, record, after }) {
+  try {
+    const pages = readJson(runGh, repo, ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/events?per_page=100`]);
+    const view = readJson(runGh, repo, ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels']);
+    return newerAcceptanceOnHead({ comments: readPrComments({ repo, pr, runGh }), events: Array.isArray(pages) ? pages.flat() : null,
+      labels: view?.labels ?? null, record, ...after });
+  } catch { return false; }
 }
 
 export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true, revalidate = false }) {
@@ -239,7 +255,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
       // record nothing, so the new head keeps `review:pending` and its re-review stays owed.
       const after = readLiveHeads({ repo, pr, runGh, headRefName: facts.headRefName });
       if (!sameHead(restoration.record, after.prHead, after.refHead)
-        && newerAcceptanceOnHead({ comments: readPrComments({ repo, pr, runGh }), record: restoration.record, ...after })) {
+        && readNewerAcceptanceOnHead({ repo, pr, runGh, record: restoration.record, after })) {
         // The head moved AND a newer acceptance of the live head was recorded meanwhile: the label is its now. A
         // clearance comment that lands only after this read is still rolled back (no conditional write exists): the
         // fail-closed side, a re-review owed, never an approval nobody granted.

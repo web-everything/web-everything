@@ -345,13 +345,19 @@ describe('I/O shell', () => {
     const Y = 'b'.repeat(40);
     const clearY = comment(`✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${Y} -->\n<!-- cleared-human: chalbert -->`, '19:10:00');
     const rollback = ['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted'];
+    const accepted = ['review:accepted', 'review-round:1', 'status:ready-to-merge'];
     it.each([
-      ['newer clearance of the live head', [clearY], false],
-      ['newer clearance, then a hold comment', [clearY, comment('Hold: one more look.', '19:11:00')], true],
-      ['newer clearance of another head', [{ ...clearY, body: clearY.body.replace(Y, 'c'.repeat(40)) }], true],
-      ['newer clearance by an untrusted author', [{ ...clearY, author: { login: 'mallory' } }], true],
-      ['unreadable comments', null, true],
-    ])('after a post-write head move, rollback honours %s', (_kind, added, rolledBack) => {
+      ['newer clearance of the live head', { added: [clearY] }, false],
+      ['newer clearance, then a hold comment', { added: [clearY, comment('Hold: one more look.', '19:11:00')] }, true],
+      ['newer clearance of another head', { added: [{ ...clearY, body: clearY.body.replace(Y, 'c'.repeat(40)) }] }, true],
+      ['newer clearance by an untrusted author', { added: [{ ...clearY, author: { login: 'mallory' } }] }, true],
+      ['newer clearance, then a label-only acceptance removal', { added: [clearY], events: [event('unlabeled', 'review:accepted', '19:11:00', 'chalbert')] }, true],
+      ['newer clearance, then a hold label', { added: [clearY], events: [event('labeled', 'review:changes', '19:11:00', 'chalbert')] }, true],
+      ['newer clearance, a hold label still standing', { added: [clearY], labels: [...accepted, 'review:human'] }, true],
+      ['unreadable comments', { added: null }, true],
+      ['unreadable events', { added: [clearY], events: null }, true],
+      ['unreadable labels', { added: [clearY], labels: null }, true],
+    ])('after a post-write head move, rollback honours %s', (_kind, live, rolledBack) => {
       const fake = fakeGh(restoreFacts.labels);
       let written = false;
       const runGh = args => {
@@ -359,11 +365,18 @@ describe('I/O shell', () => {
         const result = fake.runGh(args);
         const path = args.find(a => a.startsWith('repos/')) ?? '';
         if (written) {
-          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...JSON.parse(result), headRefOid: Y });
+          if (args[0] === 'pr' && args[1] === 'view') {
+            if (live.labels === null && args.at(-1) === 'labels') throw new Error('read failed');
+            return JSON.stringify({ ...JSON.parse(result), headRefOid: Y, labels: live.labels ?? accepted });
+          }
           if (path.includes('/git/ref/')) return JSON.stringify({ object: { sha: Y } });
           if (path.includes('/comments')) {
-            if (!added) throw new Error('read failed');
-            return JSON.stringify([rest([...comments, ...added])]);
+            if (!live.added) throw new Error('read failed');
+            return JSON.stringify([rest([...comments, ...live.added])]);
+          }
+          if (path.includes('/events')) {
+            if (live.events === null) throw new Error('read failed');
+            return JSON.stringify([[...events, ...(live.events ?? [])]]);
           }
         }
         return result;

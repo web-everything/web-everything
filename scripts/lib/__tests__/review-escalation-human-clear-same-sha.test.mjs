@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
+import { parseLatestHumanClearedSha, isAcceptRecordBody } from '../review-escalation.mjs';
 
 // Live #5193 (2026-10-13): the operator cleared 9c7202417 (clear-human); a false no-push re-arm then triggered an AI
 // re-review whose plain accept named the SAME sha, so merge-gate read "no human clearance" for the cleared tree.
@@ -60,6 +60,18 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
     expect(parseLatestHumanClearedSha([clear(X), accept(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
     expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: false })).toBeNull();
+  });
+  it('recognises every acceptance its producers render, and nothing else they render', async () => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const { buildCarryRecordBody } = await import('../human-clearance-carry.mjs');
+    const verdict = to => buildVerdictComment({ to, actor: 'chalbert', headSha: X, reason: 'looked at it',
+      humanClearance: to === 'restamp' ? { actor: 'chalbert', sha: X } : null });
+    for (const to of ['accepted', 'clear-human', 'restamp']) expect(isAcceptRecordBody(verdict(to)), to).toBe(true);
+    expect(isAcceptRecordBody(buildVerdictComment({ to: 'restamp', actor: 'drain', headSha: X }))).toBe(true);
+    expect(isAcceptRecordBody(buildCarryRecordBody({ fromSha: Y, toSha: X, fingerprint: 'd'.repeat(64), actor: 'chalbert', headDiffText: 'diff' }))).toBe(true);
+    // Renamed 2026-10-11; records under the old heading are still on open PRs.
+    expect(isAcceptRecordBody('📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)\n')).toBe(true);
+    expect(isAcceptRecordBody(verdict('changes'))).toBe(false);
   });
   it('carries across a plain re-stamp and a machine note that carry the marker', () => {
     const restamp = say(`📌 review — acceptance re-stamped after a rebase (no new review)\n${quote}`, 'web-everything');

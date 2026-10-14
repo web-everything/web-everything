@@ -1950,13 +1950,15 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
  * `buildVerdictComment` (we:scripts/review-set-label.mjs: accepted, clear-human, restamp) and `buildCarryRecordBody`
  * (we:scripts/lib/human-clearance-carry.mjs). PR #5237 round 5: a comment that only carries a `reviewed-sha` marker
  * (a revocation quoting it) is not an acceptance. Missing a heading here fails closed: the comment ends a same-sha
- * clearance run and cannot be restored from.
+ * clearance run and cannot be restored from. A renamed heading stays listed: records written under the old name
+ * are still on open PRs (the carry heading read "identical net diff" until 2026-10-11).
  */
 const ACCEPT_RECORD_HEADINGS = [
   '✅ review — accepted',
   '✅ review — `review:human` cleared via the sanctioned path',
   '📌 review — acceptance re-stamped after a rebase (no new review)',
   '📌 review — human clearance carried forward (equivalent change after a mechanical refresh, no new review)',
+  '📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)',
 ];
 
 /** Pure: does this comment body open with an acceptance heading (its first non-blank line, exactly)? */
