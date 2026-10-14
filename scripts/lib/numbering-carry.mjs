@@ -2,7 +2,8 @@
  * @file scripts/lib/numbering-carry.mjs
  * @description Carry acceptance only across mechanically proven drain numbering commits. A matching subject
  *   is necessary but insufficient: every change must be a backlog card rename, its optional bornAs stamp,
- *   or a whole-token id rewrite. The IO shell proves a bounded linear chain above the accepted head.
+ *   or a whole-token id rewrite that leaves every existing `bornAs:` line untouched. The IO shell proves a bounded
+ *   linear chain above the accepted head, and the writer re-reads the PR before each write.
  *
  *   THE LIVE CASE (WE PR #5025): 8d3f2044f → e2e7e3f97 numbered xf74q20→#6053 and xztd0mv→#6054.
  *   Two backlog cards were renamed and stamped; one existing card and the renamed cards had references
@@ -10,6 +11,7 @@
  *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
  */
 import { execFileSync } from 'node:child_process';
+import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
 import { resolveHumanClearanceCarrySetting } from './human-clearance-carry.mjs';
@@ -64,6 +66,19 @@ export function isMappedRewrite(before, after, map) {
   return cursor === after.length;
 }
 
+/**
+ * PURE: the drain's own rewrite rule (applyLedger): line by line, every mapped token may become its number EXCEPT on
+ * a `bornAs: <hash>` line, which is a card's birth identity and must survive byte for byte. Numbers never contain a
+ * newline, so a genuine rewrite keeps the line count.
+ */
+export function isLedgerRewrite(before, after, map) {
+  if (typeof before !== 'string' || typeof after !== 'string') return false;
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  if (beforeLines.length !== afterLines.length) return false;
+  return beforeLines.every((line, i) => (BORN_AS_RE.test(line) ? line === afterLines[i] : isMappedRewrite(line, afterLines[i], map)));
+}
+
 const refuse = (reason) => ({ ok: false, reason });
 const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(hash) ?? hash);
 
@@ -111,8 +126,10 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
     if (typeof before !== 'string' || typeof after !== 'string') return refuse(`missing content blob for rename ${deleted.path}`);
     const prefix = `---\nbornAs: ${hash}\n`;
     const unstamped = after.startsWith(prefix) ? `---\n${after.slice(prefix.length)}` : null;
-    const stampMatches = !/^bornAs:/m.test(before) && unstamped !== null && isMappedRewrite(before, unstamped, referenceMap);
-    if (!isMappedRewrite(before, after, referenceMap) && !stampMatches) return refuse(`rename content is not an id rewrite at ${deleted.path}`);
+    const stampMatches = !/^bornAs:/m.test(before) && unstamped !== null && isLedgerRewrite(before, unstamped, referenceMap);
+    if (!isLedgerRewrite(before, after, referenceMap) && !stampMatches) {
+      return refuse(`rename content is not an id rewrite with every bornAs line kept at ${deleted.path}`);
+    }
     used.add(hash);
     renames.push({ from: deleted.path, to: added.path });
   }
@@ -120,7 +137,9 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   for (const change of changes.filter((c) => c.status === 'M')) {
     if (typeof change.before !== 'string' || typeof change.after !== 'string') return refuse(`missing content blob at ${change.path}`);
     if (change.before === change.after) return refuse(`modified path ${change.path} is unchanged`);
-    if (!isMappedRewrite(change.before, change.after, referenceMap)) return refuse(`modification is not an id rewrite at ${change.path}`);
+    if (!isLedgerRewrite(change.before, change.after, referenceMap)) {
+      return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
+    }
   }
   for (const hash of map.keys()) {
     if (!used.has(hash)) return refuse(`subject pair ${hash} renamed no backlog card`);
@@ -342,9 +361,35 @@ export function _resetNumberingRestampMemo() { settledRestamps.clear(); }
 export function numberingRestampSettled(repo, pr, head) { return settledRestamps.has(`${repo}#${pr}@${head}`); }
 const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
 
-/** IO: prove first, record before labels; only settled proof outcomes are memoized. */
+/**
+ * IO: re-read the PR and re-plan right before a write, so a hold, head move or label change that arrived while the
+ * proof ran wins over the plan it was given. Returns the fresh state, or the result to return without writing.
+ * Nothing here is memoized: a held or unreadable head is planned again on the next pass.
+ */
+function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }) {
+  if (typeof readLiveState !== 'function') return { result: { action: 'retry', reason: 'no live re-read before the write' } };
+  let live;
+  try { live = readLiveState(); }
+  catch (e) { return { result: { action: 'retry', reason: `live re-read failed: ${errorReason(e)}` } }; }
+  const state = live?.state;
+  if (!state || !Array.isArray(state.comments) || !Array.isArray(state.labels)) {
+    return { result: { action: 'retry', reason: 'live re-read returned no complete thread' } };
+  }
+  const plan = planNumberingRestamp({ labels: state.labels, headSha: state.headRefOid, comments: state.comments, reviews: live.reviews });
+  if (!plan.candidate) {
+    return { result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
+  }
+  if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)) {
+    return { result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
+  }
+  try { guardReferrals(state, { repo, pr }); }
+  catch (e) { return { result: { action: 'retry', reason: errorReason(e) } }; }
+  return { state };
+}
+
+/** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
 export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFileSync, cwd, provider,
-  readNetDiff, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
+  readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
   guardReferrals = assertMandatoryReferralsCleared } = {}) {
   if (!enabled || acceptCarry !== 'on') return null;
@@ -356,9 +401,13 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // A guard read failure is retryable and never settles the head or grants an acceptance.
   try { guardReferrals(state, { repo, pr }); }
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
+  const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
+    expected: { from: plan.from, to: plan.to, labelsOnly } });
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
-    try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: state.labels }); }
+    const live = recheck(true);
+    if (!live.state) return live.result;
+    try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: live.state.labels }); }
     catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
     settledRestamps.add(key);
     return { action: 'restamped', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true,
@@ -375,9 +424,15 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (dryRun) return { action: 'would-restamp', ...carried };
   const body = buildNumberingRestampBody({ fromSha: plan.from, toSha: plan.to, ...carried,
     headDiffText, proofReason: proof.reason, writer });
+  // The proof and diff read are slow: a hold posted meanwhile would sit BEFORE the new record and read as superseded.
+  const before = recheck(false);
+  if (!before.state) return before.result;
   try { provider.postComment(repo, pr, body); }
   catch (e) { return { action: 'error', reason: errorReason(e) }; }
-  try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: state.labels }); }
+  // The record is now on the thread; a hold posted after it still keeps review:pending.
+  const after = recheck(true);
+  if (!after.state) return { ...after.result, commentPosted: true };
+  try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: after.state.labels }); }
   catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
   settledRestamps.add(key);
   return { action: 'restamped', ...carried, reason: proof.reason };

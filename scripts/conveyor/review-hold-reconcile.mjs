@@ -171,16 +171,21 @@ export function sweepReviewHoldLabels({
     try {
       const slug = repoOf();
       if (numberingRestampSettled(slug, pr.number, pr.headRefOid)) continue;
-      const metadata = provider.readPrState(slug, pr.number);
-      const state = { ...metadata, comments: readComments(pr.number, { repo: slug }) };
-      if (state.state !== 'OPEN') throw new Error('PR is not open');
-      if (!Array.isArray(state.labels) || state.labels.some((l) =>
-        typeof (l?.name ?? l) !== 'string' || !(l?.name ?? l).trim())) throw new Error('unusable labels');
-      if (typeof state.headRefOid !== 'string' || !state.headRefOid.trim()) throw new Error('missing head');
-      if (!Array.isArray(state.comments)) throw new Error('comments read returned no array');
-      if (state.number != null && state.number !== pr.number) throw new Error('PR number mismatch');
-      let reviews;
-      try { reviews = provider.readPrReviews(slug, pr.number); } catch { reviews = null; }
+      // One validated live read, used for the plan and again right before each write (a hold can arrive mid-proof).
+      const readLiveState = () => {
+        const metadata = provider.readPrState(slug, pr.number);
+        const live = { ...metadata, comments: readComments(pr.number, { repo: slug }) };
+        if (live.state !== 'OPEN') throw new Error('PR is not open');
+        if (!Array.isArray(live.labels) || live.labels.some((l) =>
+          typeof (l?.name ?? l) !== 'string' || !(l?.name ?? l).trim())) throw new Error('unusable labels');
+        if (typeof live.headRefOid !== 'string' || !live.headRefOid.trim()) throw new Error('missing head');
+        if (!Array.isArray(live.comments)) throw new Error('comments read returned no array');
+        if (live.number != null && live.number !== pr.number) throw new Error('PR number mismatch');
+        let liveReviews;
+        try { liveReviews = provider.readPrReviews(slug, pr.number); } catch { liveReviews = null; }
+        return { state: live, reviews: liveReviews };
+      };
+      const { state, reviews } = readLiveState();
       let origin = '';
       try { origin = String(exec('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' })).trim(); } catch { /* other checkout */ }
       const originSlug = origin.replace(/^.*github\.com[:/]/i, '').replace(/\.git$/i, '').replace(/\/$/, '');
@@ -192,7 +197,7 @@ export function sweepReviewHoldLabels({
       const readNetDiff = (sha) => readNetDiffAtHead({
         exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
       });
-      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd, readNetDiff, exec });
+      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd, readNetDiff, readLiveState, exec });
       if (r) {
         results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });
         if (r.action === 'restamped' || (dryRun && r.action === 'would-restamp')) restamped.add(pr.number);

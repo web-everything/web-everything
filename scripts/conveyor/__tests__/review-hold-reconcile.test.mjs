@@ -558,3 +558,21 @@ it('passes unreadable reviews as null and keeps numbering failures isolated per 
   expect(result).toContainEqual({ num: 1, numberingRestamp: 'error', detail: 'isolated failure' });
   expect(result).toContainEqual({ num: 2, numberingRestamp: 'retry', detail: 'formal reviews unreadable' });
 });
+
+it('re-reads the PR before posting, so an objection made during the numbering proof keeps the hold (red team #5233)', () => {
+  _resetNumberingRestampMemo();
+  const accept = { author: { login: 'chalbert' }, createdAt: '2026-10-12T10:00:00Z',
+    body: `✅ review — human cleared\n<!-- reviewed-sha: ${'b'.repeat(40)} -->\n<!-- cleared-human: chalbert -->` };
+  const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+  let proved = false;
+  const p = provider({ readPrState: () => ({ comments: proved ? [accept, objection] : [accept] }) });
+  p.readPrReviews = () => [];
+  const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [pr(5025, ['review:pending'])],
+    numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: true, acceptCarry: 'on', guardReferrals: () => {},
+      prove: () => { proved = true; return { ok: true, reason: 'verified' }; } }) });
+  expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'held' }));
+  expect(p.calls.readPrState).toHaveLength(2);
+  expect(p.calls.postComment).toEqual([]);
+  expect(p.calls.set).toEqual([]);
+  _resetNumberingRestampMemo();
+});

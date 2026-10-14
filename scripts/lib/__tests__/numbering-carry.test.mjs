@@ -119,6 +119,35 @@ describe('checkNumberingCommit', () => {
     delete missing.changes[1].before;
     refused(checkNumberingCommit(missing), /blob|content/);
   });
+  // Red team #5233: applyLedger never rewrites a `bornAs: <hash>` line, so a numbering commit that does is not one.
+  it.each([
+    ['modified card', (o) => o.changes.push({ status: 'M', path: 'backlog/9000-existing.md',
+      before: '---\nbornAs: xdef456\n---\nsee #xdef456\n', after: '---\nbornAs: 9000\n---\nsee #9000\n' })],
+    ['modified card, CRLF', (o) => o.changes.push({ status: 'M', path: 'backlog/9000-existing.md',
+      before: '---\r\nbornAs: xdef456\r\n---\r\n', after: '---\r\nbornAs: 9000\r\n---\r\n' })],
+    ['modified card, subject hash', (o) => o.changes.push({ status: 'M', path: 'backlog/9000-existing.md',
+      before: '---\nbornAs:  xf74q20 \n---\n', after: '---\nbornAs:  6053 \n---\n' })],
+    ['renamed card with an existing stamp', (o) => {
+      o.changes[1].before = stamp(o.changes[1].before, 'xf74q20');
+      o.changes[2].after = o.changes[2].after.replace('bornAs: xf74q20\n', '').replace('---\n', '---\nbornAs: 6053\n');
+    }],
+    ['renamed card carrying another alias line', (o) => {
+      o.changes[1].before = `${stamp(o.changes[1].before, 'xf74q20')}bornAs: xdef456\n`;
+      o.changes[2].after += 'bornAs: 9000\n';
+    }],
+  ])('refuses a rewritten bornAs line: %s', (_name, mutate) => {
+    const o = live();
+    o.extraMap = new Map([['xdef456', '9000']]);
+    mutate(o);
+    refused(checkNumberingCommit(o), /bornAs|content|rewrite/);
+  });
+  it('still permits a reference rewrite beside a preserved bornAs line', () => {
+    const o = live();
+    o.extraMap = new Map([['xdef456', '9000']]);
+    o.changes.push({ status: 'M', path: 'backlog/9000-existing.md',
+      before: '---\nbornAs: xdef456\n---\nsee #xdef456\n', after: '---\nbornAs: xdef456\n---\nsee #9000\n' });
+    expect(checkNumberingCommit(o).ok).toBe(true);
+  });
   it('preserves existing bornAs and refuses adding a second stamp', () => {
     const o = live();
     o.changes[1].before = stamp(o.changes[1].before, 'xf74q20');
@@ -130,7 +159,7 @@ describe('checkNumberingCommit', () => {
 
 // Exercise the actual IO shell without writing git state: exec observes the same raw
 // bytes cat-file returns, including bytes a permissive UTF-8 decoder would discard.
-function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree } = {}) {
+function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '' } = {}) {
   const from = 'a'.repeat(40), numbered = 'b'.repeat(40);
   const heads = [numbered, 'e'.repeat(40)];
   const head = heads[subjects.length - 1];
@@ -146,6 +175,7 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
     if (args[0] === 'rev-parse') output = from;
     else if (args[0] === 'rev-list') output = subjects.map((_s, i) => `${heads[i]} ${i ? heads[i - 1] : from}\n`).join('');
     else if (args[0] === 'log') output = `${subjects[heads.indexOf(args.at(-1))]}\n`;
+    else if (args[0] === 'grep') output = mainAliases;
     else if (args[0] === 'ls-tree') {
       if (args.includes(failTree)) throw Error('inventory unreadable');
       const ref = args.find((a) => a === from || a === 'origin/main');
@@ -163,6 +193,14 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
 }
 
 describe('proveNumberingOnlyMove read-only regressions', () => {
+  it('refuses a numbering commit that rewrites an existing card\'s bornAs through a main alias (red team #5233)', () => {
+    const existing = { status: 'M', path: 'backlog/9000-existing.md', before: '---\nbornAs: xdef456\n---\nbody\n' };
+    const mainAliases = 'origin/main:backlog/9000-existing.md:bornAs: xdef456\n';
+    const corrupt = [...live().changes, { ...existing, after: '---\nbornAs: 9000\n---\nbody\n' }];
+    refused(proofReader({ changes: corrupt, mainAliases }).prove(), /bornAs|rewrite/);
+    const kept = [...live().changes, { ...existing, before: `${existing.before}see #xdef456\n`, after: '---\nbornAs: xdef456\n---\nbody\nsee #9000\n' }];
+    expect(proofReader({ changes: kept, mainAliases }).prove().ok).toBe(true);
+  });
   it('reads zero blobs for an ordinary subject', () => {
     const r = proofReader({ commitSubject: 'ordinary author change' });
     refused(r.prove(), /subject/);
@@ -459,8 +497,91 @@ describe('numbering acceptance restamp', () => {
     expect(latestAcceptRecord(comments).sha).toBe(TO);
     expect(buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: false })).not.toContain('cleared-human:');
   });
-  const run = (over = {}) => restampAfterNumbering({ repo: 'o/n', pr: 5025,
-    state: { labels: ['review:pending'], headRefOid: TO, comments: liveComments() }, reviews: [], ...over });
+  // The live re-read sees the caller's state plus whatever this run itself posted, unless a test overrides it.
+  const run = (over = {}) => {
+    const state = over.state ?? { labels: ['review:pending'], headRefOid: TO, comments: liveComments() };
+    const reviews = over.reviews ?? [];
+    const posted = [];
+    const provider = over.provider && { ...over.provider, postComment: (r, n, body) => {
+      const out = over.provider.postComment(r, n, body);
+      posted.push({ author: { login: 'chalbert' }, body });
+      return out;
+    } };
+    return restampAfterNumbering({ repo: 'o/n', pr: 5025, state, reviews,
+      readLiveState: () => ({ state: { ...state, comments: [...state.comments, ...posted] }, reviews }),
+      ...over, ...(provider ? { provider } : {}) });
+  };
+  const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+  const recording = () => {
+    const calls = [];
+    return { calls, provider: { postComment: (_r, _n, body) => calls.push(body), setLabels: (_r, _n, spec) => calls.push(spec) } };
+  };
+  describe('a hold that arrives while the proof runs (red team #5233)', () => {
+    const liveRead = (patch) => () => {
+      const state = { labels: ['review:pending'], headRefOid: TO, comments: liveComments() };
+      return patch({ state, reviews: [] }) ?? { state, reviews: [] };
+    };
+    it.each([
+      ['an operator objection', liveRead((l) => { l.state.comments.push(objection); })],
+      ['a formal changes-requested review', liveRead((l) => { l.reviews.push({ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-13T00:00:00Z' }); })],
+      ['a review:human label', liveRead((l) => { l.state.labels.push('review:human'); })],
+      ['a review:changes label', liveRead((l) => { l.state.labels.push({ name: 'review:changes' }); })],
+      ['pending removed', liveRead((l) => { l.state.labels = []; })],
+    ])('writes nothing and keeps the head open: %s', (_name, readLiveState) => {
+      const { calls, provider } = recording();
+      const r = run({ provider, readLiveState, prove: () => ({ ok: true, reason: 'verified' }) });
+      expect(r).toMatchObject({ action: 'held' });
+      expect(calls).toEqual([]);
+      expect(run({ provider, prove: () => ({ ok: true, reason: 'verified' }) }).action).toBe('restamped');
+    });
+    it.each([
+      ['a head move', liveRead((l) => { l.state.headRefOid = 'f'.repeat(40); })],
+      ['unreadable reviews', liveRead((l) => { l.reviews = null; })],
+      ['a truncated comment read', liveRead((l) => { l.state.comments = null; })],
+      ['a failed re-read', () => { throw Error('gh offline'); }],
+      ['no re-read result', () => undefined],
+    ])('retries without writes after %s', (_name, readLiveState) => {
+      const { calls, provider } = recording();
+      expect(run({ provider, readLiveState, prove: () => ({ ok: true, reason: 'verified' }) })).toMatchObject({ action: 'retry' });
+      expect(calls).toEqual([]);
+    });
+    it('writes nothing without a live re-read', () => {
+      const { calls, provider } = recording();
+      expect(run({ provider, readLiveState: undefined, prove: () => ({ ok: true, reason: 'verified' }) })).toMatchObject({ action: 'retry' });
+      expect(calls).toEqual([]);
+    });
+    it('re-checks the referral guard on the re-read state', () => {
+      const { calls, provider } = recording();
+      let reads = 0;
+      const guardReferrals = () => { if (++reads > 1) throw Error('mandatory referral hold: unresolved'); };
+      expect(run({ provider, guardReferrals, prove: () => ({ ok: true, reason: 'verified' }) }))
+        .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
+      expect(calls).toEqual([]);
+    });
+    it('keeps pending when the objection lands between the record and the label write', () => {
+      const { calls, provider } = recording();
+      let reads = 0;
+      const readLiveState = () => {
+        const comments = [...liveComments(), ...calls.filter((c) => typeof c === 'string').map((body) => ({ author: { login: 'chalbert' }, body }))];
+        if (++reads > 1) comments.push(objection);
+        return { state: { labels: ['review:pending'], headRefOid: TO, comments }, reviews: [] };
+      };
+      expect(run({ provider, readLiveState, prove: () => ({ ok: true, reason: 'verified' }) }))
+        .toMatchObject({ action: 'held', commentPosted: true });
+      expect(calls).toHaveLength(1);
+      expect(typeof calls[0]).toBe('string');
+    });
+    it('a labels-only recovery re-reads before removing pending', () => {
+      const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
+      const comments = [...liveComments(), { author: { login: 'chalbert' }, body }];
+      const { calls, provider } = recording();
+      const r = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments },
+        readLiveState: () => ({ state: { labels: ['review:pending'], headRefOid: TO, comments: [...comments, objection] }, reviews: [] }),
+        prove: () => { throw Error('no proof is owed for a recorded re-stamp'); } });
+      expect(r).toMatchObject({ action: 'held' });
+      expect(calls).toEqual([]);
+    });
+  });
   it('retries a transient proof read failure on the same head', () => {
     const r = repo(); const head = r.number();
     let fail = true;
