@@ -121,7 +121,7 @@
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -4327,6 +4327,8 @@ async function runCli() {
   const onlyPr = flags.only != null ? String(flags.only) : (flags.couple != null ? String(flags.couple) : (flags.pr != null ? String(flags.pr) : null));
   const fastDrain = onlyPr != null ? resolveFastDrainScopeSetting() : { scope: 'full' };
   if (onlyPr != null) process.stderr.write(`${fastDrain.line}\n`);
+  const fastDrainListing = onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' };
+  if (onlyPr != null) process.stderr.write(`${fastDrainListing.line}\n`);
   // #2683 — the target repo for `--only=<pr>`. PR numbers are per-repo (WE #12 ≠ FUI #12), so a bare `--only=12`
   // on the DEFAULT constellation scope would match a same-numbered PR in EVERY repo. `--only-repo=<slug>` names
   // the ONE repo the target lives in; absent, the target defaults to the LOCAL (cwd) repo. The full REPOS scope
@@ -4939,26 +4941,46 @@ async function runCli() {
     try {
       const slug = repo || localSlug;
       let listed;
-      if (slug) {
+      // A fast drain reuses snapshot context, but its sole candidate is always read live.
+      if (slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
+        const fields = RECONCILE ? SWEEP_LIST_FIELDS
+          : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
+        try {
+          const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields, caller: 'merge-ai-prs.mjs' }));
+          if (snap == null) {
+            process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
+          } else {
+            const targetRow = await __t.timeAsync('listing.target', async () => {
+              const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},state`],
+                { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+              return JSON.parse(stdout.trim() || 'null');
+            });
+            listed = { rows: mergeLiveTargetIntoRows(snap, targetRow, onlyPr), truncated: false, cache: drainHeavyCacheByRepo.get(repo) || {} };
+          }
+        } catch {
+          process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
+        }
+      }
+      if (slug && !listed) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
         const wanted = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
         // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
         let seed = [];
-        try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { seed = []; }
-        listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+        try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+        listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
           heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } });
+          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
         drainHeavyCacheByRepo.set(repo, listed.cache);
-      } else {
+      } else if (!slug) {
         // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
         const sized = candidateListLimit(repo);
         let rows = await run(sized);
         if (rows.length >= sized) rows = await run(OPEN_PR_LIST_LIMIT);
         listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
       }
-      const rows = await resolveListedChecks(repo, listed.rows);
+      const rows = await __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       const { prs: labelMatched, truncated } = filterOpenPrsByLabel(rows, label, OPEN_PR_LIST_LIMIT);
       const prs = filterOpenPrsByBase(labelMatched, base);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
@@ -4976,7 +4998,7 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
     }
   };
-  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), Promise.all(REPOS.map(resolveDefaultBranch))]));
+  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.map(resolveDefaultBranch)))]));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
   // from the live rows, so the context re-list also fails and the couple gate fails closed for it.
@@ -4984,7 +5006,8 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
-  // #4108 — this pass's already-fetched LIVE rows per repo (see `buildLiveListingsByRepo`'s docblock for why
+  // #4108 — this pass's already-fetched rows per repo (full passes live; snapshot fast drains have a live target).
+  // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
@@ -4996,7 +5019,7 @@ async function runCli() {
   // #xc7p3q9 (B3) — when the blind context is NEVER collected (`RECONCILE` false: a bare `/merge` sweep or
   // `--no-reconcile-labels`), it is INCOMPLETE by construction — `contextComplete:false` — so the couple gate
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
-  const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => collectContext(liveListingsByRepo)) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
+  const openPrContext = RECONCILE ? await __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false });
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.

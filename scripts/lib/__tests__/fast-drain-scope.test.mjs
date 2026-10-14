@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  shaCacheRepo, resolveFastDrainScopeSetting, shouldReadContextCommits,
+  shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, mergeLiveTargetIntoRows, shouldReadContextCommits,
   filterToFastDrainTarget, readLegacyManifestCached,
 } from '../fast-drain-scope.mjs';
 
@@ -60,5 +60,50 @@ describe('legacy manifest persistence', () => {
     expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toBe(manifest);
     if (persists) expect(writeCache).toHaveBeenCalledWith({ ...key, value: manifest });
     else expect(writeCache).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('fast drain listing', () => {
+  const resolve = (options = {}) => resolveFastDrainListingSetting({ env: {}, tool: {}, platform: {}, ...options });
+  it('defaults to snapshot from the standard', () => {
+    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard)' });
+  });
+  it('resolves platform, tool and env in cascade order', () => {
+    expect(resolve({ platform: { listing: 'live' } })).toMatchObject({ listing: 'live', source: 'platform' });
+    expect(resolve({ platform: { listing: 'snapshot' }, tool: { listing: 'live' } })).toMatchObject({ listing: 'live', source: 'tool' });
+    expect(resolve({ tool: { listing: 'snapshot' }, env: { WE_FAST_DRAIN_LISTING: 'live' } })).toMatchObject({ listing: 'live', source: 'env' });
+  });
+  it('reads the declared tool fastDrain block', () => {
+    expect(resolve({ tool: undefined, readSettings: () => ({ settings: { mergeQueue: { fastDrain: { listing: 'live' } } } }) })).toMatchObject({ listing: 'live', source: 'tool' });
+  });
+  it.each([
+    { platform: { listing: 'bogus' } }, { tool: { listing: 'bogus' } },
+    { env: { WE_FAST_DRAIN_LISTING: 'bogus' } },
+  ])('ignores and reports invalid listing settings: %s', (options) => {
+    expect(resolve(options)).toMatchObject({ listing: 'snapshot', source: 'standard' });
+    expect(resolve(options).line).toMatch(/ignored invalid:.*bogus/);
+  });
+});
+
+describe('mergeLiveTargetIntoRows', () => {
+  const other = Object.freeze({ number: 8 });
+  const stale = Object.freeze({ number: 7, title: 'stale' });
+  const rows = Object.freeze([stale, other]);
+  it('replaces the target using string-normalized numbers without mutation', () => {
+    const target = Object.freeze({ number: 7, state: 'OPEN', title: 'live' });
+    const result = mergeLiveTargetIntoRows(rows, target, '7');
+    expect(result).toEqual([target, other]);
+    expect(result).not.toBe(rows);
+    expect(result[0]).toBe(target);
+    expect(rows).toEqual([stale, other]);
+  });
+  it('appends a missing target, including a row without state', () => {
+    const target = Object.freeze({ number: 9 });
+    expect(mergeLiveTargetIntoRows(rows, target, 9)).toEqual([stale, other, target]);
+  });
+  it.each([null, { number: 7, state: 'CLOSED' }, { number: 7, state: 'MERGED' }])('removes a null or closed target: %s', (target) => {
+    expect(mergeLiveTargetIntoRows(rows, target, '7')).toEqual([other]);
+    expect(rows).toEqual([stale, other]);
   });
 });

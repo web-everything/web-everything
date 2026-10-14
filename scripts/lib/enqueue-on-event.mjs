@@ -432,19 +432,43 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = '
     later: candidates.slice(room).map((p) => p.num), skipped };
 }
 
+/** Return the latest pass's timings, independent of any stderr tail truncation. */
+export function extractPassTimings(stderrText) {
+  let latest = null;
+  for (const line of String(stderrText || '').split('\n')) {
+    const marker = 'merge-ai-prs · pass timings: ';
+    const at = line.indexOf(marker);
+    if (at >= 0) latest = line.slice(at + marker.length).replace(/\s+\(considered\b.*\)\s*$/, '').trim();
+  }
+  return latest;
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderrTail = ''; let timedOut = false;
+    let passTimings = null; let stderrPending = '';
+    const scanTimings = (text) => {
+      const extracted = extractPassTimings(text);
+      if (extracted !== null) passTimings = extracted;
+    };
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
+    catch (e) { resolveRun({ code: null, stdout: '', passTimings, error: String(e?.message || e) }); return; }
     onChild(child);
     child.stdout?.on('data', (d) => { stdout += d; });
-    child.stderr?.on('data', (d) => { stderrTail = (stderrTail + d).slice(-2000); });
+    child.stderr?.on('data', (d) => {
+      stderrTail = (stderrTail + d).slice(-2000);
+      stderrPending += d;
+      const end = stderrPending.lastIndexOf('\n');
+      if (end >= 0) {
+        scanTimings(stderrPending.slice(0, end));
+        stderrPending = stderrPending.slice(end + 1);
+      }
+    });
     const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
     killer.unref?.();
-    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, stdout, stderrTail, timedOut, error: String(e?.message || e) }); });
-    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, stdout, stderrTail, timedOut }); });
+    child.on('error', (e) => { clearTimeout(killer); scanTimings(stderrPending); resolveRun({ code: null, stdout, stderrTail, timedOut, passTimings, error: String(e?.message || e) }); });
+    child.on('close', (code) => { clearTimeout(killer); scanTimings(stderrPending); resolveRun({ code, stdout, stderrTail, timedOut, passTimings }); });
   });
 }
 
@@ -685,7 +709,7 @@ export function createEnqueueOnEvent({
           refillCatchUp();
         }
         const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
-        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]`);
+        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]${r.passTimings ? ` · phases: ${r.passTimings}` : ''}`);
         ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
       const task = finish().catch(e => {

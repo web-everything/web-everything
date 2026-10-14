@@ -23,6 +23,36 @@ export function resolveFastDrainScopeSetting({ env = process.env, tool, platform
   return { scope, source, line };
 }
 
+/** Resolve standard → platform → tool → env; injected layers keep unit probes deterministic. */
+export function resolveFastDrainListingSetting({ env = process.env, tool, platform, readSettings = readDeclaredSettings } = {}) {
+  let block = tool;
+  if (block === undefined) {
+    try { block = readSettings().settings?.mergeQueue?.fastDrain; } catch { block = undefined; }
+  }
+  const raw = String(env?.WE_FAST_DRAIN_LISTING ?? '').trim().toLowerCase();
+  const c = cascadePolicy('mergeQueue.fastDrain', block, {
+    env, standard: { listing: 'snapshot' }, envValues: { listing: raw || undefined },
+    valid: { listing: (v) => v === 'snapshot' || v === 'live' },
+    ...(platform !== undefined ? { platform } : {}), log: () => {},
+  });
+  const listing = c.value.listing, source = c.sources.listing;
+  const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
+  return { listing, source, line };
+}
+
+/** Replace the live target while preserving snapshot context without mutating either input. */
+export function mergeLiveTargetIntoRows(snapshotRows, targetRow, onlyPr) {
+  const keepTarget = targetRow != null && (targetRow.state === undefined || targetRow.state === 'OPEN');
+  let found = false;
+  const rows = snapshotRows.flatMap((row) => {
+    if (String(row.number) !== String(onlyPr)) return [row];
+    found = true;
+    return keepTarget ? [targetRow] : [];
+  });
+  if (keepTarget && !found) rows.push(targetRow);
+  return rows;
+}
+
 export function shouldReadContextCommits({ onlyPr, scope, isTarget }) {
   return onlyPr == null || scope !== 'target' || isTarget;
 }
