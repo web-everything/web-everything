@@ -1,0 +1,6 @@
+{
+  "$comment": "Default Claude helper/juror model. Cascade: standard → platform claudeHelper → this file → WE_CLAUDE_HELPER_MODEL. Explicit per-task design/Opus choices remain caller overrides; the resolved source is logged by the shared cascade.",
+  "claudeHelper": {
+    "model": "claude-sonnet-5-5"
+  }
+}

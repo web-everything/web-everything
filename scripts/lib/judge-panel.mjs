@@ -163,13 +163,13 @@
  * and cannot reach, so an `accept` from this panel is never read as a tool-backed one.
  */
 
+import { resolveClaudeHelperRoute } from './claude-helper-route.mjs';
 import {
   judgeSpawn,
   buildJudgeArgv,
   assertNoForbiddenArgv,
   deriveSessionId,
   sessionSeed,
-  DEFAULT_MODEL,
   DEFAULT_EFFORT,
   DEFAULT_BUDGET_USD,
 } from './judge-spawn.mjs';
@@ -390,7 +390,7 @@ export async function judgePanel({
   mandate,
   input,
   shape,
-  model = DEFAULT_MODEL,
+  model = resolveClaudeHelperRoute().model,
   effort = DEFAULT_EFFORT,
   budget = DEFAULT_BUDGET_USD,
   cwd,
