@@ -49,6 +49,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
+import { ghThrottleLockRoot } from '../../lib/gh-throttle.mjs';
 
 function headOfClone(cloneRoot) {
   return execFileSync('git', ['-C', cloneRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -178,6 +179,9 @@ function a3Def() {
     daemons: ['review', 'fix-dispatch'],
     lanes: 2,
     setup(w) {
+      // A1/A2 advance their child clocks. Sharing the ambient per-file throttle state here would carry
+      // their future budget windows into this fresh world and can block a tick for the full acquire timeout.
+      expect(ghThrottleLockRoot(w.simCloneRoot, w.env)).not.toBe(ghThrottleLockRoot(process.cwd(), process.env));
       return { w };
     },
     play: [
