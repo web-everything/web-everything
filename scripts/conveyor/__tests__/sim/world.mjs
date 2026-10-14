@@ -33,6 +33,7 @@ import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
+import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -250,9 +251,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // Cover those paths too: npm may reuse the matching local fixture, never download dependencies.
   writeFixtureNpm(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy', 'npm']);
-  for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
-    // An ambient App shim contains only a gh wrapper (already replaced by rawGh). Do not scan host auth state.
-    if (dir.replaceAll('\\', '/').includes('/.claude/github-app-token/')) continue;
+  for (const dir of toolPathDirs()) {
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -262,7 +261,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    ...isolatedProcessEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
@@ -335,13 +334,6 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
-  delete env.WE_GITHUB_APP_ID;
-  delete env.WE_GITHUB_APP_INSTALLATION_ID;
-  delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
-  delete env.GITHUB_TOKEN;
-  // A daemon's inherited last-good routing snapshot can name models absent from this template's catalogue.
-  // The copied policy is the simulator's source of truth, just like the copied daemon code.
-  delete env.WE_DISPATCH_ROUTING_SNAPSHOT;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
