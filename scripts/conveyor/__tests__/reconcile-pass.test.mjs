@@ -1468,3 +1468,16 @@ describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)',
     ]);
   });
 });
+
+it('cards 273/278 threads resolved ownership settings and keeps pure defaults on unreadable IO', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { readFileSync } = await import('node:fs');
+  const fx = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-ci-heal-escalated.json', 'utf8'));
+  const options = { ...xxOptions(), readPrs: () => [fx.pr], readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
+    now: Date.parse(fx.observedAt), excuseMergeGateHolds: prs => prs, enrichMechanicalRound: prs => prs,
+    enrichReferralHolds: prs => prs, enrichLedgerHolds: prs => prs, enrichRulings: prs => prs,
+    enrichScopeBloat: prs => prs, enrichCodeQL: prs => prs, enrichEscalationBase: prs => prs,
+    loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'on', source: 'test' }, unlabeledRedAgentPr: { value: 'off', source: 'test' } }) };
+  expect(runReconcilePass(options).dispatch).toContainEqual(expect.objectContaining({ kind: 'review', advisoryReview: expect.objectContaining({ ciWaived: true }) }));
+  expect(runReconcilePass({ ...options, loadPrOwnership: () => { throw Error('unreadable'); } }).dispatch.some(d => d.kind === 'review')).toBe(false);
+});
