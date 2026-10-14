@@ -626,3 +626,21 @@ describe('stand-down head lapse', () => {
     expect(annotateLapsedStandDowns(pr, { lapseOnNewHead: 'off' })).toBe(pr);
   });
 });
+
+it('lapses only trusted current-head exhaustion when the red-main predicate proves release', () => {
+  const head = 'a'.repeat(40);
+  const comment = reason => ({ body: buildStandDownComment({ reason, head }), author: AUTOMATION });
+  const options = { lapseOnNewHead: 'off', redMainLapse: () => true };
+  const lapse = { fromHead: head, toHead: head, reason: 'fix-loop-exhausted', lapse: 'red-main-only' };
+  expect(standDownLapse(comment('fix-loop-exhausted'), head, options)).toEqual(lapse);
+  expect(standDownLapse(comment('fix-loop-exhausted'), head, { redMainLapse: () => false })).toBeNull();
+  expect(standDownLapse(comment('fix-loop-exhausted'), head)).toBeNull();
+  expect(standDownLapse({ ...comment('fix-loop-exhausted'), author: { login: 'stranger' } }, head, options)).toBeNull();
+  for (const reason of Object.keys(STAND_DOWN_REASONS).filter(r => r !== 'fix-loop-exhausted')) {
+    expect(standDownLapse(comment(reason), head, options)).toBeNull();
+  }
+  const result = annotateLapsedStandDowns({ number: 5195, headRefOid: head, comments: [comment('fix-loop-exhausted')] },
+    { ...options, onLapse: () => {} });
+  expect(result.standDownLapses).toEqual([lapse]);
+  expect(countTerminalStandDowns(result.comments)).toBe(0);
+});

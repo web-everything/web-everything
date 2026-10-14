@@ -12,7 +12,7 @@ const loadBacklog = require('../backlog.js');
 const FIB = new Set([1, 2, 3, 5, 8, 13]);
 const bd = computeBurndown();
 const items = loadBacklog();
-const sized = items.filter((i: any) => typeof i.size === 'number' && FIB.has(i.size));
+const sized = items.filter((i: any) => i.status !== 'closed' && typeof i.size === 'number' && FIB.has(i.size));
 
 describe('backlog burndown — accounting invariants', () => {
   it('totals to the sum of every item size (each unit of scope counted once)', () => {

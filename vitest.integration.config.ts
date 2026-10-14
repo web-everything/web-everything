@@ -146,10 +146,10 @@ export default defineConfig({
     ].filter((f) => !LIVE_SUITE.has(f)),
     poolMatchGlobs: [
       ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],
-      // The Rust parity suites compile and scan the real repository. Pools run concurrently, so leaving
-      // them in threads overlaps that work with the serial daemon scenarios and can exhaust A3's 180s
-      // deadline (CI run 38619616650). Share the single fork to serialize these scans with the scenarios
-      // and with one another, including their cargo builds against the same target directory.
+      // These parity checks scan the real repository (and build/run the Rust scanner). Separate Vitest pools
+      // run concurrently: leaving these in threads makes them compete with the serial daemon scenarios below.
+      // In CI the citation parity file took 183s while self-sync A3 hit its 180s timeout. Queue all scanner parity
+      // checks in the SAME singleFork pool, as already done for stdout-flush's full standards scan.
       ['scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs', 'forks'],
       ['scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs', 'forks'],
       ['scripts/__tests__/rust-scan-locus-prefix-parity.test.mjs', 'forks'],

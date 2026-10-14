@@ -192,7 +192,9 @@ describe('fix-couple-split — wiring into runCli\'s live cascade', () => {
   const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs'), 'utf8');
   it('the live cascade iterates the couple-gated order, not raw plan.ready', () => {
     expect(SRC).toMatch(/const coupleStep = planCoupleCascadeStep\(plan\.ready,/);
-    expect(SRC).toContain('for (const c of coupleStep.ordered) {');
+    // The bounded scheduler now drives iteration; its input must remain the couple-gated list.
+    expect(SRC).toMatch(/await runEnqueueCandidates\(coupleStep\.ordered,\s*\{/);
+    expect(SRC).not.toMatch(/runEnqueueCandidates\(plan\.ready\s*[,)]/);
     expect(SRC).not.toContain('for (const c of plan.ready) {');
   });
   it('an impl half pre-flights its carrier fresh, and a split is reported in the JSON result', () => {

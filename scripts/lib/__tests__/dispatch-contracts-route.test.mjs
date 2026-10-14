@@ -15,7 +15,7 @@ function freeze(value) { if (value && typeof value === 'object') { Object.values
 
 describe('story routing', () => {
   it('routes cold builds to the fallback with a cheaper shadow', () => {
-    expect(c.routeDispatch(profile(), { stage: 'story', kind: 'build' })).toMatchObject({ role: c.SUPERVISOR_ROLE, provider: 'claude', model: 'claude-opus-5', tier: 'opus', mode: 'acting', backend: 'claude-native', spotCheck: null, shadow: { provider: 'antigravity', mode: 'shadow' } });
+    expect(c.routeDispatch(profile(), { stage: 'story', kind: 'build' })).toMatchObject({ role: c.SUPERVISOR_ROLE, provider: 'claude', model: 'claude-opus-5-5', tier: 'opus', mode: 'acting', backend: 'claude-native', spotCheck: null, shadow: { provider: 'antigravity', mode: 'shadow' } });
   });
   // #3857 — the standalone STORY_KIND_RUNGS table is folded into workerTierFor (provider-routing.mjs); a
   // non-build story kind's tier is now the SAME table a code-change dispatch's tier is. `investigate` no
@@ -402,5 +402,28 @@ describe('#4034 — routeDispatch wires the critical-work verdict and critical-m
     ];
     const out = c.decideDispatchRoute(dispatch4081(), { scorecards, criticalWorkGate: openBugfix });
     expect(out).toMatchObject({ routed: 'claude', probationWorker: { id: 'antigravity-claude', review: 'full' } });
+  });
+});
+
+
+describe('prepare-item card envelope', () => {
+  const dispatch = { kind: 'prepare-item', scopePaths: ['we:scripts/lib/foo.mjs'], cardPath: 'backlog/1-x.md' };
+  it('offers Codex for the card even when implementation scope is critical', () => {
+    expect(current.decideDispatchRoute(dispatch).probationWorker?.provider).toBe('codex');
+    expect(current.decideDispatchRoute({ ...dispatch, scopePaths: ['we:scripts/lib/dispatch-contracts.mjs'] }).probationWorker?.provider).toBe('codex');
+  });
+  it('keeps high risk, critical card paths and critical misses on Claude', () => {
+    for (const [extra, options] of [
+      [{ risk: 'high' }, {}],
+      [{ cardPath: 'scripts/lib/dispatch-contracts.mjs' }, {}],
+      [{}, { scorecards: [record({ model: 'gpt-6-astra', taskType: 'prepare', outcome: 'rejected' })] }],
+    ]) {
+      expect(current.decideDispatchRoute({ ...dispatch, ...extra }, options))
+        .toMatchObject({ probationWorker: null, routed: 'claude' });
+    }
+  });
+  it('keeps implementation scope gating when cardPath is absent', () => {
+    expect(current.decideDispatchRoute({ ...dispatch, cardPath: undefined, scopePaths: ['we:scripts/lib/dispatch-contracts.mjs'] }))
+      .toMatchObject({ probationWorker: null, routed: 'claude' });
   });
 });

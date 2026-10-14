@@ -369,7 +369,7 @@ async function runHealArc(args, io, evidence) {
     const preHookSurface = hookReset.snapshot;
     log(`running ${worker.launcher} --model=${worker.model}`);
     evidence.executor = worker.executor;
-    const run = io.runWorker(buildWorkerArgv({ worker, weRoot: WE_ROOT, dir: lanePath, taskFile }));
+    const run = io.runWorker(buildWorkerArgv({ worker, weRoot: WE_ROOT, dir: lanePath, taskFile, pr, caller: 'probation-heal-run.mjs' }));
     modelEvidence = run.modelEvidence ?? {};
     Object.assign(evidence, modelEvidence);
     workerEvidence = { exitCode: run.status ?? null, signal: run.signal ?? null, diagnostics: redactedTail(run.out ?? 'unknown', 4000), quotaState: 'unknown' };
@@ -406,7 +406,7 @@ async function runHealArc(args, io, evidence) {
     if (!gate.pass) return finish('gate-red', executor, 'the gate is still red after the worker\'s repair', { diff: diffRow });
     if (worker.checker) {
       const checkerTask = io.writeTaskFile(lanePath, 'probation-heal-check.md', buildCheckerTask({ pr, reason, diff: io.diffText(lanePath, baseSha), failingChecks: io.failingChecks(pr) }));
-      const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: WE_ROOT, dir: lanePath, taskFile: checkerTask })));
+      const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: WE_ROOT, dir: lanePath, taskFile: checkerTask, pr, caller: 'probation-heal-run.mjs' })));
       checkerRow = { provider: worker.checker, verdict: verdict.verdict, reason: verdict.reason };
       if (!verdict.approved) return finish('gate-red', executor, `the ${worker.checker} checker did not approve: ${verdict.verdict} ${verdict.reason}`, { diff: diffRow, checker: checkerRow });
     }
