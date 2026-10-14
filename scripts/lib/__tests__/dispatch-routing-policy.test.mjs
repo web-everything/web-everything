@@ -8,8 +8,18 @@ import { validateRoutingPolicy, resolveOperationRoute } from '../dispatch-routin
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { routeDispatchProvider } from '../../operations/dispatch-lane-io.mjs';
+import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
+import { readSettings } from '../settings-files.mjs';
 
 const copy = () => structuredClone(readRoutingPolicy());
+// Exercise an explicit launch override without replacing the default evidence/tier repair router.
+// The Codex retry rungs come from settings, not a duplicated policy fallback.
+const repairLaunchRoute = (kind, vetoes = []) => {
+  const policy = copy();
+  policy.operations[kind] = { provider: 'codex', model: 'sol', effort: 'high',
+    fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }] };
+  return resolveOperationRoute({ operation: kind, policy, vetoes });
+};
 describe('operation routing policy', () => {
   it('resolves aliases, ordered availability fallback, and inherited routes', () => {
     expect(resolveOperationRoute({ operation: 'prepare-item' })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5' }] });
@@ -153,8 +163,8 @@ it('adapts effort and provider to bounded prepares, design and mechanical work',
   expect(resolveOperationRoute({ operation: 'prepare-item', size: 5 }).effort).toBe('high');
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix' }).effort).toBe('medium');
   expect(resolveOperationRoute({ operation: 'build', taskType: 'test-fix' })).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash', effort: 'low' });
-  expect(resolveOperationRoute({ operation: 'ci-heal' })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
-  expect(resolveOperationRoute({ operation: 'fix' })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
+  expect(resolveOperationRoute({ operation: 'ci-heal' })).toBeNull();
+  expect(resolveOperationRoute({ operation: 'fix' })).toBeNull();
 });
 
 it.each(['codex', 'claude', 'antigravity', 'agy-claude', 'agy-gemini'])('rejects unknown %s effort and retains the last good edit', provider => {
@@ -195,18 +205,27 @@ it('accepts and reports a reasoned explicit model pin through the selected nativ
   }
 });
 
-it.each(['fix', 'ci-heal'])('%s applies explicit repair routing despite a global task-type policy', kind => {
+it.each(['fix', 'ci-heal'])('%s retains inherited repair routing despite a global task-type policy', kind => {
   const policy = copy();
   const dispatch = { kind, scopePaths: ['we:scripts/example.mjs'], risk: 'low', size: 2 };
   const inherited = decideDispatchRoute(dispatch, { routingPolicy: { ...policy, taskTypes: {} } });
   const routed = decideDispatchRoute(dispatch, { routingPolicy: policy });
   expect(routed).toEqual(inherited);
-  expect(routed.policyRoute).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' });
+  expect(routed.policyRoute).toBeUndefined();
+  expect(routed.probationWorker).toMatchObject({ taskType: kind === 'fix' ? 'bugfix' : kind });
+  expect(resolveOperationRoute({ operation: kind, taskType: 'bugfix' })).toBeNull();
+  expect(policy.operations[kind]).toMatchObject({ inherit: true });
+  expect(policy.taskTypes.bugfix).toMatchObject({ inherit: true });
+  expect(Object.values(policy.operations[kind].effort)).toEqual(['high', 'high', 'high', 'high', 'high']);
+  expect(Object.values(policy.taskTypes.bugfix.effort)).toEqual(['high', 'high', 'high', 'high', 'high']);
 });
 
 it.each(['fix', 'ci-heal'])('%s retries Astra high before Claude only on definite pre-launch refusal', kind => {
-  const route = resolveOperationRoute({ operation: kind });
-  expect([route, ...route.fallback].map(({ provider, model, effort }) => ({ provider, model, effort }))).toEqual([
+  const route = repairLaunchRoute(kind);
+  const taskRoute = resolveCodexTaskRoute({ kind, tool: readSettings().codex.modelByTask, platform: {}, env: {}, log: false });
+  expect(taskRoute.sources).toMatchObject({ model: 'tool', effort: 'tool', retry: 'tool' });
+  expect([{ provider: 'codex', model: taskRoute.model, effort: taskRoute.effort },
+    ...taskRoute.retry.map(rung => ({ provider: 'codex', ...rung })), ...route.fallback]).toEqual([
     { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
     { provider: 'codex', model: 'gpt-6-astra', effort: 'high' },
     { provider: 'claude', model: 'claude-sonnet-5-5', effort: 'high' },
@@ -261,7 +280,7 @@ it('preserves operator-protected Astra and ruling escalation routes', () => {
 
 it('honours a configured retry array at the real launch boundary', async () => {
   const { resolveCodexTaskRoute } = await import('../codex-task-route.mjs');
-  const route = resolveOperationRoute({ operation: 'fix' });
+  const route = repairLaunchRoute('fix');
   for (const retry of [[], [{ model: 'gpt-6-luna', effort: 'max' }]]) {
     const models = [];
     const wrapper = r => { models.push(r.policyRoute.model); throw Object.assign(new Error('not started'), { notApplied: true }); };
@@ -275,7 +294,7 @@ it('honours a configured retry array at the real launch boundary', async () => {
 });
 
 it('does not resurrect a vetoed Codex retry model at launch', () => {
-  const route = resolveOperationRoute({ operation: 'fix', vetoes: [{ provider: 'codex', model: 'gpt-6-astra' }] });
+  const route = repairLaunchRoute('fix', [{ provider: 'codex', model: 'gpt-6-astra' }]);
   const models = [];
   routeDispatchProvider({ launchKind: 'fix', policyRoute: route }, {
     registry: { fix: { runScript: 'wrapper.mjs', provider: r => { models.push(r.policyRoute.model); throw Object.assign(new Error('not started'), { notApplied: true }); } } },

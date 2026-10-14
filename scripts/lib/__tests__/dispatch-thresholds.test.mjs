@@ -7,7 +7,7 @@ import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 const profile = (extra = {}) => c.buildDispatchProfile({ taskType: 'doc-fix', estimatedLoc: 30, filesTouched: ['docs/readme.md'], acceptanceTestable: true, dependsOn: [], ...extra }).profile;
 function row(i, unclean = false, provider = 'codex', model = 'gpt-6-astra') {
   const identity = { storyRef: '3383', round: 1, taskId: `t${i}`, attempt: 1 };
-  const supervisor = { provider: 'claude', model: 'claude-opus-5', sessionId: 'supervisor' };
+  const supervisor = { provider: 'claude', model: 'claude-opus-5-5', sessionId: 'supervisor' };
   const result = { ...identity, taskType: 'doc-fix', authorRef: 'author', provider, model,
     executor: provider === 'claude' ? 'claude-subagent' : 'codex-direct-task', supervisionLevel: 'full', supervisor, sessionName: null,
     status: 'landed', evidence: { pr: 1, tests: { command: 'test', passed: 1, failed: 0 } }, findings: [] };
@@ -106,7 +106,7 @@ describe('real ground-truth trials through risk-based routing', () => {
       expect(out.supervision).toBe('full'); expect(out.spotCheck).toBeNull();
     }
     // Exercise statute forcing on a graduated native story rung as well.
-    const native = [{ ...row(0, true, 'claude', 'claude-opus-5'), informative: true, rootCause }, ...Array.from({ length: 20 }, (_, i) => row(i + 1, false, 'claude', 'claude-opus-5'))];
+    const native = [{ ...row(0, true, 'claude', 'claude-opus-5-5'), informative: true, rootCause }, ...Array.from({ length: 20 }, (_, i) => row(i + 1, false, 'claude', 'claude-opus-5-5'))];
     const out = c.routeDispatch(profile({ filesTouched: ['docs/agent/a.md'] }), { stage: 'story', kind: 'prepare', scorecards: native });
     expect(out.supervision).toBe('full'); expect(out.auditTrail.some(a => a.criterion === 'never-spot-check')).toBe(true);
   });
