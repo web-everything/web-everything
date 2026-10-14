@@ -480,9 +480,10 @@ jobs:
     needs: daemon-soak-scope
     if: needs.daemon-soak-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # No measured per-shard p95 yet (this split is new) — sized generously pending a first-run sample, same
-    # ~3x-p95 method `test-shard` used once IT had data (see that job's own timeout comment above).
-    timeout-minutes: 15
+    # Measured (PR #5195): the stored timings put each break shard at ~17 min on 4 runners (shards 2-4 timed out
+    # at 15 min with every completed test green) and ~13 min on 5 runners, plus install. 20 min keeps headroom
+    # over the 5-runner split instead of sitting a minute under the old cap.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
