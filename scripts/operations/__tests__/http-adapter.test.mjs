@@ -49,6 +49,8 @@ import { DISPATCH_ELIGIBILITY_OP } from '../dispatch-eligibility.mjs';
 import { REVIEW_PREP_OP } from '../review-prep.mjs';
 import { CLAIM_OP } from '../claim.mjs';
 import { RESOLVE_OP } from '../resolve.mjs';
+import { CLOSE_ITEMS_OP } from '../close-items.mjs';
+import { REOPEN_ITEMS_OP } from '../reopen-items.mjs';
 import { SCAFFOLD_OP } from '../scaffold.mjs';
 import { FILE_ITEM_OP } from '../file-item.mjs';
 import { CLEAR_STUCK_SESSION_OP } from '../clear-stuck-session.mjs';
@@ -426,6 +428,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // the property this list cannot express for a writing operation — the DECLARING module reaches nothing
     // that can act, and every write lives in `resolve-io.mjs`.
     [RESOLVE_OP]: 'resolve.mjs',
+    // Batch close/reopen both have a writing effect; listed for map coverage, never read-only.
+    [CLOSE_ITEMS_OP]: 'close-items.mjs',
+    [REOPEN_ITEMS_OP]: 'reopen-items.mjs',
     // #xrrpfo7 — the BIRTH of the lifecycle. NOT read-only, for the same reason `claim` is not: its `write`
     // step creates the card. Listed for map coverage; the declaring module reaches nothing that can act and
     // every write lives in `scaffold-io.mjs`, behind the guarded writer.

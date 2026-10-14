@@ -247,16 +247,11 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `owed-main-rule`     — drain-assigned numbers await main’s CI exemption; never undo them via ci-heal.
  *   `owed-ci-rerun`      — we:backlog/x5uqim1-*.md (#4075/#3383): the required check failed while `main`'s OWN
  *                          CI was red (`we:scripts/conveyor/main-red-recovery.mjs#isPrCiFailureOwedRerun`) and
- *                          this PR's head has not yet been refreshed onto the now-recovered `main`. Owed a
- *                          mechanical rebase onto `main` (`we:scripts/conveyor/ci-red-recovery-watch.mjs`, via
- *                          the SAME proven `we:scripts/lib/rebase-drop-manifest.mjs` plumbing the drain itself
- *                          uses), NEVER a `ci-heal` — a ci-heal agent dispatched here would misdiagnose `main`'s
- *                          own breakage as a defect in code that was never broken. NAMED `owed-ci-rerun` for the
- *                          population it covers (a red-`main`-caused CI failure), not the literal mechanism —
- *                          see the leaf's own file header for why a REBASE, not a rerun of the same stale
- *                          commit, is what actually resolves it. Once the head already contains `main`'s
- *                          current tip and is STILL red, this refusal no longer fires and the PR falls through
- *                          to the ordinary `ci-red` → `ci-heal` path below, unaffected. we:backlog/
+ *                          this PR's head has not yet been refreshed onto main. When main is green and
+ *                          fix.owedCiRerun permits it, this planner owns a bounded mechanical rerun of the
+ *                          failed required jobs through the ci-timeout-rerun executor. Pending requests hold;
+ *                          a spent per-head budget falls through to ordinary ci-heal. Otherwise this refusal
+ *                          retains the existing mechanical-rebase ownership. we:backlog/
  *                          review-while-main-red (#4075/#3383): this refusal NO LONGER means nothing else is
  *                          dispatched for the PR — a `review:pending` PR reaching it also gets a `review`
  *                          dispatched IN PARALLEL (`extra: { owedCiRerun: true }` on that row), via {@link
@@ -1918,6 +1913,7 @@ export function planReconcile({
   // `takeover` (a takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting and the
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
+  owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
   // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
@@ -2803,34 +2799,72 @@ export function planReconcile({
           }
           continue;
         }
-        // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
-        const viaClass = classifyMainDefect({
-          comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
-          mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
-          prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
-          mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
-        });
-        const viaMainGreen = viaClass.via !== 'red-window';
-        const viaSignature = viaClass.via === 'signature';
-        refuse('owed-ci-rerun', {
-          ...withPhase,
-          why: viaSignature
-            ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
-            : viaMainGreen
-            ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
-            : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`,
-        });
-        // Preserve rerun ownership while folding the independent review prerequisite into this
-        // same refusal row. Required checks must succeed even when their failure belongs to main.
-        if (withPhase.labels.includes('review:pending')) {
-          const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
-          dispatchReviewRow({
-            pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
-            refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
-            extra: { owedCiRerun: true },
-          });
+        let owedRerunSpent = false;
+        const retry = pr.owedCiRerunRetry;
+        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false
+            && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
+          const foldReview = row => {
+            if (!withPhase.labels.includes('review:pending')) return;
+            const foldRefusal = foldReviewRefusalInto(row, withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          };
+          const budget = pr.timeoutRetryBudget;
+          if (budget?.pending) {
+            refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+              why: 're-run of the failed required jobs already requested on this head; result not observed yet' });
+            foldReview(refusals[refusals.length - 1]);
+            continue;
+          }
+          const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
+          const cap = owedCiRerun.maxRerunsPerHead * retry.jobs.length;
+          if (spent < cap) {
+            const names = splitFailingChecks(pr.statusCheckRollup, requiredChecks).required.join(', ');
+            dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'owed-ci-rerun',
+              timeoutRetry: { ...retry, cap },
+              why: `main is green again (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)} at ${pr.mainGreenNow.at}); required check(s) ${names} failed while main was red — mechanical re-run of the failed jobs ${spent + 1}/${cap} on head ${pr.headRefOid.slice(0, 8)}, no heal budget` });
+            foldReview(dispatch[dispatch.length - 1]);
+            continue;
+          }
+          if (spent >= cap) {
+            owedRerunSpent = true;
+            notes.push({ kind: 'owed-ci-rerun-spent', prNumber, attempts: spent, cap,
+              text: `PR #${prNumber}: failed required jobs remain red after ${spent}/${cap} re-runs on this head with main green — ordinary ci-heal is owed` });
+          }
         }
-        continue;
+        if (!owedRerunSpent) {
+          // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
+          const viaClass = classifyMainDefect({
+            comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
+            mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+            prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
+            mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
+          });
+          const viaMainGreen = viaClass.via !== 'red-window';
+          const viaSignature = viaClass.via === 'signature';
+          refuse('owed-ci-rerun', {
+            ...withPhase,
+            why: (viaSignature
+              ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
+              : viaMainGreen
+              ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
+              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : ''),
+          });
+          // Preserve rerun ownership while folding the independent review prerequisite into this
+          // same refusal row. Required checks must succeed even when their failure belongs to main.
+          if (withPhase.labels.includes('review:pending')) {
+            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          }
+          continue;
+        }
       }
       // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, PR #2783 (chalbert/
       // web-everything): three ci-heal sessions in one evening each ended "escalated (needs human — not a CI

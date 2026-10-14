@@ -1,3 +1,4 @@
+import { isTerminalStatus } from './backlog-status.cjs';
 /**
  * @file scripts/lib/priority-order.mjs
  * @description The gate behind epic #3383's `## Priority order` section — the ONE maintained, ordered list of
@@ -152,7 +153,7 @@ export function mergeCards(...sources) {
     for (const [id, c] of src) {
       const prev = out.get(id);
       if (!prev) { out.set(id, c); continue; }
-      if (c.status === 'resolved' && prev.status !== 'resolved') out.set(id, { ...prev, status: 'resolved' });
+      if (isTerminalStatus(c.status) && !isTerminalStatus(prev.status)) out.set(id, { ...prev, status: c.status });
     }
   }
   return out;

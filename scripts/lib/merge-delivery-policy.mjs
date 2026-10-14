@@ -21,6 +21,8 @@
  *   PURE except `loadMergeDeliveryPolicy` (reads the two files; never throws).
  *
  *   The knobs:
+ *     - `concurrency`         { gateReads: 6, enqueue: 3 }; each positive integer resolves independently.
+ *                             1/1 restores sequential reads/preparation. Branch writes and main writes stay serial.
  *     - `strategy`            'drain-direct' | 'github-merge-queue'. github-merge-queue = the drain ENQUEUES a
  *                             ready PR (GraphQL `enqueuePullRequest`) and GitHub's merge queue re-tests and merges;
  *                             the drain's gates move into the required `merge-gate` CI check.
@@ -60,6 +62,7 @@ export const STANDARD_MERGE_DELIVERY = Object.freeze({
   mergeMethod: 'merge',
   redMainFreezeBranch: 'ops/red-main-freeze',
   gatePlacement: Object.freeze({}),
+  concurrency: Object.freeze({ gateReads: 6, enqueue: 3 }),
 });
 
 export const PLATFORM_PREFERENCES_PATH = join(dirname(fileURLToPath(import.meta.url)), 'delivery-platform-preferences.json');
@@ -89,9 +92,10 @@ export function placementKeepsMerger(placement, strategy) {
  *   gatePlacement:Object<string,string>, sources:Object<string,string>, invalid:string[]}}
  */
 export function resolveMergeDeliveryPolicy({ platform, tool, knownGates = null } = {}) {
-  const out = { ...STANDARD_MERGE_DELIVERY, gatePlacement: {} };
+  const out = { ...STANDARD_MERGE_DELIVERY, gatePlacement: {}, concurrency: { ...STANDARD_MERGE_DELIVERY.concurrency } };
   const sources = { strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' };
   const invalid = [];
+  for (const key of Object.keys(out.concurrency)) sources[`concurrency.${key}`] = 'standard';
   const layers = [['platform', platform], ['tool', tool]];
   for (const [name, layer] of layers) {
     if (layer === undefined || layer === null) continue;
@@ -101,6 +105,16 @@ export function resolveMergeDeliveryPolicy({ platform, tool, knownGates = null }
       if (!ok(layer[key])) { invalid.push(`${name}.${key}=${JSON.stringify(layer[key])}`); continue; }
       out[key] = layer[key];
       sources[key] = name;
+    }
+    if (layer.concurrency !== undefined) {
+      if (!isObj(layer.concurrency)) invalid.push(`${name}.concurrency: not an object`);
+      else for (const key of Object.keys(out.concurrency)) {
+        if (!Object.hasOwn(layer.concurrency, key)) continue;
+        const value = layer.concurrency[key];
+        if (!Number.isSafeInteger(value) || value < 1) { invalid.push(`${name}.concurrency.${key}=${JSON.stringify(value)}`); continue; }
+        out.concurrency[key] = value;
+        sources[`concurrency.${key}`] = name;
+      }
     }
   }
   // Placement is judged against the FINAL strategy, so a tool flip of the strategy re-validates platform placements.
@@ -130,6 +144,7 @@ export function placementOf(policy, gateId) {
 export function formatMergeDeliverySourcesLine(policy) {
   const keys = ['strategy', 'batchSize', 'maxGroupWaitMinutes', 'mergeMethod', 'redMainFreezeBranch'];
   const parts = keys.map((k) => `${k}=${policy[k]} (${policy.sources?.[k] ?? 'standard'})`);
+  for (const [key, value] of Object.entries(policy.concurrency || {})) parts.push(`concurrency.${key}=${value} (${policy.sources?.[`concurrency.${key}`] ?? 'standard'})`);
   for (const [g, p] of Object.entries(policy.gatePlacement || {})) parts.push(`gatePlacement.${g}=${p} (${policy.sources?.[`gatePlacement.${g}`]})`);
   const bad = policy.invalid?.length ? ` · ignored invalid: ${policy.invalid.join('; ')}` : '';
   return `merge-delivery policy: ${parts.join(', ')}${bad}`;
