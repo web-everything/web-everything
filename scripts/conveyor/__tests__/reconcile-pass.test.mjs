@@ -14,8 +14,17 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   };
 });
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
+vi.mock('../../lib/required-status-checks.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    // Snapshot/CLI contracts must not read GitHub policy or the host's policy cache.
+    getRequiredStatusChecks: vi.fn(() => ({ checks: [...actual.FALLBACK_REQUIRED_STATUS_CHECKS], source: 'fixture' })),
+  };
+});
 
 import { prFileContract } from './pr-file-test-helpers.mjs';
+import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
@@ -35,15 +44,10 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
     readAgents: () => [], enrich: (agents) => agents,
   });
   expect(readPrs).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
-  // #4501 — `enrichMainRed` now also receives the live-fetched `requiredChecks` (here degraded to the
-  // FALLBACK_REQUIRED_STATUS_CHECKS default, since `execFileSync` is mocked with no real `gh` behind it) —
-  // this test's own concern (repo-key normalisation) is unaffected.
-  // The live required-checks read goes through a host-level cache, so on a machine whose cache already holds the
-  // real branch-protection list (e.g. with `soak-replay-gate`) the list is a SUPERSET of the fallback — assert the
-  // fallback checks are present rather than pinning the exact host-dependent list.
+  // #4501 — main-red attribution receives the same deterministic required set as the planner.
   expect(enrichMainRed).toHaveBeenCalledWith([], {
     repo: 'web-everything/web-everything', defaultBranch: 'main',
-    requiredChecks: expect.arrayContaining(['test', 'smoke', 'daemon-soak']),
+    requiredChecks: [...FALLBACK_REQUIRED_STATUS_CHECKS],
   });
 });
 
