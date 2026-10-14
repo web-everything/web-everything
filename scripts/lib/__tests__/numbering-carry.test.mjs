@@ -84,7 +84,8 @@ describe('checkNumberingCommit', () => {
   it.each([
     ['merge', (o) => { o.parents.push('other'); }, /parent/],
     ['non-id edit in rename', (o) => { o.changes[2].after += 'author edit'; }, /content|rewrite/],
-    ['extra added file', (o) => { o.changes.push({ status: 'A', path: 'scripts/x.mjs', after: 'new' }); }, /partner|unpaired/],
+    ['extra added file', (o) => { o.changes.push({ status: 'A', path: 'backlog/9000-extra.md', after: 'new' }); }, /partner|unpaired/],
+    ['added file outside backlog', (o) => { o.changes.push({ status: 'A', path: 'scripts/x.mjs', after: 'new' }); }, /outside backlog/],
     ['code change', (o) => { o.changes.push({ status: 'M', path: 'scripts/app.mjs', before: 'old', after: 'new' }); }, /rewrite/],
     ['unused subject pair', (o) => { o.subject = o.subject.replace(' at land', ', xabc123→#7001 at land'); }, /rename/],
     ['wrong target number', (o) => { o.changes[2].path = 'backlog/9999-hold-auto-land.md'; }, /partner|unpaired/],
