@@ -173,3 +173,35 @@ describe('ci.yml wiring', () => {
     expect(line).toMatch(/"\$\{files\[@\]\}" \$\(node scripts\/ci\/quarantine-skip\.mjs\)/);
   });
 });
+
+describe('job-specific and nonblocking output', () => {
+  const integration = { ...ADDED.entries[0], test: 'scripts/integration.test.mjs', job: 'integration' };
+  const soak = { ...ADDED.entries[0], test: 'scripts/soak.test.mjs', job: 'soak-shard (1)' };
+  const shard = { ...ADDED.entries[0], test: 'scripts/shard.test.mjs', job: 'test-shard (2)' };
+  const read = { ok: true, list: { ...LIST, mode: 'quarantine', entries: [...LIST.entries, integration, soak, shard] } };
+  const selected = (job, extra = {}) => run({ pr: 4990, event: prEvent(4990), read, flags: { event: 'pull_request', ref: 'refs/pull/4990/merge', job, ...extra } });
+  it('selects only this job; legacy entries remain unit shard entries', () => {
+    expect(selected('integration').line).toBe('--exclude=scripts/integration.test.mjs');
+    expect(selected('soak-shard (1)').line).toBe('--exclude=scripts/soak.test.mjs');
+    expect(selected('test-shard (2)').skip).toEqual([TEST_FILE, 'scripts/shard.test.mjs']);
+    expect(selected('test-shard (1)').skip).toEqual([TEST_FILE]);
+    expect(selected('test').line).toBe('');
+    expect(selected(undefined).skip).toEqual([TEST_FILE]);
+  });
+  it('nonblocking prints the same selected files, space-separated', () => {
+    expect(selected('integration', { nonblocking: true }).line).toBe('scripts/integration.test.mjs');
+    expect(selected('test-shard (2)', { nonblocking: true }).line).toBe(`${TEST_FILE} scripts/shard.test.mjs`);
+  });
+  it('nonblocking preserves the fail-safe decisions', () => {
+    const flags = { event: 'pull_request', ref: 'refs/pull/4990/merge', job: 'integration', nonblocking: true };
+    const base = { pr: 4990, event: prEvent(4990), read, flags };
+    expect(run({ ...base, changed: ['scripts/integration.test.mjs'] }).line).toBe('');
+    expect(run({ ...base, changed: null }).line).toBe('');
+    expect(run({ ...base, mode: { value: 'stop', source: 'tool' } }).line).toBe('');
+    expect(run({ ...base, read: { ok: false } }).line).toBe('');
+    expect(run({ ...base, flags: { ...flags, ref: `refs/pull/${FIX_PR}/merge` }, event: prEvent(FIX_PR) }).line).toBe('');
+    expect(run({ ...base, flags: { ...flags, event: 'push', ref: 'refs/heads/main' } }).line).toBe('');
+    const named = { ...integration, test: `${integration.test}::named failure` };
+    expect(run({ ...base, read: { ok: true, list: { ...read.list, entries: [named] } } }).line).toBe('');
+  });
+});

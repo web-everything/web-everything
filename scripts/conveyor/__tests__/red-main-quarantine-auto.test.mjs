@@ -45,7 +45,8 @@ const LOG = [
 
 const STOP = { value: 'stop', source: 'settings' };
 const QUARANTINE = { value: 'quarantine', source: 'env' };
-const SETTINGS = resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: null });
+// pins the pre-guardrail rule; the guardrails are tested in scripts/lib/__tests__/red-main-quarantine-guardrails.test.mjs
+const SETTINGS = resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: { requireProvenFlake: false, fileCardPerEntry: false } });
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rmq-auto-')); });
@@ -93,26 +94,26 @@ describe('planSafetyNet — pure rules', () => {
   const jf = { 'test-shard (3)': parseVitestFailures(LOG) };
   const now = T('2026-10-10T19:00:00Z');
   it('main red on a known failing test ⇒ add exactly that file', () => {
-    const p = planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, fixPrs: null, now });
+    const p = planSafetyNet({ settings: SETTINGS.value, status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, fixPrs: null, now });
     expect(p).toMatchObject({ action: 'add', tests: [TEST_FILE] });
     expect(p.names).toEqual([`${TEST_FILE} > ${TEST_NAME}`]);
   });
   it('a failed job outside the unit suite ⇒ none (quarantine cannot skip it; STOP holds)', () => {
-    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: [...FAILING.jobs, 'smoke'], jobFailures: jf, list: { version: 1, entries: [] }, now }).action).toBe('none');
+    expect(planSafetyNet({ settings: SETTINGS.value, status: 'red', firstRedSha: FIRST_RED, failedJobs: [...FAILING.jobs, 'smoke'], jobFailures: jf, list: { version: 1, entries: [] }, now }).action).toBe('none');
   });
   it('a unit job whose failing tests are unknown ⇒ none', () => {
-    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: { 'test-shard (3)': null }, list: { version: 1, entries: [] }, now }).action).toBe('none');
+    expect(planSafetyNet({ settings: SETTINGS.value, status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: { 'test-shard (3)': null }, list: { version: 1, entries: [] }, now }).action).toBe('none');
   });
   it('more failing files than maxTests ⇒ none', () => {
     const many = { files: ['a/1.test.mjs', 'a/2.test.mjs'], tests: [], complete: true };
-    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: ['test-shard (1)'], jobFailures: { 'test-shard (1)': many }, list: { version: 1, entries: [] }, now, settings: { maxTests: 1 } }).action).toBe('none');
+    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: ['test-shard (1)'], jobFailures: { 'test-shard (1)': many }, list: { version: 1, entries: [] }, now, settings: { ...SETTINGS.value, maxTests: 1 } }).action).toBe('none');
   });
   it('main green with entries ⇒ prune (main-green)', () => {
     const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }).list;
     expect(planSafetyNet({ status: 'green', list, now })).toMatchObject({ action: 'prune', mainGreen: true });
   });
   it('an entry for this red that already expired is never re-added (stale-entry guard)', () => {
-    const p = planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, addedForRed: [TEST_FILE], now });
+    const p = planSafetyNet({ settings: SETTINGS.value, status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, addedForRed: [TEST_FILE], now });
     expect(p.action).toBe('none');
     expect(p.why).toMatch(/expired — STOP/);
   });
@@ -133,7 +134,7 @@ describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
     expect(calls.reads).toBe(1);
     expect(net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at + MIN }).calls.reads).toBe(0);
     const lines = shadowLines();
-    expect(lines).toHaveLength(1);
+    expect(lines).toHaveLength(2); // The next tick logs none because why changed from add to already quarantined.
     expect(lines[0]).toMatchObject({ wouldDo: 'add', tests: [TEST_FILE], firstRedSha: FIRST_RED, mode: 'stop', modeSource: 'settings' });
     expect(lines[0].names).toEqual([`${TEST_FILE} > ${TEST_NAME}`]);
     expect(lines[0].settingsSources).toMatchObject({ ttlMin: 'standard', maxTests: 'standard' });
@@ -145,7 +146,7 @@ describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
     expect(first.calls.logs).toBe(1);
     expect(second.calls.logs).toBe(0);
     expect(second.r.plan.action).toBe('none');
-    expect(shadowLines()).toHaveLength(1);
+    expect(shadowLines()).toHaveLength(2); // The next tick logs none because why changed from add to already quarantined.
   });
   it('the fix PR set rides on the list once one is published', () => {
     net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
@@ -466,8 +467,10 @@ describe('readListOrAbsent — the first add must be possible', () => {
 
 describe('settings cascade — standard → platform → tool → env, with sources', () => {
   it('standard defaults', () => {
-    expect(SETTINGS.value).toMatchObject({ ttlMin: 360, maxTests: 5, derivedJobs: ['test'] });
-    expect(SETTINGS.sources.ttlMin).toBe('standard');
+    // pins the pre-guardrail rule; the guardrails are tested in scripts/lib/__tests__/red-main-quarantine-guardrails.test.mjs
+    const settings = resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: { derivedJobs: ['test'] } });
+    expect(settings.value).toMatchObject({ ttlMin: 360, maxTests: 5, derivedJobs: ['test'] });
+    expect(settings.sources.ttlMin).toBe('standard');
   });
   it('platform, then env override; an invalid env value never wins', () => {
     const s = resolveQuarantineSettings({ env: { WE_RED_MAIN_QUARANTINE_TTL_MIN: '90', WE_RED_MAIN_QUARANTINE_MAX_TESTS: 'lots' }, file: '/nonexistent', platform: { maxTests: 3 } });
