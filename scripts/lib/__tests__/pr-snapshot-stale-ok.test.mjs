@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, utimesSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import * as snapshot from '../pr-snapshot.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS } from '../pr-snapshot.mjs';
@@ -9,6 +10,8 @@ import { snapshotPath, PR_SNAPSHOT_VERSION, snapshotKey } from '../pr-snapshot-s
 
 vi.mock('../settings-files.mjs', () => ({ readDeclaredSettings: () => ({ settings: {} }) }));
 
+// happy-dom URL resolution can produce HTTP URLs; native Node children need the on-disk module.
+const snapshotModulePath = join(process.cwd(), 'scripts/lib/pr-snapshot.mjs');
 const clock = Date.parse('2026-10-14T14:00:00Z');
 const prs = [
   { number: 9, createdAt: '2026-10-03T00:00:00Z' },
@@ -54,7 +57,7 @@ process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: {
 } } } }));
 `);
     chmodSync(bin, 0o755);
-    execFileSync(process.execPath, [new URL('../pr-snapshot.mjs', import.meta.url).pathname,
+    execFileSync(process.execPath, [snapshotModulePath,
       '--refresh', `--repo=${repo}`, '--fields=number'], {
       encoding: 'utf8', env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, REFRESH_TEST_CAPTURE: capture,
         GH_TOKEN: 'refresh-test-token', WE_GH_THROTTLE_PERSONAL_ROUTE: '0', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'locks'),
@@ -85,7 +88,7 @@ process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: {
       };
       syncBuiltinESMExports();
       delete process.env.VITEST; delete process.env.WE_UNDER_TEST;
-      const snapshot = await import(${JSON.stringify(new URL('../pr-snapshot.mjs', import.meta.url).href)});
+      const snapshot = await import(${JSON.stringify(pathToFileURL(snapshotModulePath).href)});
       const rows = snapshot.readSharedOpenPrs({ repo: ${JSON.stringify(repo)}, dir: ${JSON.stringify(dir)},
         fields: ['number'], now: () => ${clock},
         env: { ...${JSON.stringify(env)}, WE_GH_THROTTLE_LOCK_ROOT: ${JSON.stringify(dir)} } });

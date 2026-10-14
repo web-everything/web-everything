@@ -6,10 +6,9 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
-  const { looksLikePersonalAccessDenial } = await importOriginal();
   return {
-    // The real shared denial classifier: required-status-checks.mjs delegates its 403/404 test to it (#4708).
-    looksLikePersonalAccessDenial,
+    // Keep real exports, including the shared denial classifier used by required-status-checks.mjs (#4708).
+    ...await importOriginal(),
     execFileSyncThrottled: vi.fn((file, args, opts) => execFileSync(file, args, opts)),
     runGhSync: vi.fn((args, opts) => execFileSync('gh', args, opts)),
   };
