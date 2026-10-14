@@ -127,13 +127,16 @@ async function main(argv) {
   }
 
   const { shard, total } = parseShardArg(argv);
-  let files;
-  if (suite === 'unit') {
-    files = await listUnitTestFiles();
-  } else {
-    const { listAllSoakFiles } = await import('../conveyor/soak/shard-files.mjs');
-    files = listAllSoakFiles();
+  if (suite === 'soak') {
+    if (argv.some((a) => a.startsWith('--group='))) throw new Error('shard-assign: --group only applies to --suite=unit');
+    // Use the soak runner's policy, including its exclusive baseline shard.
+    const { shardFiles } = await import('../conveyor/soak/shard-files.mjs');
+    const mine = shardFiles({ shard, total });
+    if (mine.some((f) => /\s/.test(f))) throw new Error('shard-assign: a test path contains whitespace; the workflow cannot pass it as a filter');
+    process.stdout.write(mine.length ? `${mine.join('\n')}\n` : '');
+    return 0;
   }
+  let files = await listUnitTestFiles();
   const group = (argv.find((a) => a.startsWith('--group=')) ?? '').slice('--group='.length);
   if (group && suite !== 'unit') throw new Error('shard-assign: --group only applies to --suite=unit');
   if (group && group !== 'covered' && group !== 'nocov') throw new Error('shard-assign: --group must be covered or nocov');
