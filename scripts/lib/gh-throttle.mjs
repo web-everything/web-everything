@@ -1603,7 +1603,7 @@ function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn) {
   }
   const waitedMs = acq.waitedMs ?? 0;
   recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass, holders: acq.holders ?? [] });
-  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick; holders: ${ghHoldersSummary(acq.holders)}\n`;
+  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick\n`;
   try { (warn || (m => process.stderr.write(m)))(message); } catch { /* best-effort */ }
   return message;
 }
