@@ -128,11 +128,13 @@ async function main(argv) {
 
   const { shard, total } = parseShardArg(argv);
   let files;
+  let soakShardFiles;
   if (suite === 'unit') {
     files = await listUnitTestFiles();
   } else {
-    const { listAllSoakFiles } = await import('../conveyor/soak/shard-files.mjs');
+    const { listAllSoakFiles, shardFiles } = await import('../conveyor/soak/shard-files.mjs');
     files = listAllSoakFiles();
+    soakShardFiles = shardFiles;
   }
   const group = (argv.find((a) => a.startsWith('--group=')) ?? '').slice('--group='.length);
   if (group && suite !== 'unit') throw new Error('shard-assign: --group only applies to --suite=unit');
@@ -143,7 +145,7 @@ async function main(argv) {
     const split = await classifyTests(files);
     files = split[group];
   }
-  const mine = assignByTime(files, loadTimings()[suite], total)[shard - 1];
+  const mine = suite === 'soak' ? soakShardFiles({ shard, total }) : assignByTime(files, loadTimings()[suite], total)[shard - 1];
   if (suite === 'unit') {
     const bad = ambiguousFilters(mine, universe);
     if (bad.length) throw new Error(`shard-assign: filter is a substring of another test path: ${bad.map(([a, b]) => `${a} in ${b}`).join('; ')}`);

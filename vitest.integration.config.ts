@@ -12,7 +12,7 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * test — proof-of-CLI-behavior fixtures, not pure-logic unit tests — so they're slow in a way isolation
  * inside the shared suite can only ever redistribute, never remove. Splitting them into their own run:
  *   - keeps them off the `threads` pool the ~2000-file unit suite shares, so they can't inflate each
- *     other's cost under contention (the original motivation for the handful pinned to `forks` below);
+ *     other's cost under contention (the original motivation for the `forks` pool);
  *   - lets `npm run test:unit` (and everything that shells it — `verify-lane.mjs`'s local gate, `npm test`,
  *     `npm run verify`) skip real git/subprocess cost entirely, including its own "sensitive surface, fall
  *     back to full" case — this file is what still proves the real behavior, in CI, before merge.
@@ -33,12 +33,12 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * files, its two tests that spawn a real full `check-standards.mjs` scan went from 48.4s/39.7s (alone, in
  * the old unit suite) to 83s/72s (contending with everyone else's git subprocess spawns here) — the exact
  * contention problem this whole split exists to solve, recreated one tier down. Since vitest runs separate
- * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), moving it into the isolated
- * `forks` pool below removes it from that contention AND stops it dragging the other ~18 files down, at the
- * cost of queuing behind its 3 forks-pool siblings (all small next to it) rather than the ~18-file `threads`
- * pool. Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
- * longer sharing it, ordinary multi-worker parallelism is enough; they don't need to queue behind one
- * another the way `singleFork` would force.
+ * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), a separate serial
+ * `forks` pool still shares runner capacity with the `threads` pool. The self-sync sibling scenario's A3
+ * timed out under that arrangement in CI. This tier now runs every file in the same fork pool,
+ * keeping assertions and deadlines intact while removing the cross-pool contention. The single pool is NOT
+ * `singleFork`: one fork per file, `maxTestWorkers` at a time, so the tier stays inside the 20-minute CI job budget
+ * (a fully serial run was cancelled at that cap).
  */
 export default defineConfig({
   test: {
@@ -142,47 +142,17 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
     ].filter((f) => !LIVE_SUITE.has(f)),
-    poolMatchGlobs: [
-      ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],
-      ['scripts/__tests__/gate-entrypoint-integration.test.mjs', 'forks'],
-      ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
-      ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
-      // #3383 — the daemon-scenario tracer forks a long-lived daemon host child (itself dynamically importing
-      // and running the sim clone's whole module graph) plus many short-lived `node`/`git` children per tick —
-      // isolated here for the identical contention reason as this array's other members.
-      ['scripts/conveyor/__tests__/sim-scenarios-smoke.test.mjs', 'forks'],
-      ['scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs', 'forks'],
-      ['scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs', 'forks'],
-      ['scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs', 'forks'],
-      // #x01b2gj — a fifth join, for the identical CORRECTNESS reason as the four above: its TTL-backdating
-      // cases (the item-resolved AND pr-merged terminal axes) flaked red twice on 2026-08-30 under real
-      // concurrent host load, passing clean in isolation. It spawns real `lane-pool.mjs` children (each
-      // shelling real `git`/`gh` subprocesses) sharing the default `threads` pool with ~18 other
-      // subprocess-heavy files; under contention those children compete for CPU/fork slots and the reap
-      // decision's bounded `gh pr list` call (see the widened timeout in `scripts/lane-pool.mjs`) can miss
-      // its terminal signal before the test asserts on it. Isolating it here removes that contention.
-      ['scripts/__tests__/lane-pool-reap-on-acquire.test.mjs', 'forks'],
-      // #3449 — a sixth join, pre-emptively, for the same reason: this file drives the identical
-      // `reapDeadLeasesInPool` function through the identical real-subprocess TTL-backdating +
-      // item-resolved-axis pattern as its sibling above, so the same contention risk applies by construction.
-      ['scripts/__tests__/lane-pool-reap-on-list-acquirable.test.mjs', 'forks'],
-      // #xkk4lv7 — a seventh join, pre-emptively, for the same reason: it drives `deadLeasePlan`'s NEW
-      // branch-based fallback through the identical real-subprocess TTL-backdating pattern as its two siblings
-      // above, so the same contention-induced flake risk applies by construction.
-      ['scripts/__tests__/lane-pool-reap-branch-fallback.test.mjs', 'forks'],
-    ],
-    // #x1jcikc: default `threads` pool cap (see vitest.shared.ts#maxTestWorkers) — the handful of files
-    // above are pinned to the SEPARATE `forks` pool's `singleFork: true` for a correctness reason (flaky
-    // under contention), which this leaves untouched; everything else here still shares the uncapped
-    // `threads` pool today, so it needs the same ceiling `vitest.config.ts` gets.
-    pool: 'threads',
+    // Separate Vitest pools run concurrently, so keep every real-subprocess fixture in ONE pool: simulator
+    // ticks then cannot contend with a second pool's git fixtures or Rust builds. That pool must NOT be
+    // `singleFork`: it serialized the whole ~50-file tier into one process, which ran past CI's 20-minute
+    // job budget (the job was cancelled at the cap). One fork per file, at most `maxTestWorkers` at a time.
+    pool: 'forks',
     poolOptions: {
-      threads: {
-        maxThreads: maxTestWorkers,
-        minThreads: 1,
-      },
       forks: {
-        singleFork: true,
+        singleFork: false,
+        maxForks: maxTestWorkers,
+        // Vitest otherwise defaults the minimum to CPU count - 1, which can exceed our shared ceiling.
+        minForks: 1,
       },
     },
   },
