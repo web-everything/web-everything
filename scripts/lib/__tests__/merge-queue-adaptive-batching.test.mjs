@@ -277,13 +277,16 @@ describe('intermediate cancellation selection', () => {
 import { createAdaptiveBatching, readQueueFacts, readGroupingStrategy, replayBatching } from '../merge-queue-adaptive-batching.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 
-function ioHarness({ state = empty(), queue = [], dryRun = false, failQueue = false, strategy = 'HEADGREEN', runs = [] } = {}) {
+function ioHarness({ state = empty(), queue = [], dryRun = false, failQueue = false, strategy = 'HEADGREEN', runs = [], dequeue = () => {} } = {}) {
   let stored = structuredClone(state);
   const calls = [], logs = [], writes = [], renames = [];
   const exec = (cmd, args) => {
     calls.push([cmd, ...args]);
     if (args.includes('graphql')) {
-      if (args.some(a => a.includes('dequeuePullRequest'))) return JSON.stringify({ data: { dequeuePullRequest: { mergeQueueEntry: { id: 'e' } } } });
+      if (args.some(a => a.includes('dequeuePullRequest'))) {
+        dequeue(Number(args.find(a => a.startsWith('id=pr-')).slice(6)));
+        return JSON.stringify({ data: { dequeuePullRequest: { mergeQueueEntry: { id: 'e' } } } });
+      }
       if (failQueue) throw new Error('queue unavailable');
       return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: queue.map(num => ({ id: `entry-${num}`, pullRequest: { id: `pr-${num}`, number: num } })) } } } } });
     }
@@ -299,6 +302,77 @@ function ioHarness({ state = empty(), queue = [], dryRun = false, failQueue = fa
 }
 
 describe('batching IO shell and drain hook', () => {
+  it('retries only outstanding recovery dequeues after a transient failure and restart', () => {
+    const queue = [2, 3], attempts = [];
+    const dequeue = num => {
+      attempts.push(num);
+      if (num === 2 && attempts.filter(n => n === 2).length === 1) throw new Error('HTTP 502');
+      queue.splice(queue.indexOf(num), 1);
+    };
+    const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1, 2, 3], seen: [1, 2, 3] })] }, queue, dequeue });
+    expect(h.shell.observe({}).dequeued).toEqual([3]);
+    expect(h.shell.gate(1).admit).toBe(false);
+    const restarted = ioHarness({ state: h.state(), queue, dequeue });
+    expect(restarted.shell.observe({}).dequeued).toEqual([2]);
+    expect(attempts).toEqual([2, 3, 2]);
+    expect(restarted.state().failures).toHaveLength(1);
+    expect(restarted.shell.gate(1).admit).toBe(true);
+  });
+  it('ignores confirmation retired by recovery but tracks a fresh isolation admission', () => {
+    const queue = [];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ status: 'forming', prs: [1], seen: [1] })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    expect(h.shell.gate(2).admit).toBe(true);
+    queue.push(2); // enqueue succeeded; confirmation is delayed
+    expect(h.shell.observe({}).dequeued).toEqual([2]);
+    h.shell.confirm(2);
+    expect(h.shell.observe({}).events).toEqual([]);
+    expect(h.state().culprits).toEqual([]);
+    expect(h.state().isolate).toEqual([1, 2]);
+    expect(h.shell.gate(2).admit).toBe(true);
+    h.shell.confirm(2);
+    expect(h.shell.observe({}).events).toContainEqual({ type: 'culprit', num: 2 });
+  });
+  it('does not let an old confirmation mark a replacement reservation seen', () => {
+    const queue = [2];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1, 2], seen: [1] })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    h.shell.observe({});
+    const fresh = h.shell.gate(2);
+    expect(fresh.groupId).not.toBe('g1');
+    h.shell.confirm(2, 'g1');
+    expect(h.state().groups.find(g => g.id === fresh.groupId).seen ?? []).toEqual([]);
+    expect(h.shell.observe({}).events).toEqual([]);
+    expect(h.state().culprits).toEqual([]);
+  });
+  it('dequeues an enqueue that finishes after recovery observed its reservation', () => {
+    const queue = [];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1], seen: [1], status: 'forming' })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    const admission = h.shell.gate(2);
+    h.shell.observe({});
+    queue.push(2);
+    // Recovery catches this even if the enqueue process crashes before confirm.
+    expect(h.shell.gate(1).admit).toBe(false);
+    expect(h.shell.observe({}).dequeued).toEqual([2]);
+    h.shell.confirm(2, admission.groupId);
+    expect(h.shell.observe({}).events).toEqual([]);
+    expect(h.state().culprits).toEqual([]);
+  });
+  it('acknowledges a stale recovery effect before a fresh enqueue reuses the PR', () => {
+    const queue = [2];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    h.shell.observe({});
+    h.shell.confirm(2, 'g1');
+    const fresh = h.shell.gate(2);
+    queue.push(2);
+    h.shell.confirm(2, fresh.groupId);
+    expect(h.shell.observe({}).dequeued).toEqual([]);
+    queue.length = 0;
+    expect(h.shell.observe({ mergedNums: [2] }).events).toEqual([]);
+    expect(h.state().culprits).toEqual([]);
+  });
   it('preserves admission between gate and confirm, and expires abandoned reservations', () => {
     const h = ioHarness();
     const gate = h.shell.gate(1);
@@ -442,8 +516,8 @@ describe('batching IO shell and drain hook', () => {
       localSlug: 'owner/repo', log: { write: () => {} },
       readFile: () => JSON.stringify(stored), writeState: (_path, state) => { stored = structuredClone(state); },
       batching: {
-        gate: num => { order.push(['gate', num]); return num === 1 ? { admit: true } : { admit: false, reason: 'group full' }; },
-        confirm: num => order.push(['confirm', num]),
+        gate: num => { order.push(['gate', num]); return num === 1 ? { admit: true, groupId: 'reservation-1' } : { admit: false, reason: 'group full' }; },
+        confirm: (num, groupId) => order.push(['confirm', num, groupId]),
       },
       exec: (cmd, args) => {
         if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
@@ -457,9 +531,9 @@ describe('batching IO shell and drain hook', () => {
       },
     });
     expect(drain.enqueue({ num: 1 }, head)).toEqual({ enqueued: true, already: false });
-    expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1]]);
+    expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1, 'reservation-1']]);
     expect(drain.enqueue({ num: 2 }, head)).toMatchObject({ enqueued: false, deferred: true });
-    expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1], ['gate', 2]]);
+    expect(order).toEqual([['gate', 1], ['enqueue', 1], ['confirm', 1, 'reservation-1'], ['gate', 2]]);
     expect(stored.pending.map(p => p.num)).toEqual([1]);
   });
   it('reads PR node IDs for dequeue and reads the grouping strategy without mutations', () => {

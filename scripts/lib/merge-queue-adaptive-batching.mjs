@@ -108,9 +108,11 @@ export function batchingStatePath(env = process.env) {
 }
 
 /** @typedef {{id:string, prs:number[], openedAtMs:number, closedAtMs:number|null,
- * mode:'grouped'|'isolate'|'strict', status:'forming'|'queued'|'done'|'failed'}} BatchingGroup
+ * mode:'grouped'|'isolate'|'strict', status:'forming'|'queued'|'done'|'failed',
+ * recoveryRetired?:number[]}} BatchingGroup
  * @typedef {{groups:BatchingGroup[], isolate:number[], failures:Array<{atMs:number,groupId:string,prs:number[]}>,
- * culprits:Array<{num:number,atMs:number}>, strictUntilMs:number|null}} BatchingState
+ * culprits:Array<{num:number,atMs:number}>, strictUntilMs:number|null,
+ * pendingDequeues?:number[]}} BatchingState
  */
 
 // Pure policy core: no IO or ambient clock. State is JSON and every transition copies it.
@@ -168,6 +170,14 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
   const mode = currentMode(state, nowMs, settings);
   const result = (admit, groupId = null, reason = null) => ({ admit, mode, groupId, reason, state });
   if (mode === 'off') return result(true);
+  // A fresh queue snapshot acknowledges absent recovery entries before a new
+  // reservation can reuse the PR number. Never dequeue that replacement later.
+  state.pendingDequeues = (state.pendingDequeues ?? []).filter(n => inQueue.has(n));
+  if ((state.pendingDequeues ?? []).some(n => inQueue.has(n))
+    || state.groups.some(g => g.recoveryRetired?.some(n => inQueue.has(n)
+      && !state.groups.some(other => active(other) && other.prs.includes(n))))) {
+    return result(false, null, 'recovery dequeues are still outstanding');
+  }
   if (mode === 'isolate') {
     if (!state.isolate.includes(num)) return result(false, null, `isolating culprit among ${state.isolate.map(n => `#${n}`).join(',')}`);
     if (state.isolate.some(n => n !== num && inQueue.has(n))) return result(false, null, 'another isolate PR is in queue');
@@ -210,6 +220,14 @@ export function observeQueue({ state: input, inQueue, merged, closed = new Set()
   const cutoff = nowMs - settings.failureWindowMinutes * MINUTE_MS;
   state.failures = state.failures.filter(f => f.atMs >= cutoff);
   expireIsolation(state, nowMs, settings, closed, merged);
+  // Recovery effects survive terminal-group pruning and isolation expiry. Queue
+  // absence also acknowledges a dequeue whose response/persistence was lost.
+  const lateRecovery = state.groups.flatMap(g => g.recoveryRetired ?? []).filter(n =>
+    !state.groups.some(other => active(other) && other.prs.includes(n)));
+  const pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), ...lateRecovery])]
+    .filter(n => inQueue.has(n) && !merged.has(n) && !closed.has(n));
+  if (state.pendingDequeues || pendingDequeues.length) state.pendingDequeues = pendingDequeues;
+  if (pendingDequeues.length) events.push({ type: 'dequeue', nums: pendingDequeues });
   for (const g of state.groups) {
     if (g.status === 'done') continue;
     if (g.prs.every(n => merged.has(n))) {
@@ -235,6 +253,8 @@ export function observeQueue({ state: input, inQueue, merged, closed = new Set()
       state.isolate = [...new Set([...state.isolate, ...nums])];
       state.isolateSinceMs ??= {};
       for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
+      g.recoveryRetired = [...nums];
+      state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), ...nums.filter(n => inQueue.has(n))])];
       events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) }, { type: 'isolate', nums });
     } else {
       for (const num of ejected) {
@@ -250,7 +270,8 @@ export function observeQueue({ state: input, inQueue, merged, closed = new Set()
   }
   expireIsolation(state, nowMs, settings, closed, merged);
   state.groups = state.groups.filter(g => g.status === 'failed'
-    ? (g.failedAtMs ?? g.closedAtMs ?? g.openedAtMs) >= cutoff
+    ? g.recoveryRetired?.some(n => state.pendingDequeues?.includes(n))
+      || (g.failedAtMs ?? g.closedAtMs ?? g.openedAtMs) >= cutoff
     : g.status !== 'done' || (g.closedAtMs ?? g.openedAtMs) >= nowMs - DAY_MS);
   state.culprits = state.culprits.filter(c => c.atMs >= cutoff);
   return { state, events };
@@ -352,11 +373,30 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
   const transaction = fn => dryRun || !settings.enabled ? fn() : withLock(statePath, fn, { leaseMinutes: Infinity });
   const api = {
     /** Record that `num` really entered GitHub's queue (enqueue succeeded), so a fast ejection counts. */
-    confirm(num) {
+    confirm(num, groupId) {
       if (!settings.enabled) return;
       try {
         const state = load();
+        const reservation = groupId == null ? null : state.groups.find(g => g.id === groupId);
+        const live = state.groups.find(g => active(g) && g.prs.includes(num));
+        // An old enqueue cannot confirm a replacement reservation. If its
+        // history aged out, recover the late arrival rather than invent a test.
+        if (groupId != null && live && live.id !== groupId) return;
+        if (groupId != null && !reservation) {
+          state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), num])];
+          persist(state);
+          return;
+        }
+        if (reservation?.status === 'failed') {
+          state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), num])];
+          persist(state);
+          return;
+        }
         if (!state.groups.some(g => active(g) && g.prs.includes(num))) {
+          // Recovery deliberately retired this reservation. A delayed enqueue
+          // confirmation is not evidence of an isolated test. A fresh gate
+          // creates a distinct group when it makes a new reservation.
+          if (state.groups.some(g => g.recoveryRetired?.includes(num))) return;
           // An enqueue can finish after its reservation grace expired. Keep a
           // singleton record so even that late confirmation remains observable.
           openGroup(state, num, nowMs(), currentMode(state, nowMs(), settings), 1);
@@ -413,6 +453,10 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
                   if (!data.dequeuePullRequest) throw new Error(`dequeue #${num} returned no result`);
                 }
                 summary.dequeued.push(num);
+                if (!dryRun) {
+                  result.state.pendingDequeues = result.state.pendingDequeues.filter(n => n !== num);
+                  persist(result.state);
+                }
               } catch (e) { warn(e); }
             }
           } else if (event.type === 'isolate') say(`merge-queue batching: isolate ${event.nums.map(n => `#${n}`).join(',')}`);

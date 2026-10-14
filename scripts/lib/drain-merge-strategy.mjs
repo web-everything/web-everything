@@ -266,8 +266,10 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
+      let batchingGroupId;
       try {
         const g = adaptiveBatching().gate(c.num);
+        batchingGroupId = g.groupId;
         if (!g.admit) {
           say(`  merge-queue batching: defer #${c.num} (${g.reason})`);
           return { enqueued: false, deferred: true, reason: g.reason };
@@ -289,7 +291,7 @@ export function createDrainMergeStrategy({
         if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
         throw err;
       }
-      try { adaptiveBatching().confirm?.(c.num); } catch { /* batching bookkeeping never blocks an enqueue */ }
+      try { adaptiveBatching().confirm?.(c.num, batchingGroupId); } catch { /* batching bookkeeping never blocks an enqueue */ }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
       // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
