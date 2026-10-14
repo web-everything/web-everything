@@ -48,6 +48,7 @@ const NOW = '2026-09-26T10:00:00.000Z';
 const LIST_BY_KIND = {
   build: 'spawnBuilds',
   prepare: 'spawnPrepareScope',
+  'prepare-item': 'spawnPrepareItems',
   'prepare-decision': 'spawnPrepareDecision',
   investigate: 'spawnInvestigations',
   fix: 'spawnFixes',
@@ -75,7 +76,7 @@ const ITEM = { num: '9001', slug: 'route-check', scope: ['we:scripts/operations/
 
 /** Drive `readTick` directly (the io shell), fully hermetic: no `gh`, no `claude`, no real scorecard store, no
  *  real backlog file. Every process/fs boundary the shell reaches is stubbed. */
-function runReadTick(launchKind, { item = ITEM, scorecards = [], deliveryAgentOverride = null, dispatchModes = () => ({}) } = {}) {
+function runReadTick(launchKind, { item = ITEM, scorecards = [], deliveryAgentOverride = null, dispatchModes = () => ({}), preparePolicy = () => ({ runner: 'codex' }) } = {}) {
   return readTick({
     num: ITEM.num,
     root: PRIMARY,
@@ -92,6 +93,7 @@ function runReadTick(launchKind, { item = ITEM, scorecards = [], deliveryAgentOv
     readScorecards: () => scorecards,
     readDeliveryAgentOverride: () => deliveryAgentOverride,
     dispatchModes,
+    preparePolicy,
     now: () => new Date(NOW),
   });
 }
@@ -603,4 +605,16 @@ vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => {
   return { ...actual, readRoutingPolicy: () => policy,
     resolveOperationRoute: options => actual.resolveOperationRoute({ ...options, policy }),
     resolveDispatchRoute: (dispatch, options) => actual.resolveDispatchRoute(dispatch, { ...options, routingPolicy: policy }) };
+});
+
+
+describe('prepare runner card envelope wiring', () => {
+  it.each(['codex', 'scope'])('uses the %s envelope', runner => {
+    const read = runReadTick('prepare-item', {
+      item: { ...ITEM, specPath: 'backlog/1-x.md', scope: ['we:scripts/lib/dispatch-contracts.mjs'] },
+      preparePolicy: () => ({ runner }),
+    });
+    if (runner === 'codex') expect(read.routing.probationWorker?.provider).toBe('codex');
+    else expect(read.routing).toMatchObject({ probationWorker: null, routed: 'claude' });
+  });
 });
