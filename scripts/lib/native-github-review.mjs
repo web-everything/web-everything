@@ -187,6 +187,31 @@ export function planNativeReview({ verdict, labels = [], headSha }) {
   return { event: null, dismiss: [], reason: 'not-a-review-verdict' };
 }
 
+const labelNames = labels => (labels ?? []).map(label => (typeof label === 'string' ? label : label?.name));
+/** The review-state label each verdict leaves live once review-set-label has swapped it; `advisory` sets none. */
+const VERDICT_LABEL = Object.freeze({ accepted: 'review:accepted', changes: 'review:changes', rearm: 'review:pending', restamp: 'review:accepted', 'clear-human': 'review:accepted' });
+const STATE_LABELS = Object.freeze(['review:accepted', 'review:changes', 'review:pending']);
+
+/** The PR's `review:*` labels, sorted, as one comparable string (`none` when there are none). Pure. */
+export function reviewLabelKey(labels) {
+  return labelNames(labels).filter(name => typeof name === 'string' && name.startsWith('review:')).sort().join(',') || 'none';
+}
+
+/**
+ * Is `verdict` still the PR's verdict, read from its LIVE labels (red team x1b8hlo)? A later run that swapped the label
+ * owns the native review, so a superseded run must not write. The verdict's own state label must be the only one live,
+ * and the live labels must still call for the planned event (e.g. no `review:human` re-added under an APPROVE). An
+ * advisory comment never supersedes a verdict, so it is always current. Pure.
+ */
+export function verdictIsCurrent({ verdict, labels, headSha, plan }) {
+  const own = VERDICT_LABEL[verdict];
+  if (!own) return true;
+  const names = labelNames(labels);
+  if (STATE_LABELS.some(label => (label === own) !== names.includes(label))) return false;
+  if (verdict === 'clear-human' && names.includes('review:human')) return false;
+  return planNativeReview({ verdict, labels, headSha }).event === (plan ?? planNativeReview({ verdict, labels, headSha })).event;
+}
+
 /** Compare CONFIGURED GitHub App spellings consistently (settings only — never a live identity). Pure. */
 export function normaliseLogin(login) {
   return String(login ?? '').trim().toLowerCase().replace(/^app\//, '').replace(/\[bot\]$/, '');
@@ -406,6 +431,16 @@ function readViewer(run) {
   } catch { return { type: '', login: '' }; }
 }
 
+/** The live PR `{head, author, authorType, state, labels}`, or null unless every field reads as its type. */
+function readLivePr(run, endpoint) {
+  try {
+    const live = JSON.parse(run(['api', endpoint, '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state, labels: [.labels[].name]}']));
+    if (!live || typeof live.head !== 'string' || typeof live.author !== 'string' || !live.author.trim() || typeof live.authorType !== 'string'
+      || typeof live.state !== 'string' || !Array.isArray(live.labels) || !live.labels.every(name => typeof name === 'string')) return null;
+    return live;
+  } catch { return null; }
+}
+
 /** The PR's full review history; throws when any row is unreadable. */
 function readReviews(run, endpoint) {
   // A deleted account's review has `user: null`: read it as nobody's, never as an unreadable history.
@@ -427,7 +462,7 @@ const validQueueEntry = entry => entry && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.t
 
 /** The review states our CURRENT label verdict stands behind; a queued dismissal never removes one of them. Pure. */
 export function endorsedStates(labels) {
-  const names = (labels ?? []).map(label => (typeof label === 'string' ? label : label?.name));
+  const names = labelNames(labels);
   const endorsed = [];
   if (names.includes('review:changes')) endorsed.push('CHANGES_REQUESTED');
   if (names.includes('review:accepted') && !names.includes('review:human')) endorsed.push('APPROVED');
@@ -471,7 +506,15 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
       catch (error) { left.push(id); errors.push(`dismissal ${id}: ${failureReason(error)}`); }
     }
     if (left.length) retry.push({ ...attempt, ids: left });
-    if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
+    // A verdict that endorses a dismissed review again may have landed between the label read and the dismissal.
+    let settled = null;
+    if (dismissed) {
+      try {
+        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join() });
+      } catch (error) { settled = { outcome: 'failed', reason: `verdict unconfirmed after write: ${failureReason(error)}` }; }
+    }
+    if (settled) record({ ...line, outcome: settled.outcome, dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
+    else if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
   }
   for (const entry of retry) {
     if ((Number(entry.attempts) || 0) >= QUEUE_MAX_ATTEMPTS) {
@@ -481,6 +524,50 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     try { queue.append(entry); } catch { /* Best effort: the claim file is kept below so the next drainer retries. */ return; }
   }
   try { claimed?.done?.(); } catch { /* Best effort. */ }
+}
+
+/**
+ * Make GitHub show the verdict the LIVE labels hold: post its decisive review unless it is already our latest, or,
+ * when the labels hold none (pending, human) or the head moved, dismiss our standing reviews they do not endorse.
+ * Returns what it did. Throws on a failed read or write.
+ */
+function reconcileToLabels({ run, endpoint, live, head, reviewerLogin }) {
+  const names = labelNames(live.labels);
+  const want = names.includes('review:changes') ? { verdict: 'changes', event: 'REQUEST_CHANGES' }
+    : names.includes('review:accepted') && !names.includes('review:human') ? { verdict: 'accepted', event: 'APPROVE' } : null;
+  const reviews = readReviews(run, endpoint);
+  if (want && live.head === head) {
+    if (findExistingNativeReview({ reviews, head, event: want.event, reviewerLogin })) return [];
+    run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${head}`, '-f', `event=${want.event}`, '-f', `body=${nativeReviewBody({ ...want, head })}`]);
+    return [`posted ${want.event}`];
+  }
+  const endorsed = endorsedStates(live.labels);
+  const ids = ownStandingReviews({ reviews, reviewerLogin, states: DECISIVE.filter(state => !endorsed.includes(state)) });
+  for (const id of ids) dismiss(run, endpoint, id, reviewLabelKey(live.labels), head);
+  return ids.map(id => `dismissed ${id}`);
+}
+
+const SETTLE_ROUNDS = 3;
+/**
+ * After a write, re-read the labels (red team x1b8hlo). A newer verdict may have landed and mirrored while this run
+ * read and wrote; ours, written last, would then stand over it. So when ours is no longer current, mirror the live
+ * verdict instead, and repeat until the labels hold still. `isCurrent(live)` says whether the write still matches the
+ * labels. Returns null when it does, else `{outcome, reason}`. Every write by any run is followed by its own re-read,
+ * so the last writer always leaves GitHub on the live label.
+ */
+function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent }) {
+  let seen = null;
+  const actions = [];
+  for (let round = 0; round < SETTLE_ROUNDS; round++) {
+    const live = readLivePr(run, endpoint);
+    if (!live) throw new Error('pr-unreadable after write');
+    const key = reviewLabelKey(live.labels);
+    if (round === 0 && isCurrent(live)) return null;
+    if (key === seen) return { outcome: 'superseded', reason: `verdict-superseded after write (live=${key}); reconciled: ${actions.join(', ') || 'nothing to change'}` };
+    seen = key;
+    actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin }));
+  }
+  return { outcome: 'failed', reason: `verdict-superseded after write; labels kept moving (last live=${seen}); reconciled: ${actions.join(', ')}` };
 }
 
 /** Preserve the actionable last stderr line on gh failures. */
@@ -539,15 +626,14 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     event = plan.event;
     if (!event && !plan.dismiss.length) return finish('not-applicable', plan.reason);
     const endpoint = `repos/${repo}/pulls/${pr}`;
-    let live;
-    try {
-      live = JSON.parse(run(['api', endpoint, '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state}']));
-      if (!live || typeof live.head !== 'string' || typeof live.author !== 'string' || !live.author.trim() || typeof live.authorType !== 'string' || typeof live.state !== 'string') return finish('skipped', 'pr-unreadable');
-    } catch { return finish('skipped', 'pr-unreadable'); }
+    const live = readLivePr(run, endpoint);
+    if (!live) return finish('skipped', 'pr-unreadable');
     if (live.state !== 'open') return finish('skipped', 'pr-not-open');
     // A review is pinned to the reviewed head; dismissing our own review is not, so a push racing a rearm or a
     // clearance never leaves our verdict standing beside the label.
     if (live.head !== headSha && event) return finish('skipped', `head-moved (live=${live.head.slice(0, 12)})`);
+    // A later verdict swapped the label while this run waited: that run mirrors its own verdict, this one writes nothing.
+    if (!verdictIsCurrent({ verdict, labels: live.labels, headSha, plan })) return finish('superseded', `verdict-superseded (live=${reviewLabelKey(live.labels)})`);
     const resolvedIdentity = identity ?? readDeliveryIdentity({ env });
     const prAuthor = { login: live.author, type: live.authorType };
     const checked = checkReviewerIdentity({ identity: resolvedIdentity, viewer: readViewer(run), prAuthor });
@@ -611,7 +697,17 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, en
     if (dismissalErrors.length) reason = [reason, ...dismissalErrors].filter(Boolean).join('; ');
     const dismissal = dismissalErrors.length ? 'failed' : queued ? 'queued' : ids.length ? 'ok' : undefined;
     if (!event) outcome = dismissalErrors.length ? 'failed' : queued ? 'queued' : dismissed ? 'dismissed' : 'not-applicable';
-    return finish(outcome, reason, plan.dismiss.length ? { dismissed, ...(queued ? { queued } : {}), dismissal } : {});
+    const extra = plan.dismiss.length ? { dismissed, ...(queued ? { queued } : {}), dismissal } : {};
+    // A queued dismissal is re-checked against the live label when drained; a direct write is re-checked now.
+    if (writer && (outcome === 'posted' || dismissed)) {
+      try {
+        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: now => verdictIsCurrent({ verdict, labels: now.labels, headSha, plan }) });
+        if (settled) return finish(settled.outcome, [reason, settled.reason].filter(Boolean).join('; '), extra);
+      } catch (error) {
+        return finish('failed', [reason, `verdict unconfirmed after write: ${failureReason(error)}`].filter(Boolean).join('; '), { ...extra, dismissal: plan.dismiss.length ? 'failed' : undefined });
+      }
+    }
+    return finish(outcome, reason, extra);
   } catch (error) {
     try { return finish('failed', failureReason(error)); }
     catch { return { outcome: 'failed', event, reason: 'unexpected-error', line: '' }; }

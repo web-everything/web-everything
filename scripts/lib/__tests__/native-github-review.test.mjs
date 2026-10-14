@@ -22,6 +22,9 @@ const review = (id, state, commit_id = head, login = 'plateau-reviewer[bot]', ty
 const bot = { login: 'plateau-reviewer', type: 'Bot' };
 const author = { login: 'web-everything[bot]', type: 'Bot' };
 const throws = () => { throw new Error('unreadable'); };
+// The labels a verdict leaves live once review-set-label has swapped them (kept labels, e.g. review:human, carried).
+const LABEL_FOR = { accepted: 'review:accepted', changes: 'review:changes', rearm: 'review:pending', restamp: 'review:accepted', 'clear-human': 'review:accepted' };
+const liveLabelsFor = (verdict = 'accepted', kept = []) => [...kept.map(l => (typeof l === 'string' ? l : l.name)), ...(LABEL_FOR[verdict] ? [LABEL_FOR[verdict]] : [])];
 function fixture(options = {}, responses = {}) {
   const calls = [];
   const log = vi.fn();
@@ -42,7 +45,7 @@ function fixture(options = {}, responses = {}) {
       return responses.reviewsRaw ?? (responses.reviews ?? []).map(JSON.stringify).join('\n');
     }
     if (responses.prError) throw responses.prError;
-    return responses.prRaw ?? JSON.stringify({ head: responses.head ?? head, author: responses.author ?? 'web-everything[bot]', authorType: responses.authorType ?? 'Bot', state: responses.state ?? 'open' });
+    return responses.prRaw ?? JSON.stringify({ head: responses.head ?? head, author: responses.author ?? 'web-everything[bot]', authorType: responses.authorType ?? 'Bot', state: responses.state ?? 'open', labels: responses.labels ?? liveLabelsFor(options.verdict, options.labels) });
   };
   const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec, identity, mode: { mode: 'mirror', source: 'tool' }, log, appendLog, ...options });
   return { result, calls, log, appendLog, posts: calls.filter(a => a.includes('POST')), puts: calls.filter(a => a.includes('PUT')) };
@@ -185,7 +188,7 @@ describe('synchronous mirror shell', () => {
     expect(f.result.outcome).toBe('posted');
     expect(f.posts).toHaveLength(1);
     expect(f.posts[0]).toEqual(['api', '--method', 'POST', 'repos/owner/repo/pulls/123/reviews', '-f', `commit_id=${head}`, '-f', 'event=APPROVE', '-f', `body=${nativeReviewBody({ verdict: 'accepted', event: 'APPROVE', head })}`]);
-    expect(f.calls[0]).toEqual(['api', 'repos/owner/repo/pulls/123', '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state}']);
+    expect(f.calls[0]).toEqual(['api', 'repos/owner/repo/pulls/123', '--jq', '{head: .head.sha, author: .user.login, authorType: .user.type, state: .state, labels: [.labels[].name]}']);
     expect(f.calls[1]).toEqual(['api', 'graphql', '-f', 'query=query{viewer{__typename login}}', '--jq', '.data.viewer | "\\(.__typename) \\(.login)"']);
     expect(f.calls[2]).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/owner/repo/pulls/123/reviews', '--jq', '.[] | {id, state, commit_id, user: {login: (.user.login // ""), type: (.user.type // "")}}']);
     expect(f.result.line).toMatch(/^native-review: /);
@@ -282,6 +285,8 @@ describe('synchronous mirror shell', () => {
 function fakeGithub({ viewer = 'Bot plateau-reviewer', labels = [] } = {}) {
   const reviews = [];
   let nextId = 100;
+  // The PR's live labels, mutable so a test can swap them the way review-set-label does before it mirrors.
+  const gh = { labels };
   const exec = (argv) => {
     if (argv.includes('POST')) {
       const field = name => argv.find(a => a.startsWith(`${name}=`)).slice(name.length + 1);
@@ -294,21 +299,25 @@ function fakeGithub({ viewer = 'Bot plateau-reviewer', labels = [] } = {}) {
       return '{}';
     }
     if (argv.includes('graphql')) return viewer;
-    if (/\/issues\/\d+$/.test(argv[1])) return JSON.stringify(labels);
+    if (/\/issues\/\d+$/.test(argv[1])) return JSON.stringify(gh.labels);
     if (argv.includes('--paginate')) return reviews.map(JSON.stringify).join('\n');
-    return JSON.stringify({ head, author: 'web-everything[bot]', authorType: 'Bot', state: 'open' });
+    return JSON.stringify({ head, author: 'web-everything[bot]', authorType: 'Bot', state: 'open', labels: gh.labels });
   };
   // GitHub's standing verdict of one reviewer: its latest opinionated review, unless that one was dismissed.
   const standing = () => {
     const latest = reviews.filter(r => r.state !== 'COMMENTED').sort((a, b) => b.id - a.id)[0];
     return latest && latest.state !== 'DISMISSED' ? latest.state : 'none';
   };
-  return { reviews, exec, standing };
+  return Object.assign(gh, { reviews, exec, standing });
 }
 const NATIVE_FOR_LABEL = { accepted: 'APPROVED', changes: 'CHANGES_REQUESTED', rearm: 'none', restamp: 'none', 'clear-human': 'none' };
 
 describe('verdict sequences on one head (operator send-back #1 and #2)', () => {
-  const step = (gh, verdict, extra = {}) => mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict, headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, ...extra });
+  // As review-set-label does: swap the label first, then mirror.
+  const step = (gh, verdict, extra = {}) => {
+    gh.labels = liveLabelsFor(verdict);
+    return mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict, headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, ...extra });
+  };
   it.each([
     [['accepted', 'changes', 'accepted']],
     [['changes', 'accepted', 'changes']],
@@ -335,10 +344,80 @@ describe('verdict sequences on one head (operator send-back #1 and #2)', () => {
   });
 });
 
+/** Red team x1b8hlo: a superseded run never overwrites the newer verdict's native review, at any point it resumes. */
+describe('a stale verdict never overwrites a newer one on the same head', () => {
+  const mirror = (gh, verdict, extra = {}) => mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict, headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, ...extra });
+  // Run B: swap the label to its verdict, then mirror it, all while run A is paused.
+  const runB = (gh, verdict) => { gh.labels = liveLabelsFor(verdict); return mirror(gh, verdict); };
+  // Run A paused right before its first write of `kind` (POST or PUT): run B goes through in full, then A writes.
+  const pausedBefore = (gh, kind, verdictB) => {
+    let fired = false;
+    return { ...gh, exec: (argv) => { if (!fired && argv.includes(kind)) { fired = true; runB(gh, verdictB); } return gh.exec(argv); } };
+  };
+
+  it.each([
+    ['accepted', 'changes'], ['changes', 'accepted'], ['accepted', 'rearm'], ['changes', 'rearm'],
+    ['rearm', 'changes'], ['rearm', 'accepted'], ['clear-human', 'changes'], ['restamp', 'changes'],
+  ])('A=%s paused before mirroring, B=%s mirrors first: A writes nothing, GitHub keeps B', (verdictA, verdictB) => {
+    const gh = fakeGithub({ labels: liveLabelsFor(verdictA) });
+    gh.reviews.push(review(7, verdictA === 'changes' ? 'APPROVED' : 'CHANGES_REQUESTED'));
+    runB(gh, verdictB);
+    const before = JSON.stringify(gh.reviews);
+    const a = mirror(gh, verdictA);
+    expect(JSON.stringify(gh.reviews)).toBe(before);
+    expect(gh.standing()).toBe(NATIVE_FOR_LABEL[verdictB]);
+    expect(a.outcome).toBe('superseded');
+    expect(a.line).toContain('agree=n/a');
+    expect(a.reason).toContain(`verdict-superseded (live=${LABEL_FOR[verdictB]})`);
+  });
+
+  it.each([['accepted', 'changes'], ['changes', 'accepted'], ['accepted', 'rearm'], ['changes', 'rearm']])(
+    'A=%s paused between reading the label and posting, B=%s mirrors meanwhile: A restores B on GitHub', (verdictA, verdictB) => {
+      const gh = fakeGithub({ labels: liveLabelsFor(verdictA) });
+      const a = mirror(pausedBefore(gh, 'POST', verdictB), verdictA);
+      expect(gh.standing()).toBe(NATIVE_FOR_LABEL[verdictB]);
+      expect(gh.labels).toEqual(liveLabelsFor(verdictB));
+      expect(a.outcome).toBe('superseded');
+      expect(a.reason).toContain(`verdict-superseded after write (live=${LABEL_FOR[verdictB]})`);
+      expect(a.line).not.toContain('agree=yes');
+    });
+
+  it('A=rearm paused before dismissing, B=changes reuses the standing request meanwhile: A puts it back', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('rearm') });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
+    const a = mirror(pausedBefore(gh, 'PUT', 'changes'), 'rearm');
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(a.outcome).toBe('superseded');
+    expect(a.reason).toContain('reconciled: posted REQUEST_CHANGES');
+  });
+
+  it('labels that keep moving after a write are reported as a failure, never as agreement', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('accepted') });
+    const flip = ['changes', 'accepted', 'changes', 'accepted', 'changes'];
+    let posts = 0;
+    const churn = { ...gh, exec: (argv) => { const out = gh.exec(argv); if (argv.includes('POST')) gh.labels = liveLabelsFor(flip[posts++] ?? 'changes'); return out; } };
+    const a = mirror(churn, 'accepted');
+    expect(a.outcome).toBe('failed');
+    expect(a.reason).toContain('labels kept moving');
+    expect(a.line).toContain('agree=no');
+  });
+
+  it('fails closed when the live labels cannot be read', () => {
+    const f = fixture({}, { prRaw: JSON.stringify({ head, author: 'web-everything[bot]', authorType: 'Bot', state: 'open' }) });
+    expect(f.result).toMatchObject({ outcome: 'skipped', reason: 'pr-unreadable' });
+    expect(f.posts).toHaveLength(0);
+  });
+
+  it('a superseded line is neither mirrored nor a mismatch in the readiness count', () => {
+    const lines = [formatComparisonLine({ repo: 'o/r', pr: 1, head, labelVerdict: 'accepted', event: 'APPROVE', outcome: 'superseded', reason: 'verdict-superseded (live=review:changes)', mode: 'mirror', source: 'tool' })];
+    expect(summarizeReadiness(lines, { minMirroredVerdicts: 1, maxMismatches: 0 })).toMatchObject({ mirrored: 0, mismatches: 0 });
+  });
+});
+
 describe('clearing under a token that is not the reviewer App (operator send-back #3)', () => {
   const operator = 'User chalbert';
   it('clear-human run by the operator dismisses our change request with the minted reviewer token', () => {
-    const gh = fakeGithub({ viewer: operator });
+    const gh = fakeGithub({ viewer: operator, labels: liveLabelsFor('clear-human') });
     gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
     const reviewerGh = { ...gh, calls: [] };
     const asReviewer = (argv) => { reviewerGh.calls.push(argv); return argv.includes('graphql') ? 'Bot plateau-reviewer' : gh.exec(argv); };
@@ -350,7 +429,7 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(result).toMatchObject({ outcome: 'dismissed', dismissed: 1 });
   });
   it('an accept under the worker token still posts nothing, but its stale change request is lifted as the reviewer', () => {
-    const gh = fakeGithub({ viewer: 'Bot web-everything' });
+    const gh = fakeGithub({ viewer: 'Bot web-everything', labels: liveLabelsFor('accepted') });
     gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
     const asReviewer = (argv) => (argv.includes('graphql') ? 'Bot plateau-reviewer' : gh.exec(argv));
     const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, reviewerExec: () => ({ exec: asReviewer }) });
@@ -360,7 +439,7 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(gh.standing()).toBe('none');
   });
   it('a minted token that is not the reviewer App is refused: nothing is written with it, the dismissal is queued', () => {
-    const gh = fakeGithub({ viewer: operator });
+    const gh = fakeGithub({ viewer: operator, labels: liveLabelsFor('clear-human') });
     gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
     const impostor = vi.fn(argv => (argv.includes('graphql') ? 'User plateau-reviewer' : gh.exec(argv)));
     const queue = { append: vi.fn(() => true), claim: vi.fn() };
@@ -371,7 +450,7 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(result.line).toContain('agree=no dismissal=queued');
   });
   it('no reviewer token: the dismissal is queued, then the next reviewer-token run dismisses it first', () => {
-    const gh = fakeGithub({ viewer: operator });
+    const gh = fakeGithub({ viewer: operator, labels: liveLabelsFor('clear-human') });
     gh.reviews.push(review(7, 'CHANGES_REQUESTED'));
     const entries = [];
     const queue = { append: (e) => { entries.push(e); return true; }, claim: () => ({ entries: entries.splice(0), done: () => {} }) };
@@ -413,6 +492,22 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(gh.reviews.find(r => r.id === 6).state).toBe('DISMISSED');
     expect(endorsedStates(['review:accepted', 'review:human'])).toEqual([]);
     expect(endorsedStates([{ name: 'review:accepted' }])).toEqual(['APPROVED']);
+  });
+  it('a changes verdict that reuses a queued review between the drain\'s label read and its dismissal is put back', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('clear-human') });
+    gh.reviews.push(review(5, 'CHANGES_REQUESTED'));
+    let fired = false;
+    const paused = (argv) => {
+      if (!fired && argv.includes('PUT')) {
+        fired = true;
+        gh.labels = liveLabelsFor('changes');
+        mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'changes', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {} });
+      }
+      return gh.exec(argv);
+    };
+    const { lines } = drainWith(gh, [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [5] }], { exec: paused });
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(lines.some(l => l.includes('label=clear-human') && l.includes('outcome=superseded') && l.includes('reconciled: posted REQUEST_CHANGES'))).toBe(true);
   });
   it('an entry for another owner waits for a run there, unchanged; a hopeless one is given up loudly', () => {
     const gh = fakeGithub();
