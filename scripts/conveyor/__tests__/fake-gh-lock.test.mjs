@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Child processes import the helper by file URL, so this suite needs the Node environment.
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync, existsSync } from 'node:fs';
