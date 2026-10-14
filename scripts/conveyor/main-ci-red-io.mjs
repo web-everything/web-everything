@@ -297,7 +297,11 @@ export async function probeAndOwnMainCi({
     withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
   }
   for (const run of probe.runs || []) {
-    if (reruns[run.databaseId]?.kind === 'flake' && run.status !== 'completed') run.rerunPending = true;
+    if (reruns[run.databaseId]?.kind !== 'flake') continue;
+    // The rerun replaces the original verdict: while it runs the run stays red, and a rerun that finishes with no
+    // verdict (cancelled / skipped / infra-only) must not erase the failure it was meant to settle.
+    if (run.status !== 'completed') run.rerunPending = true;
+    else run.rerunInconclusive = true;
   }
   const state = mainRedState(probe.runs, { tip: probe.tip });
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };

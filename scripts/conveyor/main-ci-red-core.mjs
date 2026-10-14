@@ -214,14 +214,15 @@ const RED = new Set(['failure', 'timed_out', 'startup_failure']);
 /**
  * One run's verdict about main's code: `green`, `red`, or `ignore` (still running, cancelled by a newer push,
  * skipped, or a failure whose only bad jobs were cancelled / never got a runner — `infraOnly`). A red run
- * with `rerunPending` stays red until its rerun completes. PURE.
+ * with `rerunPending` stays red until its rerun completes, and one whose rerun finished without a verdict
+ * (`rerunInconclusive`: cancelled, skipped, infra-only) stays red until a later run succeeds. PURE.
  */
 export function classifyRun(run) {
   if (String(run?.status ?? '').toLowerCase() !== 'completed') return run?.rerunPending === true ? 'red' : 'ignore';
   const c = String(run?.conclusion ?? '').toLowerCase();
   if (c === 'success') return 'green';
-  if (RED.has(c)) return run?.infraOnly === true ? 'ignore' : 'red';
-  return 'ignore';
+  if (RED.has(c) && run?.infraOnly !== true) return 'red';
+  return run?.rerunInconclusive === true ? 'red' : 'ignore';
 }
 
 const ts = (s) => { const t = Date.parse(s ?? ''); return Number.isFinite(t) ? t : null; };

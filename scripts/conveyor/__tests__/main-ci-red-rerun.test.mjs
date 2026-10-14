@@ -98,6 +98,28 @@ describe('rerun IO and ledger', () => {
     expect(opts.dispatch).not.toHaveBeenCalled();
     expect(opts.rerun).toHaveBeenCalledTimes(1);
   }));
+  it('keeps the hold when a flake rerun finishes inconclusive, and never lifts it on an older green', async () => fixture(async (opts) => {
+    await io.probeAndOwnMainCi(opts); // reserves + issues the flake rerun of run 2
+    const publish = opts.publishState;
+    for (const finished of [
+      { conclusion: 'cancelled' }, { conclusion: 'skipped' }, { conclusion: 'failure', infraOnly: true },
+    ]) {
+      publish.mockClear();
+      const out = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, { ...red, status: 'completed', attempt: 2, ...finished }] }) });
+      expect(out.mainRed, JSON.stringify(finished)).toMatchObject({ red: true, firstRedSha: red.headSha });
+      expect(out.decision.reason, JSON.stringify(finished)).not.toBe('main-green');
+      expect(publish).not.toHaveBeenCalledWith(null);
+      // the rerun finished, so repair ownership is no longer suppressed
+      expect(out.decision.reason, JSON.stringify(finished)).not.toBe('flake-rerun-pending');
+    }
+    // a later success on a newer commit still lifts the hold
+    const next = { ...green, databaseId: 9, headSha: 'beef01234567890', createdAt: '2026-10-14T05:00:00Z' };
+    const lifted = await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green, { ...red, status: 'completed', attempt: 2, conclusion: 'cancelled' }, next] }) });
+    expect(lifted.decision.reason).toBe('main-green');
+    // only runs the IO layer flagged (flake reruns) are held red; a plain cancelled run still proves nothing
+    expect(core.classifyRun({ ...tip, rerunInconclusive: true })).toBe('red');
+    expect(core.classifyRun(tip)).toBe('ignore');
+  }));
   it('prunes only old reruns on green', async () => fixture(async (opts) => {
     writeFileSync(io.ledgerPathIn(opts.dir), JSON.stringify({ _reruns: { old: { at: 0 }, recent: { at: opts.now } } }));
     await io.probeAndOwnMainCi({ ...opts, readRuns: () => ({ runs: [green] }) });
