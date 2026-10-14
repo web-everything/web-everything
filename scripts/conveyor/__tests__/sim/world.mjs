@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
-import { worldThrottleEnv } from './world-env.mjs';
+import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -246,7 +246,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const toolsDir = join(root, 'tools');
   mkdirSync(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy']);
-  for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
+  for (const dir of toolPathDirs()) {
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -256,10 +256,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    // Vitest's per-file throttle root outlives each world. A scenario that advances its clock can leave
-    // future-dated budget windows there, forcing the next scenario to wait on a different world's spend.
-    // Keep one shared throttle for this world's daemons and children, owned and removed by this world.
-    ...worldThrottleEnv(root),
+    ...isolatedProcessEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
@@ -271,6 +268,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
     LANE_POOL_ROOT: lanePoolRoot,
+    // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
+    // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
+    // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,
@@ -326,10 +327,6 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
-  delete env.WE_GITHUB_APP_ID;
-  delete env.WE_GITHUB_APP_INSTALLATION_ID;
-  delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
-  delete env.GITHUB_TOKEN;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
