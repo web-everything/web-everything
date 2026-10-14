@@ -75,7 +75,7 @@ const hasRedMainDiscount = config => config.redMainDiscount === 'on' && Array.is
 // PR #5248 review: only a CLOSED window discounts. While main is still red every
 // session counts, so the per-head ceilings keep bounding spend through the outage.
 const inClosedRedWindow = (row, config) => hasRedMainDiscount(config)
-  && isWithinRedWindow(Date.parse(row.at), config.redMainWindows.filter(window => window?.end != null));
+  && isWithinRedWindow(Date.parse(row.at), config.redMainWindows.filter(window => Number.isFinite(Date.parse(window?.end))));
 const discountedSession = (row, config) => isSession(row) && inClosedRedWindow(row, config);
 function windowRows(rows, now, config) {
   const end = new Date(now).getTime(), start = end - config.windowHours * 3600000;

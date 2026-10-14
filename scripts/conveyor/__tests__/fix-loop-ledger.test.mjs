@@ -276,6 +276,9 @@ it('keeps the per-head ceilings while main is still red (open window)', () => {
   expect(decide(3)).toBe('hold');
   expect(decide(5)).toBe('park');
   expect(fixLoopState(incident({ rows: sessions(3), config: open }))).toMatchObject({ count: 3, redMainDiscounted: 0 });
+  // An end that does not parse is open-ended to isWithinRedWindow, so it must not discount either.
+  const unparsed = { ...open, redMainWindows: [{ ...incidentWindows[0], end: 'not-a-date' }] };
+  expect(fixLoopDisposition(incident({ rows: sessions(5), config: unparsed })).action).toBe('park');
 });
 it('bounds discounted red-main sessions per head with a separate hard cap', () => {
   const windows = Array.from({ length: 4 }, (_, i) => ({ start: `2026-10-13T1${i}:00:00Z`, end: `2026-10-13T1${i}:30:00Z` }));
