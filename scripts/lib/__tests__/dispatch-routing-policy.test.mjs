@@ -14,7 +14,7 @@ describe('operation routing policy', () => {
   it('resolves aliases, ordered availability fallback, and inherited routes', () => {
     expect(resolveOperationRoute({ operation: 'prepare-item' })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5' }] });
     expect(resolveOperationRoute({ operation: 'prepare-item', available: ['claude'] })).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5', fallback: [] });
-    expect(resolveOperationRoute({ operation: 'build' })).toMatchObject({ provider: 'codex', effort: 'high' });
+    expect(resolveOperationRoute({ operation: 'build' })).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium' });
     expect(() => resolveOperationRoute({ operation: 'prepare-item', available: [] })).toThrow(/no available route/);
   });
   it.each([
@@ -56,9 +56,9 @@ describe('operation routing policy', () => {
   it('keeps the critical gate ahead of an explicit provider override, even if the policy omits the operation kind', () => {
     const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
     const dispatch = { kind: 'build', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' };
-    expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5' });
+    expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
     policy.criticalWorkGate.kinds = [];
-    expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5' });
+    expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
   });
   it('prepare policy reaches the actual launcher and reports the selected fallback model', () => {
     const routing = decideDispatchRoute({ kind: 'prepare-item', cardPath: 'we:backlog/9001-card.md' });
@@ -104,7 +104,7 @@ it('a critical-miss veto removes the exact model from the whole fallback chain',
 it('treats an edit to the routing policy itself as critical work', () => {
   const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
   const route = decideDispatchRoute({ kind: 'build', scopePaths: ['we:scripts/lib/dispatch-routing-policy.json'], risk: 'low', size: 1 }, { routingPolicy: policy });
-  expect(route.policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5' });
+  expect(route.policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
 });
 
 
@@ -125,7 +125,7 @@ describe('review-round regressions (PR 3209)', () => {
   });
   it('Claude policy ids spawn as tier aliases, never pinned ids', async () => {
     const { claudeSpawnAlias } = await import('../dispatch-routing-policy.mjs');
-    expect(['claude-haiku-4-5-20251001', 'claude-sonnet-5-5', 'claude-opus-5'].map(claudeSpawnAlias)).toEqual(['haiku', 'sonnet', 'opus']);
+    expect(['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'].map(claudeSpawnAlias)).toEqual(['haiku', 'sonnet', 'opus']);
     expect(claudeSpawnAlias('gpt-6-astra')).toBe('gpt-6-astra');
   });
   it('an env snapshot cannot loosen the critical-work gate', async () => {
@@ -151,10 +151,10 @@ it('adapts effort and provider to bounded prepares, design and mechanical work',
     expect(resolveOperationRoute({ operation: 'prepare-item', ...context })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   }
   expect(resolveOperationRoute({ operation: 'prepare-item', size: 5 }).effort).toBe('high');
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix' }).effort).toBe('low');
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix' }).effort).toBe('medium');
   expect(resolveOperationRoute({ operation: 'build', taskType: 'test-fix' })).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash', effort: 'low' });
-  expect(resolveOperationRoute({ operation: 'ci-heal' })).toBeNull();
-  expect(resolveOperationRoute({ operation: 'fix' })).toBeNull();
+  expect(resolveOperationRoute({ operation: 'ci-heal' })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
+  expect(resolveOperationRoute({ operation: 'fix' })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
 });
 
 it.each(['codex', 'claude', 'antigravity', 'agy-claude', 'agy-gemini'])('rejects unknown %s effort and retains the last good edit', provider => {
@@ -190,16 +190,96 @@ it('accepts and reports a reasoned explicit model pin through the selected nativ
     }, { probationLaunch: 'on', scriptExists: () => true, probation,
       agent: request => defaultClaudeProvider(request, { spawnAgent }) });
     expect(spawnAgent.mock.calls[0][0]).toEqual(expect.arrayContaining(['--model', pin]));
-    expect(reportModel).toHaveBeenLastCalledWith(pin === 'opus' ? 'claude-opus-5' : pin);
+    expect(reportModel).toHaveBeenLastCalledWith(pin === 'opus' ? 'claude-opus-5-5' : pin);
     expect(probation).not.toHaveBeenCalled();
   }
 });
 
-it.each(['fix', 'ci-heal'])('%s retains inherited repair routing despite a global task-type policy', kind => {
+it.each(['fix', 'ci-heal'])('%s applies explicit repair routing despite a global task-type policy', kind => {
   const policy = copy();
   const dispatch = { kind, scopePaths: ['we:scripts/example.mjs'], risk: 'low', size: 2 };
   const inherited = decideDispatchRoute(dispatch, { routingPolicy: { ...policy, taskTypes: {} } });
   const routed = decideDispatchRoute(dispatch, { routingPolicy: policy });
   expect(routed).toEqual(inherited);
-  expect(routed.policyRoute).toBeUndefined();
+  expect(routed.policyRoute).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' });
+});
+
+it.each(['fix', 'ci-heal'])('%s retries Astra high before Claude only on definite pre-launch refusal', kind => {
+  const route = resolveOperationRoute({ operation: kind });
+  expect([route, ...route.fallback].map(({ provider, model, effort }) => ({ provider, model, effort }))).toEqual([
+    { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
+    { provider: 'codex', model: 'gpt-6-astra', effort: 'high' },
+    { provider: 'claude', model: 'claude-sonnet-5-5', effort: 'high' },
+  ]);
+  const seen = [];
+  const wrapper = request => { seen.push(request.policyRoute.model); throw Object.assign(new Error('not started'), { notApplied: true }); };
+  const agent = request => { seen.push(request.table.model); return 'session'; };
+  expect(routeDispatchProvider({ launchKind: kind, policyRoute: route }, {
+    registry: { [kind]: { runScript: 'wrapper.mjs', provider: wrapper } }, scriptExists: () => true, agent,
+  })).toBe('session');
+  expect(seen).toEqual(['gpt-6.1-sol', 'gpt-6-astra', 'claude-sonnet-5-5']);
+  seen.length = 0;
+  expect(() => routeDispatchProvider({ launchKind: kind, policyRoute: route }, {
+    registry: { [kind]: { runScript: 'wrapper.mjs', provider: () => { throw new Error('indeterminate'); } } }, scriptExists: () => true, agent,
+  })).toThrow('indeterminate');
+  expect(seen).toEqual([]);
+});
+
+it('routes all mechanical documentation and filing entries at medium effort', () => {
+  const policy = copy();
+  for (const entry of [policy.operations.build, policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
+    expect(entry.provider).toBe('codex'); expect(entry.model).toBe('sol');
+    expect(Object.values(entry.effort).every(e => e === 'medium')).toBe(true);
+    expect(entry.fallback).toEqual([{ provider: 'claude', model: 'sonnet', effort: 'medium' }]);
+  }
+  expect(policy.aliases.codex.sol).toBe('gpt-6.1-sol');
+});
+
+it('routes build-new-feature task work like build, including inherited operations and fallback', () => {
+  const policy = copy();
+  expect(policy.taskTypes['build-new-feature']).toEqual({
+    provider: 'codex', model: 'sol',
+    effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
+    fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
+  });
+  expect(policy.taskTypes['build-new-feature']).toEqual(policy.operations.build);
+  const buildRoute = resolveOperationRoute({ operation: 'build', policy });
+  policy.operations.build = { inherit: true };
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toEqual(buildRoute);
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', available: ['claude'], policy })).toMatchObject({
+    provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', fallback: [],
+  });
+});
+
+it('preserves operator-protected Astra and ruling escalation routes', () => {
+  const policy = copy();
+  for (const k of ['prepare', 'prepare-decision', 'prepare-item', 'investigate']) expect(policy.operations[k].model).toBe('astra');
+  for (const k of ['design', 'diagnosis']) expect(policy.taskTypes[k].model).toBe('astra');
+  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'opus', fallback: [] });
+  expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'opus', effort: 'high' }] });
+});
+
+it('honours a configured retry array at the real launch boundary', async () => {
+  const { resolveCodexTaskRoute } = await import('../codex-task-route.mjs');
+  const route = resolveOperationRoute({ operation: 'fix' });
+  for (const retry of [[], [{ model: 'gpt-6-luna', effort: 'max' }]]) {
+    const models = [];
+    const wrapper = r => { models.push(r.policyRoute.model); throw Object.assign(new Error('not started'), { notApplied: true }); };
+    routeDispatchProvider({ launchKind: 'fix', policyRoute: route }, {
+      registry: { fix: { runScript: 'wrapper.mjs', provider: wrapper } }, scriptExists: () => true,
+      agent: r => { models.push(r.table.model); return 'session'; },
+      resolveCodexRoute: opts => resolveCodexTaskRoute({ ...opts, tool: {}, platform: {}, env: { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ fix: { retry } }) }, log: false }),
+    });
+    expect(models).toEqual(['gpt-6.1-sol', ...retry.map(r => r.model), 'claude-sonnet-5-5']);
+  }
+});
+
+it('does not resurrect a vetoed Codex retry model at launch', () => {
+  const route = resolveOperationRoute({ operation: 'fix', vetoes: [{ provider: 'codex', model: 'gpt-6-astra' }] });
+  const models = [];
+  routeDispatchProvider({ launchKind: 'fix', policyRoute: route }, {
+    registry: { fix: { runScript: 'wrapper.mjs', provider: r => { models.push(r.policyRoute.model); throw Object.assign(new Error('not started'), { notApplied: true }); } } },
+    scriptExists: () => true, agent: r => { models.push(r.table.model); return 'session'; },
+  });
+  expect(models).toEqual(['gpt-6.1-sol', 'claude-sonnet-5-5']);
 });

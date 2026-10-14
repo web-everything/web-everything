@@ -527,7 +527,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-9001',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
-      '--effort', 'high', '--model', 'opus', '# build #9001',
+      '--effort', 'medium', '--model', 'opus', '# build #9001',
     ]);
   });
 
@@ -548,11 +548,11 @@ describe('(f) workerModelTable', () => {
   it('a routed record whose model is a native Claude id → that id and its tier', () => {
     expect(workerModelTable({ outcome: 'routed', model: 'claude-sonnet-5-5', tier: 'sonnet' }))
       .toMatchObject({ tier: 'sonnet', model: 'sonnet' });
-    expect(workerModelTable({ outcome: 'routed', model: 'claude-opus-5', tier: 'opus' }))
+    expect(workerModelTable({ outcome: 'routed', model: 'claude-opus-5-5', tier: 'opus' }))
       .toMatchObject({ tier: 'opus', model: 'opus' });
     // #3906 — the spawn flag is the tier ALIAS, never the record's pinned id: a worker must never run an older
     // model than the current one of its tier (the pinned `claude-opus-5` predates Opus 5.5).
-    expect(workerModelTable({ outcome: 'routed', model: 'claude-opus-5', tier: 'opus' }).model).not.toMatch(/claude-opus-5/);
+    expect(workerModelTable({ outcome: 'routed', model: 'claude-opus-5-5', tier: 'opus' }).model).not.toMatch(/claude-opus-5/);
   });
 
   it('a role record with a tier → that tier\'s spawn alias', () => {

@@ -6,6 +6,17 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Model routing retry verification
+
+Codex `modelByTask` resolves model, effort and the optional `retry` array as independent cascade
+leaves. Each retry pair must use a catalogue model and one of its supported efforts; `[]` disables
+same-provider retries. Cover standard, platform, tool and env provenance, invalid pair rejection,
+and the actual launch sequence before Claude fallback. Routing-policy model vetoes must survive
+settings expansion at the launch boundary. Only a definite pre-launch `notApplied` refusal advances
+the chain; an indeterminate or already-started launch must never start a second worker.
+Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
+per-lens design models still override the helper default.
+
 ## Wrapped worker verification waits
 
 For the 117 S3b regression (2026-10-08), replay the saved StructuredOutput fixtures against both
