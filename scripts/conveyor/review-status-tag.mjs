@@ -44,6 +44,12 @@ import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from '
 /** Compatibility default while dispatch and hold readers still use review-status labels. */
 export const LEGACY_REVIEW_STATUS_DEFAULT = true;
 
+// No network from the label writer; the planner owns the live required-check read.
+const readCachedRequiredChecks = ({ repo }) => getRequiredStatusChecks({
+  repo,
+  readChecks: () => { throw new Error('required-status-checks: cache-only read in the status tagger'); },
+});
+
 /** Matches this module's own label shape, and only this shape.
  *
  *  `awaiting-base` — a draft stacked on a non-default branch waits for its base PR to land.
@@ -245,7 +251,7 @@ export function tagReviewStatus({
   planRows = null,
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
   requiredChecks, prStatusSettings,
-  readRequiredChecks = getRequiredStatusChecks, loadStatusSettings = loadPrStatusSettings,
+  readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
 } = {}) {
   const repoKey = repo === undefined ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`review-status-tag: --repo ${repo} is not a constellation repo`);
