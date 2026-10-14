@@ -276,6 +276,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     SIM_NPM_MODULES: nodeModulesSrc,
     SIM_NPM_LOCKFILE: join(INVOKING_ROOT, 'package-lock.json'),
     LANE_POOL_ROOT: lanePoolRoot,
+    // Each world owns a different simulated clock. Sharing the test file's throttle store lets
+    // an earlier world's clock advance leave a future points window (and leases) for the next
+    // world, which can spend the production acquire timeout waiting before the fake gh runs.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,
