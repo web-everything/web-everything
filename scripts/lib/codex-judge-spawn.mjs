@@ -80,6 +80,7 @@
  * reappearing — do not move them back to `jury-core.mjs` without re-solving this.
  */
 
+import { withCodexUsage } from './codex-usage-ledger.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync,
@@ -640,7 +641,7 @@ export async function codexJudgeSpawn({
   input,
   shape,
   model,
-  effort, mandatoryLens, care, log,
+  effort, mandatoryLens, care, log, lens, repo, pr, card,
   allowedTools = null,
   cwd = null,
   env = null,
@@ -689,7 +690,7 @@ export async function codexJudgeSpawn({
   let result;
   let lastMessage = null;
   try {
-    result = await new Promise((resolve, reject) => {
+    result = await withCodexUsage({ model, effort, taskKind: `review-${lens ?? 'general'}`, caller: 'codex-judge-spawn.mjs', repo, pr, card, changedFiles: false }, () => new Promise((resolve, reject) => {
       let child;
       try {
         child = spawnFn(cli, argv, { cwd: spawnCwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -735,7 +736,7 @@ export async function codexJudgeSpawn({
       // CLOSES it, which is the exact property that avoids probe 0's deadlock trap.
       child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
       child.stdin?.end(prompt);
-    });
+    }), { env: env ?? process.env });
     // READ THE LAST-MESSAGE FILE BEFORE CLEANUP — it lives inside `workDir`, which the `finally` below removes.
     // A run that never wrote it (killed before completion, probe 6) leaves this `null`, which
     // `parseCodexJudgeOutcome` falls back past.
