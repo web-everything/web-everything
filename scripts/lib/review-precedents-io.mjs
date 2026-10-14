@@ -7,6 +7,8 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { assertPushRef, readFromTransportBranch, stageOnTransportBranch } from './git-transport-branch.mjs';
 import { readSettings } from './settings-files.mjs';
 import {
@@ -24,7 +26,9 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 export const PRECEDENT_TRANSPORT_BRANCH = 'ops/review-requests';
 export const PRECEDENT_PUSH_REF = 'refs/heads/ops/review-requests';
 export const PRECEDENT_DIR = 'review-precedents';
-const trustedSeeds = JSON.parse(readFileSync(new URL('../review-precedents.seeds.json', import.meta.url), 'utf8')).precedents;
+// Resolve a filesystem path so Vite does not rewrite the seed URL as a browser asset.
+const seedsPath = join(dirname(fileURLToPath(import.meta.url)), '../review-precedents.seeds.json');
+const trustedSeeds = JSON.parse(readFileSync(seedsPath, 'utf8')).precedents;
 const trust = { operatorLogins: OPERATOR_LOGINS, trustedSeeds };
 
 export function precedentGitPath(repo) {
