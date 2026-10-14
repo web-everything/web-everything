@@ -85,10 +85,12 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
   insufficient. Reject untrusted rows even beneath a later trusted tip and mark the ledger unreadable;
   any retained trusted mappings are diagnostic only. Missing verification history,
   exceeded read/history budgets or append-only violations make the ledger unreadable.
-  The trust root (allowed signing keys, and the quarantine list used for recovery) is a file on `main`,
-  always read from the base ref (`origin/main`, or the merge group's base), never from the tree under check;
-  a PR that edits it gains nothing until it is reviewed and merged. Recovery from an untrusted row is a
-  reviewed, human-gated quarantine entry on that file, never a history rewrite (slice (a)).
+  The trust root (allowed signing keys, a reviewed checkpoint that bounds the history walk, and the
+  quarantine list used for recovery) is a file on `main`, read from the base ref (the merge group's base sha
+  in merge_group, `origin/main` elsewhere), never from the tree under check, and verified with an explicit
+  signers file, never the host's keyring. It is a `policy` member of `TRUST_CHAIN`, so every change to it is
+  held at `review:human`. Recovery from an untrusted row, a leaked key or an exhausted history budget is a
+  reviewed quarantine entry or checkpoint advance on that file, never a history rewrite (slice (a)).
 - A numeric card and ledger row may share a number only if the numeric card's `bornAs` equals the row id;
   this is the expected seed and materialization case. Different identities sharing a number error.
 
@@ -118,11 +120,11 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - Read source, in order: a fresh `git fetch` of `ops/card-numbers` (CI and the deploy already fetch
   `ops/quarantine` the same way), then the local remote-tracking ref, then the fallback display. A read failure
   never fails a build. It degrades to showing x-ids.
-  This display fallback does not apply to assignment or to a merge group that needs the ledger (a ledger
-  mode, an `x<6>` file in the merged tree, or a `bornAs` change; slice (c)): a failed fetch or unreadable
-  ledger errors there, even if a stale local ref exists and even inside the land window. A numeric-only
-  group in `rename-before-enqueue`, and any check outside merge_group, warns and skips the ledger-dependent
-  checks; file identity uniqueness is still enforced.
+  This display fallback does not apply to assignment or to a merge group whose own diff needs the ledger
+  (it touches an `x<6>` file; in the ledger modes, also any added card or `bornAs`; slice (c)): a failed
+  fetch or unreadable ledger errors there, even if a stale local ref exists and even inside the land window.
+  Other groups (including a trust-root or quarantine PR) and any check outside merge_group warn and skip the
+  ledger-dependent checks; file identity uniqueness is still enforced.
 
 ### Migration of the ~6,000 existing NNN cards
 

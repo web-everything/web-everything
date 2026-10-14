@@ -17,7 +17,8 @@ Slice (f) of epic xdlnylv: in mode rename-after-land, a batch job opens one PR o
 
 - New job `we:scripts/card-rename-batch.mjs`, run only when `backlog.cardNumbering.mode` is
   `rename-after-land`. `--dry-run` builds the commit and prints it, the rename-set digest and the diff, but
-  pushes nothing and opens no PR. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (default 60), in
+  pushes nothing and opens no PR. `--no-pr` pushes the branch but makes no `gh` call at all (no PR lookup,
+  open or close), for fixture runs against a local origin. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (default 60), in
   we:scripts/settings/card-numbering.json through the same cascade.
 - Each run, in a fresh worktree from `origin/main`:
   1. List `x<6>` cards on main that have a ledger row. None: exit, no PR.
@@ -124,12 +125,15 @@ fixture, never real main, and the live landed batch is slice (d)'s proof:
 - In a lane, make a scratch clone whose `origin` is a local bare copy of the lane. On its main, commit two
   fixture x-cards, one unledgered x-card and a fixture `ops/card-numbers` ledger signed by a test key that
   the scratch's trust root (slice (a)) lists. Run the job by hand with `WE_CARD_NUMBERING_MODE=rename-after-land`
-  (env beats the repo override in the cascade) and `--dry-run` (push nothing, open nothing).
-- Before: `git ls-tree origin/main backlog/ | grep '/x'` lists the three x-cards. After: the dry-run prints the
-  commit it would push (parents, rename-set digest) and its `main...commit` diff renames exactly the two
-  ledgered cards with `bornAs`. A second dry-run reports the same digest and "no push". Then advance the
-  scratch main with an unrelated commit plus one more ledgered card and rerun without `--dry-run` against the
-  scratch remote: the push is a fast-forward. Paste the listings, both digests and the push line.
+  (env beats the repo override in the cascade) and `--no-pr`, against the scratch origin only.
+- Before: `git ls-tree origin/main backlog/ | grep '/x'` lists the three x-cards.
+- Run 1 creates `lane/card-rename-batch` on the scratch origin with B1 (one parent, main). Its `main...B1`
+  diff renames exactly the two ledgered cards with `bornAs`.
+- Run 2, unchanged inputs (also after an unrelated commit on scratch main): same digest as B1, "no push",
+  the branch tip is still B1.
+- Advance scratch main with one more ledgered card. Run 3: B2's parents are (new main, B1), the plain push
+  is accepted as a fast-forward, and `main...B2` renames all three ledgered cards.
+- Paste the listings, the three digests, the parents of B1 and B2, and both push lines.
 
 ## Done when
 

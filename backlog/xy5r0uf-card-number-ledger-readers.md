@@ -4,7 +4,7 @@ size: 5
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82"]
-scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/__tests__/backlog-card-number.test.ts", "we:src/_data/__tests__/backlogRedirects.test.ts", "we:scripts/__tests__/ci-card-ledger-fetch.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
+scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__fixtures__/card-ledger-fixtures.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/__tests__/backlog-card-number.test.ts", "we:src/_data/__tests__/backlogRedirects.test.ts", "we:scripts/__tests__/ci-card-ledger-fetch.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, renderer]
 ---
@@ -65,7 +65,9 @@ Unit tests for the resolver (numeric, ledgered x, unledgered x, conflict, number
 
 Each security guarantee has a named test, in the same fixtures for both readers (slice (a)'s
 `rejectsUntrustedIntroducerBehindTrustedTip`, `trustRootReadFromBaseNotTreeUnderCheck` and partial-line
-fixtures), so the CJS twin cannot ship with weaker checks than the ESM resolver:
+fixtures), so the CJS twin cannot ship with weaker checks than the ESM resolver. The fixtures live in one
+shared module, `we:scripts/backlog/__fixtures__/card-ledger-fixtures.mjs` (fixture repos with signed and
+forged rows, a test trust root and a partial line), imported by every test file below:
 
 - `we:scripts/backlog/__tests__/card-number.test.mjs` (ESM resolver and `show`):
   - `esmRejectsUntrustedRowUnderTrustedTip` — the forged row gives no `displayNum` and no `idFor` mapping;
@@ -79,7 +81,8 @@ fixtures), so the CJS twin cannot ship with weaker checks than the ESM resolver:
   `cjsIgnoresTrustRootInTreeUnderCheck`, `cjsMissingHistoryFallsBackToXId`, plus
   `cjsAndEsmAgreeOnEveryFixture` (same input, same `displayNum` map).
 - `we:src/_data/__tests__/backlogRedirects.test.ts`: `redirectsEmitNothingForUnreadableLedger` (forged row,
-  partial line, missing history, failed fetch: no `/backlog/<NNN>/` or `/backlog/<x-id>/` ledger redirect),
+  partial line, missing history, failed fetch, missing or invalid base trust root: no `/backlog/<NNN>/` or
+  `/backlog/<x-id>/` ledger redirect),
   and the ledgered/unledgered cases above.
 - `we:scripts/__tests__/ci-card-ledger-fetch.test.mjs` (workflow integration):
   `ciFetchesLedgerHistoryBeforeConsumers` and `failedFetchIsUnreadableDespiteStaleRef` (CI and deploy fetch
@@ -88,9 +91,14 @@ fixtures), so the CJS twin cannot ship with weaker checks than the ESM resolver:
 
 ## Proof plan
 
-Live: pick a real x-named card with a shadow row from slice (a) (or a fixture card in a lane). Before:
-`/backlog/<its number>/` is a 404 on the running dev server and `we:scripts/backlog.mjs show <number>` fails. After: the
-redirect lands on the canonical page, the page shows the number, and `show` resolves it. Paste curl output.
+On a fixture: before slice (d) no real x-named card is on main (shadow-mode cards are renamed before they
+land), and the trust root is read from the base ref, so a fixture row on the real ledger would be untrusted
+and lock it. In a lane, make a scratch clone whose `origin` is a local bare copy of the lane, with a test
+trust root on its main, a fixture x-named card, and a fixture `ops/card-numbers` row signed by the test key.
+Start a throwaway dev server from the scratch clone on a spare port (never the operator's running server),
+and stop it by PID when done. Before (lane without this slice): `/backlog/<its number>/` is a 404 and
+`we:scripts/backlog.mjs show <number>` fails. After: the redirect lands on the canonical page, the page shows
+the number, and `show` resolves it. Paste the curl output.
 
 ## Done when
 

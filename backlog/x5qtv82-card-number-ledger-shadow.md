@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
-scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
+scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/backlog/card-ledger-checkpoint.mjs", "we:scripts/backlog/card-ledger-signing-key.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/git-transport-branch.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
@@ -29,21 +29,50 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
     reviewed quarantine below can).
     Missing/shallow history, signature-verification failure or an exceeded history budget makes the ledger
     unreadable; assignment and merge checks fail closed. Display readers may fall back to x-ids.
-  - Trust root: we:scripts/settings/card-ledger-trust.json on `main`, holding `allowedSigners` (the drain
-    signing keys, each with an optional `validAfter`/`validBefore` for rotation, as in git's
-    `allowed_signers` format) and `quarantine` (below). Every reader takes it with `git show` from `<base>`,
-    which is `origin/main` (or the merge group's base sha). It is never read from the working tree or the
-    PR/merge-group tree under check, so a PR that adds its own key or quarantine entry gains nothing until it
-    is reviewed and merged. Missing or invalid trust root: unreadable. A PR that changes this file is held
-    for human security review, like any other trust change.
-  - Writers never publish an unsigned row: `appendCardLedgerRows` signs its commit and verifies that
-    signature against the trust root before pushing. A signing outage therefore refuses the write (shadow
-    warns, assignment refuses) and never poisons the ledger.
-  - Recovery (break-glass): an untrusted introducing commit is cleared by a reviewed PR to `main` adding
-    `{ "commit": "<sha>", "reason", "approval": "<operator URL>" }` to `quarantine`. Readers then drop the rows
-    that commit introduced and treat their numbers as burned (never reassigned, so nothing that cited them
-    is silently remapped); with every untrusted introducer quarantined the ledger is readable again. No force
-    push and no history rewrite. An affected x-card that lost its row is re-assigned through the normal path.
+  - Trust root: we:scripts/settings/card-ledger-trust.json on `main`, holding:
+    - `allowedSigners`: the drain's SSH signing public keys, each `{ key, fingerprint, revoked? }`. Keys are
+      never removed (that would untrust every row they signed and lock the ledger). Commit dates are set by
+      the signer, so no date window is used as revocation: a `revoked` key authenticates only commits at or
+      before `checkpoint`, never after.
+    - `checkpoint`: `{ commit, fileSha256 }`, a reviewed point on `ops/card-numbers`. Verification walks only
+      history after it, and the ledger file at that commit must hash to `fileSha256`; rows at or before it
+      are trusted as reviewed. This bounds the history walk as the ledger grows. When the history budget is
+      exceeded, or a key leaks, the ledger is unreadable until a reviewed PR advances the checkpoint: a
+      script, `we:scripts/backlog/card-ledger-checkpoint.mjs`, verifies all history up to a commit and prints
+      the entry to commit.
+    - `quarantine`: entries `{ commit, reason, approval }` (below). `commit` must be a full 40-character
+      lowercase sha.
+    - Readers take it with `git show` from `<base>`: inside merge_group that is the merge group's base sha
+      (`merge_group.base_sha`); everywhere else, `origin/main`. It is never read from the working tree or the
+      PR/merge-group tree under check, so a PR that adds its own key or quarantine entry gains nothing until
+      it is reviewed and merged. A missing or invalid trust root, including a malformed quarantine or
+      checkpoint entry, makes the ledger unreadable.
+    - The file is registered in `TRUST_CHAIN` (we:scripts/lib/gate-config.mjs:106) as a `policy` member with
+      `leash: 'spec'`, so any PR that changes it, including the bootstrap PR adding the first key, is held at
+      `review:human` and cannot be merged by the AI drain alone.
+  - Verification never uses ambient trust. For each introducing commit, the reader writes an
+    `allowed_signers` file built from the base trust root to a temp path and runs
+    `git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=<tmp> verify-commit --raw <sha>`, with `GNUPGHOME`
+    set to an empty temp dir. It then checks that the reported signer fingerprint is a listed key. A key
+    trusted in the host's own keyring or git config never counts.
+  - Signing: `stageOnTransportBranch` commits and pushes in one step (`writeCommitPush`,
+    we:scripts/lib/git-transport-branch.mjs:334-336). This slice adds an optional `sign: { keyPath }` to it:
+    commit with `-S` using that key, verify the new commit as above, and only then push. Without `sign` it
+    behaves as today. `appendCardLedgerRows` always passes it, so writers never publish an unsigned row. A
+    signing outage refuses the write (shadow warns, assignment refuses) and never poisons the ledger.
+  - Key provisioning (owned here): `we:scripts/backlog/card-ledger-signing-key.mjs` creates the drain host's
+    signing key if it is absent (private key outside every checkout, mode 600) and prints the public key and
+    fingerprint. The bootstrap trust-root PR adds it and goes through `review:human`; the seed `--apply` and
+    the live proof run only after that PR lands.
+  - Recovery (break-glass): an untrusted introducing commit is cleared by a reviewed PR to `main` adding a
+    `quarantine` entry. Readers parse that commit's rows with the same strict row shape (bad lines are
+    skipped), drop them, and record their numbers as burned. Burned numbers form an exclusion list: the
+    allocator skips them, but they never raise the floor (`max` is over trusted rows and numeric files only),
+    so one forged `num: 99999` cannot use up the range. A trusted row always wins: a number held by a trusted
+    row is never burned. With every untrusted introducer quarantined (or older than the checkpoint), the
+    ledger is readable again. No force push and no history rewrite. An affected x-card that lost its row is
+    re-assigned through the normal path. The quarantine PR itself does not need the ledger to merge (slice
+    (c) decides "needs the ledger" from the group's own diff), so recovery never deadlocks in the queue.
   - `assignCardNumbers({ repo, ids, pr, floor })` runs inside `withNumberingLock`
     (we:scripts/readiness/drain-lock.mjs). Ids that already have a row return their number (idempotent).
     New ids get `max(ledger, floor) + 1, +2, ...`. Append and push with a new `appendCardLedgerRows` in
@@ -113,8 +142,22 @@ Required tests in that same suite:
   root at the base is unreadable.
 - **Capability (Red today)** — `quarantineRestoresReadabilityAndBurnsNumbers`: with a forged row beneath a
   trusted tip, the ledger is unreadable; after the base trust root quarantines the forging commit, it is
-  readable, the forged row's number is never allocated again, and an expired key (`validBefore` in the past)
-  does not authenticate a later commit.
+  readable and the forged row's number is never allocated again. A forged `num: 99999` does not raise the
+  next number; a burned number that a trusted row holds stays that row's. A short or uppercase quarantine
+  sha makes the trust root invalid.
+- **Capability (Red today)** — `revokedKeyOnlyBeforeCheckpoint`: a commit signed by a `revoked` key after the
+  checkpoint is rejected even with a backdated commit date; the same key's commits at or before the
+  checkpoint stay trusted.
+- **Capability (Red today)** — `checkpointBoundsHistoryWalk`: verification reads no commit at or before the
+  checkpoint; a checkpoint whose `fileSha256` does not match is unreadable; history past the budget after the
+  checkpoint is unreadable, and advancing the checkpoint makes it readable.
+- **Capability (Red today)** — `ignoresAmbientSignerTrust`: the forger's key is trusted in the host keyring
+  and in a local `gpg.ssh.allowedSignersFile`, but is not in the base trust root; its row is rejected.
+- **Capability (Red today)** — `signedTransportVerifiesBeforePush` (in
+  we:scripts/lib/__tests__/git-transport-branch.test.mjs): with `sign`, a commit whose signature does not
+  verify is never pushed; without `sign`, behaviour is unchanged.
+- In we:scripts/lib/__tests__/gate-config.test.mjs: a PR touching the trust root file is a `policy`-tier
+  trust-chain path.
 - **Capability (Red today)** — `writerRefusesUnsignedPush`: a signing failure makes `appendCardLedgerRows`
   push nothing and return no number.
 - **Capability (Red today)** — `rejectsOversizedLedgerBeforeAllocation`: enforce a declared byte cap at the transport read boundary,
@@ -126,12 +169,15 @@ Required tests in that same suite:
 
 ## Proof plan
 
-Live: run one drain pass with `mode: shadow` that numbers a real new card. Before: `git show
+Precondition, owned by this slice: the drain host's signing key exists and the bootstrap trust-root PR
+carrying its public key has landed through `review:human`. Then, live: run one drain pass in shadow (the
+default `rename-before-enqueue` mode with shadow writes on) that numbers a real new card. Before: `git show
 origin/ops/card-numbers:card-numbers/we.jsonl` has no row for it. After: the row exists and its `num` equals the
 NNN the rename gave the file. Paste both outputs.
 
 ## Done when
 
+- The bootstrap trust-root PR (first drain key, initial checkpoint) has landed through `review:human`.
 - The shadow rows for the next 5 real numbered cards match their renamed file numbers exactly.
 - The seed run has written one row per `bornAs` card, and `readCardLedger` reports zero conflicts.
 

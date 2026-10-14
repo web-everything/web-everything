@@ -39,11 +39,19 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
   offline/unreadable means warn and skip only the ledger-dependent checks, never "all clear"; duplicate
   file identities still error. Inside merge_group, unreadable (including failed fetch, missing history,
   truncation/over-cap or failed authentication) is an error, with no window exemption, only when the group
-  needs the ledger: the mode is not `rename-before-enqueue`, or the prospective merged tree holds an `x<6>`
-  backlog file, or the group adds or changes a card's `bornAs`. A numeric-only group in
-  `rename-before-enqueue` (today's state, and a rollback with no x-cards on main) does not depend on the ops
-  branch: the ledger-dependent checks warn and skip as outside merge_group, and duplicate file identities
-  and today's numeric rules still error. So an ops-branch outage never stops today's merge queue.
+  needs the ledger. That is decided from the group's own diff against its base, never from the mode alone
+  or from files the group does not touch:
+  - in every mode: the diff adds, renames or modifies an `x<6>` backlog file;
+  - in `rename-after-land` and `ledger-only`: also, the diff adds or renames any backlog card file or adds
+    or changes a `bornAs`.
+  Otherwise the ledger-dependent checks warn and skip, as outside merge_group, and duplicate file identities
+  and today's numeric rules still error. Cards already on main that the group does not touch were checked
+  when they landed. In `rename-before-enqueue`, a drain-numbered new card (numeric name plus the `bornAs`
+  that `stampBornAs` writes, we:scripts/backlog/id.mjs:92) does not need the ledger at the gate: once slice
+  (d) lands, the drain reads the ledger under the numbering lock before choosing that number and refuses
+  while it is unreadable; before (d) the ledger has no authority. So in `rename-before-enqueue` an
+  ops-branch outage blocks only groups that touch an x-file, and a trust-root or quarantine PR (no card
+  touched) always merges in every mode, so recovery never deadlocks.
   Slice (d) replaces #5057's blanket x-file refusal; until then that refusal remains too.
 
 ## MVP
@@ -56,10 +64,10 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — the gate consumes slice (a)'s validated rows only.
 2. **Truncated reads** — unreadable warns outside merge_group; inside merge_group it errors whenever the
-   group needs the ledger (see Design), and warns for a numeric-only group in `rename-before-enqueue`.
+   group's diff needs the ledger (see Design), and warns otherwise.
 3. **Shared state files** — read-only.
 4. **Fail closed** — an unledgered x-card past the land window errors; in merge_group an unreadable ledger
-   errors for every group that needs it (an x-file, a `bornAs` change, or a ledger mode) and, once slice (d) replaces #5057, an unledgered x-card always errors, even inside the window.
+   errors for every group whose diff needs it (see Design) and, once slice (d) replaces #5057, an unledgered x-card always errors, even inside the window.
 5. **Identity scoping** — check uniqueness across the prospective merged tree, keyed on x-id or `bornAs`,
    never the slug; seed/materialization equality is accepted only for the same identity.
 6. **State over time** — the land-window warning covers the gap between merge and the drain's row; slice (d)
@@ -81,14 +89,16 @@ Required tests in `we:scripts/__tests__/check-standards-rules.test.mjs`:
   x-id; error. Also cover two PR additions, x-file plus numeric `bornAs`, and two numeric `bornAs` aliases.
   Unchanged same-path files and a proper x-to-numeric rename pass.
 - **Capability (Red today)** — `unreadableLedgerInMergeGroupErrors` and `unreadableLedgerOutsideMergeGroupWarns`: paired context tests
-  for failed fetch with stale ref, deleted/renamed ledger file, missing history, authentication failure and
-  over-cap/truncated read; the error case repeats in `rename-after-land` and `ledger-only`, and in
-  `rename-before-enqueue` with an x-file in the merged tree and with a `bornAs` change, and inside the land
-  window.
-- **Capability (Red today)** — `unreadableLedgerNumericOnlyGroupPassesInRenameBeforeEnqueue`: the same
-  unreadable states, in merge_group, `rename-before-enqueue`, with only numeric cards in the merged tree and
-  no `bornAs` change: the gate passes with a ledger-skipped warning, while a duplicate numeric file still
-  errors (the unaffected population keeps working when the dependency is down).
+  for failed fetch with stale ref, deleted/renamed ledger file, missing history, authentication failure,
+  over-cap/truncated read, and a missing or invalid base trust root (including a malformed quarantine or
+  checkpoint entry). The error case: a diff touching an x-file in every mode, and a diff adding a card or a
+  `bornAs` in `rename-after-land` and `ledger-only`; also inside the land window.
+- **Capability (Red today)** — `unreadableLedgerUnaffectedGroupsPass`: the same unreadable states, in
+  merge_group, pass with a ledger-skipped warning for (i) a `rename-before-enqueue` group adding a
+  drain-numbered card (numeric name plus stamped `bornAs`), (ii) a group touching no card, in every mode,
+  including a trust-root quarantine PR, and (iii) a group that leaves untouched x-cards on main alone. A
+  duplicate numeric file still errors in each (the unaffected population keeps working while the dependency
+  is down).
 
 Integration in `we:scripts/__tests__/check-standards.test.mjs`: exercise the CI-fetched ledger through the
 real rule caller in merge_group, then fail the fetch and assert nonzero exit. An injected-ledger unit test
@@ -96,19 +106,23 @@ alone is insufficient proof of wiring.
 
 ## Proof plan
 
-Live: in a lane, add a fixture x-named card plus a fixture ledger row and run `node
-we:scripts/operations/run.mjs verify --checkout=<lane>` with `WE_CARD_NUMBERING_MODE=ledger-only`. Before this slice: the
-hash-on-main rule errors. After: clean. Remove the row: the rule errors again. Paste all three outputs.
-Also run with merge_group context and the CI fetch path: a failed fetch must error despite a stale ref;
-the same unreadable state outside merge_group warns. Record both outputs.
+On a fixture, never the real ledger: the trust root is read from the base ref, so a fixture row on the
+real `ops/card-numbers` would be untrusted and would lock the ledger for everyone. In a lane, make a scratch
+clone whose `origin` is a local bare copy of the lane; on its main, commit a test trust root listing a test
+signing key, and push a fixture `ops/card-numbers` branch (one row signed by that key) to the scratch origin.
+Commit a fixture x-named card and run `node we:scripts/operations/run.mjs verify --checkout=<scratch>` with
+`WE_CARD_NUMBERING_MODE=ledger-only`. Before this slice: the hash-on-main rule errors. After: clean. Remove the
+row (a new signed commit on the scratch ops branch): the rule errors again. Paste all three outputs.
+Also run with merge_group context and the CI fetch path against the scratch origin: a failed fetch must error
+for a group touching the x-card despite a stale ref, and warn for a group touching no card. Record both.
 
 ## Done when
 
 - In every mode, a ledger-numbered x-card on main passes the gate and an unledgered one fails after the window.
 - In `rename-before-enqueue`, the gate output on today's numeric main is unchanged; ledgered x-cards added
   before a rollback remain accepted.
-- CI wiring is exercised, an unreadable ledger errors in every merge group that needs it and not in a
-  numeric-only `rename-before-enqueue` group, duplicate x-ids fail, and same-identity
+- CI wiring is exercised, an unreadable ledger errors in every merge group whose diff needs it and not in
+  the unaffected groups named above, duplicate x-ids fail, and same-identity
   numeric/ledger equality passes in the named tests.
 
 ## Acceptance

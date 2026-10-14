@@ -37,14 +37,21 @@ Idempotency key: advisory-prevention-key:web-everything/web-everything#5245@9e8b
 - Require bounded-read guarantees to name a test asserting the actual read bound and zero allocation,
   append/push on overflow, including retry reads. A test checking only the returned error is insufficient.
 - Add a backlog-integrity rule for proof prerequisites (round 4): a Proof plan or Done-when that names another
-  slice as already landed ("after slice (d) has landed …") must have that slice as an ancestor in
-  `blockedBy`. A slice that names one of its own dependents there errors (the two cards would deadlock).
+  slice as already landed or as a precondition ("after slice (d) has landed …") must have that slice as an
+  ancestor in `blockedBy`; naming a dependent that way errors (the two cards would deadlock). Naming a
+  dependent as the slice that takes over a later proof ("… is in slice (d)'s Done-when") passes.
+- Add a review-lens line for preconditions stated as repo state, not slice names ("real x-cards on main", "a
+  provisioned signing key", "a row on the real ledger"): the reviewer names which ancestor slice or which
+  in-card step produces that state, or the proof must use a fixture.
 - Add review-lens checks (round 4):
   - every new fail-closed gate names a test showing the unaffected population (for example numeric-only
     merge groups) still passes when the dependency is down;
   - a trust root (allowed signers, allow-lists) is read from the base ref, never the tree under check, with a
     fixture where the PR edits it and gains nothing;
-  - every fail-closed state that later good writes cannot clear names its reviewed recovery procedure;
+  - every fail-closed state that later good writes cannot clear names its reviewed recovery procedure, and
+    that recovery itself can merge while the state holds;
+  - signature checks pass an explicit signers file built from the trust root (never the host keyring or git
+    config), never treat signer-set commit dates as revocation, and bound the history they walk;
   - every security guarantee has a named test per reader (ESM and CJS mirrors alike), and its test file is
     in `scope`.
 
@@ -60,7 +67,8 @@ Dependency and test-scope rules, plus the approval-source check and the security
 In `we:scripts/__tests__/check-standards-rules.test.mjs`, use synthetic cards/epic tables: missing versus
 present wiring dependency; a contextual slice mention; unknown slice letter; missing versus covered test
 file scope; directory and repo-prefix coverage; confirmation without source; retained gate with approval
-pending; a Proof plan naming a dependent slice as landed (error) versus an ancestor slice (pass). In `we:scripts/__tests__/check-standards.test.mjs`, exercise the real backlog scanner so these
+pending; a Proof plan naming a dependent slice as landed (error), an ancestor slice as landed (pass), and a
+dependent as the slice that takes over a later proof (pass). In `we:scripts/__tests__/check-standards.test.mjs`, exercise the real backlog scanner so these
 checks cannot pass in isolation while remaining unwired. Review fixtures cover all ledger checklist items.
 
 ## Proof plan
