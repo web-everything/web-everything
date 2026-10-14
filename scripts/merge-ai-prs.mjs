@@ -196,6 +196,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
+import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
@@ -3063,22 +3064,28 @@ export function drainHoldReasonCode(reason) {
 
 /**
  * E3 (#3929, plan R8) — append ONE `drain-hold` event when the drain's reason for holding a PR changes. Reads the
- * PR's last drain-hold event from the home ledger; an identical code appends nothing, so a `--watch` loop re-reaching
- * the same state stays silent. FAIL-SOFT and additive: never throws, never touches a label or a decision.
- * `read`/`append` are test seams.
+ * PR's last drain-hold event (the drain passes `readDrainLedgerSnapshot`, the store its writes land in; the default
+ * reads home); an identical code appends nothing, so a `--watch` loop re-reaching the same state stays silent. A hold
+ * that missed the shared store is reported as a failure, and the next pass's shared read retries it.
+ * FAIL-SOFT and additive: never throws, never touches a label or a decision. `read`/`append` are test seams.
  * @param {{repo: string, pr: number|string, reason: string, read?: Function, append?: Function}} o
  * @returns {{ok: boolean, appended: boolean, errors: string[]}}
  */
 export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
   try {
     const reasonCode = drainHoldReasonCode(reason);
-    const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
-    const prior = readEvents(repo).filter((e) => e.type === EVENT_TYPES.HOLD && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
-    if (prior.length && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
+    const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
+    // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups against home, which
+    // holds every spilled hold, so a lasting read failure cannot append a duplicate on every pass.
+    let events;
+    try { events = (read ?? readHome)(repo); } catch { events = readHome(repo); }
+    const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
+    if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({
       type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
       declaredActor: 'drain', reasonCode, holdSource: 'drain',
     }));
+    if (written.ok && written.ledgerWriteMiss) return { ok: false, appended: false, errors: ['ledger-write-miss: the hold missed the shared store; the next pass retries it'] };
     return written.ok ? { ok: true, appended: true, errors: [] } : { ok: false, appended: false, errors: written.errors };
   } catch (e) {
     return { ok: false, appended: false, errors: [String((e && e.message) || e).split('\n')[0]] };
@@ -5706,6 +5713,7 @@ async function runCli() {
         process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} ${gate.reason}\n`);
         continue;
       }
+      v.reviewGate = drainReviewGateFact(gate); // ledger facts only (drain-ledger-facts.mjs); never read for a decision
       v.escalated = score.escalate ? 'yes' : 'no';
       // #2365 — gate.humanRequired (not score.humanRequired): decideReviewGate's verdict is the sticky one (#2362
       // makes an already-applied review:human label win even when a rebase narrows the diff back to
@@ -6084,12 +6092,16 @@ async function runCli() {
   // PR the drain owns — never comment on an unrelated human PR).
   if (!DRY_RUN) {
     // E3 (#3929, plan R8) — a held/skipped PR whose drain reason CHANGED gets exactly one `drain-hold` event.
-    // Additive and fail-soft: runs before, and never alters, the stamping below.
+    // Additive and fail-soft: runs before, and never alters, the stamping below. Both recorders dedup against one
+    // read of the store their writes land in, taken before they write, so a shared-store miss is retried next pass.
+    const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
-      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason });
+      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
+    const facts = recordDrainLedgerFacts({ verdicts, localSlug, read: readDrainLedger });
+    if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
     for (const v of skipped) {
       // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
       // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).

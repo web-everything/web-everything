@@ -2,9 +2,10 @@
  * @file shard-files.mjs — #4200-ish CI speed-up (card x0zg44l's own harness). Deterministic file-level sharding
  * for `npm run test:soak`, used by `.github/workflows/ci.yml`'s `soak-shard` matrix.
  *
- * Card 11 (perf sweep 2026-10-07): files are assigned to shards by MEASURED time (`scripts/ci/test-timings.json`,
- * greedy longest-first, `scripts/ci/shard-assign.mjs`). The old split pinned the 50-tick baseline alone in shard 1 and
- * round-robined the breaks by sorted index, blind to cost, so the soak shards ran 4.9-13.4 min. A file with no stored
+ * Shard 1 runs the 50-tick baseline alone: PR #5195 hit its 10-minute timeout with break worlds on the same
+ * runner while every completed tick's invariants still held. The remaining shards balance the breaks by
+ * MEASURED time (`scripts/ci/test-timings.json`, greedy longest-first, `scripts/ci/shard-assign.mjs`), rather than
+ * round-robining them by sorted index, blind to cost. A file with no stored
  * timing gets the median, so a new break (one file, discovered from disk — never from `breaks/index.mjs`'s registry)
  * lands in a shard automatically with no shard-list edit.
  */
@@ -19,7 +20,7 @@ export const REPO_ROOT = resolve(HERE, '..', '..', '..');
 export const BASELINE_FILE = join(HERE, 'daemon-soak.soak.test.mjs');
 export const BREAKS_DIR = join(HERE, 'breaks');
 
-/** Every `breaks/*.soak.test.mjs` scenario file, sorted for a deterministic, stable round-robin. */
+/** Every `breaks/*.soak.test.mjs` scenario file, sorted for deterministic discovery. */
 export function listBreakTestFiles(breaksDir = BREAKS_DIR) {
   return readdirSync(breaksDir)
     .filter((f) => f.endsWith('.soak.test.mjs'))
@@ -36,7 +37,7 @@ function toRepoRelative(absPath, repoRoot) {
  *
  * `shard` is 1-based. `total === 1` runs everything (baseline + all breaks) — the single-shard fallback used by
  * `npm run test:soak` (no sharding) and by a local "does the split still work" smoke check. Otherwise the
- * baseline and every break are balanced across the shards by measured time.
+ * baseline runs alone in shard 1; the breaks are balanced across shards 2..N by measured time.
  */
 export function listAllSoakFiles({ breaksDir = BREAKS_DIR, baselineFile = BASELINE_FILE, repoRoot = REPO_ROOT } = {}) {
   return [baselineFile, ...listBreakTestFiles(breaksDir)].map((f) => toRepoRelative(f, repoRoot));
@@ -46,11 +47,12 @@ export function shardFiles({ shard, total, breaksDir = BREAKS_DIR, baselineFile 
   if (!Number.isInteger(total) || total < 1) throw new Error(`soak shard-files: --shard total must be a positive integer, got "${total}"`);
   if (!Number.isInteger(shard) || shard < 1 || shard > total) throw new Error(`soak shard-files: --shard index must be 1..${total}, got "${shard}"`);
 
-  // total === 1 runs everything; otherwise greedy longest-first by measured time (see scripts/ci/shard-assign.mjs).
-  // A file with no stored timing gets the median, so a new break lands in a shard with no list to edit.
-  const all = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
-  return total === 1 ? all : assignByTime(all, timings, total)[shard - 1];
-
+  const [baseline, ...breaks] = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
+  if (total === 1) return [baseline, ...breaks];
+  if (shard === 1) return [baseline];
+  // A new break still gets the median timing and lands automatically. Baseline isolation must not depend
+  // on its stored timing being current, nor on how much break coverage has accumulated.
+  return assignByTime(breaks, timings, total - 1)[shard - 2];
 }
 
 /** Parses `--shard=i/N` out of an argv array. Throws with a usage line if missing or malformed. */

@@ -6,6 +6,14 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Soak shard isolation
+
+Keep the 50-tick baseline alone in CI shard 1; balance break scenarios by measured time across the other
+four shards. Each world spawns real daemon and Git subprocesses, so timing balance alone can put competing
+worlds beside the baseline and exhaust its overall deadline even when completed ticks satisfy every invariant.
+Regression coverage must preserve every file exactly once, the single-shard fallback, and baseline isolation
+when its stored timing is missing or stale. Keep tick counts, invariants, and timeout limits intact.
+
 ## Wrapped worker verification waits
 
 For the 117 S3b regression (2026-10-08), replay the saved StructuredOutput fixtures against both
