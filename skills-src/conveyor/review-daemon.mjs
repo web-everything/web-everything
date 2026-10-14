@@ -99,6 +99,7 @@ import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 // PRs — landing it in `runner.mjs` alone would leave #2549/#2578's stray labels uncleaned indefinitely, the
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
+import { sweepHumanSurfaceRepark } from '../../scripts/conveyor/human-surface-repark.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
 // `kind:'convert-advisory'` dispatch entry. Wired as its OWN additive pipeline stage below
@@ -250,6 +251,19 @@ export function describeReconcileError(e) {
 }
 
 /**
+ * The tick's review-hold sweeps: the human-surface re-park (live #5193 — an accepted PR whose head touches a
+ * human-only surface goes back to `review:human`) runs first, then the stray-label reconcile. A re-park failure is
+ * its own entry and never stops the reconcile.
+ */
+export function sweepReviewHolds(opts) {
+  let repark;
+  try { repark = sweepHumanSurfaceRepark(opts) ?? []; } catch (e) {
+    repark = [{ num: 0, repark: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] }];
+  }
+  return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
+}
+
+/**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
  * runner.mjs's own mechanical pass ran (see the file header for what's deliberately NOT replicated). Every
@@ -274,7 +288,7 @@ export function runReviewTick({
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
-  holdReconcile = sweepReviewHoldLabels,
+  holdReconcile = sweepReviewHolds,
   notifyReferral = notifyReferralHold,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
@@ -1057,6 +1071,7 @@ export function buildCliDaemonEffects({
       // `h.remove`/`h.healed`/`h.flagged` are INDEPENDENT optional fields on one entry (see
       // `sweepReviewHoldLabels`'s own return doc) — never assume any one of them is present.
       for (const h of (result.holdReconcile ?? [])) {
+        if (h.repark) log.error(`review-daemon: ${h.repo}#${h.num} human-surface re-park ${h.repark} at ${String(h.head||'').slice(0,9)} (${(h.files||[]).join(',')})${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.carry) log.error(`review-daemon: ${h.repo}#${h.num} accept carry-forward ${h.carry}${h.detail ? ` — ${h.detail}` : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`); // card xu7kxtt
