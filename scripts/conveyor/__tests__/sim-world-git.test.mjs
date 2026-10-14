@@ -2,14 +2,76 @@
  * @file Pins no-clone commitToMain/createBranch plumbing, the slim sim template,
  * and the whole-scenario budget error.
  */
-import { mkdirSync, utimesSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
 
 const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
+  it('isolates throttle windows across worlds whose clocks move backwards', async () => {
+    const throttle = new URL('../../lib/gh-throttle.mjs', import.meta.url).href;
+    const roots = [];
+    const inherited = process.env.WE_GH_THROTTLE_LOCK_ROOT;
+    for (const clockStartOffsetMs of [11 * 60_000, 0]) {
+      await runScenario(scenario('independent throttle windows', {
+        lanes: 1,
+        clockStartOffsetMs,
+        play: [(w) => {
+          const lockRoot = w.env.WE_GH_THROTTLE_LOCK_ROOT;
+          expect(lockRoot).toBe(join(w.root, 'gh-throttle'));
+          expect(lockRoot).not.toBe(inherited);
+          expect(roots).not.toContain(lockRoot);
+          roots.push(lockRoot);
+          // Spend the entire budget at +11m, then spend at baseline time in a fresh world. A shared root
+          // times out on the second spend. Bound the probe so a regression fails without a two-minute wait.
+          const spend = () => JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+            import { acquireGhPointsSync } from ${JSON.stringify(throttle)};
+            console.log(JSON.stringify(acquireGhPointsSync({
+              lockRoot: process.env.WE_GH_THROTTLE_LOCK_ROOT,
+              budgetPerMin: 1, owner: 'sim-world-regression', timeoutMs: 100,
+            })));
+          `], { env: w.env, encoding: 'utf8', timeout: 5_000 }));
+          expect(spend()).toMatchObject({ ok: true, timedOut: false });
+          // Two children of the SAME world must still share the budget.
+          expect(spend()).toMatchObject({ ok: false, timedOut: true });
+        }],
+      }));
+    }
+  }, 180_000);
+
+  it('keeps launcher routing snapshots and live gh shim directories out of the world', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sim-launcher-env-'));
+    const shim = join(dir, 'github-app-token', 'gh-shim.d', 'fixture');
+    mkdirSync(shim, { recursive: true });
+    const liveTool = 'sim-live-shim-only-tool';
+    writeFileSync(join(shim, liveTool), '');
+    const policy = JSON.parse(readFileSync(new URL('../../lib/dispatch-routing-policy.json', import.meta.url), 'utf8'));
+    policy.aliases.claude.haiku = 'model-only-in-the-launcher-checkout';
+    const oldSnapshot = process.env.WE_DISPATCH_ROUTING_SNAPSHOT;
+    const oldPath = process.env.PATH;
+    process.env.WE_DISPATCH_ROUTING_SNAPSHOT = JSON.stringify(policy);
+    process.env.PATH = `${shim}:${oldPath}`;
+    try {
+      await runScenario(scenario('launcher isolation', {
+        lanes: 1,
+        play: [(w) => {
+          expect(w.env.WE_DISPATCH_ROUTING_SNAPSHOT).toBeUndefined();
+          expect(existsSync(join(w.root, 'tools', liveTool))).toBe(false);
+        }],
+      }));
+    } finally {
+      if (oldSnapshot === undefined) delete process.env.WE_DISPATCH_ROUTING_SNAPSHOT;
+      else process.env.WE_DISPATCH_ROUTING_SNAPSHOT = oldSnapshot;
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 180_000);
+
   it('recovers an orphan fake-gh lock during a fix-dispatch tick', async () => {
     await runScenario(scenario('fix-dispatch orphan lock', {
       repos: ['we'],

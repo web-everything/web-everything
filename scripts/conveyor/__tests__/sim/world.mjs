@@ -252,6 +252,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   mkdirSync(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy']);
   for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
+    // The operator's GitHub App shim is live credential state, not a tool directory to enumerate.
+    // The world's own fake gh already wins PATH; none of the shim's siblings belong in this world.
+    if (/(^|\/)gh-shim\.d(\/|$)/.test(dir)) continue;
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -273,6 +276,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
     LANE_POOL_ROOT: lanePoolRoot,
+    // Vitest supplies one throttle root per FILE. Worlds within that file have independent clocks:
+    // A1/A2 advance 11m, then A3 starts at offset zero. Sharing a future budget window can make each
+    // gh call wait the production 120s acquire timeout. All children of ONE world still share its gate.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,
@@ -332,6 +339,8 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   delete env.WE_GITHUB_APP_INSTALLATION_ID;
   delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
   delete env.GITHUB_TOKEN;
+  // A launcher can carry a last-good policy from a newer checkout. Use THIS tree's policy in its children.
+  delete env.WE_DISPATCH_ROUTING_SNAPSHOT;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
