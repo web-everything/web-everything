@@ -15,21 +15,46 @@ function isExecutedTimeoutRow(row) {
     && isEnvTimeoutRow(row);
 }
 
-// What a timeout row measured: the kind of give-up and the budget it ran out of. Two timeouts on one check are the
-// same measurement only when both match; a kill at another budget (or another give-up kind) proves nothing.
-function timeoutSignature(row) {
-  const detail = String(row.detail ?? '');
-  const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
-  if (killed) return `kill:${killed[1]}`;
-  const scans = [...detail.matchAll(/scan exceeded its (\d+)ms budget/g)].map((m) => m[1]).sort();
-  if (scans.length) return `scan:${scans.join(',')}`;
-  if (/gave up waiting for the shared acquirability-scan lock/.test(detail)) return 'scan-lock';
-  return null;
+// The kind of give-up and the budget a timeout fragment ran out of (0 for a lock give-up); null when the text is
+// not a timeout at all. A kill is the gate's own clock; scan and lock text is printed by the tree under test.
+function fragmentBudget(text) {
+  const kill = /timed out after (\d+)ms \(process group killed\)/.exec(text);
+  if (kill) return { kind: 'kill', budget: Number(kill[1]) };
+  const scan = /scan exceeded its (\d+)ms budget/.exec(text);
+  if (scan) return { kind: 'scan', budget: Number(scan[1]) };
+  return /gave up waiting for the shared acquirability-scan lock/.test(text) ? { kind: 'lock', budget: 0 } : null;
 }
 
+// What a timeout row measured, as unit → {kind, budget it ran out of}. A multi-repo reconcile row is one unit per
+// repo; every other row is a single unit. null when any unit is something other than a timeout (a real error
+// beside a timeout).
+function timeoutProfile(row) {
+  const detail = String(row.detail ?? '');
+  const kills = /^reconcile-pass dry-run \(\d+\/\d+ repo\(s\) — (.+)\) failed: (timed out after \d+ms \(process group killed\))$/.exec(detail);
+  if (kills) return new Map(kills[1].split(', ').map((repo) => [repo, fragmentBudget(kills[2])]));
+  const mixed = /^reconcile-pass dry-run failed for \d+\/\d+ repo\(s\): (.+)$/.exec(detail);
+  if (mixed) {
+    const units = new Map();
+    for (const part of mixed[1].split('; ')) {
+      const m = /^([^:]+): ((?:timed out after|scan exceeded its|gave up waiting)[\s\S]*)$/.exec(part);
+      const budget = m ? fragmentBudget(m[2]) : null;
+      if (budget === null) return null;
+      units.set(m[1], budget);
+    }
+    return units;
+  }
+  const budget = fragmentBudget(detail);
+  return budget === null ? null : new Map([['', budget]]);
+}
+
+// Equivalent control = same check, every candidate unit timed out again, and with at least as much time. A control
+// killed at a smaller budget (host load differs, or the shared deadline cut it short) proves nothing; one killed at
+// a larger budget is stronger evidence. Exact equality would reject nearly every load-scaled budget.
 function sameTimeout(candidateRow, controlRow) {
-  const sig = timeoutSignature(candidateRow);
-  return sig !== null && candidateRow.name === controlRow.name && sig === timeoutSignature(controlRow);
+  const want = timeoutProfile(candidateRow);
+  const got = timeoutProfile(controlRow);
+  return !!want && !!got && candidateRow.name === controlRow.name
+    && [...want].every(([unit, w]) => got.get(unit)?.kind === w.kind && got.get(unit).budget >= w.budget);
 }
 
 /** Resolve the environment-timeout hold cap through the platform/env policy cascade. Never throws. */

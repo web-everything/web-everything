@@ -145,6 +145,49 @@ describe('env-timeout hold escape', () => {
     expect((await envTimeout.run(ctx)).reason).toBe('env-timeout-adopted-not-worse');
   });
 
+  const killRow = (ms) => ({ ...failed[0], detail: `reconcile failed: timed out after ${ms}ms (process group killed)` });
+  const repoKills = (repos, total, ms) => ({ ...failed[0],
+    detail: `reconcile-pass dry-run (${repos.length}/${total} repo(s) — ${repos.join(', ')}) failed: timed out after ${ms}ms (process group killed)` });
+  const runWith = (candidateRow, controlRow) => {
+    const candidate = { verdict: 'env-timeout', smoke: { results: [candidateRow] } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: { verdict: 'env-timeout', smoke: { results: [controlRow] } } }) });
+    return envTimeout.run(ctx).then((r) => ({ r, ctx }));
+  };
+
+  it('adopts when the control timed out with at least the candidate budget (load-scaled budgets differ)', async () => {
+    expect((await runWith(killRow(711_000), killRow(723_000))).r.reason).toBe('env-timeout-adopted-not-worse');
+  });
+
+  it('holds when the control was killed with less time than the candidate had', async () => {
+    const { r, ctx } = await runWith(killRow(723_000), killRow(711_000));
+    expect(r.reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a repo the control did not time out on', repoKills(['a', 'b'], 2, 120_000), repoKills(['a'], 2, 120_000), false],
+    ['a different repo', repoKills(['a'], 2, 120_000), repoKills(['b'], 2, 120_000), false],
+    ['extra repos failing on the control', repoKills(['a'], 2, 120_000), repoKills(['a', 'b'], 2, 120_000), true],
+    ['the same repos with a larger budget', repoKills(['a', 'b'], 2, 120_000), repoKills(['b', 'a'], 2, 150_000), true],
+  ])('multi-repo reconcile: %s', async (_label, candidateRow, controlRow, adopted) => {
+    const { r, ctx } = await runWith(candidateRow, controlRow);
+    expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+    if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
+  it('holds when one repo failed for a real error beside a timeout, even if the control shows the timeout', async () => {
+    const mixed = { ...failed[0],
+      detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: invalid configuration; b: scan exceeded its 120000ms budget' };
+    const onlyTimeout = { ...failed[0],
+      detail: 'reconcile-pass dry-run failed for 1/2 repo(s): b: scan exceeded its 120000ms budget' };
+    for (const control of [mixed, onlyTimeout]) {
+      const { r, ctx } = await runWith(mixed, control);
+      expect(r.reason).toBe('smoke-env-timeout');
+      expect(ctx.finalize).not.toHaveBeenCalled();
+    }
+  });
+
   it('does not report a textual control skip as a reproduced timeout', async () => {
     const skipped = { ...failed[0], detail: 'skipped: budget — scan exceeded its 120000ms budget' };
     const ctx = context({ smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [skipped] } } }) });
