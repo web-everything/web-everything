@@ -173,6 +173,19 @@ export function resolveOwedCiRerunSettings({ env = process.env, read = f => read
   return { value, source };
 }
 
+/** fix.staleCiRerun cascade: standard `once-per-head` -> scripts/settings/fix.json -> env WE_FIX_STALE_CI_RERUN; invalid fails closed to `off`. */
+export function resolveStaleCiRerunSetting({ env = process.env, read = f => readFileSync(f, 'utf8') } = {}) {
+  let value = 'once-per-head', source = 'standard';
+  const ok = v => ['off', 'once-per-head'].includes(v);
+  try {
+    const setting = JSON.parse(read(REPO_FIX_SETTINGS_PATH))?.fix?.staleCiRerun;
+    if (setting !== undefined && setting !== null) { value = ok(setting) ? setting : 'off'; source = ok(setting) ? 'settings' : 'settings-invalid'; }
+  } catch (error) { if (error?.code !== 'ENOENT') { value = 'off'; source = 'settings-invalid'; } }
+  const override = env.WE_FIX_STALE_CI_RERUN?.trim().toLowerCase();
+  if (override) { value = ok(override) ? override : 'off'; source = 'env'; }
+  return { value, source };
+}
+
 /** The last logged `fix.takeoverBudget` resolution, so a daemon logs the layer once per change. */
 let loggedTakeoverBudget = '';
 /** Card xx0055i + takeover budget — the round-cap action and `fix.takeoverBudget` (logged with its cascade layer) for
@@ -1434,6 +1447,7 @@ export function runReconcilePass({
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
   loadFixSettings = resolveFixSettings,
   loadOwedCiRerunSettings = resolveOwedCiRerunSettings,
+  loadStaleCiRerunSetting = resolveStaleCiRerunSetting,
   // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
   loadTakeoverBudget = resolveTakeoverBudget,
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
@@ -1516,8 +1530,11 @@ export function runReconcilePass({
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
+  const staleCiRerunSetting = loadStaleCiRerunSetting({ env });
+  console.error(`fix.staleCiRerun=${staleCiRerunSetting.value} (${staleCiRerunSetting.source})`);
   const plan = planReconcile({
     owedCiRerun: owedCiRerunSetting.value,
+    staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,

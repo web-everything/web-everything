@@ -1914,6 +1914,10 @@ export function planReconcile({
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
   owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
+  // `fix.staleCiRerun` (`off` | `once-per-head`): a red required check on a head that main's green CI did NOT cause
+  // (no red window explains it) still gets ONE mechanical re-run of the failed jobs per head, never a heal first.
+  // `off` here keeps this pure core byte-identical; the IO shell passes the resolved cascade value.
+  staleCiRerun = 'off',
   // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
@@ -2988,6 +2992,23 @@ export function planReconcile({
             ? 'every red required check is infra-cancelled (cancelled / startup_failure / no runner) — mechanical re-run, no heal budget'
             : 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
+      }
+      // fix.staleCiRerun — live 2026-10-14: ten ci-red PRs with 3-6 s failures on stale runs, main green, were refused the
+      // timeout re-run (no vitest inventory to read) and every ci-heal session ended in a no-op re-arm, so no fresh CI run
+      // ever started. The failed jobs of an unchanged head are re-run once (budget shared with the timeout re-run),
+      // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
+      const staleRetry = pr.owedCiRerunRetry;
+      if (staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber
+          && !(pr.statusCheckRollup ?? []).some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED')) {
+        const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
+        const staleCap = staleRetry.jobs.length;
+        if (staleSpent < staleCap) {
+          dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+            timeoutRetry: { ...staleRetry, variant: 'stale-ci-rerun', cap: staleCap },
+            why: `main is green (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)}); the failed required jobs on head ${pr.headRefOid.slice(0, 8)} are re-run once to get a fresh result (${staleSpent + 1}/${staleCap}), no heal budget` });
+          continue;
+        }
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });

@@ -1,0 +1,64 @@
+import { describe, it, expect } from 'vitest';
+import { planReconcile } from '../reconcile-core.mjs';
+import { resolveStaleCiRerunSetting } from '../reconcile-pass.mjs';
+
+const repo = 'web-everything/web-everything';
+const head = 'ab9985630d90019a07b94e946bc75f8de7a6161f';
+const green = { red: false, sha: '123456789abcdef', at: '2026-10-14T07:00:00Z' };
+const check = (over = {}) => ({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-14T16:00:00Z',
+  detailsUrl: `https://github.com/${repo}/actions/runs/123/job/456`, ...over });
+const evidence = { eligible: true, repo, pr: 5273, head, signature: 's', variant: 'owed-ci-rerun',
+  jobs: [{ repo, head, run: 123, job: 456, attempt: 1 }], infraCancelled: true };
+const fixture = (over = {}) => ({ number: 5273, state: 'OPEN', isDraft: true, headRefName: 'lane/x', headRefOid: head, labels: [],
+  mergeStateStatus: 'BLOCKED', comments: [], statusCheckRollup: [check()], requiredCheckCompletedAt: '2026-10-14T16:00:00Z',
+  requiredCheckName: 'test', aheadByOnMain: 0, mainGreenNow: green, owedCiRerunRetry: evidence,
+  timeoutRetry: { eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' },
+  timeoutRetryBudget: { confirmed: 0, rejected: 0 }, ...over });
+const plan = (over = {}, staleCiRerun = 'once-per-head') => planReconcile({
+  prs: [fixture(over)], agents: [], requiredChecks: ['test'], now: Date.parse('2026-10-14T17:00:00Z'), mainRedWindows: [], staleCiRerun });
+
+describe('fix.staleCiRerun', () => {
+  it('re-runs the failed jobs once for a stale red check on a green main, draft included, without a heal', () => {
+    const out = plan();
+    expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+      timeoutRetry: expect.objectContaining({ cap: 1 }) })]);
+    expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(false);
+    expect(out.refusals.some(r => r.kind === 'timeout-retry-ineligible')).toBe(false);
+  });
+  it('off keeps the old path: ineligible refusal, then ci-heal', () => {
+    const out = plan({}, 'off');
+    expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
+    expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(true);
+  });
+  it.each([{ confirmed: 1, rejected: 0 }, { confirmed: 0, rejected: 1 }])('falls through to ci-heal once the head budget is spent: %j', budget => {
+    const out = plan({ timeoutRetryBudget: budget });
+    expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
+    expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(true);
+  });
+  it('never authorizes on an unknown budget, a red main or a still-running check', () => {
+    for (const over of [{ timeoutRetryBudget: undefined }, { mainGreenNow: { red: true } },
+      { statusCheckRollup: [check(), { name: 'smoke', status: 'IN_PROGRESS', conclusion: '' }] }]) {
+      expect(plan(over).dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
+    }
+  });
+  it('holds a request already in flight', () => {
+    const out = plan({ timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true } });
+    expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
+  });
+});
+
+describe('resolveStaleCiRerunSetting cascade', () => {
+  const read = json => () => json;
+  const r = (json, env = {}) => resolveStaleCiRerunSetting({ env, read: read(json) });
+  it('standard, settings file, env, in that order of precedence', () => {
+    expect(r('{}')).toEqual({ value: 'once-per-head', source: 'standard' });
+    expect(r('{"fix":{"staleCiRerun":"off"}}')).toEqual({ value: 'off', source: 'settings' });
+    expect(r('{"fix":{"staleCiRerun":"off"}}', { WE_FIX_STALE_CI_RERUN: 'once-per-head' })).toEqual({ value: 'once-per-head', source: 'env' });
+  });
+  it('fails closed to off on an invalid value', () => {
+    expect(r('{"fix":{"staleCiRerun":"always"}}')).toEqual({ value: 'off', source: 'settings-invalid' });
+    expect(r('not json')).toEqual({ value: 'off', source: 'settings-invalid' });
+    expect(r('{}', { WE_FIX_STALE_CI_RERUN: 'x' })).toEqual({ value: 'off', source: 'env' });
+  });
+});
