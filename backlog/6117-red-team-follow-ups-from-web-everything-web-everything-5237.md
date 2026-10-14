@@ -1,4 +1,5 @@
 ---
+bornAs: xg2fks3
 kind: story
 size: 2
 status: open
