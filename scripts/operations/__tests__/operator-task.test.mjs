@@ -154,6 +154,18 @@ const item = { id: '123-test', title: 'Test', kind: 'story', size: 1, status: 'o
 const errors = fields => validateBacklogItem({ ...item, ...fields }, ctx).errors.map(e => e.message).join('\n');
 const template = 'open-pr\n### 9. Append a structured learnings entry\nEXIT';
 describe('operator task post-build', () => {
+  it.each(['$$', "$'", '$&', '$`'].flatMap(token =>
+    ['command', 'expect'].map(field => ({ token, field }))))('preserves $token literally in liveProof.$field', ({ token, field }) => {
+    const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
+    const output = composeOperatorTaskBrief(template, { liveProof }, {
+      settings: {}, policy: { liveProof: true },
+    });
+    expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~`);
+    expect(output).toContain(`Match output against ${JSON.stringify(liveProof.expect)}:`);
+    expect(output.startsWith('open-pr\n### 8a. Operator post-build')).toBe(true);
+    expect(output.endsWith('### 9. Append a structured learnings entry\nEXIT')).toBe(true);
+    expect(output.split('### 9. Append')).toHaveLength(2);
+  });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
     expect(errors({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
     for (const edgeClone of ['/tmp/daemon', 'C:\\daemon', '../daemon', 'other']) expect(errors({ edgeClone })).toContain('edgeClone');
