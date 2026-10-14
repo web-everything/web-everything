@@ -1787,6 +1787,17 @@ function operatorSendBackRearm(pr, operatorBudget) {
   return { verdictId: c.id, login: c.author.login, body };
 }
 
+/** True while any check on the head is not COMPLETED, or when the rollup is known to be incomplete (a refused or
+ *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
+ *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
+ *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
+const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRollup ?? []).some(c => {
+  if (!c) return false;
+  if (c.status) return String(c.status).toUpperCase() !== 'COMPLETED';
+  // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
+  return c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
+});
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
  * the durable per-PR attempt counts, return what to dispatch and every refusal with the fact it turned on. Pure,
@@ -1914,6 +1925,10 @@ export function planReconcile({
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
   owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
+  // `fix.staleCiRerun` (`off` | `once-per-head`): a red required check on a head that main's green CI did NOT cause
+  // (no red window explains it) still gets ONE mechanical re-run of the failed jobs per head, never a heal first.
+  // `off` here keeps this pure core byte-identical; the IO shell passes the resolved cascade value.
+  staleCiRerun = 'off',
   // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
@@ -2801,7 +2816,9 @@ export function planReconcile({
         }
         let owedRerunSpent = false;
         const retry = pr.owedCiRerunRetry;
-        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false
+        // Same still-running guard as the `stale-ci-rerun` branch: a live run rejects the re-run and burns the budget.
+        const rerunLive = hasLiveCheck(pr);
+        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false && !rerunLive
             && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
           const foldReview = row => {
             if (!withPhase.labels.includes('review:pending')) return;
@@ -2851,7 +2868,8 @@ export function planReconcile({
               ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
               : viaMainGreen
               ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
-              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : ''),
+              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : '')
+              + (rerunLive && pr.mainGreenNow?.red === false && owedCiRerun.rerun === 'on' ? '; another check on this head is still running — the mechanical re-run waits until it completes' : ''),
           });
           // Preserve rerun ownership while folding the independent review prerequisite into this
           // same refusal row. Required checks must succeed even when their failure belongs to main.
@@ -2988,6 +3006,29 @@ export function planReconcile({
             ? 'every red required check is infra-cancelled (cancelled / startup_failure / no runner) — mechanical re-run, no heal budget'
             : 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
+      }
+      // fix.staleCiRerun — live 2026-10-14: ten ci-red PRs with 3-6 s failures on stale runs, main green, were refused the
+      // timeout re-run (no vitest inventory to read) and every ci-heal session ended in a no-op re-arm, so no fresh CI run
+      // ever started. The failed jobs of an unchanged head are re-run once (budget shared with the timeout re-run),
+      // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
+      const staleRetry = pr.owedCiRerunRetry;
+      if (staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+        const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
+        const staleCap = staleRetry.jobs.length;
+        if (staleSpent < staleCap && hasLiveCheck(pr)) {
+          // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
+          // head whose fresh result is still on its way) and re-plan next tick.
+          refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' });
+          continue;
+        }
+        if (staleSpent < staleCap) {
+          dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+            timeoutRetry: { ...staleRetry, variant: 'stale-ci-rerun', cap: staleCap },
+            why: `main is green (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)}); the failed required jobs on head ${pr.headRefOid.slice(0, 8)} are re-run once to get a fresh result (${staleSpent + 1}/${staleCap}), no heal budget` });
+          continue;
+        }
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
