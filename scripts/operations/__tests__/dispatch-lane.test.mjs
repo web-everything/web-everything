@@ -978,7 +978,7 @@ describe('what the sink actually runs', () => {
     // real dispatch argv. Passing it bought nothing and encoded a false premise the rest of the file read as
     // fact; the handle now comes from the id the CLI prints (`parseBackgroundedId`).
     const argv = buildAgentArgv({ sessionId: 'sess-c3', payload });
-    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'medium', '--model', 'sonnet', '# build #3037']);
+    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'high', '--model', 'sonnet', '# build #3037']);
     expect(argv).not.toContain('--session-id');
     expect(argv).not.toContain('sess-c3');
   });
@@ -990,7 +990,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'medium', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', '# build #3037',
     ]);
   });
 
@@ -1003,7 +1003,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'medium', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', '# build #3037',
     ]);
   });
 
@@ -1014,7 +1014,7 @@ describe('what the sink actually runs', () => {
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
-      '--effort', 'medium', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', '# build #3037',
     ]);
   });
 
@@ -2381,7 +2381,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
     expect(spawned[0].argv.filter((_, i) => i !== settingsAt && i !== settingsAt + 1)).toEqual([
       '--bg', '-n', 'conveyor-3037',
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
-      '--effort', 'medium', '--model', 'sonnet',
+      '--effort', 'high', '--model', 'sonnet',
       expectedPrompt('build', {
         ITEM_NUM: '3037', ITEM_SPEC_PATH: 'backlog/3037-declare-dispatch.md', LANE: 8,
         SESSION_SLUG: 'conveyor-3037', SCOPE: 'we:scripts/operations/', DELIVERY_BASE: 'main',

@@ -527,7 +527,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-9001',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
-      '--effort', 'medium', '--model', 'opus', '# build #9001',
+      '--effort', 'high', '--model', 'opus', '# build #9001',
     ]);
   });
 
