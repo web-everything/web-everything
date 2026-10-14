@@ -813,3 +813,18 @@ or failed seal is archived before the active slot is replaced with its sequence 
 existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage alongside transport
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
+
+### Enqueue catch-up ordering
+
+The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
+`duePending` can otherwise undo the selected priority order. Queue fill depth comes from
+`mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
+First acceptance is the earliest structured accepted/clear-human comment across heads;
+include a removal/restore replay, comment pagination, and the ready-time fallback.
+Include an older PR with running checks ahead of a green PR at capacity one, and a window
+that closes during the first wake read then reopens on a later interval. Skipped wakes must
+allow later candidates to run; retained catch-up work reserves room in the next plan.
+Confirmed drain gate skips and revalidation aborts also release room; successful enqueues
+and ambiguous failures consume it. Give each fake child its actual target PR number.
+Also cover a queue that fills while the window is closed and an unreadable next snapshot:
+retained attempts must stay within the latest room, and cannot use a failed snapshot.
