@@ -5,6 +5,7 @@ import { applyTransition } from '../backlog/frontmatter.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 import { buildPriorityPlacement } from '../lib/build-queue.mjs';
 import { normNum, removeFromQueue } from '../conveyor/queue-store.mjs';
+import { itemNumsFromPr } from '../lib/open-pr-items.mjs';
 
 export const CLOSE_ITEMS_OP = 'close-items';
 export const CLOSE_ITEMS_EFFECT = 'close-items.write';
@@ -52,14 +53,49 @@ export function closeRequests(input, triage) {
 export function evidencePointer(evidence) {
   return String(evidence ?? '').trim().match(/^(?:[0-9a-f]{7,40}(?![0-9a-f])|#\d+\b|PR\s*#?\d+\b|https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+\b)/i)?.[0];
 }
+const HASH_ID = /(?<![0-9a-z])x[0-9a-z]{6}(?![0-9a-z])/gi;
+/**
+ * Every card id an open PR could be carrying, in both NNN and hash form: lane-ref and title numbers, body `#NNN`,
+ * any `x<6>` hash token, and `backlog/<id>-` paths in the ref, title, body and changed files. Deliberately broad:
+ * this is a safety guard, so a stray match only refuses a close (the refusal names the PR).
+ */
+export function openPrCardRefs(pr = {}) {
+  const ref = String(pr.headRefName ?? ''), title = String(pr.title ?? ''), body = String(pr.body ?? '');
+  const ids = new Set(itemNumsFromPr(/(?:^|\/)lane\//.test(ref) ? ref : `lane/${ref}`, title));
+  for (const m of body.matchAll(/#(\d{2,5})\b/g)) ids.add(m[1]);
+  for (const text of [ref, title, body, ...(pr.files ?? []).map(String)]) {
+    for (const m of text.matchAll(HASH_ID)) ids.add(m[0].toLowerCase());
+    for (const m of text.matchAll(/\bbacklog\/(\d{1,5}|x[0-9a-z]{6})-/gi)) ids.add(m[1].toLowerCase());
+  }
+  return [...ids];
+}
+/** Map each card an open PR references (resolved through the id/num/bornAs index) to the PRs naming it. */
+export function openPrCardMap(openPrs, index) {
+  const byCard = new Map();
+  const add = (id, label) => {
+    const c = index.get(normNum(id));
+    if (!c) return;
+    if (!byCard.has(c)) byCard.set(c, []);
+    if (label && !byCard.get(c).includes(label)) byCard.get(c).push(label);
+  };
+  for (const n of openPrs?.nums ?? []) add(n);
+  for (const pr of openPrs?.prs ?? []) for (const id of openPrCardRefs(pr)) add(id, `${pr.repo ?? ''}#${pr.number ?? '?'}`);
+  return byCard;
+}
+/** Fail closed: a missing, unreadable, partial or truncated open-PR read is never a complete safety check. */
+export function openPrCheckIncomplete(openPrs) {
+  if (!openPrs || typeof openPrs !== 'object') return true;
+  if (!Array.isArray(openPrs.prs) && !Array.isArray(openPrs.nums)) return true;
+  return !!(openPrs.unavailable || openPrs.partial?.length || openPrs.truncated === true || openPrs.truncated?.length);
+}
 export function planCloseItems(read, input = {}) {
   const requests = closeRequests(input, read.triage);
-  const unavailable = read.openPrs?.unavailable || read.openPrs?.partial?.length;
+  const unavailable = openPrCheckIncomplete(read.openPrs);
   if (input.apply && unavailable) fail('open-pr-check-unavailable', 'Cannot apply: open PR check unavailable or incomplete');
   const index = cardIndex(read.cards);
   const closedDuplicates = closedDuplicatesBySurvivor(read.cards, index);
   const priority = new Map((read.priority ?? []).map((x, i) => [normNum(x), i]));
-  const openPrs = new Set((read.openPrs?.nums ?? []).map(normNum));
+  const openPrs = openPrCardMap(read.openPrs, index);
   const requestedCards = new Set(requests.map(r => index.get(r.id)).filter(Boolean));
   const refused = [], candidates = new Map();
   const refuse = (r, refusal, detail) => refused.push({ id: r.id, refusal, detail });
@@ -70,7 +106,11 @@ export function planCloseItems(read, input = {}) {
     if (!why && buildPriorityPlacement(c, priority, index).buildPriorityIndex !== null) why = 'on-priority';
     if (!why && ['active', 'preparing'].includes(c.status)) why = 'in-flight';
     if (!why && isTerminalStatus(c.status)) why = 'already-terminal';
-    if (!why && openPrs.has(normNum(c.num))) why = 'open-pr';
+    if (!why && openPrs.has(c)) {
+      const prs = openPrs.get(c);
+      refuse(r, 'open-pr', `Cannot close ${r.id}: open-pr${prs.length ? ` (${prs.join(', ')})` : ''}`);
+      continue;
+    }
     if (!why && closedDuplicates.has(c)) {
       refuse(r, 'closed-duplicates', `Cannot close ${r.id}: closed duplicates ${closedDuplicates.get(c).join(', ')} still point to it via closedInto`);
       continue;

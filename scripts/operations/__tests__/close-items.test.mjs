@@ -70,15 +70,65 @@ describe('close-items fixture batches', () => {
       expect(p.output.refused[0].refusal).toBe('bad-pointer');
     }
   });
+  it('refuses hash-named cards and their NNN aliases referenced by an open PR (#5184 send-back)', () => {
+    const f = fixture({ 123: body('open', 'bornAs: xabc123\n'), xdef456: body(), 44: body('open', 'bornAs: xbody44\n'),
+      55: body(), 66: body('open', 'bornAs: xtitl66\n'), 77: body() });
+    const prs = [
+      { repo: 'o/r', number: 9001, headRefName: 'lane/descriptive-name', title: 'docs', body: '',
+        files: ['backlog/xabc123-renamed-before-numbering.md', 'backlog/xdef456-fixture.md'] },
+      { repo: 'o/r', number: 9002, headRefName: 'feature/xbody44', title: 'chore', body: 'Refs #55 and `we:backlog/77-fixture.md`.', files: [] },
+      { repo: 'o/r', number: 9003, headRefName: 'lane/foo', title: 'WE #xtitl66: thing', body: '', files: [] },
+    ];
+    const read = { ...f.reader({}), openPrs: { prs } };
+    const p = planCloseItems(read, { ids: '123,xabc123,xdef456,44,xbody44,55,66,77', reason: 'obsolete' });
+    expect(p.output.counts.wouldClose).toBe(0);
+    expect(p.output.refused.map(r => [r.id, r.refusal])).toEqual(['123', 'xabc123', 'xdef456', '44', 'xbody44', '55', '66', '77'].map(id => [id, 'open-pr']));
+    expect(p.output.refused[0].detail).toMatch(/o\/r#9001/);
+    expect(planCloseItems({ ...read, openPrs: { prs: [] } }, { ids: '123,xdef456', reason: 'obsolete' }).output.counts.wouldClose).toBe(2);
+  });
   it('fails the whole apply on unavailable/incomplete PR checks and warns in dry run', () => {
     const f = fixture({ 1: body() });
-    for (const openPrs of [{ unavailable: true }, { partial: [{ repo: 'fixture' }] }]) {
+    for (const openPrs of [{ unavailable: true }, { partial: [{ repo: 'fixture' }] }, { prs: [], truncated: [{ repo: 'fixture', reason: 'page cap' }] }, undefined, {}]) {
       const read = { ...f.reader({}), openPrs };
       expect(planCloseItems(read, { ids: '1', reason: 'obsolete' }).output.warnings).toEqual(['open-pr-check-unavailable']);
       try { planCloseItems(read, { ids: '1', reason: 'obsolete', apply: true }); throw new Error('did not refuse'); }
       catch (e) { expect(e.reason).toBe('open-pr-check-unavailable'); }
       expect(readFileSync(f.path(1), 'utf8')).toBe(body());
     }
+  });
+  describe('open-PR read for the close guard (paged, fail closed)', () => {
+    const page = (nodes, hasNextPage, totalCount) => JSON.stringify({ data: { repository: { pullRequests: { totalCount,
+      pageInfo: { hasNextPage, endCursor: hasNextPage ? 'c1' : null }, nodes } } } });
+    const node = (number, headRefName) => ({ number, title: `t${number}`, url: '', isDraft: false, createdAt: '', updatedAt: 'u',
+      headRefName, headRefOid: 'h', baseRefName: 'main', isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      reviewDecision: '', labels: { nodes: [] }, commits: { nodes: [] } });
+    function fakeGh({ pages, changedFiles = 1, files = n => [`backlog/x${n}aaaaa-fixture.md`] }) {
+      let call = 0;
+      return (cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql') return pages[call++];
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ body: '', changedFiles });
+        const n = /pulls\/(\d+)\/files/.exec(args[1])?.[1];
+        if (args[0] === 'api' && n) return files(n).map(p => `${p}\t`).join('\n');
+        throw new Error(`unexpected gh ${args.join(' ')}`);
+      };
+    }
+    const opts = exec => ({ exec, repos: ['o/r'], maxRows: 1, paging: { pageSize: 1, pageRetries: 0, heavyMaxAgeSeconds: 0 } });
+    it('reads every page and refuses the hash card a PR file names', () => {
+      const exec = fakeGh({ pages: [page([node(1, 'lane/a')], true, 2), page([node(2, 'lane/b')], false, 2)] });
+      const f = fixture({ x2aaaaa: body() });
+      const read = createCloseItemsReader({ ...f.options, openPrs: undefined, openPrRead: { ...opts(exec), maxRows: 10 } })({});
+      expect(read.openPrs.prs.map(p => p.number)).toEqual([1, 2]);
+      expect(planCloseItems(read, { ids: 'x2aaaaa', reason: 'obsolete', apply: true }).output.refused[0].refusal).toBe('open-pr');
+    });
+    it.each([
+      ['a page cap with more pages left', { pages: [page([node(1, 'lane/a')], true, 2)] }],
+      ['a file list shorter than changedFiles', { pages: [page([node(1, 'lane/a')], false, 1)], changedFiles: 3 }],
+      ['an unreadable page', { pages: ['{"errors":[{"message":"boom"}]}'] }],
+    ])('refuses apply on %s', (_, gh) => {
+      const f = fixture({ 1: body() });
+      const read = createCloseItemsReader({ ...f.options, openPrs: undefined, openPrRead: opts(fakeGh(gh)) })({});
+      expect(() => planCloseItems(read, { ids: '1', reason: 'obsolete', apply: true })).toThrow(/open PR check unavailable/);
+    });
   });
   it('allows children/dependents within the batch and cascades refusals for members that remain live', () => {
     const f = fixture({ 1: body(), 2: body('open', 'blockedBy: ["1"]\nparent: "1"\n') });
