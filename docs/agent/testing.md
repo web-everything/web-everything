@@ -806,3 +806,11 @@ or failed seal is archived before the active slot is replaced with its sequence 
 existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage alongside transport
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
+
+### Enqueue catch-up ordering
+
+The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
+`duePending` can otherwise undo the selected priority order. Queue fill depth comes from
+`mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
+First acceptance is the earliest structured accepted/clear-human comment across heads;
+include a removal/restore replay, comment pagination, and the ready-time fallback.

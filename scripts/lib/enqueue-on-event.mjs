@@ -22,8 +22,8 @@
  *   a full pass never run at the same time in one clone.
  *
  * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number,
- *   catchUp: { enabled: boolean, intervalMinutes: number } }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10}}` → platform
+ *   catchUp: { enabled: boolean, intervalMinutes: number, maxQueued: number, order: string } }`, resolved through the shared
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10, maxQueued:12, order:"priority-then-first-accept"}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
@@ -31,7 +31,7 @@
  *   burst, and GitHub's mergeable state lags the last check by a few seconds).
  *
  *   catchUp: when both enabled flags are true, list ready PRs on start and every intervalMinutes (1–240),
- *   oldest-ready first, capped by mergeDelivery.batchSize minus queued PRs; use the same fast-drain path. WHY: an
+ *   priority class, build.priority list, then first acceptance (ready-time fallback); capped by maxQueued minus queued PRs; use the same fast-drain path. WHY: an
  *   event only wakes a PR that changes AFTER the feed started; a PR that was already ready never gets one and waits
  *   on full passes that end before reaching it ("ready-not-reached", live #5025 2026-10-13). Log lines start
  *   `enqueue-on-event: catch-up`. `tick()` runs it when due; `catchUp()` runs ONLY it, for a daemon whose passes
@@ -45,11 +45,15 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
+import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
+import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mjs';
+import { readMainRedPriority } from './main-red-priority.mjs';
+import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-manifest.mjs';
+import { parseVerdictComment } from './review-log-claims.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10 }) });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, maxQueued: 12, order: 'priority-then-first-accept' }) });
 /** A fast drain that runs longer than this is stopped (SIGTERM); the PR rides the next full pass. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -57,15 +61,21 @@ const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const validInterval = (v) => Number.isFinite(v) && v >= 1 && v <= 240;
+const CATCH_UP_VALID = {
+  enabled: (v) => typeof v === 'boolean',
+  intervalMinutes: validInterval,
+  maxQueued: (v) => Number.isInteger(v) && v >= 1,
+  order: (v) => ['priority-then-first-accept', 'oldest-ready'].includes(v),
+};
 const VALID = {
-  catchUp: (v) => typeof v === 'boolean' || validInterval(v),
+  catchUp: (v) => Object.values(CATCH_UP_VALID).some((valid) => valid(v)),
   enabled: (v) => typeof v === 'boolean',
   debounceSeconds: (v) => Number.isFinite(v) && v >= 0 && v <= 600,
 };
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number}, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, maxQueued:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -86,10 +96,10 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
     sources: { ...(c.sources || {}) },
     invalid: [...(c.invalid || []), ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
   };
-  for (const leaf of ['enabled', 'intervalMinutes']) {
+  for (const leaf of Object.keys(CATCH_UP_VALID)) {
     const path = `catchUp.${leaf}`;
     const value = v.catchUp?.[leaf];
-    const valid = leaf === 'enabled' ? typeof value === 'boolean' : validInterval(value);
+    const valid = CATCH_UP_VALID[leaf](value);
     out.catchUp[leaf] = valid ? value : ENQUEUE_ON_EVENT_DEFAULTS.catchUp[leaf];
     if (!valid) {
       if (value !== undefined) out.invalid.push(`${path}=${JSON.stringify(value)}`);
@@ -98,11 +108,11 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // The cascade rejects values outside the union before the per-leaf type check can see them.
   for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes)=.*)$/.exec(invalid);
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|maxQueued|order)=.*)$/.exec(invalid);
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -208,7 +218,7 @@ export function readPrForWake({ repo, num, env = process.env, execFileImpl = exe
 }
 
 export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number isDraft isInMergeQueue} pageInfo{hasNextPage endCursor}}
+  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number body isDraft isInMergeQueue} pageInfo{hasNextPage endCursor}}
   mergeQueue(branch:"main"){entries(first:100){totalCount}}}}`;
 
 /**
@@ -216,10 +226,12 @@ export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String
  * purpose: nested inside the `pullRequests` list, GitHub returned an even shorter label-event page (live
  * 2026-10-13: #5217 got 7 of 45 events). Either way the timeline can lag by an hour or more (live: every page
  * ended ~2h before the read), so a PR labeled after that lag reads `readyAt: null`. That PR became ready MOST
- * recently, which is why null sorts last in {@link planCatchUp}: the order stays oldest-ready first.
+ * recently, which is why missing times sort last in {@link planCatchUp}. First acceptance comes from
+ * the structured verdict comments (all heads); paginate comments so a long pre-review thread does not hide it.
  */
+const commentsFields = `nodes{body createdAt} pageInfo{hasNextPage endCursor}`;
 export function readyAtQuery(nums) {
-  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}}}`;
+  const one = (n) => `p${n}:pullRequest(number:${Number(n)}){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}} comments(first:100){${commentsFields}}}`;
   return `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${nums.map(one).join(' ')}}}`;
 }
 
@@ -252,7 +264,7 @@ function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
 /**
  * IO: the open ready-to-merge PRs of `repo` and the merge queue's size, through the GraphQL repository connection
  * (never the issue-search budget `gh pr list --label` uses). Then, for the PRs that are neither drafts nor queued,
- * when each got its label (`readyAt`, null when unreadable: such PRs sort last). Never rejects.
+ * when each got its label and first acceptance (ready-time fallback when acceptance is unreadable). Never rejects.
  * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
  */
 export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile }) {
@@ -269,7 +281,7 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
     if (typeof pageInfo?.hasNextPage !== 'boolean') return { ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' };
     if (cursor === undefined) queued = list.repository.mergeQueue?.entries?.totalCount ?? 0;
-    prs.push(...nodes.map((pr) => ({ num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null })));
+    prs.push(...nodes.map((pr) => ({ ...(pr.body ? { itemIds: [extractManifestFromBody(pr.body)?.item].filter((id) => id != null).map(String) } : {}), num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null })));
     if (!pageInfo.hasNextPage) break;
     const next = pageInfo.endCursor;
     if (typeof next !== 'string' || !next || seenCursors.has(next)) return { ok: false, error: 'invalid pullRequests pagination cursor' };
@@ -281,31 +293,64 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
   for (let offset = 0; offset < open.length; offset += 100) {
     const batch = open.slice(offset, offset + 100);
     const times = await ghGraphql({ query: readyAtQuery(batch.map((p) => p.num)), owner, name, env, execFileImpl });
-    if (times.ok) for (const p of batch) p.readyAt = latestReadyAt(times.repository[`p${p.num}`]?.timelineItems);
+    if (times.ok) for (const p of batch) {
+      const record = times.repository[`p${p.num}`];
+      p.readyAt = latestReadyAt(record?.timelineItems);
+      let comments = record?.comments;
+      const dates = [];
+      const cursors = new Set();
+      while (comments) {
+        for (const comment of comments.nodes || []) {
+          const verdict = parseVerdictComment(comment);
+          const date = Date.parse(comment.createdAt);
+          if (['accepted', 'clear-human'].includes(verdict?.kind) && Number.isFinite(date)) dates.push(date);
+        }
+        if (!comments.pageInfo?.hasNextPage) break;
+        const next = comments.pageInfo.endCursor;
+        if (!next || cursors.has(next)) break;
+        cursors.add(next);
+        const page = await ghGraphql({ owner, name, env, execFileImpl, cursor: next,
+          query: `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){p${p.num}:pullRequest(number:${p.num}){comments(first:100,after:$cursor){${commentsFields}}}}}` });
+        if (!page.ok) break;
+        comments = page.repository[`p${p.num}`]?.comments;
+      }
+      if (dates.length) p.firstAcceptedAt = Math.min(...dates);
+    }
   }
   return { ok: true, prs, queued };
 }
 
-/** IO: the same merge-delivery policy used by the drain. */
-export function readQueueCapacity() {
-  try {
-    const policy = loadMergeDeliveryPolicy({ toolSettings: readDeclaredSettings().settings });
-    return { capacity: policy.batchSize, source: `mergeDelivery.batchSize (${policy.sources.batchSize})` };
-  } catch { return { capacity: 1, source: 'fallback 1 (policy unreadable)' }; }
+/** IO: catch-up fill depth, independent of GitHub's build batch size. */
+export function readQueueCapacity(setting = resolveEnqueueOnEventSetting()) {
+  return { capacity: setting.catchUp?.maxQueued ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.maxQueued,
+    source: `mergeQueue.enqueueOnEvent.catchUp.maxQueued (${setting.sources?.['catchUp.maxQueued'] || 'standard'})` };
 }
 
-/** PURE: oldest-ready candidates that fit the current queue, leaving eligibility to the drain. */
-export function planCatchUp({ prs, queued, capacity, pendingNums = [] }) {
+/** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
+export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = 'priority-then-first-accept',
+  priority, buildPriority = [], mainFix = null, repo, now = 0 }) {
   const pending = new Set(pendingNums);
   const skipped = []; const candidates = [];
   for (const pr of prs) {
     const reason = pr.isDraft ? 'draft' : pr.inQueue ? 'already queued' : pending.has(pr.num) ? 'already pending' : null;
     if (reason) skipped.push({ num: pr.num, reason });
-    else candidates.push({ num: pr.num, readyAt: pr.readyAt });
+    else candidates.push(pr);
   }
-  candidates.sort((a, b) => (a.readyAt ?? Infinity) - (b.readyAt ?? Infinity) || a.num - b.num);
+  const classes = new Map(rankByDeliveryPriority(candidates.map((pr) => ({ id: pr.num, facts: {
+    waitingSince: pr.firstAcceptedAt ?? pr.readyAt,
+    incident: { open: !!mainFix, owner: !!mainFix && [mainFix.pr, ...(mainFix.prs || [])].includes(pr.num) &&
+      (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) },
+  } })), priority, now).map((p) => [p.id, PRIORITY_CLASSES.indexOf(p.class)]));
+  const buildIndex = (pr) => {
+    const positions = (pr.itemIds || []).map((id) => buildPriority.indexOf(String(id))).filter((i) => i >= 0);
+    return positions.length ? Math.min(...positions) : Infinity;
+  };
+  const age = (pr) => (order === 'oldest-ready' ? pr.readyAt : pr.firstAcceptedAt ?? pr.readyAt) ?? Infinity;
+  candidates.sort((a, b) => (order === 'oldest-ready' ? 0 :
+    classes.get(a.num) - classes.get(b.num) || buildIndex(a) - buildIndex(b)) || age(a) - age(b) || a.num - b.num);
   const room = Math.max(0, capacity - queued);
-  return { run: candidates.slice(0, room), later: candidates.slice(room).map((p) => p.num), skipped };
+  return { run: candidates.slice(0, room).map(({ num, readyAt }) => ({ num, readyAt })),
+    later: candidates.slice(room).map((p) => p.num), skipped };
 }
 
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
@@ -333,14 +378,15 @@ const lastJsonLine = (s) => {
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readCandidates?:Function, readCapacity?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readCandidates?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
 export function createEnqueueOnEvent({
   cwd, localSlug, scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
-  readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = () => readQueueCapacity(),
+  readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = (s) => readQueueCapacity(s),
+  readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   timeoutMs = FAST_DRAIN_TIMEOUT_MS, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
   let pending = new Map();
@@ -368,13 +414,14 @@ export function createEnqueueOnEvent({
       const result = await readCandidates({ repo: localSlug });
       if (!result.ok) log(`enqueue-on-event: catch-up could not list ready PRs (${result.error}) — retrying in ${s.catchUp.intervalMinutes} min`);
       else {
-        const { capacity, source } = await readCapacity();
-        const plan = planCatchUp({ ...result, capacity, pendingNums: [...pending.values()].map((p) => p.num) });
+        const { capacity, source } = await readCapacity(s);
+        const plan = planCatchUp({ ...result, capacity, ...await readPriorities(), repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].map((p) => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
-        log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (oldest ready first)` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
+        log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
         pending = new Map(pending);
-        for (const { num, readyAt } of plan.run) pending.set(`${localSlug}#${num}`, {
-          repo: localSlug, num, firstAt: readyAt ?? now(), lastAt: now() - s.debounceSeconds * 1000,
+        for (const [index, { num }] of plan.run.entries()) pending.set(`${localSlug}#${num}`, {
+          // Keep the planned priority order through duePending, independently of ready-label churn.
+          repo: localSlug, num, firstAt: now() + index, lastAt: now() - s.debounceSeconds * 1000,
           causes: ['catch-up'], catchUp: true,
         });
       }

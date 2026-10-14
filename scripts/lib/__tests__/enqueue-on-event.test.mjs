@@ -308,12 +308,13 @@ describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)'
   });
 });
 
-const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10 } };
+const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, maxQueued: 3, order: 'priority-then-first-accept' } };
 const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, ...extra });
 const catchUpSetup = (extra = {}) => setup({
   resolveSetting: () => CATCH_UP_SETTING,
   readCandidates: async () => ({ ok: true, prs: [candidate(43, 200), candidate(42, 100), candidate(44)], queued: 1 }),
-  readCapacity: () => ({ capacity: 3, source: 'mergeDelivery.batchSize (tool)' }),
+  readCapacity: () => ({ capacity: 3, source: 'mergeQueue.enqueueOnEvent.catchUp.maxQueued (tool)' }),
+  readPriorities: () => ({}),
   ...extra,
 });
 
@@ -328,7 +329,7 @@ describe('catch-up setting', () => {
 
   it('resolves tool leaves and logs their sources', () => {
     const s = resolveSetting({ catchUp: { enabled: true, intervalMinutes: 20 } });
-    expect(s.catchUp).toEqual({ enabled: true, intervalMinutes: 20 });
+    expect(s.catchUp).toEqual({ ...ENQUEUE_ON_EVENT_DEFAULTS.catchUp, enabled: true, intervalMinutes: 20 });
     expect(s.sources).toMatchObject({ 'catchUp.enabled': 'tool', 'catchUp.intervalMinutes': 'tool' });
     expect(s.line).toContain(', catchUp.enabled=true (tool), catchUp.intervalMinutes=20 (tool)');
   });
@@ -338,7 +339,7 @@ describe('catch-up setting', () => {
     [{ enabled: 12, intervalMinutes: true }, ['catchUp.enabled=12', 'catchUp.intervalMinutes=true']],
   ])('falls back for invalid per-leaf values %j', (catchUp, invalid) => {
     const s = resolveSetting({ catchUp });
-    expect(s.catchUp).toEqual({ enabled: false, intervalMinutes: 10 });
+    expect(s.catchUp).toEqual(ENQUEUE_ON_EVENT_DEFAULTS.catchUp);
     expect(s.sources).toMatchObject({ 'catchUp.enabled': 'standard', 'catchUp.intervalMinutes': 'standard' });
     expect(s.invalid).toEqual(expect.arrayContaining(invalid));
     for (const value of invalid) expect(s.line).toContain(value);
@@ -510,7 +511,7 @@ describe('catch-up handle', () => {
     expect(reads).toBe(1);
     expect(calls.map((c) => c.args[1])).toEqual(['--only=42', '--only=43']);
     expect(ran.map((p) => [p.num, p.catchUp])).toEqual([[42, true], [43, true]]);
-    expect(lines).toContain('enqueue-on-event: catch-up listed 3 ready-to-merge PR(s), 1 in the merge queue, room 2 (capacity 3 from mergeDelivery.batchSize (tool)) — fast drain for #42 #43 (oldest ready first); later: #44');
+    expect(lines).toContain('enqueue-on-event: catch-up listed 3 ready-to-merge PR(s), 1 in the merge queue, room 2 (capacity 3 from mergeQueue.enqueueOnEvent.catchUp.maxQueued (tool)) — fast drain for #42 #43 (priority-then-first-accept); later: #44');
     expect(lines.filter((l) => l.startsWith('enqueue-on-event: catch-up #'))).toHaveLength(4);
     expect(handle.lastCatchUpAt()).toBe(1000);
     advance(60_000);
@@ -641,4 +642,94 @@ describe('catch-up handle', () => {
 it('reports top-level fast-drain refusal honestly', () => {
   expect(summarizeFastDrain({ ok: false, reason: 'gh-error', detail: 'gh pr list failed [network]: HTTP 504' }, 1))
     .toBe('refused: gh-error: gh pr list failed [network]: HTTP 504');
+});
+
+describe('catch-up fill and stable acceptance ordering', () => {
+  it('resolves and logs maxQueued and order with their sources', () => {
+    const s = resolveSetting({ catchUp: { maxQueued: 12, order: 'priority-then-first-accept' } });
+    expect(s.catchUp.maxQueued).toBe(12);
+    expect(s.line).toContain('catchUp.maxQueued=12 (tool)');
+    expect(s.line).toContain('catchUp.order=priority-then-first-accept (tool)');
+  });
+
+  it('fills to maxQueued even when build batchSize is five', async () => {
+    const { handle, calls } = catchUpSetup({
+      resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, maxQueued: 12 } }),
+      readCapacity: undefined,
+      readCandidates: async () => ({ ok: true, queued: 5, prs: Array.from({ length: 10 }, (_, i) => candidate(100 + i, i)) }),
+    });
+    await handle.catchUp();
+    expect(calls).toHaveLength(7);
+  });
+
+  it('drains a P0 ahead of build.priority and older acceptances', async () => {
+    const { handle, calls } = catchUpSetup({
+      readPriorities: () => ({ priority: { mode: 'enforce' }, buildPriority: ['7'], mainFix: { repo: 'we', pr: 99 } }),
+      readCandidates: async () => ({ ok: true, queued: 1, prs: [candidate(7, 0, { firstAcceptedAt: 0, itemIds: ['7'] }), candidate(99, 900)] }),
+    });
+    await handle.catchUp();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=99', '--only=7']);
+  });
+
+  it('uses build.priority list order within a class', () => {
+    const plan = planCatchUp({ capacity: 3, queued: 0, buildPriority: ['8', '7'], prs: [
+      candidate(1, 0), candidate(2, 200, { itemIds: ['7'] }), candidate(3, 300, { itemIds: ['8'] }),
+    ] });
+    expect(plan.run.map(p => p.num)).toEqual([3, 2, 1]);
+  });
+
+  it('retains first acceptance across heads and restore, and falls back to ready time', async () => {
+    const at = t => Date.parse(`2026-10-13T${t}:00Z`);
+    const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, _args, _opts, cb) => {
+      const query = _args.find(a => a.startsWith('query='));
+      const repository = query.includes('pullRequests(') ? {
+        pullRequests: { nodes: [5025, 5026, 5027].map(number => ({ number })), pageInfo: { hasNextPage: false } },
+        mergeQueue: { entries: { totalCount: 0 } },
+      } : Object.fromEntries([5025, 5026, 5027].map(num => [`p${num}`, {
+        timelineItems: { nodes: [{ createdAt: `2026-10-13T${num === 5025 ? '19:11' : num === 5026 ? '17:00' : '18:00'}:00Z`, label: { name: 'ready-to-merge' } }] },
+        comments: { nodes: num === 5027 ? [] : [
+          { body: '✅ review — accepted\n<!-- reviewed-sha: original -->', createdAt: `2026-10-13T${num === 5025 ? '16:49' : '17:00'}:00Z` },
+          ...(num === 5025 ? [{ body: '✅ review — `review:human` cleared via the sanctioned path\n<!-- reviewed-sha: restored -->', createdAt: '2026-10-13T19:11:00Z' }] : []),
+        ], pageInfo: { hasNextPage: false } },
+      }]));
+      cb(null, JSON.stringify({ data: { repository } }));
+    } });
+    expect(result.prs[0].firstAcceptedAt).toBe(at('16:49'));
+    const { handle, calls } = catchUpSetup({ readCandidates: async () => result, readCapacity: () => ({ capacity: 3, source: 'test' }) });
+    await handle.catchUp();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=5025', '--only=5026', '--only=5027']);
+    expect(planCatchUp({ ...result, capacity: 3, order: 'oldest-ready' }).run.map(p => p.num)).toEqual([5026, 5027, 5025]);
+  });
+});
+
+it('reads an acceptance beyond the first comments page', async () => {
+  let calls = 0;
+  const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+    calls++;
+    const repository = calls === 1 ? {
+      pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
+      mergeQueue: { entries: { totalCount: 0 } },
+    } : { p42: {
+      timelineItems: { nodes: [] },
+      comments: calls === 2 ? {
+        nodes: Array.from({ length: 100 }, () => ({ body: 'ordinary comment', createdAt: '2026-10-01' })),
+        pageInfo: { hasNextPage: true, endCursor: 'comments-next' },
+      } : {
+        nodes: [{ body: '✅ review — `review:human` cleared via the sanctioned path', createdAt: '2026-10-02' }],
+        pageInfo: { hasNextPage: false },
+      },
+    } };
+    if (calls === 3) expect(args).toContain('cursor=comments-next');
+    cb(null, JSON.stringify({ data: { repository } }));
+  } });
+  expect(calls).toBe(3);
+  expect(result.prs[0].firstAcceptedAt).toBe(Date.parse('2026-10-02'));
+});
+
+it('uses oldest-ready fallback when acceptance history cannot be read', async () => {
+  const { handle, calls } = catchUpSetup({ readCandidates: async () => ({ ok: true, queued: 1,
+    prs: [candidate(7, 200), candidate(8, 100)],
+  }) });
+  await handle.catchUp();
+  expect(calls.map(c => c.args[1])).toEqual(['--only=8', '--only=7']);
 });
