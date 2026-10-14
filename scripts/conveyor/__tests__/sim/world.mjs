@@ -76,7 +76,10 @@ let templateCache = null;
  *  `package.json`, `package-lock.json` — the daemon import graph's own dependency set (found by running the
  *  daemons against progressively wider copies; nothing outside these needed adding). `git ls-files -co
  *  --exclude-standard` (not a blind full-tree copy) so gitignored junk (`node_modules`, `_site/`, …) never
- *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs. */
+ *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs.
+ *  Tests, fixtures and corpora are excluded: per-scenario checkout/clone/teardown cost scales with this
+ *  tree, and that cost under CI load caused A3 to time out. Fake gh/claude helpers and their shims resolve
+ *  from INVOKING_ROOT, not the sim clone, so they do not need to ride along. */
 function buildWeTemplate() {
   const listed = execFileSync(
     'git',
@@ -106,7 +109,10 @@ function buildWeTemplate() {
       'schemas/worker-result.v1.json',
     ],
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
-  ).split('\n').filter(Boolean);
+  ).split('\n').filter(Boolean).filter((path) =>
+    !/(^|\/)__tests__\/|\.(?:test|spec)\.[^/]+$/.test(path)
+    && !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path)
+    && !/^scripts\/(?:.*\/)?fixtures\//.test(path));
 
   const work = mkdtempSync(join(tmpdir(), 'sim-template-we-'));
   for (const rel of listed) {
@@ -360,14 +366,30 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   });
 
   // ── git helpers ────────────────────────────────────────────────────────────────────────────────────────
-  function withScratchClone(repoKey, fn) {
+  function commitFiles(repoKey, base, files, msg) {
     const repo = repoEntries[repoKey];
     if (!repo) throw new Error(`world.git: unknown repo "${repoKey}"`);
-    const work = mkdtempSync(join(tmpdir(), 'sim-git-'));
+    const work = mkdtempSync(join(tmpdir(), 'sim-git-index-'));
+    const opts = { env: {
+      ...process.env,
+      GIT_INDEX_FILE: join(work, 'index'),
+      GIT_AUTHOR_NAME: 'Sim World', GIT_AUTHOR_EMAIL: 'sim@example.com',
+      GIT_COMMITTER_NAME: 'Sim World', GIT_COMMITTER_EMAIL: 'sim@example.com',
+    } };
     try {
-      git(root, ['clone', '--quiet', repo.originPath, work]);
-      configureRepo(work);
-      return fn(work, repo);
+      git(repo.originPath, ['read-tree', base], opts);
+      for (const [name, content] of Object.entries(files)) {
+        const blob = git(repo.originPath, ['hash-object', '-w', '--stdin'], {
+          ...opts, input: content, stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        git(repo.originPath, ['update-index', '--add', '--cacheinfo', `100644,${blob},${name}`], opts);
+      }
+      const tree = git(repo.originPath, ['write-tree'], opts).trim();
+      // A normal `git commit` rejects both empty files and writes that change nothing.
+      if (tree === git(repo.originPath, ['rev-parse', `${base}^{tree}`]).trim()) {
+        throw new Error('world.git: nothing to commit (no staged changes)');
+      }
+      return git(repo.originPath, ['commit-tree', tree, '-p', base, '-m', msg], opts).trim();
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -382,34 +404,33 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const worldGit = {
     /** A human (or another lane) pushing straight to `main` mid-scenario. */
     commitToMain(repoKey, files = {}, msg = 'sim: commit to main') {
-      withScratchClone(repoKey, (work) => {
-        git(work, ['checkout', 'main']);
-        for (const [name, content] of Object.entries(files)) {
-          const p = join(work, name);
-          mkdirSync(dirname(p), { recursive: true });
-          writeFileSync(p, content, 'utf8');
-        }
-        git(work, ['add', '-A']);
-        git(work, ['commit', '-q', '-m', msg]);
-        git(work, ['push', 'origin', 'HEAD:main']);
-      });
+      const base = headOf(repoKey, 'main');
+      const head = commitFiles(repoKey, base, files, msg);
+      git(repoEntries[repoKey].originPath, ['update-ref', 'refs/heads/main', head, base]);
       return headOf(repoKey, 'main');
     },
     /** A real PR-worthy branch on the origin — `from` defaults to `main`; `files`, if given, seed one commit. */
     createBranch(repoKey, name, { from = 'main', files = {} } = {}) {
-      withScratchClone(repoKey, (work) => {
-        git(work, ['checkout', '-b', name, `origin/${from}`]);
-        if (Object.keys(files).length) {
-          for (const [fname, content] of Object.entries(files)) {
-            const p = join(work, fname);
-            mkdirSync(dirname(p), { recursive: true });
-            writeFileSync(p, content, 'utf8');
-          }
-          git(work, ['add', '-A']);
-          git(work, ['commit', '-q', '-m', `sim: seed ${name}`]);
+      const base = headOf(repoKey, from);
+      const head = Object.keys(files).length ? commitFiles(repoKey, base, files, `sim: seed ${name}`) : base;
+      const origin = repoEntries[repoKey].originPath;
+      const ref = `refs/heads/${name}`;
+      let current = '0'.repeat(base.length);
+      try {
+        current = git(origin, ['rev-parse', '--verify', '--quiet', ref]).trim();
+      } catch (error) {
+        if (error.status !== 1) throw error;
+      }
+      if (current !== '0'.repeat(base.length)) {
+        try {
+          git(origin, ['merge-base', '--is-ancestor', current, head]);
+        } catch (error) {
+          if (error.status !== 1) throw error;
+          throw new Error(`world.git: rejected non-fast-forward update to ${ref}`);
         }
-        git(work, ['push', 'origin', `HEAD:${name}`]);
-      });
+      }
+      // Match a non-force push, with CAS protecting both creation and advancement.
+      git(origin, ['update-ref', ref, head, current]);
       return headOf(repoKey, name);
     },
     headOf,
