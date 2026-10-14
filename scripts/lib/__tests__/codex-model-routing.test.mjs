@@ -202,12 +202,13 @@ describe('per-task model AND effort routing (2026-10-12)', () => {
   const defaults = [
     ['prepare', 'gpt-6-astra', 'medium'], ['prepare-complex', 'gpt-6-astra', 'high'],
     ['takeover', 'gpt-6-astra', 'high'], ['design', 'gpt-6-astra', 'high'],
-    ...['fix', 'ci-heal', 'build', 'worker', 'review'].map(k => [k, 'gpt-6.1-sol', 'medium']),
+    ...['fix', 'ci-heal'].map(k => [k, 'gpt-6.1-sol', 'high']),
+    ...['build', 'worker', 'review', 'doc-fix', 'prevention-card', 'prepare-card'].map(k => [k, 'gpt-6.1-sol', 'medium']),
     ['trivial', 'gpt-6-luna', 'low'], ['review-mandatory', 'gpt-6-astra', 'high'],
   ];
   it.each(defaults)('%s names both defaults', (kind, model, effort) => {
-    expect(CODEX_MODEL_BY_TASK_DEFAULT[kind]).toEqual({ model, effort });
-    expect(route({ kind })).toEqual({ kind, model, effort, sources: { model: 'standard', effort: 'standard' }, bucket: 'codex' });
+    expect(CODEX_MODEL_BY_TASK_DEFAULT[kind]).toEqual({ model, effort, ...(['fix', 'ci-heal'].includes(kind) ? { retry: [{ model: 'gpt-6-astra', effort: 'high' }] } : {}) });
+    expect(route({ kind })).toEqual({ kind, model, effort, ...(['fix', 'ci-heal'].includes(kind) ? { retry: [{ model: 'gpt-6-astra', effort: 'high' }] } : {}), sources: { model: 'standard', effort: 'standard', ...(['fix', 'ci-heal'].includes(kind) ? { retry: 'standard' } : {}) }, bucket: 'codex' });
     expect(Object.isFrozen(CODEX_MODEL_BY_TASK_DEFAULT[kind])).toBe(true);
   });
   it('freezes the vocabulary and catalogue, preserving the strong identity', () => {
@@ -228,11 +229,11 @@ describe('per-task model AND effort routing (2026-10-12)', () => {
     expect(() => classifyCodexTask({ kind: 'oops' })).toThrow(/allowed.*prepare.*review-mandatory/i);
     expect(() => classifyCodexTask({ kind: 'constructor' })).toThrow(TypeError);
   });
-  it.each([['stronger','takeover'], ['stronger-model','takeover'], ...['card','card-filing','prevention-card','card-rename','conflict'].map(k => [k,'trivial']), ['delivery','build'], ['heal','ci-heal']])('aliases %s', (kind, expected) => expect(classifyCodexTask({ kind })).toBe(expected));
+  it.each([['stronger','takeover'], ['stronger-model','takeover'], ...['card','card-filing'].map(k => [k,'prevention-card']), ...['card-rename','conflict'].map(k => [k,'trivial']), ['delivery','build'], ['heal','ci-heal']])('aliases %s', (kind, expected) => expect(classifyCodexTask({ kind })).toBe(expected));
   it('resolves platform, tool, and partial env per leaf with provenance', () => {
     expect(route({ kind: 'fix', platform: { fix: { model: 'gpt-6-astra', effort: 'high' } }, tool: { fix: { model: 'gpt-6-luna' } }, env: { WE_CODEX_MODEL_BY_TASK: '{"fix":{"effort":"low"}}' } })).toMatchObject({ model: 'gpt-6-luna', effort: 'low', sources: { model: 'tool', effort: 'env' } });
     expect(route({ kind: 'fix', platform: { fix: { effort: 'high' } } }).sources.effort).toBe('platform');
-    expect(resolveCodexTaskRoute({ kind: 'fix', env: {}, platform: {}, log: false }).sources).toEqual({ model: 'tool', effort: 'tool' });
+    expect(resolveCodexTaskRoute({ kind: 'fix', env: {}, platform: {}, log: false }).sources).toEqual({ model: 'tool', effort: 'tool', retry: 'tool' });
   });
   it('ignores invalid leaves without discarding valid siblings and names invalid JSON', () => {
     expect(route({ kind: 'fix', tool: { fix: { model: 'unknown', effort: 'high' } }, env: { WE_CODEX_MODEL_BY_TASK: '{"fix":{"effort":"bogus"}}' } })).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high', sources: { model: 'standard', effort: 'tool' } });
@@ -251,7 +252,7 @@ describe('per-task model AND effort routing (2026-10-12)', () => {
   });
   it('logs every route, exactly formatted, and logging never throws', () => {
     const r = route({ kind: 'fix' });
-    const expected = 'codex-route · kind=fix model=gpt-6.1-sol (standard) effort=medium (standard) bucket=codex';
+    const expected = 'codex-route · kind=fix model=gpt-6.1-sol (standard) effort=high (standard) bucket=codex';
     expect(formatCodexRouteLine(r)).toBe(expected);
     const lines = [];
     for (let i = 0; i < 2; i++) logCodexRoute(r, { log: l => lines.push(l) });
@@ -263,4 +264,18 @@ describe('per-task model AND effort routing (2026-10-12)', () => {
     expect(parseRolloutUsageBucket(event('old', 1) + '\ninvalid\n' + event('codex', 12))).toEqual({ limit_id: 'codex', used_percent: 12 });
     expect(parseRolloutUsageBucket('{}\ninvalid')).toBeNull();
   });
+});
+
+it('cascades retry arrays as a validated leaf with provenance', () => {
+  const resolve = opts => resolveCodexTaskRoute({ kind: 'fix', platform: {}, tool: {}, env: {}, log: false, ...opts });
+  expect(resolve().retry).toEqual([{ model: 'gpt-6-astra', effort: 'high' }]);
+  const logs = [];
+  const r = resolve({ tool: { fix: { retry: [] } }, env: { WE_POLICY_CASCADE_LOG: '1', WE_CODEX_MODEL_BY_TASK: JSON.stringify({ fix: { retry: [{ model: 'gpt-6-luna', effort: 'max' }] } }) }, log: l => logs.push(l) });
+  expect(r.retry).toEqual([{ model: 'gpt-6-luna', effort: 'max' }]);
+  expect(r.sources.retry).toBe('env');
+  expect(logs.join(' ')).toMatch(/retry=.*env/);
+  for (const retry of [null, {}, [{ model: 'gpt-6-luna', effort: 'ultra' }], [{ model: 'unknown', effort: 'high' }], [{ model: 'gpt-6-astra' }], [{ model: 'gpt-6-astra', effort: 'high', extra: true }]]) {
+    expect(resolve({ tool: { fix: { retry: [] } }, env: { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ fix: { retry } }) } })).toMatchObject({ retry: [], sources: { retry: 'tool' } });
+  }
+  expect(resolve({ platform: { fix: { retry: [] } } })).toMatchObject({ retry: [], sources: { retry: 'platform' } });
 });

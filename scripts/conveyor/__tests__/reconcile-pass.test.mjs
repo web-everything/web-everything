@@ -6,17 +6,25 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
-  const { looksLikePersonalAccessDenial } = await importOriginal();
   return {
-    // Real shared denial classifier: required-status-checks.mjs delegates its 403/404 test to it (#4708).
-    looksLikePersonalAccessDenial,
+    // Keep real exports, including the shared denial classifier used by required-status-checks.mjs (#4708).
+    ...await importOriginal(),
     execFileSyncThrottled: vi.fn((file, args, opts) => execFileSync(file, args, opts)),
     runGhSync: vi.fn((args, opts) => execFileSync('gh', args, opts)),
   };
 });
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
+vi.mock('../../lib/required-status-checks.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    // Snapshot/CLI contracts must not read GitHub policy or the host's policy cache.
+    getRequiredStatusChecks: vi.fn(() => ({ checks: [...actual.FALLBACK_REQUIRED_STATUS_CHECKS], source: 'fixture' })),
+  };
+});
 
 import { prFileContract } from './pr-file-test-helpers.mjs';
+import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
@@ -36,15 +44,10 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
     readAgents: () => [], enrich: (agents) => agents,
   });
   expect(readPrs).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
-  // #4501 — `enrichMainRed` now also receives the live-fetched `requiredChecks` (here degraded to the
-  // FALLBACK_REQUIRED_STATUS_CHECKS default, since `execFileSync` is mocked with no real `gh` behind it) —
-  // this test's own concern (repo-key normalisation) is unaffected.
-  // The live required-checks read goes through a host-level cache, so on a machine whose cache already holds the
-  // real branch-protection list (e.g. with `soak-replay-gate`) the list is a SUPERSET of the fallback — assert the
-  // fallback checks are present rather than pinning the exact host-dependent list.
+  // #4501 — main-red attribution receives the same deterministic required set as the planner.
   expect(enrichMainRed).toHaveBeenCalledWith([], {
     repo: 'web-everything/web-everything', defaultBranch: 'main',
-    requiredChecks: expect.arrayContaining(['test', 'smoke', 'daemon-soak']),
+    requiredChecks: [...FALLBACK_REQUIRED_STATUS_CHECKS],
   });
 });
 
@@ -1467,4 +1470,17 @@ describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)',
       `repos/${repo}/actions/jobs/11`, `repos/${repo}/actions/runs/200`,
     ]);
   });
+});
+
+it('cards 273/278 threads resolved ownership settings and keeps pure defaults on unreadable IO', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { readFileSync } = await import('node:fs');
+  const fx = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-ci-heal-escalated.json', 'utf8'));
+  const options = { ...xxOptions(), readPrs: () => [fx.pr], readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
+    now: Date.parse(fx.observedAt), excuseMergeGateHolds: prs => prs, enrichMechanicalRound: prs => prs,
+    enrichReferralHolds: prs => prs, enrichLedgerHolds: prs => prs, enrichRulings: prs => prs,
+    enrichScopeBloat: prs => prs, enrichCodeQL: prs => prs, enrichEscalationBase: prs => prs,
+    loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'on', source: 'test' }, unlabeledRedAgentPr: { value: 'off', source: 'test' } }) };
+  expect(runReconcilePass(options).dispatch).toContainEqual(expect.objectContaining({ kind: 'review', advisoryReview: expect.objectContaining({ ciWaived: true }) }));
+  expect(runReconcilePass({ ...options, loadPrOwnership: () => { throw Error('unreadable'); } }).dispatch.some(d => d.kind === 'review')).toBe(false);
 });

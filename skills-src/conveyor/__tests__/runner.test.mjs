@@ -37,9 +37,10 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 // Keep the real fetch builder while replacing throttle effects (no machine-global locks or real gh).
-vi.mock('../../../scripts/lib/gh-throttle.mjs', async () => {
+vi.mock('../../../scripts/lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
+    ...await importOriginal(),
     runGhSync: (args, opts) => execFileSync('gh', args, opts),
     execFileSyncThrottled: (file, args, opts) => execFileSync(file, args, opts),
   };

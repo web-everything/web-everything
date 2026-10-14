@@ -442,6 +442,7 @@ export function createEnqueueOnEvent({
   let lastLine = null;
   let lastCatchUpAt = null;
   let catchUpRoom = 0; // unspent drain attempts from the most recent queue snapshot
+  let catchUpCapacity = null; // the fill depth that snapshot's room was computed against
   let setting = ENQUEUE_ON_EVENT_DEFAULTS;
   const readSetting = () => {
     try { setting = resolveSetting(); } catch (e) { setting = { ...ENQUEUE_ON_EVENT_DEFAULTS, line: `enqueue-on-event: setting unreadable (${String(e?.message || e).split('\n')[0]}) — off` }; }
@@ -453,9 +454,31 @@ export function createEnqueueOnEvent({
   const catchUpDue = (s, t) => s.enabled && s.catchUp?.enabled &&
     (lastCatchUpAt === null || t - lastCatchUpAt >= s.catchUp.intervalMinutes * 60_000);
 
+  /** Apply the current setting to work retained from earlier runs or earlier in this run; false = stop running. */
+  async function honourSetting(s) {
+    if (!s.enabled) { pending = new Map(); catchUpRoom = 0; return false; }
+    if (!s.catchUp?.enabled) {
+      // Disabling catch-up withdraws its retained work; a PR that also had an event stays as ordinary event work.
+      catchUpRoom = 0;
+      pending = new Map([...pending].flatMap(([key, p]) => {
+        if (!p.catchUp) return [[key, p]];
+        const causes = p.causes.filter((c) => c !== 'catch-up');
+        if (!causes.length) return [];
+        const next = { ...p, causes };
+        delete next.catchUp;
+        return [[key, next]];
+      }));
+    } else if (catchUpRoom > 0 && catchUpCapacity !== null) {
+      // A lowered fill depth shrinks the room granted by the last snapshot; a raised one waits for the next snapshot.
+      const { capacity } = await readCapacity(s);
+      if (capacity < catchUpCapacity) { catchUpRoom = Math.max(0, catchUpRoom - (catchUpCapacity - capacity)); catchUpCapacity = capacity; }
+    }
+    return true;
+  }
+
   async function runDue({ catchUpOnly = false } = {}) {
-    const s = readSetting();
-    if (!s.enabled) { pending = new Map(); return []; }
+    let s = readSetting();
+    if (!await honourSetting(s)) return [];
     let catchUpLater = [].values();
     let catchUpIndex = 0;
     const queueCatchUp = (num) => {
@@ -484,6 +507,7 @@ export function createEnqueueOnEvent({
         for (const num of backoff.keys()) if (!listed.has(num)) backoff.delete(num);
         const { capacity, source } = await readCapacity(s);
         catchUpRoom = Math.max(0, capacity - result.queued);
+        catchUpCapacity = capacity;
         const reserved = [...pending.values()].filter((p) => p.catchUp).length;
         const plan = planCatchUp({ ...result, capacity: capacity - reserved, ...await readPriorities(), repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].map((p) => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
@@ -495,6 +519,11 @@ export function createEnqueueOnEvent({
     const ran = [];
     for (;;) {
       if (!allowed()) break;
+      if (ran.length) { // a fast drain takes minutes: honour a setting changed while it ran
+        s = readSetting();
+        if (!await honourSetting(s)) break;
+        if (!s.catchUp?.enabled) catchUpLater = [].values();
+      }
       const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })
         .filter((p) => (!catchUpOnly || p.catchUp) && (!p.catchUp || catchUpRoom > 0));
       if (!p) break;

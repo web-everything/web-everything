@@ -30,7 +30,7 @@ const IDENTITY_FIELDS = ['purpose', 'session', 'holder', 'envSession'];
 export const MAX_REPAIR_PATTERN_LENGTH = 200;
 export const MAX_REPAIR_MATCH_VALUE_LENGTH = 256;
 export const REPAIR_MATCH_TIMEOUT_MS = 50;
-/** At most this many patterns, and at most this much wall-clock for one whole classification (every pattern x field). */
+/** At most this many patterns; matching across every pattern x field has this budget, starting after validation. */
 export const MAX_REPAIR_PATTERNS = 16;
 export const REPAIR_CLASSIFY_BUDGET_MS = 150;
 
@@ -71,13 +71,24 @@ function hasUnsafeRepeat(src) {
   return false;
 }
 
-/** True when every entry is a non-empty, length-capped string that compiles as a RegExp and nests no repeat. Pure. */
+/**
+ * Operator selections must be provably contained in the built-in repair language: exact built-in expressions,
+ * or fully anchored literal slugs that themselves match a built-in family. No general regex containment is
+ * attempted. Empty arrays disable matching; one invalid entry rejects the entire layer. Resource and unsafe
+ * repeat checks remain independent bounds if this grammar is extended later. Pure.
+ */
 export function validRepairPatterns(v) {
   if (!Array.isArray(v) || v.length > MAX_REPAIR_PATTERNS) return false;
   for (const p of v) {
     if (typeof p !== 'string' || p === '' || p.length > MAX_REPAIR_PATTERN_LENGTH) return false;
     try { new RegExp(p); } catch { return false; }
     if (hasUnsafeRepeat(p)) return false;
+    if (!DEFAULT_REPAIR_PATTERNS.includes(p)) {
+      const literal = p.slice(1, -1);
+      // Explicit endpoints and forbidden-character scan avoid '$' accepting a trailing newline.
+      if (p[0] !== '^' || !p.endsWith('$') || !literal || /[^a-z0-9-]/.test(literal)) return false;
+      if (!DEFAULT_REPAIR_PATTERNS.some((standard) => new RegExp(standard).test(literal))) return false;
+    }
   }
   return true;
 }

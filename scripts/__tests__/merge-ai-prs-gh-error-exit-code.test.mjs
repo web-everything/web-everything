@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
 // A minimal `gh` stub: `repo view --json defaultBranchRef` → "main"; `pr list` → `[]`, unless
 // GH_FAIL_LIST=1, which fails it the way a rate-limited/unauthenticated `gh` does (non-zero exit + stderr).
@@ -58,7 +59,9 @@ describe('merge-ai-prs CLI — #3383 gh-error exit code split from the dup-id tr
   const runCli = (extraEnv = {}) => spawnSync('node', [script, '--this-repo', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
     cwd: repoDir,
     encoding: 'utf8',
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, ...extraEnv },
+    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`,
+      WE_GH_THROTTLE_LOCK_ROOT: join(repoDir, `throttle-${randomUUID()}`),
+      WE_GH_THROTTLE_GH_BIN: join(shimDir, 'gh'), WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1', ...extraEnv },
   });
 
   it('a `gh pr list` failure exits 4 with reason:gh-error, distinct from the dup-id tripwire\'s exit 3', () => {

@@ -5,6 +5,7 @@
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
  */
 import { readFileSync } from 'node:fs';
+import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
@@ -121,7 +122,15 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       || verdict.head_sha.toLowerCase() !== headSha.toLowerCase() || verdict.ok !== false) return unchanged;
     const currentFreeze = verdict.results?.some(manualFreeze) && typeof freeze === 'function' ? freeze() : freeze;
     const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen });
-    if (!classification.excused) return unchanged;
+    if (!classification.excused) {
+      const holds = verdict.results?.filter(blocking) ?? [];
+      // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
+      if (holds.length && holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) {
+        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), jobId } };
+        return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
+      }
+      return unchanged;
+    }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
     return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
@@ -218,7 +227,7 @@ export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVe
     return prs.map(pr => {
       const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
         readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting });
-      return out.excused ? { ...pr, statusCheckRollup: out.rows } : pr;
+      return out.excused || out.reviewHold ? { ...pr, statusCheckRollup: out.rows } : pr;
     });
   } catch { return prs; }
 }

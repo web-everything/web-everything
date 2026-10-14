@@ -247,16 +247,11 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `owed-main-rule`     — drain-assigned numbers await main’s CI exemption; never undo them via ci-heal.
  *   `owed-ci-rerun`      — we:backlog/x5uqim1-*.md (#4075/#3383): the required check failed while `main`'s OWN
  *                          CI was red (`we:scripts/conveyor/main-red-recovery.mjs#isPrCiFailureOwedRerun`) and
- *                          this PR's head has not yet been refreshed onto the now-recovered `main`. Owed a
- *                          mechanical rebase onto `main` (`we:scripts/conveyor/ci-red-recovery-watch.mjs`, via
- *                          the SAME proven `we:scripts/lib/rebase-drop-manifest.mjs` plumbing the drain itself
- *                          uses), NEVER a `ci-heal` — a ci-heal agent dispatched here would misdiagnose `main`'s
- *                          own breakage as a defect in code that was never broken. NAMED `owed-ci-rerun` for the
- *                          population it covers (a red-`main`-caused CI failure), not the literal mechanism —
- *                          see the leaf's own file header for why a REBASE, not a rerun of the same stale
- *                          commit, is what actually resolves it. Once the head already contains `main`'s
- *                          current tip and is STILL red, this refusal no longer fires and the PR falls through
- *                          to the ordinary `ci-red` → `ci-heal` path below, unaffected. we:backlog/
+ *                          this PR's head has not yet been refreshed onto main. When main is green and
+ *                          fix.owedCiRerun permits it, this planner owns a bounded mechanical rerun of the
+ *                          failed required jobs through the ci-timeout-rerun executor. Pending requests hold;
+ *                          a spent per-head budget falls through to ordinary ci-heal. Otherwise this refusal
+ *                          retains the existing mechanical-rebase ownership. we:backlog/
  *                          review-while-main-red (#4075/#3383): this refusal NO LONGER means nothing else is
  *                          dispatched for the PR — a `review:pending` PR reaching it also gets a `review`
  *                          dispatched IN PARALLEL (`extra: { owedCiRerun: true }` on that row), via {@link
@@ -301,7 +296,7 @@ export const REFUSAL_KINDS = Object.freeze([
   // sessions in one evening). `ci-heal-escalated` — a genuine judgment call, terminal until a new push.
   // `waiting-on-system-fix` — the red is the tooling/gate's own fault and a system-level fix is already open
   // for it; this PR owes nothing further until that fix lands or its own head changes.
-  'ci-heal-escalated', 'waiting-on-system-fix',
+  'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
   'ci-timeout-rerun-in-flight',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
@@ -1439,6 +1434,25 @@ export function resolveRoundCap(env = {}) {
     && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
 }
 
+function advisoryHeadState(pr) {
+  const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+  const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
+  const latest = headSha ? latestAdvisory(trustedComments) : undefined;
+  const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+  // Card 273, #5157: only trusted verdict footers count as head coverage.
+  const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
+    || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+  // A newer unpinned advisory also stops repeated reviews until a person rules.
+  let lastHeaded = -1;
+  let lastHeadless = -1;
+  trustedComments.forEach((c, i) => {
+    if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
+    if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
+  });
+  const unpinnedAdvisory = lastHeadless > lastHeaded;
+  return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -1556,10 +1570,11 @@ function dispatchReviewRow({
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
   if (advisoryReview) {
-    if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    if (advisoryReview.ciWaived !== true && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
-      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason }, why: advisoryReview.why,
+      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
+        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
     });
     return;
   }
@@ -1898,6 +1913,7 @@ export function planReconcile({
   // `takeover` (a takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting and the
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
+  owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
   // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
@@ -1917,6 +1933,7 @@ export function planReconcile({
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
   requiredChecks = null,
+  advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
   // OPTION, never an env read — this file stays pure; a test sets it directly to exercise both sides of the
@@ -2167,24 +2184,7 @@ export function planReconcile({
       // defect is open: that is the gate working, not a defect — no takeover and no "a person must take it over".
       if (takeover?.reason === 'gate-hold') {
         // Live #4764: spent repair rounds still owe a current advisory, or a visible operator handoff.
-        const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
-        const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
-        const latest = headSha ? latestAdvisory(trustedComments) : undefined;
-        const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
-        // Structured evidence only: a verdict counts when its own footer names the live head. A sha merely mentioned
-        // in a verdict's prose (an older review quoting the new head) never marks that head reviewed.
-        const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
-          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
-        // A review whose basis was degraded or unpinned posts an advisory note with NO head to compare (no `Net basis`
-        // footer), so it can never "cover" the live head. When the newest advisory note on the thread is such a
-        // headless one, a review has already run: do not spend another every tick — the operator rules (bounds the loop).
-        let lastHeaded = -1;
-        let lastHeadless = -1;
-        trustedComments.forEach((c, i) => {
-          if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
-          if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
-        });
-        const unpinnedAdvisory = lastHeadless > lastHeaded;
+        const { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
         // The owed advisory goes through dispatchReviewRow, the ONE review decision (referral hold, scope-bloat, draft,
         // already-reviewed-head, CI). If it refuses, the refusal is named in the operator note below, never swallowed.
         let reviewRefusal = null;
@@ -2550,6 +2550,19 @@ export function planReconcile({
       continue;
     }
 
+    // Card 278, #5172: published red without a review label has no daemon owner.
+    if (unlabeledRedAgentPr === 'review-label' && reviewLabelHeal !== 'off'
+        && (pr?.state ?? 'OPEN') === 'OPEN' && !pr?.isDraft
+        && ['open', 'queued'].includes(phase) && String(pr?.headRefName ?? '').startsWith('lane/')
+        && isAiGeneratedPr(pr) && !withPhase.labels.some(l => l.startsWith('review:'))
+        && (withPhase.check === 'red' || withPhase.labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)))
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
+        variant: 'stuck', rule: 'unlabeled-red',
+        why: `agent PR reads ci-red but has no review:* label, so no daemon owns it (phase ${phase} answers nothing-owed); apply review:pending so the review path owns it; real red CI then routes to ci-heal` });
+      continue;
+    }
+
     // A required `review-gate` is red by design while a review label is held, so a `ci-red` PR whose ONLY
     // failing required check is `review-gate` must not be healed (ci-heal cannot clear it; it would re-run
     // every tick). Deliberately narrow: only the `ci-red` phase, and only when `review-gate` is the sole
@@ -2563,8 +2576,22 @@ export function planReconcile({
     // (9 h, zero dispatches). A CI repair is not a review decision: ci-heal never touches a `review:*` label, so
     // the human hold must not exclude it. Only a COMPLETED red (`check.state === 'red'`) opts a needs-human PR in —
     // pending/unchecked stay with the review path exactly as before.
+    const humanHandoffAdvisory = reason => {
+      if (advisoryReviewOnHumanHandoff !== 'on'
+          || !withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) return;
+      const { headSha, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
+      if (!headSha || advisoryIsCurrent || alreadyReviewed || unpinnedAdvisory) return;
+      const folded = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'humanHandoffAdvisory');
+      // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
+        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
+          why: reason === 'human-handoff'
+            ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
+            : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
+    };
     const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
-    if (ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -2676,7 +2703,22 @@ export function planReconcile({
       continue;
     }
 
-    if (ciRepairOwed) {
+    const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
+    const latestMergeGate = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(r => r.name === 'merge-gate');
+    const reviewHoldRed = advisoryReviewOnHumanHandoff === 'on'
+      && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      && heldGates.length > 0 && heldGates.every(name => name === 'review-gate'
+        || (name === 'merge-gate' && latestMergeGate?.mergeGateReviewHold));
+    if (reviewHoldRed) {
+      refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+      // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
+      // guards below reachable, without healing held gates or dispatching a second review.
+      if (!(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {
+        humanHandoffAdvisory('review-hold');
+        continue;
+      }
+    }
+    if (ciRepairOwed && !reviewHoldRed) {
       // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
       const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
@@ -2757,34 +2799,72 @@ export function planReconcile({
           }
           continue;
         }
-        // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
-        const viaClass = classifyMainDefect({
-          comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
-          mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
-          prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
-          mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
-        });
-        const viaMainGreen = viaClass.via !== 'red-window';
-        const viaSignature = viaClass.via === 'signature';
-        refuse('owed-ci-rerun', {
-          ...withPhase,
-          why: viaSignature
-            ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
-            : viaMainGreen
-            ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
-            : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`,
-        });
-        // Preserve rerun ownership while folding the independent review prerequisite into this
-        // same refusal row. Required checks must succeed even when their failure belongs to main.
-        if (withPhase.labels.includes('review:pending')) {
-          const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
-          dispatchReviewRow({
-            pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
-            refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
-            extra: { owedCiRerun: true },
-          });
+        let owedRerunSpent = false;
+        const retry = pr.owedCiRerunRetry;
+        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false
+            && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
+          const foldReview = row => {
+            if (!withPhase.labels.includes('review:pending')) return;
+            const foldRefusal = foldReviewRefusalInto(row, withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          };
+          const budget = pr.timeoutRetryBudget;
+          if (budget?.pending) {
+            refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+              why: 're-run of the failed required jobs already requested on this head; result not observed yet' });
+            foldReview(refusals[refusals.length - 1]);
+            continue;
+          }
+          const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
+          const cap = owedCiRerun.maxRerunsPerHead * retry.jobs.length;
+          if (spent < cap) {
+            const names = splitFailingChecks(pr.statusCheckRollup, requiredChecks).required.join(', ');
+            dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'owed-ci-rerun',
+              timeoutRetry: { ...retry, cap },
+              why: `main is green again (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)} at ${pr.mainGreenNow.at}); required check(s) ${names} failed while main was red — mechanical re-run of the failed jobs ${spent + 1}/${cap} on head ${pr.headRefOid.slice(0, 8)}, no heal budget` });
+            foldReview(dispatch[dispatch.length - 1]);
+            continue;
+          }
+          if (spent >= cap) {
+            owedRerunSpent = true;
+            notes.push({ kind: 'owed-ci-rerun-spent', prNumber, attempts: spent, cap,
+              text: `PR #${prNumber}: failed required jobs remain red after ${spent}/${cap} re-runs on this head with main green — ordinary ci-heal is owed` });
+          }
         }
-        continue;
+        if (!owedRerunSpent) {
+          // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
+          const viaClass = classifyMainDefect({
+            comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
+            mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+            prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
+            mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
+          });
+          const viaMainGreen = viaClass.via !== 'red-window';
+          const viaSignature = viaClass.via === 'signature';
+          refuse('owed-ci-rerun', {
+            ...withPhase,
+            why: (viaSignature
+              ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
+              : viaMainGreen
+              ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
+              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : ''),
+          });
+          // Preserve rerun ownership while folding the independent review prerequisite into this
+          // same refusal row. Required checks must succeed even when their failure belongs to main.
+          if (withPhase.labels.includes('review:pending')) {
+            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          }
+          continue;
+        }
       }
       // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, PR #2783 (chalbert/
       // web-everything): three ci-heal sessions in one evening each ended "escalated (needs human — not a CI
@@ -2863,6 +2943,7 @@ export function planReconcile({
                 ? `PR #${prNumber}: ci-heal confirmed head \`${escalation.headSha}\` is not a CI break (review gate only) — no further heal owed; review waits for complete successful required checks`
                 : `PR #${prNumber}: ci-heal escalated on head \`${escalation.headSha}\` — ${escalation.reason || 'needs a human judgment call'}; will not re-dispatch until a new push changes this head`,
           });
+          if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
           // Retain the escalation and fold the review prerequisite into the same row.
           // A comment claiming CI is irrelevant cannot override a required check's actual result.
           if (isNotCiBreak && withPhase.labels.includes('review:pending')) {
@@ -3134,6 +3215,7 @@ export function planReconcile({
           const latest = headSha ? latestAdvisory(trustedComments) : undefined;
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
+            if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
             if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
@@ -3192,6 +3274,7 @@ export function planReconcile({
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
+      if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;

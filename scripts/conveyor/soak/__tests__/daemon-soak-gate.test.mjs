@@ -54,9 +54,10 @@ describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
     expect(runGate({ scopeResult: 'success', run: 'true', shardResult: 'success' })).toBe(0);
   });
 
-  it('fails when scope said run and a shard failed or was skipped', () => {
+  it('fails when scope said run and a shard failed, was skipped, or was cancelled', () => {
     expect(runGate({ scopeResult: 'success', run: 'true', shardResult: 'failure' })).not.toBe(0);
     expect(runGate({ scopeResult: 'success', run: 'true', shardResult: 'skipped' })).not.toBe(0);
+    expect(runGate({ scopeResult: 'success', run: 'true', shardResult: 'cancelled' })).not.toBe(0);
   });
 
   it('rejects a failed scope job with an absent run output (no false green)', () => {

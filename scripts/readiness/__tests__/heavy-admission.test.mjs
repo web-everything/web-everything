@@ -1556,6 +1556,12 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     const link = join(lockRoot, 'link'); symlinkSync(join(ws, '.lanes'), link);
     const checkout = join(ws, 'web-everything');
     expect(privateAdmissionPool({ LANE_POOL_ROOT: link }, checkout)).toBe(false);
+    const priority = { mode: 'off', repairPatterns: [] };
+    const aliased = resolveAdmissionPolicy({ platform: { priority }, checkoutRoot: checkout,
+      tool: { priority: { mode: 'enforce' } },
+      env: { LANE_POOL_ROOT: link, WE_HEAVY_ADMISSION_PRIORITY: 'enforce' } });
+    expect(aliased.settings.priority).toEqual(priority);
+    expect(aliased.sources['priority.mode']).toBe('platform');
     expect(privateAdmissionPool({ LANE_POOL_ROOT: join(realpathSync(lockRoot), 'ws2', '.lanes') }, join(lockRoot, 'ws2', 'web-everything'))).toBe(false);
     expect(privateAdmissionPool({ LANE_POOL_ROOT: join(lockRoot, 'elsewhere') }, checkout)).toBe(true);
   });
@@ -1571,15 +1577,23 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       const prefs = join(lockRoot, 'torn.json'); const env = { WE_PLATFORM_PREFERENCES: prefs };
-      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3 } }));
-      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(3);
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3, priority: { mode: 'off', repairPatterns: [] } } }));
+      const initial = loadAdmissionPolicy({ env });
+      expect(initial.settings.cap).toBe(3);
+      expect(initial.settings.priority).toEqual({ mode: 'off', repairPatterns: [] });
+      expect(loadAdmissionPolicy({ env })).toBe(initial);
       vi.setSystemTime(Date.now() + 11_000);
       writeFileSync(prefs, '{"heavyAdmission": {"cap"');
       const torn = loadAdmissionPolicy({ env });
       expect(torn.settings.cap).toBe(3);
+      expect(torn.settings.priority).toEqual(initial.settings.priority);
+      expect(torn.sources['priority.mode']).toBe('platform');
       expect(torn.invalid.join('\n')).toMatch(/platform:/);
-      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5 } }));
-      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(5);
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5, priority: { mode: 'enforce', repairPatterns: ['^revert-red-42$'] } } }));
+      const replacement = loadAdmissionPolicy({ env });
+      expect(replacement.settings.cap).toBe(5);
+      expect(replacement.settings.priority).toEqual({ mode: 'enforce', repairPatterns: ['^revert-red-42$'] });
+      expect(replacement.sources['priority.repairPatterns']).toBe('platform');
     } finally { vi.useRealTimers(); }
   });
 
@@ -1590,10 +1604,11 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     expect(p.invalid.length).toBe(3);
   });
 
-  it('two checkouts sharing one pool, only one carrying a heavy-admission settings file, resolve identical capacity', () => {
+  it('two checkout loaders with conflicting local/env preferences share platform capacity and priority', () => {
     const home = join(lockRoot, 'home');
     const prefs = join(lockRoot, 'prefs.json');
-    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 2, fastSlots: 1 } }));
+    const priority = { mode: 'off', repairPatterns: ['^revert-red-42$'] };
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 2, fastSlots: 1, priority } }));
     const mk = (n, heavyAdmission) => {
       const root = join(lockRoot, 'workspace', '.lanes', 'web-everything', `lane-${n}`);
       mkdirSync(join(root, 'scripts', 'settings'), { recursive: true });
@@ -1601,8 +1616,16 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
       return root;
     };
     const env = { WE_PLATFORM_PREFERENCES: prefs };
-    const one = loadAdmissionPolicy({ env, repoRoot: mk(1), home });
-    const two = loadAdmissionPolicy({ env, repoRoot: mk(2, { cap: 4, fastSlots: 2 }), home });
+    const one = loadAdmissionPolicy({ env: { ...env, WE_HEAVY_ADMISSION_PRIORITY: 'enforce', WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '[]' },
+      repoRoot: mk(1, { priority: { mode: 'enforce', repairPatterns: [] } }), home });
+    const two = loadAdmissionPolicy({ env: { ...env, WE_HEAVY_ADMISSION_PRIORITY: 'off', WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '["^main-fix-abcdef0$"]' },
+      repoRoot: mk(2, { cap: 4, fastSlots: 2, priority: { mode: 'off', repairPatterns: ['^main-fix-abcdef0$'] } }), home });
+    expect(one.settings.priority).toEqual(priority);
+    expect(two.settings.priority).toEqual(priority);
+    expect(one.sources).toEqual(two.sources);
+    expect(one.sources['priority.repairPatterns']).toBe('platform');
+    expect(one.ignored.join(' ')).toContain('tool.priority.mode');
+    expect(two.ignored.join(' ')).toContain('env WE_HEAVY_ADMISSION_REPAIR_PATTERNS');
     expect(caps(two)).toEqual(caps(one));
     expect(caps(two)).toEqual([2, 1]);
   });
@@ -1772,12 +1795,12 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
     const script = `
       import { acquireSlotBlocking, ADMISSION_POLICY_STANDARD, classifyWaiterPriority } from ${JSON.stringify(pathToFileURL(CLI).href)};
       const priority = { mode: 'enforce', repairPatterns: ${JSON.stringify(patterns)} };
-      const t0 = Date.now();
+      const t0 = Date.now(); const logs = [];
       const cls = classifyWaiterPriority({ purpose: ${JSON.stringify(value)} }, priority);
       const r = await acquireSlotBlocking({ lockRoot: ${JSON.stringify(lockRoot)}, cap: 1, owner: 'MF', kind: 'files', pollMs: 10, ceilingMs: 1000, canDefer: true,
         policy: { settings: { ...ADMISSION_POLICY_STANDARD, priority }, sources: {}, invalid: [], ignored: [] },
-        readLease: () => ({ purpose: ${JSON.stringify(value)}, holder: null, session: null }), log: () => {}, env: {} });
-      console.log(JSON.stringify({ cls: cls.class, ok: r.ok, ms: Date.now() - t0 }));`;
+        readLease: () => ({ purpose: ${JSON.stringify(value)}, holder: null, session: null }), log: (m) => logs.push(m), env: {} });
+      console.log(JSON.stringify({ cls: cls.class, ok: r.ok, promoted: logs.some((m) => m.includes('class P0')), ms: Date.now() - t0 }));`;
     const res = spawnSync(process.execPath, ['--input-type=module', '-e', script],
       { encoding: 'utf8', timeout: 8000, env: { ...process.env, WE_RESOURCE_SHADOW: 'off', WE_RESOURCE_CUTOVER: 'shadow' } });
     return { timedOut: res.error?.code === 'ETIMEDOUT', out: res.stdout.trim() ? JSON.parse(res.stdout.trim().split('\n').pop()) : null, stderr: res.stderr };
@@ -1787,7 +1810,7 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
     for (const bad of ['^(main-fix-)?([a-z]+)+$', '^(a+)+$', '^(a*)*$', '^((ab)+)+x$', '^(a|b+)+$', '^(?:a{1,5}){2,}$', '^(a+){2}$', '^([a-z]+)\\1$', '^(?<n>a)\\k<n>$', `^${'a'.repeat(300)}$`]) {
       expect(validRepairPatterns([bad]), bad).toBe(false);
     }
-    for (const ok of [...DEFAULT_REPAIR_PATTERNS, '^hotfix-', '^b-{2,3}', '^(?:a|b)+$', '^(abc)+$', '^[a-z]+-\\d+$', '^x(?=y)', '^((ab)+)?x+$', '^\\(a+\\)+$']) {
+    for (const ok of [...DEFAULT_REPAIR_PATTERNS, '^main-fix-abcdef0$', '^revert-red-42$']) {
       expect(validRepairPatterns([ok]), ok).toBe(true);
     }
   });
@@ -1801,54 +1824,94 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
   it('classifyWaiterPriority never stalls: an unsafe pattern handed straight to it is bounded and falls to P3', () => {
     const r = probe(['^(main-fix-)?([a-z]+)+$'], 'a'.repeat(60) + '-1');
     expect(r.timedOut, r.stderr).toBe(false);
-    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true, promoted: false });
     expect(r.out.ms).toBeLessThan(4000);
   });
 
-  it('the matcher has a hard time bound: overlapping alternation (not caught by validation) is cut off, other patterns still match', () => {
-    expect(validRepairPatterns(['^(a|aa)+$'])).toBe(true); // star-height 1: only the time bound can stop it
-    const r = probe(['^(a|aa)+$', '^a+-1$'], 'a'.repeat(70) + 'b');
+  it('unsupported alternation cannot promote ordinary work through admission', () => {
+    const r = probe(['^(a|aa)+$', '^a+b$'], 'a'.repeat(70) + 'b');
     expect(r.timedOut, r.stderr).toBe(false);
-    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
-    expect(r.out.ms).toBeLessThan(4000);
-    const hit = probe(['^(a|aa)+$', '^a+b$'], 'a'.repeat(70) + 'b'); // the second pattern is still honoured after the first is cut off
-    expect(hit.timedOut, hit.stderr).toBe(false);
-    expect(hit.out.cls).toBe('P0');
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true, promoted: false });
   });
 
-  it('the pattern list is count-capped and one classification has a total time budget', () => {
-    expect(validRepairPatterns(Array.from({ length: 16 }, (_, i) => `^p${i}-`))).toBe(true);
-    expect(validRepairPatterns(Array.from({ length: 17 }, (_, i) => `^p${i}-`))).toBe(false);
-    // 16 distinct patterns that each blow the 50ms bound: the budget (150ms) ends the whole call, not 16 x 50ms x 4 fields.
-    const slow = Array.from({ length: 16 }, (_, i) => `^(?:a|a?)+x${i}$`);
-    const r = probe(slow, 'a'.repeat(70) + 'b');
-    expect(r.timedOut, r.stderr).toBe(false);
-    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
-    expect(r.out.ms).toBeLessThan(1500);
+  it('shared callers agree on platform priority despite conflicting tool/env selections', () => {
+    const platform = { priority: { mode: 'off', repairPatterns: ['^revert-red-42$'] } };
+    for (const pool of [undefined, '/workspace/.lanes', '/workspace/./.lanes']) {
+      for (const mode of ['enforce', 'off']) {
+        const p = resolveAdmissionPolicy({ platform, checkoutRoot: '/workspace/web-everything',
+          tool: { priority: { mode, repairPatterns: [] }, onTimeout: 'run' },
+          env: { LANE_POOL_ROOT: pool, WE_HEAVY_ADMISSION_PRIORITY: mode,
+            WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '["^main-fix-abcdef0$"]' } });
+        expect(p.settings.priority).toEqual(platform.priority);
+        expect(p.settings.onTimeout).toBe('run');
+        expect(p.sources).toMatchObject({ 'priority.mode': 'platform', 'priority.repairPatterns': 'platform' });
+        expect(p.ignored).toHaveLength(4);
+        const line = formatAdmissionPolicy(p);
+        expect(line).toContain('priority.mode=off (platform)');
+        expect(line).toContain('tool.priority.repairPatterns=[]');
+        expect(line).toContain('env WE_HEAVY_ADMISSION_PRIORITY=' + mode);
+        expect(line).toContain('env WE_HEAVY_ADMISSION_REPAIR_PATTERNS=');
+      }
+    }
   });
 
-  it('an over-long identity value is not matched at all (it is no repair slug)', () => {
-    const custom = { mode: 'enforce', repairPatterns: ['^hotfix-'] };
-    expect(classifyWaiterPriority({ purpose: 'hotfix-1' }, custom).class).toBe('P0');
-    expect(classifyWaiterPriority({ purpose: 'hotfix-'.padEnd(400, 'x') }, custom).class).toBe('P3');
-    expect(classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, ADMISSION_POLICY_STANDARD.priority).class).toBe('P0');
+  it('private priority overrides remain isolated and invalid layers preserve the previous valid selection', () => {
+    const platform = { priority: { mode: 'off', repairPatterns: ['^revert-red-42$'] } };
+    const tool = { priority: { mode: 'enforce', repairPatterns: ['^main-fix-abcdef0$'] } };
+    const env = { LANE_POOL_ROOT: lockRoot, WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '[".*"]' };
+    const p = resolveAdmissionPolicy({ platform, tool, env });
+    expect(p.settings.priority).toEqual(tool.priority);
+    expect(p.sources).toMatchObject({ 'priority.mode': 'tool', 'priority.repairPatterns': 'tool' });
+    expect(p.invalid).toEqual(['env WE_HEAVY_ADMISSION_REPAIR_PATTERNS=' + JSON.stringify(env.WE_HEAVY_ADMISSION_REPAIR_PATTERNS)]);
+    expect(p.ignored).toEqual([]);
+    const validEnv = resolveAdmissionPolicy({ platform, tool, env: { ...env,
+      WE_HEAVY_ADMISSION_PRIORITY: 'off', WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '[]' } });
+    expect(validEnv.settings.priority).toEqual({ mode: 'off', repairPatterns: [] });
+    expect(validEnv.sources['priority.repairPatterns']).toBe('env WE_HEAVY_ADMISSION_REPAIR_PATTERNS');
+    const badTool = resolveAdmissionPolicy({ platform, tool: { priority: { repairPatterns: ['.*'] } }, env: { LANE_POOL_ROOT: lockRoot } });
+    expect(badTool.settings.priority).toEqual(platform.priority);
+    expect(badTool.invalid.join('')).toContain('tool.priority.repairPatterns');
   });
 
-  it('cascade: standard → platform → tool → env, each leaf named with its source; invalid values never override', () => {
-    expect(resolveAdmissionPolicy({}).sources).toMatchObject({ 'priority.mode': 'standard', 'priority.repairPatterns': 'standard' });
-    const p = resolveAdmissionPolicy({ platform: { priority: { mode: 'off' } }, tool: { priority: { repairPatterns: ['^hotfix-'] } } });
-    expect(p.settings.priority).toEqual({ mode: 'off', repairPatterns: ['^hotfix-'] });
-    expect(p.sources).toMatchObject({ 'priority.mode': 'platform', 'priority.repairPatterns': 'tool' });
-    const e = resolveAdmissionPolicy({ platform: { priority: { mode: 'off' } },
-      env: { WE_HEAVY_ADMISSION_PRIORITY: 'enforce', WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '["^a-","^b-{2,3}"]' } });
-    expect(e.settings.priority).toEqual({ mode: 'enforce', repairPatterns: ['^a-', '^b-{2,3}'] });
-    expect(e.sources['priority.mode']).toBe('env WE_HEAVY_ADMISSION_PRIORITY');
-    expect(e.ignored).toEqual([]); // per-caller behaviour, like onTimeout: honoured on the shared pool
-    const bad = resolveAdmissionPolicy({ tool: { priority: { mode: 'sometimes', repairPatterns: ['(unclosed'] } } });
-    expect(bad.settings.priority).toEqual(ADMISSION_POLICY_STANDARD.priority);
-    expect(bad.invalid.join('\n')).toMatch(/tool\.priority\.mode/);
-    expect(bad.invalid.join('\n')).toMatch(/tool\.priority\.repairPatterns/);
-    expect(formatAdmissionPolicy(p)).toMatch(/priority\.mode=off \(platform\)/);
+  it('invalid platform mode preserves standard and invalid private env mode preserves platform', () => {
+    const badPlatform = resolveAdmissionPolicy({ platform: { priority: { mode: 'sometimes' } } });
+    expect(badPlatform.settings.priority.mode).toBe('enforce');
+    expect(badPlatform.invalid).toContain('platform.priority.mode="sometimes"');
+    const badEnv = resolveAdmissionPolicy({ platform: { priority: { mode: 'off' } },
+      env: { LANE_POOL_ROOT: lockRoot, WE_HEAVY_ADMISSION_PRIORITY: 'sometimes' } });
+    expect(badEnv.settings.priority.mode).toBe('off');
+    expect(badEnv.sources['priority.mode']).toBe('platform');
+    expect(badEnv.invalid).toContain('env WE_HEAVY_ADMISSION_PRIORITY="sometimes"');
+  });
+
+  it.each(['.*', '^main-fix-.*$', '^revert-red-42$|ordinary', '(unclosed', '.*\nFORGED' + 'x'.repeat(300)])(
+    'invalid platform pattern %j is diagnosed, and ordinary work remains P3', (pattern) => {
+      const p = resolveAdmissionPolicy({ platform: { priority: { repairPatterns: ['^revert-red-42$', pattern] } } });
+      expect(p.settings.priority.repairPatterns).toEqual([...DEFAULT_REPAIR_PATTERNS]);
+      expect(p.sources['priority.repairPatterns']).toBe('standard');
+      expect(p.invalid).toHaveLength(1);
+      expect(p.invalid[0]).toContain('platform.priority.repairPatterns=');
+      expect(p.invalid[0].length).toBeLessThanOrEqual(113);
+      const line = formatAdmissionPolicy(p);
+      expect(line).toContain('invalid: platform.priority.repairPatterns=');
+      expect(line).not.toContain('\n');
+      expect(classifyWaiterPriority({ purpose: 'ordinary' }, p.settings.priority).class).toBe('P3');
+    });
+
+  it.each(['source', 'docs', 'config', 'data'])('a %s job yields once to a live repair waiter and then resumes', async (payload) => {
+    markWaiting({ lockRoot, owner: 'REPAIR', kind: 'FULL', priority: 'P0', nowIso: iso(T0) });
+    let clock = T0; let polls = 0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'ORDINARY', kind: 'files',
+      command: 'check ' + payload, policy: policyWith({}), env: {}, readLease: () => null,
+      pollMs: 1000, ceilingMs: 10_000, canDefer: true, now: () => clock, log: (m) => logs.push(m),
+      sleep: async (ms) => {
+        clock += ms; polls += 1;
+        expect(heldSlots({ lockRoot, cap: 1, fastSlots: 1 })).toEqual([]);
+        expect(listWaiting(lockRoot).find((m) => m.owner === 'ORDINARY').priority).not.toBe('P0');
+        if (polls === 3) clearWaiting({ lockRoot, owner: 'REPAIR' });
+      } });
+    expect(r).toMatchObject({ ok: true, waitedMs: 3000 });
+    expect(logs.filter((m) => m.includes('yielding to red-main repair waiter'))).toHaveLength(1);
   });
 
   it('slotOrderFor: a P0 job may take ANY free slot, heavy or fast; other jobs keep their lane rule', () => {
