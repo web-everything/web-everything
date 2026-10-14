@@ -369,6 +369,9 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       readResumeMarker: num => mode === 'resume' && num === '7101'
         ? { meta: { pid: 999, runId: row.runId, rowKey: row.entry.key } } : null,
       sessionLivenessFor: () => ({ alive: true }),
+      readDelivery: () => null,
+      recordFailure: () => {}, releaseLaneLease: () => {},
+      spawnResume: () => { throw new Error('must not resume a live group'); },
       resolveResumability: () => ({ resumable: false }),
       releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
       releaseResumeMarker: () => {}, settleRow: () => {},
@@ -388,6 +391,8 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     row.entry.payload.groupMembers = ['7102', 'xabc123'];
     const spawned = [];
     const results = await adoptOrphanedBuildClaims({ listClaims: () => claims, isPidAlive: () => false,
+      readDelivery: () => null, sessionLivenessFor: () => null,
+      recordFailure: () => {}, releaseLaneLease: () => {},
       findRow: num => num === '7101' ? row : null, readResumeMarker: () => null,
       resolveResumability: o => {
         expect(o.groupMembers).toEqual(['7102', 'xabc123']);
