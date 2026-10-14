@@ -1,0 +1,434 @@
+{
+ "$comment": "Replay of web-everything#5172 at 2026-10-13T14:16Z (fix daemon log: reconcile-refused nothing-owed, phase queued): agent prevention-card PR, ready-to-merge + status:ci-red, no review:* label. Rollup from gh pr view (cancelled runs superseded by green re-runs).",
+ "observedAt": "2026-10-13T14:16:41Z",
+ "pr": {
+  "number": 5172,
+  "state": "OPEN",
+  "isDraft": false,
+  "headRefName": "lane/xff4ohc-prevention-card",
+  "baseRefName": "main",
+  "headRefOid": "57beca01321f6337cd458a2e20b9a0e66d247365",
+  "mergeStateStatus": "BLOCKED",
+  "labels": [
+   {
+    "name": "ready-to-merge"
+   },
+   {
+    "name": "status:ci-red"
+   }
+  ],
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "name": "changes",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:23Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "merge-gate",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:24Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "Merge gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:24Z",
+    "startedAt": "2026-10-13T14:01:23Z",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-replay-gate",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:23Z",
+    "workflowName": "Soak replay gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "changes",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:01Z",
+    "startedAt": "2026-10-13T14:01:28Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (actions)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:09Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (actions)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:02Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "merge-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:20Z",
+    "startedAt": "2026-10-13T14:01:27Z",
+    "workflowName": "Merge gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:01:51Z",
+    "startedAt": "2026-10-13T14:01:26Z",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:03:26Z",
+    "startedAt": "2026-10-13T14:03:23Z",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:06:54Z",
+    "startedAt": "2026-10-13T14:06:50Z",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "review-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:07:46Z",
+    "startedAt": "2026-10-13T14:07:41Z",
+    "workflowName": "Review gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-replay-gate",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:12Z",
+    "startedAt": "2026-10-13T14:01:27Z",
+    "workflowName": "Soak replay gate"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (javascript-typescript)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:04:22Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (javascript-typescript)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:04:28Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (python)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:15Z",
+    "startedAt": "2026-10-13T14:01:23Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (python)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:17Z",
+    "startedAt": "2026-10-13T14:01:22Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (rust)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:03:44Z",
+    "startedAt": "2026-10-13T14:01:23Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "Analyze (rust)",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:03:52Z",
+    "startedAt": "2026-10-13T14:01:21Z",
+    "workflowName": "CodeQL"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak-scope",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:24Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak-scope",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:01:50Z",
+    "startedAt": "2026-10-13T14:01:28Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-selection-measure",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:01:23Z",
+    "startedAt": "2026-10-13T14:01:24Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-selection-measure",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:26Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "visual",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:01:23Z",
+    "startedAt": "2026-10-13T14:01:24Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "visual",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:26Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test-shard",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:02:01Z",
+    "startedAt": "2026-10-13T14:02:02Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "integration",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "integration",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:10Z",
+    "startedAt": "2026-10-13T14:02:04Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "smoke",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "smoke",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:02:09Z",
+    "startedAt": "2026-10-13T14:02:03Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "soak-shard",
+    "status": "COMPLETED",
+    "conclusion": "SKIPPED",
+    "completedAt": "2026-10-13T14:01:50Z",
+    "startedAt": "2026-10-13T14:01:51Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "test",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:03:50Z",
+    "startedAt": "2026-10-13T14:02:13Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak",
+    "status": "COMPLETED",
+    "conclusion": "CANCELLED",
+    "completedAt": "2026-10-13T14:01:25Z",
+    "startedAt": "2026-10-13T14:01:25Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "daemon-soak",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:01:55Z",
+    "startedAt": "2026-10-13T14:01:52Z",
+    "workflowName": "CI"
+   },
+   {
+    "__typename": "CheckRun",
+    "name": "CodeQL",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completedAt": "2026-10-13T14:01:57Z",
+    "startedAt": "2026-10-13T14:01:52Z",
+    "workflowName": ""
+   }
+  ],
+  "commits": [
+   {
+    "oid": "2f0d46f120362cd4ecef71e285d6a6e50eceabda",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     },
+     {
+      "email": "noreply@anthropic.com",
+      "id": "MDQ6VXNlcjgxODQ3",
+      "login": "claude",
+      "name": "Claude Opus 4.8 (1M context)"
+     }
+    ],
+    "messageHeadline": "WE #xff4ohc: prevention — Extend the prepare lens… (from #5156 review)",
+    "messageBody": "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+    "committedDate": "2026-10-13T13:53:05Z"
+   },
+   {
+    "oid": "57beca01321f6337cd458a2e20b9a0e66d247365",
+    "authors": [
+     {
+      "email": "test@test.com",
+      "id": "",
+      "login": "",
+      "name": "test"
+     }
+    ],
+    "messageHeadline": "drain: JIT-number xff4ohc→#6041 at land (#2288)",
+    "messageBody": "",
+    "committedDate": "2026-10-13T14:01:08Z"
+   }
+  ],
+  "author": {
+   "login": "app/web-everything"
+  },
+  "comments": [
+   {
+    "author": {
+     "login": "web-everything"
+    },
+    "createdAt": "2026-10-13T14:00:08Z",
+    "body": "<!-- drain-review-coverage-reason -->\n⚠️ **Incomplete review — what was not examined**\n\nThis PR is being merged with its review skipped or degraded. Silence here would be indistinguishable from a clean review, so the gap is stated on the PR rather than left to a drain log nobody reads (#3308).\n\n- **`no-recorded-review`** — no verdict or clearance record was ever posted on this PR — nothing states what was examined, by whom, or against which tree.\n\nNone of the above blocked the merge — this is a record of what was **not** examined, so a later reader can tell an unreviewed change from a reviewed one."
+   },
+   {
+    "author": {
+     "login": "web-everything"
+    },
+    "createdAt": "2026-10-13T14:04:04Z",
+    "body": "<!-- drain-skip-reason -->\n· **Skipped by the drain**\n\nrequired check \"test\" is not green"
+   },
+   {
+    "author": {
+     "login": "web-everything"
+    },
+    "createdAt": "2026-10-13T14:09:06Z",
+    "body": "<!-- we-drain-enqueue-clearance head=57beca01321f6337cd458a2e20b9a0e66d247365 -->\n**Drain enqueue clearance** — the drain judged head `57beca01321f` ready (every drain gate passed: couple whole, blockedBy landed) and enqueued it on GitHub's merge queue (xtpxusq). The `merge-gate` check reads this for its couple-whole / blocked-by gates."
+   },
+   {
+    "author": {
+     "login": "web-everything"
+    },
+    "createdAt": "2026-10-13T14:13:26Z",
+    "body": "<!-- we-drain-enqueue-clearance head=57beca01321f6337cd458a2e20b9a0e66d247365 -->\n**Drain enqueue clearance** — the drain judged head `57beca01321f` ready (every drain gate passed: couple whole, blockedBy landed) and enqueued it on GitHub's merge queue (xtpxusq). The `merge-gate` check reads this for its couple-whole / blocked-by gates."
+   }
+  ]
+ }
+}

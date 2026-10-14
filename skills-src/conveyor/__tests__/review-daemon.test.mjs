@@ -1624,3 +1624,14 @@ it('tags a waiting stack surfaced only as a note using the same base/default bra
   expect(tagStatus).toHaveBeenCalledOnce();
   expect(tagStatus).toHaveBeenCalledWith(expect.objectContaining({ pr: 3915, isDraft: true, prState: pr, defaultBranch: 'release' }));
 });
+
+
+it('card 273 forwards only explicitly waived advisory heads to dispatch', () => {
+  const dispatch = vi.fn(() => ({ agentId: 'advisory-agent' }));
+  runReviewTick({ readAgents: () => [], readPrs: () => [],
+    reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 5157,
+      advisoryReview: { head: 'a'.repeat(40), reason: 'human-handoff', ciWaived: true } }], refusals: [] }),
+    dispatch, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [], acquirableLanes: () => 1 });
+  expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+    advisoryCiWaiver: { head: 'a'.repeat(40), reason: 'human-handoff' } }));
+});
