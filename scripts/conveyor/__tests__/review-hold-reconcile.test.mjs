@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
+import { restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
 // The REAL #4535 measurement (card xu7kxtt): a cleared-human accept on an older head, the merge queue moved the head, the drain re-parked.
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
@@ -18,7 +19,7 @@ const pr = (number, names) => ({ number, labels: names.map((name) => ({ name }))
 function sweepFixture(opts) {
   const prs = opts.listPrs();
   opts.provider.fixturePrs = prs;
-  return sweepReviewHoldLabels({ ...opts, settings: { referralDefault: 'operator' },
+  return sweepReviewHoldLabels({ exec: () => 'git@github.com:o/n.git', numberingRestamp: () => null, ...opts, settings: { referralDefault: 'operator' },
     readComments: opts.provider.readComments,
     readPr: ({ number }) => ({ number, state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [], comments: [] }) });
 }
@@ -515,4 +516,63 @@ describe('#5045 pending with a stale accept', () => {
       expect(p.calls.postComment[0].body).toContain('review:pending');
     }
   });
+});
+
+it('restamps numbering before the stale-accept heal and skips that heal', () => {
+  const p = provider();
+  const result = sweepFixture({ repo: 'o/n', provider: p,
+    listPrs: () => [pr(5025, ['review:pending', 'review:accepted'])],
+    exec: () => 'git@github.com:o/n.git', numberingRestamp: () => ({ action: 'restamped' }) });
+  expect(result).toContainEqual({ num: 5025, numberingRestamp: 'restamped', detail: undefined });
+  expect(p.calls.postComment).toEqual([]);
+  expect(p.calls.set).toEqual([]);
+});
+
+it('keeps an unsatisfied mandatory referral held on the daemon numbering path', () => {
+  _resetNumberingRestampMemo();
+  const p = provider({ readPrState: () => ({ comments: [
+    { author: { login: 'chalbert' }, body: '<!-- mandatory-referrals-v1: truncated -->' },
+    { author: { login: 'chalbert' }, body: `✅ review — human cleared\n<!-- reviewed-sha: ${'b'.repeat(40)} -->\n<!-- cleared-human: chalbert -->` },
+  ] }) });
+  const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [pr(5025, ['review:pending'])],
+    numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: true, acceptCarry: 'on',
+      prove: () => { throw Error('unexpected proof'); } }) });
+  expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'retry' }));
+  expect(p.calls.postComment).toEqual([]);
+  expect(p.calls.set).toEqual([]);
+  _resetNumberingRestampMemo();
+});
+
+it('passes unreadable reviews as null and keeps numbering failures isolated per PR', () => {
+  const p = provider();
+  const seen = [];
+  const result = sweepFixture({ repo: 'o/n', provider: p,
+    listPrs: () => [pr(1, ['review:pending']), pr(2, ['review:pending'])],
+    numberingRestamp: (opts) => {
+      seen.push(opts);
+      if (opts.pr === 1) throw Error('isolated failure');
+      return { action: 'retry', reason: 'formal reviews unreadable' };
+    } });
+  expect(seen.map((o) => o.reviews)).toEqual([null, null]);
+  expect(seen.every((o) => o.cwd === undefined)).toBe(true);
+  expect(result).toContainEqual({ num: 1, numberingRestamp: 'error', detail: 'isolated failure' });
+  expect(result).toContainEqual({ num: 2, numberingRestamp: 'retry', detail: 'formal reviews unreadable' });
+});
+
+it('re-reads the PR before posting, so an objection made during the numbering proof keeps the hold (red team #5233)', () => {
+  _resetNumberingRestampMemo();
+  const accept = { author: { login: 'chalbert' }, createdAt: '2026-10-12T10:00:00Z',
+    body: `✅ review — human cleared\n<!-- reviewed-sha: ${'b'.repeat(40)} -->\n<!-- cleared-human: chalbert -->` };
+  const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+  let proved = false;
+  const p = provider({ readPrState: () => ({ comments: proved ? [accept, objection] : [accept] }) });
+  p.readPrReviews = () => [];
+  const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [pr(5025, ['review:pending'])],
+    numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: true, acceptCarry: 'on', guardReferrals: () => {},
+      readNetDiff: () => null, prove: () => { proved = true; return { ok: true, reason: 'verified' }; } }) });
+  expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'held' }));
+  expect(p.calls.readPrState).toHaveLength(2);
+  expect(p.calls.postComment).toEqual([]);
+  expect(p.calls.set).toEqual([]);
+  _resetNumberingRestampMemo();
 });
