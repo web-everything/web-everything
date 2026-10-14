@@ -525,7 +525,7 @@ function validTimestamp(value) {
     && (zone === 'Z' || (Number(zone.slice(1, 3)) <= 23 && Number(zone.slice(4)) < 60));
 }
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
-export const CLAUDE_NATIVE_MODEL_BY_TIER = Object.freeze({ haiku: 'claude-haiku-4-5-20251001', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5' });
+export const CLAUDE_NATIVE_MODEL_BY_TIER = Object.freeze({ haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' });
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
 export const TASK_LIFECYCLE = Object.freeze(['planned', 'dispatched', 'landed', 'blocked', 'failed', 'validated', 'reworked']);
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
@@ -620,7 +620,7 @@ export const SUPERVISOR_CANDIDATES = Object.freeze([
   { id: 'codex-astra', backend: 'codex', provider: 'codex', model: CODEX_MODEL, tier: null },
   { id: 'claude-sonnet-5-5', backend: 'claude-native', provider: 'claude', model: CLAUDE_NATIVE_MODEL_BY_TIER.sonnet, tier: 'sonnet' },
   { id: 'agy-opus-4-6', backend: 'agy', provider: 'antigravity', model: AGY_CLAUDE_MODEL_BY_TIER.opus, tier: 'opus' },
-  { id: 'claude-opus-5', backend: 'claude-native', provider: 'claude', model: CLAUDE_NATIVE_MODEL_BY_TIER.opus, tier: 'opus' },
+  { id: 'claude-opus-5-5', backend: 'claude-native', provider: 'claude', model: CLAUDE_NATIVE_MODEL_BY_TIER.opus, tier: 'opus' },
 ].map(Object.freeze));
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
 export const SUPERVISOR_LADDERS = Object.freeze(Object.fromEntries(Object.entries({
@@ -635,7 +635,7 @@ export function selectSupervisor(profile, options = {}) {
     // subjectClass:'driver' argument below is the callee's own enforcement of the subject-class boundary.
     const records = routingRecords(options.scorecards).filter(r => r.role === 'supervise');
     const hard = profile.filesTouched.some(isStatuteTierPath) || ['architectural-decision', 'triage-research'].includes(profile.taskType);
-    const ids = hard ? ['claude-opus-5'] : SUPERVISOR_LADDERS[`${profile.risk}/${profile.complexity}`];
+    const ids = hard ? ['claude-opus-5-5'] : SUPERVISOR_LADDERS[`${profile.risk}/${profile.complexity}`];
     const auditTrail = []; let chosen;
     for (const id of ids) {
       const candidate = SUPERVISOR_CANDIDATES.find(c => c.id === id);
@@ -1372,7 +1372,6 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
     if (!picked.worker) return { ...record, probationWorker: null, outcome: 'refused', refusal: picked.reason };
     record.probationWorker = picked.worker;
   }
-  if (['fix', 'ci-heal'].includes(dispatch.kind)) return record;
   // Every policy-routed kind needs a verdict, including roles and future operation names.
   // Keep the inherited evidence router unchanged when no explicit policy route exists.
   const roleGate = decideCriticalWorkGate({ ...criticalWorkGate, kinds: [...new Set([...criticalWorkGate.kinds, dispatch.kind])] }, dispatch.kind, record.taskType ?? (dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind), {

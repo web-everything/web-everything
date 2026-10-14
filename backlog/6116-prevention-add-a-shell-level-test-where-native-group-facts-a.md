@@ -14,7 +14,7 @@ tags: []
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 1. `we:scripts/lib/merge-queue-adaptive-batching.mjs:1` — Add a shell-level test where native group facts are injected and a cancel POST is expected. Longer term, destructure the function's inputs strictly or validate its argument keys so an unknown key throws.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #xs3192y.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #6105.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5217@bcab21bf87cdaaca5f6bd3b13fa1e429706d6001
 

@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -677,12 +678,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     try { costFacts = effects.costFacts?.() ?? {}; } catch { costFacts = {}; }
     return costFacts;
   };
+  let prepareRunnerNote = '';
+  const runnerNoteFor = kind => ['prepare-item', 'prepare'].includes(kind) ? prepareRunnerNote : '';
   const loadGateFor = (kind, num) => {
     const gate = effects.hostLoadGate?.(kind) ?? { admit: true };
     if (!gate.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: 'host-load', why: gate.why });
-      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (host-load): ${gate.why}`);
-    } else if (gate.note) console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${gate.note}`);
+      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (host-load): ${gate.why}${runnerNoteFor(kind)}`);
+    } else if (gate.note) console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${gate.note}${runnerNoteFor(kind)}`);
     costDecisions.push({ num: normNum(num), kind, ...admitLaunch({ kind: kind === 'prepare' ? 'prepare-item' : kind, settings: costSettings, legacy: gate }) });
     return gate;
   };
@@ -708,8 +711,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     costDecisions.push({ num: normNum(num), kind, ...d });
     if (!d.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: d.reason, why: d.why });
-      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (${d.reason}): ${d.why}`);
-    } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}`);
+      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (${d.reason}): ${d.why}${runnerNoteFor(kind)}`);
+    } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}${runnerNoteFor(kind)}`);
     return d;
   };
   const launchBuilds = async () => {
@@ -771,10 +774,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
-  const fallback = configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases);
+  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
+  const runner = preparePolicy.runner;
+  const runnerSource = preparePolicy.sources.runner;
+  const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
+  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource})`;
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
-  const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));

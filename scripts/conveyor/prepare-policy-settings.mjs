@@ -2,28 +2,31 @@
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy, resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 
-const standard = Object.freeze({ retryUnstampedOnce: true, autoSize: true });
+const standard = Object.freeze({ retryUnstampedOnce: true, autoSize: true, runner: 'codex' });
 const bool = v => typeof v === 'boolean';
-const valid = { retryUnstampedOnce: bool, autoSize: bool };
+const valid = { retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v) };
 const parseBool = v => {
   if (bool(v)) return v;
   if (typeof v !== 'string') return undefined;
   const text = v.trim().toLowerCase();
   return ['true', '1'].includes(text) ? true : ['false', '0'].includes(text) ? false : undefined;
 };
-// Select only known boolean leaves: malformed nested objects must not become cascade leaves.
+// Select only valid known leaves: malformed nested objects must not become cascade leaves.
 const block = value => Object.fromEntries(Object.keys(standard)
-  .filter(key => bool(value?.[key])).map(key => [key, value[key]]));
+  .filter(key => valid[key](value?.[key])).map(key => [key, value[key]]));
 const envValues = env => ({
   retryUnstampedOnce: parseBool(env?.WE_PREPARE_RETRY_UNSTAMPED_ONCE),
   autoSize: parseBool(env?.WE_PREPARE_AUTO_SIZE),
+  runner: env?.WE_PREPARE_RUNNER,
 });
 const result = resolved => ({
   retryUnstampedOnce: resolved.value.retryUnstampedOnce,
   autoSize: resolved.value.autoSize,
+  runner: resolved.value.runner,
   sources: {
     retryUnstampedOnce: resolved.sources.retryUnstampedOnce,
     autoSize: resolved.sources.autoSize,
+    runner: resolved.sources.runner,
   },
 });
 

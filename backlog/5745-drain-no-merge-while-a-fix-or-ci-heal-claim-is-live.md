@@ -3,88 +3,93 @@ bornAs: xh8442i
 kind: task
 parent: "5767"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "7372a0e0a8a7b6ccca4ffffdadaf665980314880"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "26105d8adb52d1d310d5e0109933a1a80b6a5c59"
 tags: []
+estimatedLoc: 310
 ---
 
 # Drain: no merge while a fix or ci-heal claim is live
 
-Slice S6a of the async-daemons epic (S3t needs it). we:scripts/merge-ai-prs.mjs merges with `--match-head-commit` (around :5950) but ignores live fix claims. Add a read-only claim check (no claim write, per R4) next to the existing `--match-head-commit`: a live fix or ci-heal claim defers the merge with a `claim-held` skip reason.
+Slice S6a of the async-daemons epic (S3t needs it). Preserve the head pin and extend the drain's existing read-only fix-claim check to dispatcher `fix` and `ci-heal` claims. A live claim defers the merge with a stable `claim-held` skip reason. No claim acquisition, release, heartbeat, or drain-lease change belongs here.
 
 ## Acceptance
 
-- [A1] **Test (a)** — a push races a merge and `--match-head-commit` refuses it.
-- [A2] **Test (b)** — a live claim defers the merge with a `claim-held` skip reason (J2-10, J2-22).
-- [A3] **Live** — one `claim-held` skip seen in `daemon.log`.
+- [A1] A push racing the merge is refused by the existing `--match-head-commit` pin; the drain does not report a successful merge.
+- [A2] A live `fixing`, `fix`, or `ci-heal` claim defers an otherwise mergeable PR with a `claim-held` skip reason (J2-10, J2-22).
+- [A3] One real `claim-held` skip is observed in the live daemon log (location and capture procedure in Proof plan).
 
 ## Non-goals
 
-- [N1] Writing or taking the claim from the drain (R4 keeps the drain read-only here).
+- Writing or taking claims from the drain; changing the drain lease (R4).
+- Changing claim ownership, TTL/reclamation policy, or implementing quarantine.
+- Making a read-only claim observation atomic with a remote merge. A claim acquired after the observation remains a timing window; the head pin separately refuses a changed head.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
-
-1. **Untrusted text** — n/a: the claim file is daemon-written; no external text is read.
-2. **Truncated reads** — `readLockEntry` (we:scripts/readiness/file-locks.mjs:244-250) returns null for a missing or unparseable claim entry file, so a corrupt entry reads as "no claim". The build adds a fail-closed check in `readLiveDispatchClaim`: a claim directory that exists but whose entry does not parse counts as held (placeholder `who`). A test writes a truncated entry and asserts the PR is skipped.
-3. **Shared state files** — Read-only access to the claim store; no write, no lock taken.
-4. **Fail closed** — A throwing reader defers (placeholder claim, existing behaviour); a corrupt entry defers via the check in line 2. A dead dispatcher claim blocks merging for up to the full `DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES`; accepted cost, visible through the existing `fix-claim-held-no-progress` smell.
-5. **Identity scoping** — The claim is keyed by repo and PR number.
-6. **State over time** — A claim past its TTL does not block. Quarantined-claim handling is n/a until O15 of epic 5767 lands (no claim quarantine exists on `main`); tracked in Follow-ups.
-7. **Who wrote it** — n/a: the drain only reads claims written by the fixer.
+1. **Untrusted text** — holder strings are diagnostic data only, never commands. Classifier precedence must prevent holder text from selecting a different skip kind.
+2. **Truncated reads** — the low-level reader returns null on parse/read errors (we:scripts/readiness/file-locks.mjs:244-251). Null alone is not proof of absence. For all three kinds, an existing claim directory with no readable parsed entry defers with an unreadable-store placeholder.
+3. **Shared state files** — reads only; no acquire/release/heartbeat or cleanup, including when an entry disappears during the read. A transient uncertainty may defer one pass.
+4. **Fail closed** — errors other than confirmed absence defer. Use a filesystem probe that distinguishes ENOENT from permission/I/O errors; an existence-only boolean that hides errors is insufficient. Valid entries retain the existing lease policy.
+5. **Identity scoping** — normalize the repo slug to the claim-store key and use repo + kind + PR, never head SHA. Different repos or PRs must not block each other.
+6. **State over time** — valid expired entries do not block; live heartbeats do. `fixing` honors its stored TTL; dispatch kinds use the existing ten-minute default. No PID-liveness shortcut. Quarantine integration is a follow-up to epic 5767 O15.
+7. **Who wrote it** — dispatch entries have an owner but no `meta.who`; normalize this shape before attachment. A live claim must not disappear because display metadata is absent.
 
 ## Design
 
-Premise check against `main` (832e98ad): the goal is **partly delivered, not done**. The fix half landed with fix.pushBeforeGate (PR #4771 and earlier): `attachLiveFixClaim` (we:scripts/merge-ai-prs.mjs:902) is called from the merge-site fresh re-read `fetchFreshPrForRevalidation` (we:scripts/merge-ai-prs.mjs:4522), and `classifyPr` skips on `pr.fixClaim` (we:scripts/merge-ai-prs.mjs:1021). It is read-only (`readLiveFixClaim`, we:scripts/conveyor/fix-procedure.mjs:135) and fails closed on a throwing reader. The `--match-head-commit` pin is at we:scripts/merge-ai-prs.mjs:6548 (`matchHeadCommit: traceHeadSha`). Three gaps remain:
+Checked against checkout `26105d8adb52d1d310d5e0109933a1a80b6a5c59`. This is **partly delivered, not already done**:
 
-1. `readLiveFixClaim` reads only kind `fixing` (`FIXING_KIND`, we:scripts/conveyor/fix-procedure.mjs:68). The dispatcher's own spawn claims, kinds `fix` and `ci-heal` (`readFixDispatchClaim`, we:scripts/conveyor/fix-claim-store.mjs; `liveForeignDispatch` already loops both at we:scripts/conveyor/fix-procedure.mjs:183), are never read by the drain, so a live dispatched fixer or ci-heal session that has not yet taken a `fixing` claim does not defer a merge.
-2. The skip text is `fix claim held by …`; `classifySkipReason` (we:scripts/lib/drain-skip-reasons.mjs:22, an ordered regex chain) has no rule for it, so it falls to `unrecognized-reason` and there is no stable `claim-held` kind to grep in `daemon.log` (A3).
-3. Tests: the fix-claim skip is tested (we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs:176-200); there is no ci-heal test and none naming `claim-held`. A1 (a push races the merge and the head pin refuses it) is covered only as argv shape (we:scripts/__tests__/pr-merge-gate.test.mjs:35-47), not as a refused race.
+- `readLiveFixClaim` reads only `fixing` (we:scripts/conveyor/fix-procedure.mjs:135-138). The existing dispatch-kind loop in `liveForeignDispatch` is for writer admission, not the drain (we:scripts/conveyor/fix-procedure.mjs:183-192).
+- The merge-site fresh read attaches this fixing-only reader (we:scripts/merge-ai-prs.mjs:4507-4515). Attachment requires `meta.who` and catches thrown errors (we:scripts/merge-ai-prs.mjs:904-910). Dispatcher metadata has no `who` (we:scripts/conveyor/fix-dispatch-claim.mjs:132-139).
+- The classifier already refuses an attached claim, but emits `fix claim held by` (we:scripts/merge-ai-prs.mjs:1023). The ordered skip classifier lacks `claim-held` (we:scripts/lib/drain-skip-reasons.mjs:14-43).
+- Fresh-head revalidation already rejects H1 → H2 (we:scripts/merge-ai-prs.mjs:1076-1088), and the actual merge receives the pinned SHA (we:scripts/merge-ai-prs.mjs:6550). These protections must remain.
 
-Mechanism: add `readLiveDispatchClaim` (read-only `readFixDispatchClaim` over kinds `fix` and `ci-heal`, TTL via `isLeaseExpired` with `DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES`) and a combined reader `readLiveDrainClaim` = `readLiveFixClaim` then `readLiveDispatchClaim`, next to `readLiveFixClaim`; the merge-site call (we:scripts/merge-ai-prs.mjs:4529) passes the combined reader, and `attachLiveFixClaim` keeps its injected-reader shape (`data.fixClaim` plus `kind`). An unreadable store of any kind still attaches the placeholder (fail closed). Keep `classifyPr`'s skip arm but start the reason with `claim-held:`, and add `claim-held` to `SKIP_KINDS` plus a `^claim-held` rule at the TOP of `classifySkipReason`, beside `red-main-hold` (the reason embeds a holder name, so a later pattern could otherwise catch it first). No claim is written (N1, R4).
+Add a drain-specific combined reader `readLiveDrainClaim` in we:scripts/conveyor/fix-procedure.mjs. Inspect `fixing`, `fix`, and `ci-heal`, returning the first live/uncertain claim or null only when every kind is absent or expired. Reuse `readFixDispatchClaim`, `fixDispatchResource`, and the shared lock-directory mapping (we:scripts/conveyor/fix-claim-store.mjs:42-60; we:scripts/readiness/file-locks.mjs:194). Keep `readLiveFixClaim` and other writer-facing callers unchanged.
+
+For a null low-level read, inspect the keyed directory with an error-preserving filesystem operation: ENOENT means absent, an existing directory means unreadable/incomplete, and other errors propagate to attachment's fail-closed catch. Apply this to `fixing` as well as dispatch kinds; do not change the shared tolerant reader. For parsed entries use `isLiveFixClaim` for `fixing` (we:scripts/conveyor/fix-procedure.mjs:128-132), and `isLeaseExpired` with `DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES` for dispatch kinds (we:scripts/conveyor/fix-claim-store.mjs:23). This preserves the existing heartbeat and expiry semantics (we:scripts/readiness/file-locks.mjs:96-99).
+
+Normalize live entries to the attachment's existing shape: preserve metadata, populate `meta.who` from existing `who`, then owner, then a kind-specific placeholder; retain `claimedAt` when present. Synthetic uncertain entries also have a nonempty `meta.who`. Wire the combined reader into the existing fresh-read attachment in we:scripts/merge-ai-prs.mjs:4514. Keep the injected-reader seam and existing classifier gate ordering.
+
+Prefix the claim skip reason with `claim-held:`. Add `claim-held` to `SKIP_KINDS` and a leading anchored classifier rule in we:scripts/lib/drain-skip-reasons.mjs. Existing `buildSkipReasons` and stderr formatting then carry the stable kind without a new logging channel. Holder strings containing `BEHIND`, `cap`, or `review hold` must not override the prefix.
 
 ## MVP
 
-Musts only:
-- Drain reads the live dispatcher `fix` and `ci-heal` claims as well as the live `fixing` claim: read-only, keyed by repo + PR number, fail closed.
-- Skip reason starts `claim-held:` and classifies to the stable kind `claim-held`.
-- Tests A1 (race refused by the head pin) and A2 (live claim defers with `claim-held`), written RED first.
-
-Out of scope (see Follow-ups): quarantined-claim handling, any claim write from the drain.
+- Read all three claim kinds at the existing merge-site fresh-read boundary, including real dispatch-shaped entries without `meta.who`.
+- Fail closed on unreadable/incomplete keyed claims, retain existing expiry semantics, and never mutate claim state.
+- Emit `claim-held` through the actual aborted-revalidation skip row and stderr summary.
+- Demonstrate A1 at the production merge-call boundary, A2 through the production reader/attachment/classifier chain, and A3 in a real daemon pass.
 
 ## Test plan
 
-**Dispatch-claim shape (must).** Dispatcher `fix`/`ci-heal` entries carry `meta {repo, pr, kind, headSha}` and no `who` (we:scripts/conveyor/fix-claim-store.mjs:85,97), but `attachLiveFixClaim` attaches only when `claim?.meta?.who` is truthy (we:scripts/merge-ai-prs.mjs:903). The combined reader therefore normalizes a dispatch entry to `{meta:{who: <entry owner or "dispatch:<kind>">, claimedAt}}`. Every claim test below runs the REAL `attachLiveFixClaim` then `classifyPr` on a real dispatch-shaped entry, never only the reader's return value.
+Use the host heavy-run queue for every test invocation: `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>` (repo-qualified notation; execute the path relative to the WE checkout without the `we:` prefix).
 
-RED-first cases (each fails before the change):
-- **claim-held for ci-heal and fix dispatch claims** — write a live `ci-heal` (and a live `fix`) entry into a temp lock root and call the new combined reader `readLiveDrainClaim`: returns the claim (RED: the function does not exist; the old `readLiveFixClaim` returns null for those kinds). Then `classifyPr` on the attached PR returns `skip` with a reason starting `claim-held`.
-- **claim-held kind** — `classifySkipReason` / `buildSkipReasons` (we:scripts/lib/__tests__/drain-skip-reasons.test.mjs) map `claim-held: …` to kind `claim-held`, including a reason whose holder name contains words matching a later rule. RED: today it is `unrecognized-reason`. The existing fix-claim case in we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs also asserts the `claim-held` prefix (RED: prefix is `fix claim held`).
-- **A1 race at the merge-site seam (characterization, passes today; not RED — the pin already exists at :6548)** — fresh read returns head H2 while the pass-start decision was H1: the revalidation refuses (`head moved since…`) and `mergePr` is not called; with H1 == H2, `mergePr` receives `matchHeadCommit` equal to the fresh-read head, never a later one. Asserts the code's calls, not a fake's behavior. RED if the seam test cannot be written without exporting the call site: the build exports a small pure helper for it.
+- **Reader cases, RED first:** extend we:scripts/conveyor/__tests__/fix-procedure.test.mjs for the combined reader using temporary claim roots and fixed time. Cover each live kind, dispatch metadata without `who`, an expired kind followed by a live different kind, all absent/expired, heartbeat extension, repo-slug normalization, and foreign repo/PR isolation. Write truncated entries and directory-with-missing-entry cases for each kind; inject permission/I/O failures rather than relying on host permissions. Assert placeholders defer. Snapshot directory contents before/after reads to prove no mutation.
+- **End-to-end attachment cases, RED first:** in we:scripts/__tests__/merge-ai-prs.test.mjs pass real dispatch-shaped entries through the combined reader, `attachLiveFixClaim`, and `revalidateForMerge` with an otherwise green fixture. Assert skip and `claim-held`, then removal/expiry permits merge. Update existing fixing-only expectations in we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs:176-201; preserve the thrown-reader test.
+- **Skip-kind cases, RED first:** extend we:scripts/lib/__tests__/drain-skip-reasons.test.mjs for `classifySkipReason`, `buildSkipReasons` with `revalidationAborted`, and formatted stderr. Include misleading holder words to prove prefix precedence. These are new failing cases today, not already-green guards.
+- **Production wiring and A1:** add we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs, using the real CLI with isolated coordination/home state and hermetic git/gh shims, following we:scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs:1-88. Use a recognized constellation repo slug so the claim key resolves. A live dispatch claim must prevent any merge invocation and produce `claim-held` in stderr/JSON; absent and expired controls must reach the merge. A head changed before fresh revalidation must prevent the merge invocation. Separately advance the fake server head after the fresh read but before merge: record the real CLI's `--match-head-commit H1` argument, refuse the now-stale H1 against H2, and assert no successful merge or success effects. The unchanged-head control succeeds. This characterizes the existing pin, rather than claiming a new RED behavior. The shim proves drain wiring/error handling, not GitHub's implementation.
+- Retain existing argv coverage in we:scripts/__tests__/pr-merge-gate.test.mjs:35-47 as a regression check (read/run only, outside the predicted edit scope).
 
-Guard cases (pass today, must stay green; not RED):
-- **holder name matching a later classifier rule** — a `claim-held: …` reason whose holder text matches a later rule still classifies `claim-held` (regression guard for the top-of-chain placement).
-- **expired claim does not block** — a dispatch entry past its TTL returns null and `classifyPr` returns `merge`.
-- **unreadable store fails closed** — a throwing store of any kind attaches the placeholder and the PR is skipped as `claim-held`.
-- **read-only** — the readers never call acquire/release (inject throwing stubs).
+Run the scoped suites and the existing merge-gate suite through the queue, then queue `npm run check:standards`. Record actual failures separately from proof; preparation itself does not implement these tests.
 
 ## Proof plan
 
-(1) Dry-run the classification with a recorded `ci-heal` claim file under a temp `WE_COORDINATION_ROOT` against a green `ready-to-merge` PR fixture: show `merge` before the change, `skip / claim-held` after. (2) On the live daemon, capture one real `claim-held` row in `we:.drain-daemon/daemon.log` (A3) and quote it in the build PR. If no claim is live during a drain pass within the build session, the builder takes a throwaway claim on a scratch PR fixture with the real claim CLI, runs one drain dry-run pass against it, quotes that log line, and releases the claim; the dry-run replay in (1) is then the accepted proof. (3) A1 is proven by the seam test above, plus the argv assertion in we:scripts/__tests__/pr-merge-gate.test.mjs.
+1. During build, capture before/after output from the hermetic CLI case using a real-format `ci-heal` claim under an isolated `WE_COORDINATION_ROOT`. Before: merge attempted despite dispatch claim. After: no merge invocation, structured `claim-held` row and matching stderr. Repeat for `fix` and `fixing`, and keep an unclaimed merge control.
+2. Capture the A1 race harness's actual merge argv and refusal result. For service-level proof of the head pin, use an authorized disposable PR: advance H1 to H2, attempt the pinned H1 merge, and record the refusal plus the PR remaining open at H2. Do not represent the hermetic server's refusal as an observed GitHub refusal.
+3. Observe a real drain pass while a legitimate fix/ci-heal claim is live. Quote the `claim-held` row from `we:.drain-daemon/daemon.log`, PR/repo, time, and claim kind, without secrets. Do not create claims on production work merely to manufacture evidence. If no such pass occurs, report A3 pending; an isolated replay does not satisfy the live acceptance criterion.
+4. Retain queued test/gate results with the build review. This preparation turn performs no dispatch, claim mutation, live merge attempt, or implementation proof.
 
 ## Follow-ups
 
-- Quarantined-claim handling (edge case 6: a quarantined claim blocks, an expired unquarantined one does not). No claim quarantine exists on `main` yet (O15 in epic 5767); wire the drain read in once it does.
-- Surface stale-claim age in the drain skip line (a health smell `fix-claim-held-no-progress` already exists).
+- Integrate quarantined claims when epic 5767 O15 supplies their storage/reader contract. The inspected claim readers currently have no quarantine branch; this card does not invent that contract or change expiry policy.
+- Add stale-claim age diagnostics separately; the merge safety predicate needs only the existing live/expired result.
+- If stronger exclusion is later required for claims acquired after the read, design a coordinated merge/claim fence separately. The read-only observation plus head pin is not such a fence.
 
 ## Progress
 
-- 2026-10-12 prepare: premise check found the fix half delivered. Old scope: we:scripts/merge-ai-prs.mjs only. Corrected scope adds we:scripts/conveyor/fix-procedure.mjs and we:scripts/lib/drain-skip-reasons.mjs (plus their tests), per the code above. Goal unchanged.
-- 2026-10-13 review: adversarial pass found a fail-open hole (dispatch claims lack `meta.who`), an overstated corrupt-file claim, and mislabelled RED cases; all fixed above.
-- 2026-10-13 re-prepare: premise re-checked against current `main`; claim code unchanged (`readLiveFixClaim` reads kind `fixing` only; no `claim-held` kind). Citations refreshed: merge-site call now we:scripts/merge-ai-prs.mjs:4526, head pin at :6522. Goal, scope and plan unchanged.
-- 2026-10-13 re-stamp: re-checked against b00263a4; in-scope files unchanged since c696f93 (only ci-red-recovery-watch moved, not in scope); plan unchanged, stamp refreshed.
-- 2026-10-13 re-prepare (b4676cf): we:scripts/merge-ai-prs.mjs moved (workflow-human gate work); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations refreshed: attach :900, classifyPr arm :1019, merge-site call :4526, head pin :6522. Plan unchanged.
-- 2026-10-13 re-stamp (8652127): in-scope files unchanged since b4676cf; citations still hold; plan unchanged.
-- 2026-10-13 re-prepare (7372a0e): we:scripts/merge-ai-prs.mjs moved (paged open-PR reader, abc01e4e5); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations shifted ~+2/+3 and refreshed: attach :902, fresh re-read :4522, classifyPr arm :1021, merge-site call :4529, head pin :6548. Plan unchanged.
+- 2026-10-14 preparation against `26105d8adb52d1d310d5e0109933a1a80b6a5c59`: old premise said the drain ignored live claims; corrected premise is that it already reads `fixing`, but misses dispatcher `fix`/`ci-heal` and a stable skip kind. Evidence: we:scripts/conveyor/fix-procedure.mjs:135-138, we:scripts/merge-ai-prs.mjs:4514 and we:scripts/lib/drain-skip-reasons.mjs:14-43. The original goal is retained.
+- Old scope comprised three sources and four tests. Corrected scope retains those seven files and adds planned we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs for production wiring and the late head-race case. Every source has a matching scoped test. Other cited modules are read-only dependencies, not predicted edits.
+- Corrected earlier proof claims: the attachment catches thrown errors, but the underlying read swallows read/parse failures (we:scripts/readiness/file-locks.mjs:244-251). The drain-only fail-closed wrapper therefore covers all three kinds. Dispatch entries lack `who` at the actual writer (we:scripts/conveyor/fix-dispatch-claim.mjs:132-139). Revalidation alone does not exercise a push after the read; the existing CLI harness pattern makes that boundary testable without exporting a new production helper (we:scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs:23-88). Removed the former substitution of a dry-run replay for A3 live evidence.
+- `estimatedLoc` was absent; set to **310 changed lines**: we:scripts/conveyor/fix-procedure.mjs ~60; we:scripts/merge-ai-prs.mjs ~10; we:scripts/lib/drain-skip-reasons.mjs ~5; we:scripts/conveyor/__tests__/fix-procedure.test.mjs ~80; we:scripts/__tests__/merge-ai-prs.test.mjs ~30; we:scripts/__tests__/merge-ai-prs-claim-held.test.mjs ~100; we:scripts/lib/__tests__/drain-skip-reasons.test.mjs ~20; we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs ~5. Estimate is grounded in the reader/attachment/classifier seams and existing CLI harness cited above. No size existed or was added; this is a task.
+- Existing preparation stamps are preserved for the runner to replace. No blockedBy change is proposed.

@@ -7,9 +7,10 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import micromatch from 'micromatch';
+import integrationConfig from '../../vitest.integration.config';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
-import integrationConfig from '../../vitest.integration.config';
 
 describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () => {
   it('defaults to a ceiling of 4: 12 or 24 cores, cap 2 -> 4', () => {
@@ -72,16 +73,24 @@ describe('every vitest config applies the shared ceiling', () => {
     expect(minForks).toBeLessThanOrEqual(maxForks);
   });
 
-  it('keeps the integration config off singleFork (a fully serial tier overran the 20-minute CI job budget)', () => {
-    const src = read('vitest.integration.config.ts');
-    expect(src).toMatch(/forks:\s*\{\s*singleFork: false/);
-    expect(src).not.toMatch(/singleFork:\s*true/);
+  it('keeps unpinned integration files in a bounded threads pool instead of serializing the whole tier', () => {
+    const config = integrationConfig.test;
+    expect(config.pool).toBe('threads');
+    expect(config.poolOptions.threads.minThreads).toBe(1);
+    expect(config.poolOptions.threads.maxThreads).toBe(config.poolOptions.forks.maxForks);
+    expect(config.include.some((file) => !config.poolMatchGlobs.some(([glob]) => micromatch.isMatch(file, glob)))).toBe(true);
   });
 
-  it('runs the integration files in one pool so serial simulator forks do not contend with threads', () => {
-    const src = read('vitest.integration.config.ts');
-    expect(src).toContain("pool: 'forks'");
-    expect(src).not.toContain('poolMatchGlobs:');
-    expect(src).not.toMatch(/threads:\s*\{/);
+  it('serializes repository-wide scanner parity checks with daemon scenarios', () => {
+    const config = integrationConfig.test;
+    const poolFor = (file) => config.poolMatchGlobs.find(([glob]) => micromatch.isMatch(file, glob))?.[1] ?? config.pool;
+    const scenarios = config.include.filter((file) => /\/sim-scenario.*\.test\.mjs$/.test(file));
+    const scanners = config.include.filter((file) => /\/rust-scan-.*-parity\.test\.mjs$/.test(file));
+    expect(scenarios.length).toBeGreaterThan(0);
+    expect(scanners.length).toBeGreaterThan(0);
+    expect(config.poolOptions.forks.singleFork).toBe(true);
+    for (const file of [...scenarios, ...scanners]) {
+      expect(poolFor(file), file).toBe('forks');
+    }
   });
 });
