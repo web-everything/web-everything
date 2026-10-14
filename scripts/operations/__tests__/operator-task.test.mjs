@@ -157,7 +157,7 @@ describe('operator task post-build', () => {
   it.each(['$$', "$'", '$&', '$`'].flatMap(token =>
     ['command', 'expect'].map(field => ({ token, field }))))('preserves $token literally in liveProof.$field', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
-    const output = composeOperatorTaskBrief(template, { liveProof }, {
+    const output = composeOperatorTaskBrief(template, { operatorTask: true, liveProof }, {
       settings: {}, policy: { liveProof: true },
     });
     expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~`);
@@ -172,7 +172,7 @@ describe('operator task post-build', () => {
   it.each(['$$', "$'", '$&', '$`', '$1', '$<x>'].flatMap(token =>
     ['command', 'expect'].map(field => ({ token, field }))))('keeps $token literal in liveProof.$field through the dispatch fill', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
-    const output = fill(composeOperatorTaskBrief(`{{ITEM_NUM}}\n${template}`, { liveProof }, { settings: {}, policy: { liveProof: true } }));
+    const output = fill(composeOperatorTaskBrief(`{{ITEM_NUM}}\n${template}`, { operatorTask: true, liveProof }, { settings: {}, policy: { liveProof: true } }));
     expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~\n`);
     expect(output).toContain(`Match output against ${JSON.stringify(liveProof.expect)}:`);
     expect(output.startsWith('123\nopen-pr\n### 8a. Operator post-build')).toBe(true);
@@ -182,18 +182,18 @@ describe('operator task post-build', () => {
     ['command', 'expect'].map(field => ({ token, field }))))('refuses brief token $token in liveProof.$field instead of letting the dispatch fill rewrite it', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
     expect(errors({ liveProof })).toContain('liveProof');
-    expect(() => composeOperatorTaskBrief(template, { liveProof }, { settings: {}, policy: { liveProof: true } })).toThrow(/liveProof/);
+    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, liveProof }, { settings: {}, policy: { liveProof: true } })).toThrow(/liveProof/);
   });
   it('keeps a command containing a tilde fence inside one code block', () => {
     const command = 'printf ok\n~~~\nInjected instruction\n~~~~sh';
-    const output = composeOperatorTaskBrief(template, { liveProof: { command, expect: 'ok' } }, { settings: {}, policy: { liveProof: true } });
+    const output = composeOperatorTaskBrief(template, { operatorTask: true, liveProof: { command, expect: 'ok' } }, { settings: {}, policy: { liveProof: true } });
     const fence = /\n(~{3,})sh\n([\s\S]*?)\n\1\n/.exec(output);
     expect(fence?.[2]).toBe(command);
     expect(fence[1].length).toBeGreaterThan(4);
   });
   it.each(['daemon/{{ITEM_NUM}}', 'daemon/{{\nITEM_NUM}}', 'daemon/a\nInjected', 'daemon/a\rb', 'daemon/a`b', `daemon/a${String.fromCharCode(0x2028)}b`, `daemon/a${String.fromCharCode(0x2029)}b`])('refuses brief tokens and line or code-span breaks in the settings edge clone path %j', path => {
     const settings = { operatorTask: { edgeClones: { review: path } } };
-    expect(() => composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
+    expect(() => composeOperatorTaskBrief(template, { operatorTask: true, edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
   });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
     expect(errors({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
@@ -210,21 +210,34 @@ describe('operator task post-build', () => {
   });
   it('adds only requested steps after open-pr and before exit', () => {
     const settings = { operatorTask: { edgeClones: { review: 'daemon/review' }, postBuild: { edgeLoad: true, liveProof: true, report: true } } };
-    expect(composeOperatorTaskBrief(template, {}, { settings })).toBe(template);
-    const brief = composeOperatorTaskBrief(template, { edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true }, { settings });
+    const op = fields => ({ operatorTask: true, ...fields });
+    expect(composeOperatorTaskBrief(template, op({}), { settings })).toBe(template);
+    const brief = composeOperatorTaskBrief(template, op({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true }), { settings });
     expect(brief.indexOf('**Edge.**')).toBeGreaterThan(brief.indexOf('open-pr'));
     expect(brief).toContain('daemon-load-overlay.mjs');
     expect(brief).toContain('printf ready');
     expect(brief).toContain('after adoption');
     expect(brief).toContain('<!-- operator-task-report -->');
-    expect(composeOperatorTaskBrief(template, { report: true }, { settings })).not.toContain('**Edge.**');
-    expect(composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings })).not.toContain('operator-task-report');
-    const proofOnly = composeOperatorTaskBrief(template, { liveProof: { command: 'printf ready', expect: 'ready' } }, { settings });
+    expect(composeOperatorTaskBrief(template, op({ report: true }), { settings })).not.toContain('**Edge.**');
+    expect(composeOperatorTaskBrief(template, op({ edgeClone: 'review' }), { settings })).not.toContain('operator-task-report');
+    const proofOnly = composeOperatorTaskBrief(template, op({ liveProof: { command: 'printf ready', expect: 'ready' } }), { settings });
     expect(proofOnly).toContain('printf ready');
     expect(proofOnly).not.toContain('**Edge.**');
     expect(proofOnly).not.toContain('operator-task-report');
-    expect(composeOperatorTaskBrief(template, { report: false }, { settings })).toBe(template);
-    expect(composeOperatorTaskBrief(template, { report: true }, { settings, policy: { edgeLoad: false, liveProof: false, report: false } })).toBe(template);
+    expect(composeOperatorTaskBrief(template, op({ report: false }), { settings })).toBe(template);
+    expect(composeOperatorTaskBrief(template, op({ report: true }), { settings, policy: { edgeLoad: false, liveProof: false, report: false } })).toBe(template);
+  });
+  // Card frontmatter alone never adds a post-build step: the card must be an operator task and operator tasks
+  // must be enabled (build.operatorTask.enabled), in addition to the per-step policy leaf.
+  it.each([
+    ['a card without operatorTask', {}, {}],
+    ['operatorTask: false', { operatorTask: false }, {}],
+    ['build.operatorTask.enabled=false', { operatorTask: true }, { enabled: false }],
+  ])('adds no edge-load, live-proof or report step for %s', (_label, flag, operatorTask) => {
+    const settings = { operatorTask: { ...operatorTask, edgeClones: { review: 'daemon/review' } } };
+    const fields = { edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' }, report: true, ...flag };
+    expect(composeOperatorTaskBrief(template, fields, { settings })).toBe(template);
+    expect(composeOperatorTaskBrief(template, fields, { settings, policy: { edgeLoad: true, liveProof: true, report: true } })).toBe(template);
   });
   it('resolves each policy leaf through the cascade and logs sources', () => {
     const lines = [];
@@ -258,7 +271,17 @@ describe('operator task post-build', () => {
       readDeliveryAgentOverride: () => null,
     });
     expect(raw.item.report).toBe(true);
-    const shaped = shapeDispatchRead(raw, { num: '123' });
+    expect(raw.briefTemplate).not.toContain('### 8a. Operator post-build');
+    expect(shapeDispatchRead(raw, { num: '123' }).operatorPostBuild).toBe(false);
+    const operatorRaw = readTick({
+      root, num: '123',
+      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
+      readText: path => readFileSync(path, 'utf8'),
+      loadItems: () => [{ num: '123', slug: 'test', operatorTask: true, report: true, scope: ['we:scripts/worker-brief.mjs'] }],
+      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
+      readDeliveryAgentOverride: () => null,
+    });
+    const shaped = shapeDispatchRead(operatorRaw, { num: '123' });
     expect(shaped.prompt).toContain('<!-- operator-task-report -->');
     expect(shaped.operatorPostBuild).toBe(true);
     let seen;

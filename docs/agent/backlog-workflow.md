@@ -1260,7 +1260,9 @@ fill would otherwise rewrite it as a brief placeholder.
 Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
 an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
 the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
-requests it. Cards without enabled post-build steps retain their existing brief and provider route.
+requests it. The fields alone never add a step: the card must also carry `operatorTask: true`, and
+`build.operatorTask.enabled` must be true. Cards without enabled post-build steps retain their existing brief
+and provider route.
 
 The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent
 route: the minimal v2 worker finishes before its wrapper opens the PR and cannot perform these steps.
