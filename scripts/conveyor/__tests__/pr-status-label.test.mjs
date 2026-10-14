@@ -1,6 +1,6 @@
 // One `status:*` label per PR — what it is waiting on (operator ask 2026-10-10: #4708/#4689/#4631 sat at the
 // round cap and their labels did not show it).
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, operatorQueueNeedsYou } from '../pr-status-label.mjs';
 import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
 import { evaluatePr } from '../../operations/operator-queue.mjs';
@@ -11,6 +11,7 @@ import { resolvePrStatusSettings, loadPrStatusSettings, prStatusSettingValues, P
 
 const tagReviewStatus = (options) => tagReviewStatusIo({
   readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
+  excuseMergeGate: pr => pr,
   ...options,
 });
 
@@ -205,6 +206,18 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
     expect(derive({ pr: subject(), requiredChecks: [...requiredChecks, 'review-gate'], rows: [reviewRow], settings: { reviewGateSignal: 'ci' } })).toBe('ci-red');
     expect(derive({ pr: subject(), requiredChecks, rows: [row([{ name: 'advisory-only', reason: 'pending' }])] })).toBe('awaiting-review');
   });
+  it.each([
+    ['review', { holds: ['review-acceptance'], jobId: 1 }, 'awaiting-review'],
+    ['ci', { holds: ['review-acceptance'], jobId: 1 }, 'ci-red'],
+    ['review', undefined, 'ci-red'],
+  ])('#5253: merge-gate human review holds with %s signal and annotation %j yield %s', (reviewGateSignal, mergeGateReviewHold, expected) => {
+    const held = subject({ number: 5253, baseRefName: 'main', statusCheckRollup: [
+      ...green().filter(c => c.name !== 'merge-gate'),
+      { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE',
+        ...(mergeGateReviewHold ? { mergeGateReviewHold } : {}) },
+    ] });
+    expect(derive({ pr: held, requiredChecks, settings: { reviewGateSignal } })).toBe(expected);
+  });
   it('#5267: a stacked PR missing only main-only checks waits on its base', () => {
     const stacked = subject({ baseRefName: 'lane/enqueue-verify', statusCheckRollup: green().filter(c => c.name !== 'merge-gate') });
     const rows = [row([{ name: 'merge-gate', reason: 'missing' }])];
@@ -226,6 +239,60 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
   });
 });
 
+
+describe('status tagger excuses only proven merge-gate candidacy holds (#5253, #5223)', () => {
+  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const subject = () => pr(['review:pending'], [], { number: 5253,
+    statusCheckRollup: requiredChecks.map(name => check(name, name === 'merge-gate' ? 'FAILURE' : 'SUCCESS')) });
+  const run = (excuseMergeGate, prState = subject()) => {
+    const setLabels = vi.fn();
+    const result = tagReviewStatus({ pr: prState.number, repo: 'web-everything/web-everything', agents: [],
+      currentLabels: prState.labels, prState, provider: { ensureLabel: () => {}, setLabels },
+      readFixClaim: () => null, planRows: [], requiredChecks, prStatusSettings: PR_STATUS_SETTING_DEFAULTS,
+      excuseMergeGate });
+    return { result, setLabels };
+  };
+  it('uses the excused snapshot when all other required checks are green', () => {
+    const raw = subject();
+    const excuseMergeGate = vi.fn(pr => ({ ...pr, statusCheckRollup: pr.statusCheckRollup.map(row =>
+      row.name === 'merge-gate' ? { ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy' } } : row) }));
+    const { result, setLabels } = run(excuseMergeGate, raw);
+    expect(excuseMergeGate).toHaveBeenCalledOnce();
+    expect(excuseMergeGate).toHaveBeenCalledWith(raw, { repo: 'web-everything/web-everything' });
+    expect(result.prStatus).toBe('status:awaiting-review');
+    expect(setLabels).toHaveBeenCalledWith('web-everything/web-everything', 5253,
+      { add: 'status:awaiting-review', remove: [] });
+    expect(raw.statusCheckRollup.at(-1).conclusion).toBe('FAILURE');
+  });
+  it.each(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT'])('retains ci-red for an unexcused %s', conclusion => {
+    const raw = subject();
+    raw.statusCheckRollup.at(-1).conclusion = conclusion;
+    const excuseMergeGate = vi.fn(pr => pr);
+    expect(run(excuseMergeGate, raw).result.prStatus).toBe('status:ci-red');
+    expect(excuseMergeGate).toHaveBeenCalledOnce();
+  });
+  it('fails closed when excusal throws', () => {
+    const excuseMergeGate = vi.fn(() => { throw new Error('verdict unreadable'); });
+    expect(run(excuseMergeGate).result.prStatus).toBe('status:ci-red');
+    expect(excuseMergeGate).toHaveBeenCalledOnce();
+  });
+  it.each(['SUCCESS', 'NEUTRAL', 'SKIPPED', null])('does no excusal work when the latest merge-gate is %s', conclusion => {
+    const raw = subject();
+    raw.statusCheckRollup.at(-1).completedAt = at(1);
+    raw.statusCheckRollup.push({ ...check('merge-gate', conclusion),
+      status: conclusion === null ? 'IN_PROGRESS' : 'COMPLETED', startedAt: at(2) });
+    const excuseMergeGate = vi.fn(() => { throw new Error('must not read'); });
+    run(excuseMergeGate, raw);
+    expect(excuseMergeGate).not.toHaveBeenCalled();
+  });
+  it('does no excusal work without a merge-gate row', () => {
+    const raw = subject();
+    raw.statusCheckRollup = raw.statusCheckRollup.filter(row => row.name !== 'merge-gate');
+    const excuseMergeGate = vi.fn(() => { throw new Error('must not read'); });
+    run(excuseMergeGate, raw);
+    expect(excuseMergeGate).not.toHaveBeenCalled();
+  });
+});
 
 describe('prStatus settings', () => {
   it('supplies standard values and source metadata', () => {

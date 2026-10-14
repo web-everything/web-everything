@@ -57,11 +57,12 @@ export function operatorQueueNeedsYou(pr, { humanAt } = {}) {
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };
 
 /** PURE: only required checks (or the CI failure label) can make the stage red. */
-function requiredCiRed(pr, labels, requiredChecks) {
+function requiredCiRed(pr, labels, requiredChecks, settings) {
   if (labels.includes('ci:failed')) return true;
   const checks = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const required = new Set(withoutImpliedRequiredChecks(requiredChecks, checks));
   return checks.some((c) => required.has(c.name ?? c.context)
+    && !(settings.reviewGateSignal === 'review' && c.mergeGateReviewHold)
     && ((c.status === 'COMPLETED' && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion))
       || ['FAILURE', 'ERROR'].includes(c.state)));
 }
@@ -111,7 +112,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const subject = { ...pr, labels: l.map((name) => ({ name })) };
   if (operatorQueueNeedsYou(subject, { humanAt })) return 'needs-you';
   const liveFix = (reviewStatus?.role === 'fix' || reviewStatus?.role === 'ci-heal') && rs !== 'needs-human';
-  if (requiredCiRed(subject, l, ciChecks)) return liveFix ? 'fixing' : 'ci-red';
+  if (requiredCiRed(subject, l, ciChecks, settings)) return liveFix ? 'fixing' : 'ci-red';
   if (l.includes('review:accepted') && !l.includes('ready-to-merge')
     && reviewStatus?.role === 'review' && ['reviewing', 'review-stalled'].includes(rs)
     && settings.acceptedRedTeamStatus === 'red-team') return 'red-team';
