@@ -6,6 +6,10 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+Daemon simulator worlds must override `WE_GH_THROTTLE_LOCK_ROOT` inside their own temporary root.
+Vitest's per-file override takes precedence over `LANE_POOL_ROOT`; sharing it across worlds with
+independent clocks can reuse a future-dated exhausted quota window and stall each GitHub read.
+
 ## Wrapped worker verification waits
 
 For the 117 S3b regression (2026-10-08), replay the saved StructuredOutput fixtures against both
