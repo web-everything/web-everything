@@ -60,7 +60,7 @@ describe('records and events', () => {
     const first = p.citationEvent({ repo: REPO, pr: 1, head: 'abcdef1', ids: [seeds[1].id, seeds[0].id, seeds[0].id], at });
     expect(first.ids).toEqual([seeds[0].id, seeds[1].id].sort());
     expect(first.id).toBe(`cite:${REPO}#1@abcdef1:`);
-    expect(p.precedentEventId(first)).toBe(first.id);
+    expect(p.precedentEventId(first)).toBe(JSON.stringify([first.id, '', first.ids, at]));
     expect(p.foldCitations([first, { ...first, verdict: 'changes' }])).toEqual([{ ...first, verdict: 'changes' }]);
   });
 });
@@ -177,6 +177,45 @@ describe('matching and bounded prompt data', () => {
 });
 
 describe('measurement and settings', () => {
+  it('matches opposite source rulings on a shared head independently of ordering', () => {
+    const records = seeds.filter(s => s.source.pr === 5225);
+    const decisions = records.map(s => ({ ...s.source, decision: s.decision }));
+    const citations = records.map(s => p.citationEvent({ repo: REPO, pr: 5225, head: s.source.head,
+      ids: [s.id], seat: s.id, verdict: s.decision === 'changes' ? 'changes' : 'accept', at }));
+    for (const ordered of [decisions, [...decisions].reverse()]) {
+      const result = p.precedentAgreement({ precedents: records, citations, decisions: ordered });
+      expect(result.pairs).toBe(2);
+      for (const s of records) expect(result.byPrecedent[s.id]).toMatchObject({ agree: 1, disagree: 0 });
+    }
+  });
+  it('does not count advisory evidence as a pass verdict', () => {
+    const s = row();
+    const citation = p.citationEvent({ repo: REPO, pr: s.source.pr, head: s.source.head, ids: [s.id], verdict: 'advisory', at });
+    expect(p.precedentAgreement({ precedents: [s], citations: [citation], decisions: [{ ...s.source, decision: s.decision }] }).pairs).toBe(0);
+  });
+  it('rejects non-operator promotion and quoted clearance provenance', () => {
+    expect(() => p.statusEvent({ id: seeds[0].id, status: 'active', actor: 'stranger', at })).toThrow();
+    const phrase = 'Cleared by chalbert via `review-set-label.mjs --to=clear-human`\n> These are eight or more words about this review decision.';
+    expect(p.captureFromComment(comment(`Advisory quotes:\n${phrase}`, 'review-bot'), options)).toEqual([]);
+    expect(p.captureFromComment(comment(phrase.replace('chalbert', 'stranger'), 'review-bot'), options)).toEqual([]);
+  });
+  it('requires operator status events or exact reviewed seeds for active first writes', () => {
+    const event = p.precedentEvent(row(), { at });
+    expect(p.foldPrecedents([event]).get(event.id).status).toBe('draft');
+    expect(p.foldPrecedents([event], { trustedSeeds: seeds }).get(event.id).status).toBe('active');
+    const changed = { ...event, record: row({ pattern: 'Injected policy' }) };
+    expect(p.foldPrecedents([changed], { trustedSeeds: seeds }).get(event.id).status).toBe('draft');
+    expect(p.foldPrecedents([event, { kind: 'status', id: event.id, status: 'active', actor: 'stranger', at }]).get(event.id).status).toBe('draft');
+    expect(p.foldPrecedents([event, p.statusEvent({ id: event.id, status: 'active', actor: 'OtherOperator', at }, { operatorLogins: ['otheroperator'] })],
+      { operatorLogins: ['otheroperator'] }).get(event.id).status).toBe('active');
+    expect(Object.isFrozen(p.CITATION_VERDICTS)).toBe(true);
+    expect(() => p.citationEvent({ repo: REPO, pr: 1, head: 'abcdef123', ids: [], verdict: 'unknown', at })).toThrow();
+  });
+  it('renders one entry at the documented minimum character budget', () => {
+    const max = row({ pattern: 'x'.repeat(400), rationale: { operatorWords: '<'.repeat(1000), body: '' } });
+    expect(p.renderPrecedentBlock([{ precedent: max }], { maxChars: p.PRECEDENT_MIN_CHARS, maxCount: 1 }).included).toHaveLength(1);
+    expect(p.resolvePrecedentSettings({ env: { WE_REVIEW_PRECEDENTS_MAX_CHARS: '500' } })).toMatchObject({ maxChars: 4000, invalid: ['env.WE_REVIEW_PRECEDENTS_MAX_CHARS'] });
+  });
   it('extracts citations from all supported fields and plain strings', () => {
     const token = '[precedent:prec-5169-escape-not-strip]';
     expect(p.extractCitations([{ summary: token, rationale: token }, null, { detail: '[precedent:prec-abc]', why: token, other: '[precedent:prec-ignored]' }])).toEqual(['prec-5169-escape-not-strip', 'prec-abc']);
@@ -198,7 +237,7 @@ describe('measurement and settings', () => {
   });
   it('resolves default, file and env settings with invalid layer diagnostics', () => {
     expect(p.resolvePrecedentSettings({})).toMatchObject({ ...p.PRECEDENT_SETTINGS_DEFAULTS, sources: { inject: 'default', maxCount: 'default', maxChars: 'default', autoDecide: 'default' }, invalid: [] });
-    const file = { review: { precedents: { inject: 'off', maxCount: 3, maxChars: 500, autoDecide: 'on' } } };
+    const file = { review: { precedents: { inject: 'off', maxCount: 3, maxChars: p.PRECEDENT_MIN_CHARS, autoDecide: 'on' } } };
     expect(p.resolvePrecedentSettings({ file })).toMatchObject({ inject: 'off', maxCount: 3, sources: { maxCount: 'file' } });
     const env = { WE_REVIEW_PRECEDENTS_INJECT: 'true', WE_REVIEW_PRECEDENTS_MAX_COUNT: '0', WE_REVIEW_PRECEDENTS_MAX_CHARS: '20000', WE_REVIEW_PRECEDENTS_AUTO_DECIDE: '0' };
     const resolved = p.resolvePrecedentSettings({ file, env });

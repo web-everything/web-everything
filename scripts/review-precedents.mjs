@@ -12,6 +12,7 @@ import {
 } from './lib/review-precedents.mjs';
 import { createReviewPrReader } from './operations/review-pr-io.mjs';
 import { shapeReadFinding, buildReviewJudgeRequest } from './operations/review-pr.mjs';
+import { OPERATOR_LOGINS } from './lib/marker-authorship.mjs';
 
 const board = fileURLToPath(new URL('../', import.meta.url));
 const seeds = () => JSON.parse(readFileSync(new URL('./review-precedents.seeds.json', import.meta.url), 'utf8')).precedents;
@@ -122,7 +123,7 @@ async function main() {
       if (by === id) throw new Error('a precedent cannot supersede itself');
       if (precedents.get(by)?.status !== 'active') throw new Error(`${by} must exist and be active`);
     }
-    const event = statusEvent({ id, actor, at, status: command === 'promote' ? 'active' : 'superseded', supersededBy: by, note: flags.note ?? '' });
+    const event = statusEvent({ id, actor, at, status: command === 'promote' ? 'active' : 'superseded', supersededBy: by, note: flags.note ?? '' }, { operatorLogins: OPERATOR_LOGINS });
     const appended = write([event]);
     print({ mode: flags.apply ? 'apply' : 'preview', event, appended }, [`${mode}: ${id} -> ${event.status}${by ? ` by ${by}` : ''} (actor ${actor})`]);
   } else if (command === 'preview') {
@@ -154,7 +155,7 @@ async function main() {
     print({ mode: flags.apply ? 'apply' : 'preview', events, appended }, [`${mode}: ${events.length} citation events`, ...events.map(event => `${event.id} · ${event.verdict} · ${event.ids.join(', ')}`)]);
   } else if (command === 'report') {
     const { precedents, citations } = readLibrary();
-    const decisions = [...precedents.values()].map(record => ({ repo: record.source.repo, pr: record.source.pr, head: record.source.head, decision: record.decision }));
+    const decisions = [...precedents.values()].map(record => ({ id: record.id, repo: record.source.repo, pr: record.source.pr, head: record.source.head, decision: record.decision }));
     const agreement = precedentAgreement({ precedents, citations, decisions });
     const autoDecide = `autoDecide=${settings.autoDecide} (${settings.sources.autoDecide})`;
     const humanSurfaces = 'autoDecide never applies to human-only surfaces (scripts/settings/human-review-surfaces.json)';

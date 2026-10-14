@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as io from '../review-precedents-io.mjs';
-import { precedentEvent, fallbackPattern, captureFromComment } from '../review-precedents.mjs';
+import { precedentEvent, fallbackPattern, captureFromComment, citationEvent, foldCitations } from '../review-precedents.mjs';
 import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
 import { FENCED_DATA_RULE } from '../mandate-fence.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -25,6 +25,24 @@ const comment = (body, login = 'chalbert') => ({ body, author: { login }, create
 const info = { headRefOid: 'abcdef123', comments: [comment(sendBack), comment(sendBack, 'stranger'), comment('ADVISORY REVIEW', AUTOMATION_LOGINS[0])] };
 
 describe('transport IO', () => {
+  it('persists successive citation revisions on the same head and seat idempotently', () => {
+    const input = ['changes', 'accept'].map(verdict => citationEvent({ repo, pr: 9, head: 'abcdef123', seat: 'panel', ids: [seeds[0].id], verdict, at }));
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    expect(io.appendPrecedentEvents({ repo, events: input, stage }).rows).toBe(2);
+    expect(io.appendPrecedentEvents({ repo, events: input, stage }).rows).toBe(0);
+    const rows = stored.trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(2);
+    expect(foldCitations(rows).at(-1).verdict).toBe('accept');
+  });
+  it('persists a recurring verdict occurrence without source and replays it idempotently', () => {
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const events = ['changes', 'accept', 'changes'].map((verdict, index) => citationEvent({ repo, pr: 9, head: 'abcdef123', ids: [seeds[0].id], seat: 'panel', verdict, at: `${at}:${index}` }));
+    for (const event of events) expect(io.appendPrecedentEvents({ repo, events: [event], stage }).rows).toBe(1);
+    expect(io.appendPrecedentEvents({ repo, events, stage }).rows).toBe(0);
+    expect(foldCitations(stored.trim().split('\n').map(JSON.parse))[0].verdict).toBe('changes');
+  });
   it('reports a failed read as unreadable and an absent file on a read tip as empty', () => {
     expect(io.readPrecedentLog({ board: '.', repo, run: () => { throw new Error('offline'); } })).toMatchObject({ status: 'unreadable', reason: 'transport-read-failed', error: 'offline' });
     expect(io.readPrecedentLog({ board: '.', repo, run: () => '' })).toEqual({ status: 'ok', events: [], malformed: 0 });
@@ -111,6 +129,7 @@ describe('settings and drafting', () => {
     const [cmd, args, options] = spawn.mock.calls[0];
     expect(cmd).toBe('claude');
     expect(args).toContain('test-policy-model');
+    expect(args.slice(args.indexOf('--tools'), args.indexOf('--tools') + 2)).toEqual(['--tools', '']);
     expect(options.input).toContain('<decision>');
     expect(options.input).toContain(FENCED_DATA_RULE);
     expect(io.draftPatternWithModel({}, { route, spawn: () => ({ status: 1 }) })).toBeNull();
@@ -135,5 +154,16 @@ describe('settings and drafting', () => {
     const result = io.recordCitationsFromComments({ repo, pr: 5184, at, info: { ...info, comments: [comment(body, AUTOMATION_LOGINS[0]), comment(body)] } });
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({ kind: 'citation', verdict: 'changes', head: 'abcdef987', ids: ['prec-5184-bulk-link-integrity'], seat: 'panel' });
+  });
+  it('round-trips advisory and recurring panel verdicts without losing the latest evidence', () => {
+    const bodies = ['**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**', '🔁 review — changes requested', '✅ review — accepted', '🔁 review — changes requested'];
+    const comments = bodies.map((body, id) => ({ ...comment(`${body}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: abcdef987 -->`, AUTOMATION_LOGINS[0]), id: id + 1 }));
+    const events = io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, comments }, at });
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    expect(io.appendPrecedentEvents({ repo, events, stage }).rows).toBe(4);
+    expect(io.appendPrecedentEvents({ repo, events: io.recordCitationsFromComments({ repo, pr: 9, info: { ...info, comments }, at: 'later' }), stage }).rows).toBe(0);
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    expect(io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.seat, e.verdict])).toEqual([['advisory', 'advisory'], ['panel', 'changes']]);
   });
 });

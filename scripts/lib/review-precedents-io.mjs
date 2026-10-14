@@ -6,6 +6,7 @@
  * Capture writes DRAFTS only. Promotion is a separate operator/orchestrator step.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { assertPushRef, readFromTransportBranch, stageOnTransportBranch } from './git-transport-branch.mjs';
 import { readSettings } from './settings-files.mjs';
 import {
@@ -23,6 +24,8 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 export const PRECEDENT_TRANSPORT_BRANCH = 'ops/review-requests';
 export const PRECEDENT_PUSH_REF = 'refs/heads/ops/review-requests';
 export const PRECEDENT_DIR = 'review-precedents';
+const trustedSeeds = JSON.parse(readFileSync(new URL('../review-precedents.seeds.json', import.meta.url), 'utf8')).precedents;
+const trust = { operatorLogins: OPERATOR_LOGINS, trustedSeeds };
 
 export function precedentGitPath(repo) {
   const slug = String(repo ?? '').trim().replace(/[/\\\s\x00-\x1f]+/g, '-').replace(/^-+|-+$/g, '') || 'repo';
@@ -33,7 +36,7 @@ export function readPrecedentLog({ board, repo, branch = PRECEDENT_TRANSPORT_BRA
   try {
     const path = precedentGitPath(repo);
     const files = readFromTransportBranch({ board, branch, paths: [path], run });
-    return { status: 'ok', ...parsePrecedentLog(files[path] ?? '') };
+    return { status: 'ok', ...parsePrecedentLog(files[path] ?? '', trust) };
   } catch (error) {
     return { status: 'unreadable', reason: 'transport-read-failed', error: String(error?.message ?? error) };
   }
@@ -61,7 +64,7 @@ export function appendPrecedentEvents({
   const lines = events.map(event => {
     try {
       const line = JSON.stringify(event);
-      const parsed = parsePrecedentLog(line);
+      const parsed = parsePrecedentLog(line, trust);
       if (parsed.malformed || parsed.events.length !== 1) throw new Error('malformed event');
       return line;
     } catch (cause) { throw new TypeError('invalid precedent event', { cause }); }
@@ -76,7 +79,7 @@ export function appendPrecedentEvents({
         board, branch, message: `review-precedents: append ${repo}`,
         files: [{ path: precedentGitPath(repo), content: ({ existing }) => {
           const base = existing ?? '';
-          const seen = new Set(parsePrecedentLog(base).events.map(precedentEventId));
+          const seen = new Set(parsePrecedentLog(base, trust).events.map(precedentEventId));
           const fresh = lines.filter((line, index) => {
             if (seen.has(ids[index])) return false;
             seen.add(ids[index]);
@@ -111,7 +114,7 @@ export function loadPrecedentSettings({ env = process.env, settings = readSettin
 export function readPrecedents({ board, repo, run } = {}) {
   const result = readPrecedentLog({ board, repo, run });
   if (result.status !== 'ok') return result;
-  return { status: 'ok', precedents: foldPrecedents(result.events), citations: foldCitations(result.events), malformed: result.malformed };
+  return { status: 'ok', precedents: foldPrecedents(result.events, trust), citations: foldCitations(result.events), malformed: result.malformed };
 }
 
 const defaultExec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -133,7 +136,7 @@ export function draftPatternWithModel(capture, { spawn = spawnSync, route = defa
     if (selected?.provider !== 'claude' || !selected.model) return null;
     const alias = claudeSpawnAlias(selected.model);
     const prompt = `Write ONE sentence (at most 300 characters) stating the reusable review rule implied by the operator's decision. Phrase it as a general rule, with no PR numbers. Return only that sentence.\n\n${FENCED_DATA_RULE}\n\n${fenceUntrusted('decision', `${capture.operatorWords ?? ''}\n\n${capture.body ?? ''}`)}`;
-    const result = spawn('claude', ['-p', '--model', alias, '--output-format', 'text'], { input: prompt, encoding: 'utf8', timeout: 90000 });
+    const result = spawn('claude', ['-p', '--model', alias, '--tools', '', '--output-format', 'text'], { input: prompt, encoding: 'utf8', timeout: 90000 });
     if (result.error || result.status !== 0) return null;
     const line = String(result.stdout ?? '').split(/\r\n|[\r\n\u2028\u2029\u0085\v\f]/u).find(value => value.trim());
     if (!line || line.trim().length > 400) return null;
@@ -168,12 +171,15 @@ export function recordCitationsFromComments({ repo, pr, info, at }) {
     if (!AUTOMATION_LOGINS.includes(String(comment.author?.login ?? '').toLowerCase())) continue;
     const body = typeof comment.body === 'string' ? comment.body : '';
     const verdict = body.startsWith('✅ review — accepted') ? 'accept'
-      : body.startsWith('🔁 review — changes requested') ? 'changes' : body.includes('ADVISORY REVIEW') ? 'advisory' : null;
+      : body.startsWith('🔁 review — changes requested') ? 'changes'
+        : /^(?:ADVISORY REVIEW\b|\*\*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\.\*\*)/.test(body) ? 'advisory' : null;
     if (!verdict) continue;
     const ids = extractCitations(body);
     if (!ids.length) continue;
     const head = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? info.headRefOid;
-    events.push(citationEvent({ repo, pr, head, ids, seat: 'panel', verdict, at }));
+    const source = comment.id ?? comment.url ?? comment.createdAt;
+    events.push(citationEvent({ repo, pr, head, ids, seat: verdict === 'advisory' ? 'advisory' : 'panel', verdict, at,
+      source: source == null ? '' : JSON.stringify([source, comment.updatedAt ?? comment.createdAt ?? '']) }));
   }
   return events;
 }

@@ -34,3 +34,11 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Review prevention follow-up (PR #5243)
+
+Add a check:standards rule requiring each `claude -p` spawn under scripts to supply an explicit `--tools` restriction or a documented exemption. The precedent drafting spawn now disables tools; the broader scanner lies outside this repair's allowed file scope. Cover literal argument arrays and wrapped spawn helpers, including dynamically assembled arguments that need an explicit exemption.
+
+The precedent hooks must pass operator logins into status validation and preserve comment/review source identity on citation events. Active transport first writes are trusted only when they exactly match repository-reviewed seeds; other records require a validated operator status event. Actor login remains a transport-writer attestation, not proof of the invoking user's identity; stronger authentication requires a separate operator-only write boundary.
+
+The complete comment reader currently projects creation time and node identity but omits edit time. Project `updated_at` as `updatedAt` there so a same-comment edit returning to earlier content has a distinct citation revision; without that upstream field, backfill can distinguish new comments and changed evidence but cannot reconstruct repeated edits of one comment. That reader is outside this repair's scope. Direct citation writers must retain a stable occurrence time or a source identity unique to the review revision.
