@@ -1,0 +1,21 @@
+{
+  "$comment": "Complete operator briefs filed with --operatorTask skip prepare only after the shared prepare section validator plus Done when/Acceptance, Edge cases and we:-qualified scope checks. Cascade: standard enabled=true/maxPriority=P0 \u2192 platform build.operatorTask \u2192 tool build.operatorTask. Each leaf source is logged by policy-cascade. maxPriority is the highest allowed priority class (P0 allows all classes). Disabled filing leaves the card unstamped; disabled build admission holds operator cards for prepare even if previously stamped. Post-build steps require operatorTask: true on the card, enabled=true, an enabled policy leaf and the corresponding card field. edgeClones maps allowlisted names to workspace-relative or ~/ paths.",
+  "build": {
+    "operatorTask": {
+      "enabled": true,
+      "maxPriority": "P0",
+      "postBuild": {
+        "edgeLoad": true,
+        "liveProof": true,
+        "report": true
+      },
+      "edgeClones": {
+        "review": "wev-review-daemon",
+        "fix": "wev-fix-daemon",
+        "control": "wev-control",
+        "drain": ".lanes/we-drain-daemon/code",
+        "health-watch": "wev-health-watch"
+      }
+    }
+  }
+}

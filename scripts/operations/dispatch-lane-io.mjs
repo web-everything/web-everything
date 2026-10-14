@@ -1,4 +1,5 @@
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { composeOperatorTaskBrief } from './operator-task-brief.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
 import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -575,7 +576,7 @@ export function readTick({
     suppressed: match(decisions.suppressedBuilds),
     dispatchedGuard,
     item,
-    briefTemplate: String(readText(briefPath(root, launchKind))),
+    briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))), item ?? {}, { workspace: workspaceRootOf(root), kind: launchKind }),
     nextState,
     statusLine: String(decisions.statusLine || ''),
     notes: Array.isArray(decisions.notes) ? decisions.notes : [],
@@ -1040,6 +1041,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
   if (!it || !it.slug) return null;
   const rawTarget = typeof it.deliveryTarget === 'string' && it.deliveryTarget.trim() ? it.deliveryTarget.trim() : null;
   return {
+    ...Object.fromEntries(['operatorTask', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
     num: String(it.num),
     status: it.status ?? null,
     deliveryAgent: it.deliveryAgent ?? null,
@@ -1564,6 +1566,7 @@ export function createDispatchSinks({
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
+          operatorPostBuild: payload?.operatorPostBuild === true,
           headRefOid: payload?.headRefOid,
           claimOwner: payload?.claimOwner,
           claimRoot: payload?.claimRoot,
@@ -1768,6 +1771,9 @@ export function routeDispatchProvider(request, {
   providerAvailable = () => true,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
+  if (kind === 'build' && request.operatorPostBuild) {
+    return agent({ ...request, probationWorker: null, policyRoute: null });
+  }
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
     const candidates = [request.policyRoute, ...request.policyRoute.fallback];

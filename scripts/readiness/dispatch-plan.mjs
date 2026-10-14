@@ -601,7 +601,7 @@ export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, drif
     //    (cross-checking `preparedAgainstSha`) is a possible future hardening, not this MVP's job.
     //    A prepare-item launch creates this stamp: exempt ONLY that kind from this gate,
     //    leaving size, overlap, pause and lane admission unchanged.
-    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate))) {
+    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && ((item.preparedBy === 'operator-filing' && preparePolicy.operatorTask?.enabled === false) || !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate)))) {
       held.push({ num, reason: 'needs-prepare' });
       continue;
     }
@@ -1005,6 +1005,7 @@ async function main(argv) {
       // reads as unprepared under the live default policy, held `needs-prepare` rather than launching blind on
       // a card nobody has actually prepared).
       preparedDate: it?.preparedDate,
+      preparedBy: it?.preparedBy,
       // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
       preparedAgainstSha: it?.preparedAgainstSha,
       rawScope: Array.isArray(it?.scope) ? it.scope : undefined,
@@ -1138,7 +1139,8 @@ async function main(argv) {
   //     operator rule is unconditional (no "which mode" choice), so the live daemon simply turns the gate ON.
   //     Skippable via `--no-prepare-check` (mirrors `--no-size-check`/`--no-drift-check`/`--no-pause-check`) —
   //     the same emergency escape hatch every other axis above already gets.
-  const preparePolicy = flags['no-prepare-check'] ? null : { requirePreparedDate: true };
+  const { readOperatorTaskSettings } = await import('../lib/operator-task-settings.mjs');
+  const preparePolicy = flags['no-prepare-check'] ? null : { requirePreparedDate: true, operatorTask: readOperatorTaskSettings() };
   // Card 80 (b) — `--prepared-max-age-days=N` (the build daemon passes its `preparedMaxAgeDays` through
   // tick-core) turns on the `prepare-stale` gate: a stamp older than N days, or one whose `we:` scope files
   // changed on origin/main since `preparedAgainstSha`, is re-prepared before it builds. A failed drift read is

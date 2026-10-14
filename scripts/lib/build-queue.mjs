@@ -269,7 +269,7 @@ export function effectiveScore(item, config, now, ctx = {}) {
 //   - card `priority: low`              → the operator's `low` override (P4);
 //   - `queuedAt` (the sidecar's clear stamp) → `waitingSince`: the time it has waited IN the build queue, which
 //     drives the in-class score and the +1-class aging after `agingHours` (never into P0 — the rule's own cap).
-// Any other priority value (medium/normal/absent) adds no fact → the normal class.
+// Explicit P0–P4 values select the class in `cardPriority`; medium/normal/absent add no fact.
 const CARD_PRIORITY_REASON = Object.freeze({ operatorRequested: 'an operator answer waits on it', low: 'operator override low', now: 'operator override now' });
 
 /** Plain delivery-priority facts for one backlog card. PURE. */
@@ -286,13 +286,15 @@ export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
 /** Class one card; the reasons name the card's own field instead of the rule's PR-shaped wording. PURE. */
 function cardPriority(item, unblocks, settings, now) {
   const r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
+  const explicit = /^P[0-4]$/.test(item?.priority ?? '') ? item.priority : null;
   const reasons = r.reasons.map((why) => (why === CARD_PRIORITY_REASON.operatorRequested ? 'card priority: high'
     : why === CARD_PRIORITY_REASON.low ? 'card priority: low'
     : why === CARD_PRIORITY_REASON.now ? 'card priority: now (operator request)' : why));
   // Q2's in-class score is the fix-queue score: unblocks × weight + minutes waited. Mode `off` scores 0 so the
   // order stays exactly today's (tier → WSJF → rank → date → num).
   const score = settings.mode === 'off' ? 0 : unblocks * settings.unblockWeightMinutes + r.minutesWaited;
-  return { priorityClass: r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged,
+  if (explicit) reasons.push(`card priority: ${explicit}`);
+  return { priorityClass: explicit ?? r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged,
     operatorRequest: String(item?.priority ?? '').trim().toLowerCase() === 'now' && r.override === 'now' };
 }
 
@@ -314,7 +316,7 @@ function tierRank(item) {
  * operator request first (unless requestsFirstInClass=false; Q2 amendment 2026-10-09) → tier (pinned
  * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
  * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
- * `opts.priority` omitted or mode `off` → every row P3, priorityScore 0, legacy order.
+ * `opts.priority` omitted or mode `off` → derived rows P3, score 0, legacy order; explicit P0 still leads.
  * Mode `shadow` computes real classes, scores and reasons but retains the legacy keys after buildPriority:
  * tier → effectiveScore → rank → dateOpened → num. Only `enforce` applies class-first ordering.
  */
@@ -352,7 +354,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         num: numOr(Number(it.num), Infinity),
       };
     });
-  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : (a, b) => compareBuildPriority(a, b) || compareLegacyOrder(a, b));
+  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : (a, b) => Number(b.priorityClass === 'P0') - Number(a.priorityClass === 'P0') || compareBuildPriority(a, b) || compareLegacyOrder(a, b));
   return ready;
 }
 

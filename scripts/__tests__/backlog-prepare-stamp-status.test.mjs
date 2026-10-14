@@ -37,6 +37,13 @@ describe('prepare-stamp status handling (#4480)', () => {
     expect(first).toMatch(/^preparedAgainstSha:/m);
     expect(second).toBe(first);
   });
+  it('clears operator filing admission after a real prepare pass, keeping the operator task flag', () => {
+    const { first, second } = stamp('status: open\noperatorTask: true\npreparedBy: "operator-filing"\npriority: P0');
+    expect(first).not.toMatch(/^preparedBy:/m);
+    expect(first).toMatch(/^operatorTask: true$/m);
+    expect(first).toMatch(/^priority: P0$/m);
+    expect(second).toBe(first);
+  });
   it('keeps preparing', () => expect(status(stamp('status: preparing').first)).toBe('preparing'));
   it('keeps parked', () => expect(status(stamp('status: parked').first)).toBe('parked'));
   it('open and status-less cards end up open, stamped', () => {

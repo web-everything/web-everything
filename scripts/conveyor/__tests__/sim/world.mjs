@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { worldThrottleEnv } from './world-env.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -255,7 +256,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    // Vitest's per-file throttle root outlives each world. A scenario that advances its clock can leave
+    // future-dated budget windows there, forcing the next scenario to wait on a different world's spend.
+    // Keep one shared throttle for this world's daemons and children, owned and removed by this world.
+    ...worldThrottleEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
