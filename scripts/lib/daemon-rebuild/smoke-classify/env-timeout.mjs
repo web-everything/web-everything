@@ -5,6 +5,7 @@
 
 import { redactDetail } from './redact-detail.mjs';
 import { cascadePolicy } from '../../policy-cascade.mjs';
+import { isEnvTimeoutRow } from '../../daemon-live-smoke.mjs';
 
 export const ENV_TIMEOUT_HOLD_STANDARD = { mode: 'control-after', afterMinutes: 45 };
 
@@ -36,7 +37,7 @@ export const envTimeout = Object.freeze({
   async run(ctx) {
     const { a, failedA, alert, hold, plan, prepAlerts, alertsList } = ctx;
     // A check ran out of TIME twice with widened budgets. Hold first; after the cap, prove whether last-good
-    // shares a failed check before adopting as no worse (gh slot contention can persist even at low CPU load).
+    // reproduces every timeout before adopting as no worse (gh slot contention can persist at low CPU load).
     const et = a.smokeResult.envTimeout || {};
     const holdPolicy = resolveEnvTimeoutHold(ctx.env);
     const failed = failedA.map((r) => r.name).join(',');
@@ -53,12 +54,17 @@ export const envTimeout = Object.freeze({
     if (holdPolicy.mode === 'control-after' && heldSinceMinutes > holdPolicy.afterMinutes
       && ctx.smokeSha && ctx.prevHead && ctx.finalize) {
       const c = ctx.budgetAllows('last-good')
-        ? await ctx.smokeSha(ctx.prevHead, null, 'last-good', [], { failFast: failedA.map((r) => r.name) })
+        // A no-worse proof needs every failed check to run; fail-fast skips cannot reproduce a failure.
+        ? await ctx.smokeSha(ctx.prevHead, null, 'last-good', [], { failFast: [] })
         : {};
-      const reproducedOnLastGood = c.smokeResult
-        ? ctx.failedRows(c.smokeResult).filter((r) => failedA.some((f) => f.name === r.name)).map((r) => r.name)
+      const controlTimeouts = c.smokeResult
+        ? ctx.failedRows(c.smokeResult).filter((r) => !r.skipped && !r.budgetSkipped && isEnvTimeoutRow(r))
         : [];
-      if (reproducedOnLastGood.length) {
+      const reproducedOnLastGood = c.smokeResult
+        ? controlTimeouts.filter((r) => failedA.some((f) => f.name === r.name)).map((r) => r.name)
+        : [];
+      if (failedA.every((r) => !r.skipped && !r.budgetSkipped && isEnvTimeoutRow(r))
+        && ctx.failsSameChecks?.(failedA, controlTimeouts)) {
         if (ctx.aSuspects?.length) {
           const d = await ctx.dispatchOnly(plan.finalSha, ctx.aSuspects);
           if (!d.result.ok) return ctx.dispatchFailed(d);
@@ -71,8 +77,9 @@ export const envTimeout = Object.freeze({
         const fin = await ctx.finalize(plan, undefined, undefined, a.smokeResult);
         return { ...fin, reason: fin.adopted ? 'env-timeout-adopted-not-worse' : fin.reason };
       }
-      alert(c.smokeResult ? 'smoke-env-timeout-control-passed' : 'smoke-env-timeout-control-unavailable', {
-        failed, heldSinceMinutes, holdPolicy,
+      alert(!c.smokeResult ? 'smoke-env-timeout-control-unavailable'
+        : c.smokeResult.verdict === 'pass' ? 'smoke-env-timeout-control-passed' : 'smoke-env-timeout-control-not-equivalent', {
+        failed, reproducedOnLastGood, heldSinceMinutes, holdPolicy,
       });
     }
     await hold('smoke-env-timeout', failedA);

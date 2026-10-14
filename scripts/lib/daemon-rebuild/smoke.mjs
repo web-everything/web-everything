@@ -144,7 +144,9 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const c = new Set((controlFailed || []).map((r) => r.name));
+  const c = new Set((controlFailed || [])
+    .filter((r) => !r.ok && !r.skipped && !r.budgetSkipped && !/^skipped:/.test(String(r.detail ?? '')))
+    .map((r) => r.name));
   return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
 }
 
@@ -639,7 +641,7 @@ export async function smokeAndAdopt({
 
   const failedA = failedRows(a.smokeResult);
   for (const verdict of SMOKE_ENVIRONMENT_VERDICTS) {
-    if (verdict.matches(a.smokeResult.verdict)) return verdict.run({ a, failedA, alert, hold, plan, prepAlerts, alertsList, env, now, prevHead, smokeSha, finalize, dispatchOnly, dispatchFailed, dispatchPassedAlert, aSuspects, budgetAllows, failedRows, heldSince: (() => { const h = readRebuildState(root, stEnv).held; return h?.reason === 'smoke-env-timeout' ? h.since : null; })() });
+    if (verdict.matches(a.smokeResult.verdict)) return verdict.run({ a, failedA, alert, hold, plan, prepAlerts, alertsList, env, now, prevHead, smokeSha, finalize, dispatchOnly, dispatchFailed, dispatchPassedAlert, aSuspects, budgetAllows, failedRows, failsSameChecks, heldSince: (() => { const h = readRebuildState(root, stEnv).held; return h?.reason === 'smoke-env-timeout' ? h.since : null; })() });
   }
 
   // Record A's rejection exactly as before (sticky until the inputs move, or backoff for external-only).

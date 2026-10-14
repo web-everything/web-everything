@@ -1,8 +1,31 @@
 import { describe, it, expect, vi } from 'vitest';
 import { envTimeout, ENV_TIMEOUT_HOLD_STANDARD, resolveEnvTimeoutHold } from '../daemon-rebuild/smoke-classify/env-timeout.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { smokeAndAdopt, failsSameChecks } from '../daemon-rebuild/smoke.mjs';
+import { writeRebuildState, readRebuildState } from '../daemon-rebuild/state.mjs';
+import { materializeCandidate } from '../daemon-rebuild/candidate.mjs';
+import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
+
+// Exercise the real smokeAndAdopt ladder and persisted state without writing any Git metadata.
+vi.mock('../daemon-rebuild/candidate.mjs', () => ({
+  candidateSmokeEnv: ({ env }) => env,
+  materializeCandidate: vi.fn(({ sha }) => ({ ok: true, path: `/fake/${sha}` })),
+  removeCandidate: vi.fn(),
+}));
+vi.mock('../daemon-clone-lock.mjs', () => ({
+  withWriteLock: async (_root, fn) => ({ ok: true, value: await fn() }),
+}));
+vi.mock('../daemon-rebuild/adopt.mjs', () => ({
+  finalizeRebuild: vi.fn(() => ({ adopted: true, moved: true, alerts: [] })),
+  staleAlertDetail: () => null,
+  dropSuspectOverlays: vi.fn(),
+}));
 
 const now = Date.parse('2026-10-14T17:00:00Z');
-const failed = [{ name: 'reconcile-dry-run', ok: false, ms: 120_000, detail: 'timeout' }];
+const failed = [{ name: 'reconcile-dry-run', ok: false, ms: 120_000, detail: 'reconcile failed: timed out after 120000ms (process group killed)' }];
+const dispatchTimeout = { ...failed[0], name: 'dispatch-dry-run' };
 const smokeResult = { verdict: 'env-timeout', smoke: { results: failed } };
 
 function context(overrides = {}) {
@@ -17,6 +40,7 @@ function context(overrides = {}) {
     dispatchFailed: vi.fn().mockReturnValue({ moved: false, reason: 'dispatch-failed' }),
     dispatchPassedAlert: vi.fn(), aSuspects: [], budgetAllows: vi.fn().mockReturnValue(true),
     failedRows: (result) => result.smoke.results.filter((r) => !r.ok),
+    failsSameChecks,
     ...overrides,
   };
 }
@@ -38,19 +62,48 @@ describe('env-timeout hold escape', () => {
     expect(ctx.smokeSha).not.toHaveBeenCalled();
   });
 
-  it('adopts when last-good reproduces any candidate failure', async () => {
-    const ctx = context({ failedA: [...failed, { name: 'dispatch-dry-run', ok: false }] });
+  it('adopts when last-good reproduces every candidate timeout', async () => {
+    const results = [...failed, dispatchTimeout];
+    const candidate = { verdict: 'env-timeout', smoke: { results } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: candidate }) });
     expect((await envTimeout.run(ctx)).reason).toBe('env-timeout-adopted-not-worse');
     expect(ctx.smokeSha).toHaveBeenCalledWith('last-good', null, 'last-good', [], {
-      failFast: ['reconcile-dry-run', 'dispatch-dry-run'],
+      failFast: [],
     });
     expect(ctx.budgetAllows).toHaveBeenCalledWith('last-good');
-    expect(ctx.finalize).toHaveBeenCalledWith(ctx.plan, undefined, undefined, smokeResult);
+    expect(ctx.finalize).toHaveBeenCalledWith(ctx.plan, undefined, undefined, candidate);
     expect(ctx.hold).not.toHaveBeenCalled();
     expect(ctx.alert).toHaveBeenCalledWith('smoke-env-timeout-adopted-not-worse', expect.objectContaining({
-      reproducedOnLastGood: ['reconcile-dry-run'], heldSinceMinutes: 60,
+      reproducedOnLastGood: ['reconcile-dry-run', 'dispatch-dry-run'], heldSinceMinutes: 60,
       holdPolicy: { ...ENV_TIMEOUT_HOLD_STANDARD, source: { mode: 'standard', afterMinutes: 'standard' } },
     }));
+  });
+
+  it.each([
+    ['subset', failed],
+    ['passed sibling', [...failed, { ...dispatchTimeout, ok: true }]],
+    ['fail-fast skipped sibling', [...failed, { ...dispatchTimeout, detail: 'skipped: fail-fast — reconcile-dry-run failed' }]],
+    ['flagged skipped sibling', [...failed, { ...dispatchTimeout, skipped: true }]],
+    ['ordinary error', [{ ...failed[0], detail: 'reconcile failed: invalid configuration' }, dispatchTimeout]],
+    ['unmeasured timeout', [{ ...failed[0], ms: 1 }, dispatchTimeout]],
+    ['timeout text in ordinary error', [{ ...failed[0], detail: 'assertion failed: timeout option is invalid' }, dispatchTimeout]],
+  ])('holds without finalizing when control has %s', async (_label, results) => {
+    const candidate = { verdict: 'env-timeout', smoke: { results: [...failed, dispatchTimeout] } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: { verdict: 'env-timeout', smoke: { results } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+    expect(ctx.dispatchOnly).not.toHaveBeenCalled();
+    expect(ctx.hold).toHaveBeenCalledWith('smoke-env-timeout', ctx.failedA);
+  });
+
+  it('holds when a candidate failure is not a measured timeout', async () => {
+    const candidate = { verdict: 'env-timeout', smoke: { results: [...failed, { ...dispatchTimeout, detail: 'invalid dispatch configuration' }] } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [...failed, dispatchTimeout] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
   });
 
   it('holds when the control passes', async () => {
@@ -97,5 +150,53 @@ describe('env-timeout hold escape', () => {
     expect(ctx.alert).toHaveBeenCalledWith('smoke-env-timeout-control-unavailable', expect.any(Object));
     expect(ctx.finalize).not.toHaveBeenCalled();
     if (kind === 'budget') expect(ctx.smokeSha).not.toHaveBeenCalled();
+  });
+});
+
+describe('no-worse shared check comparison', () => {
+  it.each([
+    { ...failed[0], ok: true },
+    { ...failed[0], skipped: true },
+    { ...failed[0], budgetSkipped: true },
+    { ...failed[0], detail: 'skipped: fail-fast — previous check failed' },
+  ])('does not count a passed or skipped control row: %j', (row) => {
+    expect(failsSameChecks(failed, [row])).toBe(false);
+  });
+});
+
+describe('smokeAndAdopt env-timeout escape wiring', () => {
+  it.each([
+    ['aged timeout', 'smoke-env-timeout', 60, true],
+    ['different reason', 'smoke-harness-broken', 60, false],
+    ['young timeout', 'smoke-env-timeout', 44, false],
+  ])('%s', async (_label, reason, minutes, adopts) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-env-timeout-wiring-'));
+    const root = join(dir, 'clone');
+    const env = { WE_DAEMON_STATE_DIR: dir, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'absent.json'),
+      WE_SMOKE_ENV_TIMEOUT_HOLD_MODE: 'control-after', WE_SMOKE_ENV_TIMEOUT_HOLD_AFTER_MIN: '45' };
+    const stEnv = env;
+    try {
+      writeRebuildState(root, { held: { reason, since: new Date(now - minutes * 60_000).toISOString() } }, stEnv);
+      materializeCandidate.mockClear();
+      finalizeRebuild.mockClear();
+      const runSmoke = vi.fn(async () => smokeResult);
+      const result = await smokeAndAdopt({ root, env, stEnv, log: {},
+        run: () => ({ status: 1, stdout: '' }), runSmoke, now: () => now,
+        plan: { finalSha: 'candidate', mainSha: 'candidate', applied: [] }, prevHead: 'last-good',
+        lease: { path: join(dir, 'candidate'), id: 'test' }, prepAlerts: [], overlaysBefore: [],
+        dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: vi.fn(), match: vi.fn() },
+      });
+      expect(result.reason).toBe(adopts ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+      expect(runSmoke).toHaveBeenCalledTimes(adopts ? 2 : 1);
+      if (adopts) {
+        expect(materializeCandidate.mock.calls.map(([args]) => args.sha)).toEqual(['candidate', 'last-good']);
+        expect(finalizeRebuild).toHaveBeenCalledWith(expect.objectContaining({ prevHead: 'last-good', plan: expect.objectContaining({ finalSha: 'candidate' }) }));
+      } else {
+        expect(finalizeRebuild).not.toHaveBeenCalled();
+        expect(readRebuildState(root, stEnv).held.reason).toBe('smoke-env-timeout');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
