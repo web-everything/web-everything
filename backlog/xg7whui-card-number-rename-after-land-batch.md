@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
-blockedBy: ["x5qtv82", "xbpjdsd"]
+blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd"]
 scope: ["we:scripts/card-rename-batch.mjs", "we:scripts/lane-drain.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/card-rename-batch.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, merge-queue, numbering, ledger]
@@ -30,6 +30,9 @@ Slice (f) of epic xdlnylv: in mode rename-after-land, a batch job opens one PR o
   already renamed on main is skipped. Same input, same tree.
 - Gate: `handNumberedNewItems` (we:scripts/check-standards-rules.mjs:3012) accepts a new numeric file whose
   number and `bornAs` match a ledger row, as `exemptDrainNumberedItems` does for drain commits today.
+  Slice (c)'s collision rule also accepts that same-identity equality; it rejects a different/missing
+  `bornAs` for the number. Validate unique x-id/`bornAs` identities in the prospective merged tree before
+  building the batch; the valid rename replaces one file rather than adding a second identity alias.
 - Redirects: the renamed card keeps `bornAs`, so slice (b)'s x-id redirects keep old links working.
 
 ## MVP
@@ -58,6 +61,8 @@ One line per class: either the handling, or `n/a: <why>`.
 Fixture repo: two ledgered x-cards and one unledgered → the batch renames the two, leaves the third, rewrites a
 `blockedBy` reference; a second run with nothing new opens no PR; a run with an open batch PR refreshes it;
 `handNumberedNewItems` accepts the renamed files when the ledger matches and refuses a mismatched number.
+Run the collision rule on the materialized tree too: matching `bornAs` passes, a different identity errors.
+Unreadable introducing history/signatures and duplicate identities abort without creating a PR.
 
 ## Proof plan
 

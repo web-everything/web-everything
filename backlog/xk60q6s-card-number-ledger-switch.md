@@ -3,6 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
+humanGate: { kind: review, what: "Operator must link approval of the replacement #5057 merge-group invariant in the epic decision note before this switch can dispatch." }
 blockedBy: ["x5qtv82", "xy5r0uf", "xbpjdsd", "xg7whui"]
 scope: ["we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/lane-drain.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue-numbering.json", "we:scripts/settings/card-numbering.json", "we:scripts/check-standards.mjs", "we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-13"
@@ -11,11 +12,13 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Switch the card-numbering mode to rename-after-land (no code path removed)
 
-Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to the default `rename-after-land`. The pre-enqueue rename in we:scripts/lib/queue-branch-numbering.mjs is turned off for the merge queue, not deleted. The invariant was confirmed by the operator on 2026-10-13 (epic decision note), so this slice has no humanGate.
+Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering.mode`, then flip the repo to `rename-after-land`. The pre-enqueue rename is turned off for the merge queue, not deleted. This slice stays human-gated until the epic links operator approval of the replacement #5057 invariant.
 
 ## Design
 
 - Mode-gate, do not delete. Every step below stays in the code and runs only in its mode:
+  The #5057 relaxation and mode flip require linked operator approval first; an unattributed quote does not
+  clear the humanGate.
   - `rename-before-enqueue`: `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch-numbering.mjs:238),
     `sweepQueuedHashCards` (:318), `probeQueuedLand` (:354), `repairHashOnMain` (:200), and the
     `mergeGroupHashRefusals` merge_group refusal (:34-37, called at we:scripts/check-standards.mjs:787-789),
@@ -35,6 +38,9 @@ Slice (d) of epic xdlnylv: make every numbering step obey `backlog.cardNumbering
   standard default `rename-after-land` applies. Switching back is a one-line setting change.
 - If the assign fails, the candidate is skipped this pass (`decision = 'skip'`); it is never enqueued without
   its rows.
+- Before idempotent assignment, enforce slice (c)'s identity uniqueness on the prospective merged tree.
+  A second file with an existing x-id cannot inherit its number. Assignment and merge_group use fresh,
+  authenticated history from slice (a); failed fetch/history/signature checks cannot use stale success.
 - Wire the guards through `numberPendingHashes` (we:scripts/lane-drain.mjs:682), including drain-direct,
   main repair and branch/queue callers. Ops-ledger assignments override the local hash map and reservations;
   new allocations exclude every ledger number. Do not defer this safety to slice (e)'s local-map retirement.
@@ -67,6 +73,8 @@ One line per class: either the handling, or `n/a: <why>`.
 Unit, per mode: `rename-before-enqueue` still calls `prepareBranchBeforeEnqueue` and refuses unledgered x-cards;
 the other two call `assignCardNumbers` and never the branch numbering; the merge_group rule passes a ledgered
 x-card and refuses an unledgered one and an unreadable ledger; an invalid mode value is ignored and logged.
+Repeat the merge_group failure cases inside the land window and for failed fetch with a stale local ref.
+An integration candidate reusing a ledgered x-id in another file is refused before allocation/enqueue.
 
 Integration rollback fixture: land ledger-numbered x-cards in both `rename-after-land` and `ledger-only`,
 then select `rename-before-enqueue` through explicit repo/env overrides and lower-layer cascade resolution. Exercise
@@ -90,6 +98,8 @@ before/after ledger rows, filenames and CI wall times.
 
 ## Done when
 
+- The epic records an operator approval URL for the exact #5057 replacement invariant and the humanGate
+  is cleared through the human process; this design PR supplies no approval or review verdict.
 - Three consecutive real PRs with new cards land at their judged head with one CI round each.
 - Flipping the setting back to `rename-before-enqueue` restores pre-enqueue numbering for new unledgered
   cards with no additional code change; already ledger-numbered cards keep their numbers through all

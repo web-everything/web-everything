@@ -23,24 +23,23 @@ Under the merge queue, `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch
 
 The number is display data. It does not need to live in the file name.
 
-## Decision note — CONFIRMED by the operator 2026-10-13 ~19:00 ET
+## Decision note — proposed replacement, awaiting linked operator approval
 
 **Conflict.** #5057 made it "mechanically impossible to add a temp id in the queue": `mergeGroupHashRefusals`
 (we:scripts/lib/queue-branch-numbering.mjs:34-37, called from we:scripts/check-standards.mjs:787-789) refuses any
 merge group that carries an `x<6>` file name, unconditionally. Card 265 lets `x<6>` file names land on `main`.
-The two cannot both hold. The operator's approval of 265 supersedes the file-name half of #5057.
+The two cannot both hold. Approval of card 265 alone does not establish approval of this specific relaxation.
 
-**Replacement invariant (confirmed).** *x-id cards may land. Every card on `main` gets a ledger number,
+**Proposed replacement invariant.** *x-id cards may land. Every card on `main` gets a ledger number,
 assigned atomically by the drain's land step. Nothing unnumbered is user-visible.* Concretely: in every mode,
 the merge_group gate stops refusing ledgered `x<6>` file names and instead refuses any `x<6>`
 card in the group that has no ledger row. The "no hash on main" rule becomes "no unledgered hash on main".
 In mode `rename-before-enqueue`, new unledgered cards still require pre-enqueue numbering. Ledgered x-cards
 already landed in another mode remain legal on rollback and must never receive a replacement number.
 
-**Confirmation, verbatim:** "Right, so by allowing the temp id to be merged and supporting it, our system
-forgives what was previously breaking, I like it."
-
-Slice (d)'s humanGate for this invariant is cleared.
+**Approval source:** pending. No verifiable comment or issue URL is present for this replacement invariant.
+Slice (d), xk60q6s, retains its `humanGate` until the operator's approval is linked here. The quote previously
+recorded without a source is insufficient to clear that gate. This PR does not record a human verdict.
 
 ## Card naming policy — `backlog.cardNumbering.mode`
 
@@ -78,6 +77,13 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
   `appendLedgerRows` (we:scripts/lib/verdict-ledger-io.mjs:163). No new transport.
 - Two invariants on the file: one number per id, one id per number. Every reader validates both and fails
   closed on a violation (it shows the x-id and reports the conflict; it never guesses).
+- Authenticate each row at its introducing commit, with fetched file history and a verified signature from
+  a trusted drain signing key (including seed/shadow rows). Tip authorship, Git author names and `by` are
+  insufficient. Reject untrusted rows even beneath a later trusted tip and mark the ledger unreadable;
+  any retained trusted mappings are diagnostic only. Missing verification history,
+  exceeded read/history budgets or append-only violations make the ledger unreadable.
+- A numeric card and ledger row may share a number only if the numeric card's `bornAs` equals the row id;
+  this is the expected seed and materialization case. Different identities sharing a number error.
 
 ### The atomic assign-at-land step
 
@@ -86,7 +92,9 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
   `mergeStrategy.enqueue` (we:scripts/merge-ai-prs.mjs:6539-6545). Outside mode `rename-before-enqueue` it
   replaces the branch numbering; in that mode the branch numbering still runs and the row records its number.
   In drain-direct mode it runs just before `mergePr`.
-- Steps: fetch `ops/card-numbers`; list the PR head's `x<6>` cards; skip ids that already have a row (idempotent
+- Steps: fetch `ops/card-numbers`; validate x-id/`bornAs` uniqueness in the prospective merged main-plus-PR
+  tree (apply deletions/renames, count the same path once); refuse any id used by two files before assigning.
+  List the PR head's `x<6>` cards; skip ids that already have a row (idempotent
   replay, re-enqueue after a dequeue); `next = max(ledger nums, numeric file names on origin/main, open
   reservations) + 1`; append the rows; push. The push is a compare-and-swap: a non-fast-forward refusal re-reads
   and recomputes. That is what makes it atomic across hosts, not only across processes.
@@ -103,6 +111,9 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - Read source, in order: a fresh `git fetch` of `ops/card-numbers` (CI and the deploy already fetch
   `ops/quarantine` the same way), then the local remote-tracking ref, then the fallback display. A read failure
   never fails a build. It degrades to showing x-ids.
+  This display fallback does not apply to assignment or merge_group: a failed fetch or unreadable ledger
+  errors there, even if a stale local ref exists and even inside the land window. Outside merge_group the
+  ledger-dependent standards checks warn; file identity uniqueness is still enforced.
 
 ### Migration of the ~6,000 existing NNN cards
 
@@ -133,10 +144,12 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 |---|---|---|---|
 | (a) ledger store and assign-at-land, in shadow | x5qtv82 | 5 | — |
 | (b) readers and renderers use the ledger | xy5r0uf | 5 | x5qtv82 |
-| (c) check-standards rules accept ledger-numbered x-id file names | xbpjdsd | 3 | x5qtv82 |
-| (f) batched rename-after-land job (cadence setting, merge queue, idempotent) | xg7whui | 5 | x5qtv82, xbpjdsd |
+| (c) check-standards rules accept ledger-numbered x-id file names | xbpjdsd | 3 | x5qtv82, xy5r0uf |
+| (f) batched rename-after-land job (cadence setting, merge queue, idempotent) | xg7whui | 5 | x5qtv82, xy5r0uf, xbpjdsd |
 | (d) switch: flip `backlog.cardNumbering.mode` to `rename-after-land`; removes no code path | xk60q6s | 5 | x5qtv82, xy5r0uf, xbpjdsd, xg7whui |
 | (e) policy docs, retire the local hash ledger, optional by-number lookup | x2cdum4 | 3 | xk60q6s |
+
+Review prevention is tracked separately in xpr5245 (spec dependency/scope integrity and security evidence).
 
 ## Estimated saving
 
@@ -169,7 +182,9 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — ledger rows are parsed as JSON with a strict shape (`id` matches `HASH_RE`, `num` a
    positive integer); anything else is dropped and reported, never interpolated.
 2. **Truncated reads** — the JSONL read uses the sized-read pattern of `sizedLedgerRun`
-   (we:scripts/lib/verdict-ledger-io.mjs:92); a partial last line is ignored; an over-cap read fails closed.
+   (we:scripts/lib/verdict-ledger-io.mjs:92); partial lines are never parsed and mark the ledger unreadable;
+   an over-cap read fails closed before allocation, append or push. Slice (a)'s
+   `rejectsOversizedLedgerBeforeAllocation` asserts the actual cap + 1 read bound and absence of writes.
 3. **Shared state files** — the only writer is the drain under `withNumberingLock`; the push is the
    cross-host compare-and-swap; readers never write.
 4. **Fail closed** — the assign step refuses to enqueue when it cannot write the row; readers fall back to the
@@ -177,5 +192,6 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — one ledger file per repo; the id is the global key; the number is never reused.
 6. **State over time** — the ledger is append-only; a closed-unmerged PR leaves a burned number (a gap), the
    same as today's reservations.
-7. **Who wrote it** — only drain-authored rows count (the `by` field plus the trusted-author check of
-   `trustedDrainAuthors`, we:scripts/lib/queue-branch-numbering.mjs:17).
+7. **Who wrote it** — only rows with authenticated introducing commits count; trusted drain signing keys
+   authenticate provenance, not author-name strings or a later trusted tip. Both ESM and CJS readers must
+   pass slice (a)'s forged-row-under-trusted-tip fixture.

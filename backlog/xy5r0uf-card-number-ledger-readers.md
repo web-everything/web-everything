@@ -4,7 +4,7 @@ size: 5
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82"]
-scope: ["we:scripts/backlog/card-number.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
+scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, renderer]
 ---
@@ -30,7 +30,10 @@ Slice (b) of epic xdlnylv: one resolver (id to number, number to id, x-id fallba
 - `we:scripts/backlog.mjs` `show`, `claim`, `resolve` and friends accept a ledger number for an x-named card.
 - CI and deploy fetch `ops/card-numbers` before the build (`we:.github/workflows/ci.yml`,
   `we:.github/workflows/deploy.yml`), the same way they fetch `ops/quarantine`. A failed fetch degrades to the
-  x-id display; it never fails the build.
+  x-id display for rendering; it never fails the build. Fetch and preserve the file history and signature
+  verification inputs required by slice (a), not just a shallow tip or raw JSONL. Propagate failed fetches as
+  unreadable-ledger status to checks; a stale local ref must not turn a failed merge_group fetch into success.
+  The standards gate fails closed in merge_group (slice (c)), even when the renderer can build with x-ids.
 
 ## MVP
 
@@ -42,8 +45,9 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — ledger values reach templates only as validated integers or `HASH_RE` ids; titles are
    unchanged and escaped as today.
-2. **Truncated reads** — a truncated or missing ledger yields the x-id display for unknown ids, never a wrong
-   number.
+2. **Truncated reads** — a truncated or missing ledger yields x-id display for every ledger-dependent card
+   and no ledger-number redirects, including ids present in a valid-looking prefix. Both ESM and CJS
+   consumers check slice (a)'s `readable` status before using mappings; numeric files keep their own numbers.
 3. **Shared state files** — readers never write the ledger; the build reads a fetched ref, not a working file.
 4. **Fail closed** — a ledger conflict (one id with two numbers) shows the x-id and logs the conflict; it never
    picks one.
@@ -58,6 +62,12 @@ One line per class: either the handling, or `n/a: <why>`.
 Unit tests for the resolver (numeric, ledgered x, unledgered x, conflict, number to id) and for
 `backlogRedirects` (emits `/backlog/<NNN>/` for a ledgered x-card, nothing for an unledgered one). A
 `we:scripts/backlog.mjs show` test against a fixture ledger.
+Run the same trusted-introducer fixtures through the ESM resolver and CJS loader: an untrusted row followed
+by a trusted signed tip never appears as a display number or number redirect. Missing history/signatures
+yield x-id fallback. A workflow integration fixture confirms CI/deploy fetch history before consumers run
+and exposes a failed fetch as unreadable to merge_group checks, even with a stale local ledger ref.
+Repeat with a valid row followed by a partial final line: no display number or number redirect may come
+from the otherwise valid prefix, in either reader.
 
 ## Proof plan
 
