@@ -851,7 +851,14 @@ retained attempts must stay within the latest room, and cannot use a failed snap
 ## Referral rulings answering stand-downs
 
 The ruling pass relays a later trusted operator referral ruling through the existing operator-answer
-builder only when the current head has no pending, blocked or disputed findings. Replay with real
-referral, ruling and stand-down builders; verify label-before-comment order, retry after a failed
-post, head movement, and auto-policy exclusion. The queue routes needs-judgment questions to NEEDS YOU
+builder only when the current head has no pending, blocked or disputed findings and later operator rulings
+cover every explicit `{runId, key}` subject in the stand-down's final trailer. The stand-down CLI accepts
+`--finding-refs='[{"runId":"review run","key":"finding key"}]'` for a referral question; legacy markers and
+non-finding questions require an explicit operator answer. The builder encodes these subjects as base64url
+JSON, so quoted/free-text trailers cannot inject them. Multiple unresolved stand-downs also require an
+explicit answer: the shared answer ceremony supersedes older questions as well as the named question.
+Replay with real referral, ruling and stand-down
+builders; verify comment-before-label order, retry after either write fails, fresh same-head findings,
+head movement, and auto-policy exclusion. NEEDS YOU lists outstanding findings before the first ruling.
+The queue routes needs-judgment questions to NEEDS YOU
 by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.

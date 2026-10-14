@@ -384,7 +384,7 @@ it('resolved needs-judgment drops off and the stood-down setting restores the ol
   expect(report.needsYouStandDowns ?? []).toEqual([]);
   expect(report).toMatchObject({ stoodDown: [{ number: 7 }] });
 });
-it('shows remaining blocked findings, including absent files, below the fixer question', async () => {
+it.each([false, true])('shows outstanding findings with subsequent operator ruling=%s', async (ruled) => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
   const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
   const repo = 'o/n', head = 'a'.repeat(40), runId = 'review-pr-7', seat = 'judgeCorrectnessAdvisory';
@@ -399,10 +399,11 @@ it('shows remaining blocked findings, including absent files, below the fixer qu
     at: '2026-10-11T11:00:00Z', clearerId: 'session-1', rulings: [{ runId, key: referrals[0].key, result: 'not-real' }] };
   const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
   const comments = [{ id: 'ref', body: renderReferralRecord(record), author: { login: 'web-everything' }, createdAt: '2026-10-11T09:00:00Z' },
-    held, { id: 'ruling', body: buildOperatorRulingComment(ruling), author: { login: 'chalbert' }, createdAt: ruling.at }];
+    held, ...(ruled ? [{ id: 'ruling', body: buildOperatorRulingComment(ruling), author: { login: 'chalbert' }, createdAt: ruling.at }] : [])];
   execFileSync.mockReturnValue(JSON.stringify([{ ...pr(7, comments), headRefOid: head, body: record.authorBody }]));
   run();
   const section = stdout().split('NEEDS YOU (')[1].split('RULING NEEDED')[0];
   expect(section).toContain('still needs your ruling: (no file)  finding 1');
   expect(section).toContain('still needs your ruling: scripts/third.mjs:12  finding 2');
+  if (!ruled) expect(section).toContain('still needs your ruling: scripts/first.mjs  finding 0');
 });

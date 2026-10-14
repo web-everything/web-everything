@@ -1,6 +1,6 @@
 /** Relay a clearing operator referral ruling into the existing stand-down answer ceremony. */
-import { latestUnresolvedStandDown, buildOperatorAnswer } from './stand-down-answer-core.mjs';
-import { standDownTrailerReason } from './stand-down.mjs';
+import { latestUnresolvedStandDown, latestOperatorAnswer, parseOperatorAnswer, buildOperatorAnswer } from './stand-down-answer-core.mjs';
+import { standDownTrailerReason, standDownFindingRefs, standDownHead } from './stand-down.mjs';
 import { readOperatorRulings, operatorRulingId, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { openReferralFindings } from '../operations/record-referral-ruling.mjs';
@@ -10,27 +10,45 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const labelNames = labels => (labels ?? []).map(l => typeof l === 'string' ? l : l.name);
+const RELAY_CHANNEL = 'record-referral-ruling (relayed by the conveyor ruling-resolves-stand-down pass)';
+const subjectKey = ({ runId, key }) => JSON.stringify([runId, key]);
+
+/** Queue and resolver share the gate's outstanding findings, even before any operator ruling. */
+export function remainingStandDownFindings(pr, { repo }) {
+  const findings = openReferralFindings({ comments: pr.comments, repo, pr: pr.number,
+    head: pr.headRefOid, body: pr.body, createdAt: pr.createdAt });
+  const listed = [...findings.open, ...findings.disputed];
+  const remaining = listed.map(({ file, line, summary, state }) => ({ file: file ?? '', line, summary, state }));
+  const listedKeys = new Set(listed.map(f => f.key));
+  // Gate tokens without a location (malformed records, missing author, wrong subject, etc.) also hold.
+  for (const [state, keys] of [['pending', findings.pending], ['blocked', findings.blocked]]) {
+    for (const key of keys) if (!listedKeys.has(key)) remaining.push({ file: '', line: null, summary: key, state });
+  }
+  return remaining;
+}
 
 /** Pure; comments are oldest first. Only a later, subject-bound operator ruling can answer this hold. */
 export function planRulingResolvedStandDown(pr, { repo }) {
-  const { comments, headRefOid: head, number, body, createdAt } = pr;
+  const { comments, headRefOid: head, number } = pr;
   const sd = latestUnresolvedStandDown(comments);
   if (!sd || standDownTrailerReason(sd.body) !== 'needs-judgment') return null;
+  // The shared answer ceremony supersedes older holds too (newest wins). A ruling for this
+  // question cannot authorize answering another unresolved question as a side effect.
+  if (latestUnresolvedStandDown(comments.filter(c => c !== sd))) return null;
+  const heldHead = standDownHead(sd.body);
+  if (heldHead && !head?.toLowerCase().startsWith(heldHead.toLowerCase())) return null;
+  const refs = standDownFindingRefs(sd.body);
+  if (!refs) return null;
+  const subjects = new Set(refs.map(subjectKey));
   const rulings = comments.slice(comments.indexOf(sd) + 1)
     .filter(c => !(c.createdAt && sd.createdAt) || Date.parse(c.createdAt) >= Date.parse(sd.createdAt))
     .flatMap(c => readOperatorRulings([c], { head }).rulings)
     .filter(r => r.head === head && r.repo === repo && r.pr === Number(number)
-      && r.actor?.toLowerCase() !== AUTO_POLICY_ACTOR && OPERATOR_LOGINS.includes(r.actor?.toLowerCase()));
-  if (!rulings.length) return null;
-  const findings = openReferralFindings({ comments, repo, pr: number, head, body, createdAt });
-  const remaining = [...findings.open, ...findings.disputed]
-    .map(({ file, line, summary, state }) => ({ file: file ?? '', line, summary, state }));
-  // Malformed records can hold the gate without a location-bearing finding.
-  for (const key of findings.pending) {
-    if (['malformed-referral-record', 'malformed-operator-ruling', 'unavailable-reviewed-head'].includes(key)) {
-      remaining.push({ file: '', line: null, summary: key, state: 'pending' });
-    }
-  }
+      && r.actor?.toLowerCase() !== AUTO_POLICY_ACTOR && OPERATOR_LOGINS.includes(r.actor?.toLowerCase())
+      && subjects.has(subjectKey(r)));
+  const covered = new Set(rulings.map(subjectKey));
+  if (!refs.every(ref => covered.has(subjectKey(ref)))) return null;
+  const remaining = remainingStandDownFindings(pr, { repo });
   if (remaining.length) return { action: 'held', standDownId: sd.id, remaining };
   const currentLabels = pr.labels ?? [];
   const decision = labelNames(currentLabels).includes('review:changes') ? decideSetLabel({ to: 'rearm', currentLabels }) : null;
@@ -38,13 +56,31 @@ export function planRulingResolvedStandDown(pr, { repo }) {
   const addLabels = decision?.addLabel ? [decision.addLabel] : [];
   const rulingIds = [...new Set(rulings.map(operatorRulingId))];
   const actor = rulings.at(-1).actor;
-  const reason = `The operator ruling(s) ${rulingIds.join(', ')} on head ${head} cover every finding this stand-down was waiting on; no finding is pending, blocked or disputed on this head; no fix is owed for them; review is re-armed on this head (review:changes removed, review:human kept).`;
+  const reason = `The operator ruling(s) ${rulingIds.join(', ')} on head ${head} cover every finding this stand-down was waiting on; no finding is pending, blocked or disputed on this head; no fix is owed for them. The conveyor will re-arm review on this head by removing review:changes while keeping review:human.`;
   return { action: 'resolve', standDownId: sd.id, head, rulingIds, actor, removeLabels, addLabels,
     body: buildOperatorAnswer({ standDownId: String(sd.id), actor,
-      channel: 'record-referral-ruling (relayed by the conveyor ruling-resolves-stand-down pass)', reason }) };
+      channel: RELAY_CHANNEL, reason }) };
 }
 
-/** IO shell. A failed comment post leaves a retryable label-only re-arm. */
+/** Recover only this pass's byte-exact answer when the subsequent label write failed. */
+function planPendingRulingLabels(pr, { repo }) {
+  if (!labelNames(pr.labels).includes('review:changes') || latestUnresolvedStandDown(pr.comments)) return null;
+  const answer = latestOperatorAnswer(pr.comments);
+  if (answer?.channel !== RELAY_CHANNEL) return null;
+  const index = pr.comments.findLastIndex(c => {
+    const parsed = parseOperatorAnswer(c);
+    return parsed && JSON.stringify(parsed) === JSON.stringify(answer);
+  });
+  // Retry the interrupted write only, never undo a later review/comment on the same head.
+  if (index !== pr.comments.length - 1) return null;
+  const comments = pr.comments.slice(0, index);
+  const plan = planRulingResolvedStandDown({ ...pr, comments }, { repo });
+  return plan?.action === 'resolve' && plan.body === pr.comments[index]?.body ? { ...plan, answerPosted: true } : null;
+}
+
+const planPass = (pr, options) => planRulingResolvedStandDown(pr, options) ?? planPendingRulingLabels(pr, options);
+
+/** IO shell. Post failures retain candidate labels; label failures recover from the durable answer. */
 export async function runRulingResolvesStandDownPass({
   repo = CONSTELLATION_REPOS.we.slug, setting, settingSource,
   listPrs, readPr, editLabels, postComment, log = console.error,
@@ -74,7 +110,7 @@ export async function runRulingResolvesStandDownPass({
     const pr = candidate.number;
     let standDownId = null;
     try {
-      const plan = planRulingResolvedStandDown(await readPr(pr), { repo });
+      let plan = planPass(await readPr(pr), { repo });
       if (!plan) continue;
       standDownId = plan.standDownId;
       if (plan.action === 'resolve') {
@@ -83,8 +119,16 @@ export async function runRulingResolvesStandDownPass({
           rows.push({ repo, pr, action: 'head-moved', standDownId: plan.standDownId });
           continue;
         }
-        await editLabels(pr, plan);
-        await postComment(pr, plan.body);
+        const updated = planPass(fresh, { repo });
+        if (!updated || updated.standDownId !== plan.standDownId) {
+          rows.push({ repo, pr, action: 'state-changed', standDownId });
+          continue;
+        }
+        plan = updated;
+        if (plan.action === 'resolve') {
+          if (!plan.answerPosted) await postComment(pr, plan.body);
+          await editLabels(pr, plan);
+        }
       }
       rows.push({ repo, pr, ...plan });
       log(`ruling-resolves-stand-down: ${repo}#${pr} ${plan.action} stand-down=${plan.standDownId}`);

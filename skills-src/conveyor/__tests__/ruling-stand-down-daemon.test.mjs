@@ -1,5 +1,9 @@
 import { expect, it, vi } from 'vitest';
 import { runTickAllRepos } from '../reconcile-fix-dispatch-daemon.mjs';
+import rulingHoldBreak from '../../../scripts/conveyor/soak/breaks/ruling-answers-unrelated-or-stale-stand-down.mjs';
+it('replays unrelated rulings, fresh same-head blocks and failed writes through the real daemon tick', async () => {
+  expect(rulingHoldBreak.judge(await rulingHoldBreak.run())).toEqual([]);
+});
 it('runs the injected ruling half even with auth paused, forwarding results', async () => {
   const empty = () => ({ dispatched: [], refusals: [], reconcileRefusals: [] });
   const rulingStandDownTick = vi.fn(() => ({ setting: 'on', settingSource: 'file',

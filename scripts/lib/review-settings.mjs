@@ -37,7 +37,8 @@ export const isValidRoundBudget = (v) => Number.isInteger(v) && v >= 1 && v <= R
 export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
 /**
  * `review.rulingResolvesStandDown` — `on` (built-in) relays a later operator referral ruling as an answer
- * when no findings remain held. `off` requires the explicit stand-down-answer ceremony.
+ * when no findings remain held and every explicit stand-down finding subject is ruled.
+ * Unbound questions still require the explicit stand-down-answer ceremony; `off` requires it for all holds.
  * Env: WE_REVIEW_RULING_RESOLVES_STAND_DOWN.
  *
  * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions

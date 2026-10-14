@@ -66,8 +66,8 @@ catch { /* Fail safe toward operator judgment. */ }
 // Optional like the siblings below: a staged CLI copy without the settings module keeps the built-in layout.
 let reviewSettings = null;
 try { reviewSettings = await import('../lib/review-settings.mjs'); } catch { /* built-in */ }
-let planRulingResolvedStandDown;
-try { ({ planRulingResolvedStandDown } = await import('../conveyor/ruling-resolved-stand-down.mjs')); }
+let remainingStandDownFindings;
+try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolved-stand-down.mjs')); }
 catch { /* Staged copies still surface the question without remaining findings. */ }
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
@@ -650,9 +650,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           const reason = standDownReason(unresolved.body) ?? '';
           const clause = STAND_DOWN_REASONS['needs-judgment'];
           const question = reason === clause ? '' : reason.startsWith(`${clause}. `) ? reason.slice(clause.length + 2) : reason;
-          const plan = planRulingResolvedStandDown?.({ ...pr, comments }, { repo });
+          const remaining = remainingStandDownFindings?.({ ...pr, comments }, { repo }) ?? [];
           (report.needsYouStandDowns ??= []).push({ repo, number: pr.number, title: pr.title,
-            standDownAt: unresolved.createdAt, question, remaining: plan?.action === 'held' ? plan.remaining : [] });
+            standDownAt: unresolved.createdAt, question, remaining });
         } else {
           report.stoodDown.push(unresolved ? { repo, number: pr.number, title: pr.title,
             standDownAt: unresolved.createdAt, reason: standDownReason(unresolved.body),

@@ -148,13 +148,28 @@ export const CONCURRENT_AUTHOR_PAUSE_MARKER = '⏸ conveyor fix — paused for a
 const PAUSE_TRAILER_RE = /<!--\s*fix-pause\b([^>]*)-->/;
 
 /** Machine-readable trailer {@link buildStandDownComment} ends every stand-down with:
- *  `<!-- stand-down reason=<reason> head=<sha> -->` (head optional). Anchored to the END of the body, so a `--detail` (free text, written
+ *  `<!-- stand-down reason=<reason> head=<sha> findings=<base64url JSON> -->` (head/findings optional). Anchored to the END of the body, so a `--detail` (free text, written
  *  earlier in the body) can never supply it. */
-const STAND_DOWN_TRAILER_RE = /<!--\s*stand-down reason=([a-z-]+)(?: head=([0-9a-f]{7,40}))?\s*-->\s*$/i;
+const STAND_DOWN_TRAILER_RE = /<!--\s*stand-down reason=([a-z-]+)(?: head=([0-9a-f]{7,40}))?(?: findings=([A-Za-z0-9_-]+))?\s*-->\s*$/i;
 
 /** End-anchored machine reason; quoted or embedded trailers do not count. */
 export function standDownTrailerReason(body) {
   return typeof body === 'string' ? STAND_DOWN_TRAILER_RE.exec(body)?.[1]?.toLowerCase() ?? null : null;
+}
+
+const validFindingRefs = refs => Array.isArray(refs) && refs.length > 0 && refs.length <= 200
+  && refs.every(r => r && Object.keys(r).length === 2
+    && typeof r.runId === 'string' && r.runId.trim() && r.runId.length <= 300
+    && typeof r.key === 'string' && r.key.trim() && r.key.length <= 16000);
+
+/** Explicit finding subjects only; legacy/unbound questions must be answered by hand. */
+export function standDownFindingRefs(body) {
+  const encoded = typeof body === 'string' ? STAND_DOWN_TRAILER_RE.exec(body)?.[3] : null;
+  if (!encoded || encoded.length > 40000) return null;
+  try {
+    const refs = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    return validFindingRefs(refs) && Buffer.from(JSON.stringify(refs)).toString('base64url') === encoded ? refs : null;
+  } catch { return null; }
 }
 
 export const STAND_DOWN_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'stand-down.json');
@@ -670,7 +685,12 @@ export function standDownReason(body) {
  * @param {{ actor?:string, reason?:string, detail?:string }} o
  * @returns {string}
  */
-export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null } = {}) {
+export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null, findingRefs } = {}) {
+  if (findingRefs !== undefined && (reason !== 'needs-judgment' || !validFindingRefs(findingRefs))) {
+    throw new Error('findingRefs requires needs-judgment and a non-empty list of {runId, key} subjects');
+  }
+  const encodedRefs = findingRefs ? Buffer.from(JSON.stringify(findingRefs)).toString('base64url') : null;
+  if (encodedRefs?.length > 40000) throw new Error('findingRefs exceeds the stand-down comment subject budget');
   const why = STAND_DOWN_REASONS[reason] || 'the fix agent could not complete the repair safely';
   return [
     STAND_DOWN_MARKER,
@@ -685,7 +705,7 @@ export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '
       'stands — re-running it would only re-ask the same question. Take it over with `/finish`, or delete this ' +
       'comment once the blocker is resolved to hand the PR back to the loop.',
     ...(isSafeGitSha(head) ? ['This hold is for this head only and lapses automatically on a new push.'] : []),
-    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'}${isSafeGitSha(head) ? ` head=${head}` : ''} -->`,
+    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'}${isSafeGitSha(head) ? ` head=${head}` : ''}${encodedRefs ? ` findings=${encodedRefs}` : ''} -->`,
   ].join('\n');
 }
 
@@ -712,6 +732,11 @@ if (IS_CLI) {
   }
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
   const detail = typeof flags.detail === 'string' ? flags.detail : undefined;
+  let findingRefs;
+  if (flags['finding-refs'] !== undefined) {
+    try { findingRefs = JSON.parse(flags['finding-refs']); } catch { fail('--finding-refs must be JSON [{"runId":"…","key":"…"}]'); }
+    if (flags.reason !== 'needs-judgment' || !validFindingRefs(findingRefs)) fail('--finding-refs requires needs-judgment and non-empty {runId, key} subjects');
+  }
   // fix procedure — a concurrent author is a PAUSE, never a terminal stand-down. Only the explicit reason makes
   // one: free `--detail` prose is never sniffed (PR #2821 review — an unrelated stand-down that merely mentioned
   // a "concurrent author" was re-armed). A legacy conflict-shaped post is still reclassified when READ.
@@ -732,7 +757,7 @@ if (IS_CLI) {
       alt: typeof flags.alt === 'string' ? flags.alt : (parseAltBranch(detail)?.branch ?? null),
       altSha: typeof flags['alt-sha'] === 'string' ? flags['alt-sha'] : (parseAltBranch(detail)?.sha ?? null),
     })
-    : buildStandDownComment({ actor, head: isSafeGitSha(flags.head) ? flags.head : undefined, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail });
+    : buildStandDownComment({ actor, head: isSafeGitSha(flags.head) ? flags.head : undefined, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail, findingRefs });
   const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []; // a missing --repo derives from cwd.
   const gh = (args) => execFileSync('gh', args, { /* #74c write-only call: stdout is never read, so it is not captured (nothing to overflow or truncate) */ stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   try {
