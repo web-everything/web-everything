@@ -67,6 +67,36 @@ describe('human surface re-park sweep', () => {
     expect(f.run()).toEqual([]);
     expect(f.calls).toEqual([]);
   });
+  it.each([false, true])('skips a fresh comments page that can hide concurrent clearance (dryRun=%s)', dryRun => {
+    const f = fixture();
+    const thread = Array.from({ length: 101 }, (_, i) => ({ id: `C_${i}`, body: `discussion ${i}` }));
+    const readComments = vi.fn(() => {
+      const snapshot = [...thread];
+      // A ceremony lands after the complete read, beyond the state's first page.
+      thread.push({ id: 'C_clear', ...clearance(head) });
+      return snapshot;
+    });
+    f.provider.readPrState.mockImplementation(() => ({ ...f.state, comments: thread.slice(0, 100) }));
+    expect(f.run({ readComments, dryRun })).toEqual([{ num: 7, skipped: 'fresh comments may be truncated' }]);
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(f.calls).toEqual([]);
+  });
+  it('skips even an exactly full fresh page when the earlier complete read was short', () => {
+    const f = fixture();
+    f.provider.readPrState.mockReturnValueOnce(f.state).mockReturnValueOnce({
+      ...f.state, comments: Array.from({ length: 100 }, (_, i) => ({ id: `C_${i}`, body: 'discussion' })),
+    });
+    expect(f.run()).toEqual([{ num: 7, skipped: 'fresh comments may be truncated' }]);
+    expect(f.calls).toEqual([]);
+  });
+  it('still re-parks when the fresh thread is below the page limit', () => {
+    const f = fixture();
+    f.provider.readPrState.mockReturnValue({
+      ...f.state, comments: Array.from({ length: 99 }, (_, i) => ({ id: `C_${i}`, body: 'discussion' })),
+    });
+    expect(f.run()[0].repark).toBe('reparked');
+    expect(f.calls.map(c => c[0])).toEqual(['comment', 'labels']);
+  });
   it.each([false, true])('preserves a concurrent clear-human ceremony (dryRun=%s)', dryRun => {
     const f = fixture();
     const readComments = vi.fn(() => {

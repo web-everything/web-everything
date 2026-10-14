@@ -7,7 +7,7 @@ import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkTo
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
-import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
@@ -62,8 +62,13 @@ export function sweepHumanSurfaceRepark({
       state = fresh;
       if (state.state !== 'OPEN') throw new Error('PR is not open');
       if (!Array.isArray(state.labels)) throw new Error('labels read returned no array');
-      // Keep the complete thread's order: a truncated fresh prefix must not resurrect
-      // superseded clearance. Update known comments in place and append new ceremonies.
+      // A full fresh page can hide a clearance posted or edited after the complete read.
+      // Skip rather than re-park using that stale snapshot, even at exactly the page size.
+      if (Array.isArray(state.comments) && state.comments.length >= LIST_COMMENTS_PAGE_SIZE) {
+        results.push({ num, skipped: 'fresh comments may be truncated' });
+        continue;
+      }
+      // Keep the complete thread's order. Update known comments in place and append new ceremonies.
       const observedComments = new Map(comments.map(c => [commentKey(c), c]));
       for (const c of Array.isArray(state.comments) ? state.comments : []) observedComments.set(commentKey(c), c);
       comments = [...observedComments.values()];
