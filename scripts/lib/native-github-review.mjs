@@ -516,7 +516,21 @@ function dismiss(run, endpoint, id, verdict, head) {
 const QUEUE_MAX_ATTEMPTS = 20;
 const validQueueEntry = entry => entry && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(entry.repo ?? '') && Number.isInteger(entry.pr) && entry.pr > 0
   && /^[0-9a-f]{40}$/.test(entry.head ?? '') && /^[a-z-]{1,32}$/.test(entry.verdict ?? '')
-  && Array.isArray(entry.ids) && (entry.ids.length > 0 || entry.unsettled === true) && entry.ids.every(id => Number.isInteger(id) && id > 0);
+  && Array.isArray(entry.ids) && (entry.ids.length > 0 || entry.unsettled === true) && entry.ids.every(id => Number.isInteger(id) && id > 0)
+  && (entry.event === undefined || SUPERSEDING[entry.event] === true);
+
+/**
+ * The ledger outcome of a drained entry. One queued for a decisive review that did not land (`event`) reads as
+ * `posted` / `already-posted` once the reconcile put it on GitHub, and stays `failed` while it could not (no approval
+ * to restore). Without `event`, or once the label moved on, it is the settle outcome. Pure.
+ */
+function drainedOutcome(settled, event) {
+  const actions = settled.actions ?? [];
+  if (!event || settled.outcome === 'failed') return settled.outcome;
+  if (actions.includes(`posted ${event}`)) return 'posted';
+  if (actions.includes(`already-posted ${event}`)) return 'already-posted';
+  return actions.some(action => action.startsWith('no APPROVE')) ? 'failed' : settled.outcome;
+}
 
 /** The review states our CURRENT label verdict stands behind; a queued dismissal never removes one of them. Pure. */
 export function endorsedStates(labels) {
@@ -542,7 +556,8 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     // This token is the reviewer App's installation for `owner` only.
     if (entry.repo.split('/')[0].toLowerCase() !== owner) { retry.push(entry); continue; }
     const endpoint = `repos/${entry.repo}/pulls/${entry.pr}`;
-    const line = { repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: null };
+    // An entry queued for a decisive review that did not land carries its event, so its ledger line still counts.
+    const line = { repo: entry.repo, pr: entry.pr, head: entry.head, labelVerdict: entry.verdict, event: entry.event ?? null };
     const attempt = { ...entry, attempts: (Number(entry.attempts) || 0) + 1 };
     let reviews;
     let endorsed;
@@ -583,8 +598,9 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     const unsettled = settled?.outcome === 'failed';
     const next = { ...attempt };
     delete next.unsettled;
-    if (left.length || unsettled) retry.push({ ...next, ids: left.length ? left : entry.ids, ...(unsettled ? { unsettled: true } : {}) });
-    if (settled) record({ ...line, outcome: settled.outcome, dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
+    delete next.event;
+    if (left.length || unsettled) retry.push({ ...next, ids: left.length ? left : entry.ids, ...(unsettled ? { unsettled: true, ...(entry.event ? { event: entry.event } : {}) } : {}) });
+    if (settled) record({ ...line, outcome: drainedOutcome(settled, entry.event), dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
     else if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
   }
   for (const entry of retry) {
@@ -611,7 +627,7 @@ function reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenRevie
   const reviews = readReviews(run, endpoint);
   const actions = [];
   if (want && live.head === head && !isReviewerBotUser({ login: live.author, type: live.authorType }, reviewerLogin)) {
-    if (findExistingNativeReview({ reviews, head, event: want.event, reviewerLogin })) return [];
+    if (findExistingNativeReview({ reviews, head, event: want.event, reviewerLogin })) return [`already-posted ${want.event}`];
     if (want.event !== 'APPROVE' || approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman, dismissedByRun })) {
       run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${head}`, '-f', `event=${want.event}`, '-f', `body=${nativeReviewBody({ ...want, head })}`]);
       return [`posted ${want.event}`];
@@ -643,8 +659,8 @@ function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent, se
     if (!live) throw new Error('pr-unreadable after write');
     const key = reviewLabelKey(live.labels);
     if (round === 0 && isCurrent(live)) return null;
-    if (key === seen) return { outcome: 'superseded', reason: `verdict-superseded after write (live=${key}); reconciled: ${actions.join(', ') || 'nothing to change'}` };
-    if (round === SETTLE_ROUNDS) return { outcome: 'failed', reason: `verdict-superseded after write; labels kept moving (last live=${key}); reconciled: ${actions.join(', ')}` };
+    if (key === seen) return { outcome: 'superseded', actions, reason: `verdict-superseded after write (live=${key}); reconciled: ${actions.join(', ') || 'nothing to change'}` };
+    if (round === SETTLE_ROUNDS) return { outcome: 'failed', actions, reason: `verdict-superseded after write; labels kept moving (last live=${key}); reconciled: ${actions.join(', ')}` };
     seen = key;
     actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman, dismissedByRun }));
   }
@@ -797,11 +813,14 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
       }
       // A dismissal that errored, or a write GitHub is not confirmed to match the label on (a failed POST, a failed
       // re-check), goes to the queue: the next drain retries the dismissal and reconciles to the live label.
-      const unsettled = (attempted && outcome === 'failed') || settled?.outcome === 'failed';
+      // A failed COMMENT changes no decisive state, so only a decisive review that did not land, or was not
+      // confirmed, carries its event to the drain.
+      const postFailed = attempted && outcome === 'failed' && SUPERSEDING[event] === true;
+      const unsettled = postFailed || settled?.outcome === 'failed';
       let requeued = '';
       if (pending && (failedIds.length || unsettled)) {
         try {
-          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids: failedIds, ...(unsettled ? { unsettled: true } : {}), ...(sawHuman ? { human: true } : {}), at: new Date().toISOString() });
+          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids: failedIds, ...(unsettled ? { unsettled: true } : {}), ...(unsettled && SUPERSEDING[event] === true ? { event } : {}), ...(sawHuman ? { human: true } : {}), at: new Date().toISOString() });
           requeued = 're-queued for the next drain';
         } catch (error) { requeued = `not re-queued: ${failureReason(error)}`; }
       }

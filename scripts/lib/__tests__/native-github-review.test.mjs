@@ -720,11 +720,40 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     const failed = mirrorNativeReview({ ...base, verdict: 'changes', exec: flaky });
     expect(failed.outcome).toBe('failed');
     expect(failed.reason).toContain('re-queued for the next drain');
-    expect(entries).toEqual([expect.objectContaining({ verdict: 'changes', ids: [], unsettled: true })]);
+    expect(entries).toEqual([expect.objectContaining({ verdict: 'changes', ids: [], unsettled: true, event: 'REQUEST_CHANGES' })]);
     expect(gh.standing()).toBe('none');
-    mirrorNativeReview({ ...base, verdict: 'advisory', exec: gh.exec });
+    const lines = [];
+    mirrorNativeReview({ ...base, verdict: 'advisory', exec: gh.exec, log: l => lines.push(l) });
     expect(gh.standing()).toBe('CHANGES_REQUESTED');
     expect(entries).toEqual([]);
+    expect(lines.some(l => l.includes('label=changes native=REQUEST_CHANGES outcome=posted agree=yes'))).toBe(true);
+  });
+  it('a drained approval that cannot be restored stays a mismatch in the ledger', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('accepted') });
+    let failPost = true;
+    const flaky = (argv) => {
+      if (failPost && argv.includes('POST')) { failPost = false; throw new Error('HTTP 502'); }
+      return gh.exec(argv);
+    };
+    const entries = [];
+    const lines = [];
+    const queue = { append: (e) => { entries.push(e); return true; }, claim: () => ({ entries: entries.splice(0), done: () => {} }) };
+    const base = { repo: 'owner/repo', pr: 123, headSha: head, env: { WE_UNDER_TEST: '1' }, identity, mode: { mode: 'mirror', source: 'tool' }, log: l => lines.push(l), appendLog: () => {}, queue };
+    mirrorNativeReview({ ...base, verdict: 'accepted', exec: flaky });
+    expect(entries).toEqual([expect.objectContaining({ verdict: 'accepted', event: 'APPROVE', unsettled: true })]);
+    mirrorNativeReview({ ...base, verdict: 'advisory', exec: gh.exec });
+    // A reconcile never originates an approval, so the drained line keeps the failure visible.
+    expect(gh.reviews.filter(r => r.state === 'APPROVED')).toHaveLength(0);
+    expect(lines.at(-2)).toContain('label=accepted native=APPROVE outcome=failed agree=no');
+    expect(summarizeReadiness(lines, { minMirroredVerdicts: 1, maxMismatches: 0 }).mismatches).toBe(1);
+  });
+  it('a failed advisory COMMENT queues nothing', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('changes') });
+    const failing = (argv) => (argv.includes('POST') ? (() => { throw new Error('HTTP 502'); })() : gh.exec(argv));
+    const queue = { append: vi.fn(() => true), claim: () => ({ entries: [], done: () => {} }) };
+    const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'advisory', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: failing, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, queue });
+    expect(result.outcome).toBe('failed');
+    expect(queue.append).not.toHaveBeenCalled();
   });
   it('a direct dismissal that errored is queued with only its failed id', () => {
     const gh = fakeGithub({ labels: liveLabelsFor('rearm') });
