@@ -62,6 +62,9 @@ const HASH_ID = /(?<![0-9a-z])x[0-9a-z]{6}(?![0-9a-z])/gi;
 export function openPrCardRefs(pr = {}) {
   const ref = String(pr.headRefName ?? ''), title = String(pr.title ?? ''), body = String(pr.body ?? '');
   const ids = new Set(itemNumsFromPr(/(?:^|\/)lane\//.test(ref) ? ref : `lane/${ref}`, title));
+  // A ref segment may carry a letter suffix (`lane/4674b-prepare-…`); itemNumsFromPr needs a bare-digit segment.
+  const slug = ref.replace(/^(?:.*\/)?lane\//, '').replace(/^batch-\d{4}-\d{2}-\d{2}/, '');
+  for (const m of slug.matchAll(/(?:^|[-/])(\d{2,5})[a-z]?(?=$|[-/])/gi)) ids.add(m[1]);
   for (const m of body.matchAll(/#(\d{2,5})\b/g)) ids.add(m[1]);
   for (const text of [ref, title, body, ...(pr.files ?? []).map(String)]) {
     for (const m of text.matchAll(HASH_ID)) ids.add(m[0].toLowerCase());
