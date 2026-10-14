@@ -404,3 +404,26 @@ describe('#4034 — routeDispatch wires the critical-work verdict and critical-m
     expect(out).toMatchObject({ routed: 'claude', probationWorker: { id: 'antigravity-claude', review: 'full' } });
   });
 });
+
+
+describe('prepare-item card envelope', () => {
+  const dispatch = { kind: 'prepare-item', scopePaths: ['we:scripts/lib/foo.mjs'], cardPath: 'backlog/1-x.md' };
+  it('offers Codex for the card even when implementation scope is critical', () => {
+    expect(current.decideDispatchRoute(dispatch).probationWorker?.provider).toBe('codex');
+    expect(current.decideDispatchRoute({ ...dispatch, scopePaths: ['we:scripts/lib/dispatch-contracts.mjs'] }).probationWorker?.provider).toBe('codex');
+  });
+  it('keeps high risk, critical card paths and critical misses on Claude', () => {
+    for (const [extra, options] of [
+      [{ risk: 'high' }, {}],
+      [{ cardPath: 'scripts/lib/dispatch-contracts.mjs' }, {}],
+      [{}, { scorecards: [record({ model: 'gpt-6-astra', taskType: 'prepare', outcome: 'rejected' })] }],
+    ]) {
+      expect(current.decideDispatchRoute({ ...dispatch, ...extra }, options))
+        .toMatchObject({ probationWorker: null, routed: 'claude' });
+    }
+  });
+  it('keeps implementation scope gating when cardPath is absent', () => {
+    expect(current.decideDispatchRoute({ ...dispatch, cardPath: undefined, scopePaths: ['we:scripts/lib/dispatch-contracts.mjs'] }))
+      .toMatchObject({ probationWorker: null, routed: 'claude' });
+  });
+});
