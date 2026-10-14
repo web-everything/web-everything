@@ -37,10 +37,12 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
 - Legacy duplicates. Main already holds 7 `bornAs` values shared by two cards each (listed in slice (a),
   6121). The whole-tree check honours slice (a)'s allowlist, `we:scripts/settings/card-ledger-legacy-identities.json`,
   read from `<base>` (never the tree under check): an entry lets exactly its listed numeric files share
-  that id. Anything else still errors: a third file with the id, an x-named file with the id, a rename of a
-  listed card to an unlisted number, an unlisted shared `bornAs`, and a stale entry (a listed file missing
-  from the merged tree or no longer carrying that `bornAs`). Deleting one card of a pair is allowed and
-  leaves the entry stale, so the same PR must also drop or shrink the entry.
+  that id. An entry is an upper bound: at most its listed files may share the id, and fewer is fine.
+  Anything else still errors: a third file with the id, an x-named file with the id, a rename of a listed
+  card to an unlisted number, and an unlisted shared `bornAs`. Because the allowlist is read from `<base>`,
+  a PR cannot edit an entry and rely on that edit at once. So deleting one card of a pair (or dropping its
+  `bornAs`) passes in a single PR; the entry is then stale (fewer than two listed files carry the id), which
+  is a warning, never an error, and a later reviewed PR trims it.
 - `duplicateBornAs` (we:scripts/check-standards-rules.mjs:2882): an x-named card needs no `bornAs`; a seed row
   that disagrees with a card's `bornAs` is an error. For an allowlisted id, the seed row must carry the
   entry's `canonical` number; the alias card sharing that `bornAs` is not a disagreement.
@@ -101,8 +103,8 @@ Required tests in `we:scripts/__tests__/check-standards-rules.test.mjs`:
   Unchanged same-path files and a proper x-to-numeric rename pass.
 - **Capability (Red today)** — `legacyDuplicateBornAsAllowlisted`: with the real 7-pair allowlist at the
   base, today's main passes the whole-tree check. Each of these errors: a third file reusing an allowlisted
-  id, an unlisted shared `bornAs`, a stale entry, a rename of a listed card to an unlisted number, and an
-  allowlist entry added only in the tree under check. A body-text `bornAs:` line (card 4658 shape) never
+  id, an unlisted shared `bornAs`, a rename of a listed card to an unlisted number, and an allowlist entry
+  added only in the tree under check. A PR deleting one card of a pair passes with a stale-entry warning. A body-text `bornAs:` line (card 4658 shape) never
   counts as a duplicate. The seed row for an allowlisted id passes `duplicateBornAs` at `canonical` and
   errors at the alias number.
 - **Capability (Red today)** — `unreadableLedgerInMergeGroupErrors` and `unreadableLedgerOutsideMergeGroupWarns`: paired context tests

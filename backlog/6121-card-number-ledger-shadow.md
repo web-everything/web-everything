@@ -104,16 +104,18 @@ Slice (a) of epic 6122: an append-only id-to-number ledger on ops/card-numbers, 
     cards each: `xzdi27a` (3111, 3112), `x2t6cr5` (3201, 3244), `xu2krte` (3544, 3557), `x8hzy1m` (3660,
     3663), `xhprieg` (3661, 3664), `xldrls6` (3662, 3665), `xp12dod` (4498, 4512). They are not migrated:
     no file and no `bornAs` line changes. Instead a reviewed allowlist,
-    `we:scripts/settings/card-ledger-legacy-identities.json`, lists each pair as
-    `{ id, nums: [<a>, <b>], canonical: <a>, reason }`. `canonical` is the lower (earlier-filed) number
-    unless the entry says otherwise; the other card is a legacy alias.
+    `we:scripts/settings/card-ledger-legacy-identities.json`, keyed by repo like the ledger files
+    (`{ "we": [...] }`), lists each pair as `{ id, nums: [<a>, <b>], canonical: <a>, reason }`.
+    `canonical` is the lower (earlier-filed) number unless the entry says otherwise; the other card is a
+    legacy alias.
   - For an allowlisted id the seed writes ONE row, `num = canonical`. The alias card keeps its own numeric
     file name, which is its number (numeric files need no row), so the alias number is never reallocated:
-    the allocator floor already covers it.
+    the allocator floor already covers it. If the entry is stale (the canonical card was deleted or lost its
+    `bornAs`), the seed uses the one listed card still carrying the id and warns.
   - The seed refuses (`--apply` pushes nothing, dry-run lists them) when any `bornAs` is shared by two or
-    more cards and is not covered by an exact entry (same id, same set of numbers), or when an entry is
-    stale (a listed number's file is missing from the base tree or no longer carries that `bornAs`). So the
-    seed completes on today's main, and a new duplicate can never be seeded silently.
+    more cards that are not all listed in one entry for that id. An entry is an upper bound (6125): fewer
+    listed cards is a warning, never a refusal. So the seed completes on today's main, and a new duplicate
+    can never be seeded silently.
   - The allowlist is read from `<base>` with `git show`, like the trust root, never from the tree under
     check. It is registered in `TRUST_CHAIN` (we:scripts/lib/gate-config.mjs:106) as a `policy` member with
     `leash: 'spec'`, so adding an entry is held at `review:human`. It is a closed set: slice (c)'s identity
@@ -156,8 +158,9 @@ numbers) reported, a partial last line, the floor taken from numeric file names,
 
 - **Capability (Red today)** — `seedHandlesLegacyDuplicateBornAs`: on a fixture holding an allowlisted pair
   (two cards, one `bornAs`), the seed writes exactly one row for that id, at the `canonical` number, and
-  `readCardLedger` reports zero conflicts. An unlisted shared `bornAs`, an entry whose number set differs
-  from the cards (a third card added), and a stale entry each make the seed refuse with no push. A `bornAs:`
+  `readCardLedger` reports zero conflicts. An unlisted shared `bornAs` and a third card sharing a listed
+  id each make the seed refuse with no push. A stale entry (canonical card deleted) seeds the remaining
+  listed card's number with a warning. A `bornAs:`
   line in a card's body (the card 4658 shape) is not an identity. An allowlist entry present only in the tree
   under check, not at `<base>`, has no effect. A last fixture is the real list of 7 pairs from main.
 

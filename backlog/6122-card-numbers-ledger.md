@@ -144,8 +144,9 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - Canonical page stays `/backlog/<file stem>/` (we:src/backlog-pages.njk:7). For a new card that is
   `/backlog/x7k2q9a-slug/` until it is renamed. After a batched rename, the old `/backlog/x7k2q9a-slug/` and
   `/backlog/x7k2q9a/` routes redirect to the new `NNN-slug` page (the x-id is kept as `bornAs`), so links
-  never break. The batched rename (slice (f)) records the old full stem in `formerSlugs`, which the existing
-  old-slug redirect pages serve; slice (b) emits the bare `/backlog/<x-id>/` and `/backlog/<NNN>/` routes.
+  never break. The batched rename (slice (f)) records the old full stem and the bare x-id in `formerSlugs`,
+  which the existing old-slug redirect pages serve; slice (b) emits `/backlog/<x-id>/` and
+  `/backlog/<NNN>/` while the card is still x-named.
 - `/backlog/<NNN>/` keeps working: `backlogRedirects` (we:src/_data/backlogRedirects.js:18) emits a redirect for
   each ledgered x-card's number, the same way it does for numeric cards (we:src/backlog-redirects.njk:13).
 - `/backlog/<x-id>/` also redirects to the canonical page.

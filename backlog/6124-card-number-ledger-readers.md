@@ -25,10 +25,10 @@ Slice (b) of epic 6122: one resolver (id to number, number to id, x-id fallback)
 - Templates show `displayNum` where they show the number today (`we:src/backlog-pages.njk`,
   `we:src/_includes/backlog-badges.njk`). Canonical permalink stays `backlog/{{ item.id }}/`.
 - Redirects `we:src/_data/backlogRedirects.js:18`: also emit `/backlog/<displayNum>/` and `/backlog/<x-id>/`
-  for each ledgered x-card, pointing at its canonical page. Numeric cards are unchanged. The old full stem
-  `/backlog/<x-id>-<slug>/` of a card renamed by the batch is not emitted here: slice (f) (6126) appends it
-  to the card's `formerSlugs`, which the existing old-slug pages (`we:src/_data/backlogAliases.js`,
-  `we:src/backlog-slug-redirects.njk`) already serve.
+  for each ledgered x-card, pointing at its canonical page. Numeric cards are unchanged. Once the batch
+  renames a card, neither its old full stem `/backlog/<x-id>-<slug>/` nor its bare `/backlog/<x-id>/` is
+  emitted here: slice (f) (6126) appends both to the card's `formerSlugs`, which the existing old-slug
+  pages (`we:src/_data/backlogAliases.js`, `we:src/backlog-slug-redirects.njk`) already serve.
 - `blockedBy` / `parent` edge resolution (`we:src/_data/backlog.js:435-487`) accepts either form through
   `idFor`.
 - `we:scripts/backlog.mjs` `show`, `claim`, `resolve` and friends accept a ledger number for an x-named card.
