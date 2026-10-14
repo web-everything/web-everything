@@ -46,7 +46,7 @@ import {
 } from '../lib/review-escalation.mjs';
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
-import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, parseAdvisories } from '../lib/advisory-labels.mjs';
 
 // HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
 // +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
@@ -569,6 +569,20 @@ describe('decideSetLabel — bad input', () => {
     expect(() => decideSetLabel({ to: 'merge', currentLabels: neither })).toThrow();
     expect(() => decideSetLabel({ to: undefined, currentLabels: neither })).toThrow();
   });
+});
+
+describe('buildVerdictComment — a one-line actor cannot start a new line (card x9wyb24)', () => {
+  const advisory = ['**Verdict:** ok', 'Net basis: `abc1234..abc1234`', '**Advisory outcome:** `accept`'];
+  for (const to of ['clear-human', 'accepted', 'changes']) {
+    for (const separator of ['\n', '\r', '\r\n', String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)]) {
+      it(`${to} actor ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const body = buildVerdictComment({
+          to, actor: `op${separator}${advisory.join(separator)}`, headSha: 'c'.repeat(40), reason: 'why', body: 'note',
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
+    }
+  }
 });
 
 describe('buildVerdictComment — the stamp must survive the REAL reader (#2882/#2409)', () => {

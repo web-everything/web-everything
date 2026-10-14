@@ -2009,8 +2009,11 @@ export function buildVerdictComment({
   // which comment actually granted it. This is the sentence #2572 lacked, which is what let the anti-test-
   // gaming gate see "latest accept-shaped comment has no cleared-human marker" and re-park review:human on a
   // PR a human had just cleared minutes earlier.
+  // The actor is rendered inside a prose line: every line break (`^` under /m in parseAdvisories also matches after
+  // CR and U+2028/9) would start a new line a plain-prose reader treats as its own, so fold them all into spaces.
+  const oneLine = (value) => String(value).replace(/\r\n|[\r\n\u{2028}\u{2029}]/gu, ' ');
   const carriedClearanceNote = carriesHumanClearance
-    ? ` The HUMAN clearance ${humanClearance.actor} granted (reviewed-sha ${String(humanClearance.sha).slice(0, 12)}…) `
+    ? ` The HUMAN clearance ${oneLine(humanClearance.actor)} granted (reviewed-sha ${String(humanClearance.sha).slice(0, 12)}…) `
       + (channel === 'ci-heal'
         ? 'is carried forward to this head after the CI-heal coverage proof passed: the '
         : 'is carried forward to this head: the drain\'s own content-preserving rebase moved the tree, and the ')
@@ -2018,7 +2021,7 @@ export function buildVerdictComment({
       + 'ran here — `review:human` stays cleared on the strength of the ORIGINAL clearance, not a fresh one.'
     : '';
   const attribution = to === 'clear-human'
-    ? `Cleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n`
+    ? `Cleared by ${oneLine(actor)} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n`
       // Every line break starts a new quoted line: `^` under /m (parseAdvisories) also matches after CR and U+2028/9.
       + `> ${String(reason || '').split(/\r\n|[\r\n\u{2028}\u{2029}]/u).join('\n> ')}\n\n`
       + 'What this record proves: the clearance went through the sanctioned tool, so the label swap, the '
@@ -2026,7 +2029,7 @@ export function buildVerdictComment({
       + 'it. The actor name and the reason above are free text and nothing verifies who supplied them — #2895 '
       + 'deferred the unforgeable actor signal (no local construct survives an agent with shell access on the '
       + 'same machine), and #2946 is the durable fix.'
-    : `Recorded by ${actor}${normalizeChannel(channel) ? ` via ${normalizeChannel(channel)}` : ''}.${carriedClearanceNote}`;
+    : `Recorded by ${oneLine(actor)}${normalizeChannel(channel) ? ` via ${normalizeChannel(channel)}` : ''}.${carriedClearanceNote}`;
   // ────────────────────────────────────────────────────────────────────────────────────────────────────────
   // THE RENDER BOUNDARY (PR #1147 review — the structural close of the marker-forgery class).
   //
