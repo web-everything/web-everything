@@ -68,6 +68,7 @@ import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.m
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
+import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
@@ -798,6 +799,7 @@ export async function runTickAllRepos({
         return plan;
       },
       dispatch: createRoutedCiHealDispatch({ dispatch: dispatchCiHeal,
+        staleBaseGate: createStaleBaseGate(),
         route: (planned) => fixExecutorRoute({ ...entries.find((e) => e.kind === 'ci-heal' && e.prNumber === planned.pr), ...planned }),
         createSinks: createDispatchSinks, launchCodex: fixDetachedProvider,
         writePrompt: writePrivateBorrowedPrompt, removePrompt: (file) => { try { unlinkSync(file); } catch {} },
