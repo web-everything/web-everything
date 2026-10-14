@@ -23,7 +23,9 @@ Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a
   we:scripts/settings/card-numbering.json through the same cascade.
 - Each run, in a fresh worktree from `origin/main`:
   1. List `x<6>` cards on main that have a ledger row. None: exit, no PR.
-  2. Rename each to the `<NNN>-<slug>` file name, add `bornAs: <x-id>`, and rewrite references with the existing
+  2. Rename each to the `<NNN>-<slug>` file name, add `bornAs: <x-id>`, append the old full file stem
+     (`<x-id>-<slug>`, exactly as on main) to the card's `formerSlugs` (create the array if absent, keep
+     existing entries, never add the same stem twice), and rewrite references with the existing
      rename-and-rewrite core of `numberPendingHashes` (we:scripts/lane-drain.mjs:682), fed the ledger numbers
      (it never allocates a number).
   3. Commit once and open or refresh ONE PR on a fixed branch (`lane/card-rename-batch`), marked for the drain
@@ -53,8 +55,9 @@ Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a
        `git merge-base --is-ancestor <live tip>^1 origin/main`. Both writers (this job and the drain) put main
        first, so `<tip>^1` is the main the tip was built on; a tip built on a newer main than ours means our
        main is stale, so start the next attempt (a stale tree would revert that main's changes).
-    6. Self-check: `git diff <fresh origin/main>...<new commit>` holds only the renames and reference rewrites of
-       this rename set (edge case 7).
+    6. Self-check: `git diff <fresh origin/main>...<new commit>` holds only the renames, the `bornAs` and
+       `formerSlugs` lines, and the reference rewrites of this rename set (edge case 7). Every renamed card's
+       `formerSlugs` holds its old stem.
     7. Plain push. Refused (the branch moved): next attempt. After 3, end the run with no PR change and report.
   - PR: after a successful push, or a no-op, make sure one batch PR is open on the branch, so a crash between
     push and `gh pr create` is healed by the next run. A batch PR closed unmerged by a person with the same
@@ -68,7 +71,12 @@ Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a
   Slice (c)'s collision rule also accepts that same-identity equality; it rejects a different/missing
   `bornAs` for the number. Validate unique x-id/`bornAs` identities in the prospective merged tree before
   building the batch; the valid rename replaces one file rather than adding a second identity alias.
-- Redirects: the renamed card keeps `bornAs`, so slice (b)'s x-id redirects keep old links working.
+- Redirects: every published route of the x-named card keeps resolving after the rename.
+  - `/backlog/<x-id>-<slug>/` (the old canonical page): served by the `formerSlugs` entry from step 2,
+    through the existing old-slug redirect pages (`we:src/_data/backlogAliases.js`,
+    `we:src/backlog-slug-redirects.njk`), validated by the existing `formerSlugs` rule in
+    we:scripts/check-standards.mjs (6d-bis). Slice (b) does not emit this route, so this slice owns it.
+  - `/backlog/<x-id>/` and `/backlog/<NNN>/`: slice (b)'s redirects, through the kept `bornAs` and the ledger.
 
 ## MVP
 
@@ -91,8 +99,9 @@ One line per class: either the handling, or `n/a: <why>`.
 6. **State over time** — a card landed after the batch was built goes into the next batch; an open PR still
    citing the old x-id resolves through the ledger and `bornAs`. Main advancing under an open batch PR is
    handled by the two-parent refresh (first parent main, second the old tip).
-7. **Who wrote it** — the batch PR is authored by the drain identity and changes only renames and reference
-   rewrites; anything else in its diff fails the job's own self-check.
+7. **Who wrote it** — the batch PR is authored by the drain identity and changes only renames, the
+   `bornAs`/`formerSlugs` lines and reference rewrites; anything else in its diff fails the job's own
+   self-check.
 
 ## Test plan
 
@@ -116,6 +125,11 @@ Against a bare remote with `receive.denyNonFastForwards`:
 `handNumberedNewItems` accepts the renamed files when the ledger matches and refuses a mismatched number.
 Run the collision rule on the materialized tree too: matching `bornAs` passes, a different identity errors.
 Unreadable introducing history/signatures and duplicate identities abort without creating a PR.
+- **Capability (Red today)** — `materializedCardKeepsFullStemRoute`: after the batch renames the fixture
+  card with stem `x7k2q9a-slug` to stem `<NNN>-slug`, the card's `formerSlugs` holds `x7k2q9a-slug`; a card
+  that already had `formerSlugs` keeps its old entries; a second run adds no duplicate. Through the real
+  loaders, `backlogAliases` yields `{ from: 'x7k2q9a-slug', to: '<NNN>-slug' }` and the existing
+  `formerSlugs` rule passes. A batch commit missing the stem fails the job's self-check.
 
 ## Proof plan
 
@@ -134,11 +148,16 @@ fixture, never real main, and the live landed batch is slice (d)'s proof:
   the branch tip is still B1.
 - Advance scratch main with one more ledgered card. Run 3: B2's parents are (new main, B1), the plain push
   is accepted as a fast-forward, and `main...B2` renames all three ledgered cards.
-- Paste the listings, the three digests, the parents of B1 and B2, and both push lines.
+- Build the scratch site from B2's tree on a throwaway dev server (spare port, stopped by PID after) and
+  curl one renamed card's old `/backlog/<x-id>-<slug>/`: before the rename it is the card's page, after it
+  redirects to `/backlog/<NNN>-<slug>/`.
+- Paste the listings, the three digests, the parents of B1 and B2, both push lines and the curl output.
 
 ## Done when
 
 - The fixture proof above is pasted, and the named tests pass.
+- Every card the batch renames keeps its old full-stem route: `/backlog/<x-id>-<slug>/` redirects to the
+  new `NNN-slug` page through `formerSlugs` (`materializedCardKeepsFullStemRoute` and the curl proof).
 - The job is wired to the cadence and exits early outside `rename-after-land`, so landing it changes nothing
   on real main until slice (d) flips the mode. The first real batch PR landing through the merge queue with
   one CI run is in slice (d)'s Done-when.

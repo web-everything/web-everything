@@ -32,8 +32,18 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
   and numeric cards' `bornAs`, independent of slug and ledger presence. Build the prospective merged tree
   (apply additions, deletions and renames to main); the same file seen on both refs counts once, and a valid
   x-to-numeric rename with matching `bornAs` counts once. Reusing an existing id in a second file errors.
+  `bornAs` is read from frontmatter only; a `bornAs:` line in a card body (card 4658 quotes three) is not
+  an identity.
+- Legacy duplicates. Main already holds 7 `bornAs` values shared by two cards each (listed in slice (a),
+  6121). The whole-tree check honours slice (a)'s allowlist, `we:scripts/settings/card-ledger-legacy-identities.json`,
+  read from `<base>` (never the tree under check): an entry lets exactly its listed numeric files share
+  that id. Anything else still errors: a third file with the id, an x-named file with the id, a rename of a
+  listed card to an unlisted number, an unlisted shared `bornAs`, and a stale entry (a listed file missing
+  from the merged tree or no longer carrying that `bornAs`). Deleting one card of a pair is allowed and
+  leaves the entry stale, so the same PR must also drop or shrink the entry.
 - `duplicateBornAs` (we:scripts/check-standards-rules.mjs:2882): an x-named card needs no `bornAs`; a seed row
-  that disagrees with a card's `bornAs` is an error.
+  that disagrees with a card's `bornAs` is an error. For an allowlisted id, the seed row must carry the
+  entry's `canonical` number; the alias card sharing that `bornAs` is not a disagreement.
 - `handNumberedNewItems` (we:scripts/check-standards-rules.mjs:3012): unchanged. Hand-picked numbers stay
   forbidden.
 - The gate reads the ledger fetched by CI (slice (b), 6124 wiring, hence blockedBy). Outside merge_group,
@@ -89,6 +99,12 @@ Required tests in `we:scripts/__tests__/check-standards-rules.test.mjs`:
 - **Capability (Red today)** — `duplicateXIdAcrossMainAndPrErrors`: a PR adds a differently slugged file with an already ledgered main
   x-id; error. Also cover two PR additions, x-file plus numeric `bornAs`, and two numeric `bornAs` aliases.
   Unchanged same-path files and a proper x-to-numeric rename pass.
+- **Capability (Red today)** — `legacyDuplicateBornAsAllowlisted`: with the real 7-pair allowlist at the
+  base, today's main passes the whole-tree check. Each of these errors: a third file reusing an allowlisted
+  id, an unlisted shared `bornAs`, a stale entry, a rename of a listed card to an unlisted number, and an
+  allowlist entry added only in the tree under check. A body-text `bornAs:` line (card 4658 shape) never
+  counts as a duplicate. The seed row for an allowlisted id passes `duplicateBornAs` at `canonical` and
+  errors at the alias number.
 - **Capability (Red today)** — `unreadableLedgerInMergeGroupErrors` and `unreadableLedgerOutsideMergeGroupWarns`: paired context tests
   for failed fetch with stale ref, deleted/renamed ledger file, missing history, authentication failure,
   over-cap/truncated read, and a missing or invalid base trust root (including a malformed quarantine or
@@ -125,6 +141,8 @@ for a group touching the x-card despite a stale ref, and warn for a group touchi
 - CI wiring is exercised, an unreadable ledger errors in every merge group whose diff needs it and not in
   the unaffected groups named above, duplicate x-ids fail, and same-identity
   numeric/ledger equality passes in the named tests.
+- The whole-tree identity check passes on today's main only through the 7 allowlisted legacy pairs, and
+  `legacyDuplicateBornAsAllowlisted` shows any other shared `bornAs` still errors.
 
 ## Acceptance
 

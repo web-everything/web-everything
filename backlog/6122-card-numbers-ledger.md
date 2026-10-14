@@ -133,7 +133,9 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - A numeric file name is its own number. It needs no row.
 - Seed one row per existing card that carries `bornAs: x<6>` (id = the bornAs hash, num = its file number), so
   an old x-id still cited anywhere (docs, flows, prose) resolves to the right card. This is the "maps both ways"
-  half.
+  half. Seven `bornAs` values are already shared by two cards each on main; a reviewed allowlist seeds one
+  row per id at a chosen `canonical` number, and the identity check accepts only those exact pairs (slices
+  (a) and (c)).
 - New cards get a row at land. Their file stays `x<6>` until the batched rename (mode `rename-after-land`),
   forever (mode `ledger-only`), or is renamed before enqueue (mode `rename-before-enqueue`).
 
@@ -142,7 +144,8 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - Canonical page stays `/backlog/<file stem>/` (we:src/backlog-pages.njk:7). For a new card that is
   `/backlog/x7k2q9a-slug/` until it is renamed. After a batched rename, the old `/backlog/x7k2q9a-slug/` and
   `/backlog/x7k2q9a/` routes redirect to the new `NNN-slug` page (the x-id is kept as `bornAs`), so links
-  never break.
+  never break. The batched rename (slice (f)) records the old full stem in `formerSlugs`, which the existing
+  old-slug redirect pages serve; slice (b) emits the bare `/backlog/<x-id>/` and `/backlog/<NNN>/` routes.
 - `/backlog/<NNN>/` keeps working: `backlogRedirects` (we:src/_data/backlogRedirects.js:18) emits a redirect for
   each ledgered x-card's number, the same way it does for numeric cards (we:src/backlog-redirects.njk:13).
 - `/backlog/<x-id>/` also redirects to the canonical page.

@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "6122"
 status: open
-scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/backlog/card-ledger-checkpoint.mjs", "we:scripts/backlog/card-ledger-signing-key.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/git-transport-branch.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
+scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/settings/card-ledger-legacy-identities.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/backlog/card-ledger-checkpoint.mjs", "we:scripts/backlog/card-ledger-signing-key.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/git-transport-branch.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
@@ -95,8 +95,29 @@ Slice (a) of epic 6122: an append-only id-to-number ledger on ops/card-numbers, 
   `numberPendingHashes` returns `n.assigned` (hash to NNN pairs, line 271), write one `kind:"shadow"` row per
   pair with the SAME number the rename chose. The rename path stays the source of truth. A ledger write failure
   is logged as a warning and never blocks the enqueue in shadow mode.
-- Seed script `we:scripts/backlog/seed-card-number-ledger.mjs`: one `kind:"seed"` row per existing card with a
-  `bornAs: x<6>` line (id = bornAs, num = file number). Dry-run by default; `--apply` pushes once.
+- Seed script `we:scripts/backlog/seed-card-number-ledger.mjs`: one `kind:"seed"` row per distinct `bornAs`
+  identity (id = bornAs, num = file number). Dry-run by default; `--apply` pushes once.
+  - `bornAs` is read from the card's frontmatter block only, never from body lines. Card 4658's body quotes
+    the frontmatter of three other cards, so a line scan finds `x7pj0mw`, `xggb0ep` and `xycb80x` twice;
+    frontmatter parsing finds each once (cards 4397, 4383, 4398).
+  - Existing duplicate birth identities. On main today, 7 `bornAs` values sit in the frontmatter of two
+    cards each: `xzdi27a` (3111, 3112), `x2t6cr5` (3201, 3244), `xu2krte` (3544, 3557), `x8hzy1m` (3660,
+    3663), `xhprieg` (3661, 3664), `xldrls6` (3662, 3665), `xp12dod` (4498, 4512). They are not migrated:
+    no file and no `bornAs` line changes. Instead a reviewed allowlist,
+    `we:scripts/settings/card-ledger-legacy-identities.json`, lists each pair as
+    `{ id, nums: [<a>, <b>], canonical: <a>, reason }`. `canonical` is the lower (earlier-filed) number
+    unless the entry says otherwise; the other card is a legacy alias.
+  - For an allowlisted id the seed writes ONE row, `num = canonical`. The alias card keeps its own numeric
+    file name, which is its number (numeric files need no row), so the alias number is never reallocated:
+    the allocator floor already covers it.
+  - The seed refuses (`--apply` pushes nothing, dry-run lists them) when any `bornAs` is shared by two or
+    more cards and is not covered by an exact entry (same id, same set of numbers), or when an entry is
+    stale (a listed number's file is missing from the base tree or no longer carries that `bornAs`). So the
+    seed completes on today's main, and a new duplicate can never be seeded silently.
+  - The allowlist is read from `<base>` with `git show`, like the trust root, never from the tree under
+    check. It is registered in `TRUST_CHAIN` (we:scripts/lib/gate-config.mjs:106) as a `policy` member with
+    `leash: 'spec'`, so adding an entry is held at `review:human`. It is a closed set: slice (c)'s identity
+    check (6125) honours an entry only for the exact numbers it lists.
 
 ## MVP
 
@@ -116,6 +137,8 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — in shadow, a failed write warns and the rename path proceeds unchanged; the module itself
    never returns a number it did not read back after the push.
 5. **Identity scoping** — the file is per repo (`we.jsonl`, `plateau-app.jsonl`); a row never maps across repos.
+   One row per id: the 7 legacy duplicate `bornAs` pairs seed one row each (the allowlist's `canonical`
+   number); any other shared `bornAs` refuses the seed.
 6. **State over time** — append-only; a re-enqueue after a dequeue re-reads the existing row instead of minting.
 7. **Who wrote it** — authenticate the commit that introduced each row using a trusted drain signing key,
    not a tip commit or `trustedDrainAuthors` author-name comparison. Seed and shadow writers must sign too.
@@ -130,6 +153,13 @@ the winner's rows, so the two ids get different numbers and the loser's first-at
 appended), a push to any ref other than `refs/heads/ops/card-numbers` refused before any git call, a conflicting row (same id, two
 numbers) reported, a partial last line, the floor taken from numeric file names, seed rows built from
 `bornAs`.
+
+- **Capability (Red today)** — `seedHandlesLegacyDuplicateBornAs`: on a fixture holding an allowlisted pair
+  (two cards, one `bornAs`), the seed writes exactly one row for that id, at the `canonical` number, and
+  `readCardLedger` reports zero conflicts. An unlisted shared `bornAs`, an entry whose number set differs
+  from the cards (a third card added), and a stale entry each make the seed refuse with no push. A `bornAs:`
+  line in a card's body (the card 4658 shape) is not an identity. An allowlist entry present only in the tree
+  under check, not at `<base>`, has no effect. A last fixture is the real list of 7 pairs from main.
 
 Required tests in that same suite:
 - **Capability (Red today)** — `rejectsUntrustedIntroducerBehindTrustedTip`: an untrusted commit appends a forged row, then a trusted
@@ -180,7 +210,9 @@ NNN the rename gave the file. Paste both outputs.
 
 - The bootstrap trust-root PR (first drain key, initial checkpoint) has landed through `review:human`.
 - The shadow rows for the next 5 real numbered cards match their renamed file numbers exactly.
-- The seed run has written one row per `bornAs` card, and `readCardLedger` reports zero conflicts.
+- The legacy-identities allowlist (the 7 pairs above) has landed through `review:human`.
+- The seed run has written one row per distinct `bornAs` identity (one row, at the `canonical` number, for
+  each allowlisted pair), and `readCardLedger` reports zero conflicts.
 
 ## Acceptance
 
