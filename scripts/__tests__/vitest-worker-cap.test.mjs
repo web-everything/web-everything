@@ -63,8 +63,10 @@ describe('every vitest config applies the shared ceiling', () => {
     expect(src).toContain(needle);
   });
 
-  it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
-    expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  it('keeps the integration config off singleFork (a fully serial tier overran the 20-minute CI job budget)', () => {
+    const src = read('vitest.integration.config.ts');
+    expect(src).toMatch(/forks:\s*\{\s*singleFork: false/);
+    expect(src).not.toMatch(/singleFork:\s*true/);
   });
 
   it('runs the integration files in one pool so serial simulator forks do not contend with threads', () => {

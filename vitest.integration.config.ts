@@ -12,7 +12,7 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * test — proof-of-CLI-behavior fixtures, not pure-logic unit tests — so they're slow in a way isolation
  * inside the shared suite can only ever redistribute, never remove. Splitting them into their own run:
  *   - keeps them off the `threads` pool the ~2000-file unit suite shares, so they can't inflate each
- *     other's cost under contention (the original motivation for the serial `forks` pool);
+ *     other's cost under contention (the original motivation for the `forks` pool);
  *   - lets `npm run test:unit` (and everything that shells it — `verify-lane.mjs`'s local gate, `npm test`,
  *     `npm run verify`) skip real git/subprocess cost entirely, including its own "sensitive surface, fall
  *     back to full" case — this file is what still proves the real behavior, in CI, before merge.
@@ -35,9 +35,10 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * contention problem this whole split exists to solve, recreated one tier down. Since vitest runs separate
  * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), a separate serial
  * `forks` pool still shares runner capacity with the `threads` pool. The self-sync sibling scenario's A3
- * timed out under that arrangement in CI. This tier now runs every file in the same serial fork pool,
- * keeping assertions and deadlines intact while removing contention between its own test files.
- * The 20-minute CI job budget still applies; CI must verify the resulting total duration.
+ * timed out under that arrangement in CI. This tier now runs every file in the same fork pool,
+ * keeping assertions and deadlines intact while removing the cross-pool contention. The single pool is NOT
+ * `singleFork`: one fork per file, `maxTestWorkers` at a time, so the tier stays inside the 20-minute CI job budget
+ * (a fully serial run was cancelled at that cap).
  */
 export default defineConfig({
   test: {
@@ -141,13 +142,14 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
     ].filter((f) => !LIVE_SUITE.has(f)),
-    // Separate Vitest pools run concurrently: singleFork only serializes its own files.
-    // Put every real-subprocess fixture in that pool so simulator ticks cannot contend
-    // with thread-pool git fixtures or Rust builds and exhaust their unchanged deadlines.
+    // Separate Vitest pools run concurrently, so keep every real-subprocess fixture in ONE pool: simulator
+    // ticks then cannot contend with a second pool's git fixtures or Rust builds. That pool must NOT be
+    // `singleFork`: it serialized the whole ~50-file tier into one process, which ran past CI's 20-minute
+    // job budget (the job was cancelled at the cap). One fork per file, at most `maxTestWorkers` at a time.
     pool: 'forks',
     poolOptions: {
       forks: {
-        singleFork: true,
+        singleFork: false,
         maxForks: maxTestWorkers,
       },
     },
