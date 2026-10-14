@@ -18,7 +18,7 @@ import { DEFAULT_FIXER_ESCALATION } from '../../lib/fixer-escalation-policy.mjs'
 const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 const SID = '11111111-2222-4333-8444-555555555555';
-const OPUS = { provider: 'claude', model: 'claude-opus-5', effort: 'high' };
+const OPUS = { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' };
 /** The platform ladder with the stronger-model rung routed to Opus on Claude (cross-provider unavailable). */
 const LADDER = {
   policy: DEFAULT_FIXER_ESCALATION,
@@ -58,7 +58,7 @@ describe('rung by round (planRoundEscalation / roundEscalationFor)', () => {
   it('rounds 1 and 2 stay on the ordinary route; round 3 and later take the stronger-model rung', () => {
     expect(planRoundEscalation({ round: 2, fromRound: 3, fixerLadder: LADDER })).toBeNull();
     const r3 = planRoundEscalation({ round: 3, fromRound: 3, fixerLadder: LADDER });
-    expect(r3).toMatchObject({ round: 3, fromRound: 3, rung: { id: 'stronger-model', model: 'claude-opus-5' }, route: OPUS });
+    expect(r3).toMatchObject({ round: 3, fromRound: 3, rung: { id: 'stronger-model', model: 'claude-opus-5-5' }, route: OPUS });
     expect(planRoundEscalation({ round: 6, fromRound: 3, fixerLadder: LADDER }).rung.id).toBe('stronger-model');
   });
   it('0 turns it off; no launchable stronger rung keeps the ordinary route', () => {
@@ -77,7 +77,7 @@ describe('rung by round (planRoundEscalation / roundEscalationFor)', () => {
   });
   it('the launch table of a round-3 fix is the routing policy\'s stronger-model route', () => {
     const esc = roundEscalationFor(planned({ attempts: 2 }), { fixSettings: SETTINGS, loadLadder: () => LADDER });
-    expect(launchTableFor(planned({ attempts: 2 }), esc)).toMatchObject({ model: 'claude-opus-5', effort: 'high' });
+    expect(launchTableFor(planned({ attempts: 2 }), esc)).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' });
     expect(launchTableFor(planned({ attempts: 1 }), null)).toBeNull();
   });
   it('dispatchFix launches a round-3 ordinary fix with --model opus, and a round-2 fix on the ordinary route', () => {
@@ -443,7 +443,7 @@ describe('replayFixLaunch / formatReplay — the read-only replay of the next fi
     expect(r.launch).toEqual({ mode: 'resume', sessionId: SID, lane: 4, lanePath: '/lanes/we/lane-4', held: 'free' });
     const text = formatReplay(r);
     expect(text).toContain('next fix would be round 6 (round given)');
-    expect(text).toContain('stronger-model route — claude-opus-5 (--model opus), from round 3');
+    expect(text).toContain('stronger-model route — claude-opus-5-5 (--model opus), from round 3');
     expect(text).toContain(`resume ${SID} — no cold start; checkout: re-take its untouched lane-4 (--no-reset)`);
     expect(text).toContain('dry run: nothing claimed, posted, spawned or resumed');
   });

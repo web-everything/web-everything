@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x1lkurc-prevention-add-a-card-lint-that-requires-each-must-never-cla.md:17` — Have the mechanical filer (or a check:standards rule) check that each cited `we:<path>:<line>` resolves to a non-blank line at filing time, or record the reviewed SHA next to the anchor.
+1. `we:backlog/6070-prevention-add-a-card-lint-that-requires-each-must-never-cla.md:17` — Have the mechanical filer (or a check:standards rule) check that each cited `we:<path>:<line>` resolves to a non-blank line at filing time, or record the reviewed SHA next to the anchor.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5215@ae2e94c109c5b840639316a0b1d7ae55aac5f2e9
 
