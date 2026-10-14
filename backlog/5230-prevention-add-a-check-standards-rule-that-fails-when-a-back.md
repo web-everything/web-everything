@@ -24,3 +24,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5268 (finding 2: `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:33` — Add a check:standards rule that fails when a backlog card's scope lists a test file that the Test plan never mentions.)

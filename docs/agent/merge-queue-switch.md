@@ -47,6 +47,20 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
 
 ## Preconditions
 
+`mergeDelivery.concurrency` bounds per-candidate work: `{ "gateReads": 6, "enqueue": 3 }` by default.
+Each key resolves independently through standard → platform → tool; invalid values (anything other than
+a positive safe integer) fall through to the lower layer and are reported. The pass-timings line logs both
+effective values and their sources. Set both to `1` to restore sequential execution.
+
+Gate reads retain candidate order when reduced into classifications. Enqueue preparation fans out only for
+independent PRs in the GitHub merge-queue strategy. A read of the entire pinned git tree can prove there are
+no pending hash cards and bypass branch preparation; a missing object or failed read keeps preparation serial.
+Coupled PRs, branch-numbering preparation, rebased PRs,
+freshness hooks that could refresh a branch, and direct merges use the existing serial path. Each serial PR
+is a barrier between parallel batches; numbering locks, branch pushes and writes to main never overlap.
+The enqueue API and shared follow-up state remain under the existing merge-write lock. A failed candidate
+does not cancel preparation of the other PRs. Async GitHub reads run through the existing throttled CLI.
+
 - [ ] PR #4715 merged: red-main freeze published to a shared ops branch CI can read; it carries card 5905,
   the drain-side reader of that branch.
 - [ ] `merge-gate` runs in **enforce**. PR #4715 does not itself set `mergeGate.mode`; enforce needs
