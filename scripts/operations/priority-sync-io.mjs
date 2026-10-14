@@ -1,3 +1,4 @@
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/operations/priority-sync-io.mjs
  * @description THE IO SHELL of {@link ./priority-sync.mjs} — the reader its `read` step is injected with, and the
@@ -94,7 +95,7 @@ export function mergeRaw(local, fromRef, localCards, merged) {
   for (const id of new Set([...local.keys(), ...fromRef.keys()])) {
     const l = local.get(id);
     const r = fromRef.get(id);
-    const resolvedOnlyOnRef = merged.get(id)?.status === 'resolved' && localCards.get(id)?.status !== 'resolved';
+    const resolvedOnlyOnRef = isTerminalStatus(merged.get(id)?.status) && !isTerminalStatus(localCards.get(id)?.status);
     out.set(id, l && !(resolvedOnlyOnRef && r) ? l : (r ?? l));
   }
   return out;

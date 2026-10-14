@@ -270,6 +270,7 @@ describe('validateBacklogItem — real backlog stays clean', () => {
   const backlog = typeof loadBacklog === 'function' ? loadBacklog() : loadBacklog;
 
   const ctx = {
+    itemByRef: new Map([...backlog.filter((b) => b.bornAs).map((b) => [String(b.bornAs), b]), ...backlog.map((b) => [String(b.num), b])]),
     projectById: new Map(projects.map((p) => [p.id, p])),
     graduatedKinds: buildGraduatedKinds({ blocks, intents, protocols, projects, plugs, capabilityIds, adapters, demos }),
     knownNums: new Set(backlog.map((b) => b.num).filter(Boolean)),
@@ -647,7 +648,7 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
       git(['update-ref', 'HEAD', baseline]);
       git(['update-ref', 'refs/remotes/origin/main', baseline]);
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
-      for (const f of ['scripts/check-standards.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
       const runGate = (args) => {
         const result = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...args], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
@@ -719,7 +720,7 @@ ${note}
       execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
       // The gate's scope guards need an origin/main base ref; a clone of a CI checkout has none (the empty-stdout failure).
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
       const warnings = () => {
@@ -762,7 +763,7 @@ ${note}
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
-      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/git-grep-gate.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs', 'scripts/lib/backlog-status.cjs', 'scripts/lib/git-grep-gate.mjs', 'backlog/026-droplist-njk-family-wording.md', 'backlog/027-droplist-trait-language.md']) copyFileSync(join(ROOT, f), join(repo, f));
       const warnings = () => {
         const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
@@ -812,5 +813,42 @@ describe('#4490 citation gates use runGitGrepGate', () => {
     expect(c).toMatch(/runGitGrepGate\(HASH_PATH_CITE_SOURCE, \{[^}]*emit: emit3/s);
     expect(d).toMatch(/runGitGrepGate\(BACKLOG_GLOB_CITE_SOURCE, \{[^}]*emit: emit4/s);
     for (const s of [c, d]) expect(s).not.toMatch(/execFileSync\(\s*'git', \['grep'/);
+  });
+});
+
+describe('closed backlog coherence', () => {
+  const survivor = { ...baseItem, id: '100-survivor', num: '100', bornAs: 'xabc123' };
+  const closed = { ...baseItem, status: 'closed', closedReason: 'duplicate', closedInto: '100', dateClosed: '2026-10-13' };
+  const errors = (item, target = survivor) => validateBacklogItem(item, {
+    ...FIXTURE_CTX,
+    itemByRef: new Map([[target.num, target], [target.bornAs, target]]),
+  }).errors.map((e) => e.message).join('\n');
+  it.each(['100', 'xabc123'])('resolves duplicate survivor %s', (ref) => {
+    expect(errors({ ...closed, closedInto: ref })).toBe('');
+  });
+  it.each(['fixed-elsewhere', 'obsolete', 'wont-do'])('accepts %s without a survivor', (closedReason) => {
+    expect(errors({ ...closed, closedReason, closedInto: undefined, ...(closedReason === 'fixed-elsewhere' ? { closedBy: 'PR #10' } : {}) })).toBe('');
+  });
+  it.each([
+    [{ closedReason: undefined }, /closedReason/], [{ closedReason: 'unknown' }, /closedReason/],
+    [{ dateClosed: undefined }, /dateClosed/], [{ dateClosed: 'yesterday' }, /dateClosed/],
+    [{ closedInto: undefined }, /requires closedInto/], [{ closedInto: '404' }, /does not resolve/],
+    [{ closedReason: 'obsolete' }, /only allowed for duplicate/], [{ closedBy: 'abc' }, /only allowed for fixed-elsewhere/],
+  ])('refuses malformed closure %j', (overrides, message) => {
+    expect(errors({ ...closed, ...overrides })).toMatch(message);
+  });
+  it('refuses self and closed survivors', () => {
+    expect(errors({ ...closed, closedInto: '999' }, closed)).toMatch(/itself/);
+    expect(errors(closed, { ...survivor, status: 'closed' })).toMatch(/closed item #100/);
+  });
+  it.each(['closedReason', 'closedInto', 'closedBy', 'dateClosed'])('refuses stale %s on every non-closed state', (key) => {
+    for (const status of ['open', 'parked', 'active', 'preparing', 'resolved'])
+      expect(errors({ ...baseItem, status, [key]: 'stale' })).toMatch(new RegExp(`stale ${key}`));
+  });
+  it('names the closed blocker and each live dependent, without clearing that dependency', () => {
+    for (const status of ['open', 'active', 'preparing', 'parked'])
+      expect(errors({ ...baseItem, status, blockedBy: ['xabc123'] }, { ...survivor, status: 'closed' })).toMatch(/#999 blockedBy closed item #100/);
+    for (const status of ['resolved', 'closed'])
+      expect(errors({ ...closed, status, blockedBy: ['100'], closedInto: undefined, closedReason: 'obsolete', dateResolved: '2026-10-13' }, { ...survivor, status: 'closed' })).not.toMatch(/blockedBy closed/);
   });
 });

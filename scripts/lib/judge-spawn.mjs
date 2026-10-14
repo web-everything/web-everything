@@ -75,6 +75,7 @@
  * Argv construction and outcome parsing are pure. A LEAF module: it imports nothing from the review/jury seams.
  */
 
+import { CLAUDE_HELPER_MODEL_DEFAULT, resolveClaudeHelperRoute } from './claude-helper-route.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -427,7 +428,7 @@ export function laneRootOf(resolvedPath) {
 export const EFFORT_LEVELS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /** Defaults for the care→rigor dial. Per-lens callers override all three; these are the cheap middle. */
-export const DEFAULT_MODEL = 'sonnet';
+export const DEFAULT_MODEL = CLAUDE_HELPER_MODEL_DEFAULT;
 export const DEFAULT_EFFORT = 'medium';
 
 /**
@@ -604,7 +605,7 @@ export function retrySessionId(sessionId, attempt) {
 export function buildJudgeArgv({
   mandate,
   shape,
-  model = DEFAULT_MODEL,
+  model = resolveClaudeHelperRoute().model,
   effort = DEFAULT_EFFORT,
   budget = DEFAULT_BUDGET_USD,
   sessionId,
@@ -848,7 +849,7 @@ export async function judgeSpawn({
   mandate,
   input,
   shape,
-  model = DEFAULT_MODEL,
+  model = resolveClaudeHelperRoute().model,
   effort = DEFAULT_EFFORT,
   budget = DEFAULT_BUDGET_USD,
   runId,
