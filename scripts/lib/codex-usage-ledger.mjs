@@ -3,9 +3,9 @@
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
+import { readGit } from './proc-read.mjs';
 
 export function codexUsageLedgerPath(env = process.env) {
   return env.WE_CODEX_USAGE_LEDGER || join(daemonConveyorStateRoot(env), 'codex-usage.jsonl');
@@ -85,7 +85,7 @@ export function appendCodexUsage(record, { env = process.env, append = appendFil
 
 function repositorySnapshot(cwd) {
   try {
-    const git = (args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+    const git = (args) => readGit(['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
     // Include untracked contents as well as tracked edits and commits, without modifying the index.
     const hash = createHash('sha256').update(git(['rev-parse', 'HEAD'])).update(git(['diff', 'HEAD', '--binary']));
     for (const path of git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)) hash.update(path).update(readFileSync(join(cwd, path)));
