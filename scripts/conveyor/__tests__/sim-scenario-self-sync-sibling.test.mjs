@@ -178,6 +178,8 @@ function a3Def() {
     daemons: ['review', 'fix-dispatch'],
     lanes: 2,
     setup(w) {
+      // A1/A2 advance their clocks; their future throttle windows must not survive into A3's fresh clock.
+      expect(w.env.WE_GH_THROTTLE_LOCK_ROOT).toBe(join(w.root, 'gh-throttle'));
       return { w };
     },
     play: [
