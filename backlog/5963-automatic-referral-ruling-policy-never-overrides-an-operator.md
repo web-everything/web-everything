@@ -2,10 +2,11 @@
 bornAs: xsim499
 kind: story
 size: 3
-status: active
+status: resolved
 scope: ["we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/record-referral-ruling-io.mjs", "we:scripts/operations/__tests__/record-referral-ruling*.test.mjs", "we:scripts/operations/__tests__/record-referral-ruling-io*.test.mjs"]
 dateOpened: "2026-10-12"
 dateStarted: "2026-10-13"
+dateResolved: "2026-10-13"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "6b4b641a7d59f8fda623db622bc41b243272405e"
 tags: []
