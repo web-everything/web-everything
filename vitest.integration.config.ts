@@ -151,6 +151,8 @@ export default defineConfig({
       forks: {
         singleFork: false,
         maxForks: maxTestWorkers,
+        // Vitest otherwise defaults the minimum to CPU count - 1, which can exceed our shared ceiling.
+        minForks: 1,
       },
     },
   },

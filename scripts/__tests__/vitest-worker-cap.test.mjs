@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
+import integrationConfig from '../../vitest.integration.config';
 
 describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () => {
   it('defaults to a ceiling of 4: 12 or 24 cores, cap 2 -> 4', () => {
@@ -61,6 +62,14 @@ describe('every vitest config applies the shared ceiling', () => {
     const src = read(file);
     expect(src).toContain("from './vitest.shared'");
     expect(src).toContain(needle);
+  });
+
+  it('keeps the integration fork range valid even when the shared ceiling is one worker', () => {
+    const { minForks, maxForks } = integrationConfig.test.poolOptions.forks;
+    const lowestCeiling = resolveMaxTestWorkers({}, 1);
+    expect(minForks).toBeGreaterThanOrEqual(1);
+    expect(minForks).toBeLessThanOrEqual(lowestCeiling);
+    expect(minForks).toBeLessThanOrEqual(maxForks);
   });
 
   it('keeps the integration config off singleFork (a fully serial tier overran the 20-minute CI job budget)', () => {
