@@ -46,6 +46,7 @@
 
 import {
   mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync, statSync, readdirSync,
+  unlinkSync, rmdirSync,
 } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -187,6 +188,24 @@ const realNowMs = () => performance.timeOrigin + performance.now();
 const lockTokens = new Map();
 const siblingPath = (lockPath, kind) => `${lockPath}.${kind}-${process.pid}-${randomUUID()}`;
 const removeLockDir = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+const holderName = (token) => `holder-${token}.json`;
+const isHolderName = (name) => /^holder-[0-9a-f-]{36}\.json$/.test(name) || name === 'holder.json';
+
+/** Remove only the observed generation's entry. rmdir is an atomic empty-directory check: a
+ * replacement's unique holder makes it fail, even if that owner arrived after our last read.
+ * Never rename or recursively remove the shared path; neither operation can check ownership. */
+function retireStoreLock(lockPath, entry) {
+  if (entry) {
+    try { unlinkSync(join(lockPath, entry)); } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+  rmdirSync(lockPath);
+}
+
+function processIsAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code !== 'ESRCH'; }
+}
 
 /** Recover debris left by a killed acquire/release. One directory scan per acquire, best effort. */
 function sweepLockSiblings(lockPath) {
@@ -197,6 +216,10 @@ function sweepLockSiblings(lockPath) {
       if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
       try {
         const path = join(parent, name);
+        // A paused publisher may still rename its candidate. Do not empty that directory while
+        // it is live, which could otherwise publish an empty lock after the sweeper's unlink.
+        const pid = name.slice(`${basename(lockPath)}.tmp-`.length).split('-')[0];
+        if (name.startsWith(`${basename(lockPath)}.tmp-`) && /^\d+$/.test(pid) && processIsAlive(Number(pid))) continue;
         if (realNowMs() - statSync(path).mtimeMs > LOCK_STALE_MS) removeLockDir(path);
       } catch { /* a concurrent sweeper may already have removed it */ }
     }
@@ -205,14 +228,14 @@ function sweepLockSiblings(lockPath) {
 
 /**
  * Publish a complete holder record with atomic rename. Retry contention with a short randomized backoff;
- * stale holders (including unreadable legacy records) are renamed away before removal.
+ * each generation has a unique holder filename. Retirement unlinks only that filename and
+ * atomically removes the directory only if empty, so it cannot retire a replacement owner.
  *
  * @param {string} storePath
  * @returns {string} the lock directory path — pass to {@link releaseStoreLock} to release it
  */
 export function acquireStoreLock(storePath) {
   const lockPath = `${storePath}.lock`;
-  const holderPath = join(lockPath, 'holder.json');
   const deadline = realNowMs() + LOCK_RETRY_TIMEOUT_MS;
   sweepLockSiblings(lockPath);
   for (;;) {
@@ -227,7 +250,7 @@ export function acquireStoreLock(storePath) {
       const token = randomUUID();
       try {
         mkdirSync(tmp);
-        writeFileSync(join(tmp, 'holder.json'), JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
+        writeFileSync(join(tmp, holderName(token)), JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
         renameSync(tmp, lockPath);
         lockTokens.set(lockPath, token);
         return lockPath;
@@ -239,18 +262,30 @@ export function acquireStoreLock(storePath) {
       continue;
     }
     let at = lockStat.mtimeMs;
+    let entry;
     try {
-      const holder = JSON.parse(readFileSync(holderPath, 'utf8'));
-      if (Number.isFinite(holder.at)) at = holder.at;
-    } catch { /* missing, empty or torn holder: age the directory itself */ }
+      const entries = readdirSync(lockPath);
+      // A published lock has exactly one entry. Unknown contents fail closed rather than
+      // removing files we cannot attribute to a holder.
+      if (entries.length > 1 || (entries.length === 1 && !isHolderName(entries[0]))) {
+        sleepSyncMs(5 + Math.floor(Math.random() * 15));
+        continue;
+      }
+      entry = entries[0];
+      if (entry) {
+        const raw = readFileSync(join(lockPath, entry), 'utf8');
+        try {
+          const holder = JSON.parse(raw);
+          if (Number.isFinite(holder?.at)) at = holder.at;
+        } catch { /* empty or torn holder: age the directory itself */ }
+      }
+    } catch (err) {
+      if (err.code === 'ENOENT') continue; // the observed generation has already retired
+      throw err;
+    }
     if (realNowMs() - at > LOCK_STALE_MS) {
       try {
-        // Avoid taking over a replacement that arrived while we read the old holder.
-        const current = statSync(lockPath);
-        if (current.ino !== lockStat.ino || current.dev !== lockStat.dev) continue;
-        const dead = siblingPath(lockPath, 'dead');
-        renameSync(lockPath, dead);
-        try { removeLockDir(dead); } catch { /* the next sweep can finish removal */ }
+        retireStoreLock(lockPath, entry);
         continue;
       } catch { /* another waiter may have won the takeover */ }
     }
@@ -259,17 +294,13 @@ export function acquireStoreLock(storePath) {
   }
 }
 
-/** Release only our current holder, removing the live path atomically before best-effort cleanup. */
+/** Unlink only our unique holder; a replacement's nonempty directory cannot be removed. */
 export function releaseStoreLock(lockPath) {
   const token = lockTokens.get(lockPath);
   if (!token) return;
   lockTokens.delete(lockPath);
   try {
-    const holder = JSON.parse(readFileSync(join(lockPath, 'holder.json'), 'utf8'));
-    if (holder.token !== token) return;
-    const dead = siblingPath(lockPath, 'dead');
-    renameSync(lockPath, dead);
-    removeLockDir(dead);
+    retireStoreLock(lockPath, holderName(token));
   } catch { /* best effort: a missing lock dir is not an error */ }
 }
 

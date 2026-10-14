@@ -2,7 +2,7 @@
 // Child processes import the helper by file URL, so this suite needs the Node environment.
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireStoreLock, releaseStoreLock, LOCK_STALE_MS } from './helpers/fake-gh.mjs';
@@ -20,7 +20,8 @@ function backdate(path) {
   const past = new Date(realNowMs() - LOCK_STALE_MS - 5_000);
   utimesSync(path, past, past);
 }
-function holder(lock) { return JSON.parse(readFileSync(join(lock, 'holder.json'), 'utf8')); }
+function holderPath(lock) { return join(lock, readdirSync(lock)[0]); }
+function holder(lock) { return JSON.parse(readFileSync(holderPath(lock), 'utf8')); }
 
 // Signal readiness before entering the synchronous acquire, so assertions never depend on child boot time.
 async function waiter(store, futureClock = false) {
@@ -49,6 +50,81 @@ async function waiter(store, futureClock = false) {
 }
 
 describe('fake-gh store lock recovery', () => {
+  const races = ['release', 'takeover', 'empty', 'malformed'].flatMap((operation) =>
+    ['entry', 'directory'].map((boundary) => [operation, boundary]));
+  races.push(['missing', 'directory']);
+  it.each(races)('%s preserves a replacement arriving before retiring the %s', (operation, boundary) => {
+    const store = fixture();
+    // Intercept the filesystem boundary in a real Node process. A second process acquires the
+    // replacement after another retiree removes the old lock, before the paused operation resumes.
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { execFileSync } from 'node:child_process';
+      import { join } from 'node:path';
+      import { acquireStoreLock, releaseStoreLock } from ${JSON.stringify(helper)};
+      const store = ${JSON.stringify(store)};
+      const lock = acquireStoreLock(store);
+      const entry = fs.readdirSync(lock)[0];
+      const original = JSON.parse(fs.readFileSync(join(lock, entry), 'utf8'));
+      if (${JSON.stringify(operation)} === 'takeover') {
+        fs.writeFileSync(join(lock, entry), JSON.stringify({ ...original, at: 0 }));
+      }
+      if (['missing', 'empty', 'malformed'].includes(${JSON.stringify(operation)})) {
+        fs.unlinkSync(join(lock, entry));
+        if (${JSON.stringify(operation)} !== 'missing') {
+          fs.writeFileSync(join(lock, 'holder.json'), ${JSON.stringify(operation)} === 'empty' ? '' : '{');
+        }
+        fs.utimesSync(lock, new Date(0), new Date(0));
+      }
+      const saved = { renameSync: fs.renameSync, unlinkSync: fs.unlinkSync, rmdirSync: fs.rmdirSync };
+      let replacement;
+      let injecting = false;
+      function replace() {
+        if (replacement || injecting) return;
+        injecting = true;
+        fs.rmSync(lock, { recursive: true });
+        execFileSync(process.execPath, ['--input-type=module', '-e',
+          'import { acquireStoreLock } from ' + ${JSON.stringify(JSON.stringify(helper))} +
+          '; acquireStoreLock(' + JSON.stringify(store) + ');'
+        ], { timeout: 5_000 });
+        const name = fs.readdirSync(lock)[0];
+        replacement = { name, body: fs.readFileSync(join(lock, name), 'utf8') };
+        injecting = false;
+      }
+      fs.renameSync = (from, to) => { if (from === lock) replace(); return saved.renameSync(from, to); };
+      fs.unlinkSync = (path) => {
+        if (${JSON.stringify(boundary)} === 'entry' && path.startsWith(lock + '/')) replace();
+        return saved.unlinkSync(path);
+      };
+      fs.rmdirSync = (path, options) => {
+        if (${JSON.stringify(boundary)} === 'directory' && path === lock) replace();
+        return saved.rmdirSync(path, options);
+      };
+      syncBuiltinESMExports();
+      const wait = Atomics.wait;
+      Atomics.wait = () => { throw new Error('replacement is still held'); };
+      let outcome = 'released';
+      try {
+        if (${JSON.stringify(operation)} === 'release') releaseStoreLock(lock);
+        else { acquireStoreLock(store); outcome = 'acquired'; }
+      } catch (err) {
+        if (err.message !== 'replacement is still held') throw err;
+        outcome = 'blocked';
+      } finally {
+        Object.assign(fs, saved);
+        syncBuiltinESMExports();
+        Atomics.wait = wait;
+      }
+      const preserved = replacement && fs.existsSync(join(lock, replacement.name)) &&
+        fs.readFileSync(join(lock, replacement.name), 'utf8') === replacement.body;
+      process.stdout.write(JSON.stringify({ injected: !!replacement, preserved: !!preserved, outcome }));
+    `], { encoding: 'utf8', timeout: 10_000 }));
+    expect(result.injected).toBe(true);
+    expect(result.preserved).toBe(true);
+    expect(result.outcome).toBe(operation === 'release' ? 'released' : 'blocked');
+  });
+
   it.each(['missing', 'empty', 'malformed'])('promptly recovers a stale %s holder', (kind) => {
     const store = fixture();
     const lock = `${store}.lock`;
@@ -80,7 +156,7 @@ describe('fake-gh store lock recovery', () => {
     const store = fixture();
     const lock = acquireStoreLock(store);
     const original = holder(lock);
-    writeFileSync(join(lock, 'holder.json'), JSON.stringify({ ...original, at: realNowMs() - 60_000 }));
+    writeFileSync(holderPath(lock), JSON.stringify({ ...original, at: realNowMs() - 60_000 }));
     execFileSync(process.execPath, ['--input-type=module', '-e', `
       import { acquireStoreLock } from ${JSON.stringify(helper)};
       acquireStoreLock(${JSON.stringify(store)});
@@ -118,4 +194,39 @@ describe('fake-gh store lock recovery', () => {
     }
     releaseStoreLock(lock);
   });
+
+  it('preserves an old candidate while its publisher is still alive', () => {
+    const store = fixture();
+    const candidate = `${store}.lock.tmp-${process.pid}-paused`;
+    mkdirSync(candidate);
+    writeFileSync(join(candidate, 'holder-paused.json'), 'complete record');
+    backdate(candidate);
+    const lock = acquireStoreLock(store);
+    expect(readFileSync(join(candidate, 'holder-paused.json'), 'utf8')).toBe('complete record');
+    releaseStoreLock(lock);
+  });
+
+  it('serializes concurrent processes updating the shared store', async () => {
+    const store = fixture();
+    writeFileSync(store, JSON.stringify({ count: 0 }));
+    await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', `
+        import { withStore, sleepSyncMs } from ${JSON.stringify(helper)};
+        for (let i = 0; i < 5; i++) {
+          withStore(${JSON.stringify(store)}, (state) => {
+            const count = state.count;
+            sleepSyncMs(5);
+            state.count = count + 1;
+          });
+        }
+      `], { stdio: ['ignore', 'ignore', 'pipe'] });
+      cleanups.push(() => child.kill('SIGKILL'));
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`writer exited ${code}: ${stderr}`)));
+    })));
+    expect(JSON.parse(readFileSync(store, 'utf8')).count).toBe(30);
+    expect(existsSync(`${store}.lock`)).toBe(false);
+  }, 10_000);
 });
