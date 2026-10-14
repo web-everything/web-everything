@@ -5,7 +5,25 @@ import {
   normaliseLogin, reviewerBotLogin, isReviewerBotUser, checkReviewerIdentity, findExistingNativeReview, ownStandingReviews,
   nativeReviewBody, formatComparisonLine, mirrorNativeReview, readReviewerToken, fileDismissalQueue, endorsedStates, QUEUE_CLAIM_STALE_MS,
   STANDARD_PROMOTION, resolvePromotionCriteria, loadPromotionCriteria, parseComparisonLine, summarizeReadiness, formatReadinessLine,
+  approvalRestorable,
 } from '../native-github-review.mjs';
+
+// A write that opens its file, then pauses (running `beforeWrite`) before the bytes land, as appendFileSync and
+// writeFileSync do internally. Pass-through while no hook is armed.
+const fsHook = vi.hoisted(() => ({ beforeWrite: null }));
+vi.mock('node:fs', async (importOriginal) => {
+  const real = await importOriginal();
+  const paused = (append) => (file, data, options) => {
+    const hook = fsHook.beforeWrite;
+    if (!hook) return (append ? real.appendFileSync : real.writeFileSync)(file, data, options);
+    fsHook.beforeWrite = null;
+    const fd = real.openSync(file, append ? 'a' : (options?.flag ?? 'w'));
+    try { hook(); real.writeSync(fd, String(data)); } finally { real.closeSync(fd); }
+    return undefined;
+  };
+  const patched = { ...real, appendFileSync: paused(true), writeFileSync: paused(false) };
+  return { ...patched, default: patched };
+});
 import { appendFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -442,6 +460,55 @@ describe('a stale verdict never overwrites a newer one on the same head', () => 
     expect(a.reason).toContain('gateway timeout');
   });
 
+  // Red team on 5257ced00 (#5223): a stale run's reconcile read clear-human's review:accepted as a reviewer acceptance.
+  it('A=changes under review:human paused before posting, the operator clears the hold meanwhile: A never approves', () => {
+    const gh = fakeGithub({ labels: ['review:changes', 'review:human'] });
+    let fired = false;
+    const paused = (argv) => {
+      if (!fired && argv.includes('POST')) {
+        fired = true;
+        gh.labels = ['review:accepted'];
+        const operator = (a) => (a.includes('graphql') ? 'User chalbert' : gh.exec(a));
+        mirror({ ...gh, exec: operator }, 'clear-human', { labels: ['review:changes', 'review:human'], reviewerExec: () => ({ reason: 'none' }) });
+      }
+      return gh.exec(argv);
+    };
+    const a = mirror({ ...gh, exec: paused }, 'changes', { labels: ['review:pending', 'review:human'] });
+    expect(gh.reviews.filter(r => r.state === 'APPROVED')).toHaveLength(0);
+    expect(gh.standing()).toBe('none');
+    expect(a.outcome).toBe('superseded');
+    expect(a.reason).toContain('no APPROVE');
+    expect(a.reason).toMatch(/dismissed \d+/);
+  });
+
+  it('a reconcile never originates an approval no reviewer run posted (an accept under the worker token)', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('changes') });
+    let fired = false;
+    const paused = (argv) => {
+      if (!fired && argv.includes('POST')) {
+        fired = true;
+        gh.labels = liveLabelsFor('accepted');
+        mirror({ ...gh, exec: a => (a.includes('graphql') ? 'Bot web-everything' : gh.exec(a)) }, 'accepted', { reviewerExec: () => ({ reason: 'none' }) });
+      }
+      return gh.exec(argv);
+    };
+    const a = mirror({ ...gh, exec: paused }, 'changes');
+    expect(gh.reviews.filter(r => r.state === 'APPROVED')).toHaveLength(0);
+    expect(gh.standing()).toBe('none');
+    expect(a.reason).toContain('no APPROVE');
+  });
+
+  it('approvalRestorable: only the approval that stood before the write, or one posted since, never under the human hold', () => {
+    const login = 'plateau-reviewer[bot]';
+    const base = { head, reviewerLogin: login, sawHuman: false };
+    expect(approvalRestorable({ ...base, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'APPROVED'), review(6, 'CHANGES_REQUESTED')] })).toBe(true);
+    expect(approvalRestorable({ ...base, seenReviews: [], reviews: [review(6, 'APPROVED'), review(7, 'CHANGES_REQUESTED')] })).toBe(true);
+    expect(approvalRestorable({ ...base, sawHuman: true, seenReviews: [review(5, 'APPROVED')], reviews: [review(5, 'APPROVED')] })).toBe(false);
+    expect(approvalRestorable({ ...base, seenReviews: [review(4, 'APPROVED'), review(5, 'DISMISSED')], reviews: [review(4, 'APPROVED'), review(5, 'DISMISSED')] })).toBe(false);
+    expect(approvalRestorable({ ...base, seenReviews: [review(5, 'APPROVED', otherHead)], reviews: [review(5, 'APPROVED', otherHead)] })).toBe(false);
+    expect(approvalRestorable({ ...base, seenReviews: [], reviews: [review(6, 'APPROVED', head, 'plateau-reviewer', 'User')] })).toBe(false);
+  });
+
   it('reconcile never writes on a PR that closed meanwhile', () => {
     const gh = fakeGithub({ labels: liveLabelsFor('accepted') });
     let reads = 0;
@@ -630,10 +697,36 @@ describe('reviewer token and dismissal queue IO', () => {
     q.append({ a: 1 });
     const claimed = q.claim();
     const [claimFile] = readdirSync(dir);
-    appendFileSync(join(dir, claimFile), `${JSON.stringify({ a: 2 })}\n`); // the racing append's fd followed the rename
+    appendFileSync(join(dir, claimFile), `${JSON.stringify({ a: 2 })}\n`); // an older producer's fd followed the rename
     claimed.done();
-    expect(readdirSync(dir)).toEqual(['q.jsonl']);
+    expect(readdirSync(dir)).toEqual([expect.stringMatching(/^q\.jsonl\.entry-/)]);
     expect(q.claim().entries).toEqual([{ a: 2 }]);
+  });
+  // Red team on 5257ced00 (#5223): the append opened the queue, a drainer renamed, read and unlinked it, then the write
+  // landed in the deleted file and append() still returned true.
+  it('an append that opened its file before a drainer claimed and deleted the queue is never lost', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    const q = fileDismissalQueue(join(dir, 'q.jsonl'), { alive: () => true });
+    q.append({ pr: 1 });
+    let drained;
+    fsHook.beforeWrite = () => { const claimed = q.claim(); drained = claimed.entries; claimed.done(); };
+    expect(q.append({ pr: 2 })).toBe(true);
+    expect(drained).toEqual([{ pr: 1 }]);
+    expect(q.claim().entries).toEqual([{ pr: 2 }]);
+  });
+  it('a dead producer\'s temp file and a legacy shared queue file are still drained, in queue order', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    const path = join(dir, 'q.jsonl');
+    writeFileSync(path, `${JSON.stringify({ a: 0 })}\n`);
+    writeFileSync(`${path}.tmp-999999-x`, `${JSON.stringify({ a: 9 })}\n`);
+    let alive = true;
+    const q = fileDismissalQueue(path, { alive: () => alive });
+    q.append({ a: 1 });
+    q.append({ a: 2 });
+    expect(q.claim().entries).toEqual([{ a: 0 }, { a: 1 }, { a: 2 }]);
+    alive = false;
+    const dead = q.claim();
+    expect(dead.entries).toContainEqual({ a: 9 });
   });
 });
 

@@ -23,7 +23,7 @@
  *   App's own installation token (the shared cache, else minted now); with no token it is queued
  *   ({@link nativeReviewQueuePath}) and the next run as the reviewer App dismisses it before its own work.
  */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -276,11 +276,33 @@ export function findExistingNativeReview({ reviews, head, event, reviewerLogin }
   const own = (reviews ?? []).filter(review => isReviewerBotUser(review?.user, reviewerLogin));
   // Comments do not replace a decisive verdict; retain their per-head idempotency.
   if (event === 'COMMENT') return own.find(review => review.commit_id === head && review.state === 'COMMENTED') ?? null;
-  const latest = own.reduce((last, review) => {
-    if (!DECISIVE.includes(review.state) && review.state !== 'DISMISSED') return last;
+  const latest = latestOpinionated(own);
+  return latest?.commit_id === head && latest.state === EVENT_STATE[event] ? latest : null;
+}
+
+/** The newest of `reviews` that is APPROVED, CHANGES_REQUESTED or DISMISSED, by id; null when none. Pure. */
+function latestOpinionated(reviews) {
+  return (reviews ?? []).reduce((last, review) => {
+    if (!DECISIVE.includes(review?.state) && review?.state !== 'DISMISSED') return last;
     return !last || review.id > last.id ? review : last;
   }, null);
-  return latest?.commit_id === head && latest.state === EVENT_STATE[event] ? latest : null;
+}
+
+/**
+ * May a reconcile post APPROVE (red team on 5257ced00, #5223)? Only to RESTORE the reviewer App's approval on `head`:
+ * the one that was its latest opinionated review when this run read the history (`seenReviews`), or one a concurrent
+ * run posted after that read. A reconcile never originates an approval. A run that saw `review:human` never restores
+ * one: `clear-human` is the only verdict that lifts that hold, so a human-free `review:accepted` it later reads is the
+ * operator's clearance, whose native approval is the operator's own ({@link planNativeReview}). Pure.
+ */
+export function approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman }) {
+  if (sawHuman || !reviewerLogin) return false;
+  const own = list => (list ?? []).filter(review => isReviewerBotUser(review?.user, reviewerLogin));
+  const seen = own(seenReviews);
+  const prior = latestOpinionated(seen);
+  if (prior?.commit_id === head && prior.state === 'APPROVED') return true;
+  const seenIds = new Set(seen.map(review => review.id));
+  return own(reviews).some(review => !seenIds.has(review.id) && review.commit_id === head && review.state === 'APPROVED');
 }
 
 /** Ids of this reviewer App's own still-standing reviews in `states` (any head). Pure. */
@@ -323,31 +345,42 @@ function pidAlive(pid) {
 }
 
 /**
- * The file-backed queue. `claim()` renames the queue to a claim file named for this process, and takes over another
- * drainer's claim only when its pid is gone or the claim is stale ({@link QUEUE_CLAIM_STALE_MS}), so two live
- * drainers never process the same entries. An append whose open raced the rename lands in the claim file after it
- * was read; `done()` re-reads each claim and re-queues any such late line before deleting it.
+ * The file-backed queue. An append never writes into a shared file (red team on 5257ced00, #5223: an append whose
+ * open raced a drainer's rename, read and unlink wrote into the deleted file and was lost). It writes a private
+ * `<queue>.tmp-<pid>-…` file and renames it to its own `<queue>.entry-…` file, so a drainer only ever sees whole
+ * entries nobody writes to again. `claim()` renames each entry file (and a legacy shared `<queue>` file) to a claim
+ * file named for this process, and takes over another drainer's claim, or a producer's temp file, only when its pid
+ * is gone or it is stale ({@link QUEUE_CLAIM_STALE_MS}), so two live drainers never process the same entries.
+ * `done()` re-queues any line an older producer appended to a claimed legacy file after it was read, then deletes it.
  */
 export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAlive } = {}) {
   const dir = dirname(path);
   const base = basename(path);
-  const claimRe = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.claim-(\\d+)-`);
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const ownedRe = new RegExp(`^${escaped}\\.(?:claim|tmp)-(\\d+)-`);
+  const entryRe = new RegExp(`^${escaped}\\.entry-`);
+  let seq = 0;
   const takeable = (name) => {
-    if (name === base) return true;
-    const m = claimRe.exec(name);
+    if (name === base || entryRe.test(name)) return true;
+    const m = ownedRe.exec(name);
     if (!m) return false;
     if (!alive(Number(m[1]))) return true;
     try { return now() - statSync(join(dir, name)).mtimeMs > QUEUE_CLAIM_STALE_MS; } catch { return false; }
   };
   const append = (text) => {
     mkdirSync(dir, { recursive: true });
-    appendFileSync(path, text);
+    // Sortable by time, then by this process's own order, so entries drain in the order they were queued.
+    const id = `${String(now()).padStart(15, '0')}-${process.pid}-${String(seq++).padStart(6, '0')}-${randomUUID()}`;
+    const tmp = join(dir, `${base}.tmp-${process.pid}-${id}`);
+    writeFileSync(tmp, text, { flag: 'wx' });
+    try { renameSync(tmp, join(dir, `${base}.entry-${id}`)); }
+    catch (error) { try { unlinkSync(tmp); } catch { /* A dead producer's temp file is claimed later. */ } throw error; }
   };
   return {
     append(entry) { append(`${JSON.stringify(entry)}\n`); return true; },
     claim() {
       let names = [];
-      try { names = readdirSync(dir).filter(takeable); } catch { names = []; }
+      try { names = readdirSync(dir).filter(takeable).sort(); } catch { names = []; }
       const claims = [];
       const entries = [];
       for (const name of names) {
@@ -499,8 +532,12 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     const attempt = { ...entry, attempts: (Number(entry.attempts) || 0) + 1 };
     let reviews;
     let endorsed;
+    let sawHuman;
     try {
-      endorsed = endorsedStates(JSON.parse(run(['api', `repos/${entry.repo}/issues/${entry.pr}`, '--jq', '[.labels[].name]'])));
+      const labels = JSON.parse(run(['api', `repos/${entry.repo}/issues/${entry.pr}`, '--jq', '[.labels[].name]']));
+      endorsed = endorsedStates(labels);
+      // A clear-human entry, or one queued or drained under the human hold, never restores an approval.
+      sawHuman = entry.human === true || entry.verdict === 'clear-human' || labelNames(labels).includes('review:human');
       reviews = readReviews(run, endpoint);
     } catch (error) {
       retry.push(attempt);
@@ -521,7 +558,7 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
     let settled = null;
     if (dismissed) {
       try {
-        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join() });
+        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join(), seenReviews: reviews, sawHuman });
       } catch (error) { settled = { outcome: 'failed', reason: `verdict unconfirmed after write: ${failureReason(error)}` }; }
     }
     if (settled) record({ ...line, outcome: settled.outcome, dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
@@ -542,22 +579,26 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
  * when the labels hold none (pending, human) or the head moved, dismiss our standing reviews they do not endorse.
  * Returns what it did. Throws on a failed read or write.
  */
-function reconcileToLabels({ run, endpoint, live, head, reviewerLogin }) {
+function reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman }) {
   // The same refusals as the mirror's own write: never on a closed PR, never a verdict on the App's own PR.
   if (live.state !== 'open') return ['nothing: pr-not-open'];
   const names = labelNames(live.labels);
   const want = names.includes('review:changes') ? { verdict: 'changes', event: 'REQUEST_CHANGES' }
     : names.includes('review:accepted') && !names.includes('review:human') ? { verdict: 'accepted', event: 'APPROVE' } : null;
   const reviews = readReviews(run, endpoint);
+  const actions = [];
   if (want && live.head === head && !isReviewerBotUser({ login: live.author, type: live.authorType }, reviewerLogin)) {
     if (findExistingNativeReview({ reviews, head, event: want.event, reviewerLogin })) return [];
-    run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${head}`, '-f', `event=${want.event}`, '-f', `body=${nativeReviewBody({ ...want, head })}`]);
-    return [`posted ${want.event}`];
+    if (want.event !== 'APPROVE' || approvalRestorable({ reviews, seenReviews, head, reviewerLogin, sawHuman })) {
+      run(['api', '--method', 'POST', `${endpoint}/reviews`, '-f', `commit_id=${head}`, '-f', `event=${want.event}`, '-f', `body=${nativeReviewBody({ ...want, head })}`]);
+      return [`posted ${want.event}`];
+    }
+    actions.push('no APPROVE: no reviewer approval of this head to restore');
   }
   const endorsed = endorsedStates(live.labels);
   const ids = ownStandingReviews({ reviews, reviewerLogin, states: DECISIVE.filter(state => !endorsed.includes(state)) });
   for (const id of ids) dismiss(run, endpoint, id, reviewLabelKey(live.labels), head);
-  return ids.map(id => `dismissed ${id}`);
+  return [...actions, ...ids.map(id => `dismissed ${id}`)];
 }
 
 const SETTLE_ROUNDS = 3;
@@ -566,9 +607,11 @@ const SETTLE_ROUNDS = 3;
  * read and wrote; ours, written last, would then stand over it. So when ours is no longer current, mirror the live
  * verdict instead, and repeat until the labels hold still. `isCurrent(live)` says whether the write still matches the
  * labels. Returns null when it does, else `{outcome, reason}`. Every write by any run is followed by its own re-read,
- * so the last writer always leaves GitHub on the live label.
+ * so the last writer always leaves GitHub on the live label. An approval is only ever restored, never originated
+ * ({@link approvalRestorable}: `seenReviews` is the history this run read before writing, `sawHuman` whether its own
+ * view held `review:human`).
  */
-function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent }) {
+function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent, seenReviews, sawHuman }) {
   let seen = null;
   const actions = [];
   // Up to SETTLE_ROUNDS reconciles, each followed by a fresh read; the last read only judges.
@@ -580,7 +623,7 @@ function settleOnLiveVerdict({ run, endpoint, head, reviewerLogin, isCurrent }) 
     if (key === seen) return { outcome: 'superseded', reason: `verdict-superseded after write (live=${key}); reconciled: ${actions.join(', ') || 'nothing to change'}` };
     if (round === SETTLE_ROUNDS) return { outcome: 'failed', reason: `verdict-superseded after write; labels kept moving (last live=${key}); reconciled: ${actions.join(', ')}` };
     seen = key;
-    actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin }));
+    actions.push(...reconcileToLabels({ run, endpoint, live, head, reviewerLogin, seenReviews, sawHuman }));
   }
 }
 
@@ -649,6 +692,8 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
     // A later verdict swapped the label while this run waited: that run mirrors its own verdict, this one writes nothing.
     const stillCurrent = now => verdictIsCurrent({ verdict, labels: now.labels, swappedLabels, preSwapLabels: labels });
     if (!stillCurrent(live)) return finish('superseded', `verdict-superseded (live=${reviewLabelKey(live.labels)})`);
+    // This run's own view held the human hold: a reconcile it runs may never restore an approval (approvalRestorable).
+    const sawHuman = verdict === 'clear-human' || [...labelNames(labels), ...labelNames(swappedLabels), ...labelNames(live.labels)].includes('review:human');
     const resolvedIdentity = identity ?? readDeliveryIdentity({ env });
     const prAuthor = { login: live.author, type: live.authorType };
     const checked = checkReviewerIdentity({ identity: resolvedIdentity, viewer: readViewer(run), prAuthor });
@@ -699,7 +744,7 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
       if (!writer) {
         try {
           if (!pending) throw new Error('no dismissal queue');
-          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids, at: new Date().toISOString() });
+          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids, ...(sawHuman ? { human: true } : {}), at: new Date().toISOString() });
           queued = ids.length;
           reason = [reason, `dismissal queued for the reviewer App (${unavailable})`].filter(Boolean).join('; ');
         } catch (error) { dismissalErrors.push(`dismissal not queued (${unavailable}): ${failureReason(error)}`); }
@@ -719,7 +764,7 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
     // A failed POST or dismissal may still have landed on GitHub, so any attempted write is re-checked.
     if (writer && (attempted || ids.length)) {
       try {
-        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent });
+        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent, seenReviews: reviews, sawHuman });
         if (settled) return finish(settled.outcome, [reason, settled.reason].filter(Boolean).join('; '), extra);
       } catch (error) {
         return finish('failed', [reason, `verdict unconfirmed after write: ${failureReason(error)}`].filter(Boolean).join('; '), { ...extra, dismissal: plan.dismiss.length ? 'failed' : undefined });
