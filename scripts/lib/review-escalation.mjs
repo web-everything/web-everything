@@ -1919,12 +1919,13 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
     if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
       while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
     }
+    const machineNote = isKnownMachineBody(body)
+      || (isTrustedMarkerAuthor(c) && body.trimStart().startsWith('<!-- approval-prevention-filed:'));
     if (bodySha === null) {
       // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
       // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
       // shape ends the same-sha run, so a later plain accept of that sha cannot revive the clearance (fail closed).
-      if (!isKnownMachineBody(body)
-        && !(isTrustedMarkerAuthor(c) && body.trimStart().startsWith('<!-- approval-prevention-filed:'))) humanInSameShaRun = false;
+      if (!machineNote) humanInSameShaRun = false;
       continue;
     }
     CLEARED_HUMAN_RE.lastIndex = 0;
@@ -1933,12 +1934,35 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
       CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
       bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
     }
-    // A record that is itself a verdict or hold (a changes verdict that quotes a reviewed-sha) also ends the run.
-    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && !isLaterVerdictBody(body)) || bodyHumanCleared;
+    // PR #5237 round 5: carrying the marker does not make a comment an acceptance. A revocation can QUOTE it (in a
+    // fence, a blockquote, a whole line or inline). The run continues only through a recognised acceptance
+    // (`isAcceptRecordBody`) or a machine note; any other marker-bearing comment ends it, like a marker-free one.
+    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && (isAcceptRecordBody(body) || machineNote)
+      && !isLaterVerdictBody(body)) || bodyHumanCleared;
     latestSha = bodySha;
     latestWasHumanCleared = bodyHumanCleared;
   }
   return latestWasHumanCleared || (sameShaCarries && humanInSameShaRun) ? latestSha : null;
+}
+
+/**
+ * The headings of the comments that RECORD an acceptance, as their producers write them on the first line:
+ * `buildVerdictComment` (we:scripts/review-set-label.mjs: accepted, clear-human, restamp) and `buildCarryRecordBody`
+ * (we:scripts/lib/human-clearance-carry.mjs). PR #5237 round 5: a comment that only carries a `reviewed-sha` marker
+ * (a revocation quoting it) is not an acceptance. Missing a heading here fails closed: the comment ends a same-sha
+ * clearance run and cannot be restored from.
+ */
+const ACCEPT_RECORD_HEADINGS = [
+  '✅ review — accepted',
+  '✅ review — `review:human` cleared via the sanctioned path',
+  '📌 review — acceptance re-stamped after a rebase (no new review)',
+  '📌 review — human clearance carried forward (equivalent change after a mechanical refresh, no new review)',
+];
+
+/** Pure: does this comment body open with an acceptance heading (its first non-blank line, exactly)? */
+export function isAcceptRecordBody(body) {
+  const first = String(typeof body === 'string' ? body : '').split('\n').find((l) => l.trim() !== '');
+  return first !== undefined && ACCEPT_RECORD_HEADINGS.includes(first.replace(/\r$/, '').trim());
 }
 
 /** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */

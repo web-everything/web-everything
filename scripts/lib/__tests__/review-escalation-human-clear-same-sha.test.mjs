@@ -46,6 +46,26 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     const verdict = say(`🔁 review — changes requested\n<!-- reviewed-sha: ${X} -->`, 'web-everything');
     expect(parseLatestHumanClearedSha([clear(X), verdict, accept(X)], { sameShaCarries: true })).toBeNull();
   });
+  // PR #5237 round 5 (red team): a revocation that QUOTES the reviewed-sha marker is a marker-bearing record, so it
+  // skipped the marker-free revocation check. Only a recognised acceptance (or a machine note) continues the run now.
+  const quote = `<!-- reviewed-sha: ${X} -->`;
+  it.each([
+    ['fenced quote', `Hold this PR; I revoke my approval.\n\n\`\`\`\n${quote}\n\`\`\``],
+    ['blockquote', `Hold this PR; I revoke my approval.\n> ${quote}`],
+    ['whole-line quote', `Hold this PR; I revoke my approval.\n${quote}`],
+    ['inline quote', `I revoke my approval of ${quote} — hold.`],
+    ['lookalike accept heading', `✅ review — accepted?? No: I revoke it.\n${quote}`],
+  ])('does not carry clearance across a revocation that quotes the marker: %s', (_kind, body) => {
+    const revocation = say(body, 'chalbert');
+    expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
+    expect(parseLatestHumanClearedSha([clear(X), accept(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
+    expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: false })).toBeNull();
+  });
+  it('carries across a plain re-stamp and a machine note that carry the marker', () => {
+    const restamp = say(`📌 review — acceptance re-stamped after a rebase (no new review)\n${quote}`, 'web-everything');
+    const note = say(`🔔 conveyor — note\n${quote}`);
+    expect(parseLatestHumanClearedSha([clear(X), restamp, note, accept(X)], { sameShaCarries: true })).toBe(X);
+  });
   it('still carries across machine notes, and a revocation before the clearance does not matter', () => {
     const note = say('🔒 conveyor fix-begin — claimed by fix-1');
     expect(parseLatestHumanClearedSha([clear(X), note, accept(X)], { sameShaCarries: true })).toBe(X);

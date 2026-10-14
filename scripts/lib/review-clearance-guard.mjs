@@ -5,7 +5,7 @@ import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewCle
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor, isAutomationAuthored } from './marker-authorship.mjs';
-import { parseLatestHumanClearedSha } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, isAcceptRecordBody } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -24,6 +24,18 @@ const starts = (c, marker) => typeof c?.body === 'string' && c.body.split(/\r?\n
 const sameHead = (record, prHead, refHead) => /^[0-9a-f]{40}$/.test(record?.sha ?? '') && record.sha === prHead && record.sha === refHead;
 const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());
+/** Could this comment hold a clearance? Anything but a known machine note or the trusted approval-prevention notice. */
+const holdsClearance = c => !isKnownMachineBody(c?.body)
+  && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.startsWith('<!-- approval-prevention-filed:'));
+/**
+ * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation
+ * that quotes the marker is the latest record too, and it is not a clearance: null, so nothing is restored or
+ * protected from it, and a newer marker-bearing comment of any other kind never lets an older acceptance through.
+ */
+const latestAcceptance = comments => {
+  const record = latestAcceptRecord(comments);
+  return record && isAcceptRecordBody(comments[record.index]?.body) ? record : null;
+};
 
 export function classifyGateFailure({ name, verdict } = {}) {
   if (name === 'review-gate') return { ciBreak: false, kind: 'review-gate', why: 'review-gate reads review labels' };
@@ -91,7 +103,7 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
   if (!enabled(setting)) return no('clearance restoration off');
   const ls = names(labels);
   if (!ls.includes('review:pending') || ['review:accepted', ...holds.filter(l => l !== 'review:pending')].some(l => ls.includes(l))) return no('labels do not permit restoration');
-  const record = latestAcceptRecord(comments);
+  const record = latestAcceptance(comments);
   if (!sameHead(record, prHead, refHead) || !Number.isFinite(Date.parse(record?.at))) return no('same head clearance unproven');
   if (!Array.isArray(reviews) || laterReviewHold(reviews, record.at)) return no('formal reviews unreadable or hold clearance');
   if (!Array.isArray(events)) return no('issue events unreadable');
@@ -101,8 +113,7 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
   if (!rearmComment) return no('no later trusted re-arm');
   if (later.some(c => starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c)
     && c.body.includes(prHead) && Date.parse(at(c)) > Date.parse(at(rearmComment)))) return no('restoration already recorded');
-  if (later.some(c => !rearms.includes(c) && !isKnownMachineBody(c?.body)
-    && !(isTrustedMarkerAuthor(c) && c?.body?.startsWith('<!-- approval-prevention-filed:')))) return no('intervening comment holds clearance');
+  if (later.some(c => !rearms.includes(c) && holdsClearance(c))) return no('intervening comment holds clearance');
   const removals = events.filter(e => e.event === 'unlabeled' && e.label?.name === 'review:accepted');
   if (removals.some(e => !Number.isFinite(Date.parse(at(e))))) return no('unlabel event time unreadable');
   // The re-arm's swap must be the ONLY removal since the clearance. A second one means the acceptance was granted
@@ -131,7 +142,7 @@ export function buildRestoreComment({ head, record, rearm, setting }) {
 
 /** Cheap pre-check (comments only): is there a trusted re-arm after a same-sha accept record, not yet restored? */
 export function mayNeedRestore({ comments, prHead } = {}) {
-  const record = latestAcceptRecord(comments);
+  const record = latestAcceptance(comments);
   if (!record || record.sha !== prHead) return false;
   const later = comments.slice(record.index + 1);
   const last = later.map((c, i) => [c, i]).filter(([c]) => starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c)).at(-1);
@@ -151,13 +162,33 @@ export function readLiveHeads({ repo, pr, runGh = runGhSync, headRefName }) {
   return { prHead: name && name === headRefName ? view?.headRefOid ?? null : null, refHead: ref?.object?.sha ?? null };
 }
 
+/** The PR's whole comment thread, in the shape the deciders read; null when any page fails (never a partial list). */
+export function readPrComments({ repo, pr, runGh = runGhSync }) {
+  const pages = readJson(runGh, repo, ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/comments?per_page=100`]);
+  return Array.isArray(pages)
+    ? pages.flat().map(c => ({ body: c.body, createdAt: c.created_at, author: { login: c.user?.login ?? '' }, url: c.html_url }))
+    : null;
+}
+
+/**
+ * PR #5237 round 5: after a post-write head move, has a NEWER acceptance been recorded for the live head (a push and
+ * a fresh clear-human landing during the restoration)? Then `review:accepted` is that acceptance's label, not ours,
+ * and the rollback must leave it. It must be the latest acceptance record, trusted, name both live heads, be newer
+ * than the record we restored from, and have no comment after it that could hold it. Anything unreadable is false.
+ */
+export function newerAcceptanceOnHead({ comments, record, prHead, refHead } = {}) {
+  if (!Array.isArray(comments)) return false;
+  const latest = latestAcceptance(comments);
+  return !!latest && sameHead(latest, prHead, refHead) && Date.parse(latest.at) > Date.parse(record?.at)
+    && !comments.slice(latest.index + 1).some(holdsClearance);
+}
+
 export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true, revalidate = false }) {
   const read = args => readJson(runGh, repo, args);
   // Every list read is complete (`--paginate --slurp`, flattened); a failed read is null, never a partial list.
   const list = path => { const pages = read(['api', '--paginate', '--slurp', `${path}?per_page=100`]); return Array.isArray(pages) ? pages.flat() : null; };
   const view = read(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName,labels,statusCheckRollup']);
-  const rest = view ? list(`repos/${repo}/issues/${pr}/comments`) : null;
-  const comments = rest && rest.map(c => ({ body: c.body, createdAt: c.created_at, author: { login: c.user?.login ?? '' }, url: c.html_url }));
+  const comments = view ? readPrComments({ repo, pr, runGh }) : null;
   const facts = { prHead: view?.headRefOid ?? null, refHead: null, labels: view?.labels ?? null, comments,
     rows: view?.statusCheckRollup ?? null, reviews: null, events: null };
   // `full: 'if-restore'` (the sweep) pays for reviews / events / the ref read only when a restore is plausible.
@@ -207,7 +238,14 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
       // Read both heads again AFTER the write; if either moved or cannot be read, undo it at once (fail closed) and
       // record nothing, so the new head keeps `review:pending` and its re-review stays owed.
       const after = readLiveHeads({ repo, pr, runGh, headRefName: facts.headRefName });
-      if (!sameHead(restoration.record, after.prHead, after.refHead)) {
+      if (!sameHead(restoration.record, after.prHead, after.refHead)
+        && newerAcceptanceOnHead({ comments: readPrComments({ repo, pr, runGh }), record: restoration.record, ...after })) {
+        // The head moved AND a newer acceptance of the live head was recorded meanwhile: the label is its now. A
+        // clearance comment that lands only after this read is still rolled back (no conditional write exists): the
+        // fail-closed side, a re-review owed, never an approval nobody granted.
+        log(`review-clearance: PR #${pr} restoration superseded — a newer acceptance of ${after.prHead.slice(0, 9)} owns review:accepted; no rollback`);
+        restoration = { restore: false, why: 'a newer acceptance of the live head was recorded during the restoration' };
+      } else if (!sameHead(restoration.record, after.prHead, after.refHead)) {
         try { mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']); }
         catch (e) { throw new Error(`restoration rollback failed after the head moved: ${e.message}`); }
         log(`review-clearance: PR #${pr} restoration undone — head moved or unreadable after the approval write`);
@@ -231,7 +269,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
     };
     const row = collapseRollupToLatestPerName(facts.rows).find(r => r.name === 'merge-gate');
     const rerun = decideStaleGateRerun({ setting: setting('rerunStaleGateOnClearance'), labels: facts.labels,
-      record: latestAcceptRecord(facts.comments), row, rows: facts.rows, verdict: row && failing(row) ? verdictFor(row) : null,
+      record: latestAcceptance(facts.comments), row, rows: facts.rows, verdict: row && failing(row) ? verdictFor(row) : null,
       humanClearedSha: parseLatestHumanClearedSha(facts.comments ?? []), head: facts.prHead });
     if (rerun.rerun && !reruns.has(rerun.jobId)) {
       mutate(['api', '-X', 'POST', `repos/${repo}/actions/jobs/${rerun.jobId}/rerun`]);
@@ -281,7 +319,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
     guardRearm({ pr }) {
       try {
         const facts = readPrClearanceFacts({ repo, pr, runGh });
-        return decideRearmGuard({ ...facts, record: latestAcceptRecord(facts.comments), setting: setting('rearmRequiresHeadChange') });
+        return decideRearmGuard({ ...facts, record: latestAcceptance(facts.comments), setting: setting('rearmRequiresHeadChange') });
       } catch (e) { return { refuse: false, why: `guard error: ${e.message}` }; }
     },
   };

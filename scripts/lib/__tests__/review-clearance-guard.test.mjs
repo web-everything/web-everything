@@ -8,7 +8,7 @@ import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
 import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import {
   REVIEW_CLEARANCE_SETTINGS, REARM_MARKER, resolveReviewClearanceSetting, loadReviewClearanceSetting,
-  classifyGateFailure, failingCiChecks, decideStaleGateRerun, decideRearmGuard,
+  classifyGateFailure, failingCiChecks, decideStaleGateRerun, decideRearmGuard, mayNeedRestore,
   decideClearanceRestore, buildRestoreComment, createReviewClearanceGuard, readPrClearanceFacts,
 } from '../review-clearance-guard.mjs';
 
@@ -95,6 +95,22 @@ describe('#5193 review clearance', () => {
     { events: null }, { events: [] }, { setting: off },
   ])('does not restore with unproven or intervening evidence: %j', patch => {
     expect(decideClearanceRestore({ ...restoreFacts, ...patch }).restore).toBe(false);
+  });
+  // PR #5237 round 5 (red team): a revocation quoting the reviewed-sha marker was picked as the "latest accept
+  // record", so the intervening-comment check never looked at it and restoration cited it as the clearance.
+  const revocations = [
+    ['fenced', `Hold this PR; I revoke my approval.\n\n\`\`\`\n<!-- reviewed-sha: ${head} -->\n\`\`\``],
+    ['whole-line', `Hold this PR; I revoke my approval.\n<!-- reviewed-sha: ${head} -->`],
+  ];
+  it.each(revocations)('does not restore over an operator revocation that quotes the marker (%s)', (_kind, body) => {
+    const thread = [acceptance, comments[1], comment(body, '18:45:00'), rearm];
+    expect(decideClearanceRestore({ ...restoreFacts, comments: thread }).restore).toBe(false);
+    expect(mayNeedRestore({ comments: thread, prHead: head })).toBe(false);
+  });
+  it.each(revocations)('lets a re-arm through after an operator revocation that quotes the marker (%s)', (_kind, body) => {
+    const { runGh } = fakeGh(['review:accepted'], [acceptance, comment(body, '18:45:00')]);
+    const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+    expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
   });
   it('pins the local marker', () => expect(REARM_MARKER).toBe(REARM_COMMENT_MARKER));
   it.each(['chalbert', 'mallory'])('never restores an acceptance removed by %s', login => {
@@ -323,6 +339,41 @@ describe('I/O shell', () => {
         ['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted'],
       ]);
       expect(fake.calls.filter(a => a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
+    // PR #5237 round 5 (red team): a push of Y and a fresh operator clear-human(Y) can land between the approval write
+    // and the post-write head reads. That newer approval owns `review:accepted` now; the rollback must not erase it.
+    const Y = 'b'.repeat(40);
+    const clearY = comment(`✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${Y} -->\n<!-- cleared-human: chalbert -->`, '19:10:00');
+    const rollback = ['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted'];
+    it.each([
+      ['newer clearance of the live head', [clearY], false],
+      ['newer clearance, then a hold comment', [clearY, comment('Hold: one more look.', '19:11:00')], true],
+      ['newer clearance of another head', [{ ...clearY, body: clearY.body.replace(Y, 'c'.repeat(40)) }], true],
+      ['newer clearance by an untrusted author', [{ ...clearY, author: { login: 'mallory' } }], true],
+      ['unreadable comments', null, true],
+    ])('after a post-write head move, rollback honours %s', (_kind, added, rolledBack) => {
+      const fake = fakeGh(restoreFacts.labels);
+      let written = false;
+      const runGh = args => {
+        if (args[0] === 'pr' && args[1] === 'edit') { written = true; return fake.runGh(args); }
+        const result = fake.runGh(args);
+        const path = args.find(a => a.startsWith('repos/')) ?? '';
+        if (written) {
+          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...JSON.parse(result), headRefOid: Y });
+          if (path.includes('/git/ref/')) return JSON.stringify({ object: { sha: Y } });
+          if (path.includes('/comments')) {
+            if (!added) throw new Error('read failed');
+            return JSON.stringify([rest([...comments, ...added])]);
+          }
+        }
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result?.restored).not.toBe(true);
+      expect(fake.calls.filter(a => a[1] === 'edit').some(a => a.join(' ') === rollback.join(' '))).toBe(rolledBack);
+      expect(fake.calls.filter(a => a[1] === 'comment')).toEqual([]);
     });
     it('still checks the head and rolls back when the approval write throws after GitHub applied it', () => {
       const fake = fakeGh(restoreFacts.labels);
