@@ -516,7 +516,7 @@ function dismiss(run, endpoint, id, verdict, head) {
 const QUEUE_MAX_ATTEMPTS = 20;
 const validQueueEntry = entry => entry && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(entry.repo ?? '') && Number.isInteger(entry.pr) && entry.pr > 0
   && /^[0-9a-f]{40}$/.test(entry.head ?? '') && /^[a-z-]{1,32}$/.test(entry.verdict ?? '')
-  && Array.isArray(entry.ids) && entry.ids.length > 0 && entry.ids.every(id => Number.isInteger(id) && id > 0);
+  && Array.isArray(entry.ids) && (entry.ids.length > 0 || entry.unsettled === true) && entry.ids.every(id => Number.isInteger(id) && id > 0);
 
 /** The review states our CURRENT label verdict stands behind; a queued dismissal never removes one of them. Pure. */
 export function endorsedStates(labels) {
@@ -773,10 +773,11 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
         } catch (error) { dismissalErrors.push(`dismissal not queued (${unavailable}): ${failureReason(error)}`); }
       }
     }
+    const failedIds = [];
     if (writer) {
       for (const id of ids) {
         try { dismiss(writer, endpoint, id, verdict, headSha); dismissed++; }
-        catch (error) { dismissalErrors.push(`dismissal ${id}: ${failureReason(error)}`); }
+        catch (error) { failedIds.push(id); dismissalErrors.push(`dismissal ${id}: ${failureReason(error)}`); }
       }
     }
     if (dismissalErrors.length) reason = [reason, ...dismissalErrors].filter(Boolean).join('; ');
@@ -786,12 +787,26 @@ export function mirrorNativeReview({ repo, pr, verdict, labels = [], headSha, sw
     // A queued dismissal is re-checked against the live label when drained; a direct write is re-checked now.
     // A failed POST or dismissal may still have landed on GitHub, so any attempted write is re-checked.
     if (writer && (attempted || ids.length)) {
+      let settled;
+      let threw = false;
       try {
-        const settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent, seenReviews: reviews, sawHuman, dismissedByRun: writer ? ids : [] });
-        if (settled) return finish(settled.outcome, [reason, settled.reason].filter(Boolean).join('; '), extra);
+        settled = settleOnLiveVerdict({ run: writer, endpoint, head: headSha, reviewerLogin, isCurrent: stillCurrent, seenReviews: reviews, sawHuman, dismissedByRun: writer ? ids : [] });
       } catch (error) {
-        return finish('failed', [reason, `verdict unconfirmed after write: ${failureReason(error)}`].filter(Boolean).join('; '), { ...extra, dismissal: plan.dismiss.length ? 'failed' : undefined });
+        threw = true;
+        settled = { outcome: 'failed', reason: `verdict unconfirmed after write: ${failureReason(error)}` };
       }
+      // A dismissal that errored, or a write GitHub is not confirmed to match the label on (a failed POST, a failed
+      // re-check), goes to the queue: the next drain retries the dismissal and reconciles to the live label.
+      const unsettled = (attempted && outcome === 'failed') || settled?.outcome === 'failed';
+      let requeued = '';
+      if (pending && (failedIds.length || unsettled)) {
+        try {
+          pending.append({ v: 1, repo, pr: Number(pr), head: headSha, verdict, ids: failedIds, ...(unsettled ? { unsettled: true } : {}), ...(sawHuman ? { human: true } : {}), at: new Date().toISOString() });
+          requeued = 're-queued for the next drain';
+        } catch (error) { requeued = `not re-queued: ${failureReason(error)}`; }
+      }
+      if (settled) return finish(settled.outcome, [reason, settled.reason, requeued].filter(Boolean).join('; '), threw ? { ...extra, dismissal: plan.dismiss.length ? 'failed' : undefined } : extra);
+      if (requeued) reason = [reason, requeued].filter(Boolean).join('; ');
     }
     return finish(outcome, reason, extra);
   } catch (error) {

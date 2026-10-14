@@ -698,12 +698,43 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     };
     const { appended } = drainWith(gh, [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [5] }], { exec: racing });
     expect(gh.standing()).toBe('none');
-    expect(appended).toEqual([expect.objectContaining({ ids: [5], unsettled: true, attempts: 1 })]);
+    // The run's own advisory write could not be re-checked either, so it is queued beside the drained entry.
+    const drained = appended.filter(e => e.verdict === 'clear-human');
+    expect(drained).toEqual([expect.objectContaining({ ids: [5], unsettled: true, attempts: 1 })]);
     // Next drain: the request is gone and the label endorses it, yet the entry still reconciles to the live label.
-    const { appended: again, lines } = drainWith(gh, appended);
+    const { appended: again, lines } = drainWith(gh, drained);
     expect(gh.standing()).toBe('CHANGES_REQUESTED');
     expect(again).toEqual([]);
     expect(lines.some(l => l.includes('label=clear-human') && l.includes('reconciled: posted REQUEST_CHANGES'))).toBe(true);
+  });
+  it('a direct write left unconfirmed is queued, and the next drain reconciles it to the live label', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('changes') });
+    let failPost = true;
+    const flaky = (argv) => {
+      if (failPost && argv.includes('POST')) { failPost = false; throw Object.assign(new Error('timeout'), { stderr: 'HTTP 502' }); }
+      return gh.exec(argv);
+    };
+    const entries = [];
+    const queue = { append: (e) => { entries.push(e); return true; }, claim: () => ({ entries: entries.splice(0), done: () => {} }) };
+    const base = { repo: 'owner/repo', pr: 123, headSha: head, env: { WE_UNDER_TEST: '1' }, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, queue };
+    const failed = mirrorNativeReview({ ...base, verdict: 'changes', exec: flaky });
+    expect(failed.outcome).toBe('failed');
+    expect(failed.reason).toContain('re-queued for the next drain');
+    expect(entries).toEqual([expect.objectContaining({ verdict: 'changes', ids: [], unsettled: true })]);
+    expect(gh.standing()).toBe('none');
+    mirrorNativeReview({ ...base, verdict: 'advisory', exec: gh.exec });
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(entries).toEqual([]);
+  });
+  it('a direct dismissal that errored is queued with only its failed id', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('rearm') });
+    gh.reviews.push(review(7, 'CHANGES_REQUESTED'), review(8, 'APPROVED', otherHead));
+    const flaky = (argv) => (argv.includes('PUT') && argv[3].endsWith('/7/dismissals') ? (() => { throw new Error('HTTP 500'); })() : gh.exec(argv));
+    const queue = { append: vi.fn(() => true), claim: () => ({ entries: [], done: () => {} }) };
+    const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'rearm', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: flaky, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {}, queue });
+    expect(result.outcome).toBe('failed');
+    expect(queue.append).toHaveBeenCalledWith(expect.objectContaining({ verdict: 'rearm', ids: [7] }));
+    expect(queue.append.mock.calls[0][0].unsettled).toBeUndefined();
   });
   it('an entry for another owner waits for a run there, unchanged; a hopeless one is given up loudly', () => {
     const gh = fakeGithub();
