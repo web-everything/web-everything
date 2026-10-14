@@ -12,7 +12,7 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * test — proof-of-CLI-behavior fixtures, not pure-logic unit tests — so they're slow in a way isolation
  * inside the shared suite can only ever redistribute, never remove. Splitting them into their own run:
  *   - keeps them off the `threads` pool the ~2000-file unit suite shares, so they can't inflate each
- *     other's cost under contention (the original motivation for the handful pinned to `forks` below);
+ *     other's cost under contention (the original motivation for the `forks` pool);
  *   - lets `npm run test:unit` (and everything that shells it — `verify-lane.mjs`'s local gate, `npm test`,
  *     `npm run verify`) skip real git/subprocess cost entirely, including its own "sensitive surface, fall
  *     back to full" case — this file is what still proves the real behavior, in CI, before merge.
@@ -32,13 +32,10 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * way (measured on this branch): left on the default `threads` pool alongside the other ~18 git-fixture
  * files, its two tests that spawn a real full `check-standards.mjs` scan went from 48.4s/39.7s (alone, in
  * the old unit suite) to 83s/72s (contending with everyone else's git subprocess spawns here) — the exact
- * contention problem this whole split exists to solve, recreated one tier down. Since vitest runs separate
- * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), moving it into the isolated
- * `forks` pool below removes it from that contention AND stops it dragging the other ~18 files down, at the
- * cost of queuing behind its 3 forks-pool siblings (all small next to it) rather than the ~18-file `threads`
- * pool. Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
- * longer sharing it, ordinary multi-worker parallelism is enough; they don't need to queue behind one
- * another the way `singleFork` would force.
+ * contention problem this whole split exists to solve, recreated one tier down. Since Vitest runs separate
+ * pools CONCURRENTLY, repository-wide Rust scanner parity checks join the daemon scenarios in the SAME
+ * serial `forks` pool. The remaining files use the `threads` pool with the shared worker ceiling, avoiding
+ * a fully serial tier that exceeded CI's 20-minute job budget while retaining the correctness pins.
  */
 export default defineConfig({
   test: {
@@ -181,8 +178,7 @@ export default defineConfig({
     ],
     // #x1jcikc: default `threads` pool cap (see vitest.shared.ts#maxTestWorkers) — the handful of files
     // above are pinned to the SEPARATE `forks` pool's `singleFork: true` for a correctness reason (flaky
-    // under contention), which this leaves untouched; everything else here still shares the uncapped
-    // `threads` pool today, so it needs the same ceiling `vitest.config.ts` gets.
+    // under contention); everything else here uses the same bounded `threads` pool as `vitest.config.ts`.
     pool: 'threads',
     poolOptions: {
       threads: {
@@ -191,6 +187,9 @@ export default defineConfig({
       },
       forks: {
         singleFork: true,
+        maxForks: maxTestWorkers,
+        // Vitest otherwise defaults the minimum to CPU count - 1, which can exceed our shared ceiling.
+        minForks: 1,
       },
     },
   },

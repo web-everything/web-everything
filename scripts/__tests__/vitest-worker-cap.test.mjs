@@ -56,7 +56,7 @@ describe('every vitest config applies the shared ceiling', () => {
   const read = (f) => readFileSync(resolve(process.cwd(), f), 'utf8');
   it.each([
     ['vitest.config.ts', 'maxThreads: maxTestWorkers'],
-    ['vitest.integration.config.ts', 'maxThreads: maxTestWorkers'],
+    ['vitest.integration.config.ts', 'maxForks: maxTestWorkers'],
     ['vitest.maas-conformance.config.ts', 'maxThreads: maxTestWorkers'],
     ['vitest.soak.config.ts', 'maxForks: maxTestWorkers'],
   ])('%s', (file, needle) => {
@@ -65,8 +65,20 @@ describe('every vitest config applies the shared ceiling', () => {
     expect(src).toContain(needle);
   });
 
-  it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
-    expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  it('keeps the integration fork range valid even when the shared ceiling is one worker', () => {
+    const { minForks, maxForks } = integrationConfig.test.poolOptions.forks;
+    const lowestCeiling = resolveMaxTestWorkers({}, 1);
+    expect(minForks).toBeGreaterThanOrEqual(1);
+    expect(minForks).toBeLessThanOrEqual(lowestCeiling);
+    expect(minForks).toBeLessThanOrEqual(maxForks);
+  });
+
+  it('keeps unpinned integration files in a bounded threads pool instead of serializing the whole tier', () => {
+    const config = integrationConfig.test;
+    expect(config.pool).toBe('threads');
+    expect(config.poolOptions.threads.minThreads).toBe(1);
+    expect(config.poolOptions.threads.maxThreads).toBe(config.poolOptions.forks.maxForks);
+    expect(config.include.some((file) => !config.poolMatchGlobs.some(([glob]) => micromatch.isMatch(file, glob)))).toBe(true);
   });
 
   it('serializes repository-wide scanner parity checks with daemon scenarios', () => {
