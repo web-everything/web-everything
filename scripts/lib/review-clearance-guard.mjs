@@ -131,7 +131,7 @@ export function mayNeedRestore({ comments, prHead } = {}) {
   return !!last && !later.slice(last[1] + 1).some(c => starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c));
 }
 
-export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true }) {
+export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true, revalidate = false }) {
   const read = args => {
     try { return JSON.parse(runGh(args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'review-clearance-read', repo } })); }
     catch { return null; }
@@ -145,9 +145,20 @@ export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true 
     rows: view?.statusCheckRollup ?? null, reviews: null, events: null };
   // `full: 'if-restore'` (the sweep) pays for reviews / events / the ref read only when a restore is plausible.
   if (!view || (full === 'if-restore' && !(comments && mayNeedRestore(facts)))) return facts;
-  const ref = view.headRefName ? read(['api', `repos/${repo}/git/ref/heads/${view.headRefName}`]) : null;
-  return { ...facts, refHead: ref?.object?.sha ?? null,
-    reviews: list(`repos/${repo}/pulls/${pr}/reviews`), events: list(`repos/${repo}/issues/${pr}/events`) };
+  const readRef = () => view.headRefName ? read(['api', `repos/${repo}/git/ref/heads/${view.headRefName}`]) : null;
+  let ref = revalidate ? null : readRef();
+  const reviews = list(`repos/${repo}/pulls/${pr}/reviews`);
+  const events = list(`repos/${repo}/issues/${pr}/events`);
+  if (revalidate) {
+    // List pagination can span a push or a new hold. Read both heads and live labels last,
+    // immediately before the restore decision, rather than trusting the initial view.
+    ref = readRef();
+    const live = read(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName,labels,statusCheckRollup']);
+    facts.prHead = live?.headRefName === view.headRefName ? live?.headRefOid ?? null : null;
+    facts.labels = live?.labels ?? null;
+    facts.rows = live?.statusCheckRollup ?? null;
+  }
+  return { ...facts, refHead: ref?.object?.sha ?? null, reviews, events };
 }
 
 export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdict = readMergeGateVerdict,
@@ -161,8 +172,15 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
   const reruns = new Set();
   const apply = (pr, facts) => {
     const restoreSetting = setting('restoreNoPushRearm');
-    const restoration = decideClearanceRestore({ ...facts, setting: restoreSetting });
+    let restoration = decideClearanceRestore({ ...facts, setting: restoreSetting });
     let restored = false;
+    if (restoration.restore) {
+      const collectedHead = facts.prHead;
+      Object.assign(facts, readPrClearanceFacts({ repo, pr, runGh, revalidate: true }));
+      restoration = facts.prHead === collectedHead
+        ? decideClearanceRestore({ ...facts, setting: restoreSetting })
+        : { restore: false, why: 'head changed or unreadable during restoration validation' };
+    }
     if (restoration.restore) {
       mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']);
       mutate(['pr', 'comment', String(pr), '--repo', repo, '--body', buildRestoreComment({ head: facts.prHead, record: restoration.record, rearm: restoration.rearmComment, setting: restoreSetting })]);

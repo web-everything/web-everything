@@ -5,6 +5,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
+import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import {
   REVIEW_CLEARANCE_SETTINGS, REARM_MARKER, resolveReviewClearanceSetting, loadReviewClearanceSetting,
   classifyGateFailure, failingCiChecks, decideStaleGateRerun, decideRearmGuard,
@@ -190,6 +191,92 @@ function fakeGh(labels = ['review:accepted'], thread = comments) {
   return { calls, runGh };
 }
 describe('I/O shell', () => {
+  it.each(Object.keys(REVIEW_CLEARANCE_SETTINGS))('honours the %s off path', key => {
+    const { calls, runGh } = fakeGh(key === 'restoreNoPushRearm' ? restoreFacts.labels : ['review:accepted']);
+    const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict,
+      loadSetting: ({ key: requested }) => requested === key ? off : on });
+    switch (key) {
+      case 'rerunStaleGateOnClearance':
+        expect(guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })).toMatchObject({ rerun: false });
+        expect(calls.some(a => a.includes('POST'))).toBe(false);
+        break;
+      case 'reviewHoldIsNotCiFailure':
+      case 'ciHealRequiresFailingChecks':
+        expect(guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })).toMatchObject({ launch: true, why: 'CI heal allowed' });
+        break;
+      case 'rearmRequiresHeadChange':
+        expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
+        break;
+      case 'restoreNoPushRearm':
+        expect(guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })).toMatchObject({ restored: false });
+        expect(calls.some(a => a[1] === 'edit' || a[1] === 'comment')).toBe(false);
+        break;
+      case 'humanClearanceSurvivesSameShaAccept': {
+        // This leaf setting belongs to the parser, rather than the I/O guard.
+        const thread = [acceptance, comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, '19:26:00')];
+        expect(parseLatestHumanClearedSha(thread, { sameShaCarries: true })).toBe(head);
+        expect(parseLatestHumanClearedSha(thread, { sameShaCarries: false })).toBeNull();
+        break;
+      }
+      default: throw new Error(`No off-path assertion for ${key}`);
+    }
+  });
+  describe.each(['beforeCiHeal', 'sweep'])('%s restoration revalidation', entryPoint => {
+    it.each(['pr-head', 'ref-head', 'label-hold'])('checks live %s after the refreshed evidence lists', change => {
+      const fake = fakeGh(restoreFacts.labels);
+      let eventReads = 0;
+      const runGh = args => {
+        const result = fake.runGh(args);
+        const path = args.find(a => a.startsWith('repos/')) ?? '';
+        if (path.includes('/events')) eventReads++;
+        if (eventReads >= 2) {
+          if (change === 'ref-head' && path.includes('/git/ref/')) return JSON.stringify({ object: { sha: 'a'.repeat(40) } });
+          if (args[0] === 'pr' && args[1] === 'view') {
+            if (change === 'pr-head') return JSON.stringify({ ...JSON.parse(result), headRefOid: 'a'.repeat(40) });
+            if (change === 'label-hold') return JSON.stringify({ ...JSON.parse(result), labels: [...restoreFacts.labels, 'review:human'] });
+          }
+        }
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(eventReads).toBe(2);
+      expect(result).toMatchObject({ restored: false });
+      expect(fake.calls.filter(a => a[1] === 'edit' || a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
+    it.each(['pr-head', 'ref-head', 'label-hold', 'comment-hold', 'formal-review', 'event-hold',
+      'unreadable-view', 'unreadable-ref', 'unreadable-comments', 'unreadable-reviews', 'unreadable-events'])
+    ('does not restore when the head changes after evidence collection or a hold appears: %s', change => {
+      const fake = fakeGh(restoreFacts.labels);
+      let collected = false;
+      const runGh = args => {
+        const result = fake.runGh(args);
+        const path = args.find(a => a.startsWith('repos/')) ?? '';
+        const view = args[0] === 'pr' && args[1] === 'view';
+        if (collected) {
+          if (change === 'unreadable-view' && view || change === 'unreadable-ref' && path.includes('/git/ref/')
+            || change === 'unreadable-comments' && path.includes('/comments')
+            || change === 'unreadable-reviews' && path.includes('/reviews')
+            || change === 'unreadable-events' && path.includes('/events')) throw new Error('read failed');
+          if (change === 'pr-head' && view) return JSON.stringify({ ...JSON.parse(result), headRefOid: 'a'.repeat(40) });
+          if (change === 'ref-head' && path.includes('/git/ref/')) return JSON.stringify({ object: { sha: 'a'.repeat(40) } });
+          if (change === 'label-hold' && view) return JSON.stringify({ ...JSON.parse(result), labels: [...restoreFacts.labels, 'review:human'] });
+          if (change === 'comment-hold' && path.includes('/comments')) return JSON.stringify([rest([...comments, comment('🔁 review — changes requested', '19:03:00')])]);
+          if (change === 'formal-review' && path.includes('/reviews')) return JSON.stringify([[{ state: 'CHANGES_REQUESTED', submitted_at: '2026-10-13T19:03:00Z', user: { login: 'chalbert' } }]]);
+          if (change === 'event-hold' && path.includes('/events')) return JSON.stringify([[...events, event('labeled', 'review:pending', '19:03:00')]]);
+        }
+        // The first evidence snapshot is stale by the time its final list returns.
+        if (path.includes('/events')) collected = true;
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result).toMatchObject({ restored: false });
+      expect(fake.calls.filter(a => a[1] === 'edit' || a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
+  });
   it('refuses a heal and requests the stale job rerun', async () => {
     const { calls, runGh } = fakeGh();
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on });
