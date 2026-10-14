@@ -46,6 +46,7 @@ describe('exhausted retry', () => {
     expect(basePlan({ aheadBy: 0, now: Date.parse(at) + 12 * 3600000 })).toMatchObject({ action: 'retry', mode: 'rerun', trigger: 'after-hours' });
     expect(basePlan({ retriesUsed: 1 })).toMatchObject({ action: 'needs-you' });
     expect(basePlan({ mainFailureSignature: signature, mainRecoveredForCheck: false })).toMatchObject({ action: 'wait', why: expect.stringContaining('test-timeout') });
+    expect(basePlan({ mainFailureSignature: { matched: false, signature: 'test-timeout' }, mainRecoveredForCheck: false })).toMatchObject({ action: 'wait' });
     expect(basePlan({ mainTip: { sha: mainSha, committedAt: at } }).action).toBe('wait');
   });
   it('counts retry markers across heads, without counting spent markers', () => {

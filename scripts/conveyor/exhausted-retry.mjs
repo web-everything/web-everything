@@ -63,8 +63,9 @@ export function planExhaustedRetry({ facts, retriesUsed = 0, settings, mainTip, 
     ? `; ${mainFailureSignature.matched ? "matches main's own failure" : 'known infra signature'}: ${mainFailureSignature.signature}` : '';
   if (retriesUsed >= settings.maxRetries) return { action: 'needs-you',
     why: `the one automatic retry after exhaustion (${facts.kind}) was already used and the PR is still red — a person must take it over${infra}` };
-  if (mainFailureSignature?.matched && !mainRecoveredForCheck) return { action: 'wait',
-    why: `main still has the same failure; retrying now proves nothing${infra}` };
+  // A known-infra signature (matched on main or not) waits for main's own run of that check to be green again.
+  if (mainFailureSignature?.signature && !mainRecoveredForCheck) return { action: 'wait',
+    why: `main has not shown that check green since this failure; retrying now proves nothing${infra}` };
   const at = Date.parse(facts.at);
   const trigger = settings.onMainMove && aheadBy > 0 && Date.parse(mainTip?.committedAt) > at ? 'main-move'
     : settings.afterHours > 0 && now - at >= settings.afterHours * 3600000 ? 'after-hours' : null;
