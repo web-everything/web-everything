@@ -63,6 +63,7 @@ describe('runner freshness policy', () => {
       [
         "agent-activity",
         "claim",
+        "clear-claim",
         "clear-stuck-session",
         "close-items",
         "daemon-status",
@@ -76,6 +77,7 @@ describe('runner freshness policy', () => {
         "gap-sweep-status",
         "gate-health",
         "graduation-progress-report",
+        "grant-rounds",
         "health-respond",
         "heavy-queue",
         "item-activity",
@@ -91,12 +93,15 @@ describe('runner freshness policy', () => {
         "pr-status",
         "pre-pr-check",
         "priority-sync",
+        "rearm",
         "record-referral-ruling",
         "record-verdict",
+        "refresh",
         "reopen-items",
         "resolve",
         "resource-status",
         "restart-runner",
+        "retry-prepare",
         "revert-red-check",
         "review-pr",
         "review-prep",
@@ -109,7 +114,9 @@ describe('runner freshness policy', () => {
         "stale-state",
         "suggest-next",
         "telemetry-summary",
+        "unpark",
         "verify",
+        "why",
       ]
     `);
     for (const name of ['close-items', 'reopen-items']) {

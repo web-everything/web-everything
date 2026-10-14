@@ -58,7 +58,7 @@ import { healthDir } from './health-watch-section.mjs';
 
 /** The declared read operations the agent may run through `run.mjs` (4078: runner-activity, stale-state,
  *  dispatch-eligibility). Every other operation id is denied — see {@link NON_READ_OPERATIONS}. */
-export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'dispatch-eligibility', 'health-respond']);
+export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'dispatch-eligibility', 'health-respond', 'why']);
 
 /** Every OTHER `run.mjs` operation id, denied by name. A static list (importing `run.mjs` here would pull every
  *  operation's io into the health tick); `health-investigate-dispatch.test.mjs` asserts it covers every id in
@@ -70,6 +70,7 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'graduation-progress-report', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
   'free-scope', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status',
+  'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim',
 ]);
 
 /** Pre-approved commands, as `node <root>/…` prefixes (the agent's cwd is a scratch dir outside any checkout). */

@@ -442,13 +442,13 @@ jobs:
   # test. Now three jobs:
   #   job `daemon-soak-scope` — the path-touch check, run ONCE (not per-shard) so the ~10s no-daemon-code skip
   #                 stays exactly as cheap as it was in the single-job version.
-  #   job `soak-shard`  — a 4-way matrix (`scripts/conveyor/soak/shard-files.mjs`): shard 1 is ALWAYS the 50-tick
+  #   job `soak-shard`  — a 5-way matrix (`scripts/conveyor/soak/shard-files.mjs`): shard 1 is ALWAYS the 50-tick
   #                 baseline alone (it dwarfs any one break scenario, so a blind file-count split would strand it
-  #                 next to a handful of breaks in one shard while the rest sit idle); shards 2-4 round-robin the
-  #                 `breaks/*.soak.test.mjs` files by filename, discovered from disk — a new break scenario (one
+  #                 next to a handful of breaks in one shard while the rest sit idle); shards 2-4 balance the
+  #                 `breaks/*.soak.test.mjs` files by measured time, discovered from disk — a new break scenario (one
   #                 new file) lands in a shard automatically, no shard-list to hand-maintain, so wall time stays
   #                 flat as scenarios grow instead of creeping back up. A matrix job, so its own check names are
-  #                 `soak-shard (1..4)`, NOT required (mirrors `test-shard`'s non-required matrix checks).
+  #                 `soak-shard (1..5)`, NOT required (mirrors `test-shard`'s non-required matrix checks).
   #   job `daemon-soak` — THE required aggregating check, name UNCHANGED: skips in ~10s when `daemon-soak-scope`
   #                 found no daemon code touched (identical observable behavior to before the split), red if the
   #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
@@ -484,7 +484,7 @@ jobs:
           fi
 
   # One shard of the soak: shard 1 is the 50-tick baseline alone, shards 2-4 each get a slice of the break
-  # scenarios (`scripts/conveyor/soak/shard-files.mjs`'s round-robin — see that module's own header for why a
+  # scenarios (`scripts/conveyor/soak/shard-files.mjs`'s timing-based split — see that module's own header for why a
   # blind vitest `--shard` split doesn't work here). `fail-fast: false` mirrors `test-shard`: one shard's break
   # failing must not hide a sibling shard's own result.
   soak-shard:
@@ -493,11 +493,14 @@ jobs:
     runs-on: ubuntu-latest
     # No measured per-shard p95 yet (this split is new) — sized generously pending a first-run sample, same
     # ~3x-p95 method `test-shard` used once IT had data (see that job's own timeout comment above).
+    # Shard 1 is the baseline alone, so the ~133 break scenarios split across the remaining shards: with only
+    # 3 of them (shards 2-4, ~44 files each) a shard ran 13-15 min and hit this cap; 4 (shards 2-5, ~33 files
+    # each, ~10-11 min) leaves headroom.
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
