@@ -182,11 +182,12 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
     if (!state.isolate.includes(num)) return result(false, null, `isolating culprit among ${state.isolate.map(n => `#${n}`).join(',')}`);
     if (state.isolate.some(n => n !== num && inQueue.has(n))) return result(false, null, 'another isolate PR is in queue');
   }
+  // A seen member absent from the queue may have exited. Enqueueing into its group
+  // before observation would hide that exit or blame the newcomer for it.
+  const unobservedExit = g => (g.seen ?? []).some(n => !inQueue.has(n));
   const existing = state.groups.find(g => active(g) && g.prs.includes(num));
-  // A seen PR absent from the queue has exited (the drain only enqueues open PRs).
-  // Re-enqueueing it before observation would hide that ejection from recovery.
-  if (existing?.seen?.includes(num) && !inQueue.has(num)) {
-    return result(false, null, `#${num} left the queue; observe its exit before re-enqueue`);
+  if (existing && !inQueue.has(num) && unobservedExit(existing)) {
+    return result(false, null, `#${(existing.seen ?? []).find(n => !inQueue.has(n))} left the queue; observe its exit before re-enqueue`);
   }
   if (existing) return result(true, existing.id);
   // A PR already in the native queue needs no new admission/group record.
@@ -195,7 +196,7 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
 
   for (const g of state.groups.filter(g => g.status === 'forming')) {
     if (mode === 'grouped' && g.mode === 'grouped' && g.prs.length < settings.groupSize
-      && nowMs - g.openedAtMs <= settings.groupFormMinutes * MINUTE_MS) {
+      && nowMs - g.openedAtMs <= settings.groupFormMinutes * MINUTE_MS && !unobservedExit(g)) {
       g.prs.push(num);
       g.pendingUntilMs ??= {};
       g.pendingUntilMs[num] = nowMs + ADMISSION_GRACE_MS;
@@ -207,6 +208,35 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
   const count = state.groups.filter(active).length;
   if (count >= settings.maxGroupsInFlight) return result(false, null, `queue holds ${count} group(s) (max ${settings.maxGroupsInFlight})`);
   return result(true, openGroup(state, num, nowMs, mode, mode === 'strict' ? 1 : settings.groupSize).id);
+}
+
+// Fail a group whose seen member(s) left the queue unmerged. Shared by observation
+// and by a confirmation that proves an exit happened between gate and enqueue.
+function recordQueueExit({ state, g, ejected, inQueue, merged, closed, nowMs, settings }) {
+  const events = [];
+  g.status = 'failed';
+  g.failedAtMs = nowMs;
+  state.failures.push({ atMs: nowMs, groupId: g.id, prs: [...g.prs] });
+  if (g.mode === 'grouped' && g.prs.length > 1) {
+    const nums = g.prs.filter(n => !merged.has(n) && !closed.has(n));
+    state.isolate = [...new Set([...state.isolate, ...nums])];
+    state.isolateSinceMs ??= {};
+    for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
+    g.recoveryRetired = [...nums];
+    state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), ...nums.filter(n => inQueue.has(n))])];
+    events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) }, { type: 'isolate', nums });
+  } else {
+    for (const num of ejected) {
+      state.culprits.push({ num, atMs: nowMs });
+      state.isolate = state.isolate.filter(n => n !== num);
+      events.push({ type: 'culprit', num });
+    }
+  }
+  if (state.failures.length >= settings.failureThreshold && !(state.strictUntilMs > nowMs)) {
+    state.strictUntilMs = nowMs + settings.strictModeMinutes * MINUTE_MS;
+    events.push({ type: 'strict-on', untilMs: state.strictUntilMs });
+  }
+  return events;
 }
 
 /** PURE: reconcile queue membership and confirmed merges; emit effects for a future IO shell.
@@ -250,28 +280,7 @@ export function observeQueue({ state: input, inQueue, merged, closed = new Set()
     if (g.prs.every(n => merged.has(n))) { g.status = 'done'; g.closedAtMs = nowMs; continue; }
     const ejected = g.prs.filter(n => g.seen.includes(n) && !inQueue.has(n) && !merged.has(n));
     if (!ejected.length) continue;
-    g.status = 'failed';
-    g.failedAtMs = nowMs;
-    state.failures.push({ atMs: nowMs, groupId: g.id, prs: [...g.prs] });
-    if (g.mode === 'grouped' && g.prs.length > 1) {
-      const nums = g.prs.filter(n => !merged.has(n) && !closed.has(n));
-      state.isolate = [...new Set([...state.isolate, ...nums])];
-      state.isolateSinceMs ??= {};
-      for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
-      g.recoveryRetired = [...nums];
-      state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), ...nums.filter(n => inQueue.has(n))])];
-      events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) }, { type: 'isolate', nums });
-    } else {
-      for (const num of ejected) {
-        state.culprits.push({ num, atMs: nowMs });
-        state.isolate = state.isolate.filter(n => n !== num);
-        events.push({ type: 'culprit', num });
-      }
-    }
-    if (state.failures.length >= settings.failureThreshold && !(state.strictUntilMs > nowMs)) {
-      state.strictUntilMs = nowMs + settings.strictModeMinutes * MINUTE_MS;
-      events.push({ type: 'strict-on', untilMs: state.strictUntilMs });
-    }
+    events.push(...recordQueueExit({ state, g, ejected, inQueue, merged, closed, nowMs, settings }));
   }
   expireIsolation(state, nowMs, settings, closed, merged);
   state.groups = state.groups.filter(g => g.status === 'failed'
@@ -324,9 +333,11 @@ function graphql(exec, query, fields = []) {
 export function readQueueFacts({ repo, exec = execFileSync }) {
   try {
     const [owner, name] = repo.split('/');
-    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){nodes{id state pullRequest{id number headRefName headRefOid}}}}}}', [`owner=${owner}`, `name=${name}`]);
+    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{id state pullRequest{id number headRefName headRefOid}}}}}}', [`owner=${owner}`, `name=${name}`]);
     const nodes = data.repository?.mergeQueue?.entries?.nodes;
     if (!Array.isArray(nodes)) throw new Error('unreadable merge queue');
+    // A partial page would make queued PRs look ejected.
+    if (data.repository.mergeQueue.entries.pageInfo?.hasNextPage) throw new Error('merge queue has more than 100 entries');
     const entries = nodes.map(n => {
       if (!n.pullRequest?.id || !Number.isInteger(n.pullRequest.number)) throw new Error('invalid merge queue entry');
       return { id: n.pullRequest.id, num: n.pullRequest.number };
@@ -378,10 +389,17 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
   const transaction = fn => dryRun || !settings.enabled ? fn() : withLock(statePath, fn, { leaseMinutes: Infinity });
   const api = {
     /** Record that `num` really entered GitHub's queue (enqueue succeeded), so a fast ejection counts. */
-    confirm(num, groupId) {
+    confirm(num, groupId, { already } = {}) {
       if (!settings.enabled) return;
       try {
         const state = load();
+        const seenLive = state.groups.find(g => active(g) && g.seen?.includes(num));
+        // A fresh enqueue of a PR already seen in the queue proves it left between
+        // gate and enqueue. Record that exit; the code below then recovers the PR.
+        const exitRecorded = already === false && !!seenLive && (groupId == null || seenLive.id === groupId);
+        if (exitRecorded) {
+          recordQueueExit({ state, g: seenLive, ejected: [num], inQueue: new Set(), merged: new Set(), closed: new Set(), nowMs: nowMs(), settings });
+        }
         const reservation = groupId == null ? null : state.groups.find(g => g.id === groupId);
         const live = state.groups.find(g => active(g) && g.prs.includes(num));
         // An old enqueue cannot confirm a replacement reservation. If its
@@ -401,7 +419,7 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           // Recovery deliberately retired this reservation. A delayed enqueue
           // confirmation is not evidence of an isolated test. A fresh gate
           // creates a distinct group when it makes a new reservation.
-          if (state.groups.some(g => g.recoveryRetired?.includes(num))) return;
+          if (state.groups.some(g => g.recoveryRetired?.includes(num))) { if (exitRecorded) persist(state); return; }
           // An enqueue can finish after its reservation grace expired. Keep a
           // singleton record so even that late confirmation remains observable.
           openGroup(state, num, nowMs(), currentMode(state, nowMs(), settings), 1);
@@ -414,7 +432,14 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
       if (!settings.enabled) return { admit: true };
       try {
         const facts = readQueueFacts({ repo, exec });
-        if (facts.error) throw new Error(facts.error);
+        if (facts.error) {
+          // Fail open, except for a PR seen in the queue: it may have been ejected.
+          if (load().groups.some(g => active(g) && g.seen?.includes(num))) {
+            warn(facts.error);
+            return { admit: false, reason: `#${num} was seen in the queue; queue unreadable`, error: facts.error };
+          }
+          throw new Error(facts.error);
+        }
         const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue });
         persist(result.state);
         const g = result.state.groups.find(g => g.id === result.groupId);

@@ -154,6 +154,16 @@ describe('pure admission', () => {
     const isolated = freeze({ ...empty(), isolate: [1], groups: [group({ mode: 'isolate', prs: [1], seen: [1] })] });
     expect(admit(isolated, 1)).toMatchObject({ admit: false, mode: 'isolate', groupId: null });
     expect(admit(isolated, 1, 0, { inQueue: new Set([1]) })).toMatchObject({ admit: true, groupId: 'g1' });
+    // A pending member is not re-enqueued into a group with an unobserved exit.
+    const pending = freeze({ ...empty(), groups: [group({ seen: [1] })] });
+    expect(admit(pending, 2)).toMatchObject({ admit: false, reason: '#1 left the queue; observe its exit before re-enqueue' });
+  });
+  it('never joins a forming group whose seen member left the queue', () => {
+    const forming = freeze({ ...empty(), groups: [group({ status: 'forming', prs: [1], seen: [1] })] });
+    expect(admit(forming, 3, 0, { inQueue: new Set([1]) })).toMatchObject({ admit: true, groupId: 'g1' });
+    const stale = admit(forming, 3);
+    expect(stale).toMatchObject({ admit: false, reason: 'queue holds 1 group(s) (max 1)' });
+    expect(stale.state.groups[0]).toMatchObject({ prs: [1], status: 'queued' });
   });
   it('supports groupSize one and zero forming time without holding terminal groups', () => {
     const state = { ...empty(), groups: [group({ status: 'done' }), group({ id: 'failed', status: 'failed' })] };
@@ -327,11 +337,11 @@ describe('batching IO shell and drain hook', () => {
     expect(restarted.shell.gate(1).admit).toBe(true);
   });
   it('ignores confirmation retired by recovery but tracks a fresh isolation admission', () => {
-    const queue = [];
+    const queue = [1];
     const h = ioHarness({ state: { ...empty(), groups: [group({ status: 'forming', prs: [1], seen: [1] })] }, queue,
       dequeue: num => queue.splice(queue.indexOf(num), 1) });
     expect(h.shell.gate(2).admit).toBe(true);
-    queue.push(2); // enqueue succeeded; confirmation is delayed
+    queue.splice(0, queue.length, 2); // #1 ejected; #2's enqueue succeeded, confirmation is delayed
     expect(h.shell.observe({}).dequeued).toEqual([2]);
     h.shell.confirm(2);
     expect(h.shell.observe({}).events).toEqual([]);
@@ -356,6 +366,38 @@ describe('batching IO shell and drain hook', () => {
     expect(h.state().isolate).toEqual([1, 2]);
     expect(h.shell.gate(1)).toMatchObject({ admit: true, mode: 'isolate' });
   });
+  it('records an exit that happens between gate and a fresh enqueue', () => {
+    const queue = [1, 2];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    const gate = h.shell.gate(1);
+    expect(gate).toMatchObject({ admit: true, groupId: 'g1' });
+    // #1 is ejected, then the drain's enqueue re-adds it (not `already`).
+    h.shell.confirm(1, gate.groupId, { already: false });
+    expect(h.state().failures).toHaveLength(1);
+    expect(h.state().isolate).toEqual([1, 2]);
+    expect(h.shell.observe({}).dequeued).toEqual([1, 2]);
+    // A PR already in the queue (`already`) is not an exit.
+    const steady = ioHarness({ state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue: [1, 2] });
+    steady.shell.confirm(1, 'g1', { already: true });
+    expect(steady.state().failures).toEqual([]);
+  });
+  it('records a culprit and dequeues a singleton that re-enters between gate and enqueue', () => {
+    const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1], seen: [1] })] }, queue: [1] });
+    h.shell.confirm(1, 'g1', { already: false });
+    expect(h.state().culprits).toEqual([{ num: 1, atMs: minute }]);
+    expect(h.state().pendingDequeues).toEqual([1]);
+  });
+  it('defers a seen PR when the queue is unreadable, failing open for others', () => {
+    const h = ioHarness({ state: { ...empty(), groups: [group({ seen: [1] })] }, failQueue: true });
+    expect(h.shell.gate(1)).toMatchObject({ admit: false });
+    expect(h.shell.gate(3).admit).toBe(true);
+    expect(h.writes).toEqual([]);
+  });
+  it('treats a merge queue beyond one page as unreadable rather than as ejections', () => {
+    const exec = () => JSON.stringify({ data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: true }, nodes: [] } } } } });
+    expect(readQueueFacts({ repo: 'o/r', exec })).toMatchObject({ error: 'merge queue has more than 100 entries' });
+  });
   it('does not let an old confirmation mark a replacement reservation seen', () => {
     const queue = [2];
     const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1, 2], seen: [1] })] }, queue,
@@ -369,10 +411,11 @@ describe('batching IO shell and drain hook', () => {
     expect(h.state().culprits).toEqual([]);
   });
   it('dequeues an enqueue that finishes after recovery observed its reservation', () => {
-    const queue = [];
+    const queue = [1];
     const h = ioHarness({ state: { ...empty(), groups: [group({ prs: [1], seen: [1], status: 'forming' })] }, queue,
       dequeue: num => queue.splice(queue.indexOf(num), 1) });
     const admission = h.shell.gate(2);
+    queue.length = 0; // #1 ejected before #2's enqueue lands
     h.shell.observe({});
     queue.push(2);
     // Recovery catches this even if the enqueue process crashes before confirm.
