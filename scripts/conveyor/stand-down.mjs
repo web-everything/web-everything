@@ -178,33 +178,37 @@ export function standDownHead(body) {
   return /\bHead: ([0-9a-f]{40})\b/.exec(body)?.[1] ?? null;
 }
 
-/** A trusted head-bound hold lapses when a different safe head arrives. */
-export function standDownLapse(comment, headRefOid, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value } = {}) {
+/** A trusted head-bound hold lapses on a new head, or proven red-main-only loop exhaustion. */
+export function standDownLapse(comment, headRefOid, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, redMainLapse } = {}) {
   const body = typeof comment === 'string' ? comment : comment?.body;
-  if (lapseOnNewHead !== 'on' || typeof body !== 'string'
+  if (typeof body !== 'string'
     || !body.trimStart().startsWith(STAND_DOWN_MARKER) || !isTrustedMarkerAuthor(comment)) return null;
   const reason = STAND_DOWN_TRAILER_RE.exec(body)?.[1]?.toLowerCase() ?? null;
   const fromHead = standDownHead(body);
-  if (reason === 'superseded' || !fromHead || !isSafeGitSha(headRefOid)
-    || sameCommit(fromHead.toLowerCase(), headRefOid.toLowerCase())) return null;
+  if (reason === 'superseded' || !fromHead || !isSafeGitSha(headRefOid)) return null;
+  if (sameCommit(fromHead.toLowerCase(), headRefOid.toLowerCase())) {
+    return reason === 'fix-loop-exhausted' && redMainLapse?.(headRefOid) === true
+      ? { fromHead, toHead: headRefOid, reason, lapse: 'red-main-only' } : null;
+  }
+  if (lapseOnNewHead !== 'on') return null;
   return { fromHead, toHead: headRefOid, reason };
 }
 
 const loggedLapses = new Set();
-function logStandDownLapse({ pr, fromHead, toHead }) {
+function logStandDownLapse({ pr, fromHead, toHead, lapse }) {
   const key = `${pr}:${fromHead}:${toHead}`;
   if (loggedLapses.has(key)) return;
   loggedLapses.add(key);
-  console.error(`stand-down: PR #${pr} stand-down for head ${fromHead.slice(0, 7)} lapsed — head moved to ${toHead.slice(0, 7)} (standDown.lapseOnNewHead=on)`);
+  console.error(`stand-down: PR #${pr} stand-down for head ${fromHead.slice(0, 7)} lapsed — ${lapse === 'red-main-only' ? 'its repair attempts all ran while main was red (fix.loopHold.redMainDiscount=on)' : `head moved to ${toHead.slice(0, 7)} (standDown.lapseOnNewHead=on)`}`);
 }
 
 /** Annotate the snapshot; the durable comment thread is unchanged. */
-export function annotateLapsedStandDowns(pr, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, onLapse = logStandDownLapse } = {}) {
+export function annotateLapsedStandDowns(pr, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, onLapse = logStandDownLapse, redMainLapse } = {}) {
   if (!Array.isArray(pr?.comments)) return pr;
   const standDownLapses = [];
   const comments = pr.comments.map((c) => {
     if (c?.standDownLapsed) return c;
-    const lapse = standDownLapse(c, pr.headRefOid, { lapseOnNewHead });
+    const lapse = standDownLapse(c, pr.headRefOid, { lapseOnNewHead, redMainLapse: redMainLapse && (head => redMainLapse(head, pr)) });
     if (!lapse) return c;
     standDownLapses.push(lapse);
     onLapse({ pr: pr.number, ...lapse });

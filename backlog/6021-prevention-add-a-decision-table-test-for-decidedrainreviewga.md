@@ -7,7 +7,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-13"
 preparedDate: "2026-10-13"
-preparedAgainstSha: "e1320124c6b7f6d01e0fe99f5462c6dcd15e9b1d"
+preparedAgainstSha: "7372a0e0a8a7b6ccca4ffffdadaf665980314880"
 tags: []
 ---
 
@@ -47,7 +47,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Design
 
-`decideDrainReviewGate` (we:scripts/merge-ai-prs.mjs:836) decides the drain action from labels plus a file listing. Lines 850-852 compute `filesComplete` as `Array.isArray(files) && readOptions?.filesComplete !== false && (listedHeadSha === undefined || …)`. Both `!== false` and `=== undefined` mean a caller that omits the evidence (the files-only shape) is trusted as a complete, head-matched listing, so the pinned read at 853-861 is skipped. Fix: `filesComplete = Array.isArray(files) && readOptions?.filesComplete === true && !!readOptions.listedHeadSha && (!evidence.headSha || listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase())`. Anything else takes the existing pinned read (`readPinnedChangedFiles`) when `local` and the setting is not `off`; otherwise `decideDrainWorkflowEditHold` (we:scripts/lib/drain-workflow-edit-hold.mjs:32) already treats `filesComplete !== true` as unknown evidence and defers. The `workflowOnly` pre-check (837-839) passes the flag straight through, so it already fails closed on an absent flag. Both production callers (we:scripts/merge-ai-prs.mjs:5288, 5674) pass `workflowReadOptions(v)` (4894) with real `listedFilesComplete` and `listedHeadSha`, so live behavior is unchanged: `listedFilesComplete` is a strict boolean (line 1988) and `listedHeadSha` is a non-empty string or `null` (1983); `null` is already non-complete today (`!!null` is false), so it already takes the pinned read.
+`decideDrainReviewGate` (we:scripts/merge-ai-prs.mjs:836) decides the drain action from labels plus a file listing. Lines 850-852 compute `filesComplete` as `Array.isArray(files) && readOptions?.filesComplete !== false && (listedHeadSha === undefined || …)`. Both `!== false` and `=== undefined` mean a caller that omits the evidence (the files-only shape) is trusted as a complete, head-matched listing, so the pinned read at 853-861 is skipped. Fix: `filesComplete = Array.isArray(files) && readOptions?.filesComplete === true && !!readOptions.listedHeadSha && (!evidence.headSha || listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase())`. Anything else takes the existing pinned read (`readPinnedChangedFiles`) when `local` and the setting is not `off`; otherwise `decideDrainWorkflowEditHold` (we:scripts/lib/drain-workflow-edit-hold.mjs:32) already treats `filesComplete !== true` as unknown evidence and defers. The `workflowOnly` pre-check (837-839) passes the flag straight through, so it already fails closed on an absent flag. Both production callers (we:scripts/merge-ai-prs.mjs:5314, 5700) pass `workflowReadOptions(v)` (4894) with real `listedFilesComplete` and `listedHeadSha`, so live behavior is unchanged: `listedFilesComplete` is a strict boolean (line 1988) and `listedHeadSha` is a non-empty string or `null` (1983); `null` is already non-complete today (`!!null` is false), so it already takes the pinned read.
 
 Guard 1 is a new table test crossing review label (`changes`, `pending`, `human`, `accepted`, none) × files (workflow, non-workflow) with the intended action pinned, built on the `replay` helper in we:scripts/__tests__/drain-workflow-edit-replay.test.mjs:15-24. No `decideReviewGate` reorder (N1).
 
@@ -73,3 +73,4 @@ With the new test file present, `git stash` the one-line fix in we:scripts/merge
 ## Progress
 
 2026-10-13 prepare: premise check — still no decision-table test (existing coverage in we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs:596-690 and the replay test is spot cases only) and lines 850-852 still default-trust. Card cites 845/850; code is now at 836/850. Goal unchanged.
+2026-10-13 re-prepare: stamp was stale (preparedAgainstSha e1320124 vs main 7372a0e0). Re-checked against current main: the gate and lines 850-852 are unchanged; only the two caller citations moved (5288/5674 → 5314/5700), corrected in Design. Re-stamped.

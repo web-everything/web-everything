@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { enrichPrsWithCompleteComments, readCompletePrComments, LIST_COMMENTS_PAGE_SIZE } from '../pr-comments-complete.mjs';
 import { countGrantedRoundExtensions, buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
@@ -68,4 +68,30 @@ it('lapses a #5045 short thread before the reconciler reads it', () => {
   expect(pr.comments[0].standDownLapsed?.toHead).toBe(pr.headRefOid);
   expect(countUnresolvedStandDowns(pr.comments)).toBe(0);
   expect(standDownOf({ ...pr, labels: ['review-status:stood-down'] })).toBeNull();
+});
+
+it('builds red-main context once, lazily, including markers on complete threads', () => {
+  const head = 'a'.repeat(40);
+  const comment = { body: `🛑 conveyor fix — stood down, human judgment needed\n<!-- stand-down reason=fix-loop-exhausted head=${head} -->`, author: { login: 'web-everything' } };
+  const readRows = vi.fn(() => [5195, 5196].flatMap(pr => ['ci-heal', 'park'].map(kind => ({
+    v: 1, repo: 'we', pr, head, kind, reason: 'budget', at: '2026-10-13T22:04:33Z',
+  }))));
+  const readConfig = vi.fn(() => ({ hold: true, maxSessions: 3, windowHours: 6, redMainDiscount: 'on',
+    redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] }));
+  const options = { repo, readRows, readConfig, readComments: () => [comment] };
+  enrichPrsWithCompleteComments([{ number: 1, comments: [] }], options);
+  expect(readRows).not.toHaveBeenCalled();
+  const result = enrichPrsWithCompleteComments([
+    { number: 5195, headRefOid: head, comments: [comment] },
+    { number: 5196, headRefOid: head, comments: filler(100) },
+  ], options);
+  expect(readRows).toHaveBeenCalledTimes(1);
+  expect(readConfig).toHaveBeenCalledTimes(1);
+  expect(result.every(pr => countUnresolvedStandDowns(pr.comments) === 0)).toBe(true);
+  for (const failure of ['readRows', 'readConfig']) {
+    const [held] = enrichPrsWithCompleteComments([{ number: 5195, headRefOid: head, comments: [comment] }], {
+      ...options, [failure]: () => { throw new Error('unreadable'); },
+    });
+    expect(countUnresolvedStandDowns(held.comments)).toBe(1);
+  }
 });

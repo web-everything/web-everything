@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -251,7 +252,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const toolsDir = join(root, 'tools');
   mkdirSync(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy']);
-  for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
+  for (const dir of toolPathDirs()) {
     // The operator's GitHub App shim is live credential state, not a tool directory to enumerate.
     // The world's own fake gh already wins PATH; none of the shim's siblings belong in this world.
     if (/(^|\/)gh-shim\.d(\/|$)/.test(dir)) continue;
@@ -264,7 +265,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    ...isolatedProcessEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
@@ -335,12 +336,6 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
-  delete env.WE_GITHUB_APP_ID;
-  delete env.WE_GITHUB_APP_INSTALLATION_ID;
-  delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
-  delete env.GITHUB_TOKEN;
-  // A launcher can carry a last-good policy from a newer checkout. Use THIS tree's policy in its children.
-  delete env.WE_DISPATCH_ROUTING_SNAPSHOT;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
