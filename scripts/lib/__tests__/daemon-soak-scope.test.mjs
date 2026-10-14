@@ -5,10 +5,13 @@
  * immediately rather than silently drifting (see that module's header comment for why the two can't literally
  * share one string: ci.yml's step runs as plain bash before `npm ci`, so it cannot `import` this file).
  */
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, it, expect } from 'vitest';
+import yaml from 'js-yaml';
 import { DAEMON_SOAK_SCOPE_SOURCE, DAEMON_SOAK_SCOPE_PATTERN, isDaemonSoakScopePath, touchesDaemonSoakScope } from '../daemon-soak-scope.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -58,5 +61,90 @@ describe('daemon-soak-scope', () => {
     // `/…/` literal) — compare against a freshly-built RegExp's `.source`, not the raw string, to avoid a false
     // mismatch on that escaping alone.
     expect(DAEMON_SOAK_SCOPE_PATTERN.source).toBe(new RegExp(DAEMON_SOAK_SCOPE_SOURCE).source);
+  });
+});
+
+// Execute the actual workflow shell with stubbed git output: the PR adds a card while main
+// advances daemon code, and checkout's synthetic merge is distinct from the event's PR head.
+const scopeJob = yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope'];
+const scopeStep = scopeJob.steps.find((step) => step.id === 'scope');
+const baseSha = 'a'.repeat(40);
+const headSha = 'b'.repeat(40);
+
+function runScope({ event = 'pull_request', files = 'backlog/new-card.md', endpointFiles = 'scripts/conveyor/main-only.mjs', renamed = false, gitFails = false } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'we-daemon-scope-'));
+  const output = join(root, 'output');
+  const values = {
+    'github.event_name': event,
+    'github.event.pull_request.base.sha': baseSha,
+    'github.event.pull_request.head.sha': headSha,
+  };
+  const substitute = (value) => String(value).replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, key) => {
+    if (!(key in values)) throw new Error(`unmodelled workflow expression: ${key}`);
+    return values[key];
+  });
+  const script = `
+    git() {
+      if [ "$SCOPE_GIT_FAILS" = true ]; then return 128; fi
+      case " $* " in
+        *" $SCOPE_RANGE "*)
+          case " $* " in
+            *" --no-renames "*) printf '%s\\n' "$SCOPE_FILES" ;;
+            *) printf '%s\\n' "$SCOPE_RENAME_FILES" ;;
+          esac ;;
+        *) printf '%s\\n' "$SCOPE_ENDPOINT_FILES" ;;
+      esac
+    }
+    ${substitute(scopeStep.run)}
+  `;
+  try {
+    const result = spawnSync('bash', ['-e', '-c', script], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...Object.fromEntries(Object.entries(scopeStep.env ?? {}).map(([key, value]) => [key, substitute(value)])),
+        GITHUB_OUTPUT: output,
+        SCOPE_RANGE: `${baseSha}...${headSha}`,
+        SCOPE_FILES: files,
+        SCOPE_RENAME_FILES: renamed ? 'backlog/moved-code.md' : files,
+        SCOPE_ENDPOINT_FILES: endpointFiles,
+        SCOPE_GIT_FAILS: String(gitFails),
+      },
+    });
+    return { ...result, output: result.status === 0 ? readFileSync(output, 'utf8').trim() : '' };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe('daemon-soak scope workflow uses the PR contribution', () => {
+  it('skips a card-only PR despite daemon changes on its divergent base', () => {
+    const result = runScope();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=false');
+  });
+
+  it('runs for daemon edits at the PR head even if the synthetic merge has no endpoint change', () => {
+    const result = runScope({ files: 'scripts/conveyor/pr-edit.mjs', endpointFiles: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
+  });
+
+  it('runs when daemon code is moved outside daemon scope', () => {
+    const result = runScope({ files: 'scripts/conveyor/moved.mjs\nbacklog/moved-code.md', endpointFiles: '', renamed: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
+  });
+
+  it('fails closed when the PR diff cannot be resolved', () => {
+    const result = runScope({ gitFails: true });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toBe('');
+  });
+
+  it.each(['push', 'merge_group', 'workflow_dispatch'])('always runs on %s without resolving a PR diff', (event) => {
+    const result = runScope({ event, gitFails: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
   });
 });

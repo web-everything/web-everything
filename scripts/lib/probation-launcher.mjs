@@ -43,7 +43,7 @@ export const PROBATION_TURN_TIMEOUT_MS = 30 * 60 * 1000;
  *   timeoutMs?: number}} o
  * @returns {string[]}
  */
-export function buildWorkerArgv({ worker, weRoot, dir, taskFile, timeoutMs = PROBATION_TURN_TIMEOUT_MS }) {
+export function buildWorkerArgv({ worker, weRoot, dir, taskFile, timeoutMs = PROBATION_TURN_TIMEOUT_MS, card, pr, caller = 'probation-launcher.mjs' }) {
   if (!PROBATION_LAUNCHERS.includes(worker?.launcher)) {
     throw new TypeError(`probation-launcher: unknown launcher ${JSON.stringify(worker?.launcher)} — one of ${PROBATION_LAUNCHERS.join(', ')}`);
   }
@@ -52,6 +52,7 @@ export function buildWorkerArgv({ worker, weRoot, dir, taskFile, timeoutMs = PRO
   }
   return [
     `${weRoot}/${worker.launcher}`,
+    ...(worker.launcher === 'scripts/codex-direct-task.mjs' ? [`--usage-task-kind=${worker.taskType ?? 'worker'}`, `--caller=${caller}`, ...(card != null ? [`--card=${card}`] : []), ...(pr != null ? [`--pr=${pr}`] : [])] : []),
     `--dir=${dir}`,
     `--task-file=${taskFile}`,
     `--model=${worker.model}`,
@@ -68,9 +69,9 @@ export function buildWorkerArgv({ worker, weRoot, dir, taskFile, timeoutMs = PRO
  * @param {{checker: string, weRoot: string, dir: string, taskFile: string}} o
  * @returns {string[]}
  */
-export function buildCheckerArgv({ checker, weRoot, dir, taskFile }) {
+export function buildCheckerArgv({ checker, weRoot, dir, taskFile, card, pr, caller = 'probation-launcher.mjs' }) {
   if (checker !== 'codex') throw new TypeError(`probation-launcher: unsupported checker ${JSON.stringify(checker)}`);
-  return [`${weRoot}/scripts/codex-direct-task.mjs`, '--review', `--dir=${dir}`, `--task-file=${taskFile}`, '--gate=none', '--json'];
+  return [`${weRoot}/scripts/codex-direct-task.mjs`, '--review', `--dir=${dir}`, `--task-file=${taskFile}`, '--gate=none', '--json', '--usage-task-kind=review-checker', `--caller=${caller}`, ...(card != null ? [`--card=${card}`] : []), ...(pr != null ? [`--pr=${pr}`] : [])];
 }
 
 /**

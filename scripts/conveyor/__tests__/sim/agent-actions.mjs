@@ -14,7 +14,7 @@
  * (`we:scripts/conveyor/__tests__/helpers/fake-gh.mjs`'s `createFakeGithub` — used only by its documented
  * shape, `{openPr, comment, pr, ...}`, never imported from here), `simClone` is the abs path of the daemon's
  * own clone (so `scripts/review-set-label.mjs` etc are run for REAL, as child processes, exactly as the
- * running daemon would), `env` is the scenario's env (fake `PATH`/`HOME`/clock fragment — spread onto every
+ * running daemon would), `env` is the scenario's complete env (fake `PATH`/`HOME`/clock — passed to every
  * child process this file spawns), and `clock` is `./clock.mjs`'s `createSimClock()` return value.
  *
  * TRANSCRIPT-TOUCHING IS THE HUNG-SESSION SIGNAL. Every action here except {@link hang} stamps its session's
@@ -64,7 +64,7 @@ function touchTranscript(ctx, session) {
 function runRealCli(ctx, relPath, args) {
   return execFileSync(process.execPath, [join(ctx.simClone, relPath), ...args], {
     cwd: ctx.simClone,
-    env: { ...process.env, ...ctx.env },
+    env: ctx.env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 30_000,
@@ -367,7 +367,7 @@ export function fail401() {
       let error = null;
       try {
         execFileSync('gh', ['pr', 'view', String(pr), '--repo', slug], {
-          env: { ...process.env, ...ctx.env, GH_TOKEN: token },
+          env: { ...ctx.env, GH_TOKEN: token },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 10_000,
@@ -413,7 +413,7 @@ export function acquireLane({ purpose = 'review-loop' } = {}) {
           join(ctx.simClone, 'scripts', 'lane-pool.mjs'), 'acquire',
           `--purpose=${purpose}`, `--session=${session.name}`, '--json',
         ], {
-          cwd: ctx.simClone, env: { ...process.env, ...ctx.env }, encoding: 'utf8',
+          cwd: ctx.simClone, env: ctx.env, encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
         });
         parsed = JSON.parse(out);
@@ -443,7 +443,7 @@ export function releaseLane() {
           join(ctx.simClone, 'scripts', 'lane-pool.mjs'), 'release',
           `--lane=${lane}`, `--session=${session.name}`,
         ], {
-          cwd: ctx.simClone, env: { ...process.env, ...ctx.env }, encoding: 'utf8',
+          cwd: ctx.simClone, env: ctx.env, encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
         });
       } catch { /* best-effort — a failed release is a lane-pool-health-watch concern, not this action's */ }

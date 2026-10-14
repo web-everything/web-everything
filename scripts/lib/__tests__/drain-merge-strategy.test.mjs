@@ -40,7 +40,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
     dryRun, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
-    cancelObsoleteRuns: () => {},
+    cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
   // `peer` = a second drain process writing the same state file (its own enqueue) at any moment, as `onView` does mid-collect.
@@ -226,7 +226,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     // a transient read error / half-written file: readFile throws something that is not ENOENT
     const s = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'),
-      cancelObsoleteRuns: () => {},
+      cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
       log: { write: (l) => bad.logs.push(l) }, exec: (c, a) => { bad.calls.push([c, ...a]); throw new Error('no gh call expected'); },
       readFile: () => '{"pending": [', writeState: () => { writes++; },
     });

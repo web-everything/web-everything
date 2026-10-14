@@ -1,7 +1,8 @@
 {
-  "$comment": "retryUnstampedOnce: a prepare that ends without stamping the card for an unrecognised reason is re-dispatched once automatically; a second unstamped ending parks the card on the operator queue (needs-you) with both reasons. autoSize: a card held no-size (a task with no estimatedLoc, a story with no size) is routed to the item prepare, which authors the size/estimate from its touch set. Cascade: standard true → platform prepare → this file → env WE_PREPARE_RETRY_UNSTAMPED_ONCE / WE_PREPARE_AUTO_SIZE.",
+  "$comment": "retryUnstampedOnce: a prepare that ends without stamping the card for an unrecognised reason is re-dispatched once automatically; a second unstamped ending parks the card on the operator queue (needs-you) with both reasons. autoSize: a card held no-size (a task with no estimatedLoc, a story with no size) is routed to the item prepare, which authors the size/estimate from its touch set. runner: codex judges item preparation by the card file it edits; scope judges by the future implementation scope; claude always uses the Claude prepare session. Cascade: standard booleans true, runner codex → platform prepare → this file → env WE_PREPARE_RETRY_UNSTAMPED_ONCE / WE_PREPARE_AUTO_SIZE / WE_PREPARE_RUNNER.",
   "prepare": {
     "retryUnstampedOnce": true,
-    "autoSize": true
+    "autoSize": true,
+    "runner": "codex"
   }
 }

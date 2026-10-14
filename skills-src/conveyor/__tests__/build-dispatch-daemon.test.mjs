@@ -1,3 +1,5 @@
+import { resolveCostAdmissionSettings } from '../../../scripts/lib/cost-admission.mjs';
+import { resolvePreparePolicy } from '../../../scripts/conveyor/prepare-policy-settings.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -1650,6 +1652,33 @@ describe('automatic item preparation', () => {
     effects.readPrepareStatus = () => ({ preparedDate: null });
     effects.placePrepareHold = vi.fn();
   }
+  it('forces the Claude prepare fallback from the runner setting', async () => {
+    const effects = fixture();
+    effects.preparePolicy = vi.fn(() => ({ runner: 'claude', sources: { runner: 'tool' } }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.preparePolicy).toHaveBeenCalledTimes(1);
+    expect(tick.prepare).toMatchObject({ runner: 'claude', runnerSource: 'tool' });
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', prepareFallback: true }));
+  });
+  it.each(['off', 'on'].flatMap(mode => [true, false].flatMap(admit =>
+    ['codex', 'scope', 'claude'].map(runner => [mode, admit, runner]))))(
+    'logs prepare runner (cost admission=%s, admit=%s, runner=%s)', async (mode, admit, runner) => {
+      const effects = fixture();
+      const from = runner === 'codex' ? 'standard' : 'tool';
+      effects.preparePolicy = () => resolvePreparePolicy({ tool: runner === 'codex' ? {} : { runner } });
+      effects.hostLoadGate = () => ({ admit, note: 'host available', why: 'host busy' });
+      effects.costFacts = () => ({ cpuIdlePct: admit ? 80 : 0, memFreePct: 80, minMemFreePct: 15 });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const tick = await runBuildDispatchTick({ live: true, effects,
+          policy: { ...BUILD_DISPATCH_POLICY, costAdmission: resolveCostAdmissionSettings({ env: { WE_COST_ADMISSION: mode } }) } });
+        expect(tick.prepare).toMatchObject({ runner, runnerSource: from });
+        const kind = mode === 'on' ? 'prepare-item' : 'prepare';
+        const prefix = `build-dispatch-daemon: ${kind} launch of #4501 ${admit ? 'admitted:' : 'deferred ('}`;
+        expect(log.mock.calls.some(([line]) => line.startsWith(prefix)
+          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from})`))).toBe(true);
+      } finally { log.mockRestore(); }
+    });
   it('passes its tick to dispatch-lane', async () => {
     const effects = fixture();
     const preparePlan = effects.planTick;

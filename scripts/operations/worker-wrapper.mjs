@@ -39,6 +39,7 @@ import {
   writeProductFixDraft,
 } from './worker-result-router.mjs';
 import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
+import { withCodexUsage } from '../lib/codex-usage-ledger.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { markWorkerEnv } from './session-role.mjs';
 
@@ -325,12 +326,13 @@ async function runWorkerOnce(spec, io, stop) {
   let resourceUsage = null;
   const run = async (argv) => {
     try {
-      const out = await spawnToCompletionFn(spec.command, argv, {
+      const launch = () => spawnToCompletionFn(spec.command, argv, {
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
         cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
         stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
       }, { spawnFn: spawnWithPid });
+      const out = spec.launcher === 'codex-exec' ? await withCodexUsage({ model: spec.model ?? (argv.includes('-m') ? argv[argv.indexOf('-m') + 1] : null), effort: spec.effort ?? argv.find(a => a.startsWith('model_reasoning_effort='))?.split('=')[1], taskKind: spec.taskKind ?? spec.role, caller: 'worker-wrapper.mjs', repo: spec.repo, pr: spec.pr, card: spec.item, cwd: spec.cwd }, launch, { env: spec.env ?? process.env }) : await launch();
       stdout = out.stdout; stderr = out.stderr; resourceUsage = out.resourceUsage ?? null;
     } catch (e) {
       failure = e;

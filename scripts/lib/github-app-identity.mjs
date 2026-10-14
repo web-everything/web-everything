@@ -12,12 +12,20 @@
  *   `WE_GITHUB_APP_*` env vars + `we:scripts/lib/github-app-installations.mjs`), so nothing changes before cutover.
  *
  * SETTING `delivery.identity.<role>` → `{ appId, installations: {owner|"owner/repo": installationId}, key, botLogin? }`
- *   `key` is a REFERENCE, never the key: `{file: "/path/key.pem"}` (or a bare path string) or
- *   `{keychain: {service, account?}}` (macOS keychain, read with `/usr/bin/security`). An inline PEM is refused.
+ *   `key` is a REFERENCE, never the key. COMMIT `{name: "plateau-reviewer"}`: a NAME resolved on the host only, as
+ *   `<$WE_GITHUB_APP_KEY_DIR>/<name>.pem` (the dir is set in the daemons' local launchd plists and the operator shell,
+ *   never in the repo; a leading `~` or `$HOME` is expanded from `HOME`, since launchd does not expand it). Dir unset →
+ *   the role is skipped as `key-dir-unset`; file missing → `key-unreadable` — both the LOUD fallback below.
+ *   Back-compat, never committed (a host-local path, operator rule 2026-10-13): `{file: "/path/key.pem"}` (or a bare
+ *   path string) and `{keychain: {service, account?}}` (macOS keychain, `/usr/bin/security`). An inline PEM is refused.
  *   CASCADE, per role (a role's App is atomic — layers never mix one App's id with another's key):
  *     standard (null = today's App) → platform preference (`delivery.identity`) → tool/repo override
  *     (`we:scripts/settings/delivery-identity.json` → `delivery.identity`) → env `WE_DELIVERY_IDENTITY` (JSON
  *     `{role: {...}}`). The effective source of each role is logged once per daemon (shared policy-cascade log).
+ *   PIN: `WE_DELIVERY_IDENTITY=none` ignores the platform and repo layers — every role is today's App (an operator
+ *     kill switch, and the test pin: `we:vitest.setup.ts` sets it so tests reading the real repo settings stay hermetic
+ *     whatever role blocks the repo carries). A `none` in `process.env` pins every read of the REAL settings, even one
+ *     given an explicit `env` (a child env never un-pins this process); an injected `read` is the caller's own settings.
  *
  * WHICH ROLE A PROCESS PLAYS: explicit `role` argument > `WE_GITHUB_APP_ROLE` env > the caller map below (by the
  *   caller name `github-app-auth-env.mjs#defaultAuthCaller` derives: `<script>` or `pass-daemon.mjs:<pass>`) >
@@ -36,6 +44,7 @@
  *
  * Pure apart from {@link readDeliveryIdentity}/{@link readBotLogins} (settings files + env). Never throws.
  */
+import { existsSync } from 'node:fs';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { installationMap, remapLegacyInstallationId, ownerOfSlug } from './github-app-installations.mjs';
@@ -46,6 +55,8 @@ export const LEGACY_ROLE = 'legacy';
 export const ROLE_ENV = 'WE_GITHUB_APP_ROLE';
 export const IDENTITY_ENV = 'WE_DELIVERY_IDENTITY';
 export const BOT_LOGINS_ENV = 'WE_DELIVERY_BOT_LOGINS';
+export const KEY_DIR_ENV = 'WE_GITHUB_APP_KEY_DIR';
+export const IDENTITY_PIN_NONE = 'none';
 export const LEGACY_BOT_LOGINS = Object.freeze(['web-everything', 'web-everything[bot]']);
 
 /**
@@ -97,6 +108,10 @@ const isRole = (r) => GITHUB_APP_ROLES.includes(r);
 function normaliseKeyRef(key) {
   if (typeof key === 'string') key = { file: key };
   if (!isObj(key)) return null;
+  if (key.name !== undefined) {
+    const name = typeof key.name === 'string' ? key.name.trim() : '';
+    return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.includes('..') ? { name } : null;
+  }
   if (typeof key.file === 'string' && key.file.trim() && !key.file.includes('PRIVATE KEY')) return { file: key.file.trim() };
   const kc = key.keychain;
   if (isObj(kc) && typeof kc.service === 'string' && kc.service.trim()) {
@@ -128,9 +143,27 @@ export function normaliseRoleApp(raw) {
   return { appId, installations, key, ...(botLogin ? { botLogin } : {}) };
 }
 
+/**
+ * PURE: a key reference ready to read — `{name}` becomes `{file: <dir>/<name>.pem}` from `WE_GITHUB_APP_KEY_DIR`
+ * (leading `~`/`$HOME`/`${HOME}` expanded from `env.HOME`); `{file}`/`{keychain}` pass through. Null when a name
+ * cannot resolve because the dir is unset. Never touches the filesystem (readability is the caller's check).
+ */
+export function resolveKeyRef(key, env = {}) {
+  if (!isObj(key)) return null;
+  if (key.name === undefined) return key;
+  let dir = String(env?.[KEY_DIR_ENV] ?? '').trim();
+  if (!dir) return null;
+  const home = String(env?.HOME ?? '').trim();
+  const m = dir.match(/^(~|\$HOME|\$\{HOME\})(?=\/|$)/);
+  if (m) { if (!home) return null; dir = home + dir.slice(m[0].length); }
+  return { file: `${dir.replace(/\/+$/, '')}/${key.name}.pem`, name: key.name };
+}
+
+function isPinnedNone(env) { return String(env?.[IDENTITY_ENV] ?? '').trim().toLowerCase() === IDENTITY_PIN_NONE; }
+
 function parseEnvIdentity(env) {
   const raw = String(env?.[IDENTITY_ENV] ?? '').trim();
-  if (!raw) return { value: {}, error: null };
+  if (!raw || raw.toLowerCase() === IDENTITY_PIN_NONE) return { value: {}, error: null };
   try { const v = JSON.parse(raw); return { value: isObj(v) ? v : {}, error: isObj(v) ? null : `${IDENTITY_ENV} is not a JSON object` }; } catch (e) {
     return { value: {}, error: `${IDENTITY_ENV}: ${String(e?.message ?? e).split('\n')[0]}` };
   }
@@ -142,15 +175,17 @@ function parseEnvIdentity(env) {
  * @returns {{roles:Record<string,object|null>, sources:Record<string,string>, invalid:string[], anyConfigured:boolean,
  *   callerRoles:Record<string,string>}}
  */
-export function resolveDeliveryIdentity({ platform = {}, tool = {}, env = {} } = {}) {
+export function resolveDeliveryIdentity({ platform = {}, tool = {}, env = {}, pinned = isPinnedNone(env) } = {}) {
   const envLayer = parseEnvIdentity(env);
   const invalid = envLayer.error ? [envLayer.error] : [];
   const roles = {};
   const sources = {};
+  // Pinned to none: the platform and repo layers are ignored; an explicit env JSON layer still applies.
+  const layers = pinned ? [['env', envLayer.value]] : [['platform', platform], ['tool', tool], ['env', envLayer.value]];
   for (const role of GITHUB_APP_ROLES) {
     roles[role] = null;
-    sources[role] = 'standard';
-    for (const [name, layer] of [['platform', platform], ['tool', tool], ['env', envLayer.value]]) {
+    sources[role] = pinned ? 'pinned-none' : 'standard';
+    for (const [name, layer] of layers) {
       if (!isObj(layer) || layer[role] === undefined || layer[role] === null) continue;
       const app = normaliseRoleApp(layer[role]);
       if (!app) { invalid.push(`${name}.${role}`); continue; }
@@ -159,7 +194,7 @@ export function resolveDeliveryIdentity({ platform = {}, tool = {}, env = {} } =
     }
   }
   const callerRoles = { ...DEFAULT_CALLER_ROLES };
-  for (const layer of [platform, tool, envLayer.value]) {
+  for (const [, layer] of layers) {
     if (!isObj(layer?.callerRoles)) continue;
     for (const [caller, role] of Object.entries(layer.callerRoles)) if (isRole(role)) callerRoles[caller] = role;
   }
@@ -182,7 +217,8 @@ export function readDeliveryIdentity({ env = process.env, read = readSettings } 
     } else tool = cachedTool;
   } catch { tool = {}; }
   try { const p = platformPreference('delivery', { env })?.identity; platform = isObj(p) ? p : {}; } catch { platform = {}; }
-  const resolved = resolveDeliveryIdentity({ platform, tool, env });
+  const pinned = isPinnedNone(env) || (read === readSettings && isPinnedNone(process.env));
+  const resolved = resolveDeliveryIdentity({ platform, tool, env, pinned });
   const shown = Object.fromEntries(GITHUB_APP_ROLES.map((r) => [r, resolved.roles[r] ? `app ${resolved.roles[r].appId}` : "today's App"]));
   logCascadeSources('delivery.identity', { value: shown, sources: resolved.sources, invalid: resolved.invalid }, { env });
   return resolved;
@@ -235,9 +271,12 @@ export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, en
   for (const role of order) {
     const app = id.roles?.[role];
     if (!app) { const skip = { role, reason: id.invalid?.some((s) => s.endsWith(`.${role}`)) ? 'invalid' : 'unconfigured' }; skipped.push(skip); steps.push({ skip }); continue; }
+    const keyRef = resolveKeyRef(app.key, env);
+    // A named key with no host key dir: loud fallback (the role IS configured, this host just cannot reach its key).
+    if (!keyRef) { const skip = { role, reason: 'key-dir-unset' }; skipped.push(skip); steps.push({ skip }); continue; }
     const candidate = {
       role, appId: app.appId, installations: app.installations, installationId: primaryInstallation(app.installations),
-      keyRef: app.key, privateKeyPath: app.key.file ?? `keychain:${app.key.keychain.service}`, cachePath: roleCachePath(cachePath, app.appId),
+      keyRef, privateKeyPath: keyRef.file ?? `keychain:${keyRef.keychain.service}`, cachePath: roleCachePath(cachePath, app.appId),
       required: ROLE_REQUIRED_PERMISSIONS[role],
     };
     candidates.push(candidate);
@@ -328,6 +367,11 @@ if (IS_CLI) {
   const rows = callers.map((caller) => {
     const req = resolveRequestedRole({ role: flag('role'), env: process.env, caller, callerRoles: identity.callerRoles });
     const chain = buildIdentityChain({ requestedRole: req.role, identity, env: process.env, cachePath: '~/.claude/github-app-token/web-everything.json' });
+    // Existence only (never opens the key): a named key whose file is absent falls back at mint time, so say so now.
+    while (chain.candidates[0] && !chain.candidates[0].legacy && chain.candidates[0].keyRef?.name && !existsSync(chain.candidates[0].keyRef.file)) {
+      chain.skipped.unshift({ role: chain.candidates[0].role, reason: 'key-unreadable' });
+      chain.candidates.shift();
+    }
     const first = chain.candidates[0];
     return {
       caller, role: req.role, roleSource: req.source,
