@@ -121,6 +121,7 @@
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -4340,6 +4341,8 @@ async function runCli() {
   // single-couple FAST DRAIN that /pr (pr-land) and /finish (lane-resume) shell so they still feel instant
   // while the drain stays the sole writer to main. Same gated land path as a full sweep, just number-filtered.
   const onlyPr = flags.only != null ? String(flags.only) : (flags.couple != null ? String(flags.couple) : (flags.pr != null ? String(flags.pr) : null));
+  const fastDrain = onlyPr != null ? resolveFastDrainScopeSetting() : { scope: 'full' };
+  if (onlyPr != null) process.stderr.write(`${fastDrain.line}\n`);
   // #2683 — the target repo for `--only=<pr>`. PR numbers are per-repo (WE #12 ≠ FUI #12), so a bare `--only=12`
   // on the DEFAULT constellation scope would match a same-numbered PR in EVERY repo. `--only-repo=<slug>` names
   // the ONE repo the target lives in; absent, the target defaults to the LOCAL (cwd) repo. The full REPOS scope
@@ -4443,6 +4446,8 @@ async function runCli() {
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
   const isLocalRepo = (repo) => repo == null || repo === localSlug; // git-side ops only run against the local clone
+  const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
+  const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
   // #2262 — under `--watch`, `sweepOnce()` (below) runs every `--interval`s FOREVER; memoize which (repo, label)
   // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
@@ -4577,20 +4582,21 @@ async function runCli() {
     // `gh`-supplied refname and a dash-leading one is legal, so bare it is parsed as an option. It reaches TWO
     // calls here: the fetch, and — via `rev` — the `git show` argument, where `git show` accepts diff options
     // including `--output=`. Both guarded.
-    try { execFileSync('git', ['fetch', '--quiet', '--end-of-options', 'origin', headRef], { stdio: ['ignore', 'ignore', 'ignore'] }); } catch { /* ref may be local */ }
+    let fetchSucceeded = false;
+    try { execFileSync('git', ['fetch', '--quiet', '--end-of-options', 'origin', headRef], { stdio: ['ignore', 'ignore', 'ignore'] }); fetchSucceeded = true; } catch { /* ref may be local */ }
     for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
       try {
         const m = JSON.parse(readGit(['show', '--end-of-options', `${rev}:.lane-manifest.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
-        if (m && m.item != null) return m;
+        if (m && m.item != null) return { manifest: m, fetchSucceeded };
       } catch { /* try next rev */ }
     }
-    return null;
+    return { manifest: null, fetchSucceeded };
   });
   // #2417 review — returns `{ manifest, degraded }`. `degraded:true` marks a null that came from a swallowed gh
   // error (a transient failure we couldn't distinguish from truth), so `fetchPrReadsCached` skips caching it and
   // the next `--watch` pass re-fetches instead of latching the degraded read for the head-SHA lifetime. A null
   // from a SUCCESSFUL read (no manifest on the ref — the common orphan/impl case) is `degraded:false`: cache it.
-  const readPrManifest = async (repo, headRef, knownBody) => {
+  const readPrManifest = async (repo, headRef, knownBody, num, headSha) => {
     if (!headRef) return { manifest: null, degraded: false };
     const fromPr = await readManifestFromPrBody(repo, headRef, knownBody);
     if (fromPr.manifest) return { manifest: fromPr.manifest, degraded: false };
@@ -4606,7 +4612,8 @@ async function runCli() {
       // `degraded:true` made `contextComplete` false on EVERY pass with a manifest-less impl PR open.
       return await readRemoteManifestViaApi({ exec: execFileP, repo, headRef });
     }
-    const legacy = await readLegacyLocalManifest(headRef);
+    const legacy = await readLegacyManifestCached({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha,
+      readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef) });
     if (legacy) return { manifest: legacy, degraded: false };
     // Local git fallback found nothing. Post-cutover lanes carry the manifest in the PR BODY (not the tree), so a
     // null here after the PR-body gh read THREW is a spurious degrade — surface `fromPr.degraded` so it re-fetches.
@@ -4638,12 +4645,12 @@ async function runCli() {
     // #gh-graphql-budget — a PR's commit list is fixed by its head SHA, and the resident daemon starts a FRESH
     // process every pass (so the in-process `ctxReadCache`/`sweepReadCache` below start empty each time and
     // re-read every open PR's commits every 60s). Persist a successful read on disk keyed by (repo, PR, head SHA).
-    const cached = readShaCache({ repo, num, sha: headSha, kind: 'commits' });
+    const cached = readShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits' });
     if (Array.isArray(cached)) return { commits: cached, degraded: false };
     try {
       const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       const commits = JSON.parse(stdout.trim() || '{}').commits || [];
-      writeShaCache({ repo, num, sha: headSha, kind: 'commits', value: commits });
+      writeShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits', value: commits });
       return { commits, degraded: false };
     } catch { return { commits: [], degraded: true }; } // gh threw → degraded → re-fetch next pass
   };
@@ -4710,8 +4717,9 @@ async function runCli() {
         shaOf: ({ p }) => prHeadSha(p),
         isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
         fetchOne: async ({ repo, p }) => {
-          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body), fetchPrCommits(repo, p.number, prHeadSha(p))]);
-          return { manifest: manifestRes.manifest, commits: commitsRes.commits, degraded: manifestRes.degraded || commitsRes.degraded };
+          const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
+          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
+          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded };
         },
       });
       const out = new Map();
@@ -4748,7 +4756,7 @@ async function runCli() {
   const CI_LIFECYCLE_OWNED = [CI_LIFECYCLE_LABELS.checking, CI_LIFECYCLE_LABELS.failed, CI_LIFECYCLE_LABELS.blocked];
   const reconcileCiLifecycleLabels = (repo, ctx) => {
     if (!RECONCILE) return [];
-    const open = ctx.prsByRepo.get(repo) || [];
+    const open = fastDrainPrs(repo, ctx.prsByRepo.get(repo) || []);
     // Mint the two NEW labels once per (repo, process) — `ready-to-merge` is minted by pr-land.mjs (the first
     // applier); never re-minted here so its color/description keeps ONE single source. Mirrors the review-label
     // mint below: the WHOLE ensure-loop (including the `ensuredLabels` memoization) is skipped under DRY_RUN, so
@@ -5031,7 +5039,7 @@ async function runCli() {
     shaOf: ({ p }) => prHeadSha(p),
     isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
     fetchOne: async ({ repo, p }) => {
-      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body)]);
+      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
       return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded };
     },
   }));
@@ -5042,7 +5050,7 @@ async function runCli() {
     const settings = resolveRefreshSettings(), log = AS_JSON ? { write() {} } : process.stderr;
     logRefreshSettings(settings, log);
     const repo = REPOS.find(isLocalRepo);
-    if (REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: openPrContext.prsByRepo.get(repo) || [], slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
+    if (REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: fastDrainPrs(repo, openPrContext.prsByRepo.get(repo) || []), slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
   } catch (e) { if (!AS_JSON) process.stderr.write(`renamed-pr-refresh: ${e.message}\n`); }
 
   // #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach→couple-join sequence is now `prepareDrainVerdicts`, the
