@@ -15,6 +15,23 @@ function isExecutedTimeoutRow(row) {
     && isEnvTimeoutRow(row);
 }
 
+// What a timeout row measured: the kind of give-up and the budget it ran out of. Two timeouts on one check are the
+// same measurement only when both match; a kill at another budget (or another give-up kind) proves nothing.
+function timeoutSignature(row) {
+  const detail = String(row.detail ?? '');
+  const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
+  if (killed) return `kill:${killed[1]}`;
+  const scans = [...detail.matchAll(/scan exceeded its (\d+)ms budget/g)].map((m) => m[1]).sort();
+  if (scans.length) return `scan:${scans.join(',')}`;
+  if (/gave up waiting for the shared acquirability-scan lock/.test(detail)) return 'scan-lock';
+  return null;
+}
+
+function sameTimeout(candidateRow, controlRow) {
+  const sig = timeoutSignature(candidateRow);
+  return sig !== null && candidateRow.name === controlRow.name && sig === timeoutSignature(controlRow);
+}
+
 /** Resolve the environment-timeout hold cap through the platform/env policy cascade. Never throws. */
 export function resolveEnvTimeoutHold(env = process.env) {
   try {
@@ -66,11 +83,13 @@ export const envTimeout = Object.freeze({
       const controlTimeouts = c.smokeResult
         ? ctx.failedRows(c.smokeResult).filter(isExecutedTimeoutRow)
         : [];
+      // Equivalent = same check, same kind of timeout, same budget — not merely a failure on the same check name.
       const reproducedOnLastGood = c.smokeResult
-        ? controlTimeouts.filter((r) => failedA.some((f) => f.name === r.name)).map((r) => r.name)
+        ? controlTimeouts.filter((r) => failedA.some((f) => sameTimeout(f, r))).map((r) => r.name)
         : [];
       if (failedA.every(isExecutedTimeoutRow)
-        && ctx.failsSameChecks?.(failedA, controlTimeouts)) {
+        && ctx.failsSameChecks?.(failedA, controlTimeouts)
+        && failedA.every((f) => controlTimeouts.some((r) => sameTimeout(f, r)))) {
         if (ctx.aSuspects?.length) {
           const d = await ctx.dispatchOnly(plan.finalSha, ctx.aSuspects);
           if (!d.result.ok) return ctx.dispatchFailed(d);

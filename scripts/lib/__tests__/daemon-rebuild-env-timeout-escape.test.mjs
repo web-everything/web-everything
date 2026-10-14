@@ -120,6 +120,31 @@ describe('env-timeout hold escape', () => {
     expect(ctx.hold).toHaveBeenCalledWith('smoke-env-timeout', ctx.failedA);
   });
 
+  it.each([
+    ['a different kill budget', { detail: 'reconcile failed: timed out after 30000ms (process group killed)' }],
+    ['a different kind of give-up', { detail: 'lane scan: scan exceeded its 120000ms budget' }],
+    ['a lock give-up', { detail: 'gave up waiting for the shared acquirability-scan lock' }],
+  ])('holds when the control times out on the same check but with %s', async (_label, patch) => {
+    const controlRow = { ...failed[0], ...patch };
+    const ctx = context({ smokeSha: vi.fn().mockResolvedValue({
+      smokeResult: { verdict: 'env-timeout', smoke: { results: [controlRow] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+    expect(ctx.hold).toHaveBeenCalledWith('smoke-env-timeout', ctx.failedA);
+    expect(ctx.alert).toHaveBeenCalledWith('smoke-env-timeout-control-not-equivalent', expect.objectContaining({
+      reproducedOnLastGood: [],
+    }));
+  });
+
+  it('adopts when a scan give-up reproduces with the same budget on every repo', async () => {
+    const scan = { ...failed[0], detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: scan exceeded its 120000ms budget; b: scan exceeded its 60000ms budget' };
+    const candidate = { verdict: 'env-timeout', smoke: { results: [scan] } };
+    const reordered = { ...scan, detail: 'reconcile-pass dry-run failed for 2/2 repo(s): b: scan exceeded its 60000ms budget; a: scan exceeded its 120000ms budget' };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: { verdict: 'env-timeout', smoke: { results: [reordered] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('env-timeout-adopted-not-worse');
+  });
+
   it('does not report a textual control skip as a reproduced timeout', async () => {
     const skipped = { ...failed[0], detail: 'skipped: budget — scan exceeded its 120000ms budget' };
     const ctx = context({ smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [skipped] } } }) });
