@@ -48,7 +48,7 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 // `merge-ai-prs.mjs`), which broke this file's own mocked `node:child_process` test setup. See
 // `we:scripts/conveyor/stuck-pr-dispatch-marker.mjs`'s own header for the full story.
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
-import { standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
+import { standDownComments, standDownReason, annotateLapsedStandDowns, standDownTrailerReason, STAND_DOWN_REASONS } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
@@ -63,6 +63,12 @@ catch (error) { mergeGateVerdictImportError = String(error?.message ?? error).sp
 let standDownAnswers = null;
 try { standDownAnswers = await import('../conveyor/stand-down-answer-core.mjs'); }
 catch { /* Fail safe toward operator judgment. */ }
+// Optional like the siblings below: a staged CLI copy without the settings module keeps the built-in layout.
+let reviewSettings = null;
+try { reviewSettings = await import('../lib/review-settings.mjs'); } catch { /* built-in */ }
+let planRulingResolvedStandDown;
+try { ({ planRulingResolvedStandDown } = await import('../conveyor/ruling-resolved-stand-down.mjs')); }
+catch { /* Staged copies still surface the question without remaining findings. */ }
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
 let rulingLedgerError = null;
@@ -515,6 +521,8 @@ function readPrJson(args, { attempts, sleep, valid }) {
 }
 
 export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
+  const standDownQueueSection = reviewSettings?.resolveReviewSettings().standDownQueueSection ?? 'needs-you';
+  console.error(`operator-queue: standDownQueueSection=${standDownQueueSection} (source: ${reviewSettings ? reviewSettings.resolveReviewSettingSource('standDownQueueSection') : 'built-in'})`);
   const readAttempts = resolveReadAttempts({ env: process.env, file: readSettings() });
   console.error(`operator-queue: read attempts=${readAttempts.value} (source: ${readAttempts.source})`);
   const read = (argv, valid) => readPrJson(argv, { attempts: readAttempts.value, sleep, valid });
@@ -555,7 +563,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   for (const repo of repoSlugs) {
     try {
-      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft';
+      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,body,createdAt';
       const listing = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json'];
       const completePr = (pr) => {
         try {
@@ -629,13 +637,27 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
         if (standDownComments(pr.comments, { headRefOid: pr.headRefOid }).length === 0) continue;
-        const comments = [...pr.comments].sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
-        const latestIndex = comments.findLastIndex((comment) => standDownComments([comment], { headRefOid: pr.headRefOid }).length > 0);
-        const answered = standDownAnswers?.operatorAnswerForStandDown(comments, latestIndex);
-        if (answered) {
-          (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
-            answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
-        } else report.stoodDown.push(standDownRow(repo, pr));
+        const comments = [...annotateLapsedStandDowns(pr, { onLapse: () => {} }).comments]
+          .sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
+        const unresolved = standDownAnswers?.latestUnresolvedStandDown(comments);
+        if (standDownAnswers && !unresolved) {
+          if (standDownAnswers.latestOperatorAnswer(comments)) {
+            (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
+              answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
+          }
+        } else if (unresolved && standDownQueueSection === 'needs-you'
+          && standDownTrailerReason(unresolved.body) === 'needs-judgment') {
+          const reason = standDownReason(unresolved.body) ?? '';
+          const clause = STAND_DOWN_REASONS['needs-judgment'];
+          const question = reason === clause ? '' : reason.startsWith(`${clause}. `) ? reason.slice(clause.length + 2) : reason;
+          const plan = planRulingResolvedStandDown?.({ ...pr, comments }, { repo });
+          (report.needsYouStandDowns ??= []).push({ repo, number: pr.number, title: pr.title,
+            standDownAt: unresolved.createdAt, question, remaining: plan?.action === 'held' ? plan.remaining : [] });
+        } else {
+          report.stoodDown.push(unresolved ? { repo, number: pr.number, title: pr.title,
+            standDownAt: unresolved.createdAt, reason: standDownReason(unresolved.body),
+            alsoReviewHuman: hasLabel(pr, 'review:human') } : standDownRow(repo, pr));
+        }
       }
       // STUCK — INSPECTED (epic #3383's stuck-PR watch): every open PR the watch has already dispatched a
       // diagnosis-only inspection agent for — this costs no extra `gh` call, since `comments` already rode the
@@ -671,7 +693,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):');
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
-        : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).join('\n'));
+        : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
+      + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')

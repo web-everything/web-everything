@@ -152,6 +152,11 @@ const PAUSE_TRAILER_RE = /<!--\s*fix-pause\b([^>]*)-->/;
  *  earlier in the body) can never supply it. */
 const STAND_DOWN_TRAILER_RE = /<!--\s*stand-down reason=([a-z-]+)(?: head=([0-9a-f]{7,40}))?\s*-->\s*$/i;
 
+/** End-anchored machine reason; quoted or embedded trailers do not count. */
+export function standDownTrailerReason(body) {
+  return typeof body === 'string' ? STAND_DOWN_TRAILER_RE.exec(body)?.[1]?.toLowerCase() ?? null : null;
+}
+
 export const STAND_DOWN_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'stand-down.json');
 const onOff = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
 
