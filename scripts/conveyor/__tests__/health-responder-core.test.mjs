@@ -46,6 +46,16 @@ describe('health responder closed decision table', () => {
       expect(decide(i)[0].rule).toBe('owner-refused');
     }
   });
+  it('keeps PR liveness alerts observation-only even with a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'pr-no-movement'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Grant rounds and re-arm review';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
+  });
   it.each(['pending', 'closed', 'flapping'])('holds %s history', (status) => {
     const i = input(); i.episodes[0].status = status;
     expect(decide(i)[0].decision).toBe('hold');
