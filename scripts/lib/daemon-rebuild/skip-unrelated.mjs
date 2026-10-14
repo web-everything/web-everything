@@ -145,25 +145,38 @@ export function collectRunClosure({
   byName = trackedScriptIndex(resolvePath(root)),
 }) {
   const absRoot = resolvePath(root);
+  // Each spawn hop re-walks the growing import graph. Reuse this walk's filesystem reads across
+  // hops and the spawn scan; a new invocation gets fresh caches so later tree moves remain visible.
+  const sources = new Map();
+  const presence = new Map();
+  const readOnce = (path) => {
+    if (!sources.has(path)) sources.set(path, readFile(path));
+    return sources.get(path);
+  };
+  const existsOnce = (path) => {
+    if (!presence.has(path)) presence.set(path, exists(path));
+    return presence.get(path);
+  };
+  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce });
   const walked = new Set(entries);
-  let closure = importClosure({ root, entries: [...walked] });
+  let closure = imports();
   if (!closure) return null;
   const spawnedNames = new Set();
   const scanned = new Set();
   let unreadable = false;
   for (let hop = 0; ; hop++) {
     // package.json's `scripts` entries are commands the daemon (or its npm wrappers) run by name.
-    const unscanned = [...closure.files, ...(hop === 0 && exists(join(absRoot, 'package.json')) ? ['package.json'] : [])]
+    const unscanned = [...closure.files, ...(hop === 0 && existsOnce(join(absRoot, 'package.json')) ? ['package.json'] : [])]
       .filter((f) => !scanned.has(f));
     for (const f of unscanned) scanned.add(f);
-    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned, readFile, exists, byName });
+    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned, readFile: readOnce, exists: existsOnce, byName });
     unreadable ||= bad;
     for (const n of names) spawnedNames.add(n);
     const fresh = [...targets].filter((t) => !closure.files.has(t) && !walked.has(t));
     if (!fresh.length) break;
     if (hop >= MAX_SPAWN_HOPS) { closure = { ...closure, complete: false }; break; }
     for (const t of fresh) walked.add(t);
-    closure = importClosure({ root, entries: [...walked] }) || closure;
+    closure = imports() || closure;
   }
   return { ...closure, complete: closure.complete && !unreadable, spawnedNames };
 }
