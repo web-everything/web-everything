@@ -12,6 +12,9 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 const labelNames = labels => (labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const RELAY_CHANNEL = 'record-referral-ruling (relayed by the conveyor ruling-resolves-stand-down pass)';
 const subjectKey = ({ runId, key }) => JSON.stringify([runId, key]);
+// A missing history is unknown, never proof that review:changes was not re-added.
+const changesLabelEvents = pr => Array.isArray(pr.labelEvents)
+  ? pr.labelEvents.filter(e => ['labeled', 'unlabeled'].includes(e?.event) && e?.label?.name === 'review:changes') : null;
 
 /** Queue and resolver share the gate's outstanding findings, even before any operator ruling. */
 export function remainingStandDownFindings(pr, { repo }) {
@@ -73,6 +76,12 @@ function planPendingRulingLabels(pr, { repo }) {
   });
   // Retry the interrupted write only, never undo a later review/comment on the same head.
   if (index !== pr.comments.length - 1) return null;
+  const events = changesLabelEvents(pr), answerAt = Date.parse(pr.comments[index]?.createdAt);
+  // GitHub timestamps have second precision; equality cannot establish safe ordering.
+  if (!events || !Number.isFinite(answerAt) || events.some(e => {
+    const at = Date.parse(e.created_at);
+    return !Number.isFinite(at) || at >= answerAt;
+  })) return null;
   const comments = pr.comments.slice(0, index);
   const plan = planRulingResolvedStandDown({ ...pr, comments }, { repo });
   return plan?.action === 'resolve' && plan.body === pr.comments[index]?.body ? { ...plan, answerPosted: true } : null;
@@ -83,24 +92,28 @@ const planPass = (pr, options) => planRulingResolvedStandDown(pr, options) ?? pl
 /** IO shell. Post failures retain candidate labels; label failures recover from the durable answer. */
 export async function runRulingResolvesStandDownPass({
   repo = CONSTELLATION_REPOS.we.slug, setting, settingSource,
-  listPrs, readPr, editLabels, postComment, log = console.error,
+  listPrs, readPr, editLabels, postComment, exec = execFileSyncThrottled, log = console.error,
 } = {}) {
   const rows = [];
   const result = () => ({ rows, setting, settingSource });
   if (setting !== 'on') return result();
-  const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const gh = args => exec('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   listPrs ??= () => JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,labels,headRefOid']));
   readPr ??= n => {
-    const pr = JSON.parse(gh(['pr', 'view', String(n), '--repo', repo, '--json', 'number,headRefOid,labels,body,createdAt']));
     // The complete, paged thread: a truncated one could hide a later stand-down or ruling.
-    return { ...pr, comments: readCompletePrComments(n, { repo, exec: execFileSyncThrottled }) };
+    const comments = readCompletePrComments(n, { repo, exec });
+    const pages = JSON.parse(gh(['api', `repos/${repo}/issues/${n}/events?per_page=100`, '--paginate', '--slurp']));
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error('label event history was not returned');
+    // Read the head last, including after posting an answer, immediately before the label write.
+    const pr = JSON.parse(gh(['pr', 'view', String(n), '--repo', repo, '--json', 'number,headRefOid,labels,body,createdAt']));
+    return { ...pr, comments, labelEvents: pages.flat() };
   };
   editLabels ??= (n, { removeLabels, addLabels }) => {
     if (!removeLabels.length && !addLabels.length) return;
     gh(['pr', 'edit', String(n), '--repo', repo,
       ...removeLabels.flatMap(l => ['--remove-label', l]), ...addLabels.flatMap(l => ['--add-label', l])]);
   };
-  postComment ??= (n, body) => execFileSyncThrottled('gh',
+  postComment ??= (n, body) => exec('gh',
     ['pr', 'comment', String(n), '--repo', repo, '--body-file', '-'], { encoding: 'utf8', input: body });
   let prs;
   try { prs = await listPrs(); }
@@ -126,7 +139,25 @@ export async function runRulingResolvesStandDownPass({
         }
         plan = updated;
         if (plan.action === 'resolve') {
+          const beforeEvents = changesLabelEvents(fresh);
+          if (!beforeEvents) {
+            rows.push({ repo, pr, action: 'state-changed', standDownId });
+            continue;
+          }
+          const labelHistory = JSON.stringify(beforeEvents);
           if (!plan.answerPosted) await postComment(pr, plan.body);
+          const beforeWrite = await readPr(pr);
+          if (beforeWrite.headRefOid !== plan.head) {
+            rows.push({ repo, pr, action: 'head-moved', standDownId });
+            continue;
+          }
+          const writePlan = planPass(beforeWrite, { repo });
+          if (!writePlan || writePlan.action !== 'resolve' || writePlan.standDownId !== standDownId
+            || writePlan.body !== plan.body || JSON.stringify(changesLabelEvents(beforeWrite)) !== labelHistory) {
+            rows.push({ repo, pr, action: 'state-changed', standDownId });
+            continue;
+          }
+          plan = writePlan;
           await editLabels(pr, plan);
         }
       }

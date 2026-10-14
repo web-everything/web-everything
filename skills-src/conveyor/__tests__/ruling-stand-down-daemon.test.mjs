@@ -15,7 +15,11 @@ it('runs the injected ruling half even with auth paused, forwarding results', as
   expect(rulingStandDownTick).toHaveBeenCalledOnce();
   expect(rulingStandDownTick.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', setting: 'on' });
   expect(result.rulingStandDown.rows).toHaveLength(1);
-  expect(result.dispatched).toContainEqual(expect.objectContaining({ pr: 7, action: 'resolve' }));
+  expect(result.dispatched).toEqual([]);
+  const error = vi.fn();
+  const { buildCliDaemonEffects } = await import('../reconcile-fix-dispatch-daemon.mjs');
+  buildCliDaemonEffects({ owner: 'test', log: { error } }).onTick(result);
+  expect(error.mock.calls.flat()).toContain('reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 0');
 });
 it('logs the setting source and each held or resolved row', async () => {
   const { buildCliDaemonEffects } = await import('../reconcile-fix-dispatch-daemon.mjs');

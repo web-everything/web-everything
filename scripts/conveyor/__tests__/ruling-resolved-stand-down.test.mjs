@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildStandDownComment, standDownFindingRefs, standDownHead, standDownTrailerReason } from '../stand-down.mjs';
 import { buildOperatorAnswer, parseOperatorAnswer, latestUnresolvedStandDown } from '../stand-down-answer-core.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord, readReferralRecords, parseOperatorRulingComment } from '../../lib/jury-core.mjs';
@@ -6,6 +7,12 @@ import { planRulingResolvedStandDown, runRulingResolvesStandDownPass } from '../
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../lib/review-settings.mjs';
 
 const repo = 'o/r', head = 'a'.repeat(40);
+it('the fixer brief binds its needs-judgment stand-down to explicit finding refs', () => {
+  const brief = readFileSync('skills-src/conveyor/fix-agent-brief.md', 'utf8').replace(/\\\r?\n/g, '');
+  const commands = brief.match(/node[^\n]*stand-down\.mjs[^\n]*--reason=needs-judgment[^\n]*/g);
+  expect(commands).not.toBeNull();
+  for (const command of commands) expect(command).toContain('--finding-refs=');
+});
 const comment = (id, body, login = 'web-everything') => ({ id, body, author: { login }, createdAt: `2026-10-04T14:00:0${id}Z` });
 function fixture({ second = false, file = 'scripts/y.mjs', actor = 'chalbert', reason = 'needs-judgment', bound = true } = {}) {
   const seat = 'judgeCorrectnessAdvisory', runId = 'review-pr-1';
@@ -18,7 +25,7 @@ function fixture({ second = false, file = 'scripts/y.mjs', actor = 'chalbert', r
       reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'checked', evidence: ['diff'] })) };
   const record = { version: 1, repo, pr: 7, head, actor, channel: 'chat', reason: 'Not real',
     at: '2026-10-04T14:00:03Z', clearerId: 'session-1', rulings: [{ runId, key: referrals[0].key, result: actor === 'auto-policy' ? 'block' : 'not-real' }] };
-  return { number: 7, headRefOid: head, labels: ['review:changes', 'review:human'], body: rec.authorBody,
+  return { number: 7, headRefOid: head, labels: ['review:changes', 'review:human'], labelEvents: [], body: rec.authorBody,
     createdAt: '2026-10-04T13:00:00Z', comments: [comment(1, renderReferralRecord(rec)),
       comment(2, buildStandDownComment({ reason, detail: 'Please rule not-real.',
         findingRefs: bound && reason === 'needs-judgment' ? [{ runId, key: referrals[0].key }] : undefined })),
@@ -189,4 +196,78 @@ it('does not use a prior relay to remove labels after a newer review', async () 
   await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
     postComment: () => writes.push('answer'), editLabels: () => writes.push('labels'), log: () => {} });
   expect(writes).toEqual([]);
+});
+it('does not use a prior relay after review:changes was re-added without a comment', async () => {
+  const pr = fixture();
+  pr.comments.push(comment(4, planRulingResolvedStandDown(pr, { repo }).body));
+  pr.labelEvents = [{ event: 'labeled', label: { name: 'review:changes' }, created_at: '2026-10-04T14:00:05Z' }];
+  const writes = [];
+  await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
+    postComment: () => writes.push('answer'), editLabels: () => writes.push('labels'), log: () => {} });
+  expect(writes).toEqual([]);
+});
+it.each(['missing', 'malformed', 'same-second', 'later-unlabel'])('fails closed on %s label history during recovery', async (state) => {
+  const pr = fixture();
+  pr.comments.push(comment(4, planRulingResolvedStandDown(pr, { repo }).body));
+  if (state === 'missing') delete pr.labelEvents;
+  else pr.labelEvents = [{ event: state === 'later-unlabel' ? 'unlabeled' : 'labeled', label: { name: 'review:changes' },
+    created_at: state === 'malformed' ? 'unknown' : `2026-10-04T14:00:0${state === 'same-second' ? 4 : 5}Z` }];
+  const writes = [];
+  await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
+    postComment: () => writes.push('answer'), editLabels: () => writes.push('labels'), log: () => {} });
+  expect(writes).toEqual([]);
+});
+it('recovers failed labels when their complete history predates the answer', async () => {
+  const pr = fixture();
+  pr.comments.push(comment(4, planRulingResolvedStandDown(pr, { repo }).body));
+  pr.labelEvents = [{ event: 'labeled', label: { name: 'review:changes' }, created_at: '2026-10-04T14:00:01Z' }];
+  const writes = [];
+  await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
+    postComment: () => writes.push('answer'), editLabels: () => writes.push('labels'), log: () => {} });
+  expect(writes).toEqual(['labels']);
+});
+it.each(['new-review', 'relabel'])('holds when %s arrives during the answer post', async (state) => {
+  const pr = fixture(), writes = [];
+  const result = await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
+    postComment: (_n, body) => {
+      pr.comments.push(comment(4, body));
+      if (state === 'new-review') pr.comments.push(comment(5, 'New review requests changes.'));
+      else pr.labelEvents.push({ event: 'labeled', label: { name: 'review:changes' }, created_at: '2026-10-04T14:00:03Z' });
+    }, editLabels: () => writes.push('labels'), log: () => {} });
+  expect(writes).toEqual([]);
+  expect(result.rows).toMatchObject([{ action: 'state-changed' }]);
+});
+it('holds when the head moves during the answer post', async () => {
+  const pr = fixture(), writes = [];
+  const result = await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], readPr: () => pr,
+    postComment: (_n, body) => { pr.comments.push(comment(4, body)); pr.headRefOid = 'b'.repeat(40); },
+    editLabels: () => writes.push('labels'), log: () => {} });
+  expect(writes).toEqual([]);
+  expect(result.rows).toMatchObject([{ action: 'head-moved' }]);
+});
+it.each(['paged-relabel', 'unreadable', 'malformed-pages', 'post-head-moved'])('the production reader fails closed for %s', async (state) => {
+  const pr = fixture(), calls = [];
+  if (state !== 'post-head-moved') pr.comments.push(comment(4, planRulingResolvedStandDown(pr, { repo }).body));
+  const escape = s => s.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+  const exec = (_file, args, options) => {
+    calls.push(args);
+    if (args.includes(`repos/${repo}/issues/7/comments`)) return pr.comments.map(c =>
+      [c.body, c.createdAt, c.author.login, String(c.id)].map(escape).join('\t')).join('\n');
+    if (args.includes(`repos/${repo}/issues/7/events?per_page=100`)) {
+      expect(args).toContain('--paginate'); expect(args).toContain('--slurp');
+      if (state === 'unreadable') throw new Error('events unavailable');
+      if (state === 'malformed-pages') return '{}';
+      return JSON.stringify(state === 'paged-relabel'
+        ? [[], [{ event: 'labeled', label: { name: 'review:changes' }, created_at: '2026-10-04T14:00:05Z' }]] : [[]]);
+    }
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(pr);
+    if (args[0] === 'pr' && args[1] === 'comment') {
+      pr.comments.push(comment(4, options.input)); pr.headRefOid = 'b'.repeat(40); return '';
+    }
+    throw new Error(`Unexpected write: ${args.join(' ')}`);
+  };
+  const result = await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr], exec, log: () => {} });
+  expect(calls.some(args => args[1] === 'edit')).toBe(false);
+  if (state === 'post-head-moved') expect(result.rows).toMatchObject([{ action: 'head-moved' }]);
+  if (state === 'unreadable' || state === 'malformed-pages') expect(result.rows).toMatchObject([{ action: 'error' }]);
 });
