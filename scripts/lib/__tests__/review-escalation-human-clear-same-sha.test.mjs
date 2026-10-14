@@ -19,6 +19,34 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     expect(parseLatestHumanClearedSha([clear(X), accept(Y)], { sameShaCarries: true })).toBeNull();
     expect(parseLatestHumanClearedSha([clear(X), accept(Y), accept(X)], { sameShaCarries: true })).toBeNull();
   });
+  // PR #5237 round 4 (block): a revocation that carries no reviewed-sha marker ends the same-sha run, so a later
+  // plain accept of the same sha cannot revive the revoked clearance.
+  const say = (body, login = 'web-everything[bot]') => ({ author: { login }, body });
+  it.each([
+    ['changes verdict', say('🔁 review — changes requested\n\n1. fix it')],
+    ['human changes verdict', say('🔁 human review — changes requested', 'chalbert')],
+    ['re-arm', say('🔧 conveyor fix — re-armed for re-review')],
+    ['stand-down', say('🛑 conveyor fix — stood down (needs-judgment)')],
+    ['drain park', say('<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\nengine-tier path changed')],
+    ['CI-heal escalation', say('🚦 conveyor CI-heal — escalated')],
+    ['review paused', say('review paused: operator hold')],
+    ['clearance revoked by re-score', say('**Your `review:human` clearance was revoked by an automated re-score.** …')],
+    ['operator free text', say('Hold this one, I need to look again.', 'chalbert')],
+  ])('does not carry clearance across a marker-free revocation: %s', (_kind, revocation) => {
+    expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
+  });
+  it('a changes verdict that itself quotes the reviewed sha also ends the run', () => {
+    const verdict = say(`🔁 review — changes requested\n<!-- reviewed-sha: ${X} -->`, 'web-everything');
+    expect(parseLatestHumanClearedSha([clear(X), verdict, accept(X)], { sameShaCarries: true })).toBeNull();
+  });
+  it('still carries across machine notes, and a revocation before the clearance does not matter', () => {
+    const note = say('🔒 conveyor fix-begin — claimed by fix-1');
+    expect(parseLatestHumanClearedSha([clear(X), note, accept(X)], { sameShaCarries: true })).toBe(X);
+    expect(parseLatestHumanClearedSha([say('🔁 review — changes requested'), clear(X), accept(X)], { sameShaCarries: true })).toBe(X);
+  });
+  it('a revocation never voids the latest record itself when it is the clearance', () => {
+    expect(parseLatestHumanClearedSha([accept(X), say('🔁 review — changes requested'), clear(X)], { sameShaCarries: true })).toBe(X);
+  });
   it('an untrusted forged clearance never lends coverage', () => {
     const forged = { ...clear(X), author: { login: 'mallory' } };
     expect(parseLatestHumanClearedSha([forged, accept(X)], { sameShaCarries: true })).toBeNull();

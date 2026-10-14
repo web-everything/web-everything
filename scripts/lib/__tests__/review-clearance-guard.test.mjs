@@ -106,6 +106,25 @@ describe('#5193 review clearance', () => {
     expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
       event('labeled', 'review:pending', '19:03:00', login)] }).restore).toBe(false);
   });
+  it('honours a re-grant and second acceptance removal by the removal actor inside the swap second', () => {
+    // The same actor that removed the acceptance re-granted it and removed it again: an explicit later hold,
+    // even though every event shares the original swap's actor and timestamp.
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
+      event('labeled', 'review:accepted', '19:02:57'), event('unlabeled', 'review:accepted', '19:02:57')] }).restore).toBe(false);
+  });
+  it.each(['web-everything[bot]', 'chalbert'])('honours a re-grant by %s then a later removal by the removal actor', login => {
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
+      event('labeled', 'review:accepted', '19:03:30', login), event('unlabeled', 'review:accepted', '19:04:00')] }).restore).toBe(false);
+  });
+  it.each(['web-everything[bot]', 'chalbert'])('honours a pending release and re-hold by %s after the swap', login => {
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
+      event('unlabeled', 'review:pending', '19:03:30', login), event('labeled', 'review:pending', '19:03:31', login)] }).restore).toBe(false);
+  });
+  it('permits the original swap when its pending label lands just after the removal', () => {
+    // Live shape: GitHub can stamp the re-arm's `labeled review:pending` a second after its `unlabeled review:accepted`.
+    expect(decideClearanceRestore({ ...restoreFacts, events: [...events.slice(0, 3),
+      event('labeled', 'review:pending', '19:02:58')] }).restore).toBe(true);
+  });
   it('honours a second pending event even within the original swap timestamp', () => {
     expect(decideClearanceRestore({ ...restoreFacts, events: [...events,
       event('labeled', 'review:pending', '19:02:57')] }).restore).toBe(false);
@@ -275,6 +294,35 @@ describe('I/O shell', () => {
         : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
       expect(result).toMatchObject({ restored: false });
       expect(fake.calls.filter(a => a[1] === 'edit' || a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
+  });
+  describe.each(['beforeCiHeal', 'sweep'])('%s approval-write revalidation', entryPoint => {
+    it.each(['pr-head', 'ref-head', 'unreadable-view', 'unreadable-ref'])
+    ('does not restore when the head changes between the final read and the approval write: %s', change => {
+      const fake = fakeGh(restoreFacts.labels);
+      let written = false;
+      const runGh = args => {
+        if (args[0] === 'pr' && args[1] === 'edit') { written = true; return fake.runGh(args); }
+        const result = fake.runGh(args);
+        const path = args.find(a => a.startsWith('repos/')) ?? '';
+        const view = args[0] === 'pr' && args[1] === 'view';
+        if (written) {
+          if (change === 'unreadable-view' && view || change === 'unreadable-ref' && path.includes('/git/ref/')) throw new Error('read failed');
+          if (change === 'pr-head' && view) return JSON.stringify({ ...JSON.parse(result), headRefOid: 'a'.repeat(40) });
+          if (change === 'ref-head' && path.includes('/git/ref/')) return JSON.stringify({ object: { sha: 'a'.repeat(40) } });
+        }
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result).toMatchObject({ restored: false });
+      // The approval write is undone at once: pending back on, acceptance off. No restore record, no gate re-run.
+      expect(fake.calls.filter(a => a[1] === 'edit')).toEqual([
+        ['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending'],
+        ['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted'],
+      ]);
+      expect(fake.calls.filter(a => a[1] === 'comment' || a.includes('POST'))).toEqual([]);
     });
   });
   it('refuses a heal and requests the stale job rerun', async () => {

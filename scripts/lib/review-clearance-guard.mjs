@@ -15,6 +15,8 @@ let sweepOffset = 0;
 export const REARM_MARKER = '🔧 conveyor fix — re-armed for re-review';
 const RESTORE_MARKER = '🔔 conveyor — review clearance restored (no push since the clearance)';
 const holds = ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'];
+/** One `gh pr edit` swap: its unlabel and label events can be stamped a few seconds apart. */
+const SWAP_SKEW_MS = 10_000;
 const enabled = setting => (typeof setting === 'string' ? setting : setting?.value) === 'on';
 const names = labels => Array.isArray(labels) ? labels.map(l => typeof l === 'string' ? l : l?.name) : [];
 const at = c => c?.createdAt ?? c?.created_at;
@@ -103,18 +105,23 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
     && !(isTrustedMarkerAuthor(c) && c?.body?.startsWith('<!-- approval-prevention-filed:')))) return no('intervening comment holds clearance');
   const removals = events.filter(e => e.event === 'unlabeled' && e.label?.name === 'review:accepted');
   if (removals.some(e => !Number.isFinite(Date.parse(at(e))))) return no('unlabel event time unreadable');
-  const removal = removals.sort((a, b) => Date.parse(at(a)) - Date.parse(at(b))).at(-1);
+  // The re-arm's swap must be the ONLY removal since the clearance. A second one means the acceptance was granted
+  // again and taken away again: a later decision, whoever made it and however close in time (PR #5237 round 4).
+  const sinceClearance = removals.filter(e => Date.parse(at(e)) > Date.parse(record.at));
+  if (sinceClearance.length > 1) return no('acceptance removed more than once since the clearance');
+  const removal = sinceClearance[0];
   const login = removal?.actor?.login;
-  if (!login || !isAutomationAuthored({ author: { login } }) || !(Date.parse(at(removal)) > Date.parse(record.at))
+  if (!login || !isAutomationAuthored({ author: { login } })
     || !rearms.some(c => Math.abs(Date.parse(at(c)) - Date.parse(at(removal))) <= 180_000)) return no('accepted removal not tied to trusted re-arm');
-  // Only the original automated pending swap is exempt. Actor equality alone cannot prove that a later
-  // label event belongs to that swap: a subsequent hold from the same identity is still a revocation.
-  const originalPending = events.find(e => e.event === 'labeled' && e.label?.name === 'review:pending'
-    && Date.parse(at(e)) === Date.parse(at(removal))
-    && String(e.actor?.login ?? '').toLowerCase() === login.toLowerCase());
+  // Exactly one hold event is exempt: the swap's own automated `labeled review:pending`, the first one within a few
+  // seconds of the removal (GitHub can stamp it a second apart). It is chosen by position, never by actor identity,
+  // so any further hold label after the clearance — by the same identity or another — still revokes.
+  const swapPending = events.find(e => e.event === 'labeled' && e.label?.name === 'review:pending'
+    && Math.abs(Date.parse(at(e)) - Date.parse(at(removal))) <= SWAP_SKEW_MS
+    && isAutomationAuthored({ author: { login: e.actor?.login ?? '' } }));
   if (events.some(e => e.event === 'labeled' && holds.includes(e.label?.name)
     && (!Number.isFinite(Date.parse(at(e))) || Date.parse(at(e)) > Date.parse(record.at))
-    && e !== originalPending)) return no('intervening label hold');
+    && e !== swapPending)) return no('intervening label hold');
   return { restore: true, record: { ...record, url: comments[record.index]?.url }, rearmComment, why: 'trusted no-push re-arm removed the original clearance' };
 }
 
@@ -131,11 +138,21 @@ export function mayNeedRestore({ comments, prHead } = {}) {
   return !!last && !later.slice(last[1] + 1).some(c => starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c));
 }
 
+const readJson = (runGh, repo, args) => {
+  try { return JSON.parse(runGh(args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'review-clearance-read', repo } })); }
+  catch { return null; }
+};
+
+/** Both live heads, read fresh (PR view, then the branch ref); null for any read that fails or disagrees on the branch. */
+export function readLiveHeads({ repo, pr, runGh = runGhSync, headRefName }) {
+  const view = readJson(runGh, repo, ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName']);
+  const name = view?.headRefName;
+  const ref = name ? readJson(runGh, repo, ['api', `repos/${repo}/git/ref/heads/${name}`]) : null;
+  return { prHead: name && name === headRefName ? view?.headRefOid ?? null : null, refHead: ref?.object?.sha ?? null };
+}
+
 export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true, revalidate = false }) {
-  const read = args => {
-    try { return JSON.parse(runGh(args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'review-clearance-read', repo } })); }
-    catch { return null; }
-  };
+  const read = args => readJson(runGh, repo, args);
   // Every list read is complete (`--paginate --slurp`, flattened); a failed read is null, never a partial list.
   const list = path => { const pages = read(['api', '--paginate', '--slurp', `${path}?per_page=100`]); return Array.isArray(pages) ? pages.flat() : null; };
   const view = read(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName,labels,statusCheckRollup']);
@@ -158,7 +175,7 @@ export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true,
     facts.labels = live?.labels ?? null;
     facts.rows = live?.statusCheckRollup ?? null;
   }
-  return { ...facts, refHead: ref?.object?.sha ?? null, reviews, events };
+  return { ...facts, headRefName: view.headRefName ?? null, refHead: ref?.object?.sha ?? null, reviews, events };
 }
 
 export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdict = readMergeGateVerdict,
@@ -183,6 +200,18 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
     }
     if (restoration.restore) {
       mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']);
+      // GitHub has no conditional label write, so a push can still land between the last read and the write above.
+      // Read both heads again AFTER the write; if either moved or cannot be read, undo it at once (fail closed) and
+      // record nothing, so the new head keeps `review:pending` and its re-review stays owed.
+      const after = readLiveHeads({ repo, pr, runGh, headRefName: facts.headRefName });
+      if (!sameHead(restoration.record, after.prHead, after.refHead)) {
+        try { mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']); }
+        catch (e) { throw new Error(`restoration rollback failed after the head moved: ${e.message}`); }
+        log(`review-clearance: PR #${pr} restoration undone — head moved or unreadable after the approval write`);
+        restoration = { restore: false, why: 'head moved or unreadable after the approval write' };
+      }
+    }
+    if (restoration.restore) {
       mutate(['pr', 'comment', String(pr), '--repo', repo, '--body', buildRestoreComment({ head: facts.prHead, record: restoration.record, rearm: restoration.rearmComment, setting: restoreSetting })]);
       facts.labels = [...names(facts.labels).filter(l => l !== 'review:pending'), 'review:accepted'];
       restored = true;

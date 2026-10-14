@@ -13,7 +13,7 @@ PR #5237 advisory: a later marker-free changes verdict, re-arm, stand-down or dr
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — the "does not carry clearance across a marker-free revocation" table in `we:scripts/lib/__tests__/review-escalation-human-clear-same-sha.test.mjs` (changes verdict, re-arm, stand-down, drain park, CI-heal escalation, review paused, re-score revocation, operator text) fails before and passes after. Implemented in PR #5237 round 4: any comment that is not a known machine shape, and any accept-shaped record that is itself a verdict, ends the same-sha run.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

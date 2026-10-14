@@ -25,6 +25,7 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { loadReviewClearanceSetting } from './review-clearance-settings.mjs';
+import { isKnownMachineBody, isLaterVerdictBody } from './accept-carry-forward.mjs';
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -1912,19 +1913,28 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
   for (const c of Array.isArray(comments) ? comments : []) {
     const body = c && typeof c.body === 'string' ? c.body : '';
     if (!body) continue;
-    if (!isTrustedMarkerAuthor(c)) continue; // #4140 — an untrusted commenter's marker is never counted
     REVIEWED_SHA_RE.lastIndex = 0;
     let m;
     let bodySha = null;
-    while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
-    if (bodySha === null) continue; // not an accept-shaped comment — carries no reviewed-sha at all
+    if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
+      while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
+    }
+    if (bodySha === null) {
+      // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
+      // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
+      // shape ends the same-sha run, so a later plain accept of that sha cannot revive the clearance (fail closed).
+      if (!isKnownMachineBody(body)
+        && !(isTrustedMarkerAuthor(c) && body.startsWith('<!-- approval-prevention-filed:'))) humanInSameShaRun = false;
+      continue;
+    }
     CLEARED_HUMAN_RE.lastIndex = 0;
     let bodyHumanCleared = CLEARED_HUMAN_RE.exec(body) !== null;
     if (!bodyHumanCleared) {
       CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
       bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
     }
-    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun) || bodyHumanCleared;
+    // A record that is itself a verdict or hold (a changes verdict that quotes a reviewed-sha) also ends the run.
+    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && !isLaterVerdictBody(body)) || bodyHumanCleared;
     latestSha = bodySha;
     latestWasHumanCleared = bodyHumanCleared;
   }
