@@ -51,7 +51,7 @@ describe('planBuildDispatch', () => {
     const r = planBuildDispatch({ candidates: [cand('1', ['we:unrelated.js'])], openPrs, policy: { ...BUILD_DISPATCH_POLICY, maxOpenPrs: 12, openPrCapScope: undefined } });
     expect(r.freeze.frozen).toBe(false);
     expect(r.dispatch.map((x) => x.num)).toEqual(['1']);
-    expect(r.openPrCap).toEqual({ total: 17, counted: 7, cardOnly: 4, accepted: 6, cap: 12,
+    expect(r.openPrCap).toEqual({ total: 17, counted: 7, cardOnly: 4, accepted: 6, cap: 12, excludeCardOnly: true, excludeAccepted: true,
       countedPrs: Array.from({ length: 7 }, (_, i) => `we#${i + 1}`),
       cardOnlyPrs: Array.from({ length: 4 }, (_, i) => `we#${i + 8}`),
       acceptedPrs: Array.from({ length: 6 }, (_, i) => `we#${i + 12}`) });
@@ -62,7 +62,7 @@ describe('planBuildDispatch', () => {
       ...Array.from({ length: 5 }, (_, i) => pr('we', i + 14, [`backlog/card${i}.md`])),
     ];
     const r = planBuildDispatch({ openPrs, policy: { ...BUILD_DISPATCH_POLICY, maxOpenPrs: 12 } });
-    expect(r.freeze).toEqual({ frozen: true, kinds: ['open-prs'], reasons: ['13 open PRs counted (5 card-only, 0 accepted excluded) > maxOpenPrs 12'] });
+    expect(r.freeze).toEqual({ frozen: true, kinds: ['open-prs'], reasons: ['13 of 18 open PRs counted (not counted: 5 card-only, 0 review:accepted) — counted: #1 #2 #3 #4 #5 #6 #7 #8 #9 #10 #11 #12 #13 > maxOpenPrs 12'] });
   });
   it.each([
     ['src/a.js', ['review:accepted']],
