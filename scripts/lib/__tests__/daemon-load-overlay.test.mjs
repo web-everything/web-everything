@@ -916,6 +916,7 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(seen.prompt).toContain(`OPERATION_COMPLETIONS_DIR='${childStore}'`); // the report command carries it explicitly too
     expect(seen.prompt).not.toContain(realStore);
     expect(seen.pr).toBe('999998'); // a synthetic id, never a real PR's record
+    expect(seen.env.WE_SMOKE_ALLOW_REAL_WORKER).toBe('1');
     expect(existsSync(join(childStore, `${seen.slug}.json`))).toBe(true);
     expect(readdirSync(realStore)).toEqual([]); // the real store saw nothing
   });
