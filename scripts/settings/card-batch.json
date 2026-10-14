@@ -1,0 +1,6 @@
+{
+  "$comment": "cardBatch.adoptDescendantHead: on|off, default on; WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD=on|off overrides it. When the batch branch's remote head is a fast-forward descendant of the recorded head (e.g. a ci-heal commit), the seal adopts it as the batch head instead of refusing head-mismatch only if every commit in the range is foreign: any coordinator trailer line starting with Card-Batch: prevents adoption and retains head-mismatch; admission's reconcile path owns those coordinator commits. Members are unchanged; verification still runs on the adopted head before ready.",
+  "cardBatch": {
+    "adoptDescendantHead": "on"
+  }
+}

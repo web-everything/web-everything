@@ -8,6 +8,7 @@ import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-b
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
@@ -26,6 +27,16 @@ const readState = path => JSON.parse(readFileSync(path, 'utf8'));
 const holdReleased = state => ['remove-hold', 'ready', 'label-on-green'].includes(state.seal?.step);
 const holdPending = state => Boolean(state.pr) && !state.holdApplied && !holdReleased(state);
 const kindOf = (state, path) => state.kind ?? CARD_BATCH_KINDS.find(kind => path.endsWith(`-${kind}.json`));
+
+/** Valid env override → declared setting → on by default. */
+export function resolveAdoptDescendantHead({ env = process.env, read = readSettings } = {}) {
+  const override = env.WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD;
+  if (override === 'on' || override === 'off') return override;
+  try {
+    const value = read()?.cardBatch?.adoptDescendantHead;
+    return value === 'off' ? 'off' : 'on';
+  } catch { return 'on'; }
+}
 
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
@@ -75,6 +86,31 @@ export async function publishBatch(input, opts = {}) {
     };
     if (state.sealFailure) { retire(); return { action: 'held', state }; }
     if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
+    const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`]))
+      .trim().split(/\s+/)[0];
+    if (advertised && advertised !== state.headSha && resolveAdoptDescendantHead(opts) === 'on') {
+      await run('git', ['fetch', '--no-tags', remote, `refs/heads/${state.batchRef}`]);
+      let descendant = true;
+      try { await run('git', ['merge-base', '--is-ancestor', state.headSha, advertised]); }
+      catch (error) { if (error.status !== 1) throw error; descendant = false; }
+      if (descendant) {
+        const messages = String(await run('git', ['log', '--format=%B', `${state.headSha}..${advertised}`]));
+        // Card-Batch: is admission's MARKER; only its reconcile path may recover coordinator commits.
+        if (messages.split('\n').some(line => line.startsWith('Card-Batch: '))) descendant = false;
+      }
+      if (descendant) {
+        const from = state.headSha;
+        state.adoptedHeads = [...(state.adoptedHeads ?? []), { from, to: advertised, at: new Date(now()).toISOString() }];
+        state.headSha = advertised;
+        if (state.verificationMarker?.sha !== advertised) {
+          delete state.verificationMarker;
+          // A resumed seal must verify the adopted head before releasing its hold or making it ready.
+          if (state.sealedAt) state.seal = { ...state.seal, step: 'record-sealed' };
+        }
+        save();
+        process.stderr.write(`card-batch adopted head ${state.batchRef}: ${from}→${advertised}\n`);
+      }
+    }
     let mismatch = await check();
     if (mismatch) return refuse(mismatch);
     const plan = planPublish({ state, kind, policy, now: now() });

@@ -4,11 +4,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP } from '../card-batch-seal-io.mjs';
+import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-function fixture({ maxCards = 2, red = false } = {}) {
+function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'batch-seal-')); dirs.push(dir);
   const statePath = join(dir, 'org-repo-prevention.json');
   const state = { batchRef: 'lane/card-batch-prevention-1', seq: 1, headSha: 'a'.repeat(40), openedAt: 0,
@@ -19,6 +19,8 @@ function fixture({ maxCards = 2, red = false } = {}) {
   const exec = vi.fn((cmd, args) => {
     calls.push([cmd, ...args]);
     if (args[0] === 'ls-remote') return state.headSha + '\tref';
+    if (args[0] === 'merge-base' && !descendant) throw Object.assign(new Error('not an ancestor'), { status: 1 });
+    if (args[0] === 'log') return descendantMessages;
     if (args[0] === 'rev-parse') return args[1] === '--absolute-git-dir' ? join(dir, '.git') : state.headSha;
     if (args[1] === 'acquire') return JSON.stringify({ path: dir, lane: 3, holder: 'holder' });
     if (args[1] === 'verify') {
@@ -32,7 +34,7 @@ function fixture({ maxCards = 2, red = false } = {}) {
   });
   const policy = loadCardBatchPolicy({ prevention: { maxCards, maxAgeMinutes: 1 } });
   return { dir, statePath, state, calls, exec, input: { statePath, laneDir: dir },
-    opts: { exec, clock: () => 1000, policy }, read: () => { const saved = JSON.parse(readFileSync(statePath, 'utf8')); return saved.lastSealedState ? JSON.parse(readFileSync(saved.lastSealedState, 'utf8')) : saved; } };
+    opts: { exec, clock: () => 1000, policy, env: {} }, read: () => { const saved = JSON.parse(readFileSync(statePath, 'utf8')); return saved.lastSealedState ? JSON.parse(readFileSync(saved.lastSealedState, 'utf8')) : saved; } };
 }
 it('opens through park then immediately holds, and refreshes the body on later publication', async () => {
   const f = fixture();
@@ -71,10 +73,71 @@ it('refuses a live admission lease without commands', async () => {
   expect(await publishBatch(f.input, f.opts)).toEqual({ action: 'refuse', reason: 'lease-held' });
   expect(f.exec).not.toHaveBeenCalled();
 });
-it('refuses remote drift before any publishing', async () => {
+it('refuses a non-descendant remote head before any publishing', async () => {
   const f = fixture(); f.state.headSha = 'b'.repeat(40);
   expect(await publishBatch(f.input, f.opts)).toEqual({ action: 'refuse', reason: 'head-mismatch' });
-  expect(f.calls).toHaveLength(1);
+  expect(f.read().headSha).toBe('a'.repeat(40));
+  expect(f.read().adoptedHeads).toBeUndefined();
+  expect(f.calls.some(call => call.includes('open-pr'))).toBe(false);
+});
+it('adopts a descendant remote head, journals it and verifies the new head before ready', async () => {
+  const f = fixture({ maxCards: 1, descendant: true });
+  const from = f.state.headSha;
+  const previous = { from: 'older', to: from, at: 'earlier' };
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, adoptedHeads: [previous],
+    verificationMarker: { sha: from, status: 'green' } }));
+  f.state.headSha = 'b'.repeat(40);
+  const exec = vi.fn((cmd, args, options) => {
+    if (args[1] === 'acquire') {
+      expect(f.read().headSha).toBe(f.state.headSha);
+      expect(f.read().verificationMarker).toBeUndefined();
+    }
+    return f.exec(cmd, args, options);
+  });
+  const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    expect((await publishBatch(f.input, { ...f.opts, exec, remote: 'upstream' })).action).toBe('sealed');
+    expect(f.read()).toMatchObject({ headSha: f.state.headSha, members: f.state.members,
+      adoptedHeads: [previous, { from, to: f.state.headSha, at: new Date(1000).toISOString() }],
+      verificationMarker: { sha: f.state.headSha, status: 'green' } });
+    expect(exec.mock.calls.slice(0, 5).map(([, args]) => args)).toEqual([
+      ['ls-remote', '--refs', 'upstream', `refs/heads/${f.state.batchRef}`],
+      ['fetch', '--no-tags', 'upstream', `refs/heads/${f.state.batchRef}`],
+      ['merge-base', '--is-ancestor', from, f.state.headSha],
+      ['log', '--format=%B', `${from}..${f.state.headSha}`],
+      ['ls-remote', '--refs', 'upstream', `refs/heads/${f.state.batchRef}`],
+    ]);
+    expect(exec.mock.calls.slice(0, 5).every(([, , options]) => options.cwd === f.dir)).toBe(true);
+    expect(f.calls.findIndex(call => call.includes('verify'))).toBeLessThan(f.calls.findIndex(call => call.includes('ready')));
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`${f.state.batchRef}: ${from}→${f.state.headSha}`));
+  } finally { log.mockRestore(); }
+});
+it('refuses a descendant range containing a coordinator commit without adopting or publishing', async () => {
+  const f = fixture({ descendant: true,
+    descendantMessages: 'Repair CI\n\nAdmit card 456\n\nCard-Batch: {"cardId":"456"}\n\nAnother repair\n' });
+  const recorded = readFileSync(f.statePath, 'utf8');
+  const from = f.state.headSha;
+  f.state.headSha = 'b'.repeat(40);
+  expect(await publishBatch(f.input, f.opts)).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+  expect(readFileSync(f.statePath, 'utf8')).toBe(recorded);
+  expect(f.read().adoptedHeads).toBeUndefined();
+  expect(f.calls).toEqual([
+    ['git', 'ls-remote', '--refs', 'origin', `refs/heads/${f.state.batchRef}`],
+    ['git', 'fetch', '--no-tags', 'origin', `refs/heads/${f.state.batchRef}`],
+    ['git', 'merge-base', '--is-ancestor', from, f.state.headSha],
+    ['git', 'log', '--format=%B', `${from}..${f.state.headSha}`],
+    ['git', 'ls-remote', '--refs', 'origin', `refs/heads/${f.state.batchRef}`],
+  ]);
+  expect(f.exec.mock.calls.every(([, , options]) => options.cwd === f.dir)).toBe(true);
+});
+it('refuses a descendant remote head when adoption is off', async () => {
+  const f = fixture({ descendant: true });
+  f.state.headSha = 'b'.repeat(40);
+  expect(await publishBatch(f.input, { ...f.opts, env: { WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD: 'off' } }))
+    .toEqual({ action: 'refuse', reason: 'head-mismatch' });
+  expect(f.read().headSha).toBe('a'.repeat(40));
+  expect(f.calls.every(call => call.includes('ls-remote'))).toBe(true);
 });
 it('records red verification and leaves the PR draft and held, including retries', async () => {
   const f = fixture({ maxCards: 1, red: true });
@@ -276,4 +339,26 @@ it('keeps the sealed archive terminal when its job is explicitly retried', async
   const archived = readFileSync(active.lastSealedState, 'utf8');
   expect((await publishBatch({ statePath: active.lastSealedState }, f.opts)).action).toBe('sealed');
   expect(readFileSync(active.lastSealedState, 'utf8')).toBe(archived);
+});
+
+it.each([
+  [{}, {}, 'on'],
+  [{}, { cardBatch: { adoptDescendantHead: 'off' } }, 'off'],
+  [{ WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD: 'on' }, { cardBatch: { adoptDescendantHead: 'off' } }, 'on'],
+  [{ WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD: 'off' }, { cardBatch: { adoptDescendantHead: 'on' } }, 'off'],
+  [{ WE_CARD_BATCH_ADOPT_DESCENDANT_HEAD: 'invalid' }, { cardBatch: { adoptDescendantHead: 'off' } }, 'off'],
+  [{}, { cardBatch: { adoptDescendantHead: 'invalid' } }, 'on'],
+])('resolves adoption from env %j and settings %j to %s', (env, settings, expected) => {
+  expect(resolveAdoptDescendantHead({ env, read: () => settings })).toBe(expected);
+});
+it('defaults adoption on if settings cannot be read', () => {
+  expect(resolveAdoptDescendantHead({ env: {}, read: () => { throw Error('unreadable'); } })).toBe('on');
+});
+it('reverifies an adopted head when resuming a seal that already verified the old head', async () => {
+  const f = fixture({ maxCards: 1, descendant: true });
+  await expect(publishBatch(f.input, { ...f.opts, crashAt: 'verify' })).rejects.toThrow('crash');
+  f.state.headSha = 'b'.repeat(40);
+  expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');
+  expect(f.calls.filter(call => call.includes('verify'))).toHaveLength(2);
+  expect(f.read().verificationMarker.sha).toBe(f.state.headSha);
 });

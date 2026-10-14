@@ -52,7 +52,8 @@ it('reads the remote head, seals red without promotion, and admits a successor w
       writeFileSync(path, JSON.stringify({ ...next.state, headSha: baseSha }));
       calls.length = 0;
       expect(await publishBatch(input, { stateDir, policy, exec })).toEqual({ action: 'refuse', reason: 'head-mismatch' });
-      expect(calls).toHaveLength(1);
+      // Only local git reads ran (the descendant probe found a coordinator commit, so nothing was adopted).
+      expect(calls.every(call => call[0] === 'git')).toBe(true);
     } finally { rmSync(stateDir, { recursive: true, force: true }); }
   });
 }, 30000);
