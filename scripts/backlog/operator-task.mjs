@@ -1,7 +1,7 @@
 /** Optional operator-card metadata; shared by filing and the standards gate. Pure. */
 export const EDGE_CLONE_NAMES = Object.freeze(['review', 'fix', 'control', 'drain', 'health-watch']);
 // Same shape as dispatch-lane BRIEF_TOKEN_RE: the composed brief is filled again, which would rewrite or refuse it.
-export const BRIEF_TOKEN_SHAPE = /\{\{[^{}\n]*\}\}/;
+export const BRIEF_TOKEN_SHAPE = /\{\{\s*[^{}\n]*?\s*\}\}/;
 export function validateOperatorTask(item) {
   const errors = [];
   if (item.operatorTask !== undefined && typeof item.operatorTask !== 'boolean') errors.push('operatorTask must be a boolean');

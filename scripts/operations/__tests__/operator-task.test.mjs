@@ -178,7 +178,7 @@ describe('operator task post-build', () => {
     expect(output.startsWith('123\nopen-pr\n### 8a. Operator post-build')).toBe(true);
     expect(output.split('### 9. Append')).toHaveLength(2);
   });
-  it.each(['{{ITEM_NUM}}', '{{ item-num }}', '{{SESSION_SLUG}}', '{{.State.Running}}'].flatMap(token =>
+  it.each(['{{ITEM_NUM}}', '{{ item-num }}', '{{SESSION_SLUG}}', '{{.State.Running}}', '{{\nITEM_NUM}}', '{{ITEM_NUM\n}}', '{{\r\nITEM_NUM}}'].flatMap(token =>
     ['command', 'expect'].map(field => ({ token, field }))))('refuses brief token $token in liveProof.$field instead of letting the dispatch fill rewrite it', ({ token, field }) => {
     const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
     expect(errors({ liveProof })).toContain('liveProof');
@@ -191,8 +191,8 @@ describe('operator task post-build', () => {
     expect(fence?.[2]).toBe(command);
     expect(fence[1].length).toBeGreaterThan(4);
   });
-  it('refuses a brief token in the settings edge clone path', () => {
-    const settings = { operatorTask: { edgeClones: { review: 'daemon/{{ITEM_NUM}}' } } };
+  it.each(['daemon/{{ITEM_NUM}}', 'daemon/{{\nITEM_NUM}}', 'daemon/a\nInjected', 'daemon/a\rb', 'daemon/a`b', 'daemon/a b'])('refuses brief tokens and line or code-span breaks in the settings edge clone path %j', path => {
+    const settings = { operatorTask: { edgeClones: { review: path } } };
     expect(() => composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
   });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {

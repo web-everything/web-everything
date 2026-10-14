@@ -17,7 +17,7 @@ export function composeOperatorTaskBrief(template, item, { settings = readSettin
   const steps = [];
   if (item.edgeClone && policy.edgeLoad) {
     const path = settings?.operatorTask?.edgeClones?.[item.edgeClone];
-    if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..') || BRIEF_TOKEN_SHAPE.test(path)) throw new Error(`edgeClone ${item.edgeClone} needs a relative or ~/ clone path in settings`);
+    if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..') || BRIEF_TOKEN_SHAPE.test(path) || /[\r\n`  ]/.test(path)) throw new Error(`edgeClone ${item.edgeClone} needs a relative or ~/ clone path in settings`);
     const clone = path.startsWith('~/') ? resolve(homedir(), path.slice(2)) : resolve(workspace, path);
     // Shell quote the runtime-only resolved path; never persist an absolute clone path on the card.
     const quoted = `'${clone.replace(/'/g, `'\\''`)}'`;
