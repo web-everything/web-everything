@@ -5,8 +5,8 @@ parent: "5767"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs", "we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs"]
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "7372a0e0a8a7b6ccca4ffffdadaf665980314880"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "2e32024faa4011e4c8427e8dec77093c83f8b1d2"
 tags: []
 ---
 
@@ -38,13 +38,13 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Design
 
-Premise check against `main` (832e98ad): the goal is **partly delivered, not done**. The fix half landed with fix.pushBeforeGate (PR #4771 and earlier): `attachLiveFixClaim` (we:scripts/merge-ai-prs.mjs:902) is called from the merge-site fresh re-read `fetchFreshPrForRevalidation` (we:scripts/merge-ai-prs.mjs:4522), and `classifyPr` skips on `pr.fixClaim` (we:scripts/merge-ai-prs.mjs:1021). It is read-only (`readLiveFixClaim`, we:scripts/conveyor/fix-procedure.mjs:135) and fails closed on a throwing reader. The `--match-head-commit` pin is at we:scripts/merge-ai-prs.mjs:6548 (`matchHeadCommit: traceHeadSha`). Three gaps remain:
+Premise check against `main` (832e98ad): the goal is **partly delivered, not done**. The fix half landed with fix.pushBeforeGate (PR #4771 and earlier): `attachLiveFixClaim` (we:scripts/merge-ai-prs.mjs:904) is called from the merge-site fresh re-read `fetchFreshPrForRevalidation` (we:scripts/merge-ai-prs.mjs:4507), and `classifyPr` skips on `pr.fixClaim` (we:scripts/merge-ai-prs.mjs:1023). It is read-only (`readLiveFixClaim`, we:scripts/conveyor/fix-procedure.mjs:135) and fails closed on a throwing reader. The `--match-head-commit` pin is at we:scripts/merge-ai-prs.mjs:6550 (`matchHeadCommit: traceHeadSha`). Three gaps remain:
 
 1. `readLiveFixClaim` reads only kind `fixing` (`FIXING_KIND`, we:scripts/conveyor/fix-procedure.mjs:68). The dispatcher's own spawn claims, kinds `fix` and `ci-heal` (`readFixDispatchClaim`, we:scripts/conveyor/fix-claim-store.mjs; `liveForeignDispatch` already loops both at we:scripts/conveyor/fix-procedure.mjs:183), are never read by the drain, so a live dispatched fixer or ci-heal session that has not yet taken a `fixing` claim does not defer a merge.
 2. The skip text is `fix claim held by …`; `classifySkipReason` (we:scripts/lib/drain-skip-reasons.mjs:22, an ordered regex chain) has no rule for it, so it falls to `unrecognized-reason` and there is no stable `claim-held` kind to grep in `daemon.log` (A3).
 3. Tests: the fix-claim skip is tested (we:scripts/conveyor/__tests__/await-verify-pass-push-before-gate.test.mjs:176-200); there is no ci-heal test and none naming `claim-held`. A1 (a push races the merge and the head pin refuses it) is covered only as argv shape (we:scripts/__tests__/pr-merge-gate.test.mjs:35-47), not as a refused race.
 
-Mechanism: add `readLiveDispatchClaim` (read-only `readFixDispatchClaim` over kinds `fix` and `ci-heal`, TTL via `isLeaseExpired` with `DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES`) and a combined reader `readLiveDrainClaim` = `readLiveFixClaim` then `readLiveDispatchClaim`, next to `readLiveFixClaim`; the merge-site call (we:scripts/merge-ai-prs.mjs:4529) passes the combined reader, and `attachLiveFixClaim` keeps its injected-reader shape (`data.fixClaim` plus `kind`). An unreadable store of any kind still attaches the placeholder (fail closed). Keep `classifyPr`'s skip arm but start the reason with `claim-held:`, and add `claim-held` to `SKIP_KINDS` plus a `^claim-held` rule at the TOP of `classifySkipReason`, beside `red-main-hold` (the reason embeds a holder name, so a later pattern could otherwise catch it first). No claim is written (N1, R4).
+Mechanism: add `readLiveDispatchClaim` (read-only `readFixDispatchClaim` over kinds `fix` and `ci-heal`, TTL via `isLeaseExpired` with `DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES`) and a combined reader `readLiveDrainClaim` = `readLiveFixClaim` then `readLiveDispatchClaim`, next to `readLiveFixClaim`; the merge-site call (we:scripts/merge-ai-prs.mjs:4514) passes the combined reader, and `attachLiveFixClaim` keeps its injected-reader shape (`data.fixClaim` plus `kind`). An unreadable store of any kind still attaches the placeholder (fail closed). Keep `classifyPr`'s skip arm but start the reason with `claim-held:`, and add `claim-held` to `SKIP_KINDS` plus a `^claim-held` rule at the TOP of `classifySkipReason`, beside `red-main-hold` (the reason embeds a holder name, so a later pattern could otherwise catch it first). No claim is written (N1, R4).
 
 ## MVP
 
@@ -88,3 +88,5 @@ Guard cases (pass today, must stay green; not RED):
 - 2026-10-13 re-prepare (b4676cf): we:scripts/merge-ai-prs.mjs moved (workflow-human gate work); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations refreshed: attach :900, classifyPr arm :1019, merge-site call :4526, head pin :6522. Plan unchanged.
 - 2026-10-13 re-stamp (8652127): in-scope files unchanged since b4676cf; citations still hold; plan unchanged.
 - 2026-10-13 re-prepare (7372a0e): we:scripts/merge-ai-prs.mjs moved (paged open-PR reader, abc01e4e5); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations shifted ~+2/+3 and refreshed: attach :902, fresh re-read :4522, classifyPr arm :1021, merge-site call :4529, head pin :6548. Plan unchanged.
+- 2026-10-14 re-prepare (5b8aef2): we:scripts/merge-ai-prs.mjs moved (bounded parallel gate reads, 1162e00); claim code still unchanged (`fixing` kind only, no `claim-held`). Citations refreshed: attach :904, fresh re-read :4507, classifyPr arm :1023, merge-site call :4514, head pin :6550. Plan unchanged.
+- 2026-10-14 re-stamp (2e32024): in-scope files unchanged since 5b8aef2; citations (attach :904, classifyPr arm :1023, merge-site call :4514, head pin :6550) still hold; plan unchanged.

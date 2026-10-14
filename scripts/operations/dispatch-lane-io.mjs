@@ -1,3 +1,5 @@
+import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
+import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
@@ -1709,7 +1711,7 @@ export function workerModelTable(routing) {
   const claudeRoute = CLAUDE_NATIVE_MODEL_IDS.has(routing.model) || routing.outcome === 'role';
   if (!claudeRoute || !tier || !Object.hasOwn(CLAUDE_SPAWN_MODEL_BY_TIER, tier)) return null;
   // The spawn flag is the tier's ALIAS (see CLAUDE_SPAWN_MODEL_BY_TIER), so a worker always gets the current model.
-  return { tier, model: CLAUDE_SPAWN_MODEL_BY_TIER[tier], reason: routingTierReason(routing) };
+  return { tier, model: tier === 'sonnet' ? claudeSpawnAlias(resolveClaudeHelperRoute().model) : CLAUDE_SPAWN_MODEL_BY_TIER[tier], reason: routingTierReason(routing) };
 }
 
 /**
@@ -1766,23 +1768,34 @@ export function routeDispatchProvider(request, {
   probationLaunch = 'off',
   probation = probationWorkerDetachedProvider,
   providerAvailable = () => true,
+  resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
-    const candidates = [request.policyRoute, ...request.policyRoute.fallback];
+    let candidates = [request.policyRoute, ...request.policyRoute.fallback];
+    if (request.policyRoute.provider === 'codex' && ['fix', 'ci-heal'].includes(kind)) {
+      const taskRoute = resolveCodexRoute({ kind, standard: { model: request.policyRoute.model, effort: request.policyRoute.effort,
+        retry: request.policyRoute.fallback.filter(route => route.provider === 'codex').map(({ model, effort }) => ({ model, effort })) } });
+      candidates = [{ ...request.policyRoute, model: taskRoute.model, effort: taskRoute.effort },
+        ...(taskRoute.retry ?? []).map(rung => ({ provider: 'codex', ...rung })),
+        ...request.policyRoute.fallback.filter(route => route.provider !== 'codex')];
+    }
+    const vetoes = request.policyRoute.vetoes ?? [];
+    candidates = candidates.filter(route => route.provider === 'claude' || !vetoes.some(veto =>
+      veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider)));
     const workerFor = route => {
       if (!request.probationWorker || route.provider === 'claude') return null;
       const id = route.provider === 'codex' ? 'codex' : route.model.startsWith('claude-') ? 'antigravity-claude' : 'antigravity-gemini';
       return { ...PROBATION_WORKERS[id], taskType: request.probationWorker.taskType, model: route.model, effort: route.effort };
     };
     const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
-    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider) && (route.provider === 'claude'
+    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && (route.provider === 'claude'
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
         && scriptExists(PROBATION_LAUNCHABLE_KINDS[kind].runScript))
       || (route.provider === 'codex' && registry[kind]?.runScript && scriptExists(registry[kind].runScript))));
     if (!chosen) throw notApplied(`routing policy: ${kind} has no available launch adapter in its fallback chain`);
-    request = { ...request, policyRoute: { ...chosen, fallback: [] }, probationWorker: workerFor(chosen) };
+    request = { ...request, policyRoute: { ...chosen, fallback: [], ...(vetoes.length ? { vetoes } : {}) }, probationWorker: workerFor(chosen) };
     request.reportModel?.(chosen.model);
     request.reportEffort?.(chosen.effort);
     if (chosen !== candidates[0]) console.error(`routing-policy-fallback: ${kind} → ${chosen.provider}/${chosen.model} (primary adapter unavailable)`);
@@ -1790,9 +1803,22 @@ export function routeDispatchProvider(request, {
       request = { ...request, probationWorker: null, table: { model: chosen.model, effort: chosen.effort, tier: Object.entries(CLAUDE_NATIVE_MODEL_BY_TIER).find(([, id]) => id === chosen.model)?.[0] ?? null, reason: 'routing-policy' } };
       return agent(request);
     }
-    // An explicit Codex route whose probation launch is unavailable (probation off, or a task type the probation
-    // launcher does not run) still goes to the mechanical build wrapper, never on to the Claude agent below.
-    if (!probationLaunchDecision(request, probationLaunch).launch && registry[kind]) return registry[kind].provider({ ...request, probationWorker: null });
+    // Only a proven pre-launch refusal may advance the cascade. An indeterminate launch
+    // stops here: another worker could otherwise race the first one in the same lane.
+    const launch = () => probationLaunchDecision(request, probationLaunch).launch
+      ? probation(request) : registry[kind].provider({ ...request, probationWorker: null });
+    try { return launch(); } catch (error) {
+      if (!error?.notApplied) throw error;
+      const remaining = candidates.slice(candidates.indexOf(chosen) + 1);
+      if (!remaining.length) throw error;
+      console.error(`routing-policy-retry: ${kind} after definite pre-launch refusal of ${chosen.provider}/${chosen.model}`);
+      return routeDispatchProvider({ ...request, policyRoute: { ...remaining[0], fallback: remaining.slice(1), ...(vetoes.length ? { vetoes } : {}) },
+        probationWorker: workerFor(remaining[0]) }, {
+        modes, registry, agent, scriptExists, probationLaunch, probation, providerAvailable,
+        // The resolved retry array is already expanded; never restart the primary on recursion.
+        resolveCodexRoute: () => ({ ...remaining[0], retry: remaining.slice(1).filter(r => r.provider === 'codex') }),
+      });
+    }
   }
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
   // worker (see `dispatch-providers/probation-worker.mjs#probationLaunchDecision` for every condition).
@@ -2512,7 +2538,8 @@ export function buildAgentArgv({
     const kind = payload?.launchKind ?? 'build';
     const tier = [...LAUNCH_KINDS, 'review', 'inspect'].includes(kind)
       ? workerTierFor({ kind }).tier : null;
-    const model = explicit.found ? explicit.value : CLAUDE_SPAWN_MODEL_BY_TIER[tier];
+    const model = explicit.found ? explicit.value : tier === 'sonnet'
+      ? claudeSpawnAlias(resolveClaudeHelperRoute().model) : CLAUDE_SPAWN_MODEL_BY_TIER[tier];
     args = explicit.rest;
     if (model) modelArgs.push('--model', model);
   }

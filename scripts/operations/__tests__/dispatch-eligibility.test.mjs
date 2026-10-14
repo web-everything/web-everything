@@ -93,7 +93,7 @@ describe('dispatch-eligibility agrees with the live admission path', () => {
     expect(report[3].markers.deliveryAgent).toBeNull();
     // The report names the policy-selected executor; native adapter prediction stays available separately.
     for (const row of report.filter((r) => r.eligible)) {
-      expect(row.route).toMatchObject({ outcome: 'routed', routed: 'codex', executed: 'codex', model: 'gpt-6-astra', tier: 'sonnet' });
+      expect(row.route).toMatchObject({ outcome: 'routed', routed: 'codex', executed: 'codex', model: 'gpt-6.1-sol', tier: 'sonnet' });
       expect(row.plannedWorkerModel).toBeNull(); // native-only tier prediction is absent for an explicit Codex route
     }
   });

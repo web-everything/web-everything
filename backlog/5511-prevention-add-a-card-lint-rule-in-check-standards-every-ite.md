@@ -38,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5268 (finding 1: `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:47` — Add a check:standards rule for backlog cards. Every we:...test path in scope: must be named in the Test plan section, and every Design item that mentions a test-relevant caller needs a matching planned case.) · key `approval-prevention-key:web-everything/web-everything#5268@7fb90745bf6111c94dd4cfd41ad653d8eb807d0e`
