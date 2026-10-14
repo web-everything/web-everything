@@ -92,6 +92,7 @@ import {
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
+import { withCodexUsage } from './lib/codex-usage-ledger.mjs';
 import { admissionLockRoot } from './readiness/heavy-admission.mjs';
 
 import {
@@ -773,6 +774,7 @@ export async function runCodexDirectExec({
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
 export async function codexDirectTask({
+  caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
   dir,
   repoRoot,
@@ -829,10 +831,10 @@ export async function codexDirectTask({
   // just like the persisted Codex session and log; review mode allocates no new writable roots.
   const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
   const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
-  const run = await runCodexDirectExec({
+  const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env,
-  });
+  }), { env });
   const events = parseJsonlEvents(run.stdout);
   const summary = summarizeEvents(events);
   let lastMessage = null;
@@ -953,6 +955,7 @@ async function main() {
       model: flags.model,
       effort: flags.effort,
       tier: flags.tier,
+      caller: flags.caller, repo: flags.repo, pr: flags.pr, card: flags.card, usageTaskKind: flags['usage-task-kind'],
       taskKind: flags['task-kind'], size: flags.size === undefined ? undefined : Number(flags.size),
       care: flags.care, epic: Boolean(flags.epic), decision: Boolean(flags.decision),
       ephemeral: Boolean(flags.ephemeral),
