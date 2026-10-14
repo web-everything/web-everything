@@ -34,6 +34,13 @@ a deferred response is not an empty PR list. Discovery CLI passes can use `defer
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
 
+Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
+directory per invocation and route the binary to their fake. An intentional rate-limit response writes
+cooldown state; sharing that state with another test or the host delays unrelated reads.
+For Node subprocess script paths imported by Vitest's browser environment, use
+`join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
+import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.
+
 ## Standalone probation builds
 
 `scripts/operations/probation-build-run.mjs` accepts `--taskType=doc-fix|bugfix|test-fix|prepare` (doc-fix default),
