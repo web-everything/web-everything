@@ -29,7 +29,7 @@ vi.mock('node:fs', async (importOriginal) => {
   const patched = { ...real, appendFileSync: paused(true), writeFileSync: paused(false) };
   return { ...patched, default: patched };
 });
-import { appendFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { roleCachePath } from '../github-app-identity.mjs';
@@ -822,6 +822,31 @@ describe('reviewer token and dismissal queue IO', () => {
     const dead = q.claim();
     expect(dead.entries).toEqual([{ a: 1 }, { a: 2 }]);
     dead.done();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+  // Advisory on e9d317ea2 (#5223): a rename keeps the source file's mtime, so claiming an entry, a legacy queue file, a
+  // dead producer's temp file or a stale claim that was already old made the new claim look stale at once, and a
+  // second live drainer took the same entries. A claim's age now starts when it was claimed.
+  it('a fresh claim of an old file is never stale, so a second live drainer cannot take it', () => {
+    dir = mkdtempSync(join(tmpdir(), 'nrq-'));
+    const path = join(dir, 'q.jsonl');
+    let clock = Date.now();
+    let alive = (pid) => pid !== 999999;
+    const q = fileDismissalQueue(path, { alive: (pid) => alive(pid), now: () => clock });
+    const old = (clock - QUEUE_CLAIM_STALE_MS * 6) / 1000;
+    q.append({ a: 1 });
+    writeFileSync(path, `${JSON.stringify({ a: 0 })}\n`);
+    writeFileSync(`${path}.tmp-999999-x`, `${JSON.stringify({ a: 9 })}\n`);
+    for (const name of readdirSync(dir)) utimesSync(join(dir, name), old, old);
+    const first = q.claim();
+    expect(first.entries).toEqual([{ a: 0 }, { a: 1 }, { a: 9 }]);
+    expect(q.claim().entries).toEqual([]); // the claims are minutes old in mtime only, seconds old as claims
+    clock += QUEUE_CLAIM_STALE_MS + 1000; // now genuinely stale: taken over
+    const takeover = q.claim();
+    expect(takeover.entries).toEqual([{ a: 0 }, { a: 1 }, { a: 9 }]);
+    expect(q.claim().entries).toEqual([]); // the takeover's own claims start fresh too
+    takeover.done();
+    first.done();
     expect(readdirSync(dir)).toEqual([]);
   });
   // CI on 8638c5344: the mint child's `import(<env var>)` marked every daemon closure reaching this module incomplete.

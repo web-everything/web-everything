@@ -355,13 +355,17 @@ function pidAlive(pid) {
  * entries nobody writes to again. `claim()` renames each entry file (and a legacy shared `<queue>` file) to a claim
  * file named for this process, and takes over another drainer's claim, or a producer's temp file, only when its pid
  * is gone or it is stale ({@link QUEUE_CLAIM_STALE_MS}), so two live drainers never process the same entries.
+ * A claim's age is the claim time in its own name (`<queue>.claim-<pid>-at<ms>-…`), set by the same atomic rename:
+ * a rename keeps the source's mtime, so an old entry, legacy file or stale claim would otherwise be stale the moment it
+ * was claimed and a second live drainer would take it too (advisory on e9d317ea2, #5223). Only a claim from before
+ * this format, and a producer's freshly written temp file, fall back to mtime.
  * `done()` re-queues any line an older producer appended to a claimed legacy file after it was read, then deletes it.
  */
 export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAlive } = {}) {
   const dir = dirname(path);
   const base = basename(path);
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const ownedRe = new RegExp(`^${escaped}\\.(?:claim|tmp)-(\\d+)-`);
+  const ownedRe = new RegExp(`^${escaped}\\.(?:claim|tmp)-(\\d+)-(?:at(\\d+)-)?`);
   const entryRe = new RegExp(`^${escaped}\\.entry-`);
   // Keep the producer's sortable id across every takeover. Older claims only have a UUID;
   // those remain recoverable, though their original ordering is no longer available.
@@ -376,6 +380,7 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
     const m = ownedRe.exec(name);
     if (!m) return false;
     if (!alive(Number(m[1]))) return true;
+    if (m[2] !== undefined) return now() - Number(m[2]) > QUEUE_CLAIM_STALE_MS;
     try { return now() - statSync(join(dir, name)).mtimeMs > QUEUE_CLAIM_STALE_MS; } catch { return false; }
   };
   const append = (text) => {
@@ -398,7 +403,7 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
       const claims = [];
       const entries = [];
       for (const name of names) {
-        const claim = join(dir, `${base}.claim-${process.pid}-${entryId(name)}.${randomUUID()}`);
+        const claim = join(dir, `${base}.claim-${process.pid}-at${Math.floor(now())}-${entryId(name)}.${randomUUID()}`);
         try { renameSync(join(dir, name), claim); } catch { continue; }
         let text = '';
         try { text = readFileSync(claim, 'utf8'); } catch { text = ''; }
