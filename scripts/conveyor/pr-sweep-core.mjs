@@ -15,7 +15,8 @@ export function resolveOwner(pr, signals = {}) {
   const { now, stuckAfterMinutes = 90, operator, smell, daemons = [], sessions = [] } = signals;
   const base = { owner: null, state: 'none', why: 'No owner signal', ownerLastSeenAt: null };
   if (operator) return { ...base, owner: 'operator', state: 'waiting-operator', why: 'NEEDS YOU / RULING NEEDED' };
-  const live = sessions.filter((a) => !['done', 'stopped', 'failed'].includes(a.state)).filter((a) => {
+  const live = sessions.filter((a) => !['done', 'stopped', 'failed'].includes(a.state)
+    && a.hung !== true && a.pidAlive !== false).filter((a) => {
     const slug = parseSessionSlug(a.name);
     return slug ? slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number)
       : (a.repo ? repoKeyForSlug(a.repo) === repoKeyForSlug(pr.repo) : repoKeyForSlug(pr.repo) === 'we');
@@ -23,7 +24,7 @@ export function resolveOwner(pr, signals = {}) {
   const session = findFixerSession(live, pr.number) ?? live.find((a) => ['review', 'inspect'].includes(parseSessionSlug(a.name)?.kind));
   const daemon = [...daemons].filter((d) => Number.isFinite(ms(d.at))).sort((a, b) => ms(b.at) - ms(a.at))[0];
   const owner = session ? `session:${session.name}` : daemon ? `daemon:${daemon.name}` : null;
-  // A live session is current evidence even when its creation timestamp is old.
+  // A healthy live session is current evidence even when its creation timestamp is old.
   const at = session ? now : daemon ? ms(daemon.at) : null;
   const stuck = Boolean(smell) || (at !== null && now - at > stuckAfterMinutes * 60000);
   return { ...base, owner, ownerLastSeenAt: at === null ? null : new Date(at).toISOString(),

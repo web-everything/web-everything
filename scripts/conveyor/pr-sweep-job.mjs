@@ -3,7 +3,7 @@
  * @file scripts/conveyor/pr-sweep-job.mjs
  * @description Card 335 — detached health-pr-sweep job adoption, consume-once and cadence housekeeping.
  */
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
@@ -74,6 +74,11 @@ export function runSweepWorker(input, { timeoutMs = 15 * 60000, WorkerClass = Wo
     worker.once('exit', (code) => finish(fail, new Error(`PR sweep worker exited ${code} without result`)));
   });
 }
-if (isMainThread && process.argv[1] && resolve(process.argv[1]) === SELF) {
+// Node resolves import.meta.url, while argv[1] may retain a symlinked directory.
+function isEntry(argv1) {
+  if (!argv1) return false;
+  try { return realpathSync(argv1) === realpathSync(SELF); } catch { return resolve(argv1) === SELF; }
+}
+if (isMainThread && isEntry(process.argv[1])) {
   runJob({ steps: [{ name: 'pr-sweep', run: ({ input }) => runSweepWorker(input) }] }).then((r) => { process.exitCode = r.outcome === 'succeeded' ? 0 : 1; }).catch((e) => { console.error(e); process.exitCode = 1; });
 }

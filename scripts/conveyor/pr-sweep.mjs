@@ -3,7 +3,7 @@
  * @file scripts/conveyor/pr-sweep.mjs
  * @description Card 335 — bounded IO shell for the health-watch PR movement job. CLI: run [--dry-run] [--json].
  */
-import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, appendFileSync, readdirSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, appendFileSync, readdirSync, openSync, closeSync, fstatSync, readSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -142,7 +142,12 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   }
   return report;
 }
-if (process.argv[1] && resolve(process.argv[1]) === SELF) {
+// Match the detached job's entry check, including snapshots reached through /var symlinks.
+function isEntry(argv1) {
+  if (!argv1) return false;
+  try { return realpathSync(argv1) === realpathSync(SELF); } catch { return resolve(argv1) === SELF; }
+}
+if (isEntry(process.argv[1])) {
   if (process.argv[2] !== 'run') { console.error('usage: pr-sweep.mjs run [--dry-run] [--json]'); process.exitCode = 2; }
   else runPrSweep({ dryRun: process.argv.includes('--dry-run') }).then((r) => console.log(process.argv.includes('--json') ? JSON.stringify(r) : `${r.at}: ${r.idle.length} idle PRs, ${r.alerts.length} alerts, ${r.errors.length} errors`)).catch((e) => { console.error(e); process.exitCode = 1; });
 }

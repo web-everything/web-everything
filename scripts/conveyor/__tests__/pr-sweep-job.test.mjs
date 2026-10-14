@@ -3,13 +3,41 @@
  */
 import { it, expect, vi, afterEach } from 'vitest';
 import { runPrSweepJob, prSweepTickAllowed } from '../pr-sweep-job.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const config = { intervalMinutes: 30 };
 function seams(records = []) { const root = mkdtempSync(join(tmpdir(), 'pr-sweep-job-')); roots.push(root); return { store: { dir: root, list: () => ({ records }) }, enqueue: vi.fn(() => ({ id: 'new' })), reattach: vi.fn(async () => ({})), evict: vi.fn(), prune: vi.fn(), codeSha: 'abc', sourceRoot: tmpdir(), snapshot: {} }; }
+it.each(['pr-sweep-job.mjs', 'pr-sweep.mjs', 'health-watch.mjs'])('runs %s through a symlinked directory', (script) => {
+  const root = mkdtempSync(join(tmpdir(), 'pr-sweep-entry-')); roots.push(root);
+  const alias = join(root, 'linked-conveyor');
+  symlinkSync(resolve('scripts/conveyor'), alias, 'dir');
+  const env = { ...process.env, NODE_NO_WARNINGS: '1' };
+  for (const key of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'OPERATION_RUNS_DIR']) delete env[key];
+  const invoke = (path) => spawnSync(process.execPath, [path, 'invalid-command'], { env, encoding: 'utf8', timeout: 15000 });
+  const path = join(alias, script);
+  const direct = invoke(realpathSync(path));
+  const linked = invoke(path);
+  expect(direct.error).toBeUndefined(); expect(linked.error).toBeUndefined();
+  expect(direct.status).toBe(script === 'pr-sweep.mjs' ? 2 : 1);
+  expect(linked.status).toBe(direct.status);
+  expect(linked.stdout).toBe(direct.stdout); expect(linked.stderr).toBe(direct.stderr);
+});
+it.each([undefined, 'missing-cli-entry'])('imports safely with argv[1]=%s', (argv1) => {
+  for (const script of ['pr-sweep-job.mjs', 'pr-sweep.mjs', 'health-watch.mjs']) {
+    const url = pathToFileURL(resolve('scripts/conveyor', script)).href;
+    const source = `process.argv[1] = ${argv1 === undefined ? 'undefined' : JSON.stringify(argv1)}; await import(${JSON.stringify(url)});`;
+    const out = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+      env: { ...process.env, NODE_NO_WARNINGS: '1' }, encoding: 'utf8', timeout: 15000,
+    });
+    expect(out.error).toBeUndefined(); expect(out.status).toBe(0);
+    expect(out.stdout).toBe(''); expect(out.stderr).toBe('');
+  }
+});
 it('enqueues when due, spaces ticks and does not enqueue in flight', async () => {
   const s = seams(); const out = await runPrSweepJob({ now: 10000000, config, ...s }); expect(s.enqueue).toHaveBeenCalledOnce();
   await runPrSweepJob({ now: 10000001, state: out.state, config, ...s }); expect(s.enqueue).toHaveBeenCalledOnce();

@@ -21,6 +21,34 @@ describe('PR sweep', () => {
     expect(resolveOwner(pr, { now, ...settings, smell: 'fixer-stuck' }).smell).toBe('fixer-stuck');
     expect(resolveOwner(pr, { now, ...settings, operator: true, smell: 'fixer-stuck' }).state).toBe('waiting-operator');
   });
+  it.each([{ hung: true }, { pidAlive: false }, { hung: true, pidAlive: false }])('does not refresh ownership for unhealthy sessions: %j', async (health) => {
+    for (const [repo, tag] of [[pr.repo, ''], ['plateauapp/plateau-app', 'pa-']]) for (const kind of ['fix', 'ci-heal', 'review', 'inspect']) {
+      const key = `${repo}#12`;
+      let previous = {};
+      const alerts = [];
+      for (const minutes of [0, 30, 60, 90, 120, 240]) {
+        const out = await runPrSweep({ now: now + minutes * 60000, dryRun: true, config: {},
+          settings: { value: { ...settings, repos: [repo] }, sources: {} }, readPrs: () => [pr],
+          readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+          readSignals: () => ({ [key]: { sessions: [{ name: `${kind}-${tag}12`, state: 'working', ...health }] } }) });
+        expect(out.idle[0].state).toBe('none');
+        expect(out.idle[0].ownerLastSeenAt).toBeNull();
+        previous = out.nextState;
+        alerts.push(...out.alerts);
+      }
+      expect(alerts).toHaveLength(1);
+      expect(previous.episodes[key].alerted).toBe(true);
+    }
+  });
+  it('keeps healthy or unknown sessions active and falls back from unhealthy ones to daemon evidence', () => {
+    for (const health of [{}, { hung: false, pidAlive: true }, { pidAlive: null }]) {
+      expect(resolveOwner(pr, { now, ...settings, sessions: [{ name: 'fix-12', state: 'working', ...health }] }).state).toBe('active');
+    }
+    const unhealthy = { name: 'fix-12', state: 'working', hung: true };
+    expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy, { name: 'review-12' }] }).owner).toBe('session:review-12');
+    expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy], daemons: [{ name: 'review', at: now - 1000 }] }).state).toBe('active');
+    expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy], daemons: [{ name: 'review', at: now - 100 * 60000 }] }).state).toBe('stuck');
+  });
   it('alerts once per unmoved head episode and resets on movement/head change', () => {
     const first = plan(); expect(first.alerts).toEqual([]);
     const second = plan({ prevState: first.nextState, now: now + 91 * 60000 });

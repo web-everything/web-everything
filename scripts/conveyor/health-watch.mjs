@@ -1615,7 +1615,11 @@ export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLTo
   });
 }
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (IS_CLI) {
+function isEntry(argv1) {
+  if (!argv1) return false;
+  const self = fileURLToPath(import.meta.url);
+  try { return realpathSync(argv1) === realpathSync(self); } catch { return resolve(argv1) === self; }
+}
+if (isEntry(process.argv[1])) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; }, (e) => { console.error(`health-watch: fatal: ${e?.stack || e}`); process.exitCode = 1; });
 }

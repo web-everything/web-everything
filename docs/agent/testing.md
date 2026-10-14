@@ -891,6 +891,11 @@ A complete first queue sample records the set without alerting. A PR move or hea
 unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due
 for retry. Dry runs and fixture health ticks never dispatch the sweep against the host.
 
+Sessions marked `hung: true` or `pidAlive: false` cannot refresh sweep ownership. Missing liveness fields
+remain unknown; healthy sessions and recent daemon evidence still count. Replay the PR #5323 findings
+with the `pr-sweep-unhealthy-owner-and-symlink-entry` soak break: successive dry sweeps must alert once
+after the delay, and both CLI entry points must execute when their directory is reached through a symlink.
+
 Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the heavy-admission queue.
 Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
 agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall
