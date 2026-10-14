@@ -124,7 +124,7 @@ describe('env-timeout hold escape', () => {
 
   it.each([
     ['a different kill budget', { detail: 'reconcile failed: timed out after 30000ms (process group killed)' }],
-    ['a different kind of give-up', { detail: 'lane scan: scan exceeded its 120000ms budget' }],
+    ['a different kind of give-up', { detail: `reconcile failed: exited 1: ✗ ${scanText(120_000)}` }],
     ['a lock give-up', { detail: 'gave up waiting for the shared acquirability-scan lock' }],
   ])('holds when the control times out on the same check but with %s', async (_label, patch) => {
     const controlRow = { ...failed[0], ...patch };
@@ -181,10 +181,27 @@ describe('env-timeout hold escape', () => {
     if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
   });
 
-  const mixedDispatch = { ...dispatchTimeout,
-    detail: 'dispatch dry-run failed (2/2): review PR #1: invalid configuration; fix PR #2: scan exceeded its 120000ms budget' };
-  const twoSignatures = { ...dispatchTimeout,
-    detail: 'dispatch dry-run child failed: exited 1: scan exceeded its 120000ms budget after gave up waiting for the shared acquirability-scan lock' };
+  const mixedDispatch = { ...scanRow,
+    detail: `lane-pool list --acquirable failed (2/2): review PR #1: invalid configuration; fix PR #2: exited 1: ✗ ${scanText(120_000)}` };
+  const twoSignatures = { ...scanRow,
+    detail: `lane-pool list --acquirable failed: exited 1: ✗ ${scanText(120_000)} ${scanText(120_000)}` };
+  it.each([
+    // The gate sets the scan budget itself (the same widened value on both runs), so a scan unit proves an
+    // equivalent give-up only at the SAME budget: a smaller printed candidate budget means the candidate broke its
+    // own scan budget (code), not that the host was slow.
+    ['a candidate scan budget far under the control\'s', { ...scanRow, ms: 40_000, detail: `lane-pool list --acquirable failed: exited 1: ✗ ${scanText(1)}` },
+      { ...scanRow, ms: 125_000 }, false],
+    ['a candidate repo scan budget far under the control\'s', { ...failed[0], ms: 300_500,
+      detail: `reconcile-pass dry-run failed for 2/2 repo(s): a/a: timed out after 300000ms (process group killed); b/b: exited 1: ✗ ${scanText(1)}` },
+    { ...failed[0], ms: 420_000,
+      detail: `reconcile-pass dry-run failed for 2/2 repo(s): a/a: timed out after 300000ms (process group killed); b/b: exited 1: ✗ ${scanText(120_000)}` }, false],
+    ['a kill on the candidate and a scan give-up on the control', killRow(120_000), { ...failed[0], detail: `reconcile failed: exited 1: ✗ ${scanText(120_000)}` }, false],
+  ])('scan budgets: %s', async (_label, candidateRow, controlRow, adopted) => {
+    const { r, ctx } = await runWith(candidateRow, controlRow);
+    expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+    if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['the control carries a real error beside the timeout', scanRow, mixedDispatch, false],
     ['the candidate carries a real error beside the timeout', mixedDispatch, scanRow, false],
@@ -220,6 +237,7 @@ describe('env-timeout hold escape', () => {
     // The kill summary prints only the FIRST repo's budget; the shared deadline can cut a later repo's cap short,
     // so the control's later repos have no proven budget (the candidate's printed budget bounds all of its own).
     ['later control repos whose budget the summary hides', repoKills(['a', 'b'], 2, 120_000), repoKills(['a', 'b'], 2, 150_000), false],
+    ['an identical multi-repo summary (later budgets still unproven)', repoKills(['a', 'b'], 2, 120_000), repoKills(['a', 'b'], 2, 120_000), false],
     ['a candidate repo that is not the control summary\'s first', repoKills(['b'], 2, 120_000), repoKills(['a', 'b'], 2, 150_000), false],
   ])('multi-repo reconcile: %s', async (_label, candidateRow, controlRow, adopted) => {
     const { r, ctx } = await runWith(candidateRow, controlRow);

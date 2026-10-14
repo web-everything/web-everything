@@ -78,15 +78,18 @@ function timeoutProfile(row, side) {
 // killed at a smaller budget (host load differs, or the shared deadline cut it short) proves nothing; one killed at
 // a larger budget is stronger evidence. Exact equality would reject nearly every load-scaled budget. The printed
 // budget alone is not enough: scan text comes from the tree, so the gate's own clock must show the control spent
-// about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow).
+// about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow). A scan budget is set by the gate
+// (the same widened value on both runs) and is not cut by the deadline, so it must match exactly: a smaller printed
+// candidate budget means the candidate broke its own scan budget — code, not load.
 function sameTimeout(candidateRow, controlRow) {
   const want = timeoutProfile(candidateRow, 'candidate');
   const got = timeoutProfile(controlRow, 'control');
   const spent = Number(controlRow.ms);
   const took = Number(candidateRow.ms);
+  const covers = (w, g) => g?.kind === w.kind && (w.kind === 'scan' ? g.budget === w.budget : g.budget >= w.budget);
   return !!want && !!got && candidateRow.name === controlRow.name
     && Number.isFinite(spent) && Number.isFinite(took) && spent >= took * 0.9
-    && [...want].every(([unit, w]) => got.get(unit)?.kind === w.kind && got.get(unit).budget >= w.budget);
+    && [...want].every(([unit, w]) => covers(w, got.get(unit)));
 }
 
 /** Resolve the environment-timeout hold cap through the platform/env policy cascade. Never throws. */
