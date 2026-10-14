@@ -195,6 +195,10 @@ describe('env-timeout hold escape', () => {
       detail: `reconcile-pass dry-run failed for 2/2 repo(s): a/a: timed out after 300000ms (process group killed); b/b: exited 1: ✗ ${scanText(1)}` },
     { ...failed[0], ms: 420_000,
       detail: `reconcile-pass dry-run failed for 2/2 repo(s): a/a: timed out after 300000ms (process group killed); b/b: exited 1: ✗ ${scanText(120_000)}` }, false],
+    // A scan gives up only once its budget elapsed, so the gate's clock must show the row spent it.
+    ['a candidate that gave up long before its printed scan budget', { ...scanRow, ms: 40_000 }, { ...scanRow, ms: 125_000 }, false],
+    ['a control that gave up long before its printed scan budget', { ...scanRow, ms: 40_000 }, { ...scanRow, ms: 45_000 }, false],
+    ['both rows spent their scan budget', { ...scanRow, ms: 121_000 }, { ...scanRow, ms: 125_000 }, true],
     ['a kill on the candidate and a scan give-up on the control', killRow(120_000), { ...failed[0], detail: `reconcile failed: exited 1: ✗ ${scanText(120_000)}` }, false],
   ])('scan budgets: %s', async (_label, candidateRow, controlRow, adopted) => {
     const { r, ctx } = await runWith(candidateRow, controlRow);

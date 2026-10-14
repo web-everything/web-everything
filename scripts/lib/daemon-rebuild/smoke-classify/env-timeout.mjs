@@ -80,13 +80,16 @@ function timeoutProfile(row, side) {
 // budget alone is not enough: scan text comes from the tree, so the gate's own clock must show the control spent
 // about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow). A scan budget is set by the gate
 // (the same widened value on both runs) and is not cut by the deadline, so it must match exactly: a smaller printed
-// candidate budget means the candidate broke its own scan budget — code, not load.
+// candidate budget means the candidate broke its own scan budget — code, not load. A scan gives up only once its
+// budget elapsed, so each row's own clock must show it spent that budget (a scan quitting early is code too).
 function sameTimeout(candidateRow, controlRow) {
   const want = timeoutProfile(candidateRow, 'candidate');
   const got = timeoutProfile(controlRow, 'control');
   const spent = Number(controlRow.ms);
   const took = Number(candidateRow.ms);
-  const covers = (w, g) => g?.kind === w.kind && (w.kind === 'scan' ? g.budget === w.budget : g.budget >= w.budget);
+  const covers = (w, g) => g?.kind === w.kind && (w.kind === 'scan'
+    ? g.budget === w.budget && took >= w.budget * 0.9 && spent >= g.budget * 0.9
+    : g.budget >= w.budget);
   return !!want && !!got && candidateRow.name === controlRow.name
     && Number.isFinite(spent) && Number.isFinite(took) && spent >= took * 0.9
     && [...want].every(([unit, w]) => covers(w, got.get(unit)));
