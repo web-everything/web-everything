@@ -122,6 +122,11 @@ function buildWeTemplate() {
   git(work, ['add', '-A']);
   git(work, ['commit', '-q', '-m', 'sim template: scripts/ + skills-src/ + package.json snapshot']);
 
+  // Every world, lane and main-move scratch clone inherits this object database. Leave it packed rather than
+  // copying thousands of loose-object directory entries on every local clone. Repack synchronously BEFORE
+  // publishing the template; background auto-gc stays disabled so it cannot race a scenario's next clone.
+  git(work, ['repack', '-ad']);
+
   const bare = mkdtempSync(join(tmpdir(), 'sim-template-we-bare-'));
   rmSync(bare, { recursive: true, force: true }); // git clone --bare refuses an existing target dir
   git(work, ['clone', '--quiet', '--bare', work, bare]);

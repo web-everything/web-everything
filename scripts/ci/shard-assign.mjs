@@ -143,7 +143,10 @@ async function main(argv) {
     const split = await classifyTests(files);
     files = split[group];
   }
-  const mine = assignByTime(files, loadTimings()[suite], total)[shard - 1];
+  // Keep the soak CLI and its run-shard caller on the same partition (including baseline isolation).
+  const mine = suite === 'soak'
+    ? (await import('../conveyor/soak/shard-files.mjs')).shardFiles({ shard, total })
+    : assignByTime(files, loadTimings()[suite], total)[shard - 1];
   if (suite === 'unit') {
     const bad = ambiguousFilters(mine, universe);
     if (bad.length) throw new Error(`shard-assign: filter is a substring of another test path: ${bad.map(([a, b]) => `${a} in ${b}`).join('; ')}`);
