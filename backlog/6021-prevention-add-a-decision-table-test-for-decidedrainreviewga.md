@@ -7,7 +7,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-13"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "2f7ed11557946d5ddf986535fd7e88a4894c0560"
+preparedAgainstSha: "9b764e95bf582c1eadaa5132b4fee217ccaf8a3a"
 tags: []
 ---
 
@@ -77,3 +77,4 @@ With the new test file present, `git stash` the one-line fix in we:scripts/merge
 2026-10-14 re-prepare: stamp stale (7372a0e0 vs main 2f7ed115). Re-checked: gate logic and `!== false` / `=== undefined` defaults unchanged (only the drain concurrency commit 1162e0054 touched the file); no decision-table test exists. Citations shifted and were corrected in Design (836→840, 850-852→854-856, callers →5299/5685, workflowReadOptions →4883). Goal and plan unchanged. Re-stamped.
 2026-10-14 re-prepare: stamp stale (7372a0e0 vs main 2f7ed115). Re-checked: gate logic and the `!== false` / `=== undefined` defaults are unchanged (only drain-concurrency commit 1162e0054 touched the file); still no decision-table test. Citations shifted and were corrected in Design (836→840, 850-852→854-856, callers →5299/5685, workflowReadOptions →4883). Goal and plan unchanged. Re-stamped.
 2026-10-14 review: adversarial pass fixed MVP 2b (per-view listedHeadSha, missing-clone cases), made the Proof plan dry-run concrete, noted the endpoint and loosening hints are n/a.
+2026-10-14 re-prepare: stamp stale (2f7ed115 vs main 9b764e95). Re-checked: lines 854-856 still default-trust (`!== false`), no decision-table test file on main, the gate and hold module unchanged since the last stamp. Design/MVP/Test plan unchanged. Re-stamped.
