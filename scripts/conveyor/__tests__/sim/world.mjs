@@ -268,6 +268,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
     LANE_POOL_ROOT: lanePoolRoot,
+    // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
+    // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
+    // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,

@@ -3,8 +3,8 @@ import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
 
 const CATALOG = Object.freeze({
-  claude: ['claude-haiku-4-5-20251001', 'claude-sonnet-5-5', 'claude-opus-5'],
-  codex: ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
+  claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
+  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
   antigravity: ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'],
   // Card 84 — agy 1.3.0 serves the 5.5 family with the effort baked into the id (`agy models`, 2026-10-06).
   'agy-claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
@@ -99,7 +99,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))));
   const selected = chain.find(route => (!gateClosed || route.provider === 'claude') && (!available || available.includes(route.provider)));
   if (!selected) fail(`${operation}: no available route${gateClosed ? ' permitted by critical-work gate' : ''}`);
-  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(entry.mode && selected === chain[0] ? { mode: entry.mode } : {}) };
+  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(vetoes.length ? { vetoes: structuredClone(vetoes) } : {}), ...(entry.mode && selected === chain[0] ? { mode: entry.mode } : {}) };
 }
 
 /**

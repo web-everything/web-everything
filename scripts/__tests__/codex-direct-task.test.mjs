@@ -1082,7 +1082,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
 
 describe('direct task routes', () => {
   it.each([
-    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'medium'],
+    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'high'],
     [{ taskKind: 'prepare', size: 8 }, 'gpt-6-astra', 'high'],
     [{ taskKind: 'trivial' }, 'gpt-6-luna', 'low'],
     [{ taskKind: 'trivial', model: 'x', tier: 'opus' }, 'x', 'high'],
@@ -1097,7 +1097,7 @@ describe('direct task routes', () => {
 
 describe('direct CLI flags reach the actual spawn and JSON result', () => {
   it.each([
-    [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'medium', 'tool', 'tool'],
+    [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'high', 'tool', 'tool'],
     [['--task-kind=prepare', '--size=8'], 'prepare-complex', 'gpt-6-astra', 'high', 'tool', 'tool'],
     [['--task-kind=trivial'], 'trivial', 'gpt-6-luna', 'low', 'tool', 'tool'],
     [['--task-kind=trivial', '--model=x', '--tier=opus'], 'trivial', 'x', 'high', 'explicit', 'explicit'],

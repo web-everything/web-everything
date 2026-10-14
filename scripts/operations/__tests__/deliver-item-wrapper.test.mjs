@@ -270,7 +270,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
   it.each([
     [{}, 'gpt-6.1-sol', 'medium'],
-    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'medium'],
+    [{ taskKind: 'fix' }, 'gpt-6.1-sol', 'high'],
     [{ taskKind: 'takeover' }, 'gpt-6-astra', 'high'],
     [{ taskKind: 'trivial', model: 'x', effort: 'max' }, 'x', 'max'],
   ])('routes the actual spawn and scorecard %j', async (request, model, effort) => {
