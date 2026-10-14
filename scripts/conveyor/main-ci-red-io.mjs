@@ -26,7 +26,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
-  planPriority, admitMainFixDispatch, parseVitestFailures, classifyFlakeRun, planMainCiRerun, hexSha,
+  planPriority, admitMainFixDispatch, parseVitestFailures, classifyFlakeRun, planMainCiRerun, hexSha, FLAKE_RERUN_ROUNDS,
   findMergeGroupFlakeEvidence, mainCiRedSettingSource,
 } from './main-ci-red-core.mjs';
 import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
@@ -318,7 +318,14 @@ export async function probeAndOwnMainCi({
     withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
   }
   for (const run of probe.runs || []) {
-    if (reruns[run.databaseId]?.kind === 'flake' && run.status !== 'completed') run.rerunPending = true;
+    // Our flake reruns are ledgered, but a person's manual re-run (or a run whose ledger entry is lost or unreadable) shows
+    // only as attempt > 1. A ledgered run of another kind (the cancelled tip) was never a settled red, so it stays out.
+    const kind = reruns[run.databaseId]?.kind;
+    if (kind != null ? kind !== 'flake' : !(Number(run.attempt) > 1)) continue;
+    // The rerun replaces the original verdict: while it runs the run stays red, and a rerun that finishes with no
+    // verdict (cancelled / skipped / infra-only) must not erase the failure it was meant to settle.
+    if (run.status !== 'completed') run.rerunPending = true;
+    else run.rerunInconclusive = true;
   }
   const state = mainRedState(probe.runs, { tip: probe.tip });
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };
@@ -333,8 +340,9 @@ export async function probeAndOwnMainCi({
       withFileLock(`${ledgerPath}.lock`, () => {
         const ledger = readOwnerLedger(ledgerPath);
         ledger._reruns ??= {};
-        if (Object.hasOwn(ledger._reruns, plan.runId)) return;
-        ledger._reruns[plan.runId] = { at: now, kind: plan.kind, sha: plan.sha, reason: plan.reason, status: 'requested' };
+        const prev = ledger._reruns[plan.runId];
+        if (Object.hasOwn(ledger._reruns, plan.runId) && !(plan.retry && (prev?.rounds ?? 1) < FLAKE_RERUN_ROUNDS)) return;
+        ledger._reruns[plan.runId] = { at: now, kind: plan.kind, sha: plan.sha, reason: plan.reason, status: 'requested', rounds: prev ? (prev.rounds ?? 1) + 1 : 1 };
         writeJsonAtomic(ledgerPath, ledger);
         reserved = true;
       }, { timeoutMs: 30_000 });
