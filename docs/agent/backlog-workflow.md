@@ -1255,6 +1255,8 @@ fast-path admission so the card can build after preparation while disabled.
 These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge
 adoption, capture the command's exit status/output and expectation match, then post a report of at most eight
 lines with `<!-- operator-task-report -->`. A failed or pending adoption/proof is reported honestly.
+The command and expectation are copied verbatim into the brief, so `{{...}}` text is refused: the dispatch
+fill would otherwise rewrite it as a brief placeholder.
 Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
 an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
 the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card

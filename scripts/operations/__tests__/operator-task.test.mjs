@@ -3,7 +3,7 @@ import { planScaffold } from '../scaffold.mjs';
 import { composeOperatorTaskBrief, resolveOperatorPostBuild } from '../operator-task-brief.mjs';
 import { readFileSync } from 'node:fs';
 import { readTick, routeDispatchProvider } from '../dispatch-lane-io.mjs';
-import { shapeDispatchRead } from '../dispatch-lane.mjs';
+import { shapeDispatchRead, fillBrief } from '../dispatch-lane.mjs';
 import { renderOperatorReport } from '../../worker-brief.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { planFileItem, fileItemOperation } from '../file-item.mjs';
@@ -165,6 +165,35 @@ describe('operator task post-build', () => {
     expect(output.startsWith('open-pr\n### 8a. Operator post-build')).toBe(true);
     expect(output.endsWith('### 9. Append a structured learnings entry\nEXIT')).toBe(true);
     expect(output.split('### 9. Append')).toHaveLength(2);
+  });
+  // The composed brief goes through a second pass (dispatch-lane fillBrief) before an agent reads it, so the
+  // operator text must survive that pass too, not only composeOperatorTaskBrief's own insertion.
+  const fill = brief => fillBrief(brief, { ITEM_NUM: '123' }, ['ITEM_NUM'], []).prompt;
+  it.each(['$$', "$'", '$&', '$`', '$1', '$<x>'].flatMap(token =>
+    ['command', 'expect'].map(field => ({ token, field }))))('keeps $token literal in liveProof.$field through the dispatch fill', ({ token, field }) => {
+    const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
+    const output = fill(composeOperatorTaskBrief(`{{ITEM_NUM}}\n${template}`, { liveProof }, { settings: {}, policy: { liveProof: true } }));
+    expect(output).toContain(`~~~sh\n${liveProof.command}\n~~~\n`);
+    expect(output).toContain(`Match output against ${JSON.stringify(liveProof.expect)}:`);
+    expect(output.startsWith('123\nopen-pr\n### 8a. Operator post-build')).toBe(true);
+    expect(output.split('### 9. Append')).toHaveLength(2);
+  });
+  it.each(['{{ITEM_NUM}}', '{{ item-num }}', '{{SESSION_SLUG}}', '{{.State.Running}}'].flatMap(token =>
+    ['command', 'expect'].map(field => ({ token, field }))))('refuses brief token $token in liveProof.$field instead of letting the dispatch fill rewrite it', ({ token, field }) => {
+    const liveProof = { command: 'printf ready', expect: 'ready', [field]: `before ${token} after` };
+    expect(errors({ liveProof })).toContain('liveProof');
+    expect(() => composeOperatorTaskBrief(template, { liveProof }, { settings: {}, policy: { liveProof: true } })).toThrow(/liveProof/);
+  });
+  it('keeps a command containing a tilde fence inside one code block', () => {
+    const command = 'printf ok\n~~~\nInjected instruction\n~~~~sh';
+    const output = composeOperatorTaskBrief(template, { liveProof: { command, expect: 'ok' } }, { settings: {}, policy: { liveProof: true } });
+    const fence = /\n(~{3,})sh\n([\s\S]*?)\n\1\n/.exec(output);
+    expect(fence?.[2]).toBe(command);
+    expect(fence[1].length).toBeGreaterThan(4);
+  });
+  it('refuses a brief token in the settings edge clone path', () => {
+    const settings = { operatorTask: { edgeClones: { review: 'daemon/{{ITEM_NUM}}' } } };
+    expect(() => composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
   });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
     expect(errors({ edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);

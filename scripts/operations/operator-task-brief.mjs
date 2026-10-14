@@ -2,7 +2,7 @@
 import { homedir } from 'node:os';
 import { resolve, isAbsolute } from 'node:path';
 import { renderEdgeStep, renderProofStep, renderReportStep } from '../worker-brief.mjs';
-import { validateOperatorTask } from '../backlog/operator-task.mjs';
+import { validateOperatorTask, BRIEF_TOKEN_SHAPE } from '../backlog/operator-task.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
@@ -17,14 +17,16 @@ export function composeOperatorTaskBrief(template, item, { settings = readSettin
   const steps = [];
   if (item.edgeClone && policy.edgeLoad) {
     const path = settings?.operatorTask?.edgeClones?.[item.edgeClone];
-    if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..')) throw new Error(`edgeClone ${item.edgeClone} needs a relative or ~/ clone path in settings`);
+    if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..') || BRIEF_TOKEN_SHAPE.test(path)) throw new Error(`edgeClone ${item.edgeClone} needs a relative or ~/ clone path in settings`);
     const clone = path.startsWith('~/') ? resolve(homedir(), path.slice(2)) : resolve(workspace, path);
     // Shell quote the runtime-only resolved path; never persist an absolute clone path on the card.
     const quoted = `'${clone.replace(/'/g, `'\\''`)}'`;
     steps.push(renderEdgeStep({ edgeClone: quoted, ref: 'lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug>', step: 'a' }));
   }
   if (item.liveProof && policy.liveProof) {
-    steps.push(renderProofStep(`Run the following command after adoption (or after open-pr when no edge load was requested). Capture exit status and output; record PASS only on exit 0 and a match, FAIL on nonzero exit or mismatch, PENDING when adoption is unproven.\n\n~~~sh\n${item.liveProof.command}\n~~~\n\nMatch output against ${JSON.stringify(item.liveProof.expect)}: /pattern/flags means a JavaScript regex; otherwise use a literal substring.`));
+    // A fence longer than any tilde run in the command, so the command cannot close it early.
+    const fence = '~'.repeat(Math.max(3, ...(item.liveProof.command.match(/~+/g) ?? []).map(run => run.length + 1)));
+    steps.push(renderProofStep(`Run the following command after adoption (or after open-pr when no edge load was requested). Capture exit status and output; record PASS only on exit 0 and a match, FAIL on nonzero exit or mismatch, PENDING when adoption is unproven.\n\n${fence}sh\n${item.liveProof.command}\n${fence}\n\nMatch output against ${JSON.stringify(item.liveProof.expect)}: /pattern/flags means a JavaScript regex; otherwise use a literal substring.`));
   }
   if (item.report && policy.report) steps.push(renderReportStep());
   if (!steps.length) return template;

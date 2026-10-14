@@ -1,5 +1,7 @@
 /** Optional operator-card metadata; shared by filing and the standards gate. Pure. */
 export const EDGE_CLONE_NAMES = Object.freeze(['review', 'fix', 'control', 'drain', 'health-watch']);
+// Same shape as dispatch-lane BRIEF_TOKEN_RE: the composed brief is filled again, which would rewrite or refuse it.
+export const BRIEF_TOKEN_SHAPE = /\{\{[^{}\n]*\}\}/;
 export function validateOperatorTask(item) {
   const errors = [];
   if (item.operatorTask !== undefined && typeof item.operatorTask !== 'boolean') errors.push('operatorTask must be a boolean');
@@ -8,6 +10,7 @@ export function validateOperatorTask(item) {
   if (item.liveProof !== undefined) {
     const p = item.liveProof;
     if (!p || typeof p !== 'object' || Array.isArray(p) || typeof p.command !== 'string' || !p.command.trim() || typeof p.expect !== 'string' || !p.expect.trim()) errors.push('liveProof requires nonempty command and expect strings');
+    else if (BRIEF_TOKEN_SHAPE.test(p.command) || BRIEF_TOKEN_SHAPE.test(p.expect)) errors.push('liveProof must not contain {{...}} brief tokens');
     else if (p.expect.startsWith('/')) {
       const match = /^\/(.*)\/([imsu]*)$/s.exec(p.expect);
       try { if (!match) throw new Error(); new RegExp(match[1], match[2]); } catch { errors.push('liveProof.expect has an invalid /regex/flags'); }
