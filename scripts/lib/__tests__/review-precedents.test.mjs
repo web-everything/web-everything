@@ -95,6 +95,18 @@ describe('records and events', () => {
     expect(p.foldCitations([older, withdrawn, newer])).toEqual([newer]);
     expect(p.foldCitations([newer, withdrawn])).toEqual([]);
   });
+  it('never withdraws a row a stale snapshot could not have seen', () => {
+    const source = (comment, time) => JSON.stringify([comment, time, time]);
+    const base = { repo: REPO, pr: 1, head: 'abcdef1', seat: 'panel', ids: [seeds[0].id], verdict: 'accept' };
+    const snapshotAt = '2026-10-13T12:00:00Z';
+    // Stored by a later backfill than the snapshot's thread read.
+    const storedLater = p.citationEvent({ ...base, at: '2026-10-13T12:05:00Z', source: source(1, '2026-10-13T10:00:00Z') });
+    // Posted after the snapshot's thread read began.
+    const postedLater = p.citationEvent({ ...base, seat: 'advisory', at: '2026-10-13T11:00:00Z', source: source(2, '2026-10-13T12:01:00Z') });
+    const seenBefore = p.citationEvent({ ...base, seat: 'x', at: '2026-10-13T11:00:00Z', source: source(3, '2026-10-13T10:00:00Z') });
+    expect(p.citationRetractions([storedLater, postedLater, seenBefore], [], { repo: REPO, pr: 1, at: snapshotAt }).map(ev => ev.seat)).toEqual(['x']);
+    expect(p.citationRetractions([seenBefore], [], { repo: REPO, pr: 1, at: 'not-a-time' })).toEqual([]);
+  });
 });
 
 describe('recorded operator capture', () => {

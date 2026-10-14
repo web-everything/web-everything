@@ -184,8 +184,16 @@ export async function capturePrecedents({ repo, pr, info, existing = new Map(), 
   return { drafts, skipped, invalid };
 }
 
-export function recordCitationsFromComments({ repo, pr, info, at }) {
+export function recordCitationsFromComments({ repo, pr, info, at, stored = [] }) {
   const events = [];
+  // The head a comment was first recorded on, per [comment, seat]. The PR head moves on every push, so a comment
+  // whose head is derived from it must keep its recorded head, or a re-backfill would move it to a head it never
+  // reviewed and withdraw the right one.
+  const recordedHead = new Map();
+  for (const ev of currentCommentCitations(stored).values()) {
+    if (ev.repo !== repo || ev.pr !== pr) continue;
+    try { recordedHead.set(JSON.stringify([JSON.parse(ev.source)[0], ev.seat]), ev.head); } catch { /* unsourced */ }
+  }
   for (const comment of info.comments ?? []) {
     if (!AUTOMATION_LOGINS.includes(String(comment.author?.login ?? '').toLowerCase())) continue;
     const body = typeof comment.body === 'string' ? comment.body : '';
@@ -195,12 +203,15 @@ export function recordCitationsFromComments({ repo, pr, info, at }) {
     if (!verdict) continue;
     const ids = extractCitations(body);
     if (!ids.length) continue;
+    const seat = verdict === 'advisory' ? 'advisory' : 'panel';
+    const source = comment.id ?? comment.url ?? comment.createdAt;
     // One spelling per head, so a short or upper-case reviewed-sha folds into the same seat as the full one.
     const reviewed = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1]?.toLowerCase();
+    const recorded = source == null ? undefined : recordedHead.get(JSON.stringify([source, seat]));
     const prHead = String(info.headRefOid ?? '').toLowerCase();
-    const head = !reviewed ? info.headRefOid : prHead.startsWith(reviewed) ? prHead : reviewed;
-    const source = comment.id ?? comment.url ?? comment.createdAt;
-    events.push(citationEvent({ repo, pr, head, ids, seat: verdict === 'advisory' ? 'advisory' : 'panel', verdict, at,
+    const head = reviewed ? [recorded, prHead].find(full => full?.toLowerCase().startsWith(reviewed)) ?? reviewed
+      : recorded ?? info.headRefOid;
+    events.push(citationEvent({ repo, pr, head, ids, seat, verdict, at,
       // [comment, authored, revised]: the fold orders by authored time, so an edit never makes old evidence newest.
       source: source == null ? '' : JSON.stringify([source, comment.createdAt ?? '', comment.updatedAt ?? comment.createdAt ?? '']) }));
   }

@@ -213,6 +213,23 @@ describe('settings and drafting', () => {
     expect(panel()).toEqual([]);
     expect(backfill([]).rows).toBe(0);
   });
+  it('keeps a comment on the head it was first recorded on after the PR head moves', () => {
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const advisory = { ...automation, id: 'IC_9', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };
+    const short = { ...automation, id: 'IC_8', createdAt: '2026-10-13T10:00:00Z', body: `🔁 review — changes requested\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: abcdef9 -->` };
+    const firstHead = 'abcdef9000000000000000000000000000000000', pushedHead = '1234567000000000000000000000000000000000';
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const backfill = headRefOid => {
+      const log = io.readPrecedentLog({ board: '.', repo, run: args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '' });
+      const events = io.recordCitationsFromComments({ repo, pr: 9, at, stored: log.events, info: { ...info, headRefOid, comments: [advisory, short] } });
+      return io.appendPrecedentEvents({ repo, stage, citationSnapshot: { pr: 9, at }, events });
+    };
+    expect(backfill(firstHead).rows).toBe(2);
+    expect(backfill(pushedHead).rows).toBe(0);
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    expect(io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.seat, e.head])).toEqual([['advisory', firstHead], ['panel', firstHead]]);
+  });
   it('keeps a reverted edit current when the comment reader returns no revision time', () => {
     // The production reader (pr-comments-list.mjs) returns body, createdAt, author and id only — no updatedAt.
     const cite = verdict => `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: ABCDEF987 -->`;

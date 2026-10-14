@@ -152,7 +152,7 @@ async function main() {
     readLibrary(); // Refuse unknown transport state even for a backfill preview.
     const log = readPrecedentLog({ board, repo });
     if (log.status !== 'ok') throw Object.assign(new Error(`precedent transport unreadable: ${log.error}`), { exitCode: 2 });
-    const events = recordCitationsFromComments({ repo, pr, info, at });
+    const events = recordCitationsFromComments({ repo, pr, info, at, stored: log.events });
     // The thread is complete, so a stored comment it no longer yields is withdrawn (re-computed on the append tip).
     const withdrawn = citationRetractions(log.events, events, { repo, pr, at });
     const appended = flags.apply ? appendPrecedentEvents({ board, repo, events, citationSnapshot: { pr, at } }) : null;

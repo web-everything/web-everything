@@ -164,7 +164,13 @@ export function currentCommentCitations(events) {
  */
 export function citationRetractions(stored, snapshot, { repo, pr, at }) {
   const produced = new Set(snapshot.map(citationCommentKey).filter(Boolean));
-  return [...currentCommentCitations(stored)].filter(([key, ev]) => ev.repo === repo && ev.pr === pr && ev.ids.length && !produced.has(key))
+  // `at` is taken before the thread read. A row stored by a later backfill, or a comment posted after `at`,
+  // may be missing from this snapshot only because the read was older: never withdraw those.
+  const cutoff = timeOf(at);
+  const seenBySnapshot = ev => cutoff > -Infinity && timeOf(ev.at) > -Infinity && timeOf(ev.at) <= cutoff
+    && evidenceTime(ev)[0] <= cutoff;
+  return [...currentCommentCitations(stored)].filter(([key, ev]) => ev.repo === repo && ev.pr === pr && ev.ids.length
+    && !produced.has(key) && seenBySnapshot(ev))
     .map(([, ev]) => citationEvent({ repo, pr, head: ev.head, ids: [], seat: ev.seat, verdict: '', at, source: ev.source }));
 }
 
