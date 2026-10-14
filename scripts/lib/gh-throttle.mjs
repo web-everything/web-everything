@@ -103,7 +103,7 @@
  * its call costs more than the default passes `throttle.points` explicitly.
  *
  * A CALL BEYOND BUDGET WAITS, IT DOES NOT FIRE — {@link acquireGhPointsSync} polls (bounded, fail OPEN on
- * timeout, mirroring {@link acquireGhSlotSync}'s own policy exactly) until the current window has room or a
+ * timeout) until the current window has room or a
  * new window rolls over, exactly the shape `acquireGhSlotSync` already uses for the concurrency slot.
  *
  * RECORDING — {@link recordGhCallLogEntry} appends one JSON line per `gh` attempt (`calls.jsonl`, a sibling of
@@ -192,7 +192,7 @@ import { retryAfterMs } from '../readiness/model-proposer.mjs';
 import { createTelemetryRecorder } from '../operations/telemetry-store.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs';
-export { isGhDeferred } from './gh-deferred.mjs';
+export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
@@ -206,9 +206,9 @@ export const DEFAULT_GH_CONCURRENCY_CAP = 6;
  *  this polls faster than heavy-admission.mjs's 2000ms default). */
 export const DEFAULT_ACQUIRE_POLL_MS = 250;
 
-/** How long a caller polls for a free CONCURRENCY slot before giving up and proceeding unslotted — fail OPEN,
- *  mirroring heavy-admission.mjs's own named policy: a queuing timeout must never strand an otherwise-healthy
- *  `gh` call behind a stuck semaphore. Overridable via `WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS`. */
+/** Priority CONCURRENCY-slot wait; background reads use GH_SLOT_WAIT_STANDARD.backgroundWaitMs.
+ *  A timeout returns retryable throttling by default (card 308), with an explicit `ungated` opt-out.
+ *  Overridable via `WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS`; also bounds the separate budget gates. */
 export const DEFAULT_ACQUIRE_TIMEOUT_MS = 2 * 60_000;
 
 /** Backoff base for a RATE-LIMIT retry (distinct from the acquire-poll interval above — this is the wait AFTER
@@ -562,13 +562,65 @@ export function deriveGhCaller(throttle, env) {
 
 /** Operator ruling 2026-09-30: reserve GraphQL headroom for reviews and landing. */
 export const GH_PRIORITY_THRESHOLDS = Object.freeze({ background: 0.25, normal: 0.10, critical: 0 });
+function normalizeGhCaller(caller) {
+  return basename(String(caller).replace(/^we:/, '')).replace(/\.mjs(?=:|$)/, '');
+}
 export function ghCallerPriority(caller, args = []) {
-  const name = basename(String(caller).replace(/^we:/, '')).replace(/\.mjs(?=:|$)/, '');
+  const name = normalizeGhCaller(caller);
   if (/^(review-daemon|review-set-label|review-pr|merge-ai-prs)(:|$)/.test(name)) return 'critical';
   if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || args[0] === 'pr' && args[1] === 'merge')) return 'critical';
   if (/^ci-heal(?:-run|-pr-dispatch)?(:|$)/.test(name) && (name.includes(':push') || classifyGhWrite(args))) return 'critical';
   if (/^(dispatch-plan|parked-pr-conflict-watch|parked-pr-progress-watch|active-progress-watch|progress-board|lane-whois|reconcile-pass|reconcile-fix-dispatch|reconcile-snapshot)(:|$)/.test(name)) return 'background';
   return 'normal';
+}
+
+/**
+ * Card 308: background reads wait briefly; priority calls keep the long slot wait.
+ * Slot timeouts default to retryable `throttled`; `ungated` explicitly restores fail-open.
+ * Points/write budget timeouts and acquire exceptions retain their existing policies.
+ */
+export const GH_SLOT_WAIT_STANDARD = Object.freeze({
+  backgroundWaitMs: 8000,
+  onSlotTimeout: 'throttled',
+  priorityCallers: Object.freeze(['^(ci-red-recovery|main-ci-red|red-main|main-red|enqueue)']),
+  backgroundCallers: Object.freeze(['^(lane-pool-health-watch|parked-pr-|load-flake-reverify|advisory-label-sweep|merge-orphan-sweep|health-watch|build-dispatch-daemon|already-done-refresh|lease-reaper|rebuild-smoke|reconcile-fix-dispatch-daemon)']),
+});
+
+export function resolveGhSlotWait(env = process.env) {
+  try {
+    const raw = env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS;
+    const r = cascadePolicy('ghThrottleSlotWait', undefined, {
+      env, standard: GH_SLOT_WAIT_STANDARD,
+      envValues: {
+        backgroundWaitMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined,
+        onSlotTimeout: env?.WE_GH_THROTTLE_ON_SLOT_TIMEOUT,
+      },
+      valid: {
+        backgroundWaitMs: n => Number.isInteger(n) && n >= 0 && n <= 120000,
+        onSlotTimeout: v => v === 'throttled' || v === 'ungated',
+        backgroundCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
+        priorityCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
+      },
+    });
+    return { ...GH_SLOT_WAIT_STANDARD, ...(r.value || {}), source: r.sources || {} };
+  } catch {
+    return { ...GH_SLOT_WAIT_STANDARD, source: Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard'])) };
+  }
+}
+
+/** PURE slot-wait classification; malformed regex entries never interrupt a caller. */
+export function ghSlotWaitClass({ caller, args = [], isWrite, settings = GH_SLOT_WAIT_STANDARD }) {
+  if (isWrite || classifyGhWrite(args)) return 'priority';
+  const priority = ghCallerPriority(caller, args);
+  if (priority === 'critical') return 'priority';
+  const name = normalizeGhCaller(caller);
+  const matches = patterns => Array.isArray(patterns) && patterns.some(pattern => {
+    if (typeof pattern !== 'string') return false;
+    try { return new RegExp(pattern).test(name); } catch { return false; }
+  });
+  if (matches(settings.priorityCallers)) return 'priority';
+  if (priority === 'background' || matches(settings.backgroundCallers)) return 'background';
+  return 'priority';
 }
 
 function headroomPath(lockRoot, identity) {
@@ -1066,8 +1118,8 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
 /**
- * Poll for a free `gh`-call slot until one is won or `timeoutMs` elapses. FAILS OPEN on timeout (`{ ok:false,
- * timedOut:true }`) — mirrors `heavy-admission.mjs#acquireSlotBlocking`'s own policy, at a SYNCHRONOUS sleep
+ * Poll for a free `gh`-call slot until one is won or `timeoutMs` elapses (`{ ok:false, timedOut:true }`).
+ * The runners decide whether to throttle or opt into ungated execution. Uses a SYNCHRONOUS sleep
  * (`sleepSyncMs`, from `we:scripts/readiness/drain-lock.mjs`) rather than an async one, since `runGhSync` (this
  * module's whole point) must stay a synchronous, execFileSync-shaped call — the same reason `gh` calls
  * themselves run via `execFileSync`/`spawnSync`, not an async `exec`.
@@ -1145,8 +1197,8 @@ export function decideGhPointsSpend({ state, points, nowMs, budgetPerMin, window
  * waiting) until `points` fits in the current 60s window or `timeoutMs` elapses, guarding the shared window
  * state with `file-locks.mjs#reserve`/`releaseLockDir` (a plain single-holder mutex, held only across one
  * tiny JSON read/write — see the module header's #3670 section for why this reuses that primitive rather than
- * inventing a new one). FAILS OPEN on timeout (`{ok:false, timedOut:true}`) — mirrors {@link acquireGhSlotSync}
- * exactly: a stuck budget gate must never strand an otherwise-healthy `gh` call forever.
+ * inventing a new one). FAILS OPEN on timeout (`{ok:false, timedOut:true}`): a stuck budget gate must never
+ * strand an otherwise-healthy `gh` call forever. Slot timeouts use the separate card 308 policy.
  */
 export function acquireGhPointsSync({
   lockRoot, points = 1, budgetPerMin, owner, pid = process.pid,
@@ -1203,7 +1255,7 @@ function writeGhWriteBudgetState(lockRoot, state) {
  * lock key so exhausting the write budget never blocks a read and vice versa. A caller QUEUES here (spins,
  * bounded, injectable `sleep`/`now` for tests) rather than firing — the #gh-write-burst fix's whole point:
  * a write past budget waits for the window instead of hammering GitHub. FAILS OPEN on timeout, identically to
- * every other gate in this module. Cost is always 1 per call (write calls are not weighted by REST points —
+ * the points-budget gate. Cost is always 1 per call (write calls are not weighted by REST points —
  * unlike the points budget, this ledger counts MUTATIONS, not spend).
  */
 export function acquireGhWriteBudgetSync({
@@ -1527,8 +1579,8 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  */
 /**
  * A concurrency-slot acquire that TIMED OUT used to proceed ungated with no trace at all — the 2026-10-07 stall
- * cost every gh call on the host 2 minutes and nothing said so. Now it is a `slot_timeout` line in `calls.jsonl`
- * (with how long it waited) plus a stderr warning, so a starved pool is visible the first time it happens.
+ * cost every gh call on the host 2 minutes and nothing said so. The explicit `ungated` opt-out records a
+ * `slot_timeout` line and warning here; the default refusal records `slot_throttled` instead (card 308).
  */
 export function noteSlotTimeout(logPath, acq, entry, warn) {
   if (!acq || !acq.timedOut) return false;
@@ -1536,6 +1588,20 @@ export function noteSlotTimeout(logPath, acq, entry, warn) {
   const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated`;
   try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
   return true;
+}
+
+/** Card 308: refuse a timed-out slot before entering the subprocess retry loop. */
+function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn) {
+  if (!acq?.timedOut) return null;
+  if (settings.onSlotTimeout === 'ungated') {
+    noteSlotTimeout(logPath, acq, entry, warn);
+    return null;
+  }
+  const waitedMs = acq.waitedMs ?? 0;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass });
+  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick\n`;
+  try { (warn || (m => process.stderr.write(m)))(message); } catch { /* best-effort */ }
+  return message;
 }
 
 /** gh-budget-burn: the call log had grown to 640 MB with no rotation. Past this size it is renamed to
@@ -1751,6 +1817,10 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const isWrite = classifyGhWrite(args);
   const writeBudgetPerMin = throttle.writeBudgetPerMin != null ? throttle.writeBudgetPerMin : resolveGhWriteBudgetPerMin(env);
   const caller = deriveGhCaller(throttle, env);
+  const slotWait = resolveGhSlotWait(env);
+  const waitClass = ghSlotWaitClass({ caller, args: args, isWrite, settings: slotWait });
+  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
+    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -1804,12 +1874,14 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
+      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
-    // Fail OPEN on an acquire timeout too — proceeding unslotted rather than stranding this `gh` call forever
-    // (the residual-risk policy heavy-admission.mjs itself names: a fixed cap bounds concurrency and makes the
-    // wait observable, it does not claim to eliminate contention).
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
+    if (throttledMessage) {
+      const error = new Error(throttledMessage);
+      Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
+      throw error;
+    }
     let result;
     let failure = null;
     try {
@@ -1969,6 +2041,10 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const isWrite = classifyGhWrite(argv);
   const writeBudgetPerMin = throttle.writeBudgetPerMin != null ? throttle.writeBudgetPerMin : resolveGhWriteBudgetPerMin(env);
   const caller = deriveGhCaller(throttle, env);
+  const slotWait = resolveGhSlotWait(env);
+  const waitClass = ghSlotWaitClass({ caller, args: argv, isWrite, settings: slotWait });
+  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
+    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -2032,9 +2108,10 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
+      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, throttle.warn);
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
+    if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
