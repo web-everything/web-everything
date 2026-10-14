@@ -181,6 +181,7 @@ function a3Def() {
     setup(w) {
       // A1/A2 advance their child clocks. Sharing the ambient per-file throttle state here would carry
       // their future budget windows into this fresh world and can block a tick for the full acquire timeout.
+      expect(w.env.WE_GH_THROTTLE_LOCK_ROOT).toBe(join(w.root, 'gh-throttle'));
       expect(ghThrottleLockRoot(w.simCloneRoot, w.env)).not.toBe(ghThrottleLockRoot(process.cwd(), process.env));
       return { w };
     },

@@ -15,14 +15,19 @@ const validModel = value => {
   try { return Object.hasOwn(CODEX_MODEL_CATALOGUE, assertCodexModel(value)); } catch { return false; }
 };
 const validEffort = value => typeof value === 'string' && Object.hasOwn(CODEX_EFFORT_MAP, value);
+const validRetry = value => Array.isArray(value) && value.every(rung =>
+  isObject(rung) && Object.keys(rung).every(key => ['model', 'effort'].includes(key))
+  && validModel(rung.model) && validEffort(rung.effort)
+  && codexModelSupportsEffort(assertCodexModel(rung.model), rung.effort));
 
 /** Resolve codex.modelByTask per leaf through the shared cascade, then apply caller pins and validate the pair.
- * `tool` and `platform` are optional kind → { model, effort } blocks (also useful as deterministic IO seams).
+ * `tool` and `platform` are optional kind → { model, effort, retry? } blocks (also useful as deterministic IO seams).
+ * `standard` optionally supplies a validated operation-policy route at the launch boundary.
  */
 export function resolveCodexTaskRoute({
   kind, size, epic, decision, care, mandatoryLens, model, effort,
   env = process.env, tool = readSettings().codex?.modelByTask,
-  platform = platformPreference('codexModelByTask', { env }), log,
+  platform = platformPreference('codexModelByTask', { env }), standard, log,
 } = {}) {
   kind = classifyCodexTask({ kind, size, epic, decision, care, mandatoryLens });
   const invalid = [];
@@ -36,7 +41,7 @@ export function resolveCodexTaskRoute({
       envBlock = undefined;
     }
   }
-  // resolveCascade validates top-level leaves. Project each kind into its two scalar leaves so
+  // resolveCascade validates top-level leaves. Project each kind into its model, effort and optional retry leaves so
   // a partial env block cannot replace a whole pair, nor can a bad effort discard a valid model.
   const block = (layer, name) => {
     if (layer == null) return {};
@@ -46,15 +51,15 @@ export function resolveCodexTaskRoute({
     if (pair === undefined) return {};
     if (!isObject(pair)) { invalid.push(`${name}.${kind} (invalid pair)`); return {}; }
     return Object.fromEntries(Object.entries(pair).filter(([key, value]) => {
-      const valid = key === 'model' ? validModel(value) : key === 'effort' ? validEffort(value) : false;
+      const valid = key === 'model' ? validModel(value) : key === 'effort' ? validEffort(value) : key === 'retry' ? validRetry(value) : false;
       if (!valid) invalid.push(`${name}.${kind}.${key}=${JSON.stringify(value)}`);
       return valid;
-    }).map(([key, value]) => [key, key === 'model' ? assertCodexModel(value) : value]));
+    }).map(([key, value]) => [key, key === 'model' ? assertCodexModel(value) : key === 'retry' ? value.map(rung => ({ model: assertCodexModel(rung.model), effort: rung.effort })) : value]));
   };
   const resolved = resolveCascade({
-    standard: CODEX_MODEL_BY_TASK_DEFAULT[kind], platform: block(platform, 'platform'),
+    standard: standard ?? CODEX_MODEL_BY_TASK_DEFAULT[kind], platform: block(platform, 'platform'),
     tool: block(tool, 'tool'), envValues: block(envBlock, 'env'),
-    valid: { model: validModel, effort: validEffort },
+    valid: { model: validModel, effort: validEffort, retry: validRetry },
   });
   resolved.invalid.push(...invalid);
   logCascadeSources(`codex.modelByTask.${kind}`, resolved, { env, log: log === false ? () => {} : log });
@@ -66,7 +71,7 @@ export function resolveCodexTaskRoute({
   if (!codexModelSupportsEffort(model, effort)) {
     throw new TypeError(`Codex model ${model} does not support effort ${effort}; supported levels: ${CODEX_MODEL_CATALOGUE[model].join('|')}`);
   }
-  const route = { kind, model, effort, sources, bucket: Object.hasOwn(CODEX_USAGE_BUCKETS, model) ? CODEX_USAGE_BUCKETS[model] : null };
+  const route = { kind, model, effort, ...(resolved.value.retry !== undefined ? { retry: resolved.value.retry } : {}), sources, bucket: Object.hasOwn(CODEX_USAGE_BUCKETS, model) ? CODEX_USAGE_BUCKETS[model] : null };
   if (log !== false) {
     if (invalid.length) {
       try { (log ?? (l => console.error(l)))(`codex-route · invalid: ${invalid.join(', ')}`); } catch { /* best-effort */ }
