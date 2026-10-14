@@ -598,11 +598,11 @@ function prepareStamp() {
   let after = status === 'open' ? setFrontmatterField(before, 'status', 'open', { after: ['kind', 'size'] }) : before;
   if (after == null) die(`#${idFromName(file)} — could not splice frontmatter (no frontmatter block?)`);
   // A real prepare replaces operator filing admission, including when its fast path is disabled. operatorTask
-  // stays: it still gates the card's post-build steps.
+  // stays: it still gates the post-build steps of the card.
   after = removeFrontmatterField(after, 'preparedBy');
   const today = localToday();
   after = setFrontmatterField(after, 'preparedDate', `"${today}"`, { after: ['status', 'dateStarted', 'dateOpened'] });
-  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: DIR, encoding: 'utf8' }).trim();
+  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: DIR, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
   after = setFrontmatterField(after, 'preparedAgainstSha', `"${sha}"`, { after: ['preparedDate'] });
   writeBacklogMd(abs, rel, after);
   ok({ verb: 'prepare-stamp', num: idFromName(file), preparedDate: today, preparedAgainstSha: sha, status },
