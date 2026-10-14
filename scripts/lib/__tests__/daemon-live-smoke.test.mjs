@@ -37,8 +37,14 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner,
+  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
+
+import { readDeclaredSettings } from '../settings-files.mjs';
+vi.mock('../settings-files.mjs', async (original) => {
+  const actual = await original();
+  return { ...actual, readDeclaredSettings: vi.fn(actual.readDeclaredSettings) };
+});
 
 // Existing fixtures must never observe or write the host's resource state.
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
@@ -496,6 +502,89 @@ describe('classifySmokeFailure — pure, transient vs. code', () => {
     // candidate: `no free lane in pool "${repo.name}" (${lanes.length} all held/dirty) — release one or...`.
     const detail = 'lane-pool acquire --purpose=smoke failed: no free lane in pool "we" (42 all held/dirty) — release one or `provision` more';
     expect(classifySmokeFailure([{ ok: false, detail }])).toBe('transient');
+  });
+});
+
+describe('smoke read memo', () => {
+  it.each(['ENOSPC', 'EACCES'])('runs all checks without memo when temporary directory creation fails: %s', async code => {
+    const calls = [];
+    const defaults = withNewCheckDefaults(async () => '');
+    const runChild = async (cmd, args, opts) => {
+      calls.push(opts);
+      return defaults(cmd, args, opts);
+    };
+    const baseline = await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '0' }, runChild });
+    calls.length = 0;
+    // Fail only optional memo setup; the dispatch check still needs its mandatory isolated ledger.
+    const makeReadMemoDir = vi.fn(() => { throw Object.assign(Error('temporary storage unavailable'), { code }); });
+    const result = await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '1', WE_GH_READ_MEMO_DIR: '/inherited' },
+      runChild, makeReadMemoDir });
+    expect(makeReadMemoDir).toHaveBeenCalledOnce();
+    expect(result.results.map(({ name, ok }) => ({ name, ok })))
+      .toEqual(baseline.results.map(({ name, ok }) => ({ name, ok })));
+    expect(result.pass).toBe(baseline.pass);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(opts => opts.env?.WE_GH_READ_MEMO_DIR === undefined)).toBe(true);
+  });
+
+  it('defaults to standard on without a tool setting and falls back on reader failure', () => {
+    readDeclaredSettings.mockReturnValueOnce({ settings: {} });
+    expect(resolveSmokeReadMemo({})).toEqual({ enabled: true, source: 'standard' });
+    readDeclaredSettings.mockImplementationOnce(() => { throw Error('unreadable'); });
+    expect(resolveSmokeReadMemo({})).toEqual({ enabled: true, source: 'standard' });
+  });
+
+  it('removes the memo after failed dry-run children', async () => {
+    let dir;
+    const defaults = withNewCheckDefaults(async () => '');
+    const result = await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '1' },
+      runChild: async (cmd, args, opts) => {
+        if (opts.env?.WE_GH_READ_MEMO_DIR) {
+          dir = opts.env.WE_GH_READ_MEMO_DIR;
+          expect(existsSync(dir)).toBe(true);
+          throw Error('planner failed');
+        }
+        return defaults(cmd, args, opts);
+      } });
+    expect(result.pass).toBe(false);
+    expect(typeof dir).toBe('string');
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('resolves the declared tool setting and env overrides with their sources', () => {
+    expect(resolveSmokeReadMemo({})).toEqual({ enabled: true, source: 'tool' });
+    expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: '0' })).toEqual({ enabled: false, source: 'env' });
+    expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: '1' })).toEqual({ enabled: true, source: 'env' });
+    expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: 'invalid' })).toEqual({ enabled: true, source: 'tool' });
+  });
+
+  it.each(['1', '0'])('scopes the memo to dry-run children when enabled=%s and removes it', async (enabled) => {
+    const calls = [];
+    const runChild = withNewCheckDefaults(async () => '');
+    const recording = async (cmd, args, opts) => {
+      calls.push({ cmd, args, env: opts.env });
+      if (opts.env?.WE_GH_READ_MEMO_DIR) expect(existsSync(opts.env.WE_GH_READ_MEMO_DIR)).toBe(true);
+      return runChild(cmd, args, opts);
+    };
+    await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: enabled, GH_CALLER: 'caller-smoke' }, runChild: recording });
+    const dryRuns = calls.filter(({ args }) => args[0] === 'scripts/conveyor/reconcile-pass.mjs'
+      || args[0] === '--input-type=module' && args[2] === DISPATCH_DRY_RUN_SCRIPT);
+    expect(dryRuns.length).toBeGreaterThan(1);
+    for (const call of dryRuns) {
+      const checkName = call.args[0] === 'scripts/conveyor/reconcile-pass.mjs' ? 'reconcile-dry-run' : 'dispatch-dry-run';
+      expect(call.env.GH_CALLER).toBe(`rebuild-smoke:${checkName}`);
+    }
+    const dirs = dryRuns.map(({ env }) => env.WE_GH_READ_MEMO_DIR);
+    if (enabled === '1') {
+      expect(typeof dirs[0]).toBe('string');
+      expect(new Set(dirs).size).toBe(1);
+      expect(existsSync(dirs[0])).toBe(false);
+    } else expect(dirs.every((dir) => dir === undefined)).toBe(true);
+    for (const call of calls.filter((call) => !dryRuns.includes(call))) {
+      expect(call.env?.WE_GH_READ_MEMO_DIR).toBeUndefined();
+      expect(call.env?.GH_CALLER).toBe('caller-smoke');
+    }
+    expect(dryRuns[0].args[0]).toBe('scripts/conveyor/reconcile-pass.mjs');
   });
 });
 
@@ -1029,6 +1118,19 @@ const dispatchDryRunCheck = SMOKE_CHECKS.find((c) => c.name === 'dispatch-dry-ru
 const treeStaysCleanCheck = SMOKE_CHECKS.find((c) => c.name === 'tree-stays-clean').run;
 
 describe('dispatch-dry-run — injected runChild', () => {
+  it.each([true, false])('reports every row timing when ok=%s', async (ok) => {
+    const result = await dispatchDryRunCheck({ root: tmpdir(), budgets: { dispatchDryRunMs: 1000 }, env: {},
+      runChild: async () => JSON.stringify([
+        { kind: 'review', ok: true, ms: 12 },
+        { kind: 'reconcile-fix-pass', ok, ms: 140000, error: 'planner failed' },
+      ]) });
+    expect(result.ok).toBe(ok);
+    expect(result.detail).toContain('review 12ms');
+    expect(result.detail).toContain('reconcile-fix-pass 140s');
+    expect(result.detail.startsWith(ok ? 'dispatch dry-run ok —' : 'dispatch dry-run failed (')).toBe(true);
+    if (!ok) expect(result.detail).toContain('planner failed');
+  });
+
   it('every row passing → ok:true', async () => {
     const runChild = vi.fn(async (cmd, args) => {
       if (cmd === 'node' && args[0] === '--input-type=module') {
@@ -1289,6 +1391,7 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       const preFixOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], { cwd: tmpRoot, encoding: 'utf8', env: childEnv });
       const preFixRows = JSON.parse(preFixOut);
       const preFixCiHeal = preFixRows.find((r) => r.kind === 'ci-heal-worst-case');
+      expect(preFixRows.every((r) => Number.isFinite(r.ms) && r.ms >= 0)).toBe(true);
       expect(preFixCiHeal.ok).toBe(false);
       expect(preFixCiHeal.error).toContain('{{SCOPE}}');
       // the item-less-but-non-empty-scope case is NOT affected by this revert — SCOPE has a real value there.
@@ -1298,6 +1401,7 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       const realOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], { cwd: realRoot, encoding: 'utf8', env: childEnv });
       const realRows = JSON.parse(realOut);
       expect(realRows.length).toBeGreaterThan(0);
+      expect(realRows.every((r) => Number.isFinite(r.ms) && r.ms >= 0)).toBe(true);
       const failures = realRows.filter((r) => !r.ok);
       expect(failures).toEqual([]);
     } finally {
@@ -1949,5 +2053,44 @@ describe('GitHub environment probe boundaries — pure helpers and injected exte
     expect(result.verdict).toBe('transient');
     expect(result.attempts).toBe(5);
     expect(sleep.mock.calls).toEqual([[10], [20], [10], [10]]);
+  });
+});
+
+
+describe('smoke dry-run settings', () => {
+  const standard = { prSample: 12, snapshotStaleOkMs: 900000, lanePoolListCache: true };
+  const sources = layer => Object.fromEntries(Object.keys(standard).map(key => [key, layer]));
+  it('resolves standard defaults and tolerates unreadable settings', () => {
+    readDeclaredSettings.mockReturnValueOnce({ settings: {} });
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('standard') });
+    readDeclaredSettings.mockImplementationOnce(() => { throw Error('unreadable'); });
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('standard') });
+  });
+  it('resolves tool settings, env overrides, and zero/off with sources', () => {
+    expect(resolveSmokeDryRun({})).toEqual({ ...standard, sources: sources('tool') });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: '5', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '1000', WE_SMOKE_LANE_POOL_LIST_CACHE: 'off' }))
+      .toEqual({ prSample: 5, snapshotStaleOkMs: 1000, lanePoolListCache: false, sources: sources('env') });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: '0', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '0', WE_SMOKE_LANE_POOL_LIST_CACHE: 'on' }))
+      .toEqual({ prSample: 0, snapshotStaleOkMs: 0, lanePoolListCache: true, sources: sources('env') });
+    readDeclaredSettings.mockReturnValueOnce({ settings: { rebuildSmokeDryRun: { prSample: 7 } } });
+    expect(resolveSmokeDryRun({ WE_SMOKE_PR_SAMPLE: 'bad', WE_SMOKE_SNAPSHOT_STALE_OK_MS: '-1', WE_SMOKE_LANE_POOL_LIST_CACHE: 'invalid' }))
+      .toEqual({ ...standard, prSample: 7, sources: { ...sources('standard'), prSample: 'tool' } });
+  });
+  it.each(['on', 'off'])('scopes snapshot knobs to the two dry-run children and lists lanes with cache %s', async mode => {
+    const calls = [];
+    const defaults = withNewCheckDefaults(async () => '');
+    await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_LANE_POOL_LIST_CACHE: mode,
+      WE_SMOKE_PR_SAMPLE: mode === 'on' ? '12' : '0', WE_SMOKE_SNAPSHOT_STALE_OK_MS: mode === 'on' ? '900000' : '0' },
+      runChild: async (cmd, args, opts) => { calls.push({ args, env: opts.env }); return defaults(cmd, args, opts); } });
+    const dryRuns = calls.filter(({ args }) => args[0] === 'scripts/conveyor/reconcile-pass.mjs'
+      || args[0] === '--input-type=module' && args[2] === DISPATCH_DRY_RUN_SCRIPT);
+    expect(dryRuns.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      const enabled = mode === 'on' && dryRuns.includes(call);
+      expect(call.env?.WE_PR_SNAPSHOT_SAMPLE).toBe(enabled ? '12' : undefined);
+      expect(call.env?.WE_PR_SNAPSHOT_STALE_OK_MS).toBe(enabled ? '900000' : undefined);
+    }
+    const listing = calls.find(({ args }) => args[0] === 'scripts/lane-pool.mjs' && args[1] === 'list');
+    expect(listing.args).toEqual(['scripts/lane-pool.mjs', 'list', '--acquirable', ...(mode === 'off' ? ['--no-cache'] : []), '--limit=1', '--json']);
   });
 });
