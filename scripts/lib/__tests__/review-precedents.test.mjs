@@ -100,6 +100,16 @@ describe('records and events', () => {
     expect(p.foldCitations([older, laterWithdrawn, newer])).toEqual([older]);
     expect(p.foldCitations([older, laterWithdrawn, { ...newer, at: '2026-10-14T01:00:00Z' }])).toEqual([{ ...newer, at: '2026-10-14T01:00:00Z' }]);
   });
+  it('parses read marks and returns the newest one per PR', () => {
+    const marks = ['2026-10-13T12:00:00Z', '2026-10-13T14:00:00Z'].map(time => p.readEvent({ repo: REPO, pr: 1, at: time }));
+    const other = p.readEvent({ repo: REPO, pr: 2, at: '2026-10-13T15:00:00Z' });
+    const log = [...marks, other, { ...marks[0], id: 'read:x' }].map(ev => JSON.stringify(ev)).join('\n');
+    const parsed = p.parsePrecedentLog(log);
+    expect(parsed).toMatchObject({ malformed: 1, events: [...marks, other] });
+    expect(p.latestReadAt(parsed.events, { repo: REPO, pr: 1 })).toBe(Date.parse(marks[1].at));
+    expect(p.latestReadAt(parsed.events, { repo: REPO, pr: 3 })).toBe(-Infinity);
+    expect(() => p.readEvent({ repo: REPO, pr: 1, at: 'later' })).toThrow();
+  });
   it('never withdraws a row a stale snapshot could not have seen', () => {
     const source = (comment, time) => JSON.stringify([comment, time, time]);
     const base = { repo: REPO, pr: 1, head: 'abcdef1', seat: 'panel', ids: [seeds[0].id], verdict: 'accept' };

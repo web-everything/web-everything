@@ -12,7 +12,7 @@
 export const PRECEDENT_DECISIONS = Object.freeze(['changes', 'not-real', 'card', 'block', 'accept-ok']);
 export const CITATION_VERDICTS = Object.freeze(['', 'accept', 'changes', 'block', 'not-real', 'card', 'accept-ok', 'advisory']);
 export const PRECEDENT_STATUSES = Object.freeze(['draft', 'active', 'superseded']);
-export const PRECEDENT_EVENT_KINDS = Object.freeze(['precedent', 'status', 'citation']);
+export const PRECEDENT_EVENT_KINDS = Object.freeze(['precedent', 'status', 'citation', 'read']);
 export const PRECEDENT_ID_RE = /^prec-[a-z0-9][a-z0-9-]{2,80}$/;
 export const PRECEDENT_SETTINGS_DEFAULTS = Object.freeze({ inject: 'on', maxCount: 5, maxChars: 4000, autoDecide: 'off' });
 export const PRECEDENT_SETTINGS_ENV = Object.freeze({ inject: 'WE_REVIEW_PRECEDENTS_INJECT', maxCount: 'WE_REVIEW_PRECEDENTS_MAX_COUNT', maxChars: 'WE_REVIEW_PRECEDENTS_MAX_CHARS', autoDecide: 'WE_REVIEW_PRECEDENTS_AUTO_DECIDE' });
@@ -65,8 +65,24 @@ export function citationEvent({ repo, pr, head, ids, seat = '', verdict = '', at
     ...(source ? { source } : {}) };
 }
 
+/**
+ * A PR's citation read mark: the time a complete-thread backfill began reading. It is stored on every newer
+ * read, even one that changes no row, so a stale read landing later is refused whole (see latestReadAt).
+ */
+export function readEvent({ repo, pr, at }) {
+  if (!validRepo(repo) || !validPr(pr) || typeof at !== 'string' || !Number.isFinite(Date.parse(at))) throw new Error('invalid read event');
+  return { kind: 'read', id: `read:${repo}#${pr}`, repo, pr, at };
+}
+
+/** The newest read mark stored for one PR, as epoch ms; -Infinity when none. */
+export function latestReadAt(events, { repo, pr }) {
+  return events.reduce((latest, ev) => ev?.kind === 'read' && ev.repo === repo && ev.pr === pr
+    ? Math.max(latest, Date.parse(ev.at)) : latest, -Infinity);
+}
+
 export function precedentEventId(ev) {
   if (ev.kind === 'precedent') return `precedent:${ev.id}`;
+  if (ev.kind === 'read') return `read:${ev.repo}#${ev.pr}@${ev.at}`;
   if (ev.kind === 'status') return `status:${ev.id}:${ev.status}:${ev.at}`;
   // Storage identity includes the evidence revision; folding still selects the latest seat verdict.
   // Comment source identities exclude ingestion time; direct callers use their stable occurrence time.
@@ -87,6 +103,8 @@ export function parsePrecedentLog(text, options) {
       } else if (ev?.kind === 'status') statusEvent(ev, options);
       else if (ev?.kind === 'citation') {
         if (citationEvent(ev).id !== ev.id) throw new Error('mismatched citation id');
+      } else if (ev?.kind === 'read') {
+        if (readEvent(ev).id !== ev.id) throw new Error('mismatched read id');
       } else throw new Error('unknown event');
       events.push(ev);
     } catch { malformed += 1; }

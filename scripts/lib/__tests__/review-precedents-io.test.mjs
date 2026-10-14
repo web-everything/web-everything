@@ -245,6 +245,31 @@ describe('settings and drafting', () => {
     expect(backfill([older], '2026-10-13T18:00:00Z').rows).toBe(0);
     expect(panel()).toEqual([['accept', [seeds[0].id]]]);
   });
+  it('refuses a stale snapshot whole, even when the newer read stored no row or recorded another head', () => {
+    const automation = { author: { login: AUTOMATION_LOGINS[0] } };
+    const cited = verdict => ({ ...automation, id: 'IC_1', createdAt: '2026-10-13T10:00:00Z', body: `${verdict}\n[precedent:${seeds[0].id}]\n<!-- reviewed-sha: abcdef987 -->` });
+    let stored = '';
+    const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
+    const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
+    const snapshot = (comments, at, extra = {}) => ({ at, events: io.recordCitationsFromComments({ repo, pr: 9, at, info: { ...info, ...extra, comments } }) });
+    const apply = ({ at, events }) => io.appendPrecedentEvents({ repo, stage, citationSnapshot: { pr: 9, at }, events });
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => [e.verdict, e.head]);
+    expect(apply(snapshot([cited('✅ review — accepted')], '2026-10-13T11:00:00Z')).rows).toBe(1);
+    // A newer read sees the same verdict: no row changes, but its read is still marked.
+    expect(apply(snapshot([cited('✅ review — accepted')], '2026-10-13T15:00:00Z'))).toMatchObject({ status: 'appended', rows: 0 });
+    // A read that began before it (when the comment said changes) lands now and is refused whole.
+    expect(apply(snapshot([cited('🔁 review — changes requested')], '2026-10-13T13:00:00Z'))).toMatchObject({ status: 'stale-snapshot', rows: 0 });
+    expect(panel()).toEqual([['accept', 'abcdef987']]);
+    // Two reads of an empty log record an advisory comment on the head each saw; the stale one lands second.
+    stored = '';
+    const advisory = { ...automation, id: 'IC_2', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };
+    const older = snapshot([advisory], '2026-10-13T12:00:00Z', { headRefOid: 'aaaaaaa1' });
+    const newer = snapshot([advisory], '2026-10-13T13:00:00Z', { headRefOid: 'bbbbbbb2' });
+    expect(apply(newer).rows).toBe(1);
+    expect(apply(older).status).toBe('stale-snapshot');
+    expect(panel()).toEqual([['advisory', 'bbbbbbb2']]);
+    expect(() => apply({ at: 'not-a-time', events: [] })).toThrow(TypeError);
+  });
   it('keeps a comment on the head it was first recorded on after the PR head moves', () => {
     const automation = { author: { login: AUTOMATION_LOGINS[0] } };
     const advisory = { ...automation, id: 'IC_9', createdAt: '2026-10-13T10:00:00Z', body: `ADVISORY REVIEW\n[precedent:${seeds[0].id}]` };

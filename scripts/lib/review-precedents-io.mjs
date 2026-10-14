@@ -15,7 +15,7 @@ import {
   parsePrecedentLog, precedentEventId, foldPrecedents, foldCitations,
   resolvePrecedentSettings, formatPrecedentSettings, captureFromComment,
   scopeHintsFromBody, draftRecordFromCapture, validatePrecedent, extractCitations, citationEvent, citationCommentKey,
-  currentCommentCitations, citationRetractions, citationSupersedes,
+  currentCommentCitations, citationRetractions, citationSupersedes, readEvent, latestReadAt,
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
@@ -67,7 +67,9 @@ export function appendPrecedentEvents({
   // citationSnapshot: { pr, at } marks `events` as EVERY citation one PR's complete thread yields now (it may be
   // empty), so stored comments missing from it are withdrawn against the tip this append races.
   if (citationSnapshot !== undefined && (!Number.isSafeInteger(citationSnapshot?.pr) || citationSnapshot.pr < 1
-    || typeof citationSnapshot.at !== 'string')) throw new TypeError('citationSnapshot must be { pr, at }');
+    || typeof citationSnapshot.at !== 'string' || !Number.isFinite(Date.parse(citationSnapshot.at)))) {
+    throw new TypeError('citationSnapshot must be { pr, at } with a timed at');
+  }
   if (!Array.isArray(events) || (!events.length && !citationSnapshot)) throw new TypeError('events must be a non-empty array');
   if (citationSnapshot && events.some(event => event?.kind !== 'citation' || event.repo !== repo || event.pr !== citationSnapshot.pr)) {
     throw new TypeError('a citation snapshot holds only that PR\'s citation events');
@@ -85,13 +87,19 @@ export function appendPrecedentEvents({
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      let rows = 0, duplicates = 0;
+      let rows = 0, duplicates = 0, stale = false;
       stage({
         ...seams,
         board, branch, message: `review-precedents: append ${repo}`,
         files: [{ path: precedentGitPath(repo), content: ({ existing }) => {
           const base = existing ?? '';
           const stored = parsePrecedentLog(base, trust).events;
+          // A snapshot whose read began before the newest read mark on this tip is stale as a whole: the newer read
+          // may have stored nothing (every row unchanged), so no row-level rank could tell its rows are older.
+          const readAt = citationSnapshot ? Date.parse(citationSnapshot.at) : NaN;
+          const lastRead = citationSnapshot ? latestReadAt(stored, { repo, pr: citationSnapshot.pr }) : -Infinity;
+          stale = readAt < lastRead;
+          if (stale) { rows = 0; duplicates = lines.length; return base; }
           const seen = new Set(stored.map(precedentEventId));
           // Compare a backfilled comment against its CURRENT row only: an edit reverted to an earlier verdict must
           // be stored again, or the stale middle edit stays current. A row that would not become current (a stale
@@ -107,11 +115,14 @@ export function appendPrecedentEvents({
           }).map(ev => JSON.stringify(ev));
           rows = fresh.length;
           duplicates = Math.max(0, lines.length + withdrawn.length - rows);
-          return rows ? `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n` : base;
+          // The read mark is not a counted row; it is written whenever this read is the newest, changed or not.
+          const out = readAt > lastRead ? [...fresh, JSON.stringify(readEvent({ repo, pr: citationSnapshot.pr, at: citationSnapshot.at }))] : fresh;
+          return out.length ? `${base}${base && !base.endsWith('\n') ? '\n' : ''}${out.join('\n')}\n` : base;
         } }],
         allowRef: PRECEDENT_PUSH_REF,
       });
-      return { status: 'appended', attempts: attempt, rows, duplicates };
+      return stale ? { status: 'stale-snapshot', attempts: attempt, rows: 0, duplicates }
+        : { status: 'appended', attempts: attempt, rows, duplicates };
     } catch (error) {
       errors.push(error);
       if (attempt < attempts) {
