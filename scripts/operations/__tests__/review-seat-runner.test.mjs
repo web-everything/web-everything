@@ -162,7 +162,9 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
       spawnJudge: async ({ cwd, toolPolicy }) => {
         expect(toolPolicy).toBe('read-cwd');
         const t = join(fx.root, 'transcript.jsonl');
-        writeFileSync(t, behave.transcript ?? '');
+        writeFileSync(t, behave.transcript ?? transcriptWith([
+          { step_type: 'tool', state: 'DONE', tool_name: 'view_file', tool_info: { parameters: { AbsolutePath: join(cwd, 'math.mjs') } } },
+        ]));
         behave.act?.(cwd);
         return { value: { summary: 's', findings: [{ summary: 'add subtracts', file: join(cwd, 'math.mjs'), line: 1 }] }, sessionId: 'agy-conv-1', transcriptFile: t };
       },
@@ -189,7 +191,7 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
     } finally { fx.cleanup(); }
   });
 
-  it('a change outside its lane (the review lane it was cloned from, or this checkout) voids the seat', async () => {
+  it('a review lane change voids; an unrelated shared checkout change does not', async () => {
     const fx = fixtureLane();
     try {
       const r = await run(fx, { act: () => writeFileSync(join(fx.lane, 'math.mjs'), 'tampered\n') });
@@ -197,8 +199,8 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
       expect(r.reasons.join('\n')).toContain('change outside the juror lane: the review lane');
       expect(r.reasons.join('\n')).not.toContain(fx.root); // no local paths in a reason that can reach the PR
       const r2 = await run(fx, { act: () => writeFileSync(join(fx.other, 'math.mjs'), 'tampered too\n') });
-      expect(r2.status).toBe('voided');
-      expect(r2.reasons.join('\n')).toContain('change outside the juror lane: this checkout');
+      expect(r2.status).toBe('ok');
+      expect(r2.reasons).toEqual([]);
     } finally { fx.cleanup(); }
   });
 
