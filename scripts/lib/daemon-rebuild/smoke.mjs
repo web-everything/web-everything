@@ -6,6 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
+import { isExecutedFailureRow } from './smoke-classify/env-timeout.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -141,16 +142,15 @@ function failedRows(smokeResult) {
   return (smokeResult?.smoke?.results || []).filter((r) => !r.ok);
 }
 
-/** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
- *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
+/** PURE: does `control` fail every check `candidate` failed, each by a failure its check really ran into? — the
+ *  "the harness itself is broken" test: a failure the last-good build reproduces is not evidence against the
+ *  candidate's code. A skipped, interrupted or fail-fast/budget-refused row on either side reproduces nothing. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const executedFailure = (r) => !r.ok && !r.skipped && !r.budgetSkipped && !r.budgetInterrupted
-    && !/^skipped:/.test(String(r.detail ?? ''));
   const c = new Set((controlFailed || [])
-    .filter(executedFailure)
+    .filter(isExecutedFailureRow)
     .map((r) => r.name));
   return Array.isArray(candidateFailed) && candidateFailed.length > 0
-    && candidateFailed.every((r) => executedFailure(r) && c.has(r.name));
+    && candidateFailed.every((r) => isExecutedFailureRow(r) && c.has(r.name));
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────

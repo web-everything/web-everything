@@ -165,6 +165,38 @@ describe('env-timeout hold escape', () => {
     expect(ctx.finalize).not.toHaveBeenCalled();
   });
 
+  // The printed budget is tree text for scan and lock give-ups (and carries no budget at all for a lock); the gate's
+  // own clock (row.ms) is what proves the control really spent the time.
+  const scanRow = { ...dispatchTimeout, detail: 'dispatch dry-run child failed: exited 1: list --acquirable scan exceeded its 120000ms budget' };
+  const lockRow = { ...dispatchTimeout, detail: 'dispatch dry-run child failed: exited 1: gave up waiting for the shared acquirability-scan lock' };
+  it.each([
+    ['a kill that took far less time than its printed cap', killRow(120_000), { ...killRow(120_000), ms: 31_000 }, false],
+    ['a scan give-up that took far less time than the candidate', scanRow, { ...scanRow, ms: 31_000 }, false],
+    ['a lock give-up that took far less time than the candidate', lockRow, { ...lockRow, ms: 31_000 }, false],
+    ['a kill a few seconds short of the candidate (clock jitter)', killRow(120_000), { ...killRow(120_000), ms: 115_000 }, true],
+    ['a lock give-up that waited as long as the candidate', lockRow, { ...lockRow, ms: 125_000 }, true],
+    ['a control without a measured time', killRow(120_000), { ...killRow(120_000), ms: undefined }, false],
+  ])('equivalent timeout needs the measured time too: %s', async (_label, candidateRow, controlRow, adopted) => {
+    const { r, ctx } = await runWith(candidateRow, controlRow);
+    expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+    if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
+  const mixedDispatch = { ...dispatchTimeout,
+    detail: 'dispatch dry-run failed (2/2): review PR #1: invalid configuration; fix PR #2: scan exceeded its 120000ms budget' };
+  const twoSignatures = { ...dispatchTimeout,
+    detail: 'dispatch dry-run child failed: exited 1: scan exceeded its 120000ms budget after gave up waiting for the shared acquirability-scan lock' };
+  it.each([
+    ['the control carries a real error beside the timeout', scanRow, mixedDispatch, false],
+    ['the candidate carries a real error beside the timeout', mixedDispatch, scanRow, false],
+    ['a row carries two timeout signatures', twoSignatures, twoSignatures, false],
+    ['both rows are a single timeout', scanRow, scanRow, true],
+  ])('single-unit rows must be one timeout and nothing else: %s', async (_label, candidateRow, controlRow, adopted) => {
+    const { r, ctx } = await runWith(candidateRow, controlRow);
+    expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+    if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['a repo the control did not time out on', repoKills(['a', 'b'], 2, 120_000), repoKills(['a'], 2, 120_000), false],
     ['a different repo', repoKills(['a'], 2, 120_000), repoKills(['b'], 2, 120_000), false],
@@ -262,6 +294,22 @@ describe('no-worse shared check comparison', () => {
   ])('does not count passed, skipped or interrupted evidence on either side: %j', (row) => {
     expect(failsSameChecks(failed, [row])).toBe(false);
     expect(failsSameChecks([row], failed)).toBe(false);
+  });
+
+  // The real shapes: budgetedRunChild's refusal arrives AFTER the check's own prefix, never at the start of detail.
+  const failFastRefusal = 'skipped: fail-fast — reconcile-dry-run failed on the overlay build and again on this one';
+  const budgetRefusal = 'skipped: rebuild smoke budget exhausted (0ms left)';
+  it.each([
+    ['dispatch child refused by fail-fast', { ...dispatchTimeout, detail: `dispatch dry-run child failed: ${failFastRefusal}` }],
+    ['check that threw on a budget refusal', { ...dispatchTimeout, detail: `threw: ${budgetRefusal}` }],
+    ['lane-pool child refused by the budget', { ...dispatchTimeout, name: 'lane-pool-list', detail: `lane-pool list --acquirable failed: ${budgetRefusal}` }],
+    ['reconcile repo refused after a sibling repo failed', { ...failed[0],
+      detail: `reconcile-pass dry-run failed for 2/2 repo(s): a: timed out after 120000ms (process group killed); b: ${failFastRefusal}` }],
+  ])('does not count a refusal the budget wrapper threw as a reproduction: %s', (_label, row) => {
+    const candidate = { ...row, detail: `${row.name} failed: invalid configuration` };
+    expect(failsSameChecks([candidate], [row])).toBe(false);
+    expect(failsSameChecks([row], [candidate])).toBe(false);
+    expect(failsSameChecks([candidate], [candidate])).toBe(true);
   });
 });
 
