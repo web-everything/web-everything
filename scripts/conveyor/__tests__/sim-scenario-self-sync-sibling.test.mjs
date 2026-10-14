@@ -49,6 +49,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
+import { ghThrottleLockRoot } from '../../lib/gh-throttle.mjs';
 
 function headOfClone(cloneRoot) {
   return execFileSync('git', ['-C', cloneRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -178,6 +179,9 @@ function a3Def() {
     daemons: ['review', 'fix-dispatch'],
     lanes: 2,
     setup(w) {
+      // A1/A2 advanced their clocks by 11m. A3 starts at offset zero: sharing Vitest's throttle root
+      // would reuse their future-dated points window, adding up to 120s of quota wait per gh read.
+      expect(ghThrottleLockRoot(w.simCloneRoot, w.env)).toBe(join(w.root, 'gh-throttle'));
       return { w };
     },
     play: [

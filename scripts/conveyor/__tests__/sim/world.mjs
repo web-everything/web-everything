@@ -267,6 +267,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
     LANE_POOL_ROOT: lanePoolRoot,
+    // Vitest supplies an explicit throttle root, which wins over LANE_POOL_ROOT. Never inherit it:
+    // worlds advance independent clocks, so a later world could see a previous world's exhausted
+    // points window eleven minutes in the future and wait out the 120s acquire cap on EVERY gh read.
+    // Keep the real throttle active, with state shared only by this world's daemons and smoke children.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
     WE_DAEMON_SMOKE_STATE_DIR: smokeStateDir,
