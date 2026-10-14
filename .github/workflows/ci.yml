@@ -480,9 +480,10 @@ jobs:
     needs: daemon-soak-scope
     if: needs.daemon-soak-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # No measured per-shard p95 yet (this split is new) — sized generously pending a first-run sample, same
-    # ~3x-p95 method `test-shard` used once IT had data (see that job's own timeout comment above).
-    timeout-minutes: 15
+    # Measured 2026-10-14: shard 3 (the slowest shard) runs 10.5-14.7 min on green main runs, and a
+    # 14.6 min run (all 34 tests passed) was cancelled at the old 15 min cap — a pure timeout flake, not a hang.
+    # 25 min keeps ~1.7x headroom over the slowest observed shard.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
