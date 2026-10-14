@@ -32,6 +32,7 @@ import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
 import { nodeRuntimeEnv } from './node-runtime-env.mjs';
+import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -246,7 +247,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const toolsDir = join(root, 'tools');
   mkdirSync(toolsDir);
   const linked = new Set(['claude', 'codex', 'agy']);
-  for (const dir of String(process.env.PATH ?? '').split(':').filter(Boolean)) {
+  for (const dir of toolPathDirs()) {
     let names;
     try { names = readdirSync(dir); } catch { continue; }
     for (const name of names) {
@@ -256,7 +257,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    ...isolatedProcessEnv(root),
     // Every tick launches many Node CLIs over the same large daemon module graph. One disposable cache per
     // world reduces repeated compilation within the sibling scenario / 50-tick soak budgets, without
     // sharing module state or skipping any real tick.
@@ -327,10 +328,6 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
-  delete env.WE_GITHUB_APP_ID;
-  delete env.WE_GITHUB_APP_INSTALLATION_ID;
-  delete env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
-  delete env.GITHUB_TOKEN;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
