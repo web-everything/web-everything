@@ -123,6 +123,11 @@ CI history keeps WE's filename and adds the constellation key for sibling repos,
 when `CONVEYOR_CI_QUEUE_FILE` supplies the base path. Subprocess tests that use fake `gh`
 still acquire the throttle lock; set `LANE_POOL_ROOT` to a temporary directory in a sandbox.
 
+Daemon simulator worlds must override `WE_GH_THROTTLE_LOCK_ROOT` under their own temporary
+root. Vitest's per-file override takes precedence over `LANE_POOL_ROOT` and otherwise shares
+budget windows across worlds. A world that advances its clock can leave future-dated spend
+that makes a later world wait; sibling daemons within one world should share its throttle.
+
 ## Runner activity report
 
 `node scripts/operations/run.mjs runner-activity --json` reports the liveness of all three known
