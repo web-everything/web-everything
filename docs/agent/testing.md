@@ -814,3 +814,10 @@ The enqueue catch-up regression must exercise spawned fast drains, not only the 
 `mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
 First acceptance is the earliest structured accepted/clear-human comment across heads;
 include a removal/restore replay, comment pagination, and the ready-time fallback.
+Include an older PR with running checks ahead of a green PR at capacity one, and a window
+that closes during the first wake read then reopens on a later interval. Skipped wakes must
+allow later candidates to run; retained catch-up work reserves room in the next plan.
+Confirmed drain gate skips and revalidation aborts also release room; successful enqueues
+and ambiguous failures consume it. Give each fake child its actual target PR number.
+Also cover a queue that fills while the window is closed and an unreadable next snapshot:
+retained attempts must stay within the latest room, and cannot use a failed snapshot.

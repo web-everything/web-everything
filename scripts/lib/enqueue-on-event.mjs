@@ -196,6 +196,18 @@ export function summarizeFastDrain(json, num) {
   return 'no verdict for the PR';
 }
 
+/** A definite gate skip can release room; an ambiguous enqueue failure cannot. */
+function fastDrainUsedNoRoom(json, num) {
+  if (!isObj(json) || json.ok === false) return false;
+  const hit = (list) => Array.isArray(list) && list.some((p) => Number(p?.num) === Number(num));
+  if (hit(json.merged) || hit(json.failed)) return false;
+  if ([json.revalidationAborted, json.deferred, json.coupleHeld, json.parked].some(hit)) return true;
+  // toMerge is the planned set, so explicit non-enqueue outcomes above take precedence.
+  // toMerge also appears in skipReasons after a successful enqueue (ready-not-reached).
+  if (hit(json.toMerge)) return false;
+  return hit(json.skipReasons) || hit(json.skipped);
+}
+
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
  * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
@@ -411,6 +423,7 @@ export function createEnqueueOnEvent({
   let child = null;   // the in-flight fast drain (so the daemon can stop it when it exits)
   let lastLine = null;
   let lastCatchUpAt = null;
+  let catchUpRoom = 0; // unspent drain attempts from the most recent queue snapshot
   let setting = ENQUEUE_ON_EVENT_DEFAULTS;
   const readSetting = () => {
     try { setting = resolveSetting(); } catch (e) { setting = { ...ENQUEUE_ON_EVENT_DEFAULTS, line: `enqueue-on-event: setting unreadable (${String(e?.message || e).split('\n')[0]}) — off` }; }
@@ -425,27 +438,44 @@ export function createEnqueueOnEvent({
   async function runDue({ catchUpOnly = false } = {}) {
     const s = readSetting();
     if (!s.enabled) { pending = new Map(); return []; }
+    let catchUpLater = [].values();
+    let catchUpIndex = 0;
+    const queueCatchUp = (num) => {
+      const key = `${localSlug}#${num}`;
+      if (pending.has(key)) return false;
+      pending = new Map(pending).set(key, {
+        // Keep the planned priority order through duePending, independently of ready-label churn.
+        repo: localSlug, num, firstAt: now() + catchUpIndex++, lastAt: now() - s.debounceSeconds * 1000,
+        causes: ['catch-up'], catchUp: true,
+      });
+      return true;
+    };
+    const refillCatchUp = () => {
+      if ([...pending.values()].filter((p) => p.catchUp).length < catchUpRoom) {
+        for (const num of catchUpLater) { if (queueCatchUp(num)) break; }
+      }
+    };
     if (catchUpDue(s, now()) && allowed()) {
       lastCatchUpAt = now();
+      catchUpRoom = 0; // an unreadable queue cannot authorize retained work
       const result = await readCandidates({ repo: localSlug });
       if (!result.ok) log(`enqueue-on-event: catch-up could not list ready PRs (${result.error}) — retrying in ${s.catchUp.intervalMinutes} min`);
       else {
         const { capacity, source } = await readCapacity(s);
-        const plan = planCatchUp({ ...result, capacity, ...await readPriorities(), repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].map((p) => p.num) });
+        catchUpRoom = Math.max(0, capacity - result.queued);
+        const reserved = [...pending.values()].filter((p) => p.catchUp).length;
+        const plan = planCatchUp({ ...result, capacity: capacity - reserved, ...await readPriorities(), repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].map((p) => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
         log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
-        pending = new Map(pending);
-        for (const [index, { num }] of plan.run.entries()) pending.set(`${localSlug}#${num}`, {
-          // Keep the planned priority order through duePending, independently of ready-label churn.
-          repo: localSlug, num, firstAt: now() + index, lastAt: now() - s.debounceSeconds * 1000,
-          causes: ['catch-up'], catchUp: true,
-        });
+        for (const { num } of plan.run) queueCatchUp(num);
+        catchUpLater = plan.later.values();
       }
     }
     const ran = [];
     for (;;) {
       if (!allowed()) break;
-      const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds }).filter((p) => !catchUpOnly || p.catchUp);
+      const [p] = duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })
+        .filter((p) => (!catchUpOnly || p.catchUp) && (!p.catchUp || catchUpRoom > 0));
       if (!p) break;
       const key = `${p.repo}#${p.num}`;
       const taken = pending.get(key);
@@ -455,14 +485,22 @@ export function createEnqueueOnEvent({
       let pr = null;
       try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
       const w = wakeWorthy(pr);
-      if (!w.wake) { log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`); ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}` }); continue; }
+      if (!w.wake) {
+        log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`);
+        ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}` });
+        // A skipped wake used no queue space: try the next candidate in priority order.
+        if (p.catchUp) refillCatchUp();
+        continue;
+      }
       if (!allowed()) { pending = new Map(pending).set(key, taken); break; } // the window closed during the read
       const startedAt = now();
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
+      if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
       log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild: (c) => { child = c; } });
       child = null;
-      let what = r.error ? `could not run (${r.error})` : summarizeFastDrain(lastJsonLine(r.stdout), p.num);
+      const json = lastJsonLine(r.stdout);
+      let what = r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
       const summary = what;
       let verified = null;
       let missed = what.startsWith('not enqueued:');
@@ -494,6 +532,9 @@ export function createEnqueueOnEvent({
         pending = new Map(pending);
         for (const [key, entry] of pending) if (entry.catchUp) { pending.delete(key); dropped++; }
         log(`enqueue-on-event: catch-up stopping this round — batching deferred #${p.num} (${summary.slice('not enqueued: batching-deferred:'.length).trim()}); ${dropped} PR(s) retried at the next catch-up`);
+      } else if (p.catchUp && !r.error && fastDrainUsedNoRoom(json, p.num)) {
+        catchUpRoom++;
+        refillCatchUp();
       }
       log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what}`);
       ran.push({ ...metadata, num: p.num, code: r.code, what, verified });
