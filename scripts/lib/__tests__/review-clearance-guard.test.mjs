@@ -211,10 +211,18 @@ describe('settings', () => {
 });
 
 const rest = list => list.map(c => ({ body: c.body, created_at: c.createdAt, user: { login: c.author.login }, html_url: c.url }));
-function fakeGh(labels = ['review:accepted'], thread = comments) {
+function fakeGh(initialLabels = ['review:accepted'], thread = comments) {
   const calls = [];
+  let labels = [...initialLabels];
   const runGh = args => {
     calls.push(args);
+    // A label write lands, as on GitHub: the post-write read sees it.
+    if (args[0] === 'pr' && args[1] === 'edit') {
+      const flag = name => args[args.indexOf(name) + 1];
+      if (args.includes('--remove-label')) labels = labels.filter(l => l !== flag('--remove-label'));
+      if (args.includes('--add-label') && !labels.includes(flag('--add-label'))) labels = [...labels, flag('--add-label')];
+      return '';
+    }
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5193', labels, statusCheckRollup: rows });
     const path = args.find(a => a.startsWith('repos/')) ?? '';
     if (path.includes('/comments')) return JSON.stringify([rest(thread)]);
@@ -366,8 +374,7 @@ describe('I/O shell', () => {
         const path = args.find(a => a.startsWith('repos/')) ?? '';
         if (written) {
           if (args[0] === 'pr' && args[1] === 'view') {
-            if (live.labels === null && args.at(-1) === 'labels') throw new Error('read failed');
-            return JSON.stringify({ ...JSON.parse(result), headRefOid: Y, labels: live.labels ?? accepted });
+            return JSON.stringify({ ...JSON.parse(result), headRefOid: Y, labels: live.labels === undefined ? accepted : live.labels });
           }
           if (path.includes('/git/ref/')) return JSON.stringify({ object: { sha: Y } });
           if (path.includes('/comments')) {
@@ -386,6 +393,44 @@ describe('I/O shell', () => {
         : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
       expect(result?.restored).not.toBe(true);
       expect(fake.calls.filter(a => a[1] === 'edit').some(a => a.join(' ') === rollback.join(' '))).toBe(rolledBack);
+      expect(fake.calls.filter(a => a[1] === 'comment')).toEqual([]);
+    });
+    // PR #5237 operator send-back (2026-10-14): a same-head revocation landing after validation was missed and the
+    // approval restored. The guard now re-reads every input right before the write and refuses on any change
+    // (compare-and-set), and re-reads after the write and undoes it on a revocation that slipped in between.
+    const hold = { comment: comment('Hold — I revoke this approval.', '19:20:00'), event: event('labeled', 'review:changes', '19:20:00', 'chalbert'),
+      review: { state: 'CHANGES_REQUESTED', submitted_at: '2026-10-13T19:20:00Z', user: { login: 'chalbert' } }, label: 'review:human' };
+    const injecting = (fake, when, kind) => args => {
+      const result = fake.runGh(args);
+      if (!when()) return result;
+      const path = args.find(a => a.startsWith('repos/')) ?? '';
+      if (kind === 'comment' && path.includes('/comments')) return JSON.stringify([rest([...comments, hold.comment])]);
+      if (kind === 'event' && path.includes('/events')) return JSON.stringify([[...events, hold.event]]);
+      if (kind === 'review' && path.includes('/reviews')) return JSON.stringify([[hold.review]]);
+      if (kind === 'label' && args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...JSON.parse(result), labels: [...JSON.parse(result).labels, hold.label] });
+      return result;
+    };
+    it.each(['comment', 'event', 'review', 'label'])('refuses the restore when a same-head %s revocation lands between validation and the write', kind => {
+      const fake = fakeGh(restoreFacts.labels);
+      let commentReads = 0;
+      const inner = injecting(fake, () => commentReads >= 3, kind);
+      const runGh = args => { if ((args.find(a => a.startsWith('repos/')) ?? '').includes('/comments')) commentReads++; return inner(args); };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result).toMatchObject({ restored: false });
+      expect(fake.calls.filter(a => a[1] === 'edit' || a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
+    it.each(['comment', 'event', 'review', 'label'])('undoes the write when a same-head %s revocation lands just after it', kind => {
+      const fake = fakeGh(restoreFacts.labels);
+      let written = false;
+      const inner = injecting(fake, () => written, kind);
+      const runGh = args => { if (args[0] === 'pr' && args[1] === 'edit') { written = true; return fake.runGh(args); } return inner(args); };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result?.restored).not.toBe(true);
+      expect(fake.calls.filter(a => a[1] === 'edit').at(-1)).toEqual(['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']);
       expect(fake.calls.filter(a => a[1] === 'comment')).toEqual([]);
     });
     it('still checks the head and rolls back when the approval write throws after GitHub applied it', () => {

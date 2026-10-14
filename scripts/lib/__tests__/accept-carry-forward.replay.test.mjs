@@ -361,7 +361,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   afterAll(() => { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
 
   const BOT = { login: 'web-everything' };
-  const clearComment = () => ({ author: BOT, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
+  const clearComment = () => ({ author: BOT, body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
 
   // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's mechanical park is its OWN label. Its presence
   // is the whole proof the hold is mechanical — no ledger row, no label timeline, no event count is read.
@@ -450,7 +450,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // re-dated the `cleared-human` record past a standing CHANGES_REQUESTED review — after which the carry rule saw that
   // review as "before the accept". Every carry of a clearance now checks the latest formal review state first.
   const coveringClear = () => ({ author: BOT, createdAt: '2026-10-09T12:00:00Z',
-    body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.head} -->\n<!-- reviewed-diff: ${'d'.repeat(64)} -->\n<!-- cleared-human: chalbert -->` });
+    body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${heads.head} -->\n<!-- reviewed-diff: ${'d'.repeat(64)} -->\n<!-- cleared-human: chalbert -->` });
   const botChanges = (submitted_at = '2026-10-09T13:00:00Z') => ({ state: 'CHANGES_REQUESTED', submitted_at, user: { login: 'plateau-reviewer[bot]' } });
   it('ROUND 11: a plain restamp refuses to carry a clearance past a standing CHANGES_REQUESTED review (bot or operator): NO write', () => {
     for (const login of ['plateau-reviewer[bot]', 'chalbert']) {
@@ -840,7 +840,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
   const FP = normalizeDiffFingerprint(TEXT);
   const BOT = { login: 'web-everything' };
   const clear = (over = '') => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z',
-    body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->${over}\n<!-- cleared-human: chalbert -->` });
+    body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->${over}\n<!-- cleared-human: chalbert -->` });
   const agentAccept = () => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->` });
   const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, pinnedHeadSha: NEW, netDiffText: { scored: true, text: TEXT, rev: NEW } });
   const run = (over = {}) => carryHumanClearanceOnIdenticalDiff({ ...base(), ...over });
@@ -1050,7 +1050,7 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
   const NEW217 = '4339cf573915' + '0'.repeat(28);
   const DIFF = 'diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b\n';
   const view = { headRefOid: NEW217, headRefName: 'lane/xadunn9-wip-deeplinks',
-    comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
+    comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
   const exec = (cmd) => { if (cmd === 'gh') return JSON.stringify(view); throw new Error('unexpected'); };
   const read = (texts, carrySetting = 'on', { comments = view.comments, readReviews = () => [] } = {}) => readDrainAcceptance({
     pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', carrySetting, readReviews,

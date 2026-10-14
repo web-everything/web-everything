@@ -1928,12 +1928,9 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
       if (!machineNote) humanInSameShaRun = false;
       continue;
     }
-    CLEARED_HUMAN_RE.lastIndex = 0;
-    let bodyHumanCleared = CLEARED_HUMAN_RE.exec(body) !== null;
-    if (!bodyHumanCleared) {
-      CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
-      bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
-    }
+    // PR #5237 operator send-back (2026-10-14): a quote of a whole clearance block is not a clearance. Only a comment
+    // authored in the sanctioned shape counts, so a revoked clearance stays revoked until a NEW clear-human ceremony.
+    const bodyHumanCleared = isSanctionedClearanceBody(body);
     // PR #5237 round 5: carrying the marker does not make a comment an acceptance. A revocation can QUOTE it (in a
     // fence, a blockquote, a whole line or inline). The run continues only through a recognised acceptance
     // (`isAcceptRecordBody`) or a machine note; any other marker-bearing comment ends it, like a marker-free one.
@@ -1961,10 +1958,55 @@ const ACCEPT_RECORD_HEADINGS = [
   '📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)',
 ];
 
-/** Pure: does this comment body open with an acceptance heading (its first non-blank line, exactly)? */
+const bodyLines = (body) => String(typeof body === 'string' ? body : '').split('\n').map((l) => l.replace(/\r$/, ''));
+
+/**
+ * Pure: does this comment body open with an acceptance heading (its first non-blank line, exactly, at column 0)? An
+ * indented heading is a Markdown code block, i.e. a quote, and does not count.
+ */
 export function isAcceptRecordBody(body) {
-  const first = String(typeof body === 'string' ? body : '').split('\n').find((l) => l.trim() !== '');
-  return first !== undefined && ACCEPT_RECORD_HEADINGS.includes(first.replace(/\r$/, '').trim());
+  const first = bodyLines(body).find((l) => l.trim() !== '');
+  return first !== undefined && ACCEPT_RECORD_HEADINGS.includes(first.trimEnd());
+}
+
+/** The headings whose producers stamp a human clearance (clear-human, a restamp or carry of one); never a plain accept. */
+const CLEARANCE_HEADINGS = ACCEPT_RECORD_HEADINGS.filter((h) => h !== '✅ review — accepted');
+const CLEARED_HUMAN_LINE_RE = new RegExp(`^<!--\\s*${CLEARED_HUMAN_MARKER}:\\s*([^>]*?)\\s*-->$`);
+const MARKER_LINE_RE = /^<!--.*-->$/;
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
+/**
+ * Pure: is this comment a human clearance AUTHORED in the sanctioned shape, not one quoted inside other prose (PR #5237
+ * operator send-back, 2026-10-14)? Either:
+ *   - it opens (first non-blank line, column 0) with a clearance-stamping heading ({@link CLEARANCE_HEADINGS}) and
+ *     carries the `cleared-human` marker on a line of its own, at column 0, outside any code fence (as
+ *     `buildVerdictComment` / `buildCarryRecordBody` write it), or the legacy prose attribution `CLEARED_HUMAN_PROSE_RE`
+ *     (anchored to the start of the body under the clear-human heading); or
+ *   - it is a bare marker record: every non-blank line is a whole `<!-- … -->` marker line at column 0 (no prose
+ *     around it, so nothing is being quoted).
+ * A blockquote (`> `), an indented block, a fence, prose before the heading or the marker mid-line all fail.
+ */
+export function isSanctionedClearanceBody(body) {
+  const lines = bodyLines(body);
+  const nonBlank = lines.filter((l) => l.trim() !== '');
+  if (!nonBlank.length) return false;
+  const bare = nonBlank.every((l) => MARKER_LINE_RE.test(l));
+  if (!bare && !CLEARANCE_HEADINGS.includes(nonBlank[0].trimEnd())) return false;
+  if (!bare) {
+    CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
+    if (CLEARED_HUMAN_PROSE_RE.exec(String(body)) !== null) return true;
+  }
+  let fence = null; // { char, len } while inside a fenced code block
+  for (const line of lines) {
+    const f = FENCE_LINE_RE.exec(line);
+    if (f) {
+      if (!fence) fence = { char: f[1][0], len: f[1].length };
+      else if (f[1][0] === fence.char && f[1].length >= fence.len && line.trim() === f[1]) fence = null;
+      continue;
+    }
+    if (!fence && CLEARED_HUMAN_LINE_RE.test(line)) return true;
+  }
+  return false;
 }
 
 /** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */

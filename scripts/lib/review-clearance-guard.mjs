@@ -154,14 +154,6 @@ const readJson = (runGh, repo, args) => {
   catch { return null; }
 };
 
-/** Both live heads, read fresh (PR view, then the branch ref); null for any read that fails or disagrees on the branch. */
-export function readLiveHeads({ repo, pr, runGh = runGhSync, headRefName }) {
-  const view = readJson(runGh, repo, ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,headRefName']);
-  const name = view?.headRefName;
-  const ref = name ? readJson(runGh, repo, ['api', `repos/${repo}/git/ref/heads/${name}`]) : null;
-  return { prHead: name && name === headRefName ? view?.headRefOid ?? null : null, refHead: ref?.object?.sha ?? null };
-}
-
 /** The PR's whole comment thread, in the shape the deciders read; null when any page fails (never a partial list). */
 export function readPrComments({ repo, pr, runGh = runGhSync }) {
   const pages = readJson(runGh, repo, ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/comments?per_page=100`]);
@@ -189,14 +181,37 @@ export function newerAcceptanceOnHead({ comments, events, labels, record, prHead
     && !(Date.parse(at(e)) < Date.parse(latest.at)));
 }
 
-/** Read the live thread, events and labels, then {@link newerAcceptanceOnHead}; any read failure or throw is false. */
-function readNewerAcceptanceOnHead({ repo, pr, runGh, record, after }) {
-  try {
-    const pages = readJson(runGh, repo, ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/events?per_page=100`]);
-    const view = readJson(runGh, repo, ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels']);
-    return newerAcceptanceOnHead({ comments: readPrComments({ repo, pr, runGh }), events: Array.isArray(pages) ? pages.flat() : null,
-      labels: view?.labels ?? null, record, ...after });
-  } catch { return false; }
+/**
+ * Everything a restoration decision reads, as one comparable string: both heads, the branch, the labels and the whole
+ * comment, review and event lists (CI rows left out: they decide nothing here). PR #5237 operator send-back
+ * (2026-10-14): GitHub has no conditional label write, so the guard compares this key read right before the write
+ * with the validated one, and refuses on any difference (compare-and-set). An unreadable list keys as null.
+ */
+export function clearanceStateKey(facts) {
+  const list = (xs, row) => (Array.isArray(xs) ? xs.map(row) : null);
+  return JSON.stringify([facts?.prHead ?? null, facts?.refHead ?? null, facts?.headRefName ?? null,
+    Array.isArray(facts?.labels) ? names(facts.labels).sort() : null,
+    list(facts?.comments, c => [at(c), c?.author?.login ?? null, c?.body ?? null]),
+    list(facts?.reviews, r => [r?.id ?? null, r?.state ?? null, r?.submitted_at ?? r?.submittedAt ?? null, r?.user?.login ?? r?.author?.login ?? null]),
+    list(facts?.events, e => [e?.id ?? null, e?.event ?? null, e?.label?.name ?? null, at(e) ?? null, e?.actor?.login ?? null])]);
+}
+
+/**
+ * PR #5237 operator send-back: did a revocation land between the validated facts and the post-write read `after`, on
+ * the same head? Our own write adds only `labeled review:accepted` / `unlabeled review:pending` events. Anything that
+ * could hold the clearance counts: a new or edited comment that is not a machine note, any change in the formal
+ * reviews, a new hold label or acceptance removal event, or a hold label standing now. Unreadable is true.
+ */
+export function revokedSinceValidation(validated, after) {
+  if (!Array.isArray(after?.comments) || !Array.isArray(after?.reviews) || !Array.isArray(after?.events) || !Array.isArray(after?.labels)) return true;
+  const key = (facts, field) => clearanceStateKey({ [field]: facts[field] });
+  const before = validated.comments ?? [];
+  if (key({ comments: after.comments.slice(0, before.length) }, 'comments') !== key({ comments: before }, 'comments')) return true;
+  if (after.comments.slice(before.length).some(holdsClearance)) return true;
+  if (key(after, 'reviews') !== key(validated, 'reviews')) return true;
+  if (after.events.slice((validated.events ?? []).length).some(e => (e.event === 'unlabeled' && e.label?.name === 'review:accepted')
+    || (e.event === 'labeled' && holds.includes(e.label?.name)))) return true;
+  return names(after.labels).some(l => holds.includes(l));
 }
 
 export function readPrClearanceFacts({ repo, pr, runGh = runGhSync, full = true, revalidate = false }) {
@@ -246,26 +261,34 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
         : { restore: false, why: 'head changed or unreadable during restoration validation' };
     }
     if (restoration.restore) {
+      // Compare-and-set (PR #5237 operator send-back): re-read every input immediately before the write and refuse
+      // if anything changed since validation, e.g. a same-head revocation comment, review, label or event.
+      const live = readPrClearanceFacts({ repo, pr, runGh, revalidate: true });
+      if (clearanceStateKey(live) !== clearanceStateKey(facts)) restoration = { restore: false, why: 'clearance state changed between validation and the approval write' };
+    }
+    if (restoration.restore) {
       // A throw (deferral, timeout) does not prove the write was not applied, so the check below runs either way.
       let writeError = null;
       try { mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']); }
       catch (e) { writeError = e; }
-      // GitHub has no conditional label write, so a push can still land between the last read and the write above.
-      // Read both heads again AFTER the write; if either moved or cannot be read, undo it at once (fail closed) and
-      // record nothing, so the new head keeps `review:pending` and its re-review stays owed.
-      const after = readLiveHeads({ repo, pr, runGh, headRefName: facts.headRefName });
-      if (!sameHead(restoration.record, after.prHead, after.refHead)
-        && readNewerAcceptanceOnHead({ repo, pr, runGh, record: restoration.record, after })) {
+      // GitHub has no conditional label write, so a push or a revocation can still land between the last read and the
+      // write above. Read everything again AFTER the write; if a head moved, a revocation landed, or anything cannot be
+      // read, undo it at once (fail closed) and record nothing, so `review:pending` stands and a re-review stays owed.
+      let after = {};
+      try { after = readPrClearanceFacts({ repo, pr, runGh, revalidate: true }); } catch { after = {}; }
+      const moved = after.headRefName !== facts.headRefName || !sameHead(restoration.record, after.prHead, after.refHead);
+      if (moved && newerAcceptanceOnHead({ ...after, record: restoration.record })) {
         // The head moved AND a newer acceptance of the live head was recorded meanwhile: the label is its now. A
         // clearance comment that lands only after this read is still rolled back (no conditional write exists): the
         // fail-closed side, a re-review owed, never an approval nobody granted.
         log(`review-clearance: PR #${pr} restoration superseded — a newer acceptance of ${after.prHead.slice(0, 9)} owns review:accepted; no rollback`);
         restoration = { restore: false, why: 'a newer acceptance of the live head was recorded during the restoration' };
-      } else if (!sameHead(restoration.record, after.prHead, after.refHead)) {
+      } else if (moved || revokedSinceValidation(facts, after)) {
+        const why = moved ? 'head moved or unreadable after the approval write' : 'a revocation landed or state is unreadable after the approval write';
         try { mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']); }
-        catch (e) { throw new Error(`restoration rollback failed after the head moved: ${e.message}`); }
-        log(`review-clearance: PR #${pr} restoration undone — head moved or unreadable after the approval write`);
-        restoration = { restore: false, why: 'head moved or unreadable after the approval write' };
+        catch (e) { throw new Error(`restoration rollback failed (${why}): ${e.message}`); }
+        log(`review-clearance: PR #${pr} restoration undone — ${why}`);
+        restoration = { restore: false, why };
       }
       if (writeError) throw writeError;
     }

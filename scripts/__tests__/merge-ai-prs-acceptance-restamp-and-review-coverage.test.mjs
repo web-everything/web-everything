@@ -542,6 +542,11 @@ function acceptanceView() {
     body: `✅ review — accepted\n<!-- reviewed-sha: ${REVIEWED} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(REVIEWED_DIFF)} -->\n<!-- reviewed-contribution: ${normalizeContributionFingerprint(REVIEWED_DIFF)} -->`,
   }] };
 }
+/** Turn the accept record into a clear-human record of the same head, in the shape its producer writes (PR #5237:
+ *  a `cleared-human` marker appended to a plain accept is not a sanctioned clearance). */
+function asClearHuman(comment) {
+  comment.body = comment.body.replace('✅ review — accepted', '✅ review — `review:human` cleared via the sanctioned path') + '\n<!-- cleared-human: operator -->';
+}
 function acceptanceOptions(view = acceptanceView()) {
   return { pr: 3432, repo: 'web-everything/web-everything', local: true, files: ['src/example.js'],
     // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
@@ -680,7 +685,7 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     view.headRefOid = REVIEWED;
     const inputs = { labels: [REVIEW_LABELS.accepted], escalate: true, deviation: 'changed delivery scope' };
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('park');
-    view.comments[0].body += '\n<!-- cleared-human: operator -->';
+    asClearHuman(view.comments[0]);
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('merge');
     view.comments[0].viewerDidAuthor = false;
     view.comments[0].author = { login: 'untrusted-worker' };
@@ -726,7 +731,7 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
 
   it('merges once a trusted head-bound human clearance is recorded', () => {
     const view = reviewedView();
-    view.comments[0].body += '\n<!-- cleared-human: operator -->';
+    asClearHuman(view.comments[0]);
     expect(drain(scoreOf([WF], diff4318), view).action).toBe('merge');
   });
 

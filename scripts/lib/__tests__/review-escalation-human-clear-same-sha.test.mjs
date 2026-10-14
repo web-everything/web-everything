@@ -5,7 +5,9 @@ import { parseLatestHumanClearedSha, isAcceptRecordBody } from '../review-escala
 // re-review whose plain accept named the SAME sha, so merge-gate read "no human clearance" for the cleared tree.
 const X = '9c72024172156f0f8b1b1c0c3f94b44d1031bdd3';
 const Y = 'a'.repeat(40);
-const clear = sha => ({ author: { login: 'chalbert' }, body: `✅ review — \`review:human\` cleared\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->` });
+const CLEAR_HEADING = '✅ review — `review:human` cleared via the sanctioned path';
+const clearBlock = sha => `${CLEAR_HEADING}\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->`;
+const clear = sha => ({ author: { login: 'chalbert' }, body: clearBlock(sha) });
 const accept = sha => ({ author: { login: 'web-everything' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->` });
 
 describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanClearanceSurvivesSameShaAccept)', () => {
@@ -72,6 +74,31 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     // Renamed 2026-10-11; records under the old heading are still on open PRs.
     expect(isAcceptRecordBody('📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)\n')).toBe(true);
     expect(isAcceptRecordBody(verdict('changes'))).toBe(false);
+  });
+  // PR #5237 operator send-back (2026-10-14): quoting a WHOLE revoked clearance block (both markers) revived the human
+  // approval: the quote read as a fresh clearance and restarted the run. A revoked clearance stays revoked until a NEW
+  // clear-human ceremony: only a comment authored in the sanctioned shape counts as a clearance.
+  const block = clearBlock(X);
+  const fenced = '```\n' + block + '\n```';
+  it.each([
+    ['blockquote', `Quoting the old clearance, which I revoked:\n\n${block.split('\n').map(l => `> ${l}`).join('\n')}`],
+    ['fenced', `Quoting the old clearance, which I revoked:\n\n${fenced}`],
+    ['fenced, nothing else', fenced],
+    ['raw lines after prose', `Re-posting for the record (still revoked):\n${block}`],
+    ['indented block', block.split('\n').map(l => `    ${l}`).join('\n')],
+    ['heading kept, markers only inside a fence', `${CLEAR_HEADING}\n\nThis was revoked:\n\n\`\`\`\n<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->\n\`\`\`\n<!-- reviewed-sha: ${X} -->`],
+  ])('a quoted full clearance after a revocation does not revive it (%s)', (_kind, body) => {
+    const quote = say(body, 'chalbert');
+    const revoked = say('🔁 review — changes requested\n\n1. not yet');
+    for (const sameShaCarries of [true, false]) {
+      expect(parseLatestHumanClearedSha([clear(X), revoked, quote, accept(X)], { sameShaCarries })).toBeNull();
+      expect(parseLatestHumanClearedSha([clear(X), revoked, quote], { sameShaCarries })).toBeNull();
+    }
+  });
+  it('a NEW clear-human ceremony after the revocation does clear again', () => {
+    const revoked = say('🔁 review — changes requested\n\n1. not yet');
+    expect(parseLatestHumanClearedSha([clear(X), revoked, clear(X), accept(X)], { sameShaCarries: true })).toBe(X);
+    expect(parseLatestHumanClearedSha([clear(X), revoked, say(`<!-- reviewed-sha: ${X} -->\n<!-- cleared-human: chalbert -->`, 'web-everything')], { sameShaCarries: false })).toBe(X);
   });
   it('carries across a plain re-stamp and a machine note that carry the marker', () => {
     const restamp = say(`📌 review — acceptance re-stamped after a rebase (no new review)\n${quote}`, 'web-everything');
