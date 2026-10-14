@@ -200,16 +200,26 @@ function a3Def() {
   });
 }
 
+// Red main @ 62da75ed3 (CI run 38517676708): A3 hit vitest's 180s test bound on the integration job while the
+// card-only commit changed no code (the previous main run passed the same file in 128s total). Every tick of these
+// scenarios runs a REAL inline rebuild plus the live smoke gate (lane-pool, `gh`, `reconcile-pass.mjs` children), so
+// one scenario costs 50-160s on an idle laptop and more on a CI runner shared with the `threads` pool — a 180s bound
+// left ~20s of margin (A1 measured 160s). The bound is a hang detector, not a performance assertion, so it is sized
+// well above the measured cost; the tick bound stays below the test bound so a hung tick still fails with its own,
+// more specific message.
+const SCENARIO_TICK_TIMEOUT_MS = 300_000;
+const SCENARIO_TEST_TIMEOUT_MS = 360_000;
+
 describe('#3383 daemon scenario simulator — self-sync sibling scenarios (I-15/I-18)', () => {
   it('A1: fix-dispatch restarts within one tick on boot-HEAD drift from a sibling daemon self-syncing first (I-15)', async () => {
-    await runScenario(a1Def(), { timeoutMs: 180_000 });
-  }, 180_000);
+    await runScenario(a1Def(), { timeoutMs: SCENARIO_TICK_TIMEOUT_MS });
+  }, SCENARIO_TEST_TIMEOUT_MS);
 
   it('A2: a mid-tick stale-main refusal re-syncs and restarts within the SAME tick (I-18)', async () => {
-    await runScenario(a2Def(), { timeoutMs: 180_000 });
-  }, 180_000);
+    await runScenario(a2Def(), { timeoutMs: SCENARIO_TICK_TIMEOUT_MS });
+  }, SCENARIO_TEST_TIMEOUT_MS);
 
   it('A3: a main move touching no daemon import rebuilds the clone but restarts neither daemon (#4044)', async () => {
-    await runScenario(a3Def(), { timeoutMs: 180_000 });
-  }, 180_000);
+    await runScenario(a3Def(), { timeoutMs: SCENARIO_TICK_TIMEOUT_MS });
+  }, SCENARIO_TEST_TIMEOUT_MS);
 });
