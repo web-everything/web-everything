@@ -1,21 +1,24 @@
 ---
+bornAs: x4iwf06
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a test where the ancestry probe throws status 128 and assert head-mismatch is refused. Altern… (from web-everything/web-everything#5247 review)
+# Prevention — Lint rule or check:standards gate flagging calls to the sync exec readers (execRead / execFileSyn… (from web-everything/web-everything#5241 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/card-batch-seal-io.mjs:112` — Add a test where the ancestry probe throws status 128 and assert `head-mismatch` is refused. Alternatively, treat an unresolvable recorded head as non-descendant (e.g. `git cat-file -e` first).
-2. `we:scripts/operations/card-batch-seal-io.mjs:118` — After the path regex, require that each A/D/M path's card id belongs to state.members or is the rename counterpart of a deleted member card, and cap the count of added cards at policy.maxCards. Add a real-repo test where an unrelated new card is refused. A lint on 'adopt' paths in card-batch-seal-io is not feasible, so a named test is the cheapest durable guard.
+1. `we:scripts/lib/enqueue-on-event.mjs:317` — Lint rule or check:standards gate flagging calls to the sync exec readers (execRead / execFileSyncThrottled) from daemon-resident async modules. Alternatively, bound the per-interval comment-read count and test the bound.
+2. `we:scripts/lib/enqueue-on-event.mjs:177` — Default the field (`json.reason ?? 'unknown'`) and add a test for a refusal with no reason.
+3. `we:scripts/lib/enqueue-on-event.mjs` — Filter acceptance comments to the known verdict-bot author inside readCatchUpCandidates and add a forged-comment test. A lint rule for 'parseVerdictComment used without an author check' is the deterministic gate.
+4. `we:scripts/lib/enqueue-on-event.mjs:437` — Add a deterministic unit regression combining an older event-pending PR, a catch-up candidate, and one available slot; require shared capacity accounting or a refreshed snapshot before the catch-up enqueue.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5247@0ead1887f4febcc1ae2b83c8be69733a5a508ef8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@70e7ae2aa16eb498994e4fd5828d8f5bdb95b7aa
 
 ## Acceptance
 

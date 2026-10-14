@@ -1,23 +1,22 @@
 ---
+bornAs: xuz8150
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+scope: ["we:scripts/lib/merge-queue-adaptive-batching.mjs", "we:scripts/lib/__tests__/merge-queue-adaptive-batching.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Lint rule or check:standards gate flagging calls to the sync exec readers (execRead / execFileSyn… (from web-everything/web-everything#5241 review)
+# Prevention — Add a shell-level test where native group facts are injected and a cancel POST is expected. Longe… (from web-everything/web-everything#5217 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:scripts/lib/merge-queue-adaptive-batching.mjs:1` — Add a shell-level test where native group facts are injected and a cancel POST is expected. Longer term, destructure the function's inputs strictly or validate its argument keys so an unknown key throws.
 
-1. `we:scripts/lib/enqueue-on-event.mjs:317` — Lint rule or check:standards gate flagging calls to the sync exec readers (execRead / execFileSyncThrottled) from daemon-resident async modules. Alternatively, bound the per-interval comment-read count and test the bound.
-2. `we:scripts/lib/enqueue-on-event.mjs:177` — Default the field (`json.reason ?? 'unknown'`) and add a test for a refusal with no reason.
-3. `we:scripts/lib/enqueue-on-event.mjs` — Filter acceptance comments to the known verdict-bot author inside readCatchUpCandidates and add a forged-comment test. A lint rule for 'parseVerdictComment used without an author check' is the deterministic gate.
-4. `we:scripts/lib/enqueue-on-event.mjs:437` — Add a deterministic unit regression combining an older event-pending PR, a catch-up candidate, and one available slot; require shared capacity accounting or a refreshed snapshot before the catch-up enqueue.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #xs3192y.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@70e7ae2aa16eb498994e4fd5828d8f5bdb95b7aa
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5217@bcab21bf87cdaaca5f6bd3b13fa1e429706d6001
 
 ## Acceptance
 
