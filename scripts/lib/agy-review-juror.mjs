@@ -12,20 +12,23 @@
  *   1. ITS OWN LANE. The juror lane is a throwaway local clone of the review lane's committed HEAD (the same clone
  *      `gemini-direct-task.mjs` builds — reused, not re-implemented). A review seat is read-only, so ANY change there
  *      (a modified, added or deleted file, or a moved HEAD) voids the seat.
- *   2. OUTSIDE ITS LANE. The review lane it was cloned from and this checkout are snapshotted (HEAD, porcelain status
- *      with ignored files, a content hash of every listed file, and fs hashes of `.git/config`, hooks and attributes)
- *      before and compared after. Any difference voids the seat.
+ *   2. OUTSIDE ITS LANE. The review lane is strictly snapshotted: any change voids. Other watched checkouts are
+ *      shared; the daemon resets its checkout to origin/main every 10-40 minutes. Their HEAD/status/content changes
+ *      void only when a changed path overlaps a path named by ANY transcript tool update (including errored calls).
+ *      Changed git control files or unreadable snapshots mean unknown changes: void only if the juror touched that
+ *      checkout, and never run git after detecting changed control files.
  *   3. ITS OWN TRANSCRIPT. Any tool call that is not one of the read-only tools ({@link READ_ONLY_AGY_TOOLS}) and did
  *      not end in an error voids the seat, wherever it pointed — this is the check that catches a write (or a network
  *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed. A
  *      completed read voids it too when ANY path-like parameter (relative, `~`, URI, array or nested; symlinks
- *      followed; any `..` segment) does not resolve inside the juror lane.
+ *      followed; any `..` segment) does not resolve inside the juror lane or the run's own session folder under
+ *      ~/.gemini/antigravity-cli/brain/<conversation-id>/ — agy reads its own brain files during normal reviews.
+ *      Other conversations and the brain root remain outside; writes there still void.
  * The checks never let a checkout's own git config run code: control files are compared with plain fs reads first,
  * and git runs with fsmonitor and hooks forced off.
  *
  * A voided or failed seat returns `status: 'voided' | 'failed'` with the reasons and NO answer; the caller
- * (`we:scripts/operations/review-seat-runner.mjs`) falls back to Claude for that seat. False alarms are possible
- * (another process touching a watched checkout mid-run); they fail SAFE — the seat falls back to Claude.
+ * (`we:scripts/operations/review-seat-runner.mjs`) falls back to Claude for that seat.
  *
  * REVIEWER INDEPENDENCE. Each run is a fresh agy conversation (its own conversation id, recorded as the seat's session
  * id) and starts from the diff and its own checkout only — it is never shown another juror's answer.
@@ -145,7 +148,7 @@ function pathLeaves(value, underPathKey, depth = 0) {
  * git is run with fsmonitor and hooks forced off, so a checkout's config can never make the CHECK itself run a
  * program (PR #4131 review: a planted `core.fsmonitor` would turn the post-run `git status` into the payload). The
  * config/hook/attribute files are hashed with plain fs reads BEFORE any post-run git call (see {@link gitControlFiles}),
- * and a change there voids the seat without git ever touching that checkout again.
+ * and a change there prevents git from ever touching that checkout again.
  */
 const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false'];
 const defaultExec = (bin, args, opts = {}) => execFileSync(bin, bin === 'git' ? [...SAFE_GIT, ...args] : args, {
@@ -198,17 +201,22 @@ export function snapshotCheckout(dir, exec = defaultExec, { control = gitControl
     // untracked files either; the transcript allowlist is the check for a write there.
     const raw = exec('git', ['-C', dir, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked ? 'all' : 'no'}`, '--ignored=no']);
     const entries = [];
+    const origins = [];
     const fields = raw.split('\0');
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i];
       if (!f) continue;
       const xy = f.slice(0, 2);
       entries.push({ line: f, path: f.slice(3) });
-      if (xy[0] === 'R' || xy[0] === 'C') i += 1; // a rename/copy entry is followed by its origin path
+      if (xy[0] === 'R' || xy[0] === 'C') {
+        const origin = fields[++i]; // a rename/copy also touched its origin path
+        if (origin) origins.push({ line: `${xy} ${origin}`, path: origin });
+      }
     }
     const contents = {};
-    for (const { path } of entries) if (!path.endsWith('/')) contents[path] = fingerprintFile(join(dir, path));
-    return { head, status: entries.map((e) => e.line).join('\n') + (entries.length ? '\n' : ''), contents, control: control(dir) };
+    for (const { path } of [...entries, ...origins]) if (!path.endsWith('/')) contents[path] = fingerprintFile(join(dir, path));
+    return { head, status: entries.map((e) => e.line).join('\n') + (entries.length ? '\n' : ''),
+      paths: Object.fromEntries([...entries, ...origins].map((e) => [e.path, e.line.slice(0, 2)])), contents, control: control(dir) };
   } catch (e) {
     return { unreadable: String(e?.message ?? e).slice(0, 200), control: control(dir) };
   }
@@ -236,7 +244,7 @@ export function changedCheckouts(before = {}, after = {}) {
  * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
  * PURE.
  */
-export function stateChangingToolCalls(transcriptText, { allowedRoots = [] } = {}) {
+export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home = homedir(), sessionId } = {}) {
   // A step is tracked by (conversation, index) ACROSS step types: a `finish` tool call is first a `tool` step (ACTIVE)
   // and then re-reported as a `finish` step (DONE) with no tool name — the name must come from the tool-typed update
   // and the error status from any update (PR #4131 round 2: judging only the tool-typed update voided every finish).
@@ -259,12 +267,19 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [] } = {
   const lanes = allowedRoots.filter(Boolean).map((r) => resolve(r));
   const cwd = lanes[0];
   const roots = lanes.map((r) => canonicalPath(r) ?? r);
+  // Only the run's own conversation ids, never the brain parent or a sibling conversation.
+  if (roots.length) {
+    for (const id of conversationIds(transcriptText, sessionId)) {
+      const root = canonicalPath(join(home, '.gemini', 'antigravity-cli', 'brain', id));
+      if (root) roots.push(root);
+    }
+  }
   const out = [];
   for (const step of steps.values()) {
     if (!step.isTool || step.errored) continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
-    // A completed READ must stay inside the juror lane too: what it reads can be quoted into the published findings.
+    // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
     if (roots.length && name !== 'finish' && step.params != null) {
       // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
@@ -276,6 +291,57 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [] } = {
     }
   }
   return out;
+}
+
+/** Valid own conversation ids from the outcome and the transcript's step updates. */
+function conversationIds(transcriptText, sessionId) {
+  const ids = [sessionId, ...parseJsonlEvents(String(transcriptText ?? ''))
+    .filter((e) => e?.event === 'step_update').map((e) => e.step_update?.conversation_id)];
+  return [...new Set(ids.filter((id) => typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..'))];
+}
+
+/** Collect paths from EVERY tool update, even denied calls and later updates with different parameters. */
+function touchedPaths(transcriptText, cwd, home) {
+  const paths = [];
+  for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
+    const step = event?.event === 'step_update' ? event.step_update : null;
+    if (step?.step_type !== 'tool') continue;
+    let params = step.tool_info?.parameters;
+    if (typeof params === 'string') { try { params = JSON.parse(params); } catch { continue; } }
+    for (let p of pathLeaves(params, Array.isArray(params))) {
+      if (p.includes('\0')) continue;
+      if (/^file:\/\//i.test(p)) { try { p = fileURLToPath(p); } catch { continue; } }
+      else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) continue;
+      if (p === '~' || p.startsWith('~/')) p = join(home, p.slice(2));
+      const real = canonicalPath(resolve(cwd, p));
+      if (real) paths.push(real);
+    }
+  }
+  return [...new Set(paths)];
+}
+
+const inside = (path, root) => path === root || path.startsWith(`${root}/`);
+const overlaps = (a, b) => inside(a, b) || inside(b, a);
+
+/** Shared changes are attributable only when a changed path overlaps a transcript path. */
+function sharedChangeTouched(dir, before, after, touched, exec) {
+  const root = canonicalPath(dir) ?? resolve(dir);
+  const checkoutTouched = touched.some((p) => inside(p, root));
+  // Missing/unreadable snapshots (including control changes) leave the changed set unknown.
+  if (!before || before.unreadable || !after || after.unreadable) return checkoutTouched;
+  const paths = new Set([...Object.keys(before.contents ?? {}), ...Object.keys(after.contents ?? {})]);
+  const changed = [...paths].filter((p) => before.paths?.[p] !== after.paths?.[p]
+    || before.contents?.[p] !== after.contents?.[p]);
+  if (before.head !== after.head) {
+    try {
+      // defaultExec adds SAFE_GIT; -z preserves every pathname verbatim. No git after control changes.
+      changed.push(...exec('git', ['-C', dir, 'diff', '--name-only', '--no-renames', '-z', before.head, after.head]).split('\0').filter(Boolean));
+    } catch { return checkoutTouched; }
+  }
+  return changed.some((p) => {
+    const real = canonicalPath(resolve(dir, p));
+    return real && inside(real, root) && touched.some((t) => overlaps(real, t));
+  });
 }
 
 /** Drop local absolute paths (lanes, this checkout, the home directory) from a free-text reason. PURE. */
@@ -308,7 +374,8 @@ export function relativizeFindings(findings, roots = []) {
  * @param {string} o.laneCwd - the review lane the Claude juror uses; the juror lane is cloned from it.
  * @param {string} o.model - the agy model (e.g. `claude-opus-5-5-high`).
  * @param {string[]} [o.watch] - further checkouts to watch; the review lane and this checkout always are.
- * @param {object} [o.deps] - injectable io for tests: `exec`, `mkTempDir`, `spawnJudge`, `readFile`, `removeDir`, `now`.
+ * @param {object} [o.deps] - injectable io for tests: `exec`, `mkTempDir`, `spawnJudge`, `readFile`, `removeDir`,
+ *   `now`, `repoRoot`, `escapingLinks`, `home` (defaults to os.homedir()).
  * @returns {Promise<{status: 'ok'|'voided'|'failed', value?: object, reasons: string[], sessionId: string|null,
  *   model: string, servedModel?: string, wallMs: number, transcriptFile: string|null}>}
  */
@@ -321,6 +388,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     removeDir = (p) => rmSync(p, { recursive: true, force: true }),
     now = () => Date.now(),
     repoRoot = MODULE_REPO_ROOT,
+    home = homedir(),
   } = deps;
   const started = now();
   const result = (status, extra = {}) => ({
@@ -377,18 +445,26 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     }
     const controlAfter = Object.fromEntries(watched.map((d) => [d, gitControlFiles(d)]));
     const controlChanged = new Set(changedControl(before, controlAfter));
-    for (const dir of controlChanged) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
     const after = Object.fromEntries(watched.filter((d) => !controlChanged.has(d)).map((d) => [d, snapshotCheckout(d, exec, snapOpts(d))]));
-    const comparable = Object.fromEntries(Object.entries(before).filter(([d]) => !controlChanged.has(d)));
-    for (const dir of changedCheckouts(comparable, after)) reasons.push(`change outside the juror lane: ${label(dir)}`);
     const transcriptFile = outcome?.transcriptFile ?? spawnError?.telemetry?.transcriptFile ?? null;
+    let transcriptText = '';
     if (transcriptFile) {
-      let text = '';
-      try { text = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
-      const calls = stateChangingToolCalls(text, { allowedRoots: [jurorLane, realpathOr(jurorLane)] });
+      try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      const calls = stateChangingToolCalls(transcriptText, {
+        allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
+      });
       if (calls.length) reasons.push(`completed state-changing tool call(s): ${[...new Set(calls)].join(', ')}`);
     } else if (!spawnError) {
       reasons.push('no transcript — escape check incomplete');
+    }
+    const touched = touchedPaths(transcriptText, jurorLane, home);
+    for (const dir of watched) {
+      if (dir === resolve(laneCwd)) {
+        if (controlChanged.has(dir)) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
+        else if (changedCheckouts({ [dir]: before[dir] }, { [dir]: after[dir] }).length) reasons.push(`change outside the juror lane: ${label(dir)}`);
+      } else if (sharedChangeTouched(dir, before[dir], after[dir], touched, exec)) {
+        reasons.push(`change outside the juror lane touched by the juror: ${label(dir)}`);
+      }
     }
 
     const common = { sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
