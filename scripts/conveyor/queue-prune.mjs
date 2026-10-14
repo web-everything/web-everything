@@ -1,3 +1,4 @@
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/conveyor/queue-prune.mjs
  * @description Queue hygiene for the session conveyor queue (`.conveyor/queue.json`): a PURE planner
@@ -22,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { normNum, bornAsIndexFromItems, readQueueFile, writeQueueFile, removeFromQueue, resolveBornAsRefs } from './queue-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
 
-export const AUTO_CLASSES = Object.freeze(['resolved', 'duplicate', 'missing-card']);
+export const AUTO_CLASSES = Object.freeze(['resolved', 'closed', 'duplicate', 'missing-card']);
 /** A cleared id with no card yet is kept this long (its card may still be in an open lane PR). */
 export const MISSING_CARD_GRACE_MS = 6 * 3600 * 1000;
 
@@ -57,7 +58,7 @@ export function planPrune({ queue, items, protectedNums = [], nowMs = Date.now()
     const card = byNum.get(key) ?? (landed ? byNum.get(landed) : null) ?? null;
     const isProtected = prot.has(canonicalId(key, bornAsIdx));
     const why = (() => {
-      if (card && String(card.status).toLowerCase() === 'resolved') return { reason: 'resolved', detail: landed ? `landed as #${landed}` : undefined };
+      if (card && isTerminalStatus(String(card.status).toLowerCase())) return { reason: card.status, detail: landed ? `landed as #${landed}` : undefined };
       if (landed && queued.has(landed) && landed !== key) return { reason: 'duplicate', detail: `alias of queued #${landed}` };
       if (!card) {
         const age = e.addedAt ? nowMs - Date.parse(e.addedAt) : Infinity;
@@ -71,7 +72,7 @@ export function planPrune({ queue, items, protectedNums = [], nowMs = Date.now()
       if (isProtected) { protectedKept.push({ num: e.num }); continue; }
       drop.push({ num: e.num, ...why });
       dropped.add(key);
-    } else if (landed && landed !== key && !queued.has(landed) && !(card && String(card.status).toLowerCase() === 'resolved')) {
+    } else if (landed && landed !== key && !queued.has(landed) && !(card && isTerminalStatus(String(card.status).toLowerCase()))) {
       rename.push({ from: e.num, to: landed });
     }
   }

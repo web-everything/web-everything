@@ -34,7 +34,7 @@ as *left apart* with the unblocking action, and move on.
    consolidation-safety rubric*). Any failure → **left apart**.
 4. **Pick the outcome per surviving cluster** (*→ The three outcomes*): **umbrella** (one epic, members
    re-parented) · **pack** (`blockedBy` edges + a named pack for `/batch`, no epic) · **fold** (a true
-   near-duplicate — **report only, no mutation**, pending the folded-duplicate retirement decision).
+   near-duplicate — closed **not built** into the survivor after approval; see *Executing*, step 2a).
 5. **Write the report** `reports/<YYYY-MM-DD>-backlog-consolidation-analysis.md` — two tables: could
    consolidate (members, outcome, umbrella title/digest or pack edges, what changes on each member) and
    left apart (members, *which rubric condition failed*, the specific unblocking action). Produced even when
@@ -57,7 +57,12 @@ A single "go" authorizes the clusters you presented (*→ Executing a consolidat
 3. **Gate:** `npm run check:standards` green, and re-evaluate `blockedBy` per *backlog-workflow.md → Keep
    the blocker DAG honest*.
 
-A consolidation never renumbers, deletes, or `resolve`s a member — it adds an umbrella and rewires edges.
+2a. **Fold:** `node scripts/operations/run.mjs close-items --ids=<absorbed> --reason=duplicate
+   --into=<survivor>` — a dry run by default; re-run with `--apply` (*backlog-workflow.md → Closing an item
+   as not built*, ratified by #2982). Undo with `reopen-items`.
+
+A consolidation never renumbers, deletes, or `resolve`s a member — it adds an umbrella, rewires edges, or
+closes a folded duplicate *not built* (`status: closed`, never `resolved`).
 Close with a net-flow line (`+1 epic`, N members re-parented, M clusters left apart).
 
 ## Relationship to `/split`
