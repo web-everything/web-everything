@@ -295,7 +295,8 @@ describe('settings and drafting', () => {
     const stage = ({ files }) => { stored = files[0].content({ existing: stored }); };
     const run = args => args[0] === 'ls-tree' ? io.precedentGitPath(repo) : args[0] === 'show' ? stored : '';
     const clock = { now: () => Date.parse('2026-10-13T20:00:00Z') };
-    const panel = () => io.readPrecedents({ board: '.', repo, run, ...clock }).citations.map(e => e.verdict);
+    // The fold never reads a clock, so every reader sees the same result at any time.
+    const panel = () => io.readPrecedents({ board: '.', repo, run }).citations.map(e => e.verdict);
     const apply = (at, comments, extra = clock) => io.appendPrecedentEvents({ repo, stage, ...extra,
       citationSnapshot: { pr: 9, at, info: { ...info, comments } } });
     // A writer whose clock reads 2099 stores an accept.

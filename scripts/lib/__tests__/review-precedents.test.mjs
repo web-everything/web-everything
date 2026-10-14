@@ -28,7 +28,7 @@ describe('records and events', () => {
     }
     expect(Object.isFrozen(p.PRECEDENT_DECISIONS)).toBe(true);
     expect(p.PRECEDENT_STATUSES).toEqual(['draft', 'active', 'superseded']);
-    expect(p.PRECEDENT_EVENT_KINDS).toEqual(['precedent', 'status', 'citation']);
+    expect(p.PRECEDENT_EVENT_KINDS).toEqual(['precedent', 'status', 'citation', 'read']);
   });
   it('rejects invalid fields without throwing', () => {
     for (const bad of [null, {}, row({ id: 'bad' }), row({ pattern: 'two\nlines' }), row({ decision: 'maybe' }),
@@ -94,11 +94,11 @@ describe('records and events', () => {
     expect(p.foldCitations([older, newer, withdrawn])).toEqual([older]);
     expect(p.foldCitations([older, withdrawn, newer])).toEqual([newer]);
     expect(p.foldCitations([newer, withdrawn])).toEqual([]);
-    // Two reads of one comment revision rank by read time, so a stale read stored last never restores it.
-    const later = '2026-10-14T00:00:00Z';
-    const [laterWithdrawn] = p.citationRetractions([older, newer], [older], { repo: REPO, pr: 1, at: later });
-    expect(p.foldCitations([older, laterWithdrawn, newer])).toEqual([older]);
-    expect(p.foldCitations([older, laterWithdrawn, { ...newer, at: '2026-10-14T01:00:00Z' }])).toEqual([{ ...newer, at: '2026-10-14T01:00:00Z' }]);
+    // Two reads of one revision tie on evidence and log order decides, never the writer's clock: the append
+    // refuses a stale read whole, so log order is read order.
+    const [laterWithdrawn] = p.citationRetractions([older, newer], [older], { repo: REPO, pr: 1, at: '2026-10-14T00:00:00Z' });
+    expect(p.foldCitations([older, { ...newer, at: '2099-01-01T00:00:00Z' }, laterWithdrawn])).toEqual([older]);
+    expect(p.citationSupersedes(newer, laterWithdrawn)).toBe(true);
   });
   it('parses read marks and returns the newest one per PR', () => {
     const marks = ['2026-10-13T12:00:00Z', '2026-10-13T14:00:00Z'].map(time => p.readEvent({ repo: REPO, pr: 1, at: time }));

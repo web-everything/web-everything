@@ -146,20 +146,20 @@ const commentSource = (ev) => {
 };
 const timeOf = (value) => { const ms = Date.parse(value); return Number.isFinite(ms) ? ms : -Infinity; };
 
-// Evidence time of a citation: [authored, revised, read]. A comment source is [commentId, createdAt, updatedAt]
+// Evidence time of a citation: [authored, revised]. A comment source is [commentId, createdAt, updatedAt]
 // (legacy rows: [commentId, time]); a source-less event is a direct recording stamped with its occurrence time.
-// `read` is the row's `at`, taken before its thread read: the comment reader returns no updatedAt, so two reads
-// of one comment differ only by it, and a stale read stored last must never replace a newer read's row.
 // An untimed row sorts oldest, so the order stays total and older evidence can never leapfrog through it.
+// Two reads of one revision tie, and log order decides: the comment reader returns no updatedAt, so that is safe
+// only because a snapshot read before the newest read mark is refused whole (appendPrecedentEvents), making log
+// order read order. The writer's clock never ranks rows, so a clock that ran ahead cannot pin one.
 function evidenceTime(ev) {
   const source = commentSource(ev);
-  if (source) return [timeOf(source[1]), timeOf(source.at(-1)), timeOf(ev.at)];
-  return [timeOf(ev.at), timeOf(ev.at), timeOf(ev.at)];
+  if (source) return [timeOf(source[1]), timeOf(source.at(-1))];
+  return [timeOf(ev.at), timeOf(ev.at)];
 }
 const strictlyNewer = (a, b) => {
-  const aTime = evidenceTime(a), bTime = evidenceTime(b);
-  const index = aTime.findIndex((value, i) => value !== bTime[i]);
-  return index >= 0 && aTime[index] > bTime[index];
+  const [aAuthored, aRevised] = evidenceTime(a), [bAuthored, bRevised] = evidenceTime(b);
+  return aAuthored !== bAuthored ? aAuthored > bAuthored : aRevised > bRevised;
 };
 /** True when `candidate`, stored after `current`, becomes the current row (log order breaks a full tie). */
 export const citationSupersedes = (candidate, current) => !strictlyNewer(current, candidate);

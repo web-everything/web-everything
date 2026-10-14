@@ -102,8 +102,8 @@ export function appendPrecedentEvents({
         files: [{ path: precedentGitPath(repo), content: ({ existing }) => {
           const base = existing ?? '';
           const raw = parsePrecedentLog(base, trust).events;
-          // Rank on a view where stamps ahead of this host's clock (a skewed writer) read as the epoch, or one bad
-          // clock would freeze a comment's row and refuse every honest read until that time passes.
+          // Check staleness and withdrawals on a view where stamps ahead of this host's clock (a skewed writer) read
+          // as the epoch, or one bad clock would refuse every honest read and pin its rows until that time passes.
           const stored = clampFutureStamps(raw, now() + FUTURE_STAMP_SKEW_MS);
           // A snapshot whose read began before the newest read mark on this tip is stale as a whole: the newer read
           // may have stored nothing (every row unchanged), so no row-level rank could tell its rows are older.
@@ -155,11 +155,10 @@ export function loadPrecedentSettings({ env = process.env, settings = readSettin
   return resolved;
 }
 
-export function readPrecedents({ board, repo, run, now = Date.now } = {}) {
+export function readPrecedents({ board, repo, run } = {}) {
   const result = readPrecedentLog({ board, repo, run });
   if (result.status !== 'ok') return result;
-  return { status: 'ok', precedents: foldPrecedents(result.events, trust),
-    citations: foldCitations(clampFutureStamps(result.events, now() + FUTURE_STAMP_SKEW_MS)), malformed: result.malformed };
+  return { status: 'ok', precedents: foldPrecedents(result.events, trust), citations: foldCitations(result.events), malformed: result.malformed };
 }
 
 const defaultExec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
