@@ -2,10 +2,11 @@
 bornAs: x4bppjr
 kind: story
 size: 3
-status: active
+status: resolved
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/heavy-repair-priority.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/readiness/__tests__/heavy-repair-priority.test.mjs"]
 dateOpened: "2026-10-12"
 dateStarted: "2026-10-13"
+dateResolved: "2026-10-13"
 preparedDate: "2026-10-13"
 preparedAgainstSha: "481cfe502d4dd9b5364c4cbf1f2e6ad448b637f5"
 tags: []
