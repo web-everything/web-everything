@@ -117,6 +117,7 @@ import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
 import { resolveTakeoverBudget, PLATFORM_PREFERENCES_PATH, REPO_FIX_SETTINGS_PATH } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
+import { loadPrOwnershipSettings } from './pr-ownership-settings.mjs';
 import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
 
 /** The last logged `review.mechanicalRoundsCountTowardCap` resolution, so a daemon logs the layer once per change. */
@@ -129,6 +130,22 @@ function mechanicalRoundsSetting(resolveSetting, env, log = (line) => console.er
   const line = `mechanical-round-cap: review.mechanicalRoundsCountTowardCap=${r.value} (source: ${r.source})`;
   if (line !== loggedMechanicalSetting) { loggedMechanicalSetting = line; log(line); }
   return { mechanicalRoundsCountTowardCap: r.value };
+}
+
+const loggedOwnershipSettings = new Map();
+function prOwnershipSettings(load, env, log = line => console.error(line)) {
+  try {
+    const resolved = load({ env });
+    const values = {};
+    for (const key of ['advisoryReviewOnHumanHandoff', 'unlabeledRedAgentPr']) {
+      const r = resolved?.[key];
+      if (!r || r.source === 'unreadable') continue;
+      const line = `pr-ownership: prOwnership.${key}=${r.value} (source: ${r.source})`;
+      if (loggedOwnershipSettings.get(key) !== line) { loggedOwnershipSettings.set(key, line); log(line); }
+      values[key] = r.value;
+    }
+    return values;
+  } catch { return {}; }
 }
 
 /** `review.takeoverReviewAttempts` for `planReconcile`; an unreadable setting keeps the pure core's 0. */
@@ -1361,6 +1378,7 @@ export function runReconcilePass({
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
   // mechanical round's head needs (we:scripts/conveyor/mechanical-round-cap.mjs). Injectable.
+  loadPrOwnership = loadPrOwnershipSettings,
   loadMechanicalRoundsSetting = resolveMechanicalRoundsSetting,
   enrichMechanicalRound = enrichPrsWithMechanicalRound,
   enrichOwedMainRule = enrichPrsWithOwedMainRule,
@@ -1440,6 +1458,7 @@ export function runReconcilePass({
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...takeoverReviewSetting(loadReviewSettings, env),
     ...mechanicalSetting,
+    ...prOwnershipSettings(loadPrOwnership, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
   });

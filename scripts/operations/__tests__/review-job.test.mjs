@@ -266,6 +266,17 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
 describe('dispatchReviewJob — what the daemon calls', () => {
   const base = { ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', checkStaleness: FRESH, readCompletion: () => null };
 
+  it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('advisory CI waiver: %s', state => {
+    let spawns = 0;
+    const out = dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null,
+      advisoryCiWaiver: { head: 'A'.repeat(40), reason: 'human-handoff' },
+      ciGate: () => ({ allowed: false, headSha: state === 'missing' ? null : (state === 'mismatched' ? 'b' : 'a').repeat(40),
+        reason: state === 'unreadable' ? 'unreadable-ci' : state === 'head-changed' ? 'head-changed' : 'required-checks-not-successful' }),
+      spawnJob: () => { spawns++; return 4242; } });
+    expect(spawns).toBe(state === 'matching' ? 1 : 0);
+    expect(Boolean(out.skipped)).toBe(state !== 'matching');
+  });
+
   it('spawns the job detached with the gh shim on PATH and WITHOUT the dispatcher\'s own actor id, and claims the slot', () => {
     const spawned = [];
     const out = dispatchReviewJob({

@@ -474,6 +474,7 @@ export function runReviewTick({
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
         scopePaths: (subject?.files ?? []).map(f => typeof f === 'string' ? f : f.path),
