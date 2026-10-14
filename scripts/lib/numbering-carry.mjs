@@ -21,6 +21,12 @@ import {
 
 export const NUMBERING_SUBJECT_RE = /^drain: JIT-number (.+) at land \(#2288\)$/;
 export const MAX_NUMBERING_COMMITS = 5;
+export const MAX_NUMBERING_FILES = 256;
+export const MAX_NUMBERING_BLOB_BYTES = 1024 * 1024;
+export const MAX_NUMBERING_TOTAL_BYTES = 8 * 1024 * 1024;
+const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
+const GIT_TIMEOUT_MS = 5000;
+const canonicalNumber = (number) => number.replace(/^0+(?=\d)/, '');
 
 /** PURE: parse exact, unique hash→number pairs; malformed subjects and duplicate drops return null. */
 export function parseNumberingSubject(subject) {
@@ -31,9 +37,9 @@ export function parseNumberingSubject(subject) {
   const numbers = new Set();
   for (const entry of match[1].split(', ')) {
     const pair = /^(x[0-9a-z]{6})→#(\d+)$/.exec(entry);
-    if (!pair || pair[0] !== entry || pairs.has(pair[1]) || numbers.has(pair[2])) return null;
+    if (!pair || pair[0] !== entry || pairs.has(pair[1]) || numbers.has(canonicalNumber(pair[2]))) return null;
     pairs.set(pair[1], pair[2]);
-    numbers.add(pair[2]);
+    numbers.add(canonicalNumber(pair[2]));
   }
   return pairs.size ? pairs : null;
 }
@@ -72,6 +78,7 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   const map = parseNumberingSubject(subject);
   if (!map) return refuse('subject is not an exact drain numbering subject with unique pairs');
   if (!Array.isArray(changes) || !changes.length) return refuse('numbering commit has no changes');
+  if (changes.length > MAX_NUMBERING_FILES) return refuse(`changed files exceed numbering file limit ${MAX_NUMBERING_FILES}`);
   const paths = new Set();
   for (const change of changes) {
     if (!['A', 'D', 'M'].includes(change.status)) return refuse(`unsupported change status ${change.status} at ${change.path}`);
@@ -150,6 +157,18 @@ function readExtraMap(git, mainRef) {
   return map;
 }
 
+/** IO: inventory filenames only; an unreadable tree is never evidence of an unused number. */
+function readExistingNumbers(git, ref) {
+  const output = git(['ls-tree', '-r', '--name-only', '-z', ref, '--', 'backlog/']);
+  if (output && !output.endsWith('\0')) throw Error(`malformed backlog inventory at ${ref}`);
+  const numbers = new Set();
+  for (const path of output.split('\0')) {
+    const match = /^backlog\/(\d+)-[^/]+\.md$/.exec(path);
+    if (match) numbers.add(canonicalNumber(match[1]));
+  }
+  return numbers;
+}
+
 /**
  * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
  * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
@@ -160,28 +179,57 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
   try {
     if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
     if (fromSha === toSha) return refuse('no head move');
-    const git = (args) => String(exec('git', args, {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...(cwd === undefined ? {} : { cwd }),
-    }) ?? '');
+    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
+    // dropping it would itself conceal a non-numbering byte change.
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    const git = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
+      const output = exec('git', args, {
+        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
+        ...(cwd === undefined ? {} : { cwd }),
+      }) ?? Buffer.alloc(0);
+      if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
+      if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
+      return decoder.decode(output);
+    };
     ensureReadable(git, fromSha);
     ensureReadable(git, toSha);
     // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
     fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
-    const lines = git(['rev-list', '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);
+    const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);
     if (!lines.length) return refuse('no new numbering commits');
     if (lines.length > MAX_NUMBERING_COMMITS) return refuse(`${lines.length} commits exceed numbering limit ${MAX_NUMBERING_COMMITS}`);
-    const extraMap = readExtraMap(git, mainRef);
-    const commits = [];
-    const pairs = [];
+    // Preflight the WHOLE chain before reading any content (including main aliases).
+    const steps = [];
     let parent = fromSha;
     for (const line of lines) {
       const [sha, ...parents] = line.trim().split(/\s+/);
       if (parents.length !== 1 || parents[0] !== parent) return refuse(`commit ${sha.slice(0, 9)} is not a linear single-parent step on ${parent}`);
       const subject = git(['log', '-1', '--format=%s', sha]).replace(/\n$/, '');
+      const map = parseNumberingSubject(subject);
+      if (!map) return refuse(`commit ${sha.slice(0, 9)}: subject is not an exact drain numbering subject with unique pairs`);
+      steps.push({ sha, parents, subject, map });
+      parent = sha;
+    }
+    const existingNumbers = readExistingNumbers(git, fromSha);
+    for (const number of readExistingNumbers(git, mainRef)) existingNumbers.add(number);
+    for (const step of steps) {
+      for (const number of step.map.values()) {
+        const canonical = canonicalNumber(number);
+        if (existingNumbers.has(canonical)) return refuse(`target number ${number} already exists in backlog`);
+        existingNumbers.add(canonical);
+      }
+    }
+    const extraMap = readExtraMap(git, mainRef);
+    const commits = [];
+    const pairs = [];
+    let totalBytes = 0;
+    parent = fromSha;
+    for (const { sha, parents, subject } of steps) {
       const raw = git(['diff', '--no-renames', '--raw', '--no-abbrev', '-z', parent, sha]);
       if (raw && !raw.endsWith('\0')) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
       const fields = raw ? raw.slice(0, -1).split('\0') : [];
       if (fields.length % 2) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
+      if (fields.length / 2 > MAX_NUMBERING_FILES) return refuse(`changed files exceed numbering file limit ${MAX_NUMBERING_FILES}`);
       const changes = [];
       for (let i = 0; i < fields.length; i += 2) {
         const [metadata, path] = fields.slice(i, i + 2);
@@ -192,9 +240,21 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
         if ((status !== 'A' && !['100644', '100755'].includes(beforeMode))
           || (status !== 'D' && !['100644', '100755'].includes(afterMode))) return refuse(`unsupported file mode at ${path}`);
         const change = { status, path, beforeMode, afterMode };
-        if (status !== 'A') change.before = git(['cat-file', 'blob', `${parent}:${path}`]);
-        if (status !== 'D') change.after = git(['cat-file', 'blob', `${sha}:${path}`]);
         changes.push(change);
+      }
+      for (const change of changes) {
+        for (const [side, ref] of [['before', parent], ['after', sha]]) {
+          if ((side === 'before' && change.status === 'A') || (side === 'after' && change.status === 'D')) continue;
+          const object = `${ref}:${change.path}`;
+          const sizeText = git(['cat-file', '-s', object]).trim();
+          if (!/^\d+$/.test(sizeText)) return refuse(`invalid blob size at ${change.path}`);
+          const size = Number(sizeText);
+          if (!Number.isSafeInteger(size) || size > MAX_NUMBERING_BLOB_BYTES || totalBytes + size > MAX_NUMBERING_TOTAL_BYTES) {
+            return refuse(`blob byte limit exceeded at ${change.path}`);
+          }
+          totalBytes += size;
+          change[side] = git(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
+        }
       }
       const result = checkNumberingCommit({ subject, parents, changes, extraMap });
       if (!result.ok) return { ...refuse(`commit ${sha.slice(0, 9)}: ${result.reason}`), ...(extraMap.readFailed ? { retryable: true } : {}) };
@@ -205,6 +265,7 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
     return { ok: true, commits, pairs, reason: `${commits.length} drain numbering commit(s) ${commits.map((sha) => sha.slice(0, 9)).join(', ')} `
       + `(${pairs.map(([hash, number]) => `${hash}→#${number}`).join(', ')}) — card renames and id rewrites only` };
   } catch (e) {
+    if (e?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') return refuse('numbering proof contains invalid UTF-8');
     return { ...refuse(`numbering proof failed: ${String(e?.message ?? e).split('\n')[0]}`), retryable: true };
   }
 }

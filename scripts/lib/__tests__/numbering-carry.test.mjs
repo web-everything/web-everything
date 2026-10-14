@@ -6,8 +6,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkReviewLabelSingleHomeCode } from '../review-skill-guard.mjs';
+import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
+import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
-  MAX_NUMBERING_COMMITS, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
+  MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo,
 } from '../numbering-carry.mjs';
 
@@ -46,6 +48,7 @@ describe('parseNumberingSubject', () => {
     'drain: JIT-number xf74q20→#6053, xf74q20→#6054 at land (#2288)',
     'drain: JIT-number xf74q20→#6053, xztd0mv→#6053 at land (#2288)',
     `${subject}\n`, subject.replace(', ', ','),
+    'drain: JIT-number xf74q20→#6053, xztd0mv→#06053 at land (#2288)',
   ])('refuses malformed or repeated pairs: %s', (value) => expect(parseNumberingSubject(value)).toBeNull());
 });
 
@@ -125,6 +128,137 @@ describe('checkNumberingCommit', () => {
   });
 });
 
+// Exercise the actual IO shell without writing git state: exec observes the same raw
+// bytes cat-file returns, including bytes a permissive UTF-8 decoder would discard.
+function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree } = {}) {
+  const from = 'a'.repeat(40), numbered = 'b'.repeat(40);
+  const heads = [numbered, 'e'.repeat(40)];
+  const head = heads[subjects.length - 1];
+  const calls = [];
+  const blobs = new Map();
+  for (const c of changes) {
+    if (c.before !== undefined) blobs.set(`${from}:${c.path}`, Buffer.from(c.before));
+    if (c.after !== undefined) blobs.set(`${numbered}:${c.path}`, Buffer.from(c.after));
+  }
+  const exec = (_cmd, args, opts) => {
+    calls.push(args);
+    let output = '';
+    if (args[0] === 'rev-parse') output = from;
+    else if (args[0] === 'rev-list') output = subjects.map((_s, i) => `${heads[i]} ${i ? heads[i - 1] : from}\n`).join('');
+    else if (args[0] === 'log') output = `${subjects[heads.indexOf(args.at(-1))]}\n`;
+    else if (args[0] === 'ls-tree') {
+      if (args.includes(failTree)) throw Error('inventory unreadable');
+      const ref = args.find((a) => a === from || a === 'origin/main');
+      output = (trees[ref] ?? []).map((p) => `${p}\0`).join('');
+    } else if (args[0] === 'diff') {
+      output = changes.map((c) => `:${c.status === 'A' ? '000000' : '100644'} ${c.status === 'D' ? '000000' : '100644'} ${'c'.repeat(40)} ${'d'.repeat(40)} ${c.status}\0${c.path}\0`).join('');
+    } else if (args[0] === 'cat-file' && ['blob', '-s'].includes(args[1])) {
+      const bytes = blobs.get(args[2]);
+      if (!bytes) throw Error(`missing fixture blob ${args[2]}`);
+      output = args[1] === '-s' ? `${bytes.length}\n` : bytes;
+    }
+    return opts.encoding === null ? Buffer.from(output) : Buffer.isBuffer(output) ? output.toString('utf8') : output;
+  };
+  return { calls, exec, from, head, prove: () => proveNumberingOnlyMove({ exec, fromSha: from, toSha: head }) };
+}
+
+describe('proveNumberingOnlyMove read-only regressions', () => {
+  it('reads zero blobs for an ordinary subject', () => {
+    const r = proofReader({ commitSubject: 'ordinary author change' });
+    refused(r.prove(), /subject/);
+    expect(r.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toHaveLength(0);
+  });
+  it.each([[subject, 'ordinary author change'], ['ordinary author change', subject]])('preflights every subject before any blob: %j', (...subjects) => {
+    const r = proofReader({ subjects });
+    refused(r.prove(), /subject/);
+    expect(r.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toHaveLength(0);
+    expect(r.calls.some((a) => a[0] === 'grep')).toBe(false);
+  });
+  it('caps changed files before reading any blob', () => {
+    const changes = Array.from({ length: 257 }, (_, i) => ({ status: 'M', path: `backlog/${i}-ref.md`, before: 'xf74q20', after: '6053' }));
+    const r = proofReader({ changes });
+    refused(r.prove(), /file.*limit|limit.*file/);
+    expect(r.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toHaveLength(0);
+  });
+  it('allows a numbering commit at the changed-file limit', () => {
+    const changes = live().changes;
+    for (let i = changes.length; i < 256; i++) changes.push({ status: 'M', path: `backlog/${i}-ref.md`, before: '#xf74q20', after: '#6053' });
+    expect(proofReader({ changes }).prove().ok).toBe(true);
+  });
+  it('rejects reuse of a target number across numbering commits', () => {
+    const r = proofReader({ subjects: [subject, 'drain: JIT-number xabc123→#6053 at land (#2288)'] });
+    refused(r.prove(), /number.*already/);
+    expect(r.calls.filter((a) => a[1] === 'blob')).toHaveLength(0);
+  });
+  it.each(['accepted', 'main', 'leading zero'])('rejects a target number already present on %s', (where) => {
+    const ref = where === 'main' ? 'origin/main' : 'a'.repeat(40);
+    const r = proofReader({ trees: { [ref]: [`backlog/${where === 'leading zero' ? '06053' : '6053'}-existing.md`] } });
+    refused(r.prove(), /number.*already|collision/);
+    expect(r.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toHaveLength(0);
+  });
+  it.each(['a'.repeat(40), 'origin/main'])('fails closed when inventory %s is unreadable', (failTree) => {
+    expect(proofReader({ failTree }).prove()).toMatchObject({ ok: false, retryable: true });
+  });
+  it.each(['rename', 'modification'])('refuses numbering combined with invalid UTF-8 byte changes in a %s', (kind) => {
+    const changes = live().changes;
+    const beforeIndex = kind === 'rename' ? 1 : 0, afterIndex = kind === 'rename' ? 2 : 0;
+    changes[beforeIndex].before = Buffer.concat([Buffer.from(changes[beforeIndex].before), Buffer.from([0x80])]);
+    changes[afterIndex].after = Buffer.concat([Buffer.from(changes[afterIndex].after), Buffer.from([0x81])]);
+    refused(proofReader({ changes }).prove(), /UTF-8/);
+  });
+  it('preserves a UTF-8 BOM when comparing valid blob content', () => {
+    const changes = live().changes;
+    changes[1].before += '\ufeff';
+    changes[2].after += '\ufeff';
+    expect(proofReader({ changes }).prove().ok).toBe(true);
+    changes[2].after = changes[2].after.slice(0, -1);
+    refused(proofReader({ changes }).prove(), /rewrite/);
+  });
+  it('refuses removal of a leading UTF-8 BOM from a reference file', () => {
+    const changes = live().changes;
+    changes[0].before = `\ufeff${changes[0].before}`;
+    refused(proofReader({ changes }).prove(), /rewrite/);
+  });
+  it('refuses an oversized blob before reading it', () => {
+    const changes = live().changes;
+    changes[1].before += 'a'.repeat(1024 * 1024);
+    const r = proofReader({ changes });
+    refused(r.prove(), /byte.*limit|limit.*byte/);
+    expect(r.calls.some((a) => a[1] === 'blob' && a[2].endsWith('xf74q20-hold-auto-land.md'))).toBe(false);
+  });
+  it('bounds aggregate blob bytes across a proof', () => {
+    const before = 'xf74q20' + 'a'.repeat(900000), after = '6053' + 'a'.repeat(900000);
+    const changes = Array.from({ length: 10 }, (_, i) => ({ status: 'M', path: `backlog/${i}-ref.md`, before, after }));
+    const r = proofReader({ changes });
+    refused(r.prove(), /byte.*limit|limit.*byte/);
+    expect(r.calls.filter((a) => a[1] === 'blob').length).toBeLessThan(20);
+  });
+  it.each(['subject', 'collision', 'bytes'])('keeps a failed %s proof from carrying human clearance or writing acceptance', (kind) => {
+    const changes = live().changes;
+    if (kind === 'bytes') {
+      changes[1].before = Buffer.concat([Buffer.from(changes[1].before), Buffer.from([0x80])]);
+      changes[2].after = Buffer.concat([Buffer.from(changes[2].after), Buffer.from([0x81])]);
+    }
+    const r = proofReader({ changes, commitSubject: kind === 'subject' ? 'ordinary author change' : subject,
+      trees: kind === 'collision' ? { 'origin/main': ['backlog/6053-existing.md'] } : {} });
+    const headDiff = 'diff --git a/x b/x\n-old\n+numbered\n';
+    const carry = proveHumanClearanceCarry({ exec: r.exec, evidence: {
+      humanClearance: { sha: r.from, diff: normalizeDiffFingerprint('diff --git a/x b/x\n-old\n+new\n'), actor: 'chalbert' },
+      headSha: r.head, headDiffSha: r.head, headDiff,
+    } });
+    expect(carry).toMatchObject({ carry: false, applicable: true });
+    const writes = [];
+    const restamp = restampAfterNumbering({ repo: 'o/n', pr: 5025, exec: r.exec,
+      state: { labels: ['review:pending'], headRefOid: r.head,
+        comments: [{ author: { login: 'chalbert' }, body: `✅ review — human cleared\n<!-- reviewed-sha: ${r.from} -->\n<!-- cleared-human: chalbert -->` }] },
+      reviews: [], enabled: true, acceptCarry: 'on', guardReferrals: () => {},
+      provider: { postComment: () => writes.push('comment'), setLabels: () => writes.push('labels') },
+    });
+    expect(restamp.action).toBe('refused');
+    expect(writes).toEqual([]);
+  });
+});
+
 const repos = [];
 afterEach(() => { for (const cwd of repos.splice(0)) rmSync(cwd, { recursive: true, force: true }); });
 function repo() {
@@ -164,6 +298,15 @@ function repo() {
 }
 
 describe('proveNumberingOnlyMove (real git)', () => {
+  it('refuses numbering combined with invalid UTF-8 byte changes', () => {
+    const r = repo();
+    r.write('backlog/xabc123-foo.md', Buffer.concat([Buffer.from('---\nkind: story\n---\n'), Buffer.from([0x80])]));
+    const fromSha = r.commit('card with invalid UTF-8');
+    r.number();
+    r.write('backlog/7001-foo.md', Buffer.concat([Buffer.from('---\nbornAs: xabc123\nkind: story\n---\n'), Buffer.from([0x81])]));
+    r.git(['add', '-A']); r.git(['commit', '--amend', '--no-edit', '-q']);
+    refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha: r.git(['rev-parse', 'HEAD']) }), /UTF-8/);
+  });
   it.each(['backlog/0001-parent.md', 'backlog/7001-foo.md'])('refuses numbering combined with an executable-bit change: %s', (path) => {
     const r = repo(); r.number();
     r.git(['update-index', '--chmod=+x', path]);
@@ -187,7 +330,7 @@ describe('proveNumberingOnlyMove (real git)', () => {
     const r = repo(); r.author(); refused(r.prove(r.number()), /subject/);
   });
   it('refuses no head move', () => { const r = repo(); refused(r.prove(r.base), /no head move/); });
-  it('reads extraMap from main and tolerates missing mainRef', () => {
+  it('reads extraMap from main and refuses an unreadable main inventory', () => {
     const r = repo();
     r.write('backlog/8000-previous.md', '---\nbornAs: xghi789\n---\n');
     const main = r.commit('previous numbering on main');
@@ -207,11 +350,11 @@ describe('proveNumberingOnlyMove (real git)', () => {
       return execFileSync(cmd, args, opts);
     };
     expect(proveNumberingOnlyMove({ exec: unavailable, cwd: r.cwd, fromSha, toSha })).toMatchObject({ ok: false, retryable: true });
-    refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha, mainRef: 'missing' }), /rewrite/);
+    expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha, mainRef: 'missing' })).toMatchObject({ ok: false, retryable: true });
     const plain = repo();
     const head = plain.number();
-    expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: plain.cwd, fromSha: plain.base, toSha: head, mainRef: 'missing' }).ok)
-      .toBe(true);
+    expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: plain.cwd, fromSha: plain.base, toSha: head, mainRef: 'missing' }))
+      .toMatchObject({ ok: false, retryable: true });
   });
   it('refuses unreadable commits without throwing, fetching only once', () => {
     const r = repo();
@@ -251,12 +394,14 @@ describe('proveNumberingOnlyMove (real git)', () => {
     const exec = (cmd, args, opts) => {
       calls.push(args);
       expect(opts.cwd).toBe(r.cwd);
-      expect(opts.maxBuffer).toBe(64 * 1024 * 1024);
+      expect(opts.maxBuffer).toBe(args[0] === 'cat-file' && args[1] === 'blob' ? MAX_NUMBERING_BLOB_BYTES : 8 * 1024 * 1024);
+      expect(opts.encoding).toBeNull();
+      expect(opts.timeout).toBe(5000);
       if (args[0] === 'cat-file' && args[1] === '-e' && unreadable) {
         unreadable = false;
         throw new Error('simulated missing object');
       }
-      if (args[0] === 'fetch') return '';
+      if (args[0] === 'fetch') return Buffer.alloc(0);
       return execFileSync(cmd, args, opts);
     };
     expect(r.prove(head, exec).ok).toBe(true);
