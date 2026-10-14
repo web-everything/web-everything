@@ -1257,7 +1257,7 @@ const CODEX_PROVIDER = {
   // what this spawns without a real `codex` process or a real filesystem.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
+      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', usageTaskKind, size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1335,7 +1335,7 @@ const CODEX_PROVIDER = {
       // preserves. `resourceUsage` is threaded through to the `agent.turn` span — honestly `null` on real Node
       // today (no `ChildProcess#resourceUsage()` exists; see `spawn-to-completion.mjs`'s own header), kept only
       // for forward compatibility.
-      const spawned = (await withCodexUsage({ model, effort, taskKind, caller, repo, pr, card: item, cwd: lanePath }, () => spawnAgent(argv, {
+      const spawned = (await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind, caller, repo, pr, card: item, cwd: lanePath }, () => spawnAgent(argv, {
         cwd: lanePath,
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,

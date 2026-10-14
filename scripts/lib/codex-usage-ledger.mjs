@@ -1,11 +1,35 @@
 /** Host-local, append-only accounting. Observations may include concurrent Codex runs;
  * quota deltas are bucket percentage points, not exact per-run billing. */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { appendFileSync, mkdirSync, readdirSync, statSync, lstatSync, realpathSync, openSync, readSync, closeSync } from 'node:fs';
+import { dirname, join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 import { readGit } from './proc-read.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
+import { ghRepoSlug, canonicalizeSlug } from './constellation-repos.mjs';
+
+/** Persist an identity, never a remote's credentials, query string, or fragment. */
+function usageRepoSlug(value) {
+  if (typeof value !== 'string') return null;
+  let path = value.trim();
+  if (path.includes('://')) {
+    try {
+      const url = new URL(path);
+      if (!['https:', 'http:', 'ssh:', 'git:'].includes(url.protocol)) return null;
+      path = url.pathname.replace(/^\//, '');
+    } catch { return null; }
+  } else if (path.includes(':')) {
+    const match = /^(?:[^/@:\s]+@)?[\w.-]+:([^\s]+)$/.exec(path);
+    if (!match) return null;
+    path = match[1];
+  }
+  path = path.replace(/\.git$/i, '');
+  if (!path.includes('/')) {
+    try { return ghRepoSlug(path); } catch { return null; }
+  }
+  return /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(path) ? canonicalizeSlug(path) : null;
+}
 
 export function codexUsageLedgerPath(env = process.env) {
   return env.WE_CODEX_USAGE_LEDGER || join(daemonConveyorStateRoot(env), 'codex-usage.jsonl');
@@ -69,7 +93,7 @@ export function appendCodexUsage(record, { env = process.env, append = appendFil
     const sameWindow = record.quotaBefore?.resets_at === record.quotaAfter?.resets_at;
     const row = {
       at: record.at ?? new Date().toISOString(), model: record.model ?? null, effort: record.effort ?? null,
-      taskKind: record.taskKind ?? 'unknown', caller: record.caller ?? 'unknown', repo: record.repo ?? null,
+      taskKind: record.taskKind ?? 'unknown', caller: record.caller ?? 'unknown', repo: usageRepoSlug(record.repo),
       ...(record.pr != null ? { pr: record.pr } : {}), ...(record.card ? { card: record.card } : {}),
       tokens: record.tokens ?? codexRunTokens(record.stdout),
       quota: { before_used_percent: before, after_used_percent: after,
@@ -83,14 +107,73 @@ export function appendCodexUsage(record, { env = process.env, append = appendFil
   } catch { return null; }
 }
 
+const SNAPSHOT_OUTPUT_BYTES = 8 * 1024 * 1024;
+const SNAPSHOT_MAX_FILES = 4096;
+const SNAPSHOT_MAX_TRACKED = 65536;
+
+/** Metadata only: no content reads or executable Git conversions across a mutable worktree. */
+function hashFileMetadata(hash, root, path) {
+  const parts = path.split('/');
+  if (isAbsolute(path) || parts.some(p => !p || p === '.' || p === '..')) throw Error('unsafe untracked path');
+  hash.update(JSON.stringify(path));
+  let file = root;
+  for (const part of parts.slice(0, -1)) {
+    file = join(file, part);
+    let parent;
+    try { parent = lstatSync(file); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      hash.update('missing');
+      return;
+    }
+    if (!parent.isDirectory()) throw Error('snapshot parent is not a directory');
+  }
+  file = join(file, parts.at(-1));
+  let stat;
+  try {
+    stat = lstatSync(file, { bigint: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    hash.update('missing');
+    return;
+  }
+  if (!stat.isFile() && !stat.isSymbolicLink()) throw Error('unsupported snapshot file');
+  hash.update(JSON.stringify([stat.mode, stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String)));
+}
+
 function repositorySnapshot(cwd) {
   try {
-    const git = (args) => readGit(['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
-    // Include untracked contents as well as tracked edits and commits, without modifying the index.
-    const hash = createHash('sha256').update(git(['rev-parse', 'HEAD'])).update(git(['diff', 'HEAD', '--binary']));
-    for (const path of git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)) hash.update(path).update(readFileSync(join(cwd, path)));
+    const root = realpathSync(cwd);
+    const deadline = Date.now() + 5000;
+    // Do not inherit Git directory/config overrides from the launching process.
+    const env = laneGitHardeningEnv(Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))));
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0', GIT_NO_LAZY_FETCH: '1' });
+    const checkTime = () => { if (Date.now() >= deadline) throw Error('snapshot timeout'); };
+    const git = (args) => {
+      checkTime();
+      return readGit(['-C', root, `--work-tree=${root}`, ...hardenLaneGitArgs(args)], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: Math.max(1, deadline - Date.now()), maxBuffer: SNAPSHOT_OUTPUT_BYTES });
+    };
+    // Refuse configured filters, but never rely on this check to secure a later diff:
+    // ls-files/rev-parse/config do not execute clean/smudge/textconv drivers even if config changes.
+    if (laneFilterDrivers(git(LANE_CONFIG_LIST_ARGS)).length) return null;
+    // HEAD captures commits, stage entries capture index edits, and nanosecond metadata captures
+    // worktree changes. Touches can count as changes; accounting never reads file contents.
+    const tracked = git(['ls-files', '--stage', '--sparse', '-z']);
+    const hash = createHash('sha256').update(JSON.stringify([git(['rev-parse', 'HEAD']), tracked]));
+    const trackedPaths = tracked.split('\0').filter(Boolean).map(entry => {
+      const tab = entry.indexOf('\t');
+      if (tab < 0) throw Error('invalid index entry');
+      return entry.slice(tab + 1);
+    });
+    if (trackedPaths.length > SNAPSHOT_MAX_TRACKED) return null;
+    const paths = git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
+    if (paths.length > SNAPSHOT_MAX_FILES) return null;
+    for (const path of [...new Set(trackedPaths), ...paths]) {
+      checkTime();
+      hashFileMetadata(hash, root, path);
+    }
     let repo = null;
-    try { repo = git(['config', '--get', 'remote.origin.url']).trim(); } catch { /* no remote */ }
+    try { repo = usageRepoSlug(git(['config', '--get', 'remote.origin.url'])); } catch { /* no remote */ }
     return { hash: hash.digest('hex'), repo };
   } catch { return null; }
 }
@@ -108,10 +191,10 @@ export async function withCodexUsage(metadata, launch, { env = process.env, quot
   finally {
     const end = safe(now);
     const filesAfter = metadata.cwd ? safe(snapshot, metadata.cwd) : null;
-    safe(append, { ...metadata, repo: metadata.repo ?? filesBefore?.repo, stdout: result?.stdout ?? error?.stdout,
+    safe(append, { ...metadata, repo: usageRepoSlug(metadata.repo ?? filesBefore?.repo), stdout: result?.stdout ?? error?.stdout,
       quotaBefore: before, quotaAfter: safe(quota, env), durationMs: Number.isFinite(start) && Number.isFinite(end) ? end - start : null,
       changedFiles: metadata.changedFiles ?? (filesBefore && filesAfter ? filesBefore.hash !== filesAfter.hash : null),
-      exit: error ? (typeof error.status === 'number' ? error.status : typeof error.code === 'number' ? error.code : 1) : result?.code ?? 0,
+      exit: error ? (Number.isInteger(error.status) ? error.status : Number.isInteger(error.code) ? error.code : null) : Number.isInteger(result?.code) ? result.code : null,
       timedOut: result?.timedOut ?? error?.timedOut,
     }, { env });
   }
