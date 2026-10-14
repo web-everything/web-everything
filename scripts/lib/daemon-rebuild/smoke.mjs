@@ -624,7 +624,7 @@ export async function smokeAndAdopt({
 
   const failedA = failedRows(a.smokeResult);
   for (const verdict of SMOKE_ENVIRONMENT_VERDICTS) {
-    if (verdict.matches(a.smokeResult.verdict)) return verdict.run({ a, failedA, alert, hold, plan, prepAlerts, alertsList });
+    if (verdict.matches(a.smokeResult.verdict)) return verdict.run({ a, failedA, alert, hold, plan, prepAlerts, alertsList, env, now, prevHead, smokeSha, finalize, dispatchOnly, dispatchFailed, dispatchPassedAlert, aSuspects, budgetAllows, failedRows, heldSince: (() => { const h = readRebuildState(root, stEnv).held; return h?.reason === 'smoke-env-timeout' ? h.since : null; })() });
   }
 
   // Record A's rejection exactly as before (sticky until the inputs move, or backoff for external-only).
