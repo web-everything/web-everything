@@ -191,7 +191,7 @@ describe('operator task post-build', () => {
     expect(fence?.[2]).toBe(command);
     expect(fence[1].length).toBeGreaterThan(4);
   });
-  it.each(['daemon/{{ITEM_NUM}}', 'daemon/{{\nITEM_NUM}}', 'daemon/a\nInjected', 'daemon/a\rb', 'daemon/a`b', 'daemon/a b'])('refuses brief tokens and line or code-span breaks in the settings edge clone path %j', path => {
+  it.each(['daemon/{{ITEM_NUM}}', 'daemon/{{\nITEM_NUM}}', 'daemon/a\nInjected', 'daemon/a\rb', 'daemon/a`b', `daemon/a${String.fromCharCode(0x2028)}b`, `daemon/a${String.fromCharCode(0x2029)}b`])('refuses brief tokens and line or code-span breaks in the settings edge clone path %j', path => {
     const settings = { operatorTask: { edgeClones: { review: path } } };
     expect(() => composeOperatorTaskBrief(template, { edgeClone: 'review' }, { settings, policy: { edgeLoad: true } })).toThrow(/edgeClone/);
   });
