@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../../operations/dispatch-providers/fix.mjs';
-import { dispatchFix, roundEscalationFor } from '../reconcile-fix-dispatch.mjs';
+import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
 describe('fix.executor cascade', () => {
@@ -472,5 +472,55 @@ describe('CI-heal stale-base dispatch seam', () => {
         if (mode === 'throw') expect(log).toHaveBeenCalledWith(expect.stringContaining('stale-base gate failed open: probe failed'));
       }
     } finally { log.mockRestore(); }
+  });
+});
+
+describe('fallback chain routing', () => {
+  const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
+  it('routes triggers through the chain and keeps main-fix on Claude', () => {
+    const decision = chooseFixExecutor({setting,chain,strongerModel:true,launcherAvailable:()=>true});
+    expect(decision).toMatchObject({rung:'codex-alt',source:'repo',policyRoute:{model:'gpt-6-astra',effort:'high'}});
+    expect(formatFixExecutorLog(decision)).toContain('fix executor: codex rung=codex-alt model=gpt-6-astra effort=high');
+    expect(chooseFixExecutor({setting,chain,mainFix:true,launcherAvailable:true}).executor).toBe('claude');
+  });
+  it('routes Argon CI-heal with its policy and suppresses the Claude stronger rung', async () => {
+    const {createRoutedCiHealDispatch} = await import('../../lib/fix-slot-borrow.mjs');
+    const launchCodex = vi.fn(()=>'pid:1');
+    const dispatch = vi.fn(async (p,{sinks,routeHeal}) => { expect(p.strongerModel).toBe(false); expect(routeHeal()).toBe(null); return sinks.launch({sessionSlug:'heal',prompt:'p'}); });
+    const run = createRoutedCiHealDispatch({dispatch, route:()=>chooseFixExecutor({setting,chain,codexUnproductive:3,launcherAvailable:()=>true}),
+      createSinks:({provider})=>({launch:provider}),launchCodex,writePrompt:()=>'/tmp/p',removePrompt:vi.fn(),stampExecutor:vi.fn(),profileFor:()=>({slug:'o/r'})});
+    const log = vi.spyOn(console,'error').mockImplementation(()=>{});
+    try { await run({pr:42,scope:['we:x'],strongerModel:true}); } finally {log.mockRestore();}
+    expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({policyRoute:{provider:'antigravity',model:'gemini-4-argon-high'}}));
+  });
+});
+
+describe('chain dispatch and critical scope', () => {
+  const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
+  const options = {setting,chain,fixSettings:{strongerModelFromRound:3},loadLadder:()=>null,readRouted:()=>({}),launcherAvailable:()=>true};
+  it.each([{}, {scope:[]}, {scope:['we:scripts/lib/critical-work.mjs']}])('fails closed for critical scope %j', scope => {
+    expect(routeFixExecutor({pr:42,strongerModel:true,...scope},options)).toMatchObject({executor:'claude',reason:'critical work never leaves Claude'});
+  });
+  it('uses the injected critical verdict and fails closed on errors', () => {
+    const planned = {pr:42,strongerModel:true,scope:['we:x.ts']};
+    const criticalFor = vi.fn(()=>false);
+    expect(routeFixExecutor(planned,{...options,criticalFor}).rung).toBe('codex-alt');
+    expect(criticalFor).toHaveBeenCalledWith(planned);
+    expect(routeFixExecutor(planned,{...options,criticalFor:()=>{throw Error('unreadable');}}).executor).toBe('claude');
+  });
+  it('stamps Argon as routed and forwards the model without a Claude ladder claim', () => {
+    const spawnBorrowed = vi.fn(()=>'pid:1'), stampExecutor = vi.fn();
+    const log = vi.spyOn(console,'error').mockImplementation(()=>{});
+    try {
+      dispatchFix({pr:42,itemNum:'42',lane:2,laneRef:'lane/42-x',scope:['we:x.ts'],
+        rulingNotAddressed:{rung:{id:'opus-high',at:1},route:{provider:'claude',model:'opus'}}}, {
+        root:'/repo',readBrief:()=>'{{PR_NUM}} {{LANE_REF}}',readFixClaim:()=>null,acquireClaim:()=>({ok:true}),
+        stampExecutor,stampRunner:vi.fn(),postNotice:vi.fn(),fixExecutorRoute:()=>chooseFixExecutor({setting,chain,codexUnproductive:3,launcherAvailable:()=>true}),
+        writeBorrowedPrompt:()=>'/tmp/p',spawnBorrowed,spawnAgent:()=>{throw Error('unexpected Claude');},
+      });
+      expect(spawnBorrowed).toHaveBeenCalledWith(expect.objectContaining({policyRoute:{provider:'antigravity',model:'gemini-4-argon-high'}}));
+      expect(stampExecutor).toHaveBeenCalledWith(expect.objectContaining({decision:expect.objectContaining({executor:'antigravity',rung:'argon'})}));
+      expect(log.mock.calls.find(([line])=>line.includes('ruling-not-addressed rung'))[0]).toContain('model=gemini-4-argon-high');
+    } finally {log.mockRestore();}
   });
 });

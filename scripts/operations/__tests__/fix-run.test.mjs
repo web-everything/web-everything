@@ -107,6 +107,13 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it('records a no-change Argon outcome and resolves its provider', async () => {
+    const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
+    const resolveProvider = vi.fn(m.io.resolveProvider);
+    expect((await runFixCli(argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), {...m.io,resolveProvider,recordRouted})).code).toBe(0);
+    expect(resolveProvider).toHaveBeenCalledWith('antigravity');
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({head:'aaa',outcome:'no-change'}));
+  });
   // card 5947 (live #5045, 2026-10-13): CI context and durable outcomes precede lane acquisition.
   it('launches a ci-heal without a finding and records no-change as real repair evidence', async () => {
     const m = mk(['aaa', 'aaa']);
@@ -1441,4 +1448,19 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
     expect(renderCiHealContext(inputs)).not.toContain('b'.repeat(4001));
     expect(renderCiHealContext({ ...inputs, jobs: [{ name: 'unit', log: 'line'.repeat(10000) }] }).length).toBeLessThanOrEqual(16020);
   });
+});
+
+it('default fix provider resolves Antigravity and runs in the existing lane', async () => {
+  const {resolveFixProvider} = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  const runTask = vi.fn(async ()=>({events:{agentMessages:['earlier response'],finalResponse:'done'}}));
+  expect(await provider.spawn({prompt:'edit',model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toMatchObject({finalMessage:'done'});
+  expect(runTask).toHaveBeenCalledWith(expect.objectContaining({task:'edit',dir:'/lane',gate:'none',model:'gemini-4-argon-high',effort:'high'}));
+});
+
+it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports failed Gemini task %j with its final message', async failure => {
+  const {resolveFixProvider} = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({...failure,events:{agentMessages:['diagnosis']}})}))
+    .rejects.toMatchObject({finalMessage:'diagnosis'});
 });

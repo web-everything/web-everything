@@ -1,0 +1,4 @@
+{
+  "$comment": "The repair fallback chain advances through codex (task default), codex-alt (Astra high), argon (Gemini Argon high), and claude (the existing Claude launcher). Settings cascade from the standard default to platform fixExecutor.fallbackChain, this file, then env WE_FIX_EXECUTOR_FALLBACK_CHAIN (comma list or JSON array). [\"codex\",\"claude\"] restores the pre-chain behaviour; critical work still never leaves Claude when escalating beyond the ordinary first rung.",
+  "fixExecutor": { "fallbackChain": ["codex", "codex-alt", "argon", "claude"] }
+}

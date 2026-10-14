@@ -61,7 +61,7 @@ import { join } from 'node:path';
  *  leaf, and imported by `fix-run.mjs` — never the reverse: `fix-run.mjs` is a CLI entry with a top-level `await`
  *  that lazily imports the wrapper chain reaching this file, so a `fix.mjs -> fix-run.mjs` import deadlocks it
  *  (exit 13, "unsettled top-level await"). */
-export const FIX_RUN_EXECUTORS = Object.freeze(['codex']);
+export const FIX_RUN_EXECUTORS = Object.freeze(['codex', 'antigravity']);
 
 /** The per-dispatch process {@link fixDetachedProvider} starts. Resolved by SCRIPT LOCATION, never cwd — same
  *  reason {@link REPO_ROOT} is. */
