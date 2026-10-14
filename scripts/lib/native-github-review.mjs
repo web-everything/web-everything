@@ -363,6 +363,13 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const ownedRe = new RegExp(`^${escaped}\\.(?:claim|tmp)-(\\d+)-`);
   const entryRe = new RegExp(`^${escaped}\\.entry-`);
+  // Keep the producer's sortable id across every takeover. Older claims only have a UUID;
+  // those remain recoverable, though their original ordering is no longer available.
+  const entryId = (name) => {
+    if (name === base) return ''; // Legacy shared entries precede the newer private entry files.
+    const id = name.replace(entryRe, '').replace(ownedRe, '');
+    return name.startsWith(`${base}.claim-`) ? id.replace(/\.[^.]+$/, '') : id;
+  };
   let seq = 0;
   const takeable = (name) => {
     if (name === base || entryRe.test(name)) return true;
@@ -384,11 +391,14 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
     append(entry) { append(`${JSON.stringify(entry)}\n`); return true; },
     claim() {
       let names = [];
-      try { names = readdirSync(dir).filter(takeable).sort(); } catch { names = []; }
+      try { names = readdirSync(dir).filter(takeable).sort((a, b) => {
+        const x = entryId(a), y = entryId(b);
+        return x < y ? -1 : x > y ? 1 : a < b ? -1 : a > b ? 1 : 0;
+      }); } catch { names = []; }
       const claims = [];
       const entries = [];
       for (const name of names) {
-        const claim = join(dir, `${base}.claim-${process.pid}-${randomUUID()}`);
+        const claim = join(dir, `${base}.claim-${process.pid}-${entryId(name)}.${randomUUID()}`);
         try { renameSync(join(dir, name), claim); } catch { continue; }
         let text = '';
         try { text = readFileSync(claim, 'utf8'); } catch { text = ''; }

@@ -11,6 +11,11 @@ import {
 // A write that opens its file, then pauses (running `beforeWrite`) before the bytes land, as appendFileSync and
 // writeFileSync do internally. Pass-through while no hook is armed.
 const fsHook = vi.hoisted(() => ({ beforeWrite: null }));
+const uuidHook = vi.hoisted(() => ({ values: [] }));
+vi.mock('node:crypto', async (importOriginal) => {
+  const real = await importOriginal();
+  return { ...real, randomUUID: () => uuidHook.values.shift() ?? real.randomUUID() };
+});
 vi.mock('node:fs', async (importOriginal) => {
   const real = await importOriginal();
   const paused = (append) => (file, data, options) => {
@@ -74,7 +79,7 @@ function fixture(options = {}, responses = {}) {
   const result = mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'accepted', headSha: head, env: { WE_UNDER_TEST: '1' }, exec, identity, mode: { mode: 'mirror', source: 'tool' }, log, appendLog, ...options });
   return { result, calls, log, appendLog, posts: calls.filter(a => a.includes('POST')), puts: calls.filter(a => a.includes('PUT')) };
 }
-afterEach(() => { vi.restoreAllMocks(); fsHook.beforeWrite = null; });
+afterEach(() => { vi.restoreAllMocks(); fsHook.beforeWrite = null; uuidHook.values = []; });
 
 describe('native review policy and mapping', () => {
   it('declares frozen modes and states', () => {
@@ -694,6 +699,8 @@ describe('reviewer token and dismissal queue IO', () => {
     expect(q.claim().entries).toEqual([]);
     q.append({ a: 1 });
     q.append({ a: 2 });
+    // Recovery must retain producer order even when claim UUIDs sort in reverse order.
+    uuidHook.values = ['ffffffff-ffff-4fff-bfff-ffffffffffff', '00000000-0000-4000-8000-000000000000'];
     const first = q.claim(); // still running: its claim is its own
     expect(first.entries).toEqual([{ a: 1 }, { a: 2 }]);
     q.append({ a: 3 });
@@ -701,8 +708,10 @@ describe('reviewer token and dismissal queue IO', () => {
     expect(second.entries).toEqual([{ a: 3 }]);
     second.done();
     clock += QUEUE_CLAIM_STALE_MS + 1000; // the first claim is stale now: taken over
+    uuidHook.values = ['eeeeeeee-eeee-4eee-beee-eeeeeeeeeeee', '11111111-1111-4111-8111-111111111111'];
     const stale = q.claim();
     expect(stale.entries).toEqual([{ a: 1 }, { a: 2 }]);
+    first.done(); // an old owner's cleanup must not delete the replacement claims
     clock = Date.now();
     alive = false; // its owner died without done(): re-claimed at once
     const dead = q.claim();

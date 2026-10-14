@@ -54,7 +54,7 @@ describe('every vitest config applies the shared ceiling', () => {
   const read = (f) => readFileSync(resolve(process.cwd(), f), 'utf8');
   it.each([
     ['vitest.config.ts', 'maxThreads: maxTestWorkers'],
-    ['vitest.integration.config.ts', 'maxThreads: maxTestWorkers'],
+    ['vitest.integration.config.ts', 'maxForks: maxTestWorkers'],
     ['vitest.maas-conformance.config.ts', 'maxThreads: maxTestWorkers'],
     ['vitest.soak.config.ts', 'maxForks: maxTestWorkers'],
   ])('%s', (file, needle) => {
@@ -65,5 +65,12 @@ describe('every vitest config applies the shared ceiling', () => {
 
   it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
     expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  });
+
+  it('runs the integration files in one pool so serial simulator forks do not contend with threads', () => {
+    const src = read('vitest.integration.config.ts');
+    expect(src).toContain("pool: 'forks'");
+    expect(src).not.toContain('poolMatchGlobs:');
+    expect(src).not.toMatch(/threads:\s*\{/);
   });
 });
