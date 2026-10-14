@@ -179,6 +179,21 @@ export function resolveRebuildSmokeBudget(env = process.env, { settingsPath = RE
   return { ...REBUILD_SMOKE_BUDGET_STANDARD, ...(r.value || {}), source: r.sources };
 }
 
+/** Resolve whether plain-main success needs a candidate re-smoke before dropping suspects. Never throws. */
+export function resolveOverlaySuspectDrop(env = process.env) {
+  try {
+    const r = cascadePolicy('overlaySuspectDrop', undefined, {
+      env,
+      standard: { mode: 'confirm' },
+      envValues: { mode: env?.WE_OVERLAY_SUSPECT_DROP },
+      valid: { mode: (v) => v === 'confirm' || v === 'drop-all' },
+    });
+    return { mode: r.value.mode, source: r.sources.mode };
+  } catch {
+    return { mode: 'confirm', source: 'standard' };
+  }
+}
+
 /** The smoke check a child process belongs to, for the two checks that dominate the smoke's time (see
  *  `daemon-live-smoke.mjs#checkReconcileDryRun` / `#checkDispatchDryRun`); `null` for every other child. */
 export function smokeCheckOfChild(cmd, args = []) {
@@ -737,8 +752,9 @@ export async function smokeAndAdopt({
     });
     if (planB.ok) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
+      const policy = resolveOverlaySuspectDrop(env);
       alert('fallback-plain-main', {
-        failed: failedA.map((r) => r.name).join(','), suspects: suspectInfo, target: planB.finalSha,
+        failed: failedA.map((r) => r.name).join(','), suspects: suspectInfo, target: planB.finalSha, policy,
         message: 'main + overlays failed the live smoke — retrying plain main (pinned overlays only) (x5wbsbc)',
       });
       const failedNames = failedA.map((r) => r.name).join(',');
@@ -796,6 +812,24 @@ export async function smokeAndAdopt({
         // A reproduced a code-shaped failure on a check it already failed, while plain main passed: genuine.
       }
       if (bPassed) {
+        if (!loadOnly && policy.mode === 'confirm') {
+          const a2 = budgetAllows('confirm') ? await smokeSha(plan.finalSha, null, 'confirm', aSuspects) : { budgetSkipped: true };
+          if (a2.dispatch && !a2.dispatch.result.ok) return dispatchFailed(a2.dispatch);
+          if (!a2.budgetSkipped && !a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
+            if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
+            alert('smoke-confirm-kept-overlays', {
+              failed: failedNames, suspects: suspectInfo, policy,
+              message: 'plain main passed but the candidate passed its re-smoke too — the first failure did not reproduce; adopting the candidate with every overlay kept',
+            });
+            const fin = await finalize(plan, undefined, undefined, a2.smokeResult);
+            return { ...fin, reason: fin.adopted ? 'smoke-confirm-kept-overlays' : fin.reason };
+          }
+          alert('smoke-confirm-reproduced', {
+            failed: failedRows(a2.smokeResult).map((r) => r.name).join(',')
+              || (a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw'),
+            suspects: suspectInfo, policy,
+          });
+        }
         const fin = await finalize(planB, dropSuspects, fallbackReady, b.smokeResult);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }

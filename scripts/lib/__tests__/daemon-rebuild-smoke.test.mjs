@@ -163,6 +163,7 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
   const FAIL = { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } };
   it('a failing ordinary smoke never reaches the dispatch smoke (plain main passes and is adopted)', async () => {
     const f = makeFixture();
+    f.env.WE_OVERLAY_SUSPECT_DROP = 'drop-all'; // the legacy drop path; `confirm` re-smokes the candidate first
     addDispatchOverlay(f);
     const run = vi.fn();
     const runSmoke = vi.fn().mockResolvedValueOnce(FAIL).mockResolvedValue(PASS);

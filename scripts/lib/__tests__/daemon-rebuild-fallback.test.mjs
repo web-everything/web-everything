@@ -22,7 +22,7 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
-import { budgetedRunChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
+import { budgetedRunChild, smokeFailureFiles, attributeSmokeFailure, resolveOverlaySuspectDrop } from '../daemon-rebuild/smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
@@ -255,9 +255,75 @@ describe('attributeSmokeFailure', () => {
   });
 });
 
+describe('overlaySuspectDrop policy', () => {
+  it('reports standard, platform and env sources and ignores invalid modes', () => {
+    const preferences = join(mktemp('we-overlay-drop-policy-'), 'preferences.json');
+    writeFileSync(preferences, '{}');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: preferences };
+    expect(resolveOverlaySuspectDrop(env)).toEqual({ mode: 'confirm', source: 'standard' });
+    writeFileSync(preferences, JSON.stringify({ overlaySuspectDrop: { mode: 'drop-all' } }));
+    expect(resolveOverlaySuspectDrop(env)).toEqual({ mode: 'drop-all', source: 'platform' });
+    expect(resolveOverlaySuspectDrop({ ...env, WE_OVERLAY_SUSPECT_DROP: 'confirm' }))
+      .toEqual({ mode: 'confirm', source: 'env' });
+    expect(resolveOverlaySuspectDrop({ ...env, WE_OVERLAY_SUSPECT_DROP: 'invalid' }))
+      .toEqual({ mode: 'drop-all', source: 'platform' });
+    writeFileSync(preferences, 'broken json');
+    expect(resolveOverlaySuspectDrop(env)).toEqual({ mode: 'confirm', source: 'standard' });
+    expect(resolveOverlaySuspectDrop(null)).toEqual({ mode: 'confirm', source: 'standard' });
+  });
+
+  it.each([
+    ['confirm', true, 'smoke-confirm-kept-overlays', 3],
+    ['confirm', false, 'fallback-plain-main', 3],
+    ['drop-all', true, 'fallback-plain-main', 2],
+  ])('%s: candidate re-smoke passes=%s', async (mode, confirmPasses, reason, calls) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_OVERLAY_SUSPECT_DROP = mode;
+    const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'main'));
+    const refs = ['lane/one', 'lane/two'];
+    const shas = refs.map((ref, i) => {
+      const sha = pushBranch(originDir, ref, (dir) => writeFile(dir, `overlay-${i}.txt`, ref));
+      addOverlay(cloneDir, { ref, pr: 5237 + i }, { env });
+      return sha;
+    });
+    const overlaysBefore = readOverlays(cloneDir, { env });
+    let candidateCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay-0.txt'))) return PASS();
+      candidateCalls += 1;
+      if (candidateCalls > 1 && confirmPasses) return PASS();
+      return {
+        verdict: 'code', attempts: 1, smoke: { results: [
+          { ok: false, name: 'lane-acquire-release', detail: 'timed out after 120000ms' },
+          { ok: false, name: 'reconcile-dry-run', detail: 'gh slot throttling: exited 1' },
+        ] },
+      };
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    const kept = reason === 'smoke-confirm-kept-overlays';
+    expect(result.adopted).toBe(true);
+    expect(result.reason).toBe(reason);
+    expect(runSmoke).toHaveBeenCalledTimes(calls);
+    expect(candidateCalls).toBe(mode === 'confirm' ? 2 : 1);
+    expect(readOverlays(cloneDir, { env })).toEqual(kept ? overlaysBefore : []);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(kept ? result.plan.finalSha : mainSha);
+    for (const sha of shas) expect(git(cloneDir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status).toBe(kept ? 0 : 1);
+    expect(result.alerts.filter((a) => a.kind === 'overlay-dropped-smoke-failed')).toHaveLength(kept ? 0 : refs.length);
+    expect(result.alerts.find((a) => a.kind === 'fallback-plain-main').detail.policy)
+      .toEqual({ mode, source: 'env' });
+    if (mode === 'confirm') {
+      expect(result.alerts.find((a) => a.kind === (kept ? 'smoke-confirm-kept-overlays' : 'smoke-confirm-reproduced')).detail)
+        .toMatchObject({ failed: 'lane-acquire-release,reconcile-dry-run', policy: { mode, source: 'env' } });
+    } else {
+      expect(result.alerts.map((a) => a.kind)).not.toContain('smoke-confirm-reproduced');
+    }
+  });
+});
+
 describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
   it.each([true, false])('two overlays: attributable=%s preserves only proven-good overlays', async (attributable) => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_OVERLAY_SUSPECT_DROP = 'drop-all';
     const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'main'));
     const good = pushBranch(originDir, 'lane/good', (dir) => writeFile(dir, 'good.txt', 'good'));
     const bad = pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'scripts/conveyor/bad.mjs', 'bad'));
@@ -286,6 +352,7 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
 
   it('a bad NON-pinned overlay: falls back to plain main, adopts it, drops the overlay, alerts both kinds', async () => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_OVERLAY_SUSPECT_DROP = 'drop-all';
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
     // Advance main PAST prevHead first, so plain main is a genuinely different (newer) tree than what the clone
     // is already sitting on — otherwise falling back to "plain main" would be a no-op move (see the sibling
@@ -759,7 +826,7 @@ describe('load-shaped smoke failure: an overlay is blamed only by a same-run dif
     const { cloneDir, env } = await loadFixture();
     const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'overlay.txt')) ? loadFail() : PASS()));
     const result = await rebuildClone({
-      root: cloneDir, env: { ...env, WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL: '0' }, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      root: cloneDir, env: { ...env, WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL: '0', WE_OVERLAY_SUSPECT_DROP: 'drop-all' }, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
     });
     expect(result.reason).toBe('fallback-plain-main');
     expect(runSmoke).toHaveBeenCalledTimes(2);
@@ -797,6 +864,7 @@ describe('rebuild smoke budget and fail-fast', () => {
 
   it('hands every smoke a budgeted runChild, and plain main a fail-fast one keyed by the checks A failed', async () => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_OVERLAY_SUSPECT_DROP = 'drop-all';
     advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
     pushBranch(originDir, 'lane/bad2', (dir) => writeFile(dir, 'bad2.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/bad2' }, { env });
