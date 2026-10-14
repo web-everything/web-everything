@@ -21,6 +21,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
@@ -32,6 +33,7 @@ import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
 import { nodeRuntimeEnv } from './node-runtime-env.mjs';
+import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
@@ -165,6 +167,15 @@ function templates() {
 // createWorld
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** Base environment shared by every host and child in one simulated world.
+ * Vitest supplies a per-file throttle root, but each world resets its own clock. Sharing that root carries
+ * spent budget windows from an earlier world's future into the next world's baseline, making each call wait
+ * out the production admission timeout. Keep sibling hosts sharing one budget, scoped to this world's cleanup.
+ */
+export function worldEnv(root, ambient = process.env) {
+  return { ...ambient, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle') };
+}
+
 /**
  * @param {{repos?: string[], lanes?: number, clockStartOffsetMs?: number}} [o]
  */
@@ -246,7 +257,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // Never let a developer's real Codex/agy binary turn a soak into a paid, unscripted launch.
   const toolsDir = join(root, 'tools');
   mkdirSync(toolsDir);
-  const linked = new Set(['claude', 'codex', 'agy']);
+  // Initial lanes are seeded below, but a smoke can grow the pool or install into a fresh snapshot.
+  // Cover those paths too: npm may reuse the matching local fixture, never download dependencies.
+  writeFixtureNpm(toolsDir);
+  const linked = new Set(['claude', 'codex', 'agy', 'npm']);
   for (const dir of toolPathDirs()) {
     let names;
     try { names = readdirSync(dir); } catch { continue; }
@@ -272,10 +286,16 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     FAKE_CLAUDE_STORE: rawClaude.env.FAKE_CLAUDE_STORE,
     FAKE_CLAUDE_CALLS: rawClaude.env.FAKE_CLAUDE_CALLS,
     FAKE_CLAUDE_HOME: rawClaude.env.FAKE_CLAUDE_HOME,
+    SIM_NPM_MODULES: nodeModulesSrc,
+    SIM_NPM_LOCKFILE: join(INVOKING_ROOT, 'package-lock.json'),
     LANE_POOL_ROOT: lanePoolRoot,
     // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
     // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
     // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
+    // Each world owns a different simulated clock. Sharing the test file's throttle store lets
+    // an earlier world's clock advance leave a future points window (and leases) for the next
+    // world, which can spend the production acquire timeout waiting before the fake gh runs.
     WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     OPERATION_COMPLETIONS_DIR: completionsDir,
     WE_BACKLOG_DIR: backlogDir,
@@ -353,9 +373,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
 
   // (d, continued) provision N lanes via the REAL scripts/lane-pool.mjs, from the sim clone. `--no-install`
   // is the flag that skips `npm ci`/`npm install` entirely (lane-pool.mjs's own `ensureDeps` call sites are
-  // ALL gated on `!flags['no-install']`) — the deps marker (`.git/.lane-pool-deps`) is the OTHER route
-  // (pre-seed it with the lockfile hash so `depsReady` reads 'ok'), left undocumented-but-available below in
-  // case a future scenario needs `ensureDeps` to actually run without a real `npm ci`.
+  // ALL gated on `!flags['no-install']`). Later live-smoke acquires do NOT pass that flag, so seed their
+  // dependency readiness too: reuse this checkout's installed modules, just like the daemon clone above,
+  // and record the lane's lockfile hash in `.git/.lane-pool-deps` (the `depsReady` contract). Otherwise a
+  // rebuild tick runs a real `npm ci`, making these hermetic scenarios depend on the registry and exceed
+  // their timeout under CI load.
   // #4075 soak harness gap — `provision --acquirable` caps NEW clones per call at
   // `ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT` (4, `we:scripts/lane-pool.mjs`), so `createWorld({lanes: N})` for
   // N > 4 silently provisioned only 4 lanes (found building `breaks/lane-acquire-under-load.mjs`, which needs a
@@ -364,6 +386,24 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   execFileSync(process.execPath, [join(simClone, 'scripts', 'lane-pool.mjs'), 'provision', `--count=${lanes}`, '--acquirable', `--max-new=${lanes}`, '--no-install'], {
     cwd: simClone, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
   });
+  if (existsSync(nodeModulesSrc)) {
+    for (const pool of readdirSync(lanePoolRoot, { withFileTypes: true })) {
+      if (!pool.isDirectory()) continue;
+      const poolDir = join(lanePoolRoot, pool.name);
+      for (const lane of readdirSync(poolDir, { withFileTypes: true })) {
+        if (!lane.isDirectory() || !/^lane-\d+$/.test(lane.name)) continue;
+        const laneRoot = join(poolDir, lane.name);
+        symlinkSync(nodeModulesSrc, join(laneRoot, 'node_modules'), 'dir');
+        // `node_modules/` in .gitignore excludes directories, not our symlink. Match the daemon clone's
+        // exclude above so list/acquire still sees clean lanes and git clean preserves the shared modules.
+        appendFileSync(join(laneRoot, '.git', 'info', 'exclude'), '\nnode_modules\n');
+        const lock = join(laneRoot, 'package-lock.json');
+        const manifest = existsSync(lock) ? lock : join(laneRoot, 'package.json');
+        const hash = createHash('sha256').update(readFileSync(manifest)).digest('hex');
+        writeFileSync(join(laneRoot, '.git', '.lane-pool-deps'), hash);
+      }
+    }
+  }
 
   // ── git helpers ────────────────────────────────────────────────────────────────────────────────────────
   function withScratchClone(repoKey, fn) {

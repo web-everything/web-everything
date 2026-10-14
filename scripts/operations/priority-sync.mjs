@@ -1,3 +1,4 @@
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/operations/priority-sync.mjs
  * @description THE `priority-sync` DECLARATION (epic #3383) — keep the maintained `## Priority order` section of
@@ -209,7 +210,7 @@ const numKey = (id) => (/^\d+$/.test(id) ? Number(id) : Number.POSITIVE_INFINITY
 function blockerOutside(card, cards, live) {
   return (card.blockedBy ?? []).some((b) => {
     const bc = cards.get(b);
-    return bc && bc.status !== 'resolved' && (bc.status === 'active' || !live.has(b));
+    return bc && !isTerminalStatus(bc.status) && (bc.status === 'active' || !live.has(b));
   });
 }
 
