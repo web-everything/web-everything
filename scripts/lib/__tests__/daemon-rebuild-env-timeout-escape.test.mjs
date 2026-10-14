@@ -26,6 +26,8 @@ vi.mock('../daemon-rebuild/adopt.mjs', () => ({
 const now = Date.parse('2026-10-14T17:00:00Z');
 const failed = [{ name: 'reconcile-dry-run', ok: false, ms: 120_000, detail: 'reconcile failed: timed out after 120000ms (process group killed)' }];
 const dispatchTimeout = { ...failed[0], name: 'dispatch-dry-run' };
+const interruptedTimeout = { ...failed[0], budgetInterrupted: true,
+  detail: 'reconcile-pass dry-run failed for 2/2 repo(s): a: scan exceeded its 120000ms budget; b: skipped: rebuild smoke budget exhausted (0ms left)' };
 const smokeResult = { verdict: 'env-timeout', smoke: { results: failed } };
 
 function context(overrides = {}) {
@@ -85,6 +87,8 @@ describe('env-timeout hold escape', () => {
     ['passed sibling', [...failed, { ...dispatchTimeout, ok: true }]],
     ['fail-fast skipped sibling', [...failed, { ...dispatchTimeout, detail: 'skipped: fail-fast — reconcile-dry-run failed' }]],
     ['flagged skipped sibling', [...failed, { ...dispatchTimeout, skipped: true }]],
+    ['budget skipped sibling', [...failed, { ...dispatchTimeout, budgetSkipped: true }]],
+    ['partially executed check', [interruptedTimeout, dispatchTimeout]],
     ['ordinary error', [{ ...failed[0], detail: 'reconcile failed: invalid configuration' }, dispatchTimeout]],
     ['unmeasured timeout', [{ ...failed[0], ms: 1 }, dispatchTimeout]],
     ['timeout text in ordinary error', [{ ...failed[0], detail: 'assertion failed: timeout option is invalid' }, dispatchTimeout]],
@@ -102,6 +106,33 @@ describe('env-timeout hold escape', () => {
     const candidate = { verdict: 'env-timeout', smoke: { results: [...failed, { ...dispatchTimeout, detail: 'invalid dispatch configuration' }] } };
     const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
       smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [...failed, dispatchTimeout] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
+  it('holds when a candidate textual skip contains a timeout signature', async () => {
+    const skipped = { ...dispatchTimeout, detail: 'skipped: fail-fast — scan exceeded its 120000ms budget' };
+    const candidate = { verdict: 'env-timeout', smoke: { results: [...failed, skipped] } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
+      smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [...failed, dispatchTimeout] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+    expect(ctx.hold).toHaveBeenCalledWith('smoke-env-timeout', ctx.failedA);
+  });
+
+  it('does not report a textual control skip as a reproduced timeout', async () => {
+    const skipped = { ...failed[0], detail: 'skipped: budget — scan exceeded its 120000ms budget' };
+    const ctx = context({ smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [skipped] } } }) });
+    expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+    expect(ctx.alert).toHaveBeenCalledWith('smoke-env-timeout-control-not-equivalent', expect.objectContaining({
+      reproducedOnLastGood: [],
+    }));
+  });
+
+  it('holds when the candidate timeout check was interrupted by the budget', async () => {
+    const candidate = { ...smokeResult, smoke: { results: [interruptedTimeout] } };
+    const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results });
     expect((await envTimeout.run(ctx)).reason).toBe('smoke-env-timeout');
     expect(ctx.finalize).not.toHaveBeenCalled();
   });
@@ -158,13 +189,55 @@ describe('no-worse shared check comparison', () => {
     { ...failed[0], ok: true },
     { ...failed[0], skipped: true },
     { ...failed[0], budgetSkipped: true },
+    interruptedTimeout,
     { ...failed[0], detail: 'skipped: fail-fast — previous check failed' },
-  ])('does not count a passed or skipped control row: %j', (row) => {
+  ])('does not count passed, skipped or interrupted evidence on either side: %j', (row) => {
     expect(failsSameChecks(failed, [row])).toBe(false);
+    expect(failsSameChecks([row], failed)).toBe(false);
   });
 });
 
 describe('smokeAndAdopt env-timeout escape wiring', () => {
+  it.each([
+    ['all measured timeouts', [...failed, dispatchTimeout], true],
+    ['only one timeout', failed, false],
+    ['fail-fast skipped sibling', [...failed, { ...dispatchTimeout, detail: 'skipped: fail-fast — reconcile-dry-run failed' }], false],
+    ['budget skipped sibling', [...failed, { ...dispatchTimeout, budgetSkipped: true }], false],
+    ['partially executed check', [interruptedTimeout, dispatchTimeout], false],
+    ['ordinary failure on the same check', [...failed, { ...dispatchTimeout, detail: 'dispatch failed: invalid configuration' }], false],
+    ['unmeasured timeout on the same check', [...failed, { ...dispatchTimeout, ms: 1 }], false],
+  ])('requires every measured timeout through the real ladder: %s', async (_label, controlRows, adopts) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-env-timeout-equivalence-'));
+    const root = join(dir, 'clone');
+    const env = { WE_DAEMON_STATE_DIR: dir, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'absent.json'),
+      WE_SMOKE_ENV_TIMEOUT_HOLD_MODE: 'control-after', WE_SMOKE_ENV_TIMEOUT_HOLD_AFTER_MIN: '45' };
+    try {
+      writeRebuildState(root, { held: { reason: 'smoke-env-timeout', since: new Date(now - 60 * 60_000).toISOString() } }, env);
+      materializeCandidate.mockClear();
+      finalizeRebuild.mockClear();
+      const candidate = { ...smokeResult, smoke: { results: [...failed, dispatchTimeout] } };
+      const runSmoke = vi.fn().mockResolvedValueOnce(candidate)
+        .mockResolvedValueOnce({ ...smokeResult, smoke: { results: controlRows } });
+      const result = await smokeAndAdopt({ root, env, stEnv: env, log: {},
+        run: () => ({ status: 1, stdout: '' }), runSmoke, now: () => now,
+        plan: { finalSha: 'candidate', mainSha: 'candidate', applied: [] }, prevHead: 'last-good',
+        lease: { path: join(dir, 'candidate'), id: 'test' }, prepAlerts: [], overlaysBefore: [],
+        dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: vi.fn(), match: vi.fn() },
+      });
+      expect(result.reason).toBe(adopts ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+      expect(runSmoke).toHaveBeenCalledTimes(2);
+      expect(runSmoke.mock.calls[1][0].runChild.failFast).toEqual([]);
+      if (adopts) {
+        expect(finalizeRebuild).toHaveBeenCalledTimes(1);
+      } else {
+        expect(finalizeRebuild).not.toHaveBeenCalled();
+        expect(readRebuildState(root, env).held.reason).toBe('smoke-env-timeout');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ['aged timeout', 'smoke-env-timeout', 60, true],
     ['different reason', 'smoke-harness-broken', 60, false],

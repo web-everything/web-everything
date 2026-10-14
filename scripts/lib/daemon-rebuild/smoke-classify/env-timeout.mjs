@@ -9,6 +9,12 @@ import { isEnvTimeoutRow } from '../../daemon-live-smoke.mjs';
 
 export const ENV_TIMEOUT_HOLD_STANDARD = { mode: 'control-after', afterMinutes: 45 };
 
+// Skipped or partially executed checks can quote a timeout without completing the check.
+function isExecutedTimeoutRow(row) {
+  return !row.skipped && !row.budgetSkipped && !row.budgetInterrupted && !/^skipped:/.test(String(row.detail ?? ''))
+    && isEnvTimeoutRow(row);
+}
+
 /** Resolve the environment-timeout hold cap through the platform/env policy cascade. Never throws. */
 export function resolveEnvTimeoutHold(env = process.env) {
   try {
@@ -58,12 +64,12 @@ export const envTimeout = Object.freeze({
         ? await ctx.smokeSha(ctx.prevHead, null, 'last-good', [], { failFast: [] })
         : {};
       const controlTimeouts = c.smokeResult
-        ? ctx.failedRows(c.smokeResult).filter((r) => !r.skipped && !r.budgetSkipped && isEnvTimeoutRow(r))
+        ? ctx.failedRows(c.smokeResult).filter(isExecutedTimeoutRow)
         : [];
       const reproducedOnLastGood = c.smokeResult
         ? controlTimeouts.filter((r) => failedA.some((f) => f.name === r.name)).map((r) => r.name)
         : [];
-      if (failedA.every((r) => !r.skipped && !r.budgetSkipped && isEnvTimeoutRow(r))
+      if (failedA.every(isExecutedTimeoutRow)
         && ctx.failsSameChecks?.(failedA, controlTimeouts)) {
         if (ctx.aSuspects?.length) {
           const d = await ctx.dispatchOnly(plan.finalSha, ctx.aSuspects);

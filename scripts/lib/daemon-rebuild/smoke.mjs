@@ -144,10 +144,13 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
+  const executedFailure = (r) => !r.ok && !r.skipped && !r.budgetSkipped && !r.budgetInterrupted
+    && !/^skipped:/.test(String(r.detail ?? ''));
   const c = new Set((controlFailed || [])
-    .filter((r) => !r.ok && !r.skipped && !r.budgetSkipped && !/^skipped:/.test(String(r.detail ?? '')))
+    .filter(executedFailure)
     .map((r) => r.name));
-  return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+  return Array.isArray(candidateFailed) && candidateFailed.length > 0
+    && candidateFailed.every((r) => executedFailure(r) && c.has(r.name));
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
