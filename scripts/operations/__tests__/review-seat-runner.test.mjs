@@ -162,7 +162,9 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
       spawnJudge: async ({ cwd, toolPolicy }) => {
         expect(toolPolicy).toBe('read-cwd');
         const t = join(fx.root, 'transcript.jsonl');
-        writeFileSync(t, behave.transcript ?? '');
+        writeFileSync(t, behave.transcript ?? transcriptWith([
+          { step_type: 'tool', state: 'DONE', tool_name: 'view_file', tool_info: { parameters: { AbsolutePath: join(cwd, 'math.mjs') } } },
+        ]));
         behave.act?.(cwd);
         return { value: { summary: 's', findings: [{ summary: 'add subtracts', file: join(cwd, 'math.mjs'), line: 1 }] }, sessionId: 'agy-conv-1', transcriptFile: t };
       },
