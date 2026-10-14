@@ -1,21 +1,24 @@
 ---
+bornAs: xhcsaah
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/merge-queue-obsolete-runs.mjs", "we:scripts/lib/__tests__/merge-queue-obsolete-runs.test.mjs"]
+scope: ["we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/lib/__tests__/pr-state.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a settings-resolver convention: an invalid value in a kill-switch key resolves to the safe/of… (from web-everything/web-everything#5209 review)
+# Prevention — Add a round-trip property test: for any event sequence the drain plans, the planned rows followed… (from web-everything/web-everything#5195 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/merge-queue-obsolete-runs.mjs:44` — Add a settings-resolver convention: an invalid value in a kill-switch key resolves to the safe/off state, or the pass refuses to act. Back it with a test per kill-switch key. A lint over `resolve(...)` calls whose standard is `on` for destructive actions could enforce this.
-2. `we:scripts/lib/merge-queue-obsolete-runs.mjs:7` — Add an allowlist setting of workflow names or paths to cancel, defaulting to the required CI workflow. Add a planner test that a non-allowlisted workflow on a deleted ref is kept. If this lands on the backlog, file it as a card.
+1. `we:scripts/lib/drain-ledger-facts.mjs:42` — Add a round-trip property test: for any event sequence the drain plans, the planned rows followed by derivePrState must clear at the live head. This holds for revisited-head sequences too.
+2. `we:scripts/lib/drain-ledger-facts.mjs:44` — Have the review gate expose a structured `carried: {from, to, verifiedByNetDiff}` field and plan restamps only from it. Add a test that a skip decision writes no restamp.
+3. `we:scripts/lib/pr-state.mjs:58` — Record the escalation-rule or settings version in the exemption and treat a mismatch as a hold. Add a test that a changed rule version stops the exemption clearing.
+4. `we:scripts/lib/drain-ledger-facts.mjs:40` — Add a deterministic A → B → A recorder-and-derivation regression test, and deduplicate against the latest exemption rather than any historical matching exemption.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5209@25d142430e8f8daf8cdb86c75dd814d7d0cf5187
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@9eeab963ac7875844755d67b2c97328a98d7eab6
 
 ## Acceptance
 

@@ -1,20 +1,16 @@
 ---
+bornAs: xpb4tjh
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:backlog/x1lkurc-prevention-add-a-card-lint-that-requires-each-must-never-cla.md"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Have the mechanical filer (or a check:standards rule) check that each cited we:path:line resolves… (from web-everything/web-everything#5215 review)
+# Diagnose unknown prepare dispatch failure (cc1bf26903a4094c)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:backlog/x1lkurc-prevention-add-a-card-lint-that-requires-each-must-never-cla.md:17` — Have the mechanical filer (or a check:standards rule) check that each cited `we:<path>:<line>` resolves to a non-blank line at filing time, or record the reviewed SHA next to the anchor.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5215@ae2e94c109c5b840639316a0b1d7ae55aac5f2e9
+Prepare #5823 is held. Cause is unknown. Evidence is retained in the coordination-root prepare failure ledger under cause key cc1bf26903a4094c and item 5823; inspect the recorded terminal output before making a diagnosis. Recover the terminal evidence, fix the cause and add a regression. Release requires a reviewed fix commit. Cause key: cc1bf26903a4094c.
 
 ## Acceptance
 

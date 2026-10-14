@@ -1,23 +1,21 @@
 ---
+bornAs: ximl1yd
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/lib/__tests__/pr-state.test.mjs"]
+scope: ["we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a round-trip property test: for any event sequence the drain plans, the planned rows followed… (from web-everything/web-everything#5195 review)
+# Prevention — Stamp the marker with a scope line (e.g. scope: ruleset), count only that scope toward maxRetries… (from web-everything/web-everything#5152 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/drain-ledger-facts.mjs:42` — Add a round-trip property test: for any event sequence the drain plans, the planned rows followed by derivePrState must clear at the live head. This holds for revisited-head sequences too.
-2. `we:scripts/lib/drain-ledger-facts.mjs:44` — Have the review gate expose a structured `carried: {from, to, verifiedByNetDiff}` field and plan restamps only from it. Add a test that a skip decision writes no restamp.
-3. `we:scripts/lib/pr-state.mjs:58` — Record the escalation-rule or settings version in the exemption and treat a mismatch as a hold. Add a test that a changed rule version stops the exemption clearing.
-4. `we:scripts/lib/drain-ledger-facts.mjs:40` — Add a deterministic A → B → A recorder-and-derivation regression test, and deduplicate against the latest exemption rather than any historical matching exemption.
+1. `we:scripts/conveyor/ci-red-recovery-watch.mjs:1068` — Stamp the marker with a scope line (e.g. `scope: ruleset`), count only that scope toward maxRetriesPerPr, and add a regression case to we:missing-run-ruleset-checks.test.mjs: a ruleset-only #5060 head with two older restack markers must still dispatch once.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@9eeab963ac7875844755d67b2c97328a98d7eab6
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5152@7841b344ac717dc23fec5aefaefd71708acf0e3d
 
 ## Acceptance
 

@@ -1,20 +1,22 @@
 ---
+bornAs: x7val46
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs"]
+scope: ["we:scripts/lib/merge-queue-obsolete-runs.mjs", "we:scripts/lib/__tests__/merge-queue-obsolete-runs.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Stamp the marker with a scope line (e.g. scope: ruleset), count only that scope toward maxRetries… (from web-everything/web-everything#5152 review)
+# Prevention — Add a settings-resolver convention: an invalid value in a kill-switch key resolves to the safe/of… (from web-everything/web-everything#5209 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/ci-red-recovery-watch.mjs:1068` — Stamp the marker with a scope line (e.g. `scope: ruleset`), count only that scope toward maxRetriesPerPr, and add a regression case to we:missing-run-ruleset-checks.test.mjs: a ruleset-only #5060 head with two older restack markers must still dispatch once.
+1. `we:scripts/lib/merge-queue-obsolete-runs.mjs:44` — Add a settings-resolver convention: an invalid value in a kill-switch key resolves to the safe/off state, or the pass refuses to act. Back it with a test per kill-switch key. A lint over `resolve(...)` calls whose standard is `on` for destructive actions could enforce this.
+2. `we:scripts/lib/merge-queue-obsolete-runs.mjs:7` — Add an allowlist setting of workflow names or paths to cancel, defaulting to the required CI workflow. Add a planner test that a non-allowlisted workflow on a deleted ref is kept. If this lands on the backlog, file it as a card.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5152@7841b344ac717dc23fec5aefaefd71708acf0e3d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5209@25d142430e8f8daf8cdb86c75dd814d7d0cf5187
 
 ## Acceptance
 
