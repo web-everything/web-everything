@@ -73,6 +73,7 @@ export function fixLauncherAvailable(executor, { exists = existsSync, runScript 
 }
 
 /**
+ * Carries an optional repair kind for card 5947 (live #5045, 2026-10-13).
  * THE `fix` PROVIDER (#3640). Spawns {@link FIX_RUN_SCRIPT} detached and unref'd, and returns its `pid:<n>`
  * handle in milliseconds — see that script's own header for why the wrapper's blocking arc must not run inside
  * the runner's synchronous dispatch tick, and why this diverges from #3629's foreground proposal.
@@ -83,7 +84,7 @@ export function fixLauncherAvailable(executor, { exists = existsSync, runScript 
  * handle, which is INDETERMINATE, visible under `inFlightEntries().unknown`, and closable with
  * `resolveInFlight`.
  *
- * @param {{sessionSlug?: string, pr?: string|number, num?: string|number, cwd?: string}} request
+ * @param {{sessionSlug?: string, pr?: string|number, num?: string|number, repairKind?: string, cwd?: string}} request
  * @param {{spawnDetached?: Function, logPathFor?: Function, runScript?: string,
  *   readDeliveryAgentMarker?: Function}} [io]
  * @returns {string} the `pid:<n>` handle.
@@ -121,6 +122,7 @@ export function fixDetachedProvider(request, {
   if (request.laneRepo) argv.push(`--lane-repo=${request.laneRepo}`);
   if (request.claimRepo) argv.push(`--claim-repo=${request.claimRepo}`);
   if (request.scope) argv.push(`--scope=${request.scope}`);
+  if (typeof request.repairKind === 'string' && request.repairKind.trim()) argv.push(`--repair-kind=${request.repairKind}`);
   // build-path-codex-isolation — the run record's ONE executor field comes from here: the vendor this wrapper
   // is actually told to run, never the router's recommendation (see dispatch-lane-io.mjs#dispatchExecutorFor).
   request?.reportExecutor?.(wrapperExecutorFor(deliveryAgent));

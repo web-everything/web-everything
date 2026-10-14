@@ -32,6 +32,8 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
 import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
+import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -101,7 +103,7 @@ export function removePromptFile(file) {
 
 const REQUIRED_FLAGS = Object.freeze(['session', 'pr', 'ref', 'prompt-file']);
 
-/** PURE. `--k=v` argv -> launch shape; refuses a missing required flag by name. */
+/** PURE. Parse launch flags, including repair kind for card 5947 (live #5045, 2026-10-13); refuse invalid flags by name. */
 export function parseFixRunArgv(argv = []) {
   const flags = {};
   for (const a of Array.isArray(argv) ? argv : []) {
@@ -115,8 +117,10 @@ export function parseFixRunArgv(argv = []) {
     throw new TypeError(`fix-run: missing required flag(s) ${missing.map((m) => `--${m}=`).join(', ')}`);
   }
   const opt = (k) => (String(flags[k] ?? '').trim() || null);
+  const repairKind = flags['repair-kind'] === undefined ? 'fix' : String(flags['repair-kind']).trim();
+  if (!['fix', 'ci-heal'].includes(repairKind)) throw new TypeError(`fix-run: invalid --repair-kind=${repairKind} (supported: fix|ci-heal)`);
   return {
-    pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
+    repairKind, pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
     mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', taskKind: opt('task-kind') ?? 'fix', effort: opt('effort'), model: opt('model'),
@@ -395,6 +399,55 @@ export function renderPrContext(json) {
   ].join('\n');
 }
 
+// Job log lines have GitHub timestamps and terminal colours; keep only their readable text.
+const cleanCiLog = text => String(text ?? '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+  .split('\n').map(line => line.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+/, '').replace(/\r$/, '')).join('\n');
+const CI_FAIL_FILE_RE = /\bFAIL\s+(\S+\.(?:test|spec|soak\.test)\.[cm]?[jt]sx?)\b/;
+
+/** Read current failing checks and up to four job logs for card 5947 (live #5045, 2026-10-13).
+ * A job API failure leaves an empty log; check links still give the agent useful context. */
+export async function readCiHealInputs({ repo, pr, run = sh }) {
+  const data = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--json', 'title,body,statusCheckRollup',
+    ...(repo ? ['--repo', repo] : [])]) || '{}');
+  const checks = collapseRollupToLatestPerName(data.statusCheckRollup)
+    .filter(check => ['FAILURE', 'TIMED_OUT', 'STARTUP_FAILURE'].includes(String(check?.conclusion ?? '').toUpperCase()));
+  const jobs = [];
+  let slug = repo;
+  for (const check of checks.filter(check => /\/job\/(\d+)/.test(check.detailsUrl ?? '')).slice(0, 4)) {
+    const id = /\/job\/(\d+)/.exec(check.detailsUrl)[1];
+    let log = '';
+    try {
+      if (!slug) slug = String(await run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])).trim();
+      log = cleanCiLog(await run('gh', ['api', `repos/${slug}/actions/jobs/${id}/logs`], { maxBuffer: BLOB_MAX_BYTES }));
+    } catch { /* one inaccessible job must not refuse the repair */ }
+    jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log });
+  }
+  return { title: data.title, body: data.body, checks, jobs };
+}
+
+/** PURE. Render bounded CI evidence, without a review finding, for card 5947 (live #5045, 2026-10-13). */
+export function renderCiHealContext(inputs) {
+  const files = new Set(), errors = new Set();
+  const jobs = (inputs.jobs ?? []).map(job => {
+    const lines = cleanCiLog(job.log).split('\n');
+    let sawTest = false;
+    for (const line of lines) {
+      const match = CI_FAIL_FILE_RE.exec(line);
+      if (match) { files.add(match[1]); sawTest = true; }
+      if (sawTest && /AssertionError|Error:/.test(line)) errors.add(line);
+    }
+    return { ...job, lines, hasTests: lines.some(line => CI_FAIL_FILE_RE.test(line)) };
+  }).sort((a, b) => Number(b.hasTests) - Number(a.hasTests));
+  return cap([
+    '## CI FAILURE CONTEXT (fetched by the launcher)',
+    'Fix the code so these tests pass. The sandbox has no network: do not run gh; the launcher pushes after you exit.',
+    `Title: ${String(inputs.title ?? '')}`, '', 'PR body:', cap(inputs.body, 4000),
+    '', '### Failing checks', ...(inputs.checks ?? []).map(check => `- ${check.name}: ${check.detailsUrl ?? ''}`),
+    '', '### Failing tests', ...[...files].map(file => `- ${file}`), ...errors,
+    '', '### Failed log', ...jobs.map(job => `${job.name}\n${job.lines.slice(-120).join('\n')}`), '', '---', '',
+  ].join('\n'), 16000);
+}
+
 /** Lane path = last non-empty stdout line of `lane-pool acquire` (it prints the path last). */
 export function parseAcquiredLanePath(stdout) {
   const lines = String(stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -405,6 +458,7 @@ export function parseAcquiredLanePath(stdout) {
 
 /**
  * THE CLI AS A FUNCTION. Exit 1 only when the launch itself threw; "agent made no change" is exit 0.
+ * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
  * @returns {Promise<{code:number, result:string|null}>}
  */
 export async function runFixCli(argv = [], {
@@ -415,6 +469,8 @@ export async function runFixCli(argv = [], {
   resolveProvider = resolveDeliveryAgentProvider,
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  readCiHeal = readCiHealInputs,
+  appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
@@ -431,6 +487,7 @@ export async function runFixCli(argv = [], {
   // and, for routed codex, the per-head ledger (repeated failures fall back to Claude). The claim is released on EVERY
   // exit: a fix that ends must not keep holding its claim and a cap slot until the TTL.
   let before = null;
+  let prHeadSha = null;
   let finalMessage = '';
   let abortMerge = null;
   let outcome = 'failed';
@@ -440,17 +497,24 @@ export async function runFixCli(argv = [], {
     const repo = launch.claimRepo ?? 'we';
     reason = singleLine(reason);
     try { recordOutcome({ repo, pr: Number(launch.pr), outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
-    if (launch.provider === 'codex' && before) {
+    const head = before ?? prHeadSha;
+    if (launch.provider === 'codex' && head) {
       try {
-        const id = { repo, pr: Number(launch.pr), head: before };
+        const id = { repo, pr: Number(launch.pr), head };
         // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message
         // or the launcher's own error) is ever posted to the PR.
         const table = recordRouted({ ...id, outcome, reason, note: finalMessage });
         if (consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE) {
-          withMessageFile(escalationComment(before, table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
+          withMessageFile(escalationComment(head, table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
             run('gh', ['pr', 'comment', launch.pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         }
       } catch (e) { writeErr(`fix-run: could not record routed outcome / post escalation: ${String(e?.message ?? e)}\n`); }
+    }
+    if (head) {
+      try {
+        await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
+          outcome, infra: isInfraFixRunOutcome(outcome, reason), reason });
+      } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {
       const r = await releaseClaim({ repo, pr: Number(launch.pr), who: launch.sessionSlug });
@@ -478,17 +542,25 @@ export async function runFixCli(argv = [], {
   try {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
-    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
     // `@pr-base`: the dispatcher or launcher needs the live PR base; never guess `main`.
     const target = mergeOnto === PR_BASE_MERGE_TARGET ? String(prHead.baseRefName ?? '').trim() : mergeOnto;
     if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
-    const comments = await readComments(pr, { repo: launch.repo });
-    const prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
-      ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
-      : renderPrContext({ ...prHead, comments });
+    let prContext;
+    if (launch.repairKind === 'ci-heal') {
+      const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
+      if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
+      prContext = renderCiHealContext(inputs);
+    } else {
+      const comments = await readComments(pr, { repo: launch.repo });
+      prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+        ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
+        : renderPrContext({ ...prHead, comments });
+    }
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
       '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
@@ -640,7 +712,9 @@ export async function runFixCli(argv = [], {
     }));
     const spawned = await provider.spawn({
       taskKind: launch.taskKind,
-      sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+      sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+        ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
+        : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
     }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
       spawnAgent: async (...args) => {
