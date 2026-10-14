@@ -41,7 +41,9 @@ function setup(extra = {}) {
     child.stderr = new EventEmitter();
     child.kill = () => true;
     child.finish = () => queueMicrotask(() => {
-      child.stdout.emit('data', '{"considered":1,"toMerge":[{"num":42}],"failed":[],"skipReasons":[]}\n');
+      const num = Number(args.find(a => a.startsWith('--only=')).slice('--only='.length));
+      const result = extra.drainResult ? extra.drainResult(num) : { considered: 1, toMerge: [{ num }], failed: [], skipReasons: [] };
+      child.stdout.emit('data', `${JSON.stringify(result)}\n`);
       queueMicrotask(() => child.emit('close', 0));
     });
     children.push(child);
@@ -502,6 +504,132 @@ describe('readCatchUpCandidates', () => {
 });
 
 describe('catch-up handle', () => {
+  it.each([
+    ['gate skip', { considered: 1, toMerge: [], skipReasons: [{ num: 1, reason: 'checks failing' }] }],
+    ['revalidation abort', { considered: 1, toMerge: [{ num: 1 }], revalidationAborted: [{ num: 1, reason: 'blockedBy' }] }],
+    ['dependency deferral', { considered: 1, toMerge: [{ num: 1 }], deferred: [{ num: 1, waitOn: [99] }], skipReasons: [{ num: 1, kind: 'blocked-by' }] }],
+    ['couple hold', { considered: 1, toMerge: [{ num: 1 }], coupleHeld: [{ num: 1, reason: 'partner held' }] }],
+    ['parked candidate', { considered: 1, toMerge: [{ num: 1 }], parked: [{ num: 1, reasons: ['review pending'] }] }],
+  ])('tries a later candidate after a confirmed %s', async (_name, skipped) => {
+    const { handle, calls } = catchUpSetup({
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3].map(num => candidate(num, num)) }),
+      readPr: async ({ num }) => num === 1 ? { ...READY_PR, statusCheckRollup: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'FAILURE' }] } : READY_PR,
+      drainResult: num => num === 1 ? skipped : { considered: 1, toMerge: [{ num }], skipReasons: [{ num, reason: 'ready-not-reached' }] },
+    });
+    await handle.catchUp();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1', '--only=2']);
+  });
+
+  it.each([
+    null,
+    { ok: false, reason: 'gh-error' },
+    { considered: 1, failed: [{ num: 1 }], skipReasons: [{ num: 1, reason: 'merge-failed' }] },
+    { considered: 1, toMerge: [{ num: 1 }], skipReasons: [{ num: 1, kind: 'ready-not-reached' }] },
+    { considered: 1, toMerge: [{ num: 1 }], pendingRebased: [1], failed: [], merged: [], skipReasons: [{ num: 1, kind: 'rebuilt-pending-ci' }] },
+  ])('keeps room consumed for an ambiguous drain result %j', async (result) => {
+    const { handle, calls } = catchUpSetup({
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(1, 0), candidate(2, 1)] }),
+      drainResult: () => result,
+    });
+    await handle.catchUp();
+    await handle.tick();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1']);
+  });
+
+  it.each(['tick', 'catchUp'])('%s proceeds past older unwakeable PRs without exceeding room', async (method) => {
+    const wakeReads = [];
+    const { handle, calls, advance } = catchUpSetup({
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(1, 0), candidate(2, 1), candidate(3, 2)] }),
+      readPr: async ({ num }) => {
+        wakeReads.push(num);
+        return num === 1 ? { ...READY_PR, statusCheckRollup: [{ __typename: 'CheckRun', status: 'IN_PROGRESS' }] } : READY_PR;
+      },
+    });
+    for (let interval = 0; interval < 3; interval++) {
+      await handle[method]();
+      advance(10 * 60_000);
+    }
+    expect(wakeReads).toEqual([1, 2, 1, 2, 1, 2]);
+    expect(calls.map(c => c.args[1])).toEqual(['--only=2', '--only=2', '--only=2']);
+  });
+
+  it.each(['tick', 'catchUp'])('%s counts retained work against the next interval capacity', async (method) => {
+    let allowed = true;
+    let closeDuringRead = true;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      readCapacity: () => ({ capacity: 2, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4].map(num => candidate(num, num)) }),
+      readPr: async () => { if (closeDuringRead) allowed = false; return READY_PR; },
+    });
+    await handle[method]();
+    expect(handle.pending().map(p => p.num)).toEqual([2, 1]);
+    closeDuringRead = false;
+    allowed = true;
+    advance(10 * 60_000);
+    await handle[method]();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1', '--only=2']);
+  });
+
+  it('limits retained work when the queue fills while the window is closed', async () => {
+    let allowed = true;
+    let queued = 0;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      readCapacity: () => ({ capacity: 2, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued, prs: [1, 2, 3].map(num => candidate(num, num)) }),
+      readPr: async () => { if (!queued) allowed = false; return READY_PR; },
+    });
+    await handle.catchUp();
+    queued = 1;
+    allowed = true;
+    advance(10 * 60_000);
+    await handle.catchUp();
+    await handle.tick();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=1']);
+    expect(handle.pending().map(p => p.num)).toEqual([2]);
+  });
+
+  it('replaces an unwakeable retained reservation with a later candidate', async () => {
+    let allowed = true;
+    let reopened = false;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      readCapacity: () => ({ capacity: 2, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4].map(num => candidate(num, num)) }),
+      readPr: async ({ num }) => {
+        if (!reopened) allowed = false;
+        return reopened && num === 1 ? { ...READY_PR, state: 'CLOSED' } : READY_PR;
+      },
+    });
+    await handle.catchUp();
+    reopened = allowed = true;
+    advance(10 * 60_000);
+    await handle.catchUp();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=2', '--only=3']);
+  });
+
+  it('holds retained work when the next queue snapshot is unreadable', async () => {
+    let allowed = true;
+    let listingFails = false;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      readCandidates: async () => listingFails ? { ok: false, error: 'HTTP 504' }
+        : { ok: true, queued: 0, prs: [candidate(1)] },
+      readPr: async () => { if (!listingFails) allowed = false; return READY_PR; },
+    });
+    await handle.catchUp();
+    listingFails = allowed = true;
+    advance(10 * 60_000);
+    await handle.catchUp();
+    await handle.tick();
+    expect(calls).toEqual([]);
+    expect(handle.pending().map(p => p.num)).toEqual([1]);
+  });
+
   it('runs at the first opportunity, oldest first within room, then only every interval', async () => {
     let reads = 0;
     const { handle, calls, lines, advance } = catchUpSetup({ readCandidates: async () => {
