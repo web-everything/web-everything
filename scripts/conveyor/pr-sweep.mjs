@@ -1,0 +1,148 @@
+#!/usr/bin/env node
+/**
+ * @file scripts/conveyor/pr-sweep.mjs
+ * @description Card 335 — bounded IO shell for the health-watch PR movement job. CLI: run [--dry-run] [--json].
+ */
+import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, appendFileSync, readdirSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
+import { dirname, join, resolve, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { workspaceOf } from '../lib/automation-home.mjs';
+import { healthDir } from './health-watch-section.mjs';
+import { handoffHome } from '../operations/handoff-home.mjs';
+import { notifyDesktopChecked } from './branch-sync.mjs';
+import { flushDigest } from '../lib/quiet-hours-io.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey } from './pr-sweep-core.mjs';
+const SELF = fileURLToPath(import.meta.url);
+const ROOT = resolve(dirname(SELF), '../..');
+const exec = promisify(execFile);
+const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
+const DEFAULTS = { enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
+  const errors = []; let tool = {};
+  try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
+  const envValues = {};
+  for (const k of Object.keys(DEFAULTS)) {
+    const raw = env[`WE_PR_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`];
+    if (raw === undefined) continue;
+    envValues[k] = typeof DEFAULTS[k] === 'boolean' ? (['1', 'true'].includes(raw) ? true : ['0', 'false'].includes(raw) ? false : raw)
+      : k === 'repos' ? raw.split(',').map((v) => v.trim()) : Number(raw);
+  }
+  const valid = Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, (v) => typeof DEFAULTS[k] === 'boolean' ? typeof v === 'boolean'
+    : k === 'repos' ? Array.isArray(v) && v.length > 0 && v.every((r) => repoKeyForSlug(r) !== null) : Number.isFinite(v) && v > 0]));
+  const platform = readPlatformPreferences({ env, readFile: read }); errors.push(...platform.errors);
+  const out = cascadePolicy('prSweep', { ...tool, ...config.prSweep }, { standard: DEFAULTS, envValues, valid, platform: platform.prefs.prSweep ?? {}, env });
+  log(formatCascadeSourcesLine('prSweep', out));
+  out.value.repos = out.value.repos.map(ghRepoSlug);
+  return { ...out, errors: [...errors, ...out.invalid] };
+}
+/** Read at most the last 2 MB; never load whole daemon logs. */
+export function readLogTail(path) {
+  const fd = openSync(path, 'r');
+  try { const size = fstatSync(fd).size; const start = Math.max(0, size - 2 * 1024 * 1024); const buf = Buffer.alloc(size - start); const n = readSync(fd, buf, 0, buf.length, start); const text = buf.subarray(0, n).toString('utf8'); return start ? text.slice(text.indexOf('\n') + 1) : text; } finally { closeSync(fd); }
+}
+const mentions = (text, pr, defaultRepo = 'we') => {
+  const key = repoKeyForSlug(pr.repo);
+  // Qualified references take precedence, so identical PR numbers in different repos do not cross-bind.
+  const refs = String(text).match(/(?:[\w.-]+\/[\w.-]+|we|plateau-app|frontierui)#\d+/g) ?? [];
+  if (refs.length) return refs.some((r) => { const [repo, n] = r.split('#'); return repoKeyForSlug(repo) === key && Number(n) === Number(pr.number); });
+  return key === defaultRepo && new RegExp(`(?:fix(?:ing)?-|#)${pr.number}(?!\\d)`).test(text);
+};
+export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
+  readAgents = async () => {
+    const { defaultReadAgents, enrichAgents } = await import('./reconcile-pass.mjs');
+    return enrichAgents(defaultReadAgents({ env }));
+  }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
+  cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
+}) {
+  let sessions = []; let health = {}; const logs = [];
+  const guarded = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
+  sessions = await guarded('agents', async () => { const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array'); return rows; }, []);
+  health = await guarded('health state', async () => { const state = await readHealth(); if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('expected health object'); return state; }, {});
+  const roots = await guarded('daemon roots', cloneRoots, []);
+  const dirs = [...new Set([...roots.map((r) => join(r, '.conveyor')), ...(env.HEALTH_WATCH_LOGS_DIR ? [env.HEALTH_WATCH_LOGS_DIR] : [])])];
+  for (const d of dirs) {
+    // Absent clones have no signals; an existing but unreadable directory is a failed owner read.
+    let files;
+    try { files = listLogs(d); } catch (e) { if (e.code !== 'ENOENT') errors.push(`logs ${d}: ${e.message}`); continue; }
+    for (const name of files.filter((n) => /^(fix-dispatch-daemon|review-daemon)\.log$|drain.*\.log$|^pass-daemon\.merge-orphan-sweep\.log$/.test(n))) {
+      const text = await guarded(`log ${name}`, () => readTail(join(d, name)), '');
+      logs.push({ name: basename(name, '.log'), text, repo: /plateau/.test(d) ? 'plateau-app' : 'we' });
+    }
+  }
+  return Object.fromEntries(prs.map((pr) => {
+    const daemons = [];
+    for (const log of logs) for (const line of log.text.split('\n')) {
+      if (!mentions(line, pr, log.repo)) continue;
+      const stamp = line.match(/^\[?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))/)?.[1];
+      if (stamp && Number.isFinite(Date.parse(stamp))) daemons.push({ name: log.name, at: stamp });
+    }
+    for (const [name, data] of Object.entries(health.daemons ?? {})) for (const [ref, refusal] of Object.entries(data.prRefusals ?? {})) {
+      if (mentions(ref, pr)) daemons.push({ name, at: refusal.at, reason: refusal.reason });
+    }
+    const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
+      && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
+    return [prKey(pr), { sessions, daemons, smell: episode?.smell }];
+  }));
+}
+export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
+  settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
+  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest } = {}) {
+  const errors = [];
+  const safe = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
+  if (!config && !settings) config = await safe('health config', () => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')), {});
+  const resolved = settings ?? resolvePrSweepSettings({ config, env }); errors.push(...(resolved.errors ?? []));
+  const value = resolved.value;
+  if (settings) console.error(formatCascadeSourcesLine('prSweep', resolved));
+  const previous = await safe('previous sweep', () => readPrevious ? readPrevious() : (existsSync(join(dir, 'pr-sweep.json')) ? JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8')).nextState : {}), {});
+  const prs = []; let prsReadOk = true;
+  for (const repo of value.repos) {
+    const rows = await safe(`prs ${repo}`, async () => readPrs ? readPrs(repo) : JSON.parse(await command('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid'], env)), null);
+    if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string')) {
+      if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
+      prsReadOk = false; continue;
+    }
+    prs.push(...rows.map((p) => ({ ...p, repo })));
+  }
+  const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);
+  const queueOk = queue && !queue.incomplete && !(queue.errors?.length) && Array.isArray(queue.ready) && Array.isArray(queue.rulingNeeded)
+    && [...queue.ready, ...queue.rulingNeeded].every((p) => p && repoKeyForSlug(p.repo) !== null && Number.isInteger(Number(p.number)) && Number(p.number) > 0);
+  if (queue && !queueOk) errors.push(`operator queue incomplete: ${JSON.stringify(queue.errors ?? [])}`);
+  const needsYou = queueOk ? [...queue.ready, ...queue.rulingNeeded].map((p) => ({ ...p, repo: CONSTELLATION_REPOS[repoKeyForSlug(p.repo)]?.slug ?? p.repo })) : null;
+  const idle = classifyIdlePrs({ prs, now, idleMinutes: value.idleMinutes });
+  const before = errors.length;
+  const signals = await safe('owner signals', () => readSignals({ prs: idle, now, dir, env, errors, sourceRoot }), {});
+  const ownerReadsOk = errors.length === before && queueOk;
+  const owners = Object.fromEntries(idle.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
+  const planned = planSweep({ idle, owners, prevState: previous ?? {}, needsYou, now, settings: value, ownerReadsOk, prsReadOk });
+  const report = { at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
+  if (!dryRun) {
+    await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
+    let needsYouSendFailed = false;
+    for (const alert of report.alerts) {
+      const sent = await safe('notification', async () => { const out = await notify(alert); if (!out?.ok) throw new Error(out?.error ?? out?.reason ?? 'notification failed'); return true; });
+      if (!sent && alert.kind === 'pr-stuck') report.nextState.episodes[alert.key].alerted = false;
+      if (!sent && alert.kind === 'needs-you') needsYouSendFailed = true;
+    }
+    if (needsYouSendFailed) report.nextState.needsYou = previous.needsYou;
+
+    for (const repo of report.diagnose) await safe(`diagnose ${repo}`, () => diagnose ? diagnose(repo) : command(process.execPath, [join(ROOT, 'scripts/conveyor/stuck-pr-watch.mjs'), 'sweep', `--repo=${repo}`], env));
+    await safe('handoff log', () => {
+      const at = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'medium' }).format(now);
+      const line = `${at} ET idle=${idle.length} needsYou=${needsYou?.length ?? '?'} alerts=${report.alerts.length} errors=${errors.length} ${report.idle.map((p) => `${prKey(p)}=${p.owner ?? 'none'}(${p.state})`).join(' ')}\n`;
+      if (append) return append(line); const home = handoffHome(); mkdirSync(home, { recursive: true }); appendFileSync(join(home, 'pr-sweep.log'), `${line.trimEnd().replace(/[\r\n]/g, ' ')}\n`);
+    });
+    await safe('report write', () => {
+      if (persist) return persist(report); mkdirSync(dir, { recursive: true }); const dest = join(dir, 'pr-sweep.json'); const tmp = `${dest}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(report, null, 2)}\n`); renameSync(tmp, dest);
+    });
+  }
+  return report;
+}
+if (process.argv[1] && resolve(process.argv[1]) === SELF) {
+  if (process.argv[2] !== 'run') { console.error('usage: pr-sweep.mjs run [--dry-run] [--json]'); process.exitCode = 2; }
+  else runPrSweep({ dryRun: process.argv.includes('--dry-run') }).then((r) => console.log(process.argv.includes('--json') ? JSON.stringify(r) : `${r.at}: ${r.idle.length} idle PRs, ${r.alerts.length} alerts, ${r.errors.length} errors`)).catch((e) => { console.error(e); process.exitCode = 1; });
+}

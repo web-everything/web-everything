@@ -869,3 +869,29 @@ Confirmed drain gate skips and revalidation aborts also release room; successful
 and ambiguous failures consume it. Give each fake child its actual target PR number.
 Also cover a queue that fills while the window is closed and an unreadable next snapshot:
 retained attempts must stay within the latest room, and cannot use a failed snapshot.
+
+### PR movement health job (card 335)
+
+`health-pr-sweep` runs the deterministic PR sweep separately from health gh probes. The health tick only
+queues, reattaches and consumes; the child writes `pr-sweep.json` beside health `state.json` and appends
+one ET line to the handoff home's `pr-sweep.log`. The sweep never writes health `episodes` or `daemons`.
+Its worker keeps synchronous session/log reads off the durable job's heartbeat loop. Reuse the health
+job's detached prewarm and trash eviction paths: cold snapshots and npm installs must not block a tick.
+The reused reconcile agent-reader graph needs npm dependencies (`js-yaml`, `markdown-it`).
+
+Settings resolve through `cascadePolicy('prSweep')`: standard/platform defaults, `scripts/settings/pr-sweep.json`,
+the health `config.json` `prSweep` block, then `WE_PR_SWEEP_*` env values (for example
+`WE_PR_SWEEP_IDLE_MINUTES`, `WE_PR_SWEEP_DISPATCH_DIAGNOSIS`, and comma-separated `WE_PR_SWEEP_REPOS`).
+Sources are logged and carried into the child report. Diagnosis defaults off and delegates exclusively to
+`stuck-pr-watch.mjs sweep`; alerts use the existing checked desktop/quiet-hours gate.
+
+A failed owner read pauses stuck-alert episode updates. An incomplete operator queue also pauses them,
+since operator-owned PRs cannot safely be distinguished, and preserves the previous NEEDS YOU set.
+A complete first queue sample records the set without alerting. A PR move or head change resets its
+unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due
+for retry. Dry runs and fixture health ticks never dispatch the sweep against the host.
+
+Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the heavy-admission queue.
+Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
+agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall
+through to the host's live agents or daemon clones.

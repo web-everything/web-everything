@@ -104,6 +104,7 @@ import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
+import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -1110,6 +1111,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
 
+  // Card 335 — queue movement reads beside the archive cadence; never block a health tick.
+  const prSweepSettings = resolvePrSweepSettings({ config });
+  const prSweepJob = prSweepTickAllowed(flags, prSweepSettings.value)
+    ? await attempt('prSweepJob', async () => {
+      const out = await (deps.runPrSweepJob ?? runPrSweepJob)({ now, state: prev.prSweep, config: prSweepSettings.value, settings: prSweepSettings, dir });
+      if (out.failures?.length) probeErrors.prSweepJob = scrubText(out.failures.join('; '));
+      return out;
+    }) : null;
+
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
   // builder-starved — the build-dispatch daemon's JSON tick log lives in the coordination root, not `logsDir`.
@@ -1310,6 +1320,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const state = scrubDeep(result.state);
   if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
+  if (prSweepJob) state.prSweep = prSweepJob.state;
+  else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
