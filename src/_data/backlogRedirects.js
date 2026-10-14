@@ -1,3 +1,4 @@
+const { isTerminalStatus } = require('../../scripts/lib/backlog-status.cjs');
 // Stable-route redirect rows — one per UNIQUE num — for src/backlog-redirects.njk.
 //
 // #075 shipped the number-only stable URL (/backlog/<NNN>/ → canonical /backlog/<NNN>-<slug>/) by
@@ -23,8 +24,8 @@ module.exports = function backlogRedirects() {
       byNum.set(item.num, item);
       continue;
     }
-    const prevResolved = prev.status === 'resolved';
-    const itemResolved = item.status === 'resolved';
+    const prevResolved = isTerminalStatus(prev.status);
+    const itemResolved = isTerminalStatus(item.status);
     // Prefer the live (non-resolved) item; on a tie prefer the smaller id for stable output.
     if (prevResolved && !itemResolved) byNum.set(item.num, item);
     else if (prevResolved === itemResolved && item.id < prev.id) byNum.set(item.num, item);
