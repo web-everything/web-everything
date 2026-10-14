@@ -39,6 +39,10 @@ vi.mock('../delivery-report-store.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, tryReadDeliveryReport: vi.fn() };
 });
+vi.mock('../deliver-item-settle.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, settleDispatchEffect: vi.fn(actual.settleDispatchEffect) };
+});
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal();
   const mocked = { ...actual, execFileSync: vi.fn() };
@@ -50,7 +54,7 @@ vi.mock('node:fs', async (importOriginal) => {
     if (String(path).includes('delivery-agent-brief-v2.md')) return 'Build item {{ITEM_SPEC_PATH_BASENAME}}.';
     return actual.readFileSync(path, ...rest);
   });
-  const mocked = { ...actual, readFileSync };
+  const mocked = { ...actual, readFileSync, rmSync: vi.fn(actual.rmSync) };
   return { ...mocked, default: mocked };
 });
 // #4349 finding #7 — a way to inject a throw AFTER the root span's own `ok()` close, i.e. after a terminal
@@ -120,6 +124,7 @@ import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 // #4349 — real (never mocked) run-store + build-dispatch-claim reads, driven through a temp `OPERATION_RUNS_DIR`
 // / `WE_COORDINATION_ROOT` in the new describe block below.
 import { createFileRunStore, newRunRecord } from '../run-store.mjs';
+import { settleDispatchEffect } from '../deliver-item-settle.mjs';
 import { acquireBuildDispatchClaim, listBuildDispatchClaims, listBuildDispatchHolds } from '../../conveyor/build-dispatch-claim.mjs';
 
 // A real UUID, hardcoded for deterministic assertions (mirrors `crypto.randomUUID()`'s own output shape). Tests
@@ -3329,6 +3334,73 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(execFileSync.mock.calls.some(c => c[1]?.[1] === 'open-pr')).toBe(false);
   });
 
+  it.each([
+    ['requeue-alone', true], ['fail-group', true],
+    ['requeue-alone', false], ['fail-group', false],
+  ])('recovery preserves member drops after restoration (%s, marker removed: %s)', async (policy, removeMarker) => {
+    const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+    process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'group-drop-recovery', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build', groupMembers: ['1235', '1236'] }, result: null, error: null }] });
+    findItem.mockImplementation((num) => ({ num, slug: `card-${num}`, specPath: `backlog/${num}-card-${num}.md`, scope: [] }));
+    const launch = { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+      groupMembers: ['1235', '1236'], runId: 'group-drop-recovery', effectKey: 'dispatch:0:0' };
+    const provider = { vendor: 'claude', spawn: vi.fn(() => {
+      writeFileSync(join(lane, '.delivery-group-drop'), '1236: cannot deliver\n');
+    }) };
+    const realRemove = rmSync.getMockImplementation();
+    const realSettle = settleDispatchEffect.getMockImplementation();
+    // Stop on either side of marker removal. Disable terminal writes to model process death,
+    // rather than an ordinary exception which the wrapper catches and settles.
+    rmSync.mockImplementation((path, ...args) => {
+      if (removeMarker || path !== join(lane, '.delivery-group-drop')) realRemove(path, ...args);
+      if (path === join(lane, '.delivery-group-drop')) {
+        settleDispatchEffect.mockImplementation(() => ({ settled: false }));
+        throw new Error('simulated crash after member restoration');
+      }
+    });
+    try {
+      await expect(deliverItem(launch, provider)).rejects.toThrow('simulated crash');
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(!removeMarker);
+      expect(execFileSync.mock.calls.some(c => c[0] === 'git' && c[1]?.[0] === 'commit'
+        && c[1].includes('backlog/1236-card-1236.md'))).toBe(true);
+      const crashedEntry = store.read(launch.runId).effects[0];
+      expect(crashedEntry.status).toBe('in-flight');
+      expect(crashedEntry.payload).toMatchObject({ groupDropped: ['1236'],
+        groupDropReasons: { '1236': 'cannot deliver' } });
+      rmSync.mockImplementation(realRemove);
+      settleDispatchEffect.mockImplementation(realSettle);
+      const priorExec = execFileSync.getMockImplementation();
+      execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+      provider.spawn.mockClear();
+      execFileSync.mockClear();
+      const { groupMembers: omitted, ...resumeLaunch } = launch;
+      const result = await deliverItem({ ...resumeLaunch, resume: true }, provider);
+      expect(result.groupDropped).toEqual(['1236']);
+      expect(result.groupDropReasons).toEqual({ '1236': 'cannot deliver' });
+      expect(store.read(launch.runId).effects[0].result).toMatchObject({
+        outcome: policy === 'fail-group' ? 'group-member-dropped' : 'pr-opened',
+        groupMembers: ['1235', '1236'], groupDropped: ['1236'], groupDropReasons: { '1236': 'cannot deliver' },
+      });
+      expect(provider.spawn).not.toHaveBeenCalled();
+      const published = execFileSync.mock.calls.some(c => c[1]?.[1] === 'open-pr');
+      expect(published).toBe(policy === 'requeue-alone');
+      if (published) {
+        const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+        expect(body).toContain('Resolves #1235\n');
+        expect(body).not.toContain('Resolves #1235, #1236');
+        expect(body).toContain('Dropped from group: #1236 — cannot deliver');
+      }
+    } finally {
+      rmSync.mockImplementation(realRemove);
+      settleDispatchEffect.mockImplementation(realSettle);
+      if (previousPolicy === undefined) delete process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+      else process.env.WE_BUILD_GROUP_MEMBER_FAILURE = previousPolicy;
+    }
+  });
+
   it.each(['requeue-alone', 'fail-group'])('drives grouped delivery and drop settlement with %s policy', async (policy) => {
     const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
     process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
@@ -3365,6 +3437,30 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
         expect(body).toContain('Resolves #1235\n');
         expect(body).toContain('Dropped from group: #1236 — cannot deliver');
       }
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally {
+      if (previousPolicy === undefined) delete process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+      else process.env.WE_BUILD_GROUP_MEMBER_FAILURE = previousPolicy;
+    }
+  });
+
+  it.each(['requeue-alone', 'fail-group'])('recovery consumes an unpersisted drop marker (%s)', async (policy) => {
+    const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+    process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
+    findItem.mockImplementation((num) => ({ num, slug: `card-${num}`, specPath: `backlog/${num}-card-${num}.md`, scope: [] }));
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'pending-drop-recovery', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build', groupMembers: ['1235', '1236'] }, result: null, error: null }] });
+    writeFileSync(join(lane, '.delivery-group-drop'), '1236: cannot deliver\n');
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+    try {
+      const result = await deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+        runId: 'pending-drop-recovery', effectKey: 'dispatch:0:0', resume: true }, { spawn: vi.fn() });
+      expect(result.groupDropped).toEqual(['1236']);
+      expect(store.read('pending-drop-recovery').effects[0].payload.groupDropped).toEqual(['1236']);
+      expect(execFileSync.mock.calls.some(c => c[1]?.[1] === 'open-pr')).toBe(policy === 'requeue-alone');
       expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
     } finally {
       if (previousPolicy === undefined) delete process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
@@ -4479,6 +4575,30 @@ describe('grouped delivery contracts', () => {
       expect(run.mock.calls.some((c) => c[1].includes('drop #1235 from group: cannot deliver'))).toBe(true);
       expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
     } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it('keeps the drop marker when persisting the restored member fails', async () => {
+    const { processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const lane = mkdtempSync(join(tmpdir(), 'group-drop-persist-'));
+    try {
+      writeFileSync(join(lane, '.delivery-group-drop'), '1235: cannot deliver\n');
+      const run = vi.fn(() => '');
+      expect(() => processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, {
+        run, loadItems, recordDrops: () => { throw new Error('checkpoint refused'); },
+      })).toThrow('checkpoint refused');
+      expect(run.mock.calls.some(c => c[1][0] === 'commit')).toBe(true);
+      expect(readFileSync(join(lane, '.delivery-group-drop'), 'utf8')).toBe('1235: cannot deliver\n');
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it('persists a failed claim before attempting the next member', async () => {
+    const { claimGroupMembers } = await import('../deliver-item-wrapper.mjs');
+    const recordDrops = vi.fn();
+    const run = vi.fn((cmd, args) => {
+      if (args.includes('--ref=1235')) throw new Error('busy');
+      expect(recordDrops).toHaveBeenCalledWith({ groupDropped: ['1235'], groupDropReasons: { '1235': 'busy' } });
+      return '';
+    });
+    claimGroupMembers({ groupMembers: ['1235', '1236'], sessionSlug: 's', lanePath: '/lane' }, { run, recordDrops });
+    expect(recordDrops).toHaveBeenCalledTimes(1);
   });
 });
 

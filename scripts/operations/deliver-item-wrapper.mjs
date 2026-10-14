@@ -347,13 +347,31 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
   const requestedMembers = parseGroupMembers(resume ? recoveryEntry.payload.groupMembers ?? [] : launch.groupMembers ?? [])
     .filter((num) => num !== String(item));
   let groupMembers = [...requestedMembers];
-  const groupDropped = [];
-  const groupDropReasons = {};
+  const groupDropped = resume ? parseGroupMembers(recoveryEntry.payload.groupDropped ?? []) : [];
+  if (groupDropped.some(num => !requestedMembers.includes(num))) {
+    throw new Error('builder recovery contains a drop outside the original group');
+  }
+  const groupDropReasons = Object.fromEntries(groupDropped.map(num =>
+    [num, sanitizeGroupDropReason(recoveryEntry.payload.groupDropReasons?.[num])]));
+  groupMembers = groupMembers.filter(num => !groupDropped.includes(num));
   const grouping = readBuildGroupingSettings();
   const recordDrops = (result) => {
     for (const num of result.groupDropped) if (!groupDropped.includes(num)) groupDropped.push(num);
     Object.assign(groupDropReasons, result.groupDropReasons);
     groupMembers = groupMembers.filter((num) => !groupDropped.includes(num));
+    if (!result.groupDropped.length) return;
+    // Persist against the original dispatch BEFORE consuming the marker. Re-read the run so
+    // its current handle and sibling effects survive; this write must succeed, never best-effort.
+    const store = createFileRunStore();
+    const record = runId && effectKey ? store.read(runId) : null;
+    const entry = record?.effects?.find(entry => entry.key === effectKey);
+    if (!entry?.payload || String(entry.payload.num) !== String(item)
+      || entry.payload.launchKind !== 'build' || entry.status !== 'in-flight') {
+      throw new Error('group drops require the original in-flight dispatch record');
+    }
+    entry.payload = { ...entry.payload, groupMembers: requestedMembers,
+      groupDropped: [...groupDropped], groupDropReasons: { ...groupDropReasons } };
+    store.write(record);
   };
 
   // Every terminal exit funnels through here (alongside `finish()`, never instead of it): settle this
@@ -472,7 +490,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       spanAround('item.claim', { attributes: { item: String(item) } }, () => claimItem({ item, sessionSlug, lanePath: claimLanePath }));
     }
 
-    if (!resume) recordDrops(claimGroupMembers({ groupMembers, sessionSlug, lanePath: claimLanePath }));
+    if (!resume) claimGroupMembers({ groupMembers, sessionSlug, lanePath: claimLanePath }, { recordDrops });
     if (groupDropped.length && grouping.groupMemberFailure === 'fail-group') {
       releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
       settleTerminal('group-member-dropped', { result: { reason: 'group-member-dropped' }, releaseClaim: true, hold: 'group-member-dropped' });
@@ -544,8 +562,9 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // (The `verify.gate` span itself is emitted one level down, inside `runVerifyOperation`, so it is
     // captured identically for every wrapper rather than six times over — see that function.)
     const collectDrops = () => {
-      const drops = processGroupDrops({ lanePath: claimLanePath, groupMembers });
-      recordDrops(drops);
+      // A crash after persistence but before marker deletion leaves a valid, already-dropped
+      // member in the marker. Validate against the original set and replay restoration safely.
+      const drops = processGroupDrops({ lanePath: claimLanePath, groupMembers: requestedMembers }, { recordDrops });
       return drops.groupDropped.length > 0;
     };
     collectDrops();
@@ -726,17 +745,21 @@ export function sanitizeGroupDropReason(reason) {
     .replace(/@/g, '＠').replace(/[\[\]*_~!\\]/g, '').replace(/`/g, "'") || 'not delivered';
 }
 
-export function claimGroupMembers({ groupMembers = [], sessionSlug, lanePath }, { run: runFn = run } = {}) {
+export function claimGroupMembers({ groupMembers = [], sessionSlug, lanePath }, { run: runFn = run, recordDrops = () => {} } = {}) {
   const claimed = [], groupDropped = [], groupDropReasons = {};
   for (const item of groupMembers) {
     try { claimItem({ item, sessionSlug, lanePath }, { run: runFn }); claimed.push(item); }
-    catch (error) { groupDropped.push(item); groupDropReasons[item] = sanitizeGroupDropReason(error.message ?? error); }
+    catch (error) {
+      groupDropped.push(item);
+      groupDropReasons[item] = sanitizeGroupDropReason(error.message ?? error);
+      recordDrops({ groupDropped: [item], groupDropReasons: { [item]: groupDropReasons[item] } });
+    }
   }
   return { groupMembers: claimed, groupDropped, groupDropReasons };
 }
 
 /** Restore only declared members' cards. Unknown/malformed drop lines refuse publication. */
-export function processGroupDrops({ lanePath, groupMembers = [] }, { run: runFn = run, loadItems } = {}) {
+export function processGroupDrops({ lanePath, groupMembers = [] }, { run: runFn = run, loadItems, recordDrops = () => {} } = {}) {
   const file = `${lanePath}/.delivery-group-drop`;
   const groupDropped = [], groupDropReasons = {};
   if (!existsSync(file)) return { groupDropped, groupDropReasons };
@@ -752,6 +775,7 @@ export function processGroupDrops({ lanePath, groupMembers = [] }, { run: runFn 
     runFn('git', ['checkout', 'origin/main', '--', card], { cwd: lanePath });
     runFn('git', ['commit', '--allow-empty', '-m', `drop #${num} from group: ${groupDropReasons[num]}`, '--', card], { cwd: lanePath });
   }
+  recordDrops({ groupDropped, groupDropReasons });
   rmSync(file);
   return { groupDropped, groupDropReasons };
 }
