@@ -20,7 +20,8 @@ export default {
     const { runRulingResolvesStandDownPass } = await load('scripts/conveyor/ruling-resolved-stand-down.mjs');
     const { buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
     const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
-    const repo = 'web-everything/web-everything', head = 'a'.repeat(40), runId = 'review-pr-5246';
+    const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
+    const repo = CONSTELLATION_REPOS.we.slug, head = 'a'.repeat(40), runId = 'review-pr-5246';
     const comment = (id, body, login = 'web-everything') => ({ id, body, author: { login }, createdAt: `2026-10-14T20:15:0${id}Z` });
     const fixture = ({ bound = true, second = false } = {}) => {
       const seat = 'judgeCorrectnessAdvisory', reviewer = mandatoryReferralReviewer(runId);
