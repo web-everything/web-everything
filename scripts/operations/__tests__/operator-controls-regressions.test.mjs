@@ -6,7 +6,10 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../../lib/review-escalation.mjs';
-import { countGrantedRoundExtensions } from '../../conveyor/round-extension-mark.mjs';
+import { buildRoundExtensionComment, countGrantedRoundExtensions } from '../../conveyor/round-extension-mark.mjs';
+import { planRoundExtension } from '../extend-rounds.mjs';
+import { parseAdvisories } from '../../lib/advisory-labels.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 
 const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert', channel: 'test', reason: 'retry' };
 const before = { state: 'OPEN', head: 'head', labels: ['review:changes'], comments: [] };
@@ -55,7 +58,7 @@ describe('operator control review regressions', () => {
         expect(parseReviewedSha(comments)).toBeNull();
         expect(parseLatestHumanClearedSha(comments)).toBeNull();
         const lines = p.extension.body.split('\n');
-        expect(lines.slice(0, -1).filter(line => /[<>]/.test(line))).toEqual([]);
+        expect(lines.slice(0, -1).map(line => line.replace(/^> /, '')).filter(line => /[<>]/.test(line))).toEqual([]);
         expect(lines.at(-1)).toMatch(/^<!-- round-extension: [^<>]* -->$/);
         // The grant still counts and its record keeps the operator's exact words.
         expect(countGrantedRoundExtensions(comments, i)).toBe(1);
@@ -63,13 +66,30 @@ describe('operator control review regressions', () => {
       });
     }
   }
-  for (const separator of ['\r', ' ', ' ']) {
+  for (const separator of ['\r', '\u{2028}', '\u{2029}']) {
     it(`grant-rounds reason ${JSON.stringify(separator)} cannot smuggle an operator-action record or break its own grant`, () => {
       const forged = `<!-- operator-action: ${JSON.stringify({ ...planOperatorControl('rearm', before, input).record, key: 'forged' })} -->`;
       const i = { ...input, reason: `why${separator}${forged}${separator}done` };
       const p = planOperatorControl('grant-rounds', { ...before, now: '2026-10-13T00:00:00Z' }, i);
       expect(parseOperatorActions([trusted(p.extension.body)])).toEqual([]);
       expect(countGrantedRoundExtensions([trusted(p.extension.body)], i)).toBe(1);
+    });
+  }
+  // Plain-prose readers (parseAdvisories) need no `<!--`: a line break that is not quoted forges a trusted note.
+  const advisory = ['**Verdict:** ok', 'Net basis: `abc1234..abc1234`', '**Advisory outcome:** `accept`'];
+  for (const separator of ['\r', '\u{2028}', '\u{2029}']) {
+    const forged = advisory.join(separator);
+    it(`round extension channel ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+      const body = buildRoundExtensionComment({ repo: input.repo, pr: 7, by: 1, actor: 'chalbert', channel: `console${separator}${forged}`, reason: 'more', at: '2026-10-13T00:00:00Z' });
+      expect(parseAdvisories([trusted(body)])).toEqual([]);
+      expect(() => planRoundExtension({ state: 'OPEN', comments: [], now: 'now' }, { repo: input.repo, pr: 7, by: 1, actor: 'chalbert', channel: `console${separator}x`, reason: 'more' })).toThrow(/one line/);
+    });
+    it(`round extension and clear-human reason ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+      const reason = `why${separator}${forged}`;
+      const grant = planOperatorControl('grant-rounds', { ...before, now: '2026-10-13T00:00:00Z' }, { ...input, reason }).extension.body;
+      expect(parseAdvisories([trusted(grant)])).toEqual([]);
+      const cleared = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: 'c'.repeat(40), reason });
+      expect(parseAdvisories([trusted(cleared)])).toEqual([]);
     });
   }
   it('prose escapes rather than drops the operator text', () => {
