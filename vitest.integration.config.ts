@@ -36,7 +36,9 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), moving it into the isolated
  * `forks` pool below removes it from that contention AND stops it dragging the other ~18 files down, at the
  * cost of queuing behind its 3 forks-pool siblings (all small next to it) rather than the ~18-file `threads`
- * pool. Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
+ * pool. The four Rust scan parity files also share that serial fork: their compilation and repository scans
+ * must not overlap the daemon scenarios' many child processes (A3 exhausted its 180s deadline in CI run
+ * 38619616650). Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
  * longer sharing it, ordinary multi-worker parallelism is enough; they don't need to queue behind one
  * another the way `singleFork` would force.
  */
@@ -144,6 +146,14 @@ export default defineConfig({
     ].filter((f) => !LIVE_SUITE.has(f)),
     poolMatchGlobs: [
       ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],
+      // The Rust parity suites compile and scan the real repository. Pools run concurrently, so leaving
+      // them in threads overlaps that work with the serial daemon scenarios and can exhaust A3's 180s
+      // deadline (CI run 38619616650). Share the single fork to serialize these scans with the scenarios
+      // and with one another, including their cargo builds against the same target directory.
+      ['scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-locus-prefix-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-citation-check-parity.test.mjs', 'forks'],
       ['scripts/__tests__/gate-entrypoint-integration.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
       ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
