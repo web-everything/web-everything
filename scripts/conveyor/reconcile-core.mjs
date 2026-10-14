@@ -1787,6 +1787,11 @@ function operatorSendBackRearm(pr, operatorBudget) {
   return { verdictId: c.id, login: c.author.login, body };
 }
 
+/** True while any check on the head is not COMPLETED. GitHub rejects (HTTP 422) a re-run of a workflow that is still
+ *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
+ *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
+const hasLiveCheck = (pr) => (pr?.statusCheckRollup ?? []).some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED');
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
  * the durable per-PR attempt counts, return what to dispatch and every refusal with the fact it turned on. Pure,
@@ -2805,7 +2810,9 @@ export function planReconcile({
         }
         let owedRerunSpent = false;
         const retry = pr.owedCiRerunRetry;
-        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false
+        // Same still-running guard as the `stale-ci-rerun` branch: a live run rejects the re-run and burns the budget.
+        const rerunLive = hasLiveCheck(pr);
+        if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false && !rerunLive
             && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
           const foldReview = row => {
             if (!withPhase.labels.includes('review:pending')) return;
@@ -2855,7 +2862,8 @@ export function planReconcile({
               ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
               : viaMainGreen
               ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
-              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : ''),
+              : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : '')
+              + (rerunLive && pr.mainGreenNow?.red === false && owedCiRerun.rerun === 'on' ? '; another check on this head is still running — the mechanical re-run waits until it completes' : ''),
           });
           // Preserve rerun ownership while folding the independent review prerequisite into this
           // same refusal row. Required checks must succeed even when their failure belongs to main.
@@ -3000,7 +3008,7 @@ export function planReconcile({
       const staleRetry = pr.owedCiRerunRetry;
       if (staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber
-          && !(pr.statusCheckRollup ?? []).some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED')) {
+          && !hasLiveCheck(pr)) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = staleRetry.jobs.length;
         if (staleSpent < staleCap) {
