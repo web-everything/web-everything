@@ -1,21 +1,21 @@
 ---
+bornAs: x0k7wn0
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Extract a shared pure eligibility helper and add a deterministic duplicate-code check for this po… (from web-everything/web-everything#5235 review)
+# Prevention — Add a reconcile-core test matrix for the unlabeled-red rule covering label-only red with a green… (from web-everything/web-everything#5235 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/review-job.mjs:818` — Extract a shared pure eligibility helper and add a deterministic duplicate-code check for this policy block to check:standards.
-2. `we:skills-src/conveyor/__tests__/review-daemon.test.mjs:1629` — Extend this named test with table-driven true, false, and omitted waiver values, and run it as a deterministic CI regression gate.
+1. `we:scripts/conveyor/reconcile-core.mjs:2557` — Add a reconcile-core test matrix for the unlabeled-red rule covering label-only red with a green rollup, so the intended behaviour is pinned either way.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5235@47e45cac880c025756dd17aae76059b2f7d87558
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5235@8dc25610b3cbfa474cad9c77a9e1c85eea45e7d9
 
 ## Acceptance
 

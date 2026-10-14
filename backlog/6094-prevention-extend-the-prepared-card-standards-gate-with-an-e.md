@@ -1,20 +1,21 @@
 ---
+bornAs: xltlmoi
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
+scope: ["we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a reconcile-core test matrix for the unlabeled-red rule covering label-only red with a green… (from web-everything/web-everything#5235 review)
+# Prevention — Extend the prepared-card standards gate with an explicit behavioral-guarantee-to-named-test mappi… (from web-everything/web-everything#5207 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:2557` — Add a reconcile-core test matrix for the unlabeled-red rule covering label-only red with a green rollup, so the intended behaviour is pinned either way.
+1. `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:43` — Extend the prepared-card standards gate with an explicit behavioral-guarantee-to-named-test mapping, including state transitions and their observable assertions; file this extension to the parse-form coverage prevention work.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5235@8dc25610b3cbfa474cad9c77a9e1c85eea45e7d9
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5207@8f9df3fd2784269effb9297ac7211ed07b0aabf7
 
 ## Acceptance
 

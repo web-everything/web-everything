@@ -1,21 +1,22 @@
 ---
+bornAs: xfqpocz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+scope: ["we:scripts/operations/review-job.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Make the cascade valid predicate leaf-aware, or add a test with a platform value under an invalid… (from web-everything/web-everything#5241 review)
+# Prevention — Extract a shared pure eligibility helper and add a deterministic duplicate-code check for this po… (from web-everything/web-everything#5235 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:96` — Make the cascade `valid` predicate leaf-aware, or add a test with a platform value under an invalid tool leaf.
-2. `we:scripts/lib/enqueue-on-event.mjs` — Add a deterministic lifecycle regression test covering an interrupted catch-up, an intervening queue-capacity change, and the subsequent retry's spawn count.
+1. `we:scripts/operations/review-job.mjs:818` — Extract a shared pure eligibility helper and add a deterministic duplicate-code check for this policy block to check:standards.
+2. `we:skills-src/conveyor/__tests__/review-daemon.test.mjs:1629` — Extend this named test with table-driven true, false, and omitted waiver values, and run it as a deterministic CI regression gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@8c3032121ae84bdda7201d9b8641e65598462761
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5235@47e45cac880c025756dd17aae76059b2f7d87558
 
 ## Acceptance
 

@@ -1,20 +1,22 @@
 ---
+bornAs: xs69xya
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:config/platformDefaults.ts", "we:config/__tests__/platformDefaults.test.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule, or a shared test helper, that asserts every we:config/platformDefault… (from web-everything/web-everything#5195 review)
+# Prevention — Make the cascade valid predicate leaf-aware, or add a test with a platform value under an invalid… (from web-everything/web-everything#5241 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:config/platformDefaults.ts:123` — Add a check:standards rule, or a shared test helper, that asserts every `we:config/platformDefaults.ts` promotion key matches its `.mjs` default.
+1. `we:scripts/lib/enqueue-on-event.mjs:96` — Make the cascade `valid` predicate leaf-aware, or add a test with a platform value under an invalid tool leaf.
+2. `we:scripts/lib/enqueue-on-event.mjs` — Add a deterministic lifecycle regression test covering an interrupted catch-up, an intervening queue-capacity change, and the subsequent retry's spawn count.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@10a0e297ae1335cd18ef981e6e10cd154ff320cf
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5241@8c3032121ae84bdda7201d9b8641e65598462761
 
 ## Acceptance
 

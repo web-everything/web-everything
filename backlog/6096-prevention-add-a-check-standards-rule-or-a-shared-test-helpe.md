@@ -1,20 +1,21 @@
 ---
+bornAs: xr7gh91
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md"]
+scope: ["we:config/platformDefaults.ts", "we:config/__tests__/platformDefaults.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
-# Prevention — Extend the prepared-card standards gate with an explicit behavioral-guarantee-to-named-test mappi… (from web-everything/web-everything#5207 review)
+# Prevention — Add a check:standards rule, or a shared test helper, that asserts every we:config/platformDefault… (from web-everything/web-everything#5195 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5028-drain-and-lander-must-not-resolve-a-landed-card-whose-blocke.md:43` — Extend the prepared-card standards gate with an explicit behavioral-guarantee-to-named-test mapping, including state transitions and their observable assertions; file this extension to the parse-form coverage prevention work.
+1. `we:config/platformDefaults.ts:123` — Add a check:standards rule, or a shared test helper, that asserts every `we:config/platformDefaults.ts` promotion key matches its `.mjs` default.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5207@8f9df3fd2784269effb9297ac7211ed07b0aabf7
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@10a0e297ae1335cd18ef981e6e10cd154ff320cf
 
 ## Acceptance
 
