@@ -282,15 +282,50 @@ describe('own brain reads extend only the read allowlist', () => {
     expect(out.reasons.join(' ')).toContain('completed state-changing tool call(s): write_to_file');
   });
 
-  it('ids may come from the outcome or transcript and invalid ids grant no root', () => {
+  it('only the outcome id grants a root and invalid or missing ids grant none', () => {
     const fx = fixture();
     const brain = join(fx.home, '.gemini', 'antigravity-cli', 'brain');
     const options = { home: fx.home, allowedRoots: [fx.lane] };
-    expect(stateChangingToolCalls(transcript([tool(join(brain, 'own-id', 'task.md'))]), options)).toEqual([]);
+    expect(stateChangingToolCalls(transcript([tool(join(brain, 'own-id', 'task.md'))]), options)).toEqual(['view_file (read outside the juror lane)']);
     expect(stateChangingToolCalls(transcript([tool(join(brain, 'outcome-id', 'task.md'), { conversation_id: undefined })]), { ...options, sessionId: 'outcome-id' })).toEqual([]);
-    for (const id of ['.', '..', '../other', '', 'bad/id']) {
-      expect(stateChangingToolCalls(transcript([tool(brain, { conversation_id: id })]), { ...options, sessionId: id })).toEqual(['view_file (read outside the juror lane)']);
+    for (const id of ['.', '..', '../other', '', 'bad/id', 'own-id\n', 'own-id\r', 'own-id\u2028', 'own-id\u200b', 'ｏｗｎ-id']) {
+      expect(stateChangingToolCalls(transcript([tool(join(brain, 'own-id', 'task.md'))]), { ...options, sessionId: id })).toEqual(['view_file (read outside the juror lane)']);
     }
+  });
+
+  it.each(['non-tool', 'tool', 'errored tool'])('an unrelated %s conversation id cannot authorize a sibling brain read', async (kind) => {
+    const fx = fixture();
+    const other = join(fx.home, '.gemini', 'antigravity-cli', 'brain', 'other-id', 'task.md');
+    const steps = [tool(other), tool('', { step_index: 2, conversation_id: 'other-id',
+      step_type: kind === 'non-tool' ? 'message' : 'tool',
+      status: kind === 'errored tool' ? 'TOOL_ERROR' : undefined,
+      tool_info: { parameters: { AbsolutePath: 'file.txt' } } })];
+    expect(stateChangingToolCalls(transcript(steps), { allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id' }))
+      .toEqual(['view_file (read outside the juror lane)']);
+    const out = await fx.run(undefined, () => steps);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('view_file (read outside the juror lane)');
+  });
+
+  it.each(['external', 'sibling', 'brain parent', 'loop'])('a redirected session root cannot authorize reads: %s', async (kind) => {
+    const fx = fixture();
+    const brain = join(fx.home, '.gemini', 'antigravity-cli', 'brain');
+    const own = join(brain, 'own-id');
+    const target = kind === 'sibling' ? join(brain, 'other-id') : join(fx.home, '.ssh');
+    mkdirSync(brain, { recursive: true });
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'task.md'), 'private');
+    if (kind === 'brain parent') {
+      rmSync(brain, { recursive: true });
+      symlinkSync(target, brain);
+      mkdirSync(join(target, 'own-id'));
+    } else symlinkSync(kind === 'loop' ? own : target, own);
+    const path = kind === 'brain parent' ? join(target, 'own-id', 'task.md') : kind === 'loop' ? join(own, 'task.md') : join(target, 'task.md');
+    expect(stateChangingToolCalls(transcript([tool(path)]), { allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id' }))
+      .toEqual(['view_file (read outside the juror lane)']);
+    const out = await fx.run(undefined, () => [tool(path)]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('view_file (read outside the juror lane)');
   });
 
   it('follows symlinks in brain reads before checking containment', () => {
@@ -299,7 +334,7 @@ describe('own brain reads extend only the read allowlist', () => {
     mkdirSync(own, { recursive: true });
     symlinkSync(fx.shared, join(own, 'escape'));
     expect(stateChangingToolCalls(transcript([tool(join(own, 'escape', 'file.txt'))]), {
-      allowedRoots: [fx.lane], home: fx.home,
+      allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id',
     })).toEqual(['view_file (read outside the juror lane)']);
   });
 });

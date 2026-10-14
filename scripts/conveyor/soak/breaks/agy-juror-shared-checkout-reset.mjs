@@ -9,7 +9,7 @@
  * another session's brain read, and changes to either of the two strict lanes.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -28,6 +28,8 @@ const CASES = [
   { id: 'outside-write', target: 'outside', write: true, status: 'voided', reason: 'write_to_file' },
   { id: 'own-brain-write', target: 'ownBrain', write: true, status: 'voided', reason: 'write_to_file' },
   { id: 'other-brain-read', target: 'otherBrain', status: 'voided', reason: 'view_file (read outside the juror lane)' },
+  { id: 'foreign-transcript-id', target: 'otherBrain', foreignId: true, status: 'voided', reason: 'view_file (read outside the juror lane)' },
+  { id: 'escaping-brain-root', target: 'secret', redirectBrain: true, status: 'voided', reason: 'view_file (read outside the juror lane)' },
   { id: 'review-lane-change', target: 'juror', mutate: 'review', status: 'voided',
     reason: 'change outside the juror lane: the review lane' },
   { id: 'juror-lane-change', target: 'juror', mutate: 'juror', status: 'voided',
@@ -69,6 +71,13 @@ async function replayCase(runAgyReviewJuror, scenario) {
       mkdirSync(resolve(path, '..'), { recursive: true });
       writeFileSync(path, 'session notes\n');
     }
+    const secret = join(home, '.ssh', 'id_ed25519');
+    if (scenario.redirectBrain) {
+      mkdirSync(resolve(secret, '..'), { recursive: true });
+      writeFileSync(secret, 'fixture secret\n');
+      rmSync(resolve(ownBrain, '..'), { recursive: true });
+      symlinkSync(resolve(secret, '..'), resolve(ownBrain, '..'));
+    }
     const transcriptFile = join(root, 'transcript.jsonl');
     return await runAgyReviewJuror({
       request: { mandate: 'Review the supplied diff read-only.', input: 'fixture diff', shape: {} },
@@ -79,7 +88,7 @@ async function replayCase(runAgyReviewJuror, scenario) {
         spawnJudge: async ({ cwd }) => {
           if (scenario.reset) git(shared, 'reset', '--hard', mainHead);
           const paths = { juror: join(cwd, 'file.txt'), shared: join(shared, 'file.txt'), ownBrain, otherBrain,
-            outside: join(home, 'outside.txt'), review: join(review, 'file.txt') };
+            secret, outside: join(home, 'outside.txt'), review: join(review, 'file.txt') };
           if (scenario.mutate) writeFileSync(paths[scenario.mutate], 'unexpected lane edit\n');
           const path = paths[scenario.target];
           if (scenario.write) writeFileSync(path, 'completed write outside the lane\n');
@@ -88,7 +97,10 @@ async function replayCase(runAgyReviewJuror, scenario) {
             tool_name: scenario.write ? 'write_to_file' : 'view_file',
             tool_info: { parameters: { AbsolutePath: path } },
             ...(scenario.error ? { status: 'TOOL_ERROR' } : {}) };
-          writeFileSync(transcriptFile, scenario.emptyTranscript ? '' : `${JSON.stringify({ event: 'step_update', step_update })}\n`);
+          const foreign = scenario.foreignId ? `${JSON.stringify({ event: 'step_update', step_update: {
+            step_type: 'message', step_index: 2, conversation_id: 'other-conversation', state: 'DONE',
+          } })}\n` : '';
+          writeFileSync(transcriptFile, scenario.emptyTranscript ? '' : `${JSON.stringify({ event: 'step_update', step_update })}\n${foreign}`);
           return { value: { summary: 'fixture review', findings: [] }, sessionId: SESSION, transcriptFile };
         },
       },
@@ -108,7 +120,8 @@ export default {
       const source = readFileSync(join(root, RUNNER), 'utf8');
       return source.includes('function sharedChangeTouched(')
         && source.includes('const touchAll = () => paths.push(...roots);')
-        && source.includes("canonicalPath(join(home, '.gemini', 'antigravity-cli', 'brain', id))");
+        && source.includes('const expected = join(realHome,')
+        && source.includes('if (root === expected) roots.push(root);');
     } catch { return false; }
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {

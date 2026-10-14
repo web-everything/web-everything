@@ -268,11 +268,15 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   const lanes = allowedRoots.filter(Boolean).map((r) => resolve(r));
   const cwd = lanes[0];
   const roots = lanes.map((r) => canonicalPath(r) ?? r);
-  // Only the run's own conversation ids, never the brain parent or a sibling conversation.
-  if (roots.length) {
-    for (const id of conversationIds(transcriptText, sessionId)) {
-      const root = canonicalPath(join(home, '.gemini', 'antigravity-cli', 'brain', id));
-      if (root) roots.push(root);
+  // The outcome identifies the own session; transcript conversation ids are untrusted evidence.
+  if (roots.length && typeof sessionId === 'string' && sessionId.length
+    && !/[^A-Za-z0-9._-]/.test(sessionId) && sessionId !== '.' && sessionId !== '..') {
+    const realHome = canonicalPath(resolve(home));
+    if (realHome) {
+      const expected = join(realHome, '.gemini', 'antigravity-cli', 'brain', sessionId);
+      const root = canonicalPath(expected);
+      // A redirected session or brain ancestor must not grant its target directory read access.
+      if (root === expected) roots.push(root);
     }
   }
   const out = [];
@@ -292,13 +296,6 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     }
   }
   return out;
-}
-
-/** Valid own conversation ids from the outcome and the transcript's step updates. */
-function conversationIds(transcriptText, sessionId) {
-  const ids = [sessionId, ...parseJsonlEvents(String(transcriptText ?? ''))
-    .filter((e) => e?.event === 'step_update').map((e) => e.step_update?.conversation_id)];
-  return [...new Set(ids.filter((id) => typeof id === 'string' && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..'))];
 }
 
 /**
