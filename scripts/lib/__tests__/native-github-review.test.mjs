@@ -660,6 +660,51 @@ describe('clearing under a token that is not the reviewer App (operator send-bac
     expect(gh.standing()).toBe('CHANGES_REQUESTED');
     expect(lines.some(l => l.includes('label=clear-human') && l.includes('outcome=superseded') && l.includes('reconciled: posted REQUEST_CHANGES'))).toBe(true);
   });
+  it('the same race when the dismissal lands but its PUT returns an error is still put back', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('clear-human') });
+    gh.reviews.push(review(5, 'CHANGES_REQUESTED'));
+    let fired = false;
+    const landsThenFails = (argv) => {
+      if (!fired && argv.includes('PUT')) {
+        fired = true;
+        gh.labels = liveLabelsFor('changes');
+        mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'changes', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {} });
+        gh.exec(argv);
+        throw Object.assign(new Error('timeout'), { stderr: 'net/http: timeout awaiting response headers' });
+      }
+      return gh.exec(argv);
+    };
+    const { appended, lines } = drainWith(gh, [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [5] }], { exec: landsThenFails });
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(lines.some(l => l.includes('label=clear-human') && l.includes('timeout awaiting response headers') && l.includes('reconciled: posted REQUEST_CHANGES'))).toBe(true);
+    // The retry finds the request endorsed again and leaves it standing.
+    drainWith(gh, appended);
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+  });
+  it('an attempted dismissal whose reconcile fails is retried until a drain reconciles it', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('clear-human') });
+    gh.reviews.push(review(5, 'CHANGES_REQUESTED'));
+    let fired = false;
+    let blind = false;
+    const racing = (argv) => {
+      if (blind && argv[1] === 'repos/owner/repo/pulls/123') throw new Error('pr read failed');
+      if (!fired && argv.includes('PUT')) {
+        fired = true;
+        gh.labels = liveLabelsFor('changes');
+        mirrorNativeReview({ repo: 'owner/repo', pr: 123, verdict: 'changes', headSha: head, env: { WE_UNDER_TEST: '1' }, exec: gh.exec, identity, mode: { mode: 'mirror', source: 'tool' }, log: () => {}, appendLog: () => {} });
+        blind = true;
+      }
+      return gh.exec(argv);
+    };
+    const { appended } = drainWith(gh, [{ v: 1, repo: 'owner/repo', pr: 123, head, verdict: 'clear-human', ids: [5] }], { exec: racing });
+    expect(gh.standing()).toBe('none');
+    expect(appended).toEqual([expect.objectContaining({ ids: [5], unsettled: true, attempts: 1 })]);
+    // Next drain: the request is gone and the label endorses it, yet the entry still reconciles to the live label.
+    const { appended: again, lines } = drainWith(gh, appended);
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(again).toEqual([]);
+    expect(lines.some(l => l.includes('label=clear-human') && l.includes('reconciled: posted REQUEST_CHANGES'))).toBe(true);
+  });
   it('an entry for another owner waits for a run there, unchanged; a hopeless one is given up loudly', () => {
     const gh = fakeGithub();
     const other = { v: 1, repo: 'elsewhere/repo', pr: 4, head, verdict: 'rearm', ids: [9] };

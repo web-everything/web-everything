@@ -569,14 +569,21 @@ function drainDismissalQueue({ queue, run, owner, reviewerLogin, record }) {
       try { dismiss(run, endpoint, id, entry.verdict, entry.head); dismissed++; }
       catch (error) { left.push(id); errors.push(`dismissal ${id}: ${failureReason(error)}`); }
     }
-    if (left.length) retry.push({ ...attempt, ids: left });
     // A verdict that endorses a dismissed review again may have landed between the label read and the dismissal.
+    // Every ATTEMPTED dismissal is re-checked, since a PUT that errored may still have landed. An entry whose earlier
+    // re-check failed reconciles to the live label unconditionally: its own label read may already be that verdict.
     let settled = null;
-    if (dismissed) {
+    if (tried.length || entry.unsettled === true) {
       try {
-        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => endorsedStates(live.labels).join() === endorsed.join(), seenReviews: reviews, sawHuman, dismissedByRun: tried });
+        settled = settleOnLiveVerdict({ run, endpoint, head: entry.head, reviewerLogin, isCurrent: live => entry.unsettled !== true && endorsedStates(live.labels).join() === endorsed.join(), seenReviews: reviews, sawHuman, dismissedByRun: tried });
       } catch (error) { settled = { outcome: 'failed', reason: `verdict unconfirmed after write: ${failureReason(error)}` }; }
     }
+    // Retried while a dismissal is left or GitHub is unconfirmed against the label; a retry with nothing standing
+    // only reconciles.
+    const unsettled = settled?.outcome === 'failed';
+    const next = { ...attempt };
+    delete next.unsettled;
+    if (left.length || unsettled) retry.push({ ...next, ids: left.length ? left : entry.ids, ...(unsettled ? { unsettled: true } : {}) });
     if (settled) record({ ...line, outcome: settled.outcome, dismissal: settled.outcome === 'failed' ? 'failed' : 'ok', reason: ['queued dismissal', ...errors, settled.reason].join('; ') });
     else if (dismissed || left.length) record({ ...line, outcome: left.length ? 'failed' : 'dismissed', dismissal: left.length ? 'failed' : 'ok', reason: ['queued dismissal', ...errors].join('; ') });
   }
