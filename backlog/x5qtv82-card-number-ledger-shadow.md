@@ -30,9 +30,15 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
     unreadable; assignment and merge checks fail closed. Display readers may fall back to x-ids.
   - `assignCardNumbers({ repo, ids, pr, floor })` runs inside `withNumberingLock`
     (we:scripts/readiness/drain-lock.mjs). Ids that already have a row return their number (idempotent).
-    New ids get `max(ledger, floor) + 1, +2, ...`. Append and push through the fetch / append / bounded-retry
-    loop of `appendLedgerRows` (we:scripts/lib/verdict-ledger-io.mjs:163); a non-fast-forward push re-reads and
-    recomputes.
+    New ids get `max(ledger, floor) + 1, +2, ...`. Append and push with a new `appendCardLedgerRows` in
+    we:scripts/lib/card-number-ledger.mjs, modelled on the bounded-retry loop of `appendLedgerRows`
+    (we:scripts/lib/verdict-ledger-io.mjs:163) but not calling it: that loop takes precomputed rows, checks
+    them against the verdict schema and pins its push to `refs/heads/ops/review-requests`. The new loop calls
+    `stageOnTransportBranch` (we:scripts/lib/git-transport-branch.mjs:230) with
+    `allowRef: 'refs/heads/ops/card-numbers'`, and allocates the numbers INSIDE the `content({ existing })`
+    callback, from the freshly fetched file, on every attempt. So a non-fast-forward refusal re-reads the
+    file and recomputes every `num` (and re-runs the idempotency and uniqueness checks); a number computed
+    before the refusal is never re-appended.
   - Row: `{"id","num","pr","at","by":"drain","kind":"assign"|"seed"|"shadow"}`.
 - Policy `backlog.cardNumbering.mode` (epic xdlnylv, "Card naming policy"), resolved through `cascadePolicy`
   (we:scripts/lib/policy-cascade.mjs) with its source logged. Declared values: `rename-before-enqueue`,
@@ -72,7 +78,9 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Test plan
 
 Red-green unit tests in `we:scripts/lib/__tests__/card-number-ledger.test.mjs` with injected git and fs:
-idempotent replay, two concurrent assigners (one push refused, it recomputes), a conflicting row (same id, two
+idempotent replay, two concurrent assigners for different ids (one push refused; on retry it allocates from
+the winner's rows, so the two ids get different numbers and the loser's first-attempt number is never
+appended), a push to any ref other than `refs/heads/ops/card-numbers` refused before any git call, a conflicting row (same id, two
 numbers) reported, a partial last line, the floor taken from numeric file names, seed rows built from
 `bornAs`.
 

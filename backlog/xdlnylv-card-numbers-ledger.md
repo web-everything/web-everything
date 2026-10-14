@@ -73,8 +73,11 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 - Append-only JSON lines: `{"id":"x7k2q9a","num":5301,"pr":5240,"at":"<ISO>","by":"drain","kind":"assign"}`.
   Seed rows use `"kind":"seed"`.
 - Writes go through the existing transport: `stageOnTransportBranch` / `readFromTransportBranch`
-  (we:scripts/lib/git-transport-branch.mjs:230, :354) and the fetch / idempotent-append / bounded-retry loop of
-  `appendLedgerRows` (we:scripts/lib/verdict-ledger-io.mjs:163). No new transport.
+  (we:scripts/lib/git-transport-branch.mjs:230, :354), pinned with `allowRef: 'refs/heads/ops/card-numbers'`.
+  The retry loop is modelled on `appendLedgerRows` (we:scripts/lib/verdict-ledger-io.mjs:163) but allocates
+  numbers inside the transport's `content({ existing })` callback on every attempt (slice (a)); reusing that
+  function as-is would re-append numbers computed before a lost race, and it can only push
+  `ops/review-requests`. No new transport.
 - Two invariants on the file: one number per id, one id per number. Every reader validates both and fails
   closed on a violation (it shows the x-id and reports the conflict; it never guesses).
 - Authenticate each row at its introducing commit, with fetched file history and a verified signature from
