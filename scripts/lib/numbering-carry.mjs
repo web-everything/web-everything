@@ -1,0 +1,439 @@
+/**
+ * @file scripts/lib/numbering-carry.mjs
+ * @description Carry acceptance only across mechanically proven drain numbering commits. A matching subject
+ *   is necessary but insufficient: every change must be a backlog card rename, its optional bornAs stamp,
+ *   or a whole-token id rewrite that leaves every existing `bornAs:` line untouched. The IO shell proves a bounded
+ *   linear chain above the accepted head, and the writer re-reads the PR before each write.
+ *
+ *   THE LIVE CASE (WE PR #5025): 8d3f2044f → e2e7e3f97 numbered xf74q20→#6053 and xztd0mv→#6054.
+ *   Two backlog cards were renamed and stamped; one existing card and the renamed cards had references
+ *   rewritten. The parent acceptance looked stale despite no author change. This proof permits callers
+ *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
+ */
+import { execFileSync } from 'node:child_process';
+import { BORN_AS_RE } from '../backlog/id.mjs';
+import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
+import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
+import { resolveHumanClearanceCarrySetting } from './human-clearance-carry.mjs';
+import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
+import {
+  REVIEW_LABELS, buildStaleAcceptHealComment, buildReviewedShaMarker, buildReviewedDiffMarker,
+  buildReviewedContributionMarker, buildClearedHumanMarker,
+} from './review-escalation.mjs';
+
+export const NUMBERING_SUBJECT_RE = /^drain: JIT-number (.+) at land \(#2288\)$/;
+export const MAX_NUMBERING_COMMITS = 5;
+export const MAX_NUMBERING_FILES = 256;
+export const MAX_NUMBERING_BLOB_BYTES = 1024 * 1024;
+export const MAX_NUMBERING_TOTAL_BYTES = 8 * 1024 * 1024;
+const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
+const GIT_TIMEOUT_MS = 5000;
+const canonicalNumber = (number) => number.replace(/^0+(?=\d)/, '');
+
+/** PURE: parse exact, unique hash→number pairs; malformed subjects and duplicate drops return null. */
+export function parseNumberingSubject(subject) {
+  if (typeof subject !== 'string') return null;
+  const match = NUMBERING_SUBJECT_RE.exec(subject);
+  if (!match || match[0] !== subject) return null;
+  const pairs = new Map();
+  const numbers = new Set();
+  for (const entry of match[1].split(', ')) {
+    const pair = /^(x[0-9a-z]{6})→#(\d+)$/.exec(entry);
+    if (!pair || pair[0] !== entry || pairs.has(pair[1]) || numbers.has(canonicalNumber(pair[2]))) return null;
+    pairs.set(pair[1], pair[2]);
+    numbers.add(canonicalNumber(pair[2]));
+  }
+  return pairs.size ? pairs : null;
+}
+
+/** PURE: token-walk the original text, permitting each mapped token to stay unchanged or become its number. */
+export function isMappedRewrite(before, after, map) {
+  if (typeof before !== 'string' || typeof after !== 'string') return false;
+  let cursor = 0;
+  const segments = before.split(/(\bx[0-9a-z]{6}\b)/g);
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (i % 2 === 0 || after.startsWith(segment, cursor)) {
+      if (!after.startsWith(segment, cursor)) return false;
+      cursor += segment.length;
+    } else {
+      if (!map.has(segment)) return false;
+      const number = map.get(segment);
+      if (typeof number !== 'string' || !after.startsWith(number, cursor)) return false;
+      cursor += number.length;
+    }
+  }
+  return cursor === after.length;
+}
+
+/**
+ * PURE: the drain's own rewrite rule (applyLedger): line by line, every mapped token may become its number EXCEPT on
+ * a `bornAs: <hash>` line, which is a card's birth identity and must survive byte for byte. Numbers never contain a
+ * newline, so a genuine rewrite keeps the line count.
+ */
+export function isLedgerRewrite(before, after, map) {
+  if (typeof before !== 'string' || typeof after !== 'string') return false;
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  if (beforeLines.length !== afterLines.length) return false;
+  return beforeLines.every((line, i) => (BORN_AS_RE.test(line) ? line === afterLines[i] : isMappedRewrite(line, afterLines[i], map)));
+}
+
+const refuse = (reason) => ({ ok: false, reason });
+const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(hash) ?? hash);
+
+/**
+ * PURE: verify one commit's entire diff, supplied as no-renames additions/deletions/modifications with blobs.
+ * @param {{subject:string, parents:string[], changes:Array<{status:string,path:string,before?:string|null,after?:string|null}>,
+ *   extraMap?:Map<string,string>}} o
+ * @returns {{ok:true,pairs:Array<[string,string]>,renames:Array<{from:string,to:string}>}|{ok:false,reason:string}}
+ */
+export function checkNumberingCommit({ subject, parents, changes, extraMap = new Map() }) {
+  if (!Array.isArray(parents) || parents.length !== 1) return refuse('numbering commit must have exactly one parent');
+  const map = parseNumberingSubject(subject);
+  if (!map) return refuse('subject is not an exact drain numbering subject with unique pairs');
+  if (!Array.isArray(changes) || !changes.length) return refuse('numbering commit has no changes');
+  if (changes.length > MAX_NUMBERING_FILES) return refuse(`changed files exceed numbering file limit ${MAX_NUMBERING_FILES}`);
+  const paths = new Set();
+  for (const change of changes) {
+    if (!['A', 'D', 'M'].includes(change.status)) return refuse(`unsupported change status ${change.status} at ${change.path}`);
+    if (typeof change.path !== 'string' || paths.has(change.path)) return refuse(`invalid or repeated change path ${change.path}`);
+    if (!/^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path)
+      || change.path.split('/').some((part) => part === '.' || part === '..')) return refuse(`id rewrite is outside backlog markdown at ${change.path}`);
+    if (change.status === 'M' && change.beforeMode !== change.afterMode) return refuse(`file mode changed at ${change.path}`);
+    paths.add(change.path);
+  }
+  // Subject pairs win: main's reference aliases cannot change what this commit claims to number.
+  const referenceMap = new Map([...extraMap, ...map]);
+  const additions = new Map(changes.filter((c) => c.status === 'A').map((c) => [c.path, c]));
+  const used = new Set();
+  const renames = [];
+  for (const deleted of changes.filter((c) => c.status === 'D')) {
+    const target = swap(deleted.path, map);
+    const added = additions.get(target);
+    if (!added || target === deleted.path) return refuse(`deleted path ${deleted.path} has no added rename partner ${target}`);
+    additions.delete(target);
+    const card = /^backlog\/(x[0-9a-z]{6})-[^/]+\.md$/.exec(deleted.path);
+    if (!card) return refuse(`rename ${deleted.path} is not a provisional backlog card`);
+    const hash = card[1];
+    if (!map.has(hash) || !added.path.startsWith(`backlog/${map.get(hash)}-`)) {
+      return refuse(`rename ${deleted.path} does not use its subject number`);
+    }
+    if (used.has(hash)) return refuse(`subject hash ${hash} has more than one card rename`);
+    const { before } = deleted;
+    const { after } = added;
+    if (deleted.beforeMode !== added.afterMode) return refuse(`rename file mode changed at ${deleted.path}`);
+    if (typeof before !== 'string' || typeof after !== 'string') return refuse(`missing content blob for rename ${deleted.path}`);
+    const prefix = `---\nbornAs: ${hash}\n`;
+    const unstamped = after.startsWith(prefix) ? `---\n${after.slice(prefix.length)}` : null;
+    const stampMatches = !/^bornAs:/m.test(before) && unstamped !== null && isLedgerRewrite(before, unstamped, referenceMap);
+    if (!isLedgerRewrite(before, after, referenceMap) && !stampMatches) {
+      return refuse(`rename content is not an id rewrite with every bornAs line kept at ${deleted.path}`);
+    }
+    used.add(hash);
+    renames.push({ from: deleted.path, to: added.path });
+  }
+  if (additions.size) return refuse(`added path ${additions.keys().next().value} has no deleted rename partner`);
+  for (const change of changes.filter((c) => c.status === 'M')) {
+    if (typeof change.before !== 'string' || typeof change.after !== 'string') return refuse(`missing content blob at ${change.path}`);
+    if (change.before === change.after) return refuse(`modified path ${change.path} is unchanged`);
+    if (!isLedgerRewrite(change.before, change.after, referenceMap)) {
+      return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
+    }
+  }
+  for (const hash of map.keys()) {
+    if (!used.has(hash)) return refuse(`subject pair ${hash} renamed no backlog card`);
+  }
+  return { ok: true, pairs: [...map], renames };
+}
+
+/** IO: a missing commit gets one fetch and re-check, with every failure handled by the outer refusal boundary. */
+function ensureReadable(git, sha) {
+  try { git(['cat-file', '-e', `${sha}^{commit}`]); }
+  catch {
+    git(['fetch', '--no-tags', '-q', 'origin', sha]);
+    git(['cat-file', '-e', `${sha}^{commit}`]);
+  }
+}
+
+/** IO: main's bornAs aliases are optional evidence; failed reads must not settle a refusal that needs them. */
+function readExtraMap(git, mainRef) {
+  const map = new Map();
+  const ambiguous = new Set();
+  let output;
+  try { output = git(['grep', '-E', '^bornAs: x[0-9a-z]{6}$', mainRef, '--', 'backlog/']); }
+  catch (e) { if (e?.status !== 1) map.readFailed = true; return map; }
+  const prefix = `${mainRef}:`;
+  for (const line of output.split('\n')) {
+    if (!line.startsWith(prefix)) continue;
+    const match = /^backlog\/(\d+)-[^/]+\.md:bornAs: (x[0-9a-z]{6})$/.exec(line.slice(prefix.length));
+    if (!match) continue;
+    const [, number, hash] = match;
+    if (map.has(hash) && map.get(hash) !== number) ambiguous.add(hash);
+    map.set(hash, number);
+  }
+  for (const hash of ambiguous) map.delete(hash);
+  return map;
+}
+
+/** IO: inventory filenames only; an unreadable tree is never evidence of an unused number. */
+function readExistingNumbers(git, ref) {
+  const output = git(['ls-tree', '-r', '--name-only', '-z', ref, '--', 'backlog/']);
+  if (output && !output.endsWith('\0')) throw Error(`malformed backlog inventory at ${ref}`);
+  const numbers = new Set();
+  for (const path of output.split('\0')) {
+    const match = /^backlog\/(\d+)-[^/]+\.md$/.exec(path);
+    if (match) numbers.add(canonicalNumber(match[1]));
+  }
+  return numbers;
+}
+
+/**
+ * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
+ * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
+ * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o
+ * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
+ */
+export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
+  try {
+    if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
+    if (fromSha === toSha) return refuse('no head move');
+    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
+    // dropping it would itself conceal a non-numbering byte change.
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    const git = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
+      const output = exec('git', args, {
+        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
+        ...(cwd === undefined ? {} : { cwd }),
+      }) ?? Buffer.alloc(0);
+      if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
+      if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
+      return decoder.decode(output);
+    };
+    ensureReadable(git, fromSha);
+    ensureReadable(git, toSha);
+    // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
+    fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
+    const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);
+    if (!lines.length) return refuse('no new numbering commits');
+    if (lines.length > MAX_NUMBERING_COMMITS) return refuse(`${lines.length} commits exceed numbering limit ${MAX_NUMBERING_COMMITS}`);
+    // Preflight the WHOLE chain before reading any content (including main aliases).
+    const steps = [];
+    let parent = fromSha;
+    for (const line of lines) {
+      const [sha, ...parents] = line.trim().split(/\s+/);
+      if (parents.length !== 1 || parents[0] !== parent) return refuse(`commit ${sha.slice(0, 9)} is not a linear single-parent step on ${parent}`);
+      const subject = git(['log', '-1', '--format=%s', sha]).replace(/\n$/, '');
+      const map = parseNumberingSubject(subject);
+      if (!map) return refuse(`commit ${sha.slice(0, 9)}: subject is not an exact drain numbering subject with unique pairs`);
+      steps.push({ sha, parents, subject, map });
+      parent = sha;
+    }
+    const existingNumbers = readExistingNumbers(git, fromSha);
+    for (const number of readExistingNumbers(git, mainRef)) existingNumbers.add(number);
+    for (const step of steps) {
+      for (const number of step.map.values()) {
+        const canonical = canonicalNumber(number);
+        if (existingNumbers.has(canonical)) return refuse(`target number ${number} already exists in backlog`);
+        existingNumbers.add(canonical);
+      }
+    }
+    const extraMap = readExtraMap(git, mainRef);
+    const commits = [];
+    const pairs = [];
+    let totalBytes = 0;
+    parent = fromSha;
+    for (const { sha, parents, subject } of steps) {
+      const raw = git(['diff', '--no-renames', '--raw', '--no-abbrev', '-z', parent, sha]);
+      if (raw && !raw.endsWith('\0')) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
+      const fields = raw ? raw.slice(0, -1).split('\0') : [];
+      if (fields.length % 2) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
+      if (fields.length / 2 > MAX_NUMBERING_FILES) return refuse(`changed files exceed numbering file limit ${MAX_NUMBERING_FILES}`);
+      const changes = [];
+      for (let i = 0; i < fields.length; i += 2) {
+        const [metadata, path] = fields.slice(i, i + 2);
+        const match = /^:([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([A-Z])$/.exec(metadata);
+        if (!match) return refuse(`malformed raw diff at ${sha.slice(0, 9)}`);
+        const [, beforeMode, afterMode, status] = match;
+        if (!['A', 'D', 'M'].includes(status)) return refuse(`unsupported change status ${status} at ${path}`);
+        if ((status !== 'A' && !['100644', '100755'].includes(beforeMode))
+          || (status !== 'D' && !['100644', '100755'].includes(afterMode))) return refuse(`unsupported file mode at ${path}`);
+        const change = { status, path, beforeMode, afterMode };
+        changes.push(change);
+      }
+      for (const change of changes) {
+        for (const [side, ref] of [['before', parent], ['after', sha]]) {
+          if ((side === 'before' && change.status === 'A') || (side === 'after' && change.status === 'D')) continue;
+          const object = `${ref}:${change.path}`;
+          const sizeText = git(['cat-file', '-s', object]).trim();
+          if (!/^\d+$/.test(sizeText)) return refuse(`invalid blob size at ${change.path}`);
+          const size = Number(sizeText);
+          if (!Number.isSafeInteger(size) || size > MAX_NUMBERING_BLOB_BYTES || totalBytes + size > MAX_NUMBERING_TOTAL_BYTES) {
+            return refuse(`blob byte limit exceeded at ${change.path}`);
+          }
+          totalBytes += size;
+          change[side] = git(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
+        }
+      }
+      const result = checkNumberingCommit({ subject, parents, changes, extraMap });
+      if (!result.ok) return { ...refuse(`commit ${sha.slice(0, 9)}: ${result.reason}`), ...(extraMap.readFailed ? { retryable: true } : {}) };
+      commits.push(sha);
+      pairs.push(...result.pairs);
+      parent = sha;
+    }
+    return { ok: true, commits, pairs, reason: `${commits.length} drain numbering commit(s) ${commits.map((sha) => sha.slice(0, 9)).join(', ')} `
+      + `(${pairs.map(([hash, number]) => `${hash}→#${number}`).join(', ')}) — card renames and id rewrites only` };
+  } catch (e) {
+    if (e?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') return refuse('numbering proof contains invalid UTF-8');
+    return { ...refuse(`numbering proof failed: ${String(e?.message ?? e).split('\n')[0]}`), retryable: true };
+  }
+}
+
+export const NUMBERING_RESTAMP_MARKER = 'numbering-restamp';
+const RESTAMP_MARKER_RE = /<!--\s*numbering-restamp:\s*from=([0-9a-f]{40})\s+to=([0-9a-f]{40})\s*-->/i;
+/** PURE: the `from` sha of a numbering re-stamp record that names `head`, else null. */
+function restampMarkerFrom(body, head) {
+  const m = RESTAMP_MARKER_RE.exec(typeof body === 'string' ? body : '');
+  return m && m[2].toLowerCase() === head ? m[1].toLowerCase() : null;
+}
+const staleHealHeadline = buildStaleAcceptHealComment({}).split('\n')[0];
+const stalePark = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for review by the drain\*\*\s*\n\s*review:accepted /;
+const staleReason = /^(?:is STALE|could NOT be re-verified this pass) —/;
+
+/** PURE: head-move diagnostics cannot supersede the acceptance they describe. */
+export function isNumberingTolerableLaterBody(body) {
+  if (isKnownMachineBody(body)) return true;
+  if (typeof body !== 'string') return false;
+  const park = stalePark.exec(body);
+  return (park !== null && staleReason.test(body.slice(park[0].length))) || body.trimStart().startsWith(staleHealHeadline);
+}
+
+/** PURE: nominate an existing acceptance, retaining every later human/formal hold. */
+export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}) {
+  const names = new Set((Array.isArray(labels) ? labels : []).map((l) => typeof l === 'string' ? l : l?.name));
+  if (!names.has(REVIEW_LABELS.pending)
+    || [REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.has(l))) {
+    return { candidate: false, reason: 'labels do not permit numbering carry' };
+  }
+  if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return { candidate: false, reason: 'live head unknown' };
+  const rec = latestAcceptRecord(comments);
+  if (!rec) return { candidate: false, reason: 'no recorded acceptance' };
+  const head = headSha.toLowerCase();
+  // A numbering re-stamp whose label write failed after its record was posted: finish the labels only. The record is
+  // the trusted re-stamp itself (its own marker names this head), so no proof or second comment is owed.
+  const own = rec.sha === head ? restampMarkerFrom(comments[rec.index]?.body, head) : null;
+  if (rec.sha === head && !own) return { candidate: false, reason: 'already bound' };
+  if (rec.laterBodyDerivedHold) return { candidate: false, reason: 'later body-derived hold' };
+  if (comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+    return { candidate: false, reason: 'later verdict or unknown comment stands' };
+  }
+  if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
+  if (laterReviewHold(reviews, rec.at)) return { candidate: false, reason: 'formal review hold stands' };
+  if (own) return { candidate: true, labelsOnly: true, from: own, to: head, human: rec.humanCleared, actor: rec.actor };
+  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor };
+}
+
+// Same allow-list as human-clearance-carry; local to avoid a circular dependency between the two carry tiers.
+const sanitizeActor = (actor) => String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim().slice(0, 64) || 'the operator';
+
+/** PURE: the existing restamp headline and markers keep all acceptance readers in agreement. */
+export function buildNumberingRestampBody({ fromSha, toSha, human, actor, headDiffText, proofReason, writer }) {
+  const name = sanitizeActor(actor);
+  return [
+    '📌 review — acceptance re-stamped after a rebase (no new review)', '',
+    `Recorded by ${writer} via numbering-carry. The head moved from \`${fromSha.slice(0, 12)}\` to \`${toSha.slice(0, 12)}\` `
+      + `only by the drain's own card-numbering commit(s): ${proofReason}. Each commit was verified mechanically `
+      + '(backlog card renames to their assigned numbers, the bornAs stamp, and id-to-number rewrites; nothing else). '
+      + `The acceptance recorded on \`${fromSha.slice(0, 12)}\``
+      + (human ? ` — the human clearance by ${name} —` : '')
+      + ' is carried unchanged; any other change still needs a fresh review.', '',
+    buildReviewedShaMarker(toSha),
+    ...(typeof headDiffText === 'string' && headDiffText.length
+      ? [buildReviewedDiffMarker(headDiffText), buildReviewedContributionMarker(headDiffText)] : []),
+    ...(human ? [buildClearedHumanMarker(name)] : []),
+    `<!-- ${NUMBERING_RESTAMP_MARKER}: from=${fromSha} to=${toSha} -->`,
+  ].filter((line) => line != null).join('\n');
+}
+
+const settledRestamps = new Set();
+export function _resetNumberingRestampMemo() { settledRestamps.clear(); }
+/** Has this PR head already reached a settled numbering re-stamp outcome in this process? (lets a sweep skip its live re-read) */
+export function numberingRestampSettled(repo, pr, head) { return settledRestamps.has(`${repo}#${pr}@${head}`); }
+const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
+
+/**
+ * IO: re-read the PR and re-plan right before a write, so a hold, head move or label change that arrived while the
+ * proof ran wins over the plan it was given. Returns the fresh state, or the result to return without writing.
+ * Nothing here is memoized: a held or unreadable head is planned again on the next pass.
+ */
+function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }) {
+  if (typeof readLiveState !== 'function') return { result: { action: 'retry', reason: 'no live re-read before the write' } };
+  let live;
+  try { live = readLiveState(); }
+  catch (e) { return { result: { action: 'retry', reason: `live re-read failed: ${errorReason(e)}` } }; }
+  const state = live?.state;
+  if (!state || !Array.isArray(state.comments) || !Array.isArray(state.labels)) {
+    return { result: { action: 'retry', reason: 'live re-read returned no complete thread' } };
+  }
+  const plan = planNumberingRestamp({ labels: state.labels, headSha: state.headRefOid, comments: state.comments, reviews: live.reviews });
+  if (!plan.candidate) {
+    return { result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
+  }
+  if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)) {
+    return { result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
+  }
+  try { guardReferrals(state, { repo, pr }); }
+  catch (e) { return { result: { action: 'retry', reason: errorReason(e) } }; }
+  return { state };
+}
+
+/** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
+export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFileSync, cwd, provider,
+  readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
+  enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
+  guardReferrals = assertMandatoryReferralsCleared } = {}) {
+  if (!enabled || acceptCarry !== 'on') return null;
+  const key = `${repo}#${pr}@${state?.headRefOid}`;
+  if (settledRestamps.has(key)) return null;
+  const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
+  if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
+  // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
+  // A guard read failure is retryable and never settles the head or grants an acceptance.
+  try { guardReferrals(state, { repo, pr }); }
+  catch (e) { return { action: 'retry', reason: errorReason(e) }; }
+  const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
+    expected: { from: plan.from, to: plan.to, labelsOnly } });
+  if (plan.labelsOnly) {
+    if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
+    const live = recheck(true);
+    if (!live.state) return live.result;
+    try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: live.state.labels }); }
+    catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
+    settledRestamps.add(key);
+    return { action: 'restamped', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true,
+      reason: 'labels finished for the numbering re-stamp already recorded on this head' };
+  }
+  const proof = prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+  if (!proof.ok) {
+    if (!proof.retryable) settledRestamps.add(key);
+    return { action: proof.retryable ? 'retry' : 'refused', reason: proof.reason };
+  }
+  let headDiffText;
+  try { const net = readNetDiff?.(plan.to); if (net?.scored) headDiffText = net.text; } catch { /* proof suffices */ }
+  const carried = { from: plan.from, to: plan.to, human: plan.human, actor: plan.actor };
+  if (dryRun) return { action: 'would-restamp', ...carried };
+  const body = buildNumberingRestampBody({ fromSha: plan.from, toSha: plan.to, ...carried,
+    headDiffText, proofReason: proof.reason, writer });
+  // The proof and diff read are slow: a hold posted meanwhile would sit BEFORE the new record and read as superseded.
+  const before = recheck(false);
+  if (!before.state) return before.result;
+  try { provider.postComment(repo, pr, body); }
+  catch (e) { return { action: 'error', reason: errorReason(e) }; }
+  // The record is now on the thread; a hold posted after it still keeps review:pending.
+  const after = recheck(true);
+  if (!after.state) return { ...after.result, commentPosted: true };
+  try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: after.state.labels }); }
+  catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
+  settledRestamps.add(key);
+  return { action: 'restamped', ...carried, reason: proof.reason };
+}
