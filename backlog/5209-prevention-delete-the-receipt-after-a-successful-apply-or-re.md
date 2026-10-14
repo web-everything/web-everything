@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/queue-prune.mjs", "we:scripts/conveyor/queue.mjs", "we:scripts/conveyor/__tests__/queue-prune.test.mjs", "we:scripts/conveyor/__tests__/queue.test.mjs"]
 dateOpened: "2026-10-06"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "08e0e3039103f7107739bb5b6760e6bff7f3f8de"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "a01ad92201b64df20121a31681c47b06e91885fc"
 tags: []
 ---
 
@@ -15,7 +15,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/queue-prune.mjs:208-215` — Delete the receipt after a successful apply, or reject it when `at` is older than a few minutes. Add a CLI test that applies twice, re-adds the ids, and expects the second apply to be refused.
+1. `we:scripts/conveyor/queue-prune.mjs:209-216` — Delete the receipt after a successful apply, or reject it when `at` is older than a few minutes. Add a CLI test that applies twice, re-adds the ids, and expects the second apply to be refused.
 2. `we:scripts/conveyor/queue.mjs` — A deterministic `import/no-unresolved` lint rule to verify module resolution at build time.
 3. `we:scripts/conveyor/queue.mjs` — Strict coverage thresholds or TDD enforcement for documented failure paths.
 
@@ -23,13 +23,13 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 
 ## Progress
 
-Preparation inspection: the original scope named both queue modules and both existing test suites; the original premise bundled receipt replay prevention, unresolved-import lint, and coverage/TDD enforcement. The receipt defect remains: we:scripts/conveyor/queue-prune.mjs:204-215 hashes the drop class and sorted IDs, writes an `at` value, and checks only the digest. The old line 210 citation identified directory creation, not receipt validation; the corrected locus is we:scripts/conveyor/queue-prune.mjs:208-215. The apply branch at we:scripts/conveyor/queue.mjs:261-270 never consumes the receipt. Re-adding the same IDs restores the same digest.
+Preparation inspection: the original scope named both queue modules and both existing test suites; the original premise bundled receipt replay prevention, unresolved-import lint, and coverage/TDD enforcement. The receipt defect remains: we:scripts/conveyor/queue-prune.mjs:205-216 hashes the drop class and sorted IDs, writes an `at` value, and checks only the digest. The prior preparation cited lines 204-215 and 208-215; directory creation is now at we:scripts/conveyor/queue-prune.mjs:211 and receipt validation at we:scripts/conveyor/queue-prune.mjs:214-216; the corrected locus is we:scripts/conveyor/queue-prune.mjs:209-216. The apply branch at we:scripts/conveyor/queue.mjs:261-270 never consumes the receipt. Re-adding the same IDs restores the same digest.
 
-Corrected delivery scope: retain the four declared paths, with receipt lifecycle unit and CLI regressions in we:scripts/conveyor/__tests__/queue-prune.test.mjs and CLI import/roundtrip regression coverage in we:scripts/conveyor/__tests__/queue.test.mjs. The existing bulk CLI case at we:scripts/conveyor/__tests__/queue-prune.test.mjs:213-223 stops after the first successful apply; it does not test replay. These are existing files, not missing suites. No source relocation is needed.
+Corrected delivery scope: retain the four declared paths, with receipt lifecycle unit and CLI regressions in we:scripts/conveyor/__tests__/queue-prune.test.mjs and CLI import/roundtrip regression coverage in we:scripts/conveyor/__tests__/queue.test.mjs. The existing bulk CLI case at we:scripts/conveyor/__tests__/queue-prune.test.mjs:213-223 stops after the first successful apply; it does not test replay. These are existing files, not missing suites. No source relocation is needed. The previous preparation also proposed a new CLI startup smoke case, but we:scripts/conveyor/__tests__/queue.test.mjs:38-49 and we:scripts/conveyor/__tests__/queue.test.mjs:70-73 already start the real CLI and parse list JSON. Correct that scope detail: strengthen the existing empty-list case with success/action assertions rather than duplicate it. The four-file scope and size 3 remain unchanged; both source entries retain their existing matching test paths.
 
 The broader guard requests remain follow-ups below: we:package.json:28-45 exposes Vitest commands rather than an ESLint build gate, and we:vitest.config.ts:56-70 explicitly distinguishes tooling from the standards coverage planes (with a trust-chain exception); its thresholds already specify 80 at we:vitest.config.ts:116-121. A new repository-wide lint or coverage policy is not a prerequisite for the receipt regression.
 
-Retain size 3: approximately 15 changed lines in we:scripts/conveyor/queue-prune.mjs for receipt cleanup, 15 in we:scripts/conveyor/queue.mjs for lifecycle integration/error handling, 90 in we:scripts/conveyor/__tests__/queue-prune.test.mjs for helper and CLI cases, and 10 in we:scripts/conveyor/__tests__/queue.test.mjs for a CLI startup assertion (about 130 total). This is an estimate, not an implementation diff. Preparation is based on source inspection; no runtime reproduction or test pass is claimed. The runner owns checks and stamping.
+Retain size 3: approximately 15 changed lines in we:scripts/conveyor/queue-prune.mjs for receipt cleanup, 15 in we:scripts/conveyor/queue.mjs for lifecycle integration/error handling, 90 in we:scripts/conveyor/__tests__/queue-prune.test.mjs for helper and CLI cases, and 10 in we:scripts/conveyor/__tests__/queue.test.mjs to strengthen existing CLI startup assertions (about 130 total). This is an estimate, not an implementation diff. Preparation is based on source inspection; no runtime reproduction or test pass is claimed. The runner owns checks and stamping.
 
 ## Design
 
@@ -37,7 +37,7 @@ Use the explicitly requested deletion alternative: a completed bulk apply consum
 
 Add a receipt-removal helper beside the existing receipt functions in we:scripts/conveyor/queue-prune.mjs. In the bulk-removal branch of we:scripts/conveyor/queue.mjs, retain protection loading, plan computation, and digest validation. After successful queue persistence, delete the receipt before reporting success. A validated zero-drop apply also consumes its receipt. Dry-runs continue to write receipts without mutating the queue. Ordinary remove, automatic prune, and the shared applyPlan function keep their current semantics.
 
-Missing receipt cleanup is harmless; other filesystem errors must produce a nonzero result and an explicit cleanup diagnostic, never a successful apply response. If persistence already succeeded, the diagnostic must say so rather than imply rollback. A queue-write failure must not be presented as successful receipt consumption. Keep the existing receipt format and digest rules; no age threshold is introduced.
+Implement cleanup with unlink semantics: ignore only ENOENT, never recursively remove a receipt path. Missing receipt cleanup is harmless; other filesystem errors must produce a nonzero result and an explicit cleanup diagnostic, never a successful apply response. If persistence already succeeded, the diagnostic must say so rather than imply rollback. A queue-write failure must not be presented as successful receipt consumption. Keep the existing receipt format and digest rules; no age threshold is introduced.
 
 This establishes sequential replay prevention, not atomic cross-process exclusion or crash recovery between queue persistence and receipt deletion. Those require a separate transaction design and are not implied by this change.
 
@@ -53,24 +53,21 @@ This establishes sequential replay prevention, not atomic cross-process exclusio
 
 In we:scripts/conveyor/__tests__/queue-prune.test.mjs, extend the temporary-sidecar harness at lines 179-192. Exercise dry-run → apply → re-add via the CLI → identical apply refusal → fresh dry-run → successful apply. Assert receipt existence after dry-run, absence after success, nonzero refusal, unchanged queue bytes on refusal, and retained protected/unrelated IDs. Avoid real operator queue state and remote reads by retaining the existing protection override.
 
-Add receipt helper tests for missing, malformed, and mismatched receipt contents, successful deletion, harmless missing cleanup, and propagated non-ENOENT errors using deterministic filesystem mocks. Add zero-drop consumption and queue-write/cleanup failure tests; assert no success result on either failure and no misleading rollback claim. Do not use timing sleeps or permission-bit failures that vary under elevated users.
+Add receipt helper tests for missing, malformed, and mismatched receipt contents, successful deletion, harmless missing cleanup, and propagated non-ENOENT errors using deterministic filesystem mocks. Add zero-drop consumption and queue-write/cleanup failure tests; assert no success result on either failure and no misleading rollback claim. For deterministic CLI fault injection, launch a temporary Node module that patches the relevant node:fs synchronous operation, calls syncBuiltinESMExports, sets process.argv to the CLI invocation, then dynamically imports we:scripts/conveyor/queue.mjs. Target only the temporary queue persistence or receipt unlink operation. Assert a write failure leaves the receipt intact; an unlink failure after persistence leaves the queue updated and reports that partial outcome. Keep this launcher in the existing test harness, with no production fault-injection environment switch. Do not use timing sleeps or permission-bit failures that vary under elevated users.
 
-In we:scripts/conveyor/__tests__/queue.test.mjs, assert successful startup of the real CLI subprocess and parseable JSON for an isolated list command. Existing add/remove/list roundtrips remain regression coverage; this runtime import check supplements rather than replaces the requested future static lint.
+In we:scripts/conveyor/__tests__/queue.test.mjs:70-73, extend the existing isolated empty-list case to assert ok is true and action is list; successful subprocess exit and parseable JSON are already exercised. Existing add/remove/list roundtrips remain regression coverage; this runtime import check supplements rather than replaces the requested future static lint.
 
 ## Proof plan
 
-The implementing worker first adds the replay regression and runs it against the unchanged implementation through the host heavy-run queue. Capture the expected failure: the second apply succeeds and removes re-added IDs instead of refusing. After implementation, run both scoped suites through that same queue and capture the passing replay case and refusal assertions. Run the standards gate through admission as well. Commands below are executed from the WE repository; their script and test loci are we:scripts/readiness/heavy-admission.mjs, we:scripts/conveyor/__tests__/queue-prune.test.mjs, and we:scripts/conveyor/__tests__/queue.test.mjs.
-
-```bash
-node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/conveyor/__tests__/queue-prune.test.mjs scripts/conveyor/__tests__/queue.test.mjs
-node scripts/readiness/heavy-admission.mjs run -- npm run check:standards
-```
+The implementing worker first adds the replay regression and runs it against the unchanged implementation through the host heavy-run queue. Capture the expected failure: the second apply succeeds and removes re-added IDs instead of refusing. After implementation, run both scoped suites through that same queue and capture the passing replay case and refusal assertions. Run the standards gate through admission as well. Use we:scripts/readiness/heavy-admission.mjs with the run subcommand and pass Vitest both we:scripts/conveyor/__tests__/queue-prune.test.mjs and we:scripts/conveyor/__tests__/queue.test.mjs (strip the repository prefix when supplying local filesystem arguments). Submit `npm run check:standards` through the same admission entry point. Preparation itself does not claim a runtime reproduction or passing tests; the runner owns preparation checks and stamps.
 
 ## Done when
 
 The replay regression demonstrably fails before the fix and passes after it; receipt lifecycle/error cases and both scoped CLI suites pass, and the standards gate passes. A successful apply cannot authorize a later sequential removal through the same retained receipt. Static lint and global coverage policy remain explicitly outstanding follow-ups.
 
 ## Follow-ups
+
+The requests below remain outstanding and are not filed separately by this preparation; no follow-up delivery is claimed.
 
 - Preserve the original deterministic unresolved-import lint request: separately scope the build-gate configuration and its negative fixture (a deliberately broken relative import must fail). The CLI smoke test here proves runtime loading only. Do not introduce a new lint toolchain implicitly in this receipt fix.
 - Preserve the original strict-coverage/TDD request: separately establish which tooling files and failure branches should be instrumented against the existing coverage-plane rules in we:vitest.config.ts:56-70, then add a gate regression that demonstrates enforcement. No new percentage or TDD policy is selected here.
