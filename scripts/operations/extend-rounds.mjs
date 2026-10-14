@@ -16,7 +16,8 @@ export function planRoundExtension(read, input) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this extension is the operator's`);
   }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
-  if (!String(channel ?? '').trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
+  // Same line-break set as validateOperatorAttribution (operator-controls.mjs) and the grant counter.
+  if (!String(channel ?? '').trim() || /[\r\n\u{2028}\u{2029}]/u.test(channel)) throw new Error('--channel is required and must be one line');
   if (!Number.isInteger(by) || by < 1 || by > 5) throw new Error('--by must be an integer in 1..5');
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo ?? '')) throw new Error('--repo must be <owner/repo>');
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('--pr must be a positive integer');

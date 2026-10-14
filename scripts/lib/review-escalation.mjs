@@ -1848,7 +1848,7 @@ const CLEARED_HUMAN_PROSE_RE = /^✅ review — `review:human` cleared via the s
  * the record here, so a stray angle bracket must not silently cost the clearance its machine-readable form.
  */
 export function buildClearedHumanMarker(actor) {
-  const name = String(actor || '').replace(/[\r\n<>]+/g, ' ').trim();
+  const name = String(actor || '').replace(/[\r\n\p{Zl}\p{Zp}<>]+/gu, ' ').trim();
   return name ? `<!-- ${CLEARED_HUMAN_MARKER}: ${name} -->` : '';
 }
 
