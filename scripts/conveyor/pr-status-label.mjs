@@ -3,6 +3,7 @@
  * `needs-you` uses the operator queue's predicates; other states explain the wait.
  * Required red CI overrides readiness until green again. Label IO belongs to review-status-tag.
  */
+import { PR_STATUS_SETTING_DEFAULTS } from './pr-status-settings.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
@@ -64,6 +65,20 @@ function requiredCiRed(pr, labels, requiredChecks) {
       || ['FAILURE', 'ERROR'].includes(c.state)));
 }
 
+/** PURE: classify a planner refusal using only this caller's required checks. */
+function reviewCiWait(row, { pr, defaultBranch, requiredChecks, settings }) {
+  if (!Array.isArray(row.ci?.affected)) return 'awaiting-ci';
+  const affected = row.ci.affected.filter(check =>
+    (!Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.includes(check?.name))
+    && (settings.reviewGateSignal !== 'review' || check?.name !== 'review-gate'));
+  if (!affected.length) return 'awaiting-review';
+  if (pr.baseRefName && pr.baseRefName !== defaultBranch
+    && settings.stackedMainOnlyChecks === 'waiting-on-base'
+    && affected.every(check => settings.mainOnlyRequiredChecks.includes(check?.name)
+      && ['missing', 'pending'].includes(check?.reason))) return 'waiting-on-base';
+  return 'awaiting-ci';
+}
+
 // Neither stand-down nor advisory-labels exports a bot-author helper.
 const isHumanComment = (c) => {
   const login = c?.author?.login ?? c?.user?.login;
@@ -81,10 +96,13 @@ export function takeoverUnjudged(comments) {
 
 /**
  * PURE: the ONE `status:*` state for a PR, or null when none applies.
- * @param {{pr?:object, labels?:Array, reviewStatus?:{role?:string,state?:string}|null, rows?:Array<object>, defaultBranch?:string, humanAt?:number, requiredChecks?:string[]}} o
+ * @param {{pr?:object, labels?:Array, reviewStatus?:{role?:string,state?:string}|null, rows?:Array<object>, defaultBranch?:string, humanAt?:number, requiredChecks?:string[], settings?:object}} o
  *   `rows` = this tick's planner rows for the PR (dispatch rows, refusals, notes).
  */
-export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows = [], defaultBranch = 'main', humanAt, requiredChecks = FALLBACK_REQUIRED_STATUS_CHECKS } = {}) {
+export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows = [], defaultBranch = 'main', humanAt, requiredChecks = FALLBACK_REQUIRED_STATUS_CHECKS, settings = PR_STATUS_SETTING_DEFAULTS } = {}) {
+  settings = { ...PR_STATUS_SETTING_DEFAULTS, ...settings };
+  const ciChecks = settings.reviewGateSignal === 'review' && Array.isArray(requiredChecks)
+    ? requiredChecks.filter(name => name !== 'review-gate') : requiredChecks;
   const l = names(labels ?? pr?.labels);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const rs = reviewStatus?.state ?? null;
@@ -92,7 +110,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const subject = { ...pr, labels: l.map((name) => ({ name })) };
   if (operatorQueueNeedsYou(subject, { humanAt })) return 'needs-you';
   const liveFix = (reviewStatus?.role === 'fix' || reviewStatus?.role === 'ci-heal') && rs !== 'needs-human';
-  if (requiredCiRed(subject, l, requiredChecks)) return liveFix ? 'fixing' : 'ci-red';
+  if (requiredCiRed(subject, l, ciChecks)) return liveFix ? 'fixing' : 'ci-red';
   if (l.includes('review:accepted')) return 'ready-to-merge';
   if (liveFix) return takeoverUnjudged(comments) && reviewStatus.role === 'fix' ? 'takeover-running' : 'fixing';
   const escalated = list.some((r) => (r.kind === 'cap-exhausted' && ESCALATED.has(r.takeover))
@@ -109,7 +127,12 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   if (list.some((r) => r.mode === 'takeover' || r.takeoverReview?.ok || r.kind === 'cap-exhausted' || r.kind === 'takeover-awaiting-review')) return 'at-round-limit';
   if (rs === 'awaiting-base' || l.includes('review-status:awaiting-base')
     || list.some((r) => r.kind === 'stacked-awaiting-base' || (r.kind === 'gate-hold' && /base/.test(String(r.hold ?? ''))))) return 'waiting-on-base';
-  if (rs === 'awaiting-ci' || list.some((r) => ['review-ci', 'owed-ci-rerun'].includes(r.kind))) return 'awaiting-ci';
+  if (rs === 'awaiting-ci' || list.some((r) => r.kind === 'owed-ci-rerun')) return 'awaiting-ci';
+  const ciWaits = list.filter(r => r.kind === 'review-ci')
+    .map(row => reviewCiWait(row, { pr, defaultBranch, requiredChecks, settings }));
+  if (ciWaits.includes('awaiting-ci')) return 'awaiting-ci';
+  if (ciWaits.includes('waiting-on-base')) return 'waiting-on-base';
+  if (ciWaits.includes('awaiting-review')) return 'awaiting-review';
   if (rs === 'reviewing' || rs === 'review-stalled' || list.some((r) => r.kind === 'review') || l.includes('review:pending')) return 'awaiting-review';
   if (list.some((r) => r.kind === 'fix' || r.kind === 'ci-heal')) return 'fixing';
   const advisory = latestAdvisory(comments);

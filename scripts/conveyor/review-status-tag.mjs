@@ -26,6 +26,8 @@
  * 5748 (2026-10-11): legacy `review-status:*` writes stay on (LEGACY_REVIEW_STATUS_DEFAULT) until their readers
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { loadPrStatusSettings, prStatusSettingValues } from './pr-status-settings.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 import { readLiveFixClaim, FIX_DRAFT_REASONS } from './fix-procedure.mjs';
@@ -242,6 +244,8 @@ export function tagReviewStatus({
   // `null` (a standalone CLI call) leaves any `status:*` label untouched: without the plan it cannot be derived.
   planRows = null,
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
+  requiredChecks, prStatusSettings,
+  readRequiredChecks = getRequiredStatusChecks, loadStatusSettings = loadPrStatusSettings,
 } = {}) {
   const repoKey = repo === undefined ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`review-status-tag: --repo ${repo} is not a constellation repo`);
@@ -267,7 +271,14 @@ export function tagReviewStatus({
   let prStatus;
   const applyPrStatus = () => {
     if (!Array.isArray(planRows)) return;
-    const state = derivePrStatusLabel({ pr: { ...(subject ?? {}), labels: currentLabels }, labels: currentLabels, reviewStatus: status, rows: planRows, defaultBranch });
+    if (requiredChecks === undefined) {
+      try { requiredChecks = readRequiredChecks({ repo }).checks; } catch { /* Pure core retains its fallback. */ }
+    }
+    if (prStatusSettings === undefined) {
+      try { prStatusSettings = prStatusSettingValues(loadStatusSettings()); } catch { /* Pure core retains its defaults. */ }
+    }
+    const state = derivePrStatusLabel({ pr: { ...(subject ?? {}), labels: currentLabels }, labels: currentLabels,
+      reviewStatus: status, rows: planRows, defaultBranch, requiredChecks, settings: prStatusSettings });
     const sp = planPrStatusLabel({ state, currentLabels });
     prStatus = state ? `status:${state}` : null;
     if (sp.add || sp.remove.length) {

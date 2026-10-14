@@ -2,10 +2,17 @@
 // round cap and their labels did not show it).
 import { describe, it, expect } from 'vitest';
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, operatorQueueNeedsYou } from '../pr-status-label.mjs';
-import { tagReviewStatus, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
+import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
 import { evaluatePr } from '../../operations/operator-queue.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
+
+import { resolvePrStatusSettings, loadPrStatusSettings, prStatusSettingValues, PR_STATUS_SETTING_DEFAULTS } from '../pr-status-settings.mjs';
+
+const tagReviewStatus = (options) => tagReviewStatusIo({
+  readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
+  ...options,
+});
 
 const BOT = { login: 'web-everything' };
 const HEAD = 'a'.repeat(40);
@@ -146,5 +153,113 @@ describe('truthful stage regressions', () => {
         expect(calls.flatMap(c => c.remove)).not.toContain('review-status:draft-withdrawn');
       }
     }
+  });
+});
+
+
+describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
+  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const green = () => requiredChecks.map(name => check(name));
+  const row = (affected) => ({ kind: 'review-ci', ci: { reason: 'required-checks-not-successful', affected } });
+  const reviewRow = { kind: 'review-ci', ci: { reason: 'required-review-gate-conflict', affected: [{ name: 'review-gate', reason: 'failure' }] } };
+  const subject = (over = {}) => pr(['review:pending'], [], { statusCheckRollup: [...green(), ...Array.from({ length: 3 }, () => check('review-gate', 'FAILURE'))], ...over });
+  it('#5241: review-gate failures are review signals, including when required by repository policy', () => {
+    for (const rows of [[reviewRow], [{ kind: 'review' }]]) {
+      for (const checks of [requiredChecks, [...requiredChecks, 'review-gate']]) {
+        expect(derive({ pr: subject(), requiredChecks: checks, rows })).toBe('awaiting-review');
+      }
+    }
+    expect(derive({ pr: subject(), requiredChecks: [...requiredChecks, 'review-gate'], rows: [reviewRow], settings: { reviewGateSignal: 'ci' } })).toBe('ci-red');
+    expect(derive({ pr: subject(), requiredChecks, rows: [row([{ name: 'advisory-only', reason: 'pending' }])] })).toBe('awaiting-review');
+  });
+  it('#5267: a stacked PR missing only main-only checks waits on its base', () => {
+    const stacked = subject({ baseRefName: 'lane/enqueue-verify', statusCheckRollup: green().filter(c => c.name !== 'merge-gate') });
+    const rows = [row([{ name: 'merge-gate', reason: 'missing' }])];
+    expect(derive({ pr: stacked, requiredChecks, rows })).toBe('waiting-on-base');
+    expect(derive({ pr: stacked, requiredChecks, rows, settings: { stackedMainOnlyChecks: 'awaiting-ci' } })).toBe('awaiting-ci');
+    expect(derive({ pr: { ...stacked, baseRefName: 'main' }, requiredChecks, rows })).toBe('awaiting-ci');
+    expect(derive({ pr: stacked, requiredChecks, rows: [row([{ name: 'merge-gate', reason: 'missing' }, { name: 'test', reason: 'pending' }])] })).toBe('awaiting-ci');
+    expect(derive({ pr: stacked, requiredChecks, rows: [row([{ name: 'merge-gate', reason: 'pending' }])] })).toBe('waiting-on-base');
+    for (const reason of ['failure', 'cancelled', 'wrong-head', 'malformed']) {
+      expect(derive({ pr: stacked, requiredChecks, rows: [row([{ name: 'merge-gate', reason }])] })).toBe('awaiting-ci');
+    }
+    expect(derive({ pr: stacked, requiredChecks, rows: [reviewRow], reviewStatus: { role: 'draft', state: 'awaiting-ci' } })).toBe('awaiting-ci');
+    expect(derive({ pr: stacked, requiredChecks, rows: [reviewRow, { kind: 'owed-ci-rerun' }] })).toBe('awaiting-ci');
+  });
+  it('#5270 and #5254: required failures remain ci-red', () => {
+    const failed = subject({ statusCheckRollup: [...green().filter(c => c.name !== 'test'), check('test', 'FAILURE'), check('integration', 'FAILURE'), check('review-gate', 'FAILURE')] });
+    expect(derive({ pr: failed, requiredChecks: [...requiredChecks, 'integration'], rows: [{ kind: 'ci-heal' }] })).toBe('ci-red');
+    expect(derive({ pr: subject({ statusCheckRollup: [...green().filter(c => c.name !== 'daemon-soak'), check('daemon-soak', 'FAILURE'), check('soak-shard (3)', 'CANCELLED')] }), requiredChecks, rows: [{ kind: 'ci-heal' }] })).toBe('ci-red');
+  });
+});
+
+
+describe('prStatus settings', () => {
+  it('supplies standard values and source metadata', () => {
+    const resolved = resolvePrStatusSettings();
+    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'review', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate'] });
+    expect(prStatusSettingValues(resolved)).toEqual(PR_STATUS_SETTING_DEFAULTS);
+    for (const setting of Object.values(resolved)) expect(setting.source).toBe('standard');
+  });
+  it('layers standard < platform < repo < env independently and parses comma lists', () => {
+    const platform = { prStatus: { reviewGateSignal: 'ci', stackedMainOnlyChecks: 'awaiting-ci', mainOnlyRequiredChecks: ['platform-check'] } };
+    const repo = { prStatus: { reviewGateSignal: 'review', mainOnlyRequiredChecks: ['repo-check'] } };
+    expect(resolvePrStatusSettings({ platform }).reviewGateSignal).toEqual({ value: 'ci', source: 'platform' });
+    expect(resolvePrStatusSettings({ platform, repo }).reviewGateSignal).toEqual({ value: 'review', source: 'repo' });
+    const resolved = resolvePrStatusSettings({ platform, repo, env: {
+      WE_PR_STATUS_REVIEW_GATE_SIGNAL: 'ci', WE_PR_STATUS_STACKED_MAIN_ONLY: 'waiting-on-base',
+      WE_PR_STATUS_MAIN_ONLY_CHECKS: 'merge-gate, custom-check ',
+    } });
+    expect(prStatusSettingValues(resolved)).toEqual({ reviewGateSignal: 'ci', stackedMainOnlyChecks: 'waiting-on-base', mainOnlyRequiredChecks: ['merge-gate', 'custom-check'] });
+    for (const setting of Object.values(resolved)) expect(setting.source).toBe('env');
+  });
+  it('ignores invalid values and blocks, retaining the last valid layer', () => {
+    const resolved = resolvePrStatusSettings({ platform: { prStatus: { reviewGateSignal: 'ci' } },
+      repo: { prStatus: [] }, env: { WE_PR_STATUS_REVIEW_GATE_SIGNAL: 'invalid', WE_PR_STATUS_STACKED_MAIN_ONLY: 'invalid', WE_PR_STATUS_MAIN_ONLY_CHECKS: 'merge-gate,,test' } });
+    expect(resolved.reviewGateSignal).toMatchObject({ value: 'ci', source: 'platform', ignored: [{ source: 'repo' }, { source: 'env' }] });
+    for (const key of ['stackedMainOnlyChecks', 'mainOnlyRequiredChecks']) {
+      expect(resolved[key]).toMatchObject({ value: PR_STATUS_SETTING_DEFAULTS[key], source: 'standard', ignored: [{ source: 'repo' }, { source: 'env' }] });
+    }
+    for (const value of ['merge-gate', [''], ['  '], [7], null]) {
+      expect(resolvePrStatusSettings({ repo: { prStatus: { mainOnlyRequiredChecks: value } } }).mainOnlyRequiredChecks).toMatchObject({ source: 'standard', ignored: [{ source: 'repo' }] });
+    }
+  });
+  it('loads preferences and declared settings with injectable reads', () => {
+    const loaded = loadPrStatusSettings({ env: {}, readFile: () => JSON.stringify({ prStatus: { reviewGateSignal: 'ci' } }),
+      readDeclared: () => ({ settings: { prStatus: { stackedMainOnlyChecks: 'awaiting-ci' } } }) });
+    expect(loaded.reviewGateSignal).toEqual({ value: 'ci', source: 'platform' });
+    expect(loaded.stackedMainOnlyChecks).toEqual({ value: 'awaiting-ci', source: 'repo' });
+    const absentFile = () => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); };
+    expect(prStatusSettingValues(loadPrStatusSettings({ env: {}, readFile: absentFile, readDeclared: () => ({ settings: {} }) }))).toEqual(PR_STATUS_SETTING_DEFAULTS);
+    for (const declared of [{ errors: ['unreadable'] }, { duplicates: [{ path: 'prStatus.reviewGateSignal' }] }]) {
+      expect(() => loadPrStatusSettings({ env: {}, readFile: absentFile, readDeclared: () => declared })).toThrow('prStatus declared settings unreadable');
+    }
+    expect(() => loadPrStatusSettings({ env: {}, readFile: () => 'invalid json', readDeclared: () => ({}) })).toThrow();
+  });
+});
+
+describe('status tagger resolves required checks and settings at the IO boundary', () => {
+  const run = (options = {}) => tagReviewStatus({ pr: 7, repo: 'web-everything/web-everything', agents: [],
+    currentLabels: ['review:pending'], prState: pr(['review:pending'], [], { statusCheckRollup: [check('merge-gate', 'FAILURE'), check('review-gate', 'FAILURE')] }),
+    provider: { ensureLabel: () => {}, setLabels: () => {} }, readFixClaim: () => null,
+    planRows: [{ kind: 'review-ci', ci: { affected: [{ name: 'review-gate', reason: 'failure' }] } }], ...options });
+  it('reads the live required set and projects resolved settings into the reducer', () => {
+    const calls = [];
+    expect(run({ readRequiredChecks: (args) => { calls.push(args); return { checks: ['merge-gate'] }; },
+      loadStatusSettings: () => resolvePrStatusSettings() }).prStatus).toBe('status:ci-red');
+    expect(calls).toEqual([{ repo: 'web-everything/web-everything' }]);
+    expect(run({ readRequiredChecks: () => ({ checks: ['review-gate'] }),
+      loadStatusSettings: () => resolvePrStatusSettings({ env: { WE_PR_STATUS_REVIEW_GATE_SIGNAL: 'ci' } }) }).prStatus).toBe('status:ci-red');
+  });
+  it('honors explicit values without invoking readers and falls back when readers throw', () => {
+    const unexpected = () => { throw new Error('must not read'); };
+    let reads = 0;
+    const reader = () => { reads++; return unexpected(); };
+    expect(run({ requiredChecks: ['review-gate'], prStatusSettings: { reviewGateSignal: 'review' }, readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBe('status:awaiting-review');
+    expect(reads).toBe(0);
+    expect(run({ readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBe('status:awaiting-review');
+    expect(reads).toBe(2);
+    expect(run({ planRows: null, readRequiredChecks: reader, loadStatusSettings: reader }).prStatus).toBeUndefined();
+    expect(reads).toBe(2);
   });
 });
