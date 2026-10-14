@@ -72,8 +72,11 @@ function validRow(row) {
 }
 const isSession = row => ['ci-heal', 'fix'].includes(row.kind);
 const hasRedMainDiscount = config => config.redMainDiscount === 'on' && Array.isArray(config.redMainWindows);
-const discountedSession = (row, config) => hasRedMainDiscount(config) && isSession(row)
-  && isWithinRedWindow(Date.parse(row.at), config.redMainWindows);
+// PR #5248 review: only a CLOSED window discounts. While main is still red every
+// session counts, so the per-head ceilings keep bounding spend through the outage.
+const inClosedRedWindow = (row, config) => hasRedMainDiscount(config)
+  && isWithinRedWindow(Date.parse(row.at), config.redMainWindows.filter(window => window?.end != null));
+const discountedSession = (row, config) => isSession(row) && inClosedRedWindow(row, config);
 function windowRows(rows, now, config) {
   const end = new Date(now).getTime(), start = end - config.windowHours * 3600000;
   return (rows ?? []).filter(row => validRow(row) && isSession(row) && Date.parse(row.at) >= start && Date.parse(row.at) <= end)
@@ -139,14 +142,15 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
   const observed = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
-  const controls = observed.filter(row => !discountedSession(row, config) && !(hasRedMainDiscount(config)
-      && !isMainCurrentlyRed(config.redMainWindows) && ['park', 'rearm'].includes(row.kind)
-      && isWithinRedWindow(Date.parse(row.at), config.redMainWindows)));
+  const controls = observed.filter(row => !discountedSession(row, config) && !(!isMainCurrentlyRed(config.redMainWindows)
+      && ['park', 'rearm'].includes(row.kind) && inClosedRedWindow(row, config)));
   if (controls.some(row => row.kind === 'park')) return { action: 'parked' };
   const rearm = controls.find(row => row.kind === 'rearm');
   // Log text is not authenticated launcher evidence. Bound spend independently of
   // log-based discounts and the rolling window, allowing one extra attempt and a final re-arm.
-  const rawCount = controls.filter(isSession).length;
+  // Red-main discounts get their own hard cap: past one raw budget, discounted sessions count too.
+  const discounted = observed.filter(row => discountedSession(row, config)).length;
+  const rawCount = controls.filter(isSession).length + Math.max(0, discounted - (config.maxSessions + 2));
   if (rawCount >= config.maxSessions + 2) return { action: 'park', reason: 'raw per-head repair session ceiling reached' };
   const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
   // Discounted attempts still delimit reused session names: their outcomes must
@@ -179,7 +183,8 @@ export function fixLoopRedMainLapse({ rows, repo, pr, head, now = Date.now(), co
   if (!hasRedMainDiscount(config) || isMainCurrentlyRed(config.redMainWindows)) return false;
   if (!(rows ?? []).some(row => validRow(row) && row.repo === repo && row.pr === pr && row.head === head
     && row.kind === 'park' && Date.parse(row.at) <= new Date(now).getTime())) return false;
-  return !['park', 'parked'].includes(fixLoopDisposition({ rows, repo, pr, head, now, config }).action);
+  // PR #5248 review: judge the park with holds on, so disabling holds never releases a park red main did not cause.
+  return !['park', 'parked'].includes(fixLoopDisposition({ rows, repo, pr, head, now, config: { ...config, hold: true } }).action);
 }
 export function fixLoopBreaches({ rows, prs, now = Date.now(), config = fixLoopConfig() }) {
   const current = new Map((prs ?? []).map(pr => [`${pr.repo}#${pr.number}`, pr.headRefOid]));

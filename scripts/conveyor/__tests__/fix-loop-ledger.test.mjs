@@ -267,6 +267,33 @@ it('keeps parks when disabled, unreadable, still red, or independently exhausted
   expect(fixLoopRedMainLapse(args)).toBe(false);
   expect(fixLoopRedMainLapse(incident({ rows: [] }))).toBe(false);
 });
+it('keeps the per-head ceilings while main is still red (open window)', () => {
+  const open = { ...incident().config, redMainWindows: [{ ...incidentWindows[0], end: null }] };
+  const sessions = n => Array.from({ length: n }, (_, i) => row({ pr: 5195, session: `s${i}`,
+    at: new Date(Date.parse('2026-10-13T22:00:00Z') + i * 60000).toISOString() }));
+  const decide = n => fixLoopDisposition(incident({ rows: sessions(n), config: open })).action;
+  expect(decide(2)).toBe('dispatch');
+  expect(decide(3)).toBe('hold');
+  expect(decide(5)).toBe('park');
+  expect(fixLoopState(incident({ rows: sessions(3), config: open }))).toMatchObject({ count: 3, redMainDiscounted: 0 });
+});
+it('bounds discounted red-main sessions per head with a separate hard cap', () => {
+  const windows = Array.from({ length: 4 }, (_, i) => ({ start: `2026-10-13T1${i}:00:00Z`, end: `2026-10-13T1${i}:30:00Z` }));
+  const sessions = n => Array.from({ length: n }, (_, i) => row({ pr: 5195, session: `s${i}`,
+    at: `2026-10-13T1${Math.floor(i / 4)}:${String(10 + (i % 4) * 2).padStart(2, '0')}:00Z` }));
+  const args = n => incident({ rows: sessions(n), config: { ...incident().config, redMainWindows: windows } });
+  expect(fixLoopDisposition(args(5)).action).toBe('dispatch');
+  expect(fixLoopDisposition(args(10)).action).toBe('park');
+  const parked = args(10);
+  parked.rows = [...parked.rows, row({ pr: 5195, kind: 'park', reason: 'budget', at: '2026-10-13T13:20:00Z' })];
+  expect(fixLoopRedMainLapse(parked)).toBe(false);
+});
+it('never lets disabled holds lapse a park that main being red did not cause', () => {
+  const own = row({ pr: 5195, kind: 'park', reason: 'own failure', at: '2026-10-13T23:40:00Z' });
+  const off = { ...incident().config, hold: false };
+  expect(fixLoopRedMainLapse(incident({ rows: [...incidentRows, own], config: off }))).toBe(false);
+  expect(fixLoopRedMainLapse(incident({ config: off }))).toBe(true);
+});
 it('discounts the raw per-head ceiling beyond the rolling window, but retains outside controls', () => {
   expect(fixLoopDisposition(incident({ rows: [...incidentRows, incidentRows[0]],
     now: Date.parse('2026-10-14T12:00:00Z') })).action).toBe('dispatch');
