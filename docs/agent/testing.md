@@ -2,6 +2,11 @@
 
 > Tier-1 reference. Read when writing or changing tests.
 
+Keep the 50-tick daemon soak baseline alone in shard 1 when splitting the soak suite. Balance break
+scenarios by measured time across the remaining shards; timing estimates must never put a sibling
+scenario beside the baseline. Those scenarios fork real daemon and git children, so concurrent worlds
+can exhaust the baseline's wall-clock timeout while its per-tick invariants continue to hold.
+
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
