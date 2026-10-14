@@ -1,8 +1,8 @@
 /**
  * @file scripts/operations/pr-ownership.mjs
  * @description #4056 (epic #3383) — "who owns this PR right now, and is that owner alive". Read-only: IO is
- * injected (`pr-ownership-io.mjs`), both declared steps are compute, no sinks. This module imports only
- * `registry.mjs`/`step-kinds.mjs`, so it can reach nothing that acts.
+ * injected (`pr-ownership-io.mjs`), both declared steps are compute, no sinks. Authorship classification
+ * is pure; this module reaches nothing that acts.
  *
  * EVERY FACT IS BORROWED BY THE IO SHELL, NOT RE-DERIVED HERE:
  *   - phase            — `progress-board.mjs#classifyPr`, with the SAME required-check set the reconcile pass read.
@@ -20,6 +20,7 @@
  * NEVER GUESSES. An unreadable transcript age, phase-entry time or daemon state stays `null`/`unknown`, and a
  * flag that needs it does not fire. `drain` is not a runner-activity daemon, so its liveness is `unknown`.
  */
+import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 
@@ -49,7 +50,7 @@ const FINISHED_SESSION_STATES = new Set(['done', 'stopped']);
  * @param {{phase:string, stacked?:boolean, isDraft?:boolean}} o
  * @returns {{owner:'review'|'fix-dispatch'|'drain'|'human'|'none', nextMove:string|null, why:string}}
  */
-export function ownerFor({ phase, stacked = false, isDraft = false }) {
+export function ownerFor({ phase, stacked = false, isDraft = false, unlabeledRed = false }) {
   if (stacked && phase === 'conflicted') {
     return { owner: 'fix-dispatch', nextMove: 'stacked-rebase', why: 'conflicted against its own non-default base (#4030)' };
   }
@@ -60,6 +61,9 @@ export function ownerFor({ phase, stacked = false, isDraft = false }) {
   // move is fix-dispatch's `promote-draft` once its checks are green. A red draft still falls through to ci-heal.
   if (isDraft && (phase === 'needs-review' || phase === 'open')) {
     return { owner: 'fix-dispatch', nextMove: 'promote-draft', why: 'draft — promoted to ready once its required checks are green' };
+  }
+  if (unlabeledRed && ['queued', 'open'].includes(phase)) {
+    return { owner: 'none', nextMove: null, why: 'ci-red agent PR with no review:* label — the drain will not land it and no daemon owns it' };
   }
   switch (phase) {
     case 'needs-review': return { owner: 'review', nextMove: 'review', why: 'review:pending — a reviewer is owed' };
@@ -118,7 +122,23 @@ export function assessPrOwnership(pr, {
 } = {}) {
   const number = Number(pr.number);
   const stacked = Boolean(pr.baseRefName) && pr.baseRefName !== defaultBranch;
-  const { owner, nextMove, why } = ownerFor({ phase: pr.phase, stacked, isDraft: pr.isDraft === true });
+  const planned = [...(plan.dispatch ?? []), ...(plan.refusals ?? [])].find(r => Number(r?.prNumber) === number);
+  // Card 278, #5172: IO omits labels and commits; the planned rule already proves agent authorship.
+  const labels = (Array.isArray(pr.labels) ? pr.labels : planned?.labels ?? [])
+    .map(l => typeof l === 'string' ? l : l?.name).filter(Boolean);
+  const unlabeledRed = !pr.isDraft && String(pr.headRefName ?? '').startsWith('lane/')
+    && (isAiGeneratedPr(pr) || planned?.rule === 'unlabeled-red')
+    && !labels.some(l => l.startsWith('review:'))
+    && (labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)) || (pr.check ?? planned?.check) === 'red');
+  const { owner, nextMove, why } = ownerFor({ phase: pr.phase, stacked, isDraft: pr.isDraft === true, unlabeledRed });
+  const reconcile = reconcileRowFor(plan, number);
+  const fixKinds = ['fix', 'ci-heal', 'ci-timeout-rerun', 'promote-draft', 'restore-review-label',
+    'convert-advisory', 'close-superseded'];
+  const nextActor = reconcile.verdict === 'dispatch'
+    ? reconcile.kind === 'review' ? 'review' : fixKinds.includes(reconcile.kind) ? 'fix-dispatch' : owner
+    : owner;
+  const nextActorState = daemons.find(d => d?.name === nextActor)?.state ?? 'unknown';
+  const liveNextActor = DISPATCHING_OWNERS.has(nextActor) && String(nextActorState).startsWith('alive');
   const ownerDaemonState = owner === 'none' || owner === 'human'
     ? null : daemons.find((d) => d?.name === owner)?.state ?? 'unknown';
   const bound = Array.isArray(pr.bound) ? pr.bound : [];
@@ -140,8 +160,8 @@ export function assessPrOwnership(pr, {
         + ` touched its transcript for ${Math.round(stale.transcriptAgeMs / 60_000)} min while the PR is owed`,
     });
   }
-  if (owner === 'none') flags.push({ flag: FLAGS.ORPHAN, why });
-  else if (DEAD_DAEMON_STATES.has(ownerDaemonState)) {
+  if (!liveNextActor && owner === 'none') flags.push({ flag: FLAGS.ORPHAN, why });
+  else if (!liveNextActor && DEAD_DAEMON_STATES.has(ownerDaemonState)) {
     flags.push({ flag: FLAGS.ORPHAN, why: `owner daemon \`${owner}\` is ${ownerDaemonState}` });
   }
   const dispatchRecord = bound.length > 0 || Boolean(pr.fixClaim);
@@ -154,8 +174,8 @@ export function assessPrOwnership(pr, {
 
   return {
     repo: pr.repo, number, headRefName: pr.headRefName ?? null, baseRefName: pr.baseRefName ?? null, stacked,
-    card: pr.card ?? null, phase: pr.phase, owner, nextMove, ownerWhy: why, ownerDaemonState,
-    reconcile: reconcileRowFor(plan, number),
+    card: pr.card ?? null, phase: pr.phase, owner, nextActor, nextMove, ownerWhy: why, ownerDaemonState,
+    reconcile,
     boundSessions: bound.map((b) => ({
       name: b.name ?? null, sessionId: b.sessionId ?? null, state: b.state ?? null,
       transcriptAgeMs: Number.isFinite(b.transcriptAgeMs) ? b.transcriptAgeMs : null,
@@ -183,7 +203,10 @@ export function assessOwnership(read, thresholds = PR_OWNERSHIP_THRESHOLDS) {
   return {
     observedAt: read.observedAt, thresholds, prToCard: read.prToCard ?? {},
     daemons: read.daemons.map((d) => ({ name: d.name, state: d.state ?? 'unknown' })),
-    summary: { prs: prs.length, flagged: prs.filter((p) => !p.healthy).length, ...byFlag },
+    summary: { prs: prs.length, flagged: prs.filter((p) => !p.healthy).length, ...byFlag,
+      byNextActor: Object.fromEntries(['review', 'fix-dispatch', 'drain', 'human', 'none']
+        .map(actor => [actor, prs.filter(p => p.nextActor === actor).length])),
+    },
     prs, gaps: read.gaps,
   };
 }

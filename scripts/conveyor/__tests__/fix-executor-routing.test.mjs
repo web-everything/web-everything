@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
+import { fixDetachedProvider } from '../../operations/dispatch-providers/fix.mjs';
 import { dispatchFix, roundEscalationFor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
@@ -409,7 +410,7 @@ describe('routed codex wiring: repo and merge target reach the router and the la
     try { await run({ pr: 42, laneRef: 'lane/42-x', scope: ['fui:x.ts'], ...extra }, { root: '/repo', repo: 'fui' }); }
     finally { log.mockRestore(); }
     expect(route).toHaveBeenCalledWith(expect.objectContaining({ repo: 'fui', kind: 'ci-heal' }));
-    expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({ mergeOnto, claimRepo: 'fui' }));
+    expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({ mergeOnto, claimRepo: 'fui', repairKind: 'ci-heal' }));
   });
 
   it('runReconcileFixDispatch hands the router the repo key, so a seeded frontierui ledger falls back to Claude', async () => {
@@ -435,5 +436,41 @@ describe('routed codex wiring: repo and merge target reach the router and the la
       listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null });
     expect(fixExecutorRoute).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontierui', pr: top.pr }));
     expect(fixExecutorRoute.mock.results[0].value).toMatchObject({ executor: 'claude', reason: expect.stringContaining('falls back to Claude') });
+  });
+});
+
+it('forwards ci-heal repair-kind after scope to the detached launcher', () => {
+  const spawnDetached = vi.fn(() => ({ pid: 99 }));
+  fixDetachedProvider({ pr: 7, sessionSlug: 'ci-heal-7', scope: 'we:a', repairKind: 'ci-heal' },
+    { spawnDetached, readDeliveryAgentMarker: () => null, logPathFor: () => '/tmp/log' });
+  const argv = spawnDetached.mock.calls[0][0];
+  expect(argv[argv.indexOf('--scope=we:a') + 1]).toBe('--repair-kind=ci-heal');
+});
+
+// Card 272 part 2 (live #5045, 2026-10-13): the cheap refresh precedes every model rung.
+describe('CI-heal stale-base dispatch seam', () => {
+  it.each(['held', 'null', 'throw'])('handles a %s gate before routing', async mode => {
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const route = vi.fn(() => ({ executor: 'claude' }));
+    const dispatch = vi.fn(() => ({ spawned: true }));
+    const staleBaseGate = vi.fn(() => {
+      if (mode === 'throw') throw new Error('probe failed');
+      return mode === 'held' ? { held: true, reason: 'CI re-runs first' } : null;
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const planned = { pr: 5045, round: 4 };
+      const options = { repo: 'we', root: '/repo' };
+      const result = await createRoutedCiHealDispatch({ dispatch, route, createSinks: () => ({}), staleBaseGate })(planned, options);
+      expect(staleBaseGate).toHaveBeenCalledWith({ planned, repo: 'we', root: '/repo' });
+      if (mode === 'held') {
+        expect(result).toEqual({ held: true, reason: 'CI re-runs first' });
+        expect(route).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+      } else {
+        expect(result).toEqual({ spawned: true });
+        expect(route).toHaveBeenCalledOnce(); expect(dispatch).toHaveBeenCalledWith(planned, { ...options, sinks: {} });
+        if (mode === 'throw') expect(log).toHaveBeenCalledWith(expect.stringContaining('stale-base gate failed open: probe failed'));
+      }
+    } finally { log.mockRestore(); }
   });
 });

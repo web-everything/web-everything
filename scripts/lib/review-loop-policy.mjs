@@ -598,6 +598,8 @@ function roundCardsRefusal(verdict) {
   if (verdict.humanRequired === true) return 'human-required';
   if (verdict.pendingReferrals?.length) return 'referral-pending';
   if (verdict.blockedReferrals?.length) return 'referral-blocked';
+  // PR #5025 review — a claim retired on ONE verifier answer leaves any accept to a human: the round bounces as usual instead.
+  if (verdict.uncorroboratedRetirements?.length) return 'uncorroborated-retirement';
   const admitted = Array.isArray(verdict.admittedFindings) ? verdict.admittedFindings : [];
   if (admitted.some(requiresMandatoryReferral)) return 'confirmed-broken';
   return null;

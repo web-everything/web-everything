@@ -926,6 +926,9 @@ export function createDefaultJudge({
   // advisory agy seat) runs through the seat runner, which calls `judge` above for every Claude juror it needs.
   // A DYNAMIC import, like `defaultProviderQuotaHold`'s: this file is loaded by lightweight CLIs that never seat one.
   return async (request, opts = null) => {
+    // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
+    // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
+    if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
     if (request?.seatProvider == null) return judge(request, opts);
     const laneCwd = opts?.cwd || factoryCwd;
     return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });

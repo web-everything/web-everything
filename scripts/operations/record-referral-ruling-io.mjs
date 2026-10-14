@@ -14,7 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readOperatorRulings } from '../lib/jury-core.mjs';
+import { readOperatorRulings, AUTO_POLICY_ACTOR, exactCitedPath } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
@@ -24,7 +24,9 @@ import '../lib/verdict-ledger-io.mjs'; // registers the `git` store `appendVerdi
 import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
-import { openReferralFindings, OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
+import { openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
+  OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
+import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } from './review-pr-io.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -120,18 +122,37 @@ const lazyPrHead = (open) => {
   return { list: () => get().list(), read: (f) => get().read(f) };
 };
 
+/** Comparison cache lives for this thread read only; the final write check gets fresh evidence. */
+function readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines }) {
+  const linesFor = changedLines ?? createChangedLinesReader((args) => {
+    const data = readJson(args);
+    // Protection needs a complete file list, including when the cited file occurs before the cap.
+    if (args[1]?.includes('/compare/') && data?.files?.length >= COMPARE_FILE_CAP) return null;
+    return data;
+  });
+  return openReferralFindings({ comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
+    body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable,
+    unchangedFinding: ({ repo, base, head, source, target }) => {
+      const file = exactCitedPath(source.file);
+      if (!file || file !== exactCitedPath(target.file)) return null;
+      const changed = linesFor(repo, base, head, file);
+      if (!(changed instanceof Set) || (changed.size && !(changed.old instanceof Set))) return null;
+      return !changesTouchCitedLines(changed.old ?? changed, [source.line])
+        && !changesTouchCitedLines(changed, [target.line]);
+    } });
+}
+
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
-  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog,
+  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines,
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
     assertFresh();
     const thread = readPrThread(repo, pr, { readJson });
     const cardReadable = (ref) => readable(ref, root);
-    const open = openReferralFindings({ comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
-      body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable });
+    const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines });
     return {
-      head: thread.headRefOid, open: open.open, ruled: open.ruled, disputed: open.disputed, malformed: open.malformed,
+      head: thread.headRefOid, ...open,
       card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),
       followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',
       now: now(), clearerId: currentActorId(env),
@@ -167,7 +188,7 @@ export async function appendLedgerEvents(events, opts = {}) {
   if (misses.length) throw new Error(events.length === 1 ? misses[0] : `${misses.length} of ${events.length} ledger events failed: ${misses.join('; ')}`);
 }
 
-export function createRecordReferralRulingSinks({ readJson = ghJson,
+export function createRecordReferralRulingSinks({ readJson = ghJson, changedLines, root = REPO_ROOT, readable = referralCardReadable,
   appendEvents = appendLedgerEvents,
   warn = (m) => process.stderr.write(`${m}\n`),
   now = () => new Date().toISOString(),
@@ -222,9 +243,28 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       }
       return { action, sentBack, labelCleared, ...(ledgerWriteMiss ? { ledgerWriteMiss } : {}) };
     },
-    [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body, rulings = [], actor = '', channel = '' }) => {
+    [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body, rulings = [], actor = '', channel = '', skipped = [], protectionSnapshot }) => {
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
+      if (actor === AUTO_POLICY_ACTOR) {
+        const fresh = readProtectionContext(before, { repo, pr, readJson, changedLines, cardReadable: (ref) => readable(ref, root) });
+        if (fresh.malformed || fresh.protectionMalformed) throw new Error('automatic policy refuses malformed referral history before writing');
+        const targets = automaticPolicyTargets(fresh);
+        // Report requested skips and any newly protected write target through the existing warning channel.
+        for (const target of targets.filter((t) => t.protectingRulings.length
+          && [...rulings, ...skipped].some((r) => r.runId === t.runId && r.key === t.key))) {
+          warn(describePolicySkip({ repo, pr, head, ...target }));
+        }
+        if (!protectionSnapshot || JSON.stringify(policyProtectionSnapshot(fresh)) !== JSON.stringify(protectionSnapshot)) {
+          throw new Error('automatic policy protection changed since planning; nothing written — require a fresh plan');
+        }
+        for (const ruling of rulings) {
+          const target = targets.find((t) => t.runId === ruling.runId && t.key === ruling.key);
+          if (ruling.result !== 'block' || ruling.supersedes?.length || !target || target.protectionUnknown.length || target.protectingRulings.length) {
+            throw new Error('automatic policy protection is unknown or protected; nothing written — require a fresh plan');
+          }
+        }
+      }
       const events = rulings.map((r) => buildLedgerEvent({ type: EVENT_TYPES.RULING, repo, pr, at: now(),
         // Hash the FULL key, the form the referral row names (`review-pr-io`); a raw key never closes its referral.
         source: 'record-referral-ruling', declaredActor: actor, channel, findingKey: ledgerFindingKey(r.key), ruling: r.result }));
