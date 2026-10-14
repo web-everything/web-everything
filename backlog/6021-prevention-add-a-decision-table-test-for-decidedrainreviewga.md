@@ -3,11 +3,13 @@ bornAs: xobnfjb
 kind: story
 size: 3
 parent: "4075"
-status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+status: resolved
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/drain-review-gate-decision-table.test.mjs", "we:scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs", "we:scripts/lib/__tests__/human-clearance-carry.test.mjs"]
 dateOpened: "2026-10-13"
 preparedDate: "2026-10-14"
 preparedAgainstSha: "2f7ed11557946d5ddf986535fd7e88a4894c0560"
+dateStarted: "2026-10-14"
+dateResolved: "2026-10-14"
 tags: []
 ---
 
@@ -77,3 +79,4 @@ With the new test file present, `git stash` the one-line fix in we:scripts/merge
 2026-10-14 re-prepare: stamp stale (7372a0e0 vs main 2f7ed115). Re-checked: gate logic and `!== false` / `=== undefined` defaults unchanged (only the drain concurrency commit 1162e0054 touched the file); no decision-table test exists. Citations shifted and were corrected in Design (836→840, 850-852→854-856, callers →5299/5685, workflowReadOptions →4883). Goal and plan unchanged. Re-stamped.
 2026-10-14 re-prepare: stamp stale (7372a0e0 vs main 2f7ed115). Re-checked: gate logic and the `!== false` / `=== undefined` defaults are unchanged (only drain-concurrency commit 1162e0054 touched the file); still no decision-table test. Citations shifted and were corrected in Design (836→840, 850-852→854-856, callers →5299/5685, workflowReadOptions →4883). Goal and plan unchanged. Re-stamped.
 2026-10-14 review: adversarial pass fixed MVP 2b (per-view listedHeadSha, missing-clone cases), made the Proof plan dry-run concrete, noted the endpoint and loosening hints are n/a.
+2026-10-14 build: `filesComplete` now needs `=== true` plus a non-empty `listedHeadSha` matching the acceptance head (we:scripts/merge-ai-prs.mjs); 34-case decision table (with wiring tests for the production listing and both call sites) added (we:scripts/__tests__/drain-review-gate-decision-table.test.mjs), 10 of 34 red without the fix, all green with it; existing tests that passed `files` alone now pass the explicit flags. The live `--dry-run` comparison was not run (needs GitHub reads); production callers already pass the strict flags (pinned by the wiring tests), so live behavior is unchanged.
