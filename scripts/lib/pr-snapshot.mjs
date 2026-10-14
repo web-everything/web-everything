@@ -45,7 +45,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
-import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry } from './gh-throttle.mjs';
+import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry, WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
 import {
   PR_SNAPSHOT_VERSION, prSnapshotEnabled, prSnapshotDir, snapshotKey, snapshotPath, readSnapshotFile, latestDirtyMs,
 } from './pr-snapshot-store.mjs';
@@ -61,6 +61,16 @@ export const SNAPSHOT_FIELDS = Object.freeze([
 /** Smoke-only controls; unset keeps the normal snapshot read unchanged. */
 export const WE_PR_SNAPSHOT_SAMPLE = 'WE_PR_SNAPSHOT_SAMPLE';
 export const WE_PR_SNAPSHOT_STALE_OK_MS = 'WE_PR_SNAPSHOT_STALE_OK_MS';
+/** Controls that must not escape into a refresh which can outlive the smoke. */
+export const SMOKE_SCOPED_ENV_KEYS = Object.freeze([
+  WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS,
+  'WE_SMOKE_LIVE_CLONE', 'WE_SMOKE_PR_SAMPLE', 'WE_SMOKE_SNAPSHOT_STALE_OK_MS',
+]);
+function refreshEnv(env) {
+  const clean = { ...env };
+  for (const key of SMOKE_SCOPED_ENV_KEYS) delete clean[key];
+  return clean;
+}
 const refreshStarted = new Set();
 let sampleLogged = false;
 let candidateDefaultsLogged = false;
@@ -103,9 +113,7 @@ function smokeProjection(snap, fields, env) {
 function detachedRefresh({ repo, fields, env, dir }) {
   // The injected seam can observe scheduling in tests; real background processes never run there.
   if (isUnderTest(env) || isUnderTest()) return;
-  const childEnv = { ...process.env, ...env, WE_PR_SNAPSHOT_DIR: dir };
-  delete childEnv[WE_PR_SNAPSHOT_SAMPLE];
-  delete childEnv[WE_PR_SNAPSHOT_STALE_OK_MS];
+  const childEnv = refreshEnv({ ...process.env, ...env, WE_PR_SNAPSHOT_DIR: dir });
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--refresh', `--repo=${repo}`, `--fields=${fields.join(',')}`], {
     detached: true, stdio: 'ignore', env: childEnv,
   });
@@ -313,9 +321,9 @@ export function writeShaCache({ repo, num, sha, kind, value, env = process.env, 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv.includes('--refresh')) {
   const repo = process.argv.find(arg => arg.startsWith('--repo='))?.slice('--repo='.length);
   const fields = process.argv.find(arg => arg.startsWith('--fields='))?.slice('--fields='.length);
-  const env = { ...process.env };
-  delete env[WE_PR_SNAPSHOT_SAMPLE];
-  delete env[WE_PR_SNAPSHOT_STALE_OK_MS];
+  const env = refreshEnv(process.env);
+  // gh readers inherit process.env; scrubbing only the local snapshot options cannot force fresh gh reads.
+  for (const key of SMOKE_SCOPED_ENV_KEYS) delete process.env[key];
   try {
     if (readSharedOpenPrs({ repo, fields, env, ttlMs: 0 }) === null) process.exitCode = 1;
   } catch (e) {

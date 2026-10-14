@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, utimesSync, readFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, utimesSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import * as snapshot from '../pr-snapshot.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS } from '../pr-snapshot.mjs';
 import { snapshotPath, PR_SNAPSHOT_VERSION, snapshotKey } from '../pr-snapshot-store.mjs';
 
@@ -18,7 +20,7 @@ let dir;
 let repo;
 let sequence = 0;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'snapshot-smoke-')); repo = `fixture/repo-${sequence++}`; });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); });
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 const options = (extra = {}) => ({ repo, dir, fields: ['number'], now: () => clock,
   ...extra, env: { WE_UNDER_TEST: '1', ...extra.env } });
 function seed(age = 1000, dirty = false, rows = prs) {
@@ -36,6 +38,74 @@ function emptyExec() {
 }
 
 describe('smoke snapshot reads', () => {
+  it('scrubs ambient smoke controls from gh reads in the direct --refresh CLI', () => {
+    const binDir = join(dir, 'bin');
+    const memoDir = join(dir, 'memo');
+    const capture = join(dir, 'gh-env.json');
+    mkdirSync(binDir); mkdirSync(memoDir);
+    const bin = join(binDir, 'gh');
+    writeFileSync(bin, `#!/usr/bin/env node
+const { writeFileSync } = require('node:fs');
+writeFileSync(process.env.REFRESH_TEST_CAPTURE, JSON.stringify(Object.keys(process.env)
+  .filter(key => ${JSON.stringify(['WE_GH_READ_MEMO_DIR', 'WE_PR_SNAPSHOT_SAMPLE', 'WE_PR_SNAPSHOT_STALE_OK_MS',
+    'WE_SMOKE_LIVE_CLONE', 'WE_SMOKE_PR_SAMPLE', 'WE_SMOKE_SNAPSHOT_STALE_OK_MS'])}.includes(key))));
+process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: {
+  nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }
+} } } }));
+`);
+    chmodSync(bin, 0o755);
+    execFileSync(process.execPath, [new URL('../pr-snapshot.mjs', import.meta.url).pathname,
+      '--refresh', `--repo=${repo}`, '--fields=number'], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, REFRESH_TEST_CAPTURE: capture,
+        GH_TOKEN: 'refresh-test-token', WE_GH_THROTTLE_PERSONAL_ROUTE: '0', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'locks'),
+        WE_PR_SNAPSHOT_DIR: dir, WE_GH_READ_MEMO_DIR: memoDir, WE_PR_SNAPSHOT_SAMPLE: '1',
+        WE_PR_SNAPSHOT_STALE_OK_MS: '900000', WE_SMOKE_LIVE_CLONE: '1', WE_SMOKE_PR_SAMPLE: '1',
+        WE_SMOKE_SNAPSHOT_STALE_OK_MS: '900000' },
+    });
+    expect(JSON.parse(readFileSync(capture, 'utf8'))).toEqual([]);
+    expect(readdirSync(memoDir)).toEqual([]);
+    expect(JSON.parse(readFileSync(snapshotPath(dir, repo), 'utf8')).prs).toEqual([]);
+  });
+
+  it('scrubs smoke controls from the real detached refresh launch while preserving auth and snapshot storage', () => {
+    seed(600000);
+    const keys = ['WE_GH_READ_MEMO_DIR', 'WE_PR_SNAPSHOT_SAMPLE', 'WE_PR_SNAPSHOT_STALE_OK_MS',
+      'WE_SMOKE_LIVE_CLONE', 'WE_SMOKE_PR_SAMPLE', 'WE_SMOKE_SNAPSHOT_STALE_OK_MS'];
+    const env = { ...Object.fromEntries(keys.map(key => [key, 'override'])),
+      WE_PR_SNAPSHOT_STALE_OK_MS: '900000', GH_TOKEN: 'refresh-auth' };
+    // Exercise the actual detached launch in native Node, replacing only spawn; no background child or gh runs.
+    const script = `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      let launch, unref = false, errorHandler = false;
+      cp.spawn = (cmd, args, opts) => {
+        launch = { cmd, args, ...opts };
+        return { on(event, handler) { errorHandler = event === 'error' && typeof handler === 'function'; },
+          unref() { unref = true; } };
+      };
+      syncBuiltinESMExports();
+      delete process.env.VITEST; delete process.env.WE_UNDER_TEST;
+      const snapshot = await import(${JSON.stringify(new URL('../pr-snapshot.mjs', import.meta.url).href)});
+      const rows = snapshot.readSharedOpenPrs({ repo: ${JSON.stringify(repo)}, dir: ${JSON.stringify(dir)},
+        fields: ['number'], now: () => ${clock},
+        env: { ...${JSON.stringify(env)}, WE_GH_THROTTLE_LOCK_ROOT: ${JSON.stringify(dir)} } });
+      console.log(JSON.stringify({ launch, count: rows.length, unref, errorHandler }));
+    `;
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8', env: { ...process.env, ...Object.fromEntries(keys.map(key => [key, 'ambient'])) },
+    }));
+    expect(result.count).toBe(4);
+    expect(result.launch).toMatchObject({ cmd: process.execPath, detached: true, stdio: 'ignore' });
+    expect(result.launch.args).toContain('--refresh');
+    const childEnv = result.launch.env;
+    expect(snapshot.SMOKE_SCOPED_ENV_KEYS).toEqual(expect.arrayContaining(keys));
+    for (const key of snapshot.SMOKE_SCOPED_ENV_KEYS) expect(childEnv).not.toHaveProperty(key);
+    expect(childEnv.GH_TOKEN).toBe('refresh-auth');
+    expect(childEnv.WE_PR_SNAPSHOT_DIR).toBe(dir);
+    expect(result.errorHandler).toBe(true);
+    expect(result.unref).toBe(true);
+  });
+
   it('applies candidate defaults to marked dry-run children and logs them once', () => {
     const rows = Array.from({ length: 16 }, (_, i) => ({ number: 16 - i, createdAt: prs[0].createdAt }));
     seed(600000, true, rows);

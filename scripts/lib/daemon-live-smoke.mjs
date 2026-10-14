@@ -813,6 +813,7 @@ export async function runLiveSmoke({
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
+  makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -839,7 +840,10 @@ export async function runLiveSmoke({
       console.error(`daemon-live-smoke: smoke-dry-run ${JSON.stringify(dryRun)}`);
     }
   } catch { /* logging never changes the smoke */ }
-  const memoDir = readMemo.enabled ? mkdtempSync(join(tmpdir(), 'smoke-read-memo-')) : null;
+  let memoDir = null;
+  try {
+    if (readMemo.enabled) memoDir = makeReadMemoDir();
+  } catch { /* Optional acceleration: run every check without a memo if tmp storage is unavailable. */ }
   try {
     const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
     if ([WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS].some(key => key in env)) {
