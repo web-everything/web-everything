@@ -637,8 +637,8 @@ describe('human clearance numbering tier', () => {
       expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
       expect(posted).toHaveLength(1);
     });
-    it('never records a numbering carry without a live re-read', () => {
-      const { result, posted } = apply();
+    it.each([false, true])('never records a numbering carry without a live re-read (dry run: %s)', (dryRun) => {
+      const { result, posted } = apply({ dryRun });
       expect(result).toBeNull();
       expect(posted).toEqual([]);
     });

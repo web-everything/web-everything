@@ -334,13 +334,18 @@ export function applyHumanClearanceCarry({
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };
+  // The proof is slow (fetches, blob reads): a hold posted meanwhile would sit BEFORE this record and read as
+  // superseded. The numbering tier (new with #5233) never records without a live re-read — checked before the dry
+  // run so a preview never reports a carry the real pass refuses; the older tiers re-read whenever the caller
+  // supplies one.
+  if (d.tier === 'numbering' && typeof readLiveEvidence !== 'function') {
+    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the numbering tier records only after a live re-read\n`);
+    return null;
+  }
   if (dryRun) {
     log(`  human-clearance-carry ${tag}: WOULD carry ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; tier ${d.tier}; dry run, no record)\n`);
     return { carried };
   }
-  // The proof is slow (fetches, blob reads): a hold posted meanwhile would sit BEFORE this record and read as
-  // superseded. The numbering tier (new with #5233) never records without a live re-read; the older tiers re-read
-  // whenever the caller supplies one.
   if (typeof readLiveEvidence === 'function') {
     const changed = liveCarryChange({ readLiveEvidence, carried: d });
     if (changed) {
@@ -348,9 +353,6 @@ export function applyHumanClearanceCarry({
       return { action: 'defer', applyLabel: null,
         reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
     }
-  } else if (d.tier === 'numbering') {
-    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the numbering tier records only after a live re-read\n`);
-    return null;
   }
   const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
   try {
