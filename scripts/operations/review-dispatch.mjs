@@ -549,7 +549,7 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
  * @returns {{sessionId: string, sessionSlug: string, pr: number, repo: string, prompt: string, unknownTokens: string[]}}
  */
 export function dispatchReview({
-  ciGate = readReviewCiGate,
+  ciGate = readReviewCiGate, advisoryCiWaiver = null,
   pr, repo, root = REPO_ROOT,
   readBrief = (r) => readFileSync(reviewBriefPath(r), 'utf8'),
   mintSessionId = () => randomUUID(),
@@ -601,7 +601,12 @@ export function dispatchReview({
     );
   }
   const ci = ciGate({ repo: planned.repo, pr: planned.pr });
-  if (!ci?.allowed) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
+  // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
+  const waived = typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+    && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
+    && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
+    && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
+  if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const { prompt, unknownTokens } = fillReviewBrief(readBrief(root), {
     PR: planned.pr, REPO: planned.repo, LANE_REPO: planned.laneRepo, SESSION_SLUG: planned.sessionSlug, JUDGE_PROVIDER: judgeProvider,
     // #4174 — the checkout this dispatch is FROM, same as `root` always was; needed now that the session's

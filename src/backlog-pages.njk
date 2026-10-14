@@ -34,6 +34,7 @@ eleventyComputed:
         <div class="plug-status" style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 0.5rem;">
             {{ bk.kindBadge(item.kind, 'md') }}
             {{ bk.statusBadge(item.status, 'md') }}
+            {{ bk.closedBadge(item) }}
             {{ bk.buildStateBadge(item.buildState, 'md') }}
             {{ bk.reasonPill(item, 'md') }}
             {% if item.size %}{{ bk.metaBadge('Size', item.size) }}{% endif %}

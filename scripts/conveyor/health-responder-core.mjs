@@ -60,6 +60,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "open-prs-over-limit": "Preserve existing backpressure; never raise/disable the PR limit.",
   "pass-failing-repeatedly": "A failing pass is fixed in the pass itself via normal delivery; never rerun the pass, raise its heap or restart the daemon from the responder.",
   "pr-events-stale":"Existing polling fallback owns availability; no webhook/token/deployment edits.",
+  "pr-no-movement": "Liveness findings require the operator op from the liveness sweep; never grant rounds, change labels or bypass gates from the responder.",
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
   "pre-existing-red-on-main": "A failing test on main is fixed on main via the filed card; the responder never edits tests or the gate.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",

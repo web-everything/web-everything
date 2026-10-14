@@ -426,7 +426,7 @@ export async function runProbationBuild(args, io) {
     let rescoped = null;
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
-      const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile }), lanePath);
+      const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
       modelEvidence = run.modelEvidence ?? {};
       workerRan = true;
       // x55dojc — checked BEFORE the `run.ok` gate below on purpose: even a worker that crashed or timed out
@@ -606,7 +606,7 @@ export async function runProbationBuild(args, io) {
             'Reject scope creep, weakened tests, incorrect fixes, or work that is not simple and mechanical.',
             item.spec, io.diffText(lanePath, baseSha),
           ].join('\n\n'));
-          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask }), lanePath));
+          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath));
           checkerRow = { provider: worker.checker, verdict: verdict.verdict, reason: verdict.reason };
           const checkerHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
           if (checkerHooks.changed) {

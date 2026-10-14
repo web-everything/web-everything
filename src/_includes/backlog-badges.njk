@@ -41,6 +41,11 @@
 {% macro statusBadge(status, scale='sm') %}{% set tone = 'warning' if status == 'open' else ('info' if (status == 'active' or status == 'preparing') else ('success' if status == 'resolved' else 'neutral')) %}<we-badge tone="{{ tone }}">{% if status == 'preparing' %}Prepping{% else %}{{ status | title }}{% endif %}</we-badge>
 {% endmacro %}
 
+{# Closure stays a Status Indicator, including its reason and survivor pointer. #}
+{% macro closedBadge(item) %}
+{% if item.status == 'closed' %}<we-badge tone="neutral">Closed — {% if item.closedReason == 'duplicate' %}duplicate of {% if item.closedIntoTarget %}<a href="{{ item.closedIntoTarget.url }}" title="{{ item.closedIntoTarget.title }}">#{{ item.closedIntoTarget.num }}</a>{% else %}#{{ item.closedInto }}{% endif %}{% elif item.closedReason == 'fixed-elsewhere' %}fixed elsewhere{% if item.closedBy %} ({{ item.closedBy }}){% endif %}{% elif item.closedReason == 'obsolete' %}obsolete{% elif item.closedReason == 'wont-do' %}won't do{% endif %}</we-badge>{% endif %}
+{% endmacro %}
+
 {# BUILD STATE badge (#2474 → #2472) — the first "backlog-driven console" increment: where the item sits in
    the LOCAL loop pipeline, joined from the batch skill's offline loop-state files (claims.json / queued.json)
    by src/_data/backlog.js `deriveBuildState`. `bs` is that item's `buildState` object `{ state, session? }`.
@@ -91,7 +96,7 @@
    ⚠ open slice. ONE place so the tile and the detail page read identically. #}
 {% macro epicStatusBadge(item, scale='sm') %}
 {% if item.kind == 'epic' or item.kind == 'feature' %}
-{%- if item.ongoing and item.status != 'resolved' -%}
+{%- if item.ongoing and item.status != 'resolved' and item.status != 'closed' -%}
 <we-badge tone="info" title="Ongoing program — a continuous effort, not a fixed deliverable. It legitimately has every child resolved between slices and is NEVER a resolve cue; the next slice is added as the program advances.">ongoing program</we-badge>
 {%- elif not (item.children | length) -%}{{ unslicedBadge(item.childlessReason, scale) }}
 {%- elif item.openChildCount == 0 and (item.status == 'open' or item.status == 'active') -%}
@@ -112,7 +117,7 @@
    clickable above a card overlay (harmless on the detail page). #}
 {% macro childCircle(child) %}
 {% set bg = "#f1f5f9" %}{% set bd = "#94a3b8" %}{% set fg = "#475569" %}
-{% if child.status == 'resolved' %}{% set bg = "#f8fafc" %}{% set bd = "#cbd5e1" %}{% set fg = "#475569" %}
+{% if child.status == 'resolved' or child.status == 'closed' %}{% set bg = "#f8fafc" %}{% set bd = "#cbd5e1" %}{% set fg = "#475569" %}
 {% elif child.status == 'active' %}{% set bg = "#dbeafe" %}{% set bd = "#2563eb" %}{% set fg = "#1e40af" %}
 {% elif child.status == 'preparing' %}{% set bg = "#ede9fe" %}{% set bd = "#7c3aed" %}{% set fg = "#6d28d9" %}
 {% elif child.tier == 'A' %}{% set bg = "#dcfce7" %}{% set bd = "#16a34a" %}{% set fg = "#166534" %}

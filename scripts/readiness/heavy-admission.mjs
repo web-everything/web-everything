@@ -97,7 +97,7 @@
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
  * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
- * Cap, fastSlots and fastScale use one host-wide resolver (standard → platform preferences); their env and
+ * Cap, fastSlots, fastScale and priority use one host-wide resolver (standard → platform preferences); their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
@@ -123,10 +123,11 @@
  *     delivery-priority scale. Its marker records the class; every waiter yields to a live P0 marker; P0 waiters
  *     rank FCFS among themselves in one queue across both lanes and may take any free slot, heavy or fast. A
  *     running holder is never preempted. `heavyAdmission.priority.mode` (enforce|off) and the patterns resolve
- *     standard → platform → tool → env (WE_HEAVY_ADMISSION_PRIORITY / WE_HEAVY_ADMISSION_REPAIR_PATTERNS, a JSON
- *     array), and the P0 / yield log lines name the mode's source. Patterns are bounded (≤16 patterns, ≤200 chars each, no repeat nested
- *     in a repeat, no backreference — else the whole list is invalid and the standard patterns apply), and every match
- *     runs under a 50 ms vm timeout inside a 150 ms budget per classification, so an operator pattern can never stall admission;
+ *     standard → platform on the shared host pool. Tool/env overrides (WE_HEAVY_ADMISSION_PRIORITY /
+ *     WE_HEAVY_ADMISSION_REPAIR_PATTERNS, a JSON array) apply only to private pools; ignored shared overrides
+ *     are diagnosed. P0 / yield log lines name the mode's source. Patterns select exact built-in families or
+ *     anchored literal repair identities (≤16 patterns, ≤200 chars each); an invalid list preserves the previous
+ *     valid layer. Every match runs under a 50 ms vm timeout inside a 150 ms matching budget after validation;
  *   • THE FAST LANE: short kinds (selected / files / standards) rank first-come-first-served among themselves.
  *     The fastSlots setting adds capacity above cap (default 2 heavy + 1 fast); short jobs can also take heavy
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
@@ -236,8 +237,8 @@ const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that only shape what THIS caller does (never the shared slot range), so their env applies anywhere. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'priority.mode', 'priority.repairPatterns']);
+/** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
+const PER_CALLER_LEAVES = new Set(['onTimeout']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
@@ -284,9 +285,10 @@ export function privateAdmissionPool(env, checkoutRoot) {
 }
 
 /**
- * PURE: valid leaves override standard → platform → tool → env. Capacity leaves (everything but onTimeout) of
+ * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
- * give two callers of one pool different caps. A private pool (see {@link privateAdmissionPool}) keeps both.
+ * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
+ * keeps both local override layers.
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
@@ -304,7 +306,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
-      else invalid.push(`${layer}.${leaf}=${JSON.stringify(v)}`);
+      else invalid.push(`${layer}.${leaf}=${oneLine(JSON.stringify(v))}`);
     }
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
@@ -314,7 +316,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       } else {
         const v = parseAdmissionEnv(leaf, raw);
         if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
-        else invalid.push(`env ${name}=${JSON.stringify(raw)}`);
+        else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }
     const dot = leaf.indexOf('.');
@@ -329,7 +331,7 @@ const platformLastGood = new Map(); // path → last successfully parsed heavyAd
 const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
- * On the shared host pool the platform file is the ONE capacity source, so every caller must read the SAME file:
+ * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test). A read that fails keeps the last
  * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
