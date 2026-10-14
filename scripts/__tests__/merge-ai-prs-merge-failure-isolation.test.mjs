@@ -11,7 +11,7 @@ import * as drain from '../merge-ai-prs.mjs';
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const source = readFileSync(script, 'utf8');
 const catchStart = source.indexOf('} catch (e) {', source.indexOf('// #2412 Gap 2 — the before-land trace'));
-const catchEnd = source.indexOf('\n      }\n      if (!progressed) break;', catchStart);
+const catchEnd = source.indexOf('\n      }\n        },\n      });', catchStart);
 const mergeCatch = source.slice(catchStart, catchEnd);
 
 const fakeGh = `#!/usr/bin/env node
