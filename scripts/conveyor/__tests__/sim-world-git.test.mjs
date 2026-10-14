@@ -5,7 +5,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
 
@@ -13,7 +14,9 @@ const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
   it('isolates throttle windows across worlds whose clocks move backwards', async () => {
-    const throttle = new URL('../../lib/gh-throttle.mjs', import.meta.url).href;
+    // cwd-based: under the default vitest transform `import.meta.url` is an http: URL, which neither
+    // `import()` in a child node nor `readFileSync` accepts.
+    const throttle = pathToFileURL(resolve(process.cwd(), 'scripts/lib/gh-throttle.mjs')).href;
     const roots = [];
     const inherited = process.env.WE_GH_THROTTLE_LOCK_ROOT;
     for (const clockStartOffsetMs of [11 * 60_000, 0]) {
@@ -49,7 +52,7 @@ describe('simulator git and budget regressions', () => {
     mkdirSync(shim, { recursive: true });
     const liveTool = 'sim-live-shim-only-tool';
     writeFileSync(join(shim, liveTool), '');
-    const policy = JSON.parse(readFileSync(new URL('../../lib/dispatch-routing-policy.json', import.meta.url), 'utf8'));
+    const policy = JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/lib/dispatch-routing-policy.json'), 'utf8'));
     policy.aliases.claude.haiku = 'model-only-in-the-launcher-checkout';
     const oldSnapshot = process.env.WE_DISPATCH_ROUTING_SNAPSHOT;
     const oldPath = process.env.PATH;
