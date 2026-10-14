@@ -1,7 +1,7 @@
 /**
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -56,6 +56,7 @@ function setup(extra = {}) {
     cwd: '/clone', localSlug: REPO, scriptRoot: () => '/code', env: {},
     now: () => time, spawnImpl, log: (line) => lines.push(line),
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
+    readQueueDepth: async () => ({ ok: true, queued: 0 }),
     readPr: async () => READY_PR,
     readMembership: async () => ({ ok: true, inQueue: true, entry: { position: 1, state: 'QUEUED' }, lastEvents: [] }),
     ...extra,
@@ -314,7 +315,7 @@ describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)'
   });
 });
 
-const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, maxQueued: 3, order: 'priority-then-first-accept' } };
+const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, concurrency: 1, maxQueued: 3, order: 'priority-then-first-accept' } };
 const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, ...extra });
 const catchUpSetup = (extra = {}) => setup({
   resolveSetting: () => CATCH_UP_SETTING,
@@ -555,7 +556,7 @@ describe('catch-up handle', () => {
       await handle[method]();
       advance(10 * 60_000);
     }
-    expect(wakeReads).toEqual([1, 2, 1, 2, 1, 2]);
+    expect(wakeReads).toEqual([1, 2, 1, 3, 1, 2, 1, 3, 1, 2, 1, 3]);
     expect(calls.map(c => c.args[1])).toEqual(['--only=2', '--only=2', '--only=2']);
   });
 
@@ -633,7 +634,7 @@ describe('catch-up handle', () => {
     expect(handle.pending().map(p => p.num)).toEqual([1]);
   });
 
-  it('runs at the first opportunity, oldest first within room, then only every interval', async () => {
+  it('runs at the first opportunity, oldest first within room, and uses the busy interval for remaining work', async () => {
     let reads = 0;
     const { handle, calls, lines, advance } = catchUpSetup({ readCandidates: async () => {
       reads++;
@@ -648,10 +649,10 @@ describe('catch-up handle', () => {
     expect(handle.lastCatchUpAt()).toBe(1000);
     advance(60_000);
     await handle.tick();
-    expect(reads).toBe(1);
+    expect(reads).toBe(2);
     advance(9 * 60_000);
     await handle.tick();
-    expect(reads).toBe(2);
+    expect(reads).toBe(3);
   });
 
   it.each([false, undefined])('does not read when catchUp.enabled is %s', async (enabled) => {
@@ -1138,5 +1139,155 @@ describe('BLOCKED catch-up back-off', () => {
     const { handle, advance } = blockedSetup({ readCandidates: async () => ({ ok: true, queued: 0, prs }) });
     await handle.catchUp(); prs = []; advance(600_000); await handle.catchUp();
     expect(handle.blocked().size).toBe(0);
+  });
+});
+
+
+describe('concurrent catch-up rounds', () => {
+  const concurrent = (extra = {}) => catchUpSetup({
+    manualFinish: true,
+    resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3, busyIntervalSeconds: 60 } }),
+    readCapacity: () => ({ capacity: 8, source: 'test' }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4, 5].map(n => candidate(n, n)) }),
+    ...extra,
+  });
+  const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+
+  it.each([1, 3])('bounds active drains at concurrency %s and suppresses repeated events for an active PR', async concurrency => {
+    const { handle, calls, children, advance } = concurrent({
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency } }),
+    });
+    const round = handle.tick();
+    await flush();
+    expect(calls).toHaveLength(concurrency);
+    handle.notePoll({ ok: true, marked: [mark(1)] });
+    advance(15_000);
+    children[0].finish();
+    await flush();
+    expect(calls).toHaveLength(concurrency + 1);
+    for (let i = 1; i < 5; i++) { children[i]?.finish(); await flush(); }
+    await round;
+    expect(calls.map(c => c.args[1])).toEqual([1, 2, 3, 4, 5].map(n => `--only=${n}`));
+  });
+
+  it('rechecks room before each start, accounting for active reservations', async () => {
+    let reads = 0;
+    const { handle, calls, children } = concurrent({ readQueueDepth: async () => ({ ok: true, queued: ++reads === 1 ? 0 : 7 }) });
+    const round = handle.catchUp();
+    await flush();
+    expect(calls).toHaveLength(1);
+    children[0].finish();
+    await round;
+    expect(calls).toHaveLength(1);
+    expect(reads).toBeGreaterThan(1);
+  });
+
+  it('stops new starts after batching defers without cancelling siblings', async () => {
+    const { handle, calls, children } = concurrent({ drainResult: num => num === 1
+      ? { enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'full' }] }
+      : { toMerge: [{ num }] } });
+    const round = handle.catchUp();
+    await flush();
+    expect(calls).toHaveLength(3);
+    children[0].finish();
+    await flush();
+    expect(calls).toHaveLength(3);
+    children[1].finish(); children[2].finish();
+    expect(await round).toHaveLength(3);
+  });
+
+  it('isolates child failure and kills every active child on shutdown', async () => {
+    const { handle, calls, children } = concurrent();
+    const round = handle.catchUp();
+    await flush();
+    children[0].emit('error', new Error('failed'));
+    await flush();
+    expect(calls).toHaveLength(4);
+    let killed = 0;
+    for (const c of children.slice(1)) c.kill = () => { killed++; c.emit('close', 143); };
+    handle.kill();
+    await flush();
+    children[4]?.finish();
+    await round;
+    expect(killed).toBe(3);
+  });
+
+  it('uses the busy interval from round completion when room and runnable work remain', async () => {
+    let listings = 0;
+    const { handle, advance } = concurrent({ manualFinish: false,
+      readCandidates: async () => { listings++; return { ok: true, queued: 0, prs: [candidate(1)] }; },
+      drainJson: { failed: [{ num: 1 }] },
+    });
+    await handle.catchUp();
+    advance(59_000);
+    await handle.catchUp();
+    expect(listings).toBe(1);
+    advance(1000);
+    await handle.catchUp();
+    expect(listings).toBe(2);
+  });
+
+  it('waits the full interval when live room is full or remaining PRs are queued', async () => {
+    for (const snapshot of [{ ok: true, queued: 8 }, { ok: true, queued: 1, queuedNums: [1] }]) {
+      let listings = 0;
+      const { handle, advance } = concurrent({ manualFinish: false,
+        readQueueDepth: async () => snapshot,
+        readCandidates: async () => { listings++; return { ok: true, queued: 0, prs: [candidate(1)] }; },
+      });
+      await handle.catchUp();
+      advance(60_000);
+      await handle.catchUp();
+      expect(listings).toBe(1);
+      advance(540_000);
+      await handle.catchUp();
+      expect(listings).toBe(2);
+    }
+  });
+
+  it('measures the busy delay after a long round completes', async () => {
+    let listings = 0;
+    const { handle, children, advance } = concurrent({
+      readCandidates: async () => { listings++; return { ok: true, queued: 0, prs: [candidate(1)] }; },
+      drainJson: { failed: [{ num: 1 }] },
+    });
+    const round = handle.catchUp();
+    await flush();
+    advance(20 * 60_000);
+    children[0].finish();
+    await round;
+    await handle.catchUp();
+    expect(listings).toBe(1);
+    advance(60_000);
+    const next = handle.catchUp();
+    await flush();
+    expect(listings).toBe(2);
+    children[1].finish();
+    await next;
+  });
+
+  it('a timed out PR frees only its own slot while siblings keep running', async () => {
+    vi.useFakeTimers();
+    try {
+      const { handle, children, calls } = concurrent({ timeoutMs: 1000 });
+      const round = handle.catchUp();
+      await flush();
+      const killed = [];
+      children.forEach((child, index) => { child.kill = () => { killed.push(index); child.emit('close', 143); }; });
+      children[1].finish(); children[2].finish();
+      await flush();
+      expect(calls).toHaveLength(5);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(killed).toEqual([0]);
+      children[3].finish(); children[4].finish();
+      expect(await round).toHaveLength(5);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('cascade-resolves and logs the new leaves and rejects invalid values', () => {
+    const s = resolveSetting({ catchUp: { concurrency: 1 } }, { platform: { catchUp: { concurrency: 5, busyIntervalSeconds: 30 } } });
+    expect(s.catchUp).toMatchObject({ concurrency: 1, busyIntervalSeconds: 30 });
+    expect(s.line).toContain('catchUp.concurrency=1 (tool)');
+    expect(s.line).toContain('catchUp.busyIntervalSeconds=30 (platform)');
+    expect(resolveSetting({ catchUp: { concurrency: 0, busyIntervalSeconds: -1 } }).catchUp).toMatchObject({ concurrency: 3, busyIntervalSeconds: 60 });
   });
 });
