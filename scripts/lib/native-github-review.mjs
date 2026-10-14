@@ -429,8 +429,8 @@ export function fileDismissalQueue(path, { now = () => Date.now(), alive = pidAl
           const held = owner.get(entry);
           if (!held) return true;
           if (held.lost) return false;
-          const next = claimName(held.id);
-          try { renameSync(held.claim, next); held.claim = next; return true; }
+          // Any failure, naming included, counts as lost: done() then leaves the file for a later drainer.
+          try { const next = claimName(held.id); renameSync(held.claim, next); held.claim = next; return true; }
           catch { held.lost = true; return false; }
         },
         done() {
