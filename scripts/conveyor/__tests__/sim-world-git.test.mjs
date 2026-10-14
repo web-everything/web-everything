@@ -2,6 +2,7 @@
  * @file Pins no-clone commitToMain/createBranch plumbing, the slim sim template,
  * and the whole-scenario budget error.
  */
+import { mkdirSync, utimesSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
@@ -9,6 +10,26 @@ import { scenario, runScenario } from './sim/scenario.mjs';
 const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
+  it('recovers an orphan fake-gh lock during a fix-dispatch tick', async () => {
+    await runScenario(scenario('fix-dispatch orphan lock', {
+      repos: ['we'],
+      lanes: 1,
+      daemons: ['fix-dispatch'],
+      play: [(w) => {
+        const lock = `${w.env.FAKE_GH_STORE}.lock`;
+        mkdirSync(lock);
+        const past = new Date(performance.timeOrigin + performance.now() - 60_000);
+        utimesSync(lock, past, past);
+      }, 'tick fix-dispatch'],
+      expect(s) {
+        const ticks = s.ticks('fix-dispatch');
+        expect(ticks).toHaveLength(1);
+        expect(ticks[0].error).toBeNull();
+        expect(ticks[0].ms).toBeLessThan(60_000);
+      },
+    }), { budgetMs: 60_000 });
+  }, 90_000);
+
   it('writes exact blobs and advances branches only by fast-forward', async () => {
     await runScenario(scenario('bare-origin writes', {
       lanes: 1,

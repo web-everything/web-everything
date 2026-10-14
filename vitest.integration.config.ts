@@ -127,6 +127,7 @@ export default defineConfig({
       'scripts/operations/__tests__/fake-claude-sessions.test.mjs',
       // #3383 — the stateful fake-GitHub's own proof: real bare origin/clone + real `execFileSync('gh', …)`.
       'scripts/conveyor/__tests__/fake-gh-state.test.mjs',
+      'scripts/conveyor/__tests__/fake-gh-lock.test.mjs',
       // #xpc3krl — the #2949 fidelity qualifier against the REAL `gh` binary (see the file's own header):
       // moved here from the default suite because its whole point is a real, unauthenticated `gh` failure,
       // which `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH) would otherwise mask — this tier

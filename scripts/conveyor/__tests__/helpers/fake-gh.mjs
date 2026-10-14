@@ -15,7 +15,7 @@
  *
  * GENERATION 2 — {@link createFakeGithub} (#3383, the daemon-scenario-simulator epic, part 2 "Fake GitHub" —
  * see `reports/2026-09-24-daemon-scenario-simulator.md`) — is a STATEFUL fake GitHub: a real `gh` on `PATH`
- * backed by a JSON store file, guarded by an atomic-mkdir lock, written tmp+rename, with branch/merge facts
+ * backed by a JSON store file, guarded by an atomic-rename lock, written tmp+rename, with branch/merge facts
  * derived at READ TIME from a REAL bare origin repo (never canned). It exists because the simulator needs
  * `gh` calls made by DIFFERENT processes (the daemon hosts, pass scripts, fake agent sessions, and the test's
  * own setup code) to see and mutate the SAME PRs/labels/comments — generation 1's per-fixture canned-JSON
@@ -45,11 +45,12 @@
  */
 
 import {
-  mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync,
+  mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync, statSync, readdirSync,
 } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ============================================================================================================
@@ -170,7 +171,7 @@ const SHIM_PATH = join(HERE, 'fake-gh-shim.mjs');
  *  this fixture (including a `pr merge` that shells a few `git` subprocesses) should ever legitimately hold
  *  the lock this long, short enough that a genuinely wedged test does not hang the whole suite. */
 export const LOCK_STALE_MS = 10_000;
-/** How long a caller will retry the mkdir before giving up and throwing — comfortably above the stale window
+/** How long a caller will retry the acquire before giving up and throwing — comfortably above the stale window
  *  so a legitimate stale-takeover always gets a chance to happen before a caller gives up on it. */
 const LOCK_RETRY_TIMEOUT_MS = 20_000;
 
@@ -181,11 +182,30 @@ export function sleepSyncMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// The simulator shifts Date.now in shim processes, but leaves performance untouched.
+const realNowMs = () => performance.timeOrigin + performance.now();
+const lockTokens = new Map();
+const siblingPath = (lockPath, kind) => `${lockPath}.${kind}-${process.pid}-${randomUUID()}`;
+const removeLockDir = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+
+/** Recover debris left by a killed acquire/release. One directory scan per acquire, best effort. */
+function sweepLockSiblings(lockPath) {
+  try {
+    const parent = dirname(lockPath);
+    const prefixes = ['tmp', 'dead'].map((kind) => `${basename(lockPath)}.${kind}-`);
+    for (const name of readdirSync(parent)) {
+      if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+      try {
+        const path = join(parent, name);
+        if (realNowMs() - statSync(path).mtimeMs > LOCK_STALE_MS) removeLockDir(path);
+      } catch { /* a concurrent sweeper may already have removed it */ }
+    }
+  } catch { /* best effort */ }
+}
+
 /**
- * Acquire the store's lock via atomic `mkdir` (EEXIST is the only correctness-relevant failure mode of
- * `mkdir` — two processes racing it never both succeed). Retries with a short randomized backoff; a lock
- * whose holder record is older than {@link LOCK_STALE_MS} is force-taken (the holder crashed mid-call and
- * would otherwise wedge every future caller forever).
+ * Publish a complete holder record with atomic rename. Retry contention with a short randomized backoff;
+ * stale holders (including unreadable legacy records) are renamed away before removal.
  *
  * @param {string} storePath
  * @returns {string} the lock directory path — pass to {@link releaseStoreLock} to release it
@@ -193,33 +213,64 @@ export function sleepSyncMs(ms) {
 export function acquireStoreLock(storePath) {
   const lockPath = `${storePath}.lock`;
   const holderPath = join(lockPath, 'holder.json');
-  const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS;
+  const deadline = realNowMs() + LOCK_RETRY_TIMEOUT_MS;
+  sweepLockSiblings(lockPath);
   for (;;) {
-    try {
-      mkdirSync(lockPath);
-      writeFileSync(holderPath, JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8');
-      return lockPath;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      try {
-        const holder = JSON.parse(readFileSync(holderPath, 'utf8'));
-        if (Date.now() - holder.at > LOCK_STALE_MS) {
-          rmSync(lockPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-          continue; // retry the mkdir immediately — no need to sleep first, the slot is free now
-        }
-      } catch {
-        // holder.json missing or mid-write (another process is between mkdir and the holder write) — not
-        // yet provably stale, fall through to the ordinary backoff-and-retry below.
-      }
-      if (Date.now() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
-      sleepSyncMs(5 + Math.floor(Math.random() * 15));
+    if (realNowMs() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
+    let lockStat;
+    try { lockStat = statSync(lockPath); } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
     }
+    // POSIX rename can replace an EMPTY directory, so check legacy orphan locks before publishing.
+    if (!lockStat) {
+      const tmp = siblingPath(lockPath, 'tmp');
+      const token = randomUUID();
+      try {
+        mkdirSync(tmp);
+        writeFileSync(join(tmp, 'holder.json'), JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
+        renameSync(tmp, lockPath);
+        lockTokens.set(lockPath, token);
+        return lockPath;
+      } catch (err) {
+        if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(err.code)) throw err;
+      } finally {
+        try { removeLockDir(tmp); } catch { /* best effort */ }
+      }
+      continue;
+    }
+    let at = lockStat.mtimeMs;
+    try {
+      const holder = JSON.parse(readFileSync(holderPath, 'utf8'));
+      if (Number.isFinite(holder.at)) at = holder.at;
+    } catch { /* missing, empty or torn holder: age the directory itself */ }
+    if (realNowMs() - at > LOCK_STALE_MS) {
+      try {
+        // Avoid taking over a replacement that arrived while we read the old holder.
+        const current = statSync(lockPath);
+        if (current.ino !== lockStat.ino || current.dev !== lockStat.dev) continue;
+        const dead = siblingPath(lockPath, 'dead');
+        renameSync(lockPath, dead);
+        try { removeLockDir(dead); } catch { /* the next sweep can finish removal */ }
+        continue;
+      } catch { /* another waiter may have won the takeover */ }
+    }
+    if (realNowMs() > deadline) throw new Error(`fake-gh: timed out acquiring lock ${lockPath}`);
+    sleepSyncMs(5 + Math.floor(Math.random() * 15));
   }
 }
 
-/** Release a lock acquired by {@link acquireStoreLock}. Best-effort: a missing lock dir is not an error. */
+/** Release only our current holder, removing the live path atomically before best-effort cleanup. */
 export function releaseStoreLock(lockPath) {
-  try { rmSync(lockPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ }
+  const token = lockTokens.get(lockPath);
+  if (!token) return;
+  lockTokens.delete(lockPath);
+  try {
+    const holder = JSON.parse(readFileSync(join(lockPath, 'holder.json'), 'utf8'));
+    if (holder.token !== token) return;
+    const dead = siblingPath(lockPath, 'dead');
+    renameSync(lockPath, dead);
+    removeLockDir(dead);
+  } catch { /* best effort: a missing lock dir is not an error */ }
 }
 
 /** The empty store shape — every field a caller might read is present so nothing has to null-check it. */
