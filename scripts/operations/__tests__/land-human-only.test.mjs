@@ -1,0 +1,218 @@
+// @vitest-environment node
+/**
+ * @file land-human-only.test.mjs — card 334: the operator lands an approved human-only (workflow-file) PR the drain
+ *   may not enqueue. Covers the gates and refusals (we:scripts/operations/land-human-only.mjs), the dry-run/no-op
+ *   effect plan, and the sink order: head re-check → label → enqueue as the operator → verify → comment
+ *   (we:scripts/operations/land-human-only-io.mjs).
+ */
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+import {
+  evaluateLandGates, planLandHumanOnly, landHumanOnlyOperation, buildLandComment, LAND_HUMAN_ONLY_EFFECT, LAND_HUMAN_ONLY_MARKER,
+} from '../land-human-only.mjs';
+import { createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv } from '../land-human-only-io.mjs';
+
+const head = 'a'.repeat(40);
+const repo = 'o/r';
+
+function read(over = {}) {
+  return {
+    repo, number: 7, head, defaultBranch: 'main', nodeId: 'PR_node',
+    pr: { state: 'OPEN', isDraft: false, baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' },
+    operatorLogin: 'chalbert', inMergeQueue: false, labelPresent: true, labelDecision: { label: false, reason: null },
+    surface: { hold: true, humanOnly: true, paths: ['.github/workflows/ci.yml'] },
+    gateRows: [{ id: 'candidate-label', status: 'pass', reason: 'ok' }, { id: 'mergeable', status: 'queue', reason: 'queue-owned' },
+      { id: 'pass-cap', status: 'enqueue', reason: 'enqueue-owned' }],
+    gateRowsError: null,
+    requiredChecks: { names: ['merge-gate', 'test'], allowed: true, affected: [] },
+    ...over,
+  };
+}
+const input = (over = {}) => ({ repo, pr: 7, actor: 'chalbert', channel: 'chat', reason: 'land #7 please', 'dry-run': false, ...over });
+
+describe('land-human-only — refusals (nothing is written)', () => {
+  it.each([
+    ['a non-operator actor', {}, { actor: 'someone-else' }, /registered operator login/],
+    ['a blank reason', {}, { reason: '  ' }, /--reason is required/],
+    ['a multi-line channel', {}, { channel: 'a\nb' }, /--channel is required/],
+    ['a credential that is not an operator', { operatorLogin: 'web-everything[bot]' }, {}, /operator-credential/],
+    ['an unreadable credential', { operatorLogin: null, credentialError: 'no stored login' }, {}, /operator credential unreadable/],
+    ['a PR with no human-only surface', { surface: { hold: false } }, {}, /not a human-only PR/],
+    ['an unreadable change list', { surface: { hold: true, humanOnly: false, error: 'listed 1 of 2' } }, {}, /change list unreadable/],
+    ['a drain gate hold', { gateRows: [{ id: 'review-acceptance', status: 'hold', reason: 'human-only: needs clear-human' }] }, {}, /review-acceptance hold/],
+    ['a drain gate fail-closed', { gateRows: [{ id: 'ledger', status: 'fail-closed', reason: 'unread' }] }, {}, /ledger fail-closed/],
+    ['unreadable drain gates', { gateRows: null, gateRowsError: 'PR read failed' }, {}, /drain gate rows unreadable/],
+    ['required checks not green', { requiredChecks: { names: ['test'], allowed: false, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] } }, {}, /test failure/],
+    ['an unreadable required set', { requiredChecks: { names: null, allowed: false } }, {}, /required check set unreadable/],
+    ['a conflicting PR', { pr: { ...read().pr, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } }, {}, /not-conflicting/],
+    ['uncomputed mergeability', { pr: { ...read().pr, mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } }, {}, /re-run/],
+    ['a draft PR', { pr: { ...read().pr, isDraft: true } }, {}, /draft/],
+    ['an absent label the drain would not add', { labelPresent: false, labelDecision: { label: false, reason: 'held' } }, {}, /refuses it \(held\)/],
+  ])('refuses %s', (_name, readOver, inputOver, message) => {
+    expect(() => planLandHumanOnly(read(readOver), input(inputOver))).toThrow(message);
+  });
+});
+
+describe('land-human-only — the plan', () => {
+  it('every gate passing yields label → enqueue → verify → comment, pinned to the head', () => {
+    const v = planLandHumanOnly(read({ labelPresent: false, labelDecision: { label: true, reason: null } }), input());
+    expect(v.gates.every((g) => g.ok)).toBe(true);
+    expect(v.addLabel).toBe(true);
+    expect(v.plan).toEqual(['label ready-to-merge', `enqueue o/r#7 expectedHeadOid=${head} as chalbert`, 'verify isInMergeQueue',
+      'comment on the PR naming the actor and the instruction']);
+  });
+
+  it('a present label is not re-applied', () => {
+    const v = planLandHumanOnly(read(), input());
+    expect(v.addLabel).toBe(false);
+    expect(v.plan[0]).toBe('ready-to-merge already present');
+  });
+
+  it('every gate id is reported', () => {
+    expect(evaluateLandGates(read()).map((g) => g.id)).toEqual(['operator-credential', 'open-on-default-branch', 'human-only-surface',
+      'ready-to-merge-label', 'drain-gates', 'required-checks-green', 'not-conflicting']);
+  });
+
+  it('dry-run and an already-queued PR declare zero effects; a real run declares one', () => {
+    const op = landHumanOnlyOperation({ readLandContext: () => read() });
+    const write = op.steps.find((s) => s.name === 'write').step;
+    expect(write.effects({ verdict: planLandHumanOnly(read(), input({ 'dry-run': true })) })).toEqual([]);
+    const queued = planLandHumanOnly(read({ inMergeQueue: true }), input());
+    expect(queued.noop).toBe(true);
+    expect(write.effects({ verdict: queued })).toEqual([]);
+    const real = write.effects({ verdict: planLandHumanOnly(read(), input()) });
+    expect(real).toHaveLength(1);
+    expect(real[0]).toMatchObject({ type: LAND_HUMAN_ONLY_EFFECT, idempotent: false, payload: { verdict: { head, operatorLogin: 'chalbert' } } });
+  });
+
+  it('the comment names the actor, the channel, the instruction verbatim and the outcome', () => {
+    const body = buildLandComment(planLandHumanOnly(read(), input({ reason: 'yes, land it' })), { queued: true });
+    expect(body.startsWith(LAND_HUMAN_ONLY_MARKER)).toBe(true);
+    expect(body).toContain('Actor: `chalbert`');
+    expect(body).toContain('channel: chat');
+    expect(body).toContain('> yes, land it');
+    expect(body).toContain('isInMergeQueue');
+  });
+});
+
+// A scripted `exec`: records every call, answers by argv shape.
+function scriptedExec({ liveHead = head, labels = [{ name: 'ready-to-merge' }], inQueue = true, enqueueErrors = null } = {}) {
+  const calls = [];
+  const exec = (bin, args, opts = {}) => {
+    calls.push({ bin, args, env: opts.env });
+    const a = args.join(' ');
+    if (a.startsWith('pr view')) return JSON.stringify({ id: 'PR_node', headRefOid: liveHead, labels });
+    if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: inQueue, headRefOid: liveHead } } } });
+    if (a.includes('enqueuePullRequest')) return JSON.stringify(enqueueErrors ? { errors: enqueueErrors } : { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+    if (a.startsWith('pr comment')) {
+      const path = args[args.indexOf('--body-file') + 1];
+      calls.at(-1).body = readFileSync(path, 'utf8');
+      return 'https://example.test/c/1\n';
+    }
+    if (a.startsWith('pr edit')) return '';
+    throw new Error(`unexpected call: ${bin} ${a}`);
+  };
+  return { exec, calls };
+}
+const cred = () => ({ login: 'chalbert', token: 'tok-operator', bin: '/real/gh' });
+
+describe('land-human-only — the sink', () => {
+  const verdict = (over = {}) => planLandHumanOnly(read(over), input());
+
+  it('enqueues with expectedHeadOid on the real gh with the operator token, verifies, then comments', async () => {
+    const { exec, calls } = scriptedExec();
+    const sinks = createLandHumanOnlySinks({ exec, credential: cred });
+    const out = await sinks[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    expect(out).toMatchObject({ outcome: 'applied', ok: true, queued: true, labelled: false });
+    const enqueue = calls.find((c) => c.args.join(' ').includes('enqueuePullRequest'));
+    expect(enqueue.bin).toBe('/real/gh');
+    expect(enqueue.args).toContain(`sha=${head}`);
+    expect(enqueue.args.join(' ')).toContain('expectedHeadOid');
+    expect(enqueue.env.GH_TOKEN).toBe('tok-operator');
+    expect('GITHUB_TOKEN' in enqueue.env).toBe(false);
+    const order = calls.map((c) => c.args[0] === 'api' ? (c.args.join(' ').includes('enqueue') ? 'enqueue' : 'verify') : `${c.args[0]} ${c.args[1]}`);
+    expect(order).toEqual(['pr view', 'enqueue', 'verify', 'pr comment']);
+    expect(calls.at(-1).body).toContain('Actor: `chalbert`');
+  });
+
+  it('labels first when ready-to-merge is absent', async () => {
+    const { exec, calls } = scriptedExec({ labels: [] });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict({ labelPresent: false, labelDecision: { label: true } }) });
+    expect(out.labelled).toBe(true);
+    expect(calls[1].args).toEqual(['pr', 'edit', '7', '--repo', repo, '--add-label', 'ready-to-merge']);
+    expect(calls[1].bin).toBe('gh');
+  });
+
+  it('a head that moved refuses before any write', async () => {
+    const { exec, calls } = scriptedExec({ liveHead: 'b'.repeat(40) });
+    await expect(createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/head moved/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('isInMergeQueue false is a failure, recorded on the PR', async () => {
+    const { exec, calls } = scriptedExec({ inQueue: false });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    expect(out).toMatchObject({ outcome: 'failed', ok: false, queued: false });
+    expect(calls.at(-1).body).toContain('not queued: enqueue returned but isInMergeQueue is false');
+  });
+
+  it('a GraphQL refusal is a failure, recorded on the PR', async () => {
+    const { exec, calls } = scriptedExec({ enqueueErrors: [{ message: 'Required status check "merge-gate" is failing' }] });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    expect(out.outcome).toBe('failed');
+    expect(calls.at(-1).body).toContain('merge-gate');
+  });
+
+  it('a changed credential refuses before any write', async () => {
+    const { exec, calls } = scriptedExec();
+    const sinks = createLandHumanOnlySinks({ exec, credential: () => ({ login: 'other', token: 't', bin: '/real/gh' }) });
+    await expect(sinks[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/credential changed/);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('land-human-only — the operator credential', () => {
+  it('resolves the login with the real gh and the stored token, never the App token', () => {
+    const seen = [];
+    const out = resolveOperatorCredential({ resolveBin: () => '/real/gh', readToken: ({ bin }) => (bin === '/real/gh' ? 'tok' : null),
+      exec: (bin, args, opts) => { seen.push({ bin, args, env: opts.env }); return 'chalbert\n'; } });
+    expect(out).toEqual({ login: 'chalbert', token: 'tok', bin: '/real/gh' });
+    expect(seen[0].env.GH_TOKEN).toBe('tok');
+  });
+  it('no real gh or no stored login is an error, not a fallback', () => {
+    expect(resolveOperatorCredential({ resolveBin: () => null }).error).toMatch(/no real gh/);
+    expect(resolveOperatorCredential({ resolveBin: () => '/real/gh', readToken: () => null }).error).toMatch(/no stored login/);
+  });
+  it('operatorEnv drops an inherited GITHUB_TOKEN', () => {
+    expect(operatorEnv('t', { GITHUB_TOKEN: 'app', PATH: '/bin' })).toEqual({ GH_TOKEN: 't', PATH: '/bin' });
+  });
+});
+
+describe('land-human-only — the reader', () => {
+  it('reads the gates with ready-to-merge added only when the drain would add it', () => {
+    const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head, labels: [{ name: 'review:accepted' }],
+      commits: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    const exec = (bin, args) => {
+      const a = args.join(' ');
+      if (a.startsWith('pr view')) return JSON.stringify(live);
+      if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });
+      if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
+      throw new Error(`unexpected ${a}`);
+    };
+    let evaluatedLabels;
+    const r = createLandHumanOnlyReader({ exec, credential: cred, clone: () => null, requiredChecks: () => ['test'] })({ repo, pr: 7 });
+    expect(r.labelPresent).toBe(false);
+    expect(r.labelDecision.label).toBe(true);
+    expect(r.gateRowsError).toMatch(/no checkout/);
+    expect(r.requiredChecks.allowed).toBe(true);
+    expect(r).not.toHaveProperty('token');
+    const r2 = createLandHumanOnlyReader({ exec, credential: cred, clone: () => '/clone', requiredChecks: () => ['test'],
+      loadPolicy: () => null, redMainOf: () => null, mainCiOf: () => null, ledgerConfigOf: () => null, blockOnCodeQLOf: () => true,
+      gather: () => ({ pr: { labels: live.labels }, gatePaths: { files: ['.github/workflows/ci.yml'] } }),
+      evaluate: (facts) => { evaluatedLabels = facts.pr.labels.map((l) => l.name); return { results: [] }; } })({ repo, pr: 7 });
+    expect(evaluatedLabels).toEqual(['review:accepted', 'ready-to-merge']);
+    expect(r2.surface).toMatchObject({ hold: true, humanOnly: true });
+  });
+});
