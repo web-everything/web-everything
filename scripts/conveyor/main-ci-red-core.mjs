@@ -41,6 +41,18 @@ export const MINUTE = 60_000;
 export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   /** Off = before this card: the smell never breaches. */
   mainCiRedEnabled: true,
+  /** card 302: minutes without owner CI progress; 0 = owners never stall. */
+  mainCiRedOwnerStallMin: 30,
+  /** card 302: minutes from dispatch to a PR; 0 = no PR deadline. */
+  mainCiRedOwnerPrDeadlineMin: 45,
+  /** card 302: minutes red before stalled-owner alerts; 0 = no escalation. */
+  mainCiRedEscalateAfterMin: 60,
+  /** card 302: minutes between stalled-owner alerts; 0 = no escalation. */
+  mainCiRedEscalateEveryMin: 60,
+  /** card 302: automatic safe recovery; false = alerts only. */
+  mainCiRedAutoRecover: true,
+  /** card 302: minutes stalled before safe recovery; 0 = alerts only. */
+  mainCiRedAutoRecoverAfterMin: 60,
   /** Off = no automatic CI reruns. Each run is requested at most once. */
   mainCiRedFlakeRerun: true,
   /** card 303: off = before this card, green merge groups supply no flake evidence. */
@@ -748,4 +760,56 @@ export function mainRedDeliveryClass(job, record, { now, repo = 'we' } = {}) {
   if (job?.kind === 'owner' || job?.kind === 'combine') return 'P0';
   if (job?.kind === 'pr' && mainRedPriorityRank(job.pr, record, { now, repo }) === 0) return 'P0';
   return 'P3';
+}
+
+/** card 302: progress is observed CI or a dispatch still inside its PR deadline. PURE. */
+export function assessOwnerProgress({ state, owner, ownerPrs = [], ledgerEntry, now, rerunPending, settings = MAIN_CI_RED_DEFAULTS }) {
+  const moving = (reason) => ({ moving: true, reason });
+  if (!settings.mainCiRedEnabled || !(settings.mainCiRedOwnerStallMin > 0)) return moving('stall-off');
+  if (state?.status !== 'red' || !owner) return moving('no-red-owner');
+  if (rerunPending) return moving('rerun-pending');
+  if (!Number.isFinite(now) || ownerPrs === null) return moving('progress-unknown');
+  const recent = now - settings.mainCiRedOwnerStallMin * MINUTE;
+  if (ownerPrs.some((pr) => pr.ci?.pending || pr.ci?.status === 'pending')) return moving('owner-ci-pending');
+  if (ownerPrs.some((pr) => ts(pr.ci?.completedAt) !== null && ts(pr.ci.completedAt) > recent)) return moving('owner-ci-recent');
+  let reason, since;
+  if (ownerPrs.length) {
+    // Unknown or green CI is not proof of a stalled red owner.
+    if (ownerPrs.some((pr) => pr.ci?.status !== 'red' || ts(pr.ci?.completedAt) === null)) return moving('owner-ci-not-red');
+    since = Math.max(...ownerPrs.map((pr) => ts(pr.ci.completedAt)));
+    reason = 'owner-ci-red';
+  } else {
+    if (owner.kind !== 'dispatched' || !(settings.mainCiRedOwnerPrDeadlineMin > 0)
+      || !Number.isFinite(ledgerEntry?.at)) return moving('dispatch-unknown');
+    since = ledgerEntry.at + settings.mainCiRedOwnerPrDeadlineMin * MINUTE;
+    if (now < since) return moving('owner-pr-deadline');
+    reason = 'no-owner-pr';
+  }
+  const firstRed = state.firstRed;
+  const approval = firstRed?.attempt === 1 && !firstRed.rerunRequested
+    ? `approve a re-run of main run ${firstRed.runId} (gh run rerun ${firstRed.runId} --failed)`
+    : `review a revert of ${String(firstRed?.sha ?? '').slice(0, 9)} (the first red commit)`;
+  return { stalled: true, reason, since, approval, firstRedSha: firstRed?.sha };
+}
+
+/** card 302: a fresh subject each period while the owner remains stalled. PURE. */
+export function planEscalation({ state, stall, now, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedEnabled || !stall?.stalled || state?.status !== 'red'
+    || !(settings.mainCiRedEscalateAfterMin > 0) || !(settings.mainCiRedEscalateEveryMin > 0)
+    || !Number.isFinite(state.redSinceMs) || !Number.isFinite(stall.since) || !Number.isFinite(now)) return null;
+  const at = Math.max(stall.since, state.redSinceMs + settings.mainCiRedEscalateAfterMin * MINUTE);
+  if (now < at) return null;
+  return { n: 1 + Math.floor((now - at) / (settings.mainCiRedEscalateEveryMin * MINUTE)), at };
+}
+
+/** card 302: only one first-attempt rerun is safe; a revert is merely a proposal. PURE. */
+export function planStalledRecovery({ stall, failingRun, reruns = {}, settings = MAIN_CI_RED_DEFAULTS, now }) {
+  if (!settings.mainCiRedEnabled || !settings.mainCiRedAutoRecover || !(settings.mainCiRedAutoRecoverAfterMin > 0)
+    || !stall?.stalled || !Number.isFinite(stall.since) || !Number.isFinite(now)
+    || now - stall.since < settings.mainCiRedAutoRecoverAfterMin * MINUTE) return null;
+  if (failingRun?.status === 'completed' && classifyRun(failingRun) === 'red' && failingRun.attempt === 1
+    && !Object.hasOwn(reruns, failingRun.databaseId)) {
+    return { kind: 'rerun', runId: failingRun.databaseId, sha: failingRun.headSha, reason: 'owner-stalled' };
+  }
+  return { kind: 'revert-proposal', sha: stall.firstRedSha, reason: 'owner-stalled' };
 }

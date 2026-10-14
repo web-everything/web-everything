@@ -66,6 +66,8 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
@@ -162,6 +164,20 @@ import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+
+// card 302 — resolve red-main capacity through the shared policy layers.
+export function resolveMainFixCapacity(env = process.env) {
+  try {
+    const raw = String(env?.WE_MAIN_FIX_PAST_FIX_CAP ?? '').trim().toLowerCase();
+    const pastFixCap = ['on', 'true', '1'].includes(raw) ? true
+      : ['off', 'false', '0'].includes(raw) ? false : undefined;
+    const resolved = cascadePolicy('mainFixCapacity', readDeclaredSettings().settings.mainFixCapacity, {
+      standard: { pastFixCap: true }, env, envValues: { pastFixCap },
+      valid: { pastFixCap: value => typeof value === 'boolean' },
+    });
+    return { pastFixCap: resolved.value.pastFixCap, source: resolved.sources.pastFixCap };
+  } catch { return { pastFixCap: true, source: 'standard' }; }
+}
 
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
 const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -1748,6 +1764,8 @@ export function runReconcileFixDispatch({
   // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
   readMainRedPriorityRecord = () => readMainRedPriority(),
 } = {}) {
+  const now = Date.now();
+  const mainFixCapacity = resolveMainFixCapacity();
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
   // #x1rr9rh (multi-repo slice 2) — this staleness check guards the DISPATCHING checkout (this WE checkout's
@@ -1903,7 +1921,13 @@ export function runReconcileFixDispatch({
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
     let borrowed = null;
-    if (!t.admit) {
+    // card 302 — only a red-main owner may pass the fixer cap without borrowing.
+    const pastFixCap = !t.admit && t.kind === 'fix-cap' && mainFixCapacity.pastFixCap
+      && (entry.mainFix === true || mainRedPriorityRank(entry.pr, readMainRedPriorityRecord(), { now, repo: repoKey }) === 0);
+    if (pastFixCap) {
+      console.error(`reconcile-fix-dispatch: PR #${entry.pr} red-main fix admitted past the fixer cap (${t.why}) — mainFixCapacity.pastFixCap=true (source ${mainFixCapacity.source})`);
+    }
+    if (!t.admit && !pastFixCap) {
       const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
       // A borrowed non-Claude launch skips the router, so any entry the router keeps on Claude (ruling send-back,
