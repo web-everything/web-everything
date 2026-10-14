@@ -411,6 +411,18 @@ export function createEnqueueOnEvent({
   async function runDue({ catchUpOnly = false } = {}) {
     const s = readSetting();
     if (!s.enabled) { pending = new Map(); return []; }
+    if (!s.catchUp?.enabled) {
+      // Disabling catch-up withdraws its retained work; a PR that also had an event stays as ordinary event work.
+      catchUpRoom = 0;
+      pending = new Map([...pending].flatMap(([key, p]) => {
+        if (!p.catchUp) return [[key, p]];
+        const causes = p.causes.filter((c) => c !== 'catch-up');
+        if (!causes.length) return [];
+        const next = { ...p, causes };
+        delete next.catchUp;
+        return [[key, next]];
+      }));
+    }
     let catchUpLater = [].values();
     let catchUpIndex = 0;
     const queueCatchUp = (num) => {

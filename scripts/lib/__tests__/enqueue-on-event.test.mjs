@@ -746,6 +746,47 @@ describe('catch-up handle', () => {
     expect(handle.pending()).toMatchObject([{ num: 42, catchUp: true }]);
   });
 
+  it.each(['tick', 'catchUp'])('%s drops retained catch-up work once catch-up is disabled', async (method) => {
+    let allowed = true;
+    let setting = CATCH_UP_SETTING;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      resolveSetting: () => setting,
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, prs: [candidate(42)], queued: 0 }),
+      readPr: async () => { if (setting.catchUp.enabled) allowed = false; return READY_PR; },
+    });
+    await handle.catchUp();
+    expect(handle.pending()).toMatchObject([{ num: 42, catchUp: true }]);
+    setting = { ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, enabled: false } };
+    allowed = true;
+    advance(10 * 60_000);
+    await handle[method]();
+    expect(calls).toEqual([]);
+    expect(handle.pending()).toEqual([]);
+  });
+
+  it('keeps an event on a retained catch-up PR as ordinary event work once catch-up is disabled', async () => {
+    let allowed = true;
+    let setting = CATCH_UP_SETTING;
+    const { handle, calls, advance } = catchUpSetup({
+      allowed: () => allowed,
+      resolveSetting: () => setting,
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, prs: [candidate(42)], queued: 0 }),
+      readPr: async () => { if (setting.catchUp.enabled) allowed = false; return READY_PR; },
+    });
+    await handle.catchUp();
+    handle.notePoll({ ok: true, marked: [mark(42)] });
+    setting = { ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, enabled: false } };
+    allowed = true;
+    advance(15_000);
+    const ran = await handle.tick();
+    expect(calls.map(c => c.args[1])).toEqual(['--only=42']);
+    expect(ran[0].catchUp).toBeUndefined();
+    expect(handle.pending()).toEqual([]);
+  });
+
   it('logs candidate failure, does not spawn, and waits until the next interval to retry', async () => {
     let reads = 0;
     const { handle, calls, lines, advance } = catchUpSetup({ readCandidates: async () => {
