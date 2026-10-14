@@ -232,6 +232,18 @@ it('future infrastructure outcomes do not discount a current session', () => {
 });
 
 const incidentWindows = [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }];
+it('retains red-main attempts as outcome pairing boundaries for reused session names', () => {
+  const incidentNow = Date.parse('2026-10-14T00:00:00Z');
+  const sessions = ['21:00:00', '21:10:00', '21:20:00'].map((time, i) =>
+    row({ session: `s${i}`, at: `2026-10-13T${time}Z` }));
+  const discounted = row({ session: 's2', at: '2026-10-13T22:00:00Z' });
+  const outcome = row({ kind: 'outcome', session: 's2', outcome: 'failed', infra: true,
+    at: '2026-10-13T22:01:00Z' });
+  const args = { rows: [...sessions, discounted, outcome], repo: 'we', pr: 3990, head,
+    now: incidentNow, config: { ...config, redMainDiscount: 'on', redMainWindows: incidentWindows } };
+  expect(fixLoopState(args)).toMatchObject({ count: 3, infraFailures: 0, redMainDiscounted: 1 });
+  expect(fixLoopDisposition(args).action).toBe('rearm');
+});
 const incidentRows = ['22:04:33', '22:13:35', '22:28:12', '22:40:50', '22:40:55', '22:52:26'].map((time, i) =>
   row({ pr: 5195, at: `2026-10-13T${time}Z`, kind: i === 3 ? 'rearm' : i === 5 ? 'park' : 'ci-heal', reason: 'budget' }));
 const incident = (extra = {}) => ({ rows: incidentRows, repo: 'we', pr: 5195, head,

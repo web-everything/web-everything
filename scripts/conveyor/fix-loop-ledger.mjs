@@ -138,8 +138,8 @@ export function infraFailureCount({ logText, pr, sessions }) {
 export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
-  const controls = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime())
-    .filter(row => !discountedSession(row, config) && !(hasRedMainDiscount(config)
+  const observed = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
+  const controls = observed.filter(row => !discountedSession(row, config) && !(hasRedMainDiscount(config)
       && !isMainCurrentlyRed(config.redMainWindows) && ['park', 'rearm'].includes(row.kind)
       && isWithinRedWindow(Date.parse(row.at), config.redMainWindows)));
   if (controls.some(row => row.kind === 'park')) return { action: 'parked' };
@@ -149,7 +149,9 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
   const rawCount = controls.filter(isSession).length;
   if (rawCount >= config.maxSessions + 2) return { action: 'park', reason: 'raw per-head repair session ceiling reached' };
   const matches = fixLoopSessionRows({ rows, repo, pr, head, now, config });
-  const ledgerInfra = ledgerInfraRows({ rows: controls, repo, pr, head });
+  // Discounted attempts still delimit reused session names: their outcomes must
+  // never become infrastructure evidence for an earlier counted attempt.
+  const ledgerInfra = ledgerInfraRows({ rows: observed, repo, pr, head });
   if (infraRows !== null || ledgerInfra.length) infraRows = [...new Set([...(infraRows ?? []), ...ledgerInfra])];
   const state = fixLoopState({ rows, repo, pr, head, now, config,
     infraFailures: Math.max(infraFailures, infraRows?.filter(row => matches.includes(row)).length ?? 0) });
