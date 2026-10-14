@@ -147,6 +147,14 @@ describe('pure admission', () => {
     const first = admit(empty(), 1);
     expect(admit(first.state, 1).state).toEqual(first.state);
   });
+  it('defers re-enqueue of a seen PR that left the queue until observation records the exit', () => {
+    const grouped = freeze({ ...empty(), groups: [group({ seen: [1, 2] })] });
+    expect(admit(grouped, 1, 0, { inQueue: new Set([2]) })).toMatchObject({ admit: false, groupId: null, reason: '#1 left the queue; observe its exit before re-enqueue' });
+    expect(admit(grouped, 2, 0, { inQueue: new Set([2]) })).toMatchObject({ admit: true, groupId: 'g1' });
+    const isolated = freeze({ ...empty(), isolate: [1], groups: [group({ mode: 'isolate', prs: [1], seen: [1] })] });
+    expect(admit(isolated, 1)).toMatchObject({ admit: false, mode: 'isolate', groupId: null });
+    expect(admit(isolated, 1, 0, { inQueue: new Set([1]) })).toMatchObject({ admit: true, groupId: 'g1' });
+  });
   it('supports groupSize one and zero forming time without holding terminal groups', () => {
     const state = { ...empty(), groups: [group({ status: 'done' }), group({ id: 'failed', status: 'failed' })] };
     expect(admit(state, 3, 0, { settings: settings({ groupSize: 1 }) }).state.groups.at(-1))
@@ -332,6 +340,21 @@ describe('batching IO shell and drain hook', () => {
     expect(h.shell.gate(2).admit).toBe(true);
     h.shell.confirm(2);
     expect(h.shell.observe({}).events).toContainEqual({ type: 'culprit', num: 2 });
+  });
+  it('records an ejection before the drain can re-enqueue the ejected PR into its old group', () => {
+    const queue = [2];
+    const h = ioHarness({ state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue,
+      dequeue: num => queue.splice(queue.indexOf(num), 1) });
+    // Drain order: enqueue (gate → enqueue → confirm), then observe.
+    const gate = h.shell.gate(1);
+    if (gate.admit) { queue.push(1); h.shell.confirm(1, gate.groupId); }
+    expect(gate).toMatchObject({ admit: false });
+    const observed = h.shell.observe({});
+    expect(observed.events).toContainEqual({ type: 'isolate', nums: [1, 2] });
+    expect(observed.dequeued).toEqual([2]);
+    expect(h.state().failures).toHaveLength(1);
+    expect(h.state().isolate).toEqual([1, 2]);
+    expect(h.shell.gate(1)).toMatchObject({ admit: true, mode: 'isolate' });
   });
   it('does not let an old confirmation mark a replacement reservation seen', () => {
     const queue = [2];

@@ -183,6 +183,11 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
     if (state.isolate.some(n => n !== num && inQueue.has(n))) return result(false, null, 'another isolate PR is in queue');
   }
   const existing = state.groups.find(g => active(g) && g.prs.includes(num));
+  // A seen PR absent from the queue has exited (the drain only enqueues open PRs).
+  // Re-enqueueing it before observation would hide that ejection from recovery.
+  if (existing?.seen?.includes(num) && !inQueue.has(num)) {
+    return result(false, null, `#${num} left the queue; observe its exit before re-enqueue`);
+  }
   if (existing) return result(true, existing.id);
   // A PR already in the native queue needs no new admission/group record.
   if (inQueue.has(num)) return result(true);
