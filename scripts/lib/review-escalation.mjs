@@ -1924,7 +1924,7 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
       // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
       // shape ends the same-sha run, so a later plain accept of that sha cannot revive the clearance (fail closed).
       if (!isKnownMachineBody(body)
-        && !(isTrustedMarkerAuthor(c) && body.startsWith('<!-- approval-prevention-filed:'))) humanInSameShaRun = false;
+        && !(isTrustedMarkerAuthor(c) && body.trimStart().startsWith('<!-- approval-prevention-filed:'))) humanInSameShaRun = false;
       continue;
     }
     CLEARED_HUMAN_RE.lastIndex = 0;

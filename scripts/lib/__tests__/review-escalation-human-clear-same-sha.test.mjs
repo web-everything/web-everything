@@ -9,8 +9,15 @@ const clear = sha => ({ author: { login: 'chalbert' }, body: `✅ review — \`r
 const accept = sha => ({ author: { login: 'web-everything' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->` });
 
 describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanClearanceSurvivesSameShaAccept)', () => {
-  it('#5193: a later plain accept of the cleared sha keeps the human clearance', () => {
+  it('a later plain accept of the cleared sha, with nothing revoking in between, keeps the human clearance', () => {
     expect(parseLatestHumanClearedSha([clear(X), accept(X)], { sameShaCarries: true })).toBe(X);
+  });
+  it('#5193 live history: a re-arm between the clearance and the same-sha accept ends the carry (PR #5237 round 4)', () => {
+    // Decision: a re-arm is a revocation for this parser (fail closed). The live #5193 case is handled upstream instead:
+    // the re-arm guard refuses a no-push re-arm, and restoration puts back the original clearance record's label.
+    const rearm = { author: { login: 'web-everything[bot]' }, body: '🔧 conveyor fix — re-armed for re-review' };
+    expect(parseLatestHumanClearedSha([clear(X), rearm, accept(X)], { sameShaCarries: true })).toBeNull();
+    expect(parseLatestHumanClearedSha([clear(X), rearm], { sameShaCarries: true })).toBe(X);
   });
   it('setting off restores latest-record-only', () => {
     expect(parseLatestHumanClearedSha([clear(X), accept(X)], { sameShaCarries: false })).toBeNull();

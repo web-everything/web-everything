@@ -199,7 +199,10 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
         : { restore: false, why: 'head changed or unreadable during restoration validation' };
     }
     if (restoration.restore) {
-      mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']);
+      // A throw (deferral, timeout) does not prove the write was not applied, so the check below runs either way.
+      let writeError = null;
+      try { mutate(['pr', 'edit', String(pr), '--repo', repo, '--add-label', 'review:accepted', '--remove-label', 'review:pending']); }
+      catch (e) { writeError = e; }
       // GitHub has no conditional label write, so a push can still land between the last read and the write above.
       // Read both heads again AFTER the write; if either moved or cannot be read, undo it at once (fail closed) and
       // record nothing, so the new head keeps `review:pending` and its re-review stays owed.
@@ -210,6 +213,7 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
         log(`review-clearance: PR #${pr} restoration undone — head moved or unreadable after the approval write`);
         restoration = { restore: false, why: 'head moved or unreadable after the approval write' };
       }
+      if (writeError) throw writeError;
     }
     if (restoration.restore) {
       mutate(['pr', 'comment', String(pr), '--repo', repo, '--body', buildRestoreComment({ head: facts.prHead, record: restoration.record, rearm: restoration.rearmComment, setting: restoreSetting })]);

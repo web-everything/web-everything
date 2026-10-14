@@ -324,6 +324,22 @@ describe('I/O shell', () => {
       ]);
       expect(fake.calls.filter(a => a[1] === 'comment' || a.includes('POST'))).toEqual([]);
     });
+    it('still checks the head and rolls back when the approval write throws after GitHub applied it', () => {
+      const fake = fakeGh(restoreFacts.labels);
+      let written = false;
+      const runGh = args => {
+        const result = fake.runGh(args);
+        if (args[0] === 'pr' && args[1] === 'edit' && !written) { written = true; throw new Error('timed out'); }
+        if (written && args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...JSON.parse(result), headRefOid: 'a'.repeat(40) });
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result?.restored).not.toBe(true);
+      expect(fake.calls.filter(a => a[1] === 'edit').at(-1)).toEqual(['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']);
+      expect(fake.calls.filter(a => a[1] === 'comment' || a.includes('POST'))).toEqual([]);
+    });
   });
   it('refuses a heal and requests the stale job rerun', async () => {
     const { calls, runGh } = fakeGh();
