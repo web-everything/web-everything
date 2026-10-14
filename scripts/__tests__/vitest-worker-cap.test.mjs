@@ -7,6 +7,8 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import micromatch from 'micromatch';
+import integrationConfig from '../../vitest.integration.config';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
 
@@ -65,5 +67,18 @@ describe('every vitest config applies the shared ceiling', () => {
 
   it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
     expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  });
+
+  it('serializes repository-wide scanner parity checks with daemon scenarios', () => {
+    const config = integrationConfig.test;
+    const poolFor = (file) => config.poolMatchGlobs.find(([glob]) => micromatch.isMatch(file, glob))?.[1] ?? config.pool;
+    const scenarios = config.include.filter((file) => /\/sim-scenario.*\.test\.mjs$/.test(file));
+    const scanners = config.include.filter((file) => /\/rust-scan-.*-parity\.test\.mjs$/.test(file));
+    expect(scenarios.length).toBeGreaterThan(0);
+    expect(scanners.length).toBeGreaterThan(0);
+    expect(config.poolOptions.forks.singleFork).toBe(true);
+    for (const file of [...scenarios, ...scanners]) {
+      expect(poolFor(file), file).toBe('forks');
+    }
   });
 });

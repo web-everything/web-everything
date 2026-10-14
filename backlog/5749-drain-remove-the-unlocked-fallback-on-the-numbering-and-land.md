@@ -7,7 +7,7 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-clone-lock.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/number-pending-hashes-before-push.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/readiness/__tests__/drain-lock.test.mjs", "we:scripts/lib/__tests__/daemon-self-sync.test.mjs", "we:scripts/lib/__tests__/daemon-clone-lock.test.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/lib/__tests__/number-pending-hashes-before-push.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "902ba9ab233e57eca3e2b6421c8bebc9236f8bea"
+preparedAgainstSha: "9f9f44a3346c9c612c6fee6d0caee176cc41bbba"
 tags: []
 ---
 
@@ -41,6 +41,8 @@ Slice S6b of the async-daemons epic; also held item 203 (found by the async-daem
 - Re-prepare (2026-10-13, main e2c23218b, `prepare-stale`): scope files changed since 9b7f4edc3 (xec3amn workflow-human gate, #5009 queue relief) shifted `we:scripts/merge-ai-prs.mjs` by ~56 lines; premise unchanged (default still `true` at `we:scripts/readiness/drain-lock.mjs:210`; no delivery commit). Re-cited: land lock `:6517` (ternary `:6524`, `ran===false` `:6525`, unlocked message `:6526`); queue probe/repair `:6741-6743`; numbering gate `:6744`, lock `:6748`, `numbered = numLock.result` `:6837`, unlocked message `:6838`. Other citations verified unchanged (`we:scripts/pr-land.mjs:1386-1393`, `we:scripts/lib/number-pending-hashes-before-push.mjs:66`, `we:scripts/lib/daemon-self-sync.mjs:967`). No design change.
 - Re-prepare (2026-10-13, main cc7155ea6, `prepare-stale`): premise unchanged, not delivered (default still `true` at `we:scripts/readiness/drain-lock.mjs:210`; unlocked messages still live). `we:scripts/merge-ai-prs.mjs` shifted ~26 lines (paged open-PR reader, abc01e4e5). Current: land lock `:6543` (ternary `:6550`, `ran===false` `:6551`, unlocked message `:6552`); queue probe/repair `:6767-6769`; numbering gate `:6770`, lock `:6774`, `numbered = numLock.result` `:6863`, unlocked message `:6864`. `we:scripts/pr-land.mjs:1386-1393`, `we:scripts/lib/number-pending-hashes-before-push.mjs:65-66`, `we:scripts/lib/daemon-self-sync.mjs:967` unchanged. No design change.
 - Re-prepare (2026-10-14, main 902ba9ab2, `prepare-stale`): `git log cc7155ea6..HEAD` over every scope source file is empty, so all citations above still hold exactly (default `true` at `we:scripts/readiness/drain-lock.mjs:210`; land lock `we:scripts/merge-ai-prs.mjs:6543`/`:6552`; numbering lock `:6774`/`:6863`/`:6864`; `we:scripts/pr-land.mjs:1386-1393`; `acquireRead` `we:scripts/lib/daemon-self-sync.mjs:967`). Not delivered. Stamp refreshed only; no design change.
+
+- Re-prepare (2026-10-14, main 9f9f44a33, `prepare-stale`): only `we:scripts/merge-ai-prs.mjs` changed in scope (1162e00549, bounded parallel gate reads); premise unchanged, not delivered (default still `true` at `we:scripts/readiness/drain-lock.mjs:210`). Current citations replace the Design/MVP line numbers below (shifted +2 to +4): land lock `:6545` (ternary `:6552`, unlocked message `:6554`); queue repair `:6772-6773`; numbering gate `:6774`, lock `:6778`, `numbered = numLock.result` `:6867`, unlocked message `:6868`. `we:scripts/pr-land.mjs:1386-1393` unchanged. No design change.
 
 ## Design
 
