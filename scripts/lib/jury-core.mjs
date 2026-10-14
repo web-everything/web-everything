@@ -2811,6 +2811,228 @@ export function mandatoryReferralReviewer(runId) {
   return { id: deriveSessionId(sessionSeed([runId, 'mandatory-referral-correctness'])), lens: 'correctness' };
 }
 
+// ── #4815 — the confirmation turn: a tool-less seat's CONFIRMED claim is checked by a tool-bearing verifier ─────────
+/** Capability comes from the seat's own declaration (`tools: true`), never from a juror's claim; anything else is checked. */
+export const seatNeedsToolVerification = (seat) => seat?.tools !== true;
+
+/** Persisted outcomes on a record's `verified` list. A verification that did not finish is never persisted: the claim stays a live referral instead. */
+export const REFERRAL_VERIFY_OUTCOMES = Object.freeze(['reproduced', 'not-reproduced']);
+export const UNVERIFIED_NOTE_PREFIX = 'Unverified by a tool-bearing seat';
+export const VERIFY_REASON_MAX = 300;
+/** At most this many claims go to one verifier turn; the rest are not verified and stay CONFIRMED referrals. */
+export const VERIFY_MAX_CANDIDATES = 12;
+
+/** One line, no backticks, capped: the form a verifier's own words take wherever they are stored or shown. PURE. */
+// Control, format (bidi, zero-width), separator, private-use and lone-surrogate code points become spaces: the reason is printed raw
+// to the human asked to confirm (PR #5025 self-review), so a terminal escape must not be able to hide or rewrite that question.
+const VERIFY_REASON_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cs}]+/gu;
+// The cap is in UTF-16 code units, the unit `validateReferralRecord` counts with `.length` (PR #5025 review: a writer that counted
+// code points stored up to twice that for supplementary characters, and the record then failed validation). The cut never splits a
+// code point, so the stored text stays well-formed, and re-folding it changes nothing.
+export const foldVerifyReason = (text, fallback) => {
+  let out = '';
+  for (const ch of foldUntrusted(text).replace(VERIFY_REASON_UNSAFE, ' ').replace(/\s+/g, ' ').trim()) {
+    if (out.length + ch.length > VERIFY_REASON_MAX) break;
+    out += ch;
+  }
+  return out.trim() || fallback;
+};
+
+/**
+ * `key → outcome` for one head, from the `{ head, key, outcome }` rows the `read` step recorded. Outcome is
+ * `reproduced`, `not-reproduced`, or `referred` (a live referral an older record holds with no verification). PURE.
+ */
+export function knownVerifications(rows, head) {
+  const known = new Map();
+  if (typeof head !== 'string' || !head) return known;
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r && r.head === head && typeof r.key === 'string'
+      && (REFERRAL_VERIFY_OUTCOMES.includes(r.outcome) || r.outcome === 'referred')) known.set(r.key, r.outcome);
+  }
+  return known;
+}
+
+/**
+ * The qualifying claims that still need a verifier turn: from seats whose declaration says they carry no tools, one
+ * per finding key, skipping any key already settled on this head. `seats` is `[{ step, tools, findings }]`. PURE.
+ */
+export function verificationCandidates({ seats, known = new Map() }) {
+  const candidates = [];
+  const seen = new Set();
+  for (const seat of Array.isArray(seats) ? seats : []) {
+    if (!seatNeedsToolVerification(seat)) continue;
+    for (const original of Array.isArray(seat.findings) ? seat.findings : []) {
+      if (!requiresMandatoryReferral(original)) continue;
+      let key;
+      try { key = referralFindingKey(seat.step, original); } catch { continue; }
+      if (known.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      if (candidates.length < VERIFY_MAX_CANDIDATES) candidates.push({ index: candidates.length, seat: seat.step, key, original });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Does the verifier's STORED reason (`foldVerifyReason`: folded, one line, capped) cite a line (`<path>:<n>`, n ≥ 1) in the
+ * claim's OWN cited file? It runs on the same text that is persisted, so the recorded negative always shows the citation that let it
+ * be recorded. The path is data: matched literally, case-sensitive, as a whole path token (no letter, digit or path character of any
+ * script before it), and never opened. A claim with no file has nothing to cite, so this is false for it.
+ *
+ * THIS IS A FORMAT FILTER, NOT A SECOND SIGNAL. It turns away a lazy or free-form "does not reproduce", and makes every recorded
+ * negative point at a line a reader can check. It does not prove the cited line supports the answer: the claim's own path and
+ * line are in the verifier's input, so a steered verifier can echo them. A negative that passes it is recorded as evidence;
+ * `activeReferrals` keeps the mandatory referral live for an independent finding-specific ruling. PURE.
+ */
+export function verifierEvidenceCitesClaim(original, evidence) {
+  const file = exactCitedPath(original?.file);
+  if (!file || typeof evidence !== 'string') return false;
+  const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const cite = new RegExp(`(?<![\\p{L}\\p{N}\\p{M}_./\\\\@+~-])(?:\\./)?${escaped}:(\\d+)(?!\\d)`, 'gu');
+  for (const m of foldVerifyReason(evidence, '').matchAll(cite)) if (Number(m[1]) >= 1) return true;
+  return false;
+}
+
+/**
+ * Read the verifier's answer against the candidates it was asked about: `key → { outcome, reason }`, outcome one of
+ * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
+ * evidence-free or explicitly inconclusive (reproduced=null, or dropped by a provider that strips nulls) answer is `failed`,
+ * never persisted, and so is a `false` whose evidence cites no line in the claim's own file. A `failed` claim stays CONFIRMED and
+ * referred (`applyVerification`), so the head's durable record holds it. A `not-reproduced` is still ONE steerable answer: it does not
+ * retire the referral, and `uncorroboratedRetirements` also holds acceptance for a human. PURE.
+ * Lengths: every stored reason is `foldVerifyReason` text, at most `VERIFY_REASON_MAX` UTF-16 code units, the validator's own unit.
+ */
+export function settleVerification(candidates, answer) {
+  const settled = new Map();
+  const failAll = (reason) => {
+    for (const c of candidates) settled.set(c.key, { outcome: 'failed', reason });
+    return settled;
+  };
+  if (!answer || typeof answer !== 'object') return failAll('the verifier returned no answer');
+  if (answer.skipped) return failAll(foldVerifyReason(`the verifier was skipped: ${answer.skipped.reason ?? answer.summary ?? ''}`, 'the verifier was skipped'));
+  if (!Array.isArray(answer.results)) return failAll('the verifier returned malformed results');
+  const byIndex = new Map();
+  const conflicted = new Set();
+  for (const r of answer.results) {
+    if (!r || !Number.isInteger(r.index)) continue;
+    if (byIndex.has(r.index) && byIndex.get(r.index).reproduced !== r.reproduced) conflicted.add(r.index);
+    byIndex.set(r.index, r);
+  }
+  for (const c of candidates) {
+    const r = byIndex.get(c.index);
+    if (conflicted.has(c.index)) settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave conflicting results for this claim' });
+    // An explicit null is inconclusive. So is a result with evidence but no `reproduced` at all: the Codex parse path strips null
+    // properties, so that is how a null arrives from the real provider, and its evidence is the reason worth keeping.
+    else if (r && (r.reproduced === null || (r.reproduced === undefined && typeof r.evidence === 'string' && r.evidence.trim()))) {
+      settled.set(c.key, { outcome: 'failed', reason: foldVerifyReason(r.evidence, 'the verifier could not determine whether the claim reproduces') });
+    } else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
+    // EITHER answer needs evidence: a bare `false` is the cheapest thing a flaky or steered verifier can say, and a `not-reproduced`
+    // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: it is not
+    // retired, and it stays a CONFIRMED referral (`applyVerification`) rather than a note.
+    else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
+      settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
+    // The verifier reads attacker-controlled PR content (PR #5025 review). A negative is recorded
+    // only when its stored reason cites a line in the claim's own file; free-form evidence stays held and is asked again. That is
+    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: ONE answer never retires a mandatory referral.
+    // The existing independent ruling process must settle it; `uncorroboratedRetirements` also holds acceptance for a human.
+    // A `true` keeps the hold, so it needs no citation.
+    } else if (!r.reproduced && !verifierEvidenceCitesClaim(c.original, r.evidence)) {
+      settled.set(c.key, { outcome: 'failed',
+        reason: 'the verifier\'s not-reproduced answer cites no line in the claim\'s own file, so it cannot retire the claim' });
+    } else settled.set(c.key, { outcome: r.reproduced ? 'reproduced' : 'not-reproduced', reason: foldVerifyReason(r.evidence, '') });
+  }
+  return settled;
+}
+
+/** One qualifying claim as an advisory note: the original assertion stays visible, it can no longer be CONFIRMED. PURE. */
+export function downgradeUnverifiedFinding(original, reason) {
+  return { ...original, verdict: 'PLAUSIBLE',
+    summary: `[${UNVERIFIED_NOTE_PREFIX}: ${foldVerifyReason(reason, 'no reason recorded')}] ${original?.summary ?? ''}` };
+}
+
+/**
+ * One seat's findings after the confirmation turn. A qualifying claim from a seat that needs verification becomes an advisory
+ * note ONLY on a definitive negative: `not-reproduced` this run, or recorded earlier on this head. Every other claim stays
+ * CONFIRMED and is referred as before: reproduced, already referred on this head, and any verification that did not finish
+ * (failed, skipped, inconclusive, past the batch limit), so a quiet re-run cannot lose the hold. Returns the findings (same
+ * order) and what was downgraded. PURE.
+ */
+export function applyVerification({ seat, findings, known = new Map(), settled = new Map() }) {
+  // Anything that is not a list (absent, or the wrong type the reduce step refuses) goes back untouched, as does a tool-bearing seat.
+  if (!Array.isArray(findings) || !seatNeedsToolVerification(seat)) return { findings, downgraded: [] };
+  const downgraded = [];
+  const out = findings.map((original) => {
+    if (!requiresMandatoryReferral(original)) return original;
+    let key;
+    try { key = referralFindingKey(seat.step, original); } catch { return original; }
+    const prior = known.get(key);
+    if (prior === 'reproduced' || prior === 'referred') return original;
+    const now = settled.get(key);
+    if (now?.outcome === 'reproduced') return original;
+    // FAIL CLOSED (PR #5025 review): only a definitive negative turns the claim into a note. A verification that did not finish
+    // (failed, skipped, inconclusive, past the batch limit) leaves it CONFIRMED, so the head's durable referral record carries it:
+    // a later run in which the seat stays silent or downgrades the claim still finds the hold there.
+    if (prior !== 'not-reproduced' && now?.outcome !== 'not-reproduced') return original;
+    const reason = prior === 'not-reproduced' ? 'a tool-bearing seat could not reproduce it on this head'
+      : now.reason;
+    const note = downgradeUnverifiedFinding(original, reason);
+    downgraded.push({ seat: seat.step, key, original, reason });
+    return note;
+  });
+  return { findings: out, downgraded };
+}
+
+/** The verifier outcomes worth recording on the head's referral records (`failed` is not: it is retried). PURE. */
+export function verificationsToPersist(candidates, settled) {
+  return candidates.flatMap((c) => {
+    const s = settled.get(c.key);
+    return s && REFERRAL_VERIFY_OUTCOMES.includes(s.outcome)
+      ? [{ seat: c.seat, key: c.key, original: c.original, outcome: s.outcome, ...(s.outcome === 'not-reproduced' ? { reason: s.reason } : {}) }] : [];
+  });
+}
+
+/**
+ * The claims disputed by ONE verifier answer on this head (PR #5025 review): `not-reproduced` this run (`settled`) or recorded
+ * earlier on this head (`known`, whether or not a seat raises the claim again: a quiet re-run is not a second signal). That one
+ * answer comes from a model reading attacker-controlled PR content, and the citation check is only a format filter. The referral
+ * stays live for an independent ruling; additionally, the review reducer turns an otherwise clean accept into `needs-human` while
+ * this list is non-empty. A second independent seat that could lift it is #xztd0mv. `reasons` is `key → the verifier's reason as
+ * stored on the head's record`, so a later run shows the human what was actually answered. `[{ seat?, key, reason }]`, once per
+ * key, every reason folded (`foldVerifyReason`). PURE.
+ */
+export function uncorroboratedRetirements({ downgraded = [], known = new Map(), settled = new Map(), reasons = new Map() } = {}) {
+  const knownOf = (key) => (known instanceof Map ? known.get(key) : undefined);
+  const settledOf = (key) => (settled instanceof Map ? settled.get(key) : undefined);
+  const storedOf = (key) => (reasons instanceof Map ? reasons.get(key) : undefined);
+  const fallback = 'a tool-bearing seat could not reproduce it on this head';
+  const out = [];
+  const seen = new Set();
+  for (const d of Array.isArray(downgraded) ? downgraded : []) {
+    if (typeof d?.key !== 'string' || seen.has(d.key)) continue;
+    const now = settledOf(d.key);
+    if (knownOf(d.key) !== 'not-reproduced' && now?.outcome !== 'not-reproduced') continue;
+    seen.add(d.key);
+    const reason = now?.outcome === 'not-reproduced' ? now.reason : storedOf(d.key) ?? d.reason;
+    out.push({ seat: d.seat, key: d.key, reason: foldVerifyReason(reason, fallback) });
+  }
+  for (const [key, outcome] of known instanceof Map ? known : []) {
+    if (outcome !== 'not-reproduced' || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, reason: foldVerifyReason(storedOf(key), fallback) });
+  }
+  return out;
+}
+
+/** The stored `not-reproduced` reasons for ONE head, from the `read` step's `{ head, key, outcome, reason }` rows. PURE. */
+export function knownVerificationReasons(rows, head) {
+  const reasons = new Map();
+  if (typeof head !== 'string' || !head) return reasons;
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r && r.head === head && r.outcome === 'not-reproduced' && typeof r.key === 'string' && typeof r.reason === 'string') reasons.set(r.key, r.reason);
+  }
+  return reasons;
+}
+
 const supersededRulings = (ruling) => ruling.supersedes == null ? []
   : Array.isArray(ruling.supersedes) ? ruling.supersedes : [ruling.supersedes];
 
@@ -2823,6 +3045,8 @@ export const REFERRAL_SUPERSEDE_REASON = 'superseded: the mandatory owner alread
 export const REFERRAL_CARRY_REASON = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
 export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 // A drop only retires a finding nobody has ruled on: a finding with a ruling (a `block` above all) keeps counting.
+// Verification is evidence, never retirement authority: even a cited negative can echo untrusted PR content.
+// Keep both new and historical negative records live until the existing independent ruling process settles them.
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
@@ -3058,6 +3282,14 @@ export function validateReferralRecord(r) {
         || (c.from.rulingId !== undefined && (typeof c.from.rulingId !== 'string' || !c.from.rulingId.trim() || c.result === 'block'))
         || !['block', 'card', 'not-real'].includes(c.result)
         || (c.result === 'card' ? !CARD_REF_RE.test(c.card ?? '') : c.card !== undefined)))) return false;
+    // #4815 — what a tool-bearing verifier concluded about a tool-less seat's claim on THIS head. A `not-reproduced`
+    // entry records a disagreement and must say why; neither outcome retires the finding (`activeReferrals`).
+    if (r.verified !== undefined && (!Array.isArray(r.verified)
+      || new Set(r.verified.map(v => v?.key)).size !== r.verified.length
+      || r.verified.some(v => !v || !keys.has(v.key) || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome)
+        || (v.outcome === 'not-reproduced'
+          ? typeof v.reason !== 'string' || !v.reason.trim() || v.reason.length > VERIFY_REASON_MAX
+          : v.reason !== undefined)))) return false;
     const ids = new Set();
     for (const rli of r.rulings) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
@@ -3227,6 +3459,7 @@ export function renderReferralRecord(record) {
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
+    + (record.verified ?? []).map(v => `\n- ${v.key}: verified by a tool-bearing seat: ${v.outcome}${v.reason ? ` (${foldUntrusted(v.reason)})` : ''}`).join('')
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
     + `<!-- ${REFERRAL_RECORD_MARKER}: ${encodeURIComponent(JSON.stringify(record))} -->`;
@@ -3285,6 +3518,7 @@ export function readReferralRecords(comments, { head } = {}) {
           || JSON.stringify((r.dropped ?? []).slice(0, (previous.dropped ?? []).length)) !== JSON.stringify(previous.dropped ?? [])
           || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])
           || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
+          || JSON.stringify((r.verified ?? []).slice(0, (previous.verified ?? []).length)) !== JSON.stringify(previous.verified ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }

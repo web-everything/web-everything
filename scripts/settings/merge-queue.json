@@ -4,7 +4,8 @@
     "strategy": "github-merge-queue",
     "batchSize": 5,
     "maxGroupWaitMinutes": 5,
-    "mergeMethod": "merge"
+    "mergeMethod": "merge",
+    "concurrency": { "gateReads": 6, "enqueue": 3 }
   },
   "mergeQueue": {
     "fastDrain": { "scope": "target" },

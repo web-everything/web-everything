@@ -132,10 +132,9 @@ import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-colla
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
-import { execFileSync, execFile, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { promisify } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
@@ -172,7 +171,7 @@ import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging } from './lib/pr-list-paged.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -196,6 +195,9 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
+import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
+import { execDrainAsync } from './lib/drain-gh-async.mjs';
+export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
@@ -4146,27 +4148,9 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, Math.trunc(ms)));
 }
 
-const execFileP = promisify(execFile);
+const execFileP = execDrainAsync;
 
-/**
- * #2417 — bounded-concurrency async map. Runs `fn` over `items` with at most `limit` invocations in flight
- * at once, returning results in INPUT ORDER. The drain's per-pass candidate reads (`gh pr view --json commits`
- * + the manifest probe) are read-only, touch nothing on main, and have no ordering constraint, so a pool cuts
- * a ~N-PR / 3-repo sweep from ~N serial `gh` round-trips to ⌈N/limit⌉ waves — WITHOUT touching the strictly
- * serial `blockedBy`-ordered merge cascade downstream (that stays byte-for-byte the same, deliberately). Pure:
- * no gh/git coupling here, so it is unit-tested directly.
- */
-export async function mapWithConcurrency(items, limit, fn) {
-  const list = Array.isArray(items) ? items : [...items];
-  const results = new Array(list.length);
-  const width = Math.max(1, Math.min(Math.trunc(limit) || 1, list.length || 1));
-  let next = 0;
-  const worker = async () => {
-    for (let i = next++; i < list.length; i = next++) results[i] = await fn(list[i], i);
-  };
-  await Promise.all(Array.from({ length: width }, worker));
-  return results;
-}
+// The ordered pool lives in drain-concurrency.mjs; the public export above remains compatible.
 
 /**
  * #2417 — cross-pass read cache for the drain's per-PR candidate reads, keyed on `(repo, number, headSha)`.
@@ -4523,10 +4507,11 @@ async function runCli() {
     repo, requiredCheck: REQUIRED,
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
-  const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, 6, (pr) => resolveChecks(repo, pr));
+  const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
+  const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
-      const raw = readGh(['pr', 'view', String(num), ...repoFlag(repo), '--json',
+      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
         'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
@@ -5030,10 +5015,11 @@ async function runCli() {
   // #2417 — fan out the per-PR commits + manifest reads across EVERY candidate PR at once (bounded pool),
   // cached across `--watch` passes on unchanged head SHA — was one serial `gh pr view --json commits` + one
   // serial manifest probe per PR, one repo at a time (~2×N serial `gh` round-trips a pass). The merge cascade
-  // downstream is UNCHANGED and stays strictly serial (#2417 explicitly keeps the sole-writer loop serial).
+  // downstream keeps branch and main writers serial; independent queue preparation uses its own bounded pool.
   const sweepFlat = [];
   for (const repo of REPOS) for (const p of (prsByRepo.get(repo) || [])) sweepFlat.push({ repo, p });
   const sweepReads = await __t.timeAsync('classifyGateReads', () => fetchPrReadsCached(sweepFlat, {
+    concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
     cache: sweepReadCache,
     keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
     shaOf: ({ p }) => prHeadSha(p),
@@ -5064,7 +5050,6 @@ async function runCli() {
   // #xc7p3q9 (R11) — build verdicts from the SINGLE `prsByRepo` narrowed above (no second narrow inside
   // `prepareDrainVerdicts` — the round-1 double-narrow the reviewer flagged). The couple JOIN is deferred to
   // `planDrainPass` AFTER the escalation/park pass (R5), so `held` is read from each carrier's final decision.
-  const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
   const queueEnqueueMode = queueEnqueueModeFromPolicy(resolvedMergePolicy);
   const queueRequiredChecksOf = createQueueRequiredChecksOf({
     queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf,
@@ -6214,6 +6199,11 @@ async function runCli() {
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
   if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
+  const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
+    serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
+    readFiles: (c, sha) => readGit(['ls-tree', '-r', '--name-only', sha, '--', 'backlog/'], {
+      cwd: isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo), encoding: 'utf8',
+    }), hasPendingCards: (files) => hashBacklogFiles(files).length > 0 });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -6295,7 +6285,19 @@ async function runCli() {
       coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
         mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
       });
-      for (const c of coupleStep.ordered) {
+      await runEnqueueCandidates(coupleStep.ordered, {
+        concurrency: resolvedMergePolicy.policy.concurrency.enqueue,
+        canParallel: (c) => canParallelEnqueue(c, {
+          enqueues: mergeStrategy.enqueues(c.repo), numbering: branchPreparationRequired(c),
+          mayRefresh: mergeQueueHookEnabled(MERGE_QUEUE) && !mergeStrategy.queueOwnsFreshness(c.repo),
+          coupled: isImplHalf(c) || isCoupleCarrier(c),
+        }),
+        onError: (c, e) => {
+          const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+          failedMerges.push({ num: c.num, repo: c.repo, detail: ghListErrText(e), headSha: c.headSha ?? null });
+        },
+        run: async (candidate) => {
+        for (const c of [candidate]) { // preserve the existing serial path's continue semantics
         if (heldThisIteration.has(candKey(c))) continue;
         // fix-couple-split — impl half: its carrier must still pass a FRESH pre-merge read right now, else hold both.
         if (isImplHalf(c)) {
@@ -6545,7 +6547,7 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
-          if (numberingOnBranch && mergeStrategy.enqueues(c.repo)) {
+          if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo)) {
             const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
@@ -6642,6 +6644,8 @@ async function runCli() {
           }
         }
       }
+        },
+      });
       if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
     }
     // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
@@ -6960,7 +6964,7 @@ async function runCli() {
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
-  process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)})\n`);
+  process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };

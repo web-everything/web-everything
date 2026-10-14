@@ -1,0 +1,7 @@
+{
+  "$comment": "Drain-side cleanup (card 258), with no workflow edit: the drain cancels in-progress or queued merge_group runs whose gh-readonly-queue branch was deleted or rebuilt. mergeQueue.cancelObsoleteRuns accepts on|off (standard default on), overridden by WE_MERGE_QUEUE_CANCEL_OBSOLETE_RUNS. mergeQueue.cancelObsoleteRunsMinAgeSeconds is a non-negative integer (standard default 30), overridden by WE_MERGE_QUEUE_CANCEL_OBSOLETE_RUNS_MIN_AGE_SECONDS. Each key resolves env > repo > platform > standard; invalid values are ignored.",
+  "mergeQueue": {
+    "cancelObsoleteRuns": "on",
+    "cancelObsoleteRunsMinAgeSeconds": 30
+  }
+}
