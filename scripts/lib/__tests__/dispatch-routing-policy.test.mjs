@@ -248,10 +248,25 @@ it('routes all mechanical documentation and filing entries at medium effort', ()
   const policy = copy();
   for (const entry of [policy.operations.build, policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
     expect(entry.provider).toBe('codex'); expect(entry.model).toBe('sol');
+    expect(entry.effort.codex).toBe('medium');
+  }
+  for (const entry of ['prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])) {
     expect(Object.values(entry.effort).every(e => e === 'medium')).toBe(true);
     expect(entry.fallback).toEqual([{ provider: 'claude', model: 'sonnet', effort: 'medium' }]);
   }
   expect(policy.aliases.codex.sol).toBe('gpt-6.1-sol');
+});
+
+it('preserves Claude build and documentation effort and fallback', () => {
+  const policy = copy();
+  expect(policy.operations.build.effort.claude).toBe('high');
+  expect(policy.operations.build.fallback).toEqual([{ provider: 'claude', model: 'sonnet', effort: 'high' }]);
+  for (const entry of [policy.operations['build:doc-fix'], policy.operations['doc-fix'], policy.taskTypes['doc-fix']]) {
+    expect(entry.effort.claude).toBe('low');
+    expect(entry.fallback).toEqual([{ provider: 'claude', model: 'sonnet', effort: 'low' }]);
+  }
+  expect(resolveOperationRoute({ operation: 'build', available: ['claude'] }).effort).toBe('high');
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix', available: ['claude'] }).effort).toBe('low');
 });
 
 it('routes build-new-feature task work like build, including inherited operations and fallback', () => {
@@ -261,10 +276,16 @@ it('routes build-new-feature task work like build, including inherited operation
     effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
     fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
   });
-  expect(policy.taskTypes['build-new-feature']).toEqual(policy.operations.build);
+  expect(policy.taskTypes['build-new-feature']).toMatchObject({
+    provider: policy.operations.build.provider, model: policy.operations.build.model,
+    effort: { codex: policy.operations.build.effort.codex },
+  });
   const buildRoute = resolveOperationRoute({ operation: 'build', policy });
   policy.operations.build = { inherit: true };
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toEqual(buildRoute);
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toMatchObject({
+    provider: buildRoute.provider, model: buildRoute.model, effort: buildRoute.effort, source: buildRoute.source,
+    fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium' }],
+  });
   expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', available: ['claude'], policy })).toMatchObject({
     provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', fallback: [],
   });
