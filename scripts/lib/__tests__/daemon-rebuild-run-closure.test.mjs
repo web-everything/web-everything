@@ -1,7 +1,7 @@
 /** @file Per-walk filesystem caching for the rebuild's import and spawned-script closure. */
 import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
-import { collectRunClosure, decideSkipRebuild } from '../daemon-rebuild/skip-unrelated.mjs';
+import { collectRunClosure, decideSkipRebuild, makeSkipCheck } from '../daemon-rebuild/skip-unrelated.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
 
 function fixture(contents) {
@@ -26,6 +26,46 @@ function fixture(contents) {
 }
 
 describe('collectRunClosure filesystem reads', () => {
+  it('checks shared import targets once in a standalone import walk', () => {
+    const f = fixture({
+      'scripts/daemon.mjs': "import './shared.mjs';\nimport './worker.mjs';\n",
+      'scripts/shared.mjs': 'export {};\n',
+      'scripts/worker.mjs': "import './shared.mjs';\n",
+    });
+    const closure = collectImportClosure(f.options);
+    expect(closure.complete).toBe(true);
+    expect([...f.checks.values()].every(count => count === 1)).toBe(true);
+    f.files.delete(resolve(f.root, 'scripts/shared.mjs'));
+    expect(collectImportClosure(f.options).files.has('scripts/shared.mjs')).toBe(false);
+  });
+
+  it('uses the conservative fallback without scanning spawned scripts when imports are incomplete', () => {
+    const f = fixture({
+      'scripts/daemon.mjs': "await import(target);\nspawn(process.execPath, ['./worker.mjs']);\n",
+      'scripts/worker.mjs': "spawn(process.execPath, ['./grandchild.mjs']);\n",
+      'scripts/grandchild.mjs': 'export {};\n',
+    });
+    const check = makeSkipCheck({ ...f.options, env: {}, surface: () => [] });
+    expect(check(['backlog/card.md']).skip).toBe(true);
+    expect(check(['scripts/grandchild.mjs']).skip).toBe(false);
+    expect(check(['scripts/unknown.mjs']).skip).toBe(false);
+    expect(check(['config/settings.json']).skip).toBe(false);
+    expect(f.reads.has(resolve(f.root, 'scripts/worker.mjs'))).toBe(false);
+  });
+
+  it('stops later spawn hops once a spawned import is incomplete', () => {
+    const f = fixture({
+      'scripts/daemon.mjs': "spawn(process.execPath, ['./worker.mjs']);\n",
+      'scripts/worker.mjs': "await import(target);\nspawn(process.execPath, ['./grandchild.mjs']);\n",
+      'scripts/grandchild.mjs': 'export {};\n',
+    });
+    const check = makeSkipCheck({ ...f.options, env: {}, surface: () => [] });
+    expect(check(['backlog/card.md']).skip).toBe(true);
+    expect(check(['scripts/grandchild.mjs']).skip).toBe(false);
+    expect(f.reads.has(resolve(f.root, 'scripts/worker.mjs'))).toBe(true);
+    expect(f.reads.has(resolve(f.root, 'scripts/grandchild.mjs'))).toBe(false);
+  });
+
   it('parses shared sources once across spawn hops and preserves their dependency metadata', () => {
     const f = fixture({
       'scripts/daemon.mjs': "import './shared.mjs';\nspawn(process.execPath, ['./worker.mjs']);\n",

@@ -40,8 +40,15 @@ export function collectImportClosure({
   parsed = new Map(),
 }) {
   const absRoot = resolvePath(root);
+  // Shared dependencies occur on many edges. Cache probes for this tree snapshot only;
+  // a later invocation must observe added/deleted files, including prior misses.
+  const presence = new Map();
+  const existsOnce = (path) => {
+    if (!presence.has(path)) presence.set(path, exists(path));
+    return presence.get(path);
+  };
   const starts = (entries || []).filter(Boolean).map((e) => (isAbsolute(e) ? e : resolvePath(absRoot, e)))
-    .filter((e) => !relative(absRoot, e).startsWith('..') && exists(e));
+    .filter((e) => !relative(absRoot, e).startsWith('..') && existsOnce(e));
   if (!starts.length) return null;
   const seen = new Set();
   const jsonNames = new Set();
@@ -61,7 +68,7 @@ export function collectImportClosure({
         for (const m of src.matchAll(IMPORT_SPEC_RE)) {
           const spec = m[2];
           if (spec.startsWith('./') || spec.startsWith('../')) {
-            const hit = resolveRelativeSpec(file, spec, exists);
+            const hit = resolveRelativeSpec(file, spec, existsOnce);
             if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
