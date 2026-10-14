@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/conveyor/session-reaper.mjs
  * @description THE CONVEYOR SESSION REAPER (WE #3435, epic #3383). Walks `claude agents --json` and calls
@@ -796,7 +797,7 @@ export function groundTruthForItem(id, { backlogDir = DEFAULT_BACKLOG_DIR, readd
   try {
     const text = readFileSyncFn(join(backlogDir, fname), 'utf8');
     const status = readField(text, 'status');
-    return status === 'resolved' ? { resolved: true, evidence: `backlog#${id}:resolved` } : { resolved: false };
+    return isTerminalStatus(status) ? { resolved: true, evidence: `backlog#${id}:${status}` } : { resolved: false };
   } catch {
     return null; // the one found file itself unreadable — unknown, never reap on an unreadable signal
   }
@@ -1510,8 +1511,8 @@ export function retentionGroundTruthForItem(id, { backlogDir = DEFAULT_BACKLOG_D
   if (!fname) return { workDone: false, terminalAt: null };
   try {
     const text = readFileSyncFn(join(backlogDir, fname), 'utf8');
-    if (readField(text, 'status') !== 'resolved') return { workDone: false, terminalAt: null };
-    const resolvedAt = Date.parse(readField(text, 'dateResolved') ?? '');
+    if (!isTerminalStatus(readField(text, 'status'))) return { workDone: false, terminalAt: null };
+    const resolvedAt = Date.parse(readField(text, readField(text, 'status') === 'closed' ? 'dateClosed' : 'dateResolved') ?? '');
     return { workDone: true, terminalAt: Number.isFinite(resolvedAt) ? resolvedAt : null };
   } catch {
     return { workDone: false, terminalAt: null };
