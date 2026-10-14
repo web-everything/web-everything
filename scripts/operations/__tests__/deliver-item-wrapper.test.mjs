@@ -92,6 +92,7 @@ import { execFileSync } from 'node:child_process';
 import { SPAWN_TIMEOUT_MS, findItem } from '../dispatch-lane-io.mjs';
 import { tryReadDeliveryReport } from '../delivery-report-store.mjs';
 import { CODEX_DELIVERY_MODEL } from '../codex-delivery-provider.mjs';
+import { declaredResolvedIdsFromPr } from '../../lib/open-pr-items.mjs';
 import { parseDelegationMarker } from '../../lib/delegation-marker.mjs';
 import {
   DELIVERY_AGENT_PROVIDERS, DELIVERY_AGENT_SPAWN_TIMEOUT_MS, buildRestrictedProviderArgv,
@@ -3302,6 +3303,75 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     execFileSync.mockReset();
   });
 
+  it('recovery restores durable group members and publishes their resolution declarations', async () => {
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'group-recovery', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build', groupMembers: ['1235', 'xabc123'] }, result: null, error: null }] });
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+    const provider = { spawn: vi.fn() };
+    const result = await deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+      runId: 'group-recovery', effectKey: 'dispatch:0:0', resume: true }, provider);
+    expect(result.result).toContain('PR #4321');
+    expect(result.groupMembers).toEqual(['1235', 'xabc123']);
+    const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+    expect(body).toContain('Resolves #1235, #xabc123');
+    expect(provider.spawn).not.toHaveBeenCalled();
+  });
+
+  it('recovery fails closed before publishing when the original dispatch record is missing', async () => {
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args, opts) => cmd === 'git' && args[0] === 'rev-list' ? '1\n' : priorExec(cmd, args, opts));
+    await expect(deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+      runId: 'missing-recovery', effectKey: 'dispatch:0:0', resume: true }, { spawn: vi.fn() }))
+      .rejects.toThrow('recovery requires the original dispatch');
+    expect(execFileSync.mock.calls.some(c => c[1]?.[1] === 'open-pr')).toBe(false);
+  });
+
+  it.each(['requeue-alone', 'fail-group'])('drives grouped delivery and drop settlement with %s policy', async (policy) => {
+    const previousPolicy = process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+    process.env.WE_BUILD_GROUP_MEMBER_FAILURE = policy;
+    findItem.mockImplementation((num) => ({ num, slug: `card-${num}`, specPath: `backlog/${num}-card-${num}.md`, scope: [] }));
+    const store = createFileRunStore(process.env.OPERATION_RUNS_DIR);
+    store.write({ ...newRunRecord({ id: 'grouped-run', op: 'dispatch-lane' }),
+      effects: [{ key: 'dispatch:0:0', type: 'conveyor.dispatch-delivery-agent', stepIndex: 0, index: 0,
+        status: 'in-flight', payload: { num: '9999', launchKind: 'build' }, result: null, error: null }] });
+    const provider = { vendor: 'claude', spawn: vi.fn(({ prompt }) => {
+      expect(prompt).toContain('#1235 — backlog/1235-card-1235.md');
+      expect(prompt).toContain('#1236 — backlog/1236-card-1236.md');
+      writeFileSync(join(lane, '.delivery-group-drop'), '1236: cannot deliver\n');
+    }) };
+    try {
+      const result = await deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999',
+        groupMembers: ['1235', '1236'], runId: 'grouped-run', effectKey: 'dispatch:0:0' }, provider,
+        { newSessionId: () => 'uuid-fixed' });
+      const claims = execFileSync.mock.calls.filter((c) => c[1]?.[1] === 'claim');
+      expect(claims.map((c) => c[1][2])).toEqual(['--ref=9999', '--ref=1235', '--ref=1236']);
+      expect(claims.every((c) => c[2].cwd === lane)).toBe(true);
+      expect(result.groupMembers).toEqual(['1235', '1236']);
+      expect(result.groupDropped).toEqual(['1236']);
+      expect(store.read('grouped-run').effects[0].result).toMatchObject({
+        groupMembers: ['1235', '1236'], groupDropped: ['1236'], groupDropReasons: { '1236': 'cannot deliver' },
+        outcome: policy === 'fail-group' ? 'group-member-dropped' : 'pr-opened',
+      });
+      const openCalls = execFileSync.mock.calls.filter((c) => c[1]?.[1] === 'open-pr');
+      if (policy === 'fail-group') {
+        expect(result.result).toBe('group-member-dropped');
+        expect(openCalls).toHaveLength(0);
+      } else {
+        expect(result.result).toContain('PR #4321');
+        const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+        expect(body).toContain('Resolves #1235\n');
+        expect(body).toContain('Dropped from group: #1236 — cannot deliver');
+      }
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally {
+      if (previousPolicy === undefined) delete process.env.WE_BUILD_GROUP_MEMBER_FAILURE;
+      else process.env.WE_BUILD_GROUP_MEMBER_FAILURE = previousPolicy;
+    }
+  });
+
   it('refuses to publish a build with no durable dispatch identity', async () => {
     await expect(deliverItem({ item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '' },
       { spawn: vi.fn() }, { newSessionId: () => 'uuid-fixed' }))
@@ -4342,4 +4412,119 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       expect(envelopeReportOrNull(null, 's')).toBeNull();
     });
   });
+});
+
+describe('grouped delivery contracts', () => {
+  beforeEach(async () => { findItem.mockImplementation((await vi.importActual('../dispatch-lane-io.mjs')).findItem); });
+  const loadItems = () => [
+    { num: '1234', slug: 'lead' },
+    { num: '1235', slug: 'member' },
+  ];
+  it('appends member paths and the drop-file contract to the actual filled brief', () => {
+    const prompt = fillMinimalBrief('Read {{ITEM_SPEC_PATH_BASENAME}}.',
+      { item: '1234', sessionSlug: 's', lane: 1, groupMembers: ['1235'] }, { loadItems });
+    expect(prompt).toContain('GROUPED BUILD');
+    expect(prompt).toContain('#1235 — backlog/1235-member.md');
+    expect(prompt).toContain('.delivery-group-drop');
+    expect(prompt).toContain('status: active');
+  });
+  it('lists only delivered members in Resolves and names dropped members separately', () => {
+    const body = buildPrBody({ item: '1234', groupMembers: ['1235', '1236'],
+      groupDropped: ['1236'], groupDropReasons: { '1236': 'cannot deliver' } });
+    expect(body).toContain('Grouped build (2 cards): #1234, #1235');
+    expect(body).toContain('Resolves #1235\n');
+    expect(body).not.toContain('Resolves #1235, #1236');
+    expect(body).toContain('Dropped from group: #1236 — cannot deliver');
+  });
+  it('redacts claim failures and agent drop reasons before publication and commits', async () => {
+    const { claimGroupMembers, processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const reason = 'busy /Users/operator/private/run.mjs `secret` @someone [link](https://example.com)\u2028stderr';
+    const claimed = claimGroupMembers({ groupMembers: ['1235'], sessionSlug: 's', lanePath: '/lane' }, {
+      run: () => { throw new Error(reason); },
+    });
+    const body = buildPrBody({ item: '1234', groupMembers: ['1235'], ...claimed });
+    expect(body).not.toContain('/Users/operator');
+    expect(body).not.toContain('@someone');
+    expect(body).not.toContain('[link]');
+    const lane = mkdtempSync(join(tmpdir(), 'group-sanitize-'));
+    try {
+      writeFileSync(join(lane, '.delivery-group-drop'), `1235: ${reason}\n`);
+      const run = vi.fn(() => '');
+      const dropped = processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, { run, loadItems });
+      const message = run.mock.calls.find(([cmd, args]) => cmd === 'git' && args[0] === 'commit')[1];
+      expect(message.join(' ')).not.toContain('/Users/operator');
+      expect(message.join(' ')).not.toContain('@someone');
+      expect(dropped.groupDropReasons['1235']).toBe(claimed.groupDropReasons['1235']);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it('claims each member and records a failed claim without abandoning siblings', async () => {
+    const { claimGroupMembers } = await import('../deliver-item-wrapper.mjs');
+    const run = vi.fn((cmd, args) => { if (args.includes('--ref=1236')) throw new Error('busy'); return '{}'; });
+    const result = claimGroupMembers({ groupMembers: ['1235', '1236'], sessionSlug: 's', lanePath: '/lane' }, { run });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls.every((c) => c[2].cwd === '/lane')).toBe(true);
+    expect(result.groupMembers).toEqual(['1235']);
+    expect(result.groupDropped).toEqual(['1236']);
+    expect(result.groupDropReasons['1236']).toContain('busy');
+  });
+  it('restores dropped card paths, commits the restoration and removes the private drop file', async () => {
+    const { processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const lane = mkdtempSync(join(tmpdir(), 'group-drop-'));
+    try {
+      writeFileSync(join(lane, '.delivery-group-drop'), '1235: cannot deliver\n');
+      const run = vi.fn(() => '');
+      const result = processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, { run, loadItems });
+      expect(result.groupDropped).toEqual(['1235']);
+      expect(run).toHaveBeenCalledWith('git', ['checkout', 'origin/main', '--', 'backlog/1235-member.md'], { cwd: lane });
+      expect(run.mock.calls.some((c) => c[1].includes('drop #1235 from group: cannot deliver'))).toBe(true);
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+});
+
+describe('group drop restoration with a real git index', () => {
+  beforeEach(async () => { findItem.mockImplementation((await vi.importActual('../dispatch-lane-io.mjs')).findItem); });
+  it('restores the card to origin/main without committing the drop file or unrelated edits', async () => {
+    const { execFileSync: execReal } = await vi.importActual('node:child_process');
+    const { processGroupDrops } = await import('../deliver-item-wrapper.mjs');
+    const lane = mkdtempSync(join(tmpdir(), 'group-git-'));
+    const git = (...args) => execReal('git', args, { cwd: lane, encoding: 'utf8' });
+    try {
+      git('init', '-q'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.test');
+      mkdirSync(join(lane, 'backlog'));
+      writeFileSync(join(lane, 'backlog/1235-member.md'), 'status: queued\n');
+      writeFileSync(join(lane, 'other.txt'), 'original\n');
+      git('add', '.'); git('commit', '-qm', 'fixture main'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(lane, 'backlog/1235-member.md'), 'status: active\n');
+      git('add', '.'); git('commit', '-qm', 'fixture claims');
+      writeFileSync(join(lane, 'other.txt'), 'unrelated\n'); git('add', 'other.txt');
+      writeFileSync(join(lane, '.delivery-group-drop'), '1235: cannot deliver\n');
+      processGroupDrops({ lanePath: lane, groupMembers: ['1235'] }, {
+        loadItems: () => [{ num: '1235', slug: 'member' }],
+        run: (cmd, args, opts) => execReal(cmd, args, { ...opts, encoding: 'utf8' }),
+      });
+      expect(git('show', 'HEAD:backlog/1235-member.md')).toBe('status: queued\n');
+      expect(git('show', 'HEAD:other.txt')).toBe('original\n');
+      expect(git('diff', '--cached', '--name-only').trim()).toBe('other.txt');
+      expect(git('ls-tree', '--name-only', 'HEAD')).not.toContain('.delivery-group-drop');
+      expect(existsSync(join(lane, '.delivery-group-drop'))).toBe(false);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('grouped resolution declarations', () => {
+  it.each([['1235', 'xabc123', '1236'], ['xabc123', '1235', '1236']])(
+    'a hash member cannot suppress any resolution in the generated body (%s, %s, %s)', (...members) => {
+      const groupMembers = members.slice(0, 3);
+      const body = buildPrBody({ item: '1234', groupMembers });
+      const diff = groupMembers.map(num => [
+        `diff --git a/backlog/${num}-card.md b/backlog/${num}-card.md`,
+        `--- a/backlog/${num}-card.md`, `+++ b/backlog/${num}-card.md`,
+        '@@ -1,3 +1,3 @@', ' ---', '-status: open', '+status: active', ' ---',
+      ].join('\n')).join('\n');
+      expect(declaredResolvedIdsFromPr('lane/1234-build', 'Build cards', {
+        body, diff, changedFiles: ['scripts/a.mjs', ...groupMembers.map(num => `backlog/${num}-card.md`)],
+      }).sort()).toEqual([...groupMembers].sort());
+    });
 });
