@@ -1,4 +1,5 @@
 ---
+bornAs: x6y8z4c
 kind: story
 size: 3
 status: open
