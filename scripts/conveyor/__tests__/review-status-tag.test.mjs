@@ -5,7 +5,11 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+import { deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+const tagReviewStatus = (options) => tagReviewStatusIo({
+  readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
+  ...options,
+});
 
 describe('deriveReviewStatus', () => {
   it('null when no agent is bound to this PR by name', () => {
