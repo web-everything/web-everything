@@ -163,6 +163,15 @@ function templates() {
 // createWorld
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** Base environment shared by every host and child in one simulated world.
+ * Vitest supplies a per-file throttle root, but each world resets its own clock. Sharing that root carries
+ * spent budget windows from an earlier world's future into the next world's baseline, making each call wait
+ * out the production admission timeout. Keep sibling hosts sharing one budget, scoped to this world's cleanup.
+ */
+export function worldEnv(root, ambient = process.env) {
+  return { ...ambient, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle') };
+}
+
 /**
  * @param {{repos?: string[], lanes?: number, clockStartOffsetMs?: number}} [o]
  */
@@ -255,7 +264,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     }
   }
   const env = {
-    ...process.env,
+    ...worldEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,
