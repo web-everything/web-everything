@@ -63,6 +63,18 @@ describe('isMappedRewrite', () => {
 });
 
 describe('checkNumberingCommit', () => {
+  it.each(['scripts/app.mjs', '.github/workflows/run.yml', 'config.json'])('refuses mapped rewrites outside backlog: %s', (path) => {
+    const o = live();
+    o.changes.push({ status: 'M', path, before: "'xf74q20'", after: "'6053'" });
+    refused(checkNumberingCommit(o), /backlog/);
+  });
+  it('allows main aliases inside renamed cards', () => {
+    const o = live();
+    o.extraMap = new Map([['xabc123', '7001']]);
+    o.changes[1].before += 'see #xabc123';
+    o.changes[2].after += 'see #7001';
+    expect(checkNumberingCommit(o).ok).toBe(true);
+  });
   it('proves the live #5025 shape: one modification and two stamped renames', () => {
     expect(checkNumberingCommit(live())).toEqual({ ok: true, pairs: [...map], renames: [
       { from: 'backlog/xf74q20-hold-auto-land.md', to: 'backlog/6053-hold-auto-land.md' },
@@ -151,6 +163,12 @@ function repo() {
 }
 
 describe('proveNumberingOnlyMove (real git)', () => {
+  it.each(['backlog/0001-parent.md', 'backlog/7001-foo.md'])('refuses numbering combined with an executable-bit change: %s', (path) => {
+    const r = repo(); r.number();
+    r.git(['update-index', '--chmod=+x', path]);
+    r.git(['commit', '--amend', '--no-edit', '-q']);
+    refused(r.prove(r.git(['rev-parse', 'HEAD'])), /mode/);
+  });
   it('proves a single numbering commit', () => {
     const r = repo();
     const head = r.number();
@@ -175,12 +193,19 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.git(['update-ref', 'refs/remotes/origin/main', main]);
     r.git(['reset', '--hard', r.base]);
     r.write('backlog/0001-parent.md', 'see #xabc123 and #xghi789\n');
+    r.write('backlog/xabc123-foo.md', '---\nkind: story\n---\nsee #xdef456 and #xghi789\n');
     const fromSha = r.commit('parent with reference');
     r.number();
     r.write('backlog/0001-parent.md', 'see #7001 and #8000\n');
+    r.write('backlog/7001-foo.md', '---\nbornAs: xabc123\nkind: story\n---\nsee #7002 and #8000\n');
     r.git(['add', '-A']); r.git(['commit', '--amend', '--no-edit', '-q']);
     const toSha = r.git(['rev-parse', 'HEAD']);
     expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha }).ok).toBe(true);
+    const unavailable = (cmd, args, opts) => {
+      if (args[0] === 'grep') throw Error('temporary alias read failure');
+      return execFileSync(cmd, args, opts);
+    };
+    expect(proveNumberingOnlyMove({ exec: unavailable, cwd: r.cwd, fromSha, toSha })).toMatchObject({ ok: false, retryable: true });
     refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha, mainRef: 'missing' }), /rewrite/);
     const plain = repo();
     const head = plain.number();
@@ -290,6 +315,41 @@ describe('numbering acceptance restamp', () => {
   });
   const run = (over = {}) => restampAfterNumbering({ repo: 'o/n', pr: 5025,
     state: { labels: ['review:pending'], headRefOid: TO, comments: liveComments() }, reviews: [], ...over });
+  it('retries a transient proof read failure on the same head', () => {
+    const r = repo(); const head = r.number();
+    let fail = true;
+    const calls = [];
+    const opts = { cwd: r.cwd, state: { labels: ['review:pending'], headRefOid: head, comments: [accept(r.base)] },
+      exec: (cmd, args, opts) => {
+        if (fail) throw Error('fetch unavailable');
+        return execFileSync(cmd, args, opts);
+      }, provider: {
+      postComment: () => calls.push('comment'), setLabels: () => calls.push('labels') },
+    };
+    expect(run(opts).action).toBe('retry');
+    fail = false;
+    expect(run(opts).action).toBe('restamped');
+    expect(calls).toEqual(['comment', 'labels']);
+  });
+  it('refuses an unsatisfied mandatory referral through the shared guard', () => {
+    const state = { labels: ['review:pending'], headRefOid: TO,
+      comments: [{ author: { login: 'chalbert' }, body: '<!-- mandatory-referrals-v1: truncated -->' }, ...liveComments()] };
+    expect(run({ state, prove: () => { throw Error('unexpected proof'); } })).toMatchObject({ action: 'retry' });
+  });
+  it.each([{ enabled: false }, { acceptCarry: 'off' }])('writes nothing with a disabled carry setting: %j', (settings) => {
+    expect(run({ ...settings, prove: () => { throw Error('unexpected proof'); } })).toBeNull();
+  });
+  it.each([false, true])('checks the shared referral guard before writes (labelsOnly: %s)', (labelsOnly) => {
+    const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert' });
+    const state = { labels: ['review:pending'], headRefOid: TO,
+      comments: labelsOnly ? [...liveComments(), { author: { login: 'chalbert' }, body }] : liveComments() };
+    const checked = [];
+    expect(run({ state, prove: () => ({ ok: true }),
+      guardReferrals: (s) => { checked.push(s.headRefOid); throw Error('mandatory referral hold: unresolved'); },
+      provider: { postComment: () => { throw Error('unexpected write'); }, setLabels: () => { throw Error('unexpected write'); } } }))
+      .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
+    expect(checked).toEqual([TO]);
+  });
   it('posts before labels, then remembers the settled head', () => {
     const calls = [];
     const provider = { postComment: () => calls.push('comment'), setLabels: (_r, _n, spec) => calls.push(spec) };

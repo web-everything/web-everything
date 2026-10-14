@@ -600,6 +600,16 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
 describe('human clearance numbering tier', () => {
   const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
     headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
+  it.each(['off', 'missing recorded diff', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
+    let calls = 0;
+    const e = { ...evidence, humanClearance: { ...evidence.humanClearance } };
+    if (kind === 'missing recorded diff') e.humanClearance.diff = null;
+    if (kind === 'unread live diff') e.headDiff = null;
+    const d = proveHumanClearanceCarry({ evidence: e, enabled: kind !== 'off',
+      proveNumbering: () => { calls++; return { ok: true }; } });
+    expect(d.carry).toBe(false);
+    expect(calls).toBe(0);
+  });
   it('carries a fingerprint mismatch only with a numbering proof', () => {
     const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: true, reason: 'verified renames' }) });
     expect(d).toMatchObject({ carry: true, tier: 'numbering', actor: 'chalbert' });

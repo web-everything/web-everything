@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
+import { restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
 // The REAL #4535 measurement (card xu7kxtt): a cleared-human accept on an older head, the merge queue moved the head, the drain re-parked.
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
@@ -525,6 +526,21 @@ it('restamps numbering before the stale-accept heal and skips that heal', () => 
   expect(result).toContainEqual({ num: 5025, numberingRestamp: 'restamped', detail: undefined });
   expect(p.calls.postComment).toEqual([]);
   expect(p.calls.set).toEqual([]);
+});
+
+it('keeps an unsatisfied mandatory referral held on the daemon numbering path', () => {
+  _resetNumberingRestampMemo();
+  const p = provider({ readPrState: () => ({ comments: [
+    { author: { login: 'chalbert' }, body: '<!-- mandatory-referrals-v1: truncated -->' },
+    { author: { login: 'chalbert' }, body: `✅ review — human cleared\n<!-- reviewed-sha: ${'b'.repeat(40)} -->\n<!-- cleared-human: chalbert -->` },
+  ] }) });
+  const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [pr(5025, ['review:pending'])],
+    numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: true, acceptCarry: 'on',
+      prove: () => { throw Error('unexpected proof'); } }) });
+  expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'retry' }));
+  expect(p.calls.postComment).toEqual([]);
+  expect(p.calls.set).toEqual([]);
+  _resetNumberingRestampMemo();
 });
 
 it('passes unreadable reviews as null and keeps numbering failures isolated per PR', () => {
