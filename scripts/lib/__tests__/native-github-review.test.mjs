@@ -22,9 +22,15 @@ const review = (id, state, commit_id = head, login = 'plateau-reviewer[bot]', ty
 const bot = { login: 'plateau-reviewer', type: 'Bot' };
 const author = { login: 'web-everything[bot]', type: 'Bot' };
 const throws = () => { throw new Error('unreadable'); };
-// The labels a verdict leaves live once review-set-label has swapped them (kept labels, e.g. review:human, carried).
+// The labels a verdict leaves live once review-set-label has swapped them (decideSetLabel): the state label replaced,
+// review:human kept, except that clear-human lifts it and a review:human re-arm adds no review:pending.
 const LABEL_FOR = { accepted: 'review:accepted', changes: 'review:changes', rearm: 'review:pending', restamp: 'review:accepted', 'clear-human': 'review:accepted' };
-const liveLabelsFor = (verdict = 'accepted', kept = []) => [...kept.map(l => (typeof l === 'string' ? l : l.name)), ...(LABEL_FOR[verdict] ? [LABEL_FOR[verdict]] : [])];
+const liveLabelsFor = (verdict = 'accepted', kept = []) => {
+  const names = kept.map(l => (typeof l === 'string' ? l : l.name))
+    .filter(n => !['review:accepted', 'review:changes', 'review:pending'].includes(n) && !(verdict === 'clear-human' && n === 'review:human'));
+  if (verdict === 'rearm' && names.includes('review:human')) return names;
+  return [...names, ...(LABEL_FOR[verdict] ? [LABEL_FOR[verdict]] : [])];
+};
 function fixture(options = {}, responses = {}) {
   const calls = [];
   const log = vi.fn();
@@ -400,6 +406,54 @@ describe('a stale verdict never overwrites a newer one on the same head', () => 
     expect(a.outcome).toBe('failed');
     expect(a.reason).toContain('labels kept moving');
     expect(a.line).toContain('agree=no');
+  });
+
+  // Self-review must-fix: a review:human re-arm leaves only review:human live, never review:pending.
+  it.each([
+    ['told by the caller', { swappedLabels: ['review:human'] }],
+    ['derived from the pre-swap labels', {}],
+  ])('a re-arm on a review:human PR is current (%s) and dismisses our change request', (_, extra) => {
+    const f = fixture({ verdict: 'rearm', labels: ['review:changes', 'review:human'], ...extra }, { labels: ['review:human'], reviews: [review(7, 'CHANGES_REQUESTED')] });
+    expect(f.result).toMatchObject({ outcome: 'dismissed', dismissed: 1 });
+    expect(f.puts).toHaveLength(1);
+  });
+
+  it('the caller\'s swappedLabels win: a live label other than what this run\'s swap left is superseded', () => {
+    const f = fixture({ verdict: 'accepted', swappedLabels: ['review:accepted'] }, { labels: ['review:accepted', 'review:human'] });
+    expect(f.result.outcome).toBe('superseded');
+    expect(f.posts).toHaveLength(0);
+  });
+
+  it('a POST that errors but landed is still re-checked, and a newer verdict is put back', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('accepted') });
+    let fired = false;
+    const landedThenFailed = (argv) => {
+      if (!fired && argv.includes('POST')) {
+        fired = true;
+        runB(gh, 'changes');
+        gh.exec(argv);
+        throw Object.assign(new Error('timeout'), { stderr: 'gateway timeout' });
+      }
+      return gh.exec(argv);
+    };
+    const a = mirror({ ...gh, exec: landedThenFailed }, 'accepted');
+    expect(gh.standing()).toBe('CHANGES_REQUESTED');
+    expect(a.outcome).toBe('superseded');
+    expect(a.reason).toContain('gateway timeout');
+  });
+
+  it('reconcile never writes on a PR that closed meanwhile', () => {
+    const gh = fakeGithub({ labels: liveLabelsFor('accepted') });
+    let reads = 0;
+    const closing = (argv) => {
+      const out = gh.exec(argv);
+      if (argv.includes('POST')) gh.labels = liveLabelsFor('changes');
+      if (argv[1] === 'repos/owner/repo/pulls/123' && reads++ > 0) return JSON.stringify({ ...JSON.parse(out), state: 'closed' });
+      return out;
+    };
+    const a = mirror({ ...gh, exec: closing }, 'accepted');
+    expect(gh.reviews).toHaveLength(1);
+    expect(a.reason).toContain('nothing: pr-not-open');
   });
 
   it('fails closed when the live labels cannot be read', () => {

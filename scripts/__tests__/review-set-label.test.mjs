@@ -2124,17 +2124,19 @@ describe('the write arc and its #2964 ordering', () => {
   // Card xk8ab41, operator send-back #5 (2026-10-13): the native-review mirror runs AFTER the label swap, with the
   // verdict, the reviewed head and the PRE-swap labels (a review:human accept must mirror as a COMMENT, never APPROVE).
   it.each([
-    [['review:pending'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}],
-    [['review:accepted'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}],
+    [['review:pending'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}, ['review:accepted']],
+    [['review:accepted'], ['1048', '--repo=o/n', '--to=accepted', '--actor=op'], 'accepted', {}, ['review:accepted']],
     // The fix agent's re-arm (`rearm-review.mjs` pins the target): back to pending, so the mirror dismisses ours.
-    [['review:changes'], ['1048', '--repo=o/n'], 'rearm', { fixedTo: 'rearm' }],
-  ])('calls the native-review mirror once, after the swap, from %j', (labels, argv, to, config) => {
+    [['review:changes'], ['1048', '--repo=o/n'], 'rearm', { fixedTo: 'rearm' }, ['review:pending']],
+    // A review:human re-arm adds no review:pending (one hold at a time): the mirror is told so, not left to guess.
+    [['review:changes', 'review:human'], ['1048', '--repo=o/n'], 'rearm', { fixedTo: 'rearm' }, ['review:human']],
+  ])('calls the native-review mirror once, after the swap, from %j', (labels, argv, to, config, swappedLabels) => {
     const p = stubProvider({ labels });
     const mirrorNative = vi.fn(() => { p.calls.push('mirrorNative'); });
     const { exitCode } = run(p, argv, { mirrorNative, ...config });
     expect(exitCode).toBe(0);
     expect(mirrorNative).toHaveBeenCalledTimes(1);
-    expect(mirrorNative).toHaveBeenCalledWith({ repo: 'o/n', pr: 1048, verdict: to, labels: labels.map((name) => ({ name })), headSha: 'a'.repeat(40) });
+    expect(mirrorNative).toHaveBeenCalledWith({ repo: 'o/n', pr: 1048, verdict: to, labels: labels.map((name) => ({ name })), headSha: 'a'.repeat(40), swappedLabels });
     const order = p.calls.filter((c) => c === 'setLabels' || c === 'mirrorNative');
     expect(order).toEqual(['setLabels', 'mirrorNative']);
   });

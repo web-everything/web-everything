@@ -1875,7 +1875,11 @@ export function runReviewLabelCli({
 
   // Card xk8ab41 — mirror the verdict as a native GitHub review (`review.nativeGithubReview`): pinned to the reviewed head,
   // posted only as the reviewer App, stderr-only, never throws, never a gate (we:scripts/lib/native-github-review.mjs).
-  mirrorNative({ repo, pr: Number(pr), verdict: to, labels: Array.isArray(currentLabels) ? currentLabels : [], headSha });
+  // `swappedLabels` is what THIS run's swap left, derived from its decision (never the read-back, which a later run's
+  // swap may already have replaced): the mirror writes only while the live labels still match it (red team x1b8hlo).
+  const preSwap = (Array.isArray(currentLabels) ? currentLabels : []).map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean);
+  const swappedLabels = [...new Set([...preSwap.filter((n) => !decision.removeLabels.includes(n)), ...(decision.addLabel ? [decision.addLabel] : [])])];
+  mirrorNative({ repo, pr: Number(pr), verdict: to, labels: Array.isArray(currentLabels) ? currentLabels : [], headSha, swappedLabels });
   emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision, labels: newLabels }))}\n`);
   process.exit(0);
 }
