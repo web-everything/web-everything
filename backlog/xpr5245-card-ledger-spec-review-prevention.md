@@ -36,6 +36,17 @@ Idempotency key: advisory-prevention-key:web-everything/web-everything#5245@9e8b
   tests that pass while different identities fail.
 - Require bounded-read guarantees to name a test asserting the actual read bound and zero allocation,
   append/push on overflow, including retry reads. A test checking only the returned error is insufficient.
+- Add a backlog-integrity rule for proof prerequisites (round 4): a Proof plan or Done-when that names another
+  slice as already landed ("after slice (d) has landed …") must have that slice as an ancestor in
+  `blockedBy`. A slice that names one of its own dependents there errors (the two cards would deadlock).
+- Add review-lens checks (round 4):
+  - every new fail-closed gate names a test showing the unaffected population (for example numeric-only
+    merge groups) still passes when the dependency is down;
+  - a trust root (allowed signers, allow-lists) is read from the base ref, never the tree under check, with a
+    fixture where the PR edits it and gains nothing;
+  - every fail-closed state that later good writes cannot clear names its reviewed recovery procedure;
+  - every security guarantee has a named test per reader (ESM and CJS mirrors alike), and its test file is
+    in `scope`.
 
 The direct ledger prevention tests are already required by x5qtv82, xy5r0uf and xbpjdsd; this card adds the
 reusable authoring guard so those omissions do not recur. It does not depend on their implementation.
@@ -49,7 +60,7 @@ Dependency and test-scope rules, plus the approval-source check and the security
 In `we:scripts/__tests__/check-standards-rules.test.mjs`, use synthetic cards/epic tables: missing versus
 present wiring dependency; a contextual slice mention; unknown slice letter; missing versus covered test
 file scope; directory and repo-prefix coverage; confirmation without source; retained gate with approval
-pending. In `we:scripts/__tests__/check-standards.test.mjs`, exercise the real backlog scanner so these
+pending; a Proof plan naming a dependent slice as landed (error) versus an ancestor slice (pass). In `we:scripts/__tests__/check-standards.test.mjs`, exercise the real backlog scanner so these
 checks cannot pass in isolation while remaining unwired. Review fixtures cover all ledger checklist items.
 
 ## Proof plan

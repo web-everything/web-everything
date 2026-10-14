@@ -4,7 +4,7 @@ size: 5
 parent: "xdlnylv"
 status: open
 blockedBy: ["x5qtv82"]
-scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
+scope: ["we:scripts/backlog/card-number.mjs", "we:scripts/backlog/__tests__/card-number.test.mjs", "we:src/_data/__tests__/backlog-card-number.test.ts", "we:src/_data/__tests__/backlogRedirects.test.ts", "we:scripts/__tests__/ci-card-ledger-fetch.test.mjs", "we:src/_data/backlog.js", "we:src/_data/backlogRedirects.js", "we:src/backlog-redirects.njk", "we:src/backlog-pages.njk", "we:src/_includes/backlog-badges.njk", "we:scripts/backlog.mjs", "we:.github/workflows/deploy.yml", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-13"
 tags: [backlog, numbering, ledger, renderer]
 ---
@@ -62,12 +62,29 @@ One line per class: either the handling, or `n/a: <why>`.
 Unit tests for the resolver (numeric, ledgered x, unledgered x, conflict, number to id) and for
 `backlogRedirects` (emits `/backlog/<NNN>/` for a ledgered x-card, nothing for an unledgered one). A
 `we:scripts/backlog.mjs show` test against a fixture ledger.
-Run the same trusted-introducer fixtures through the ESM resolver and CJS loader: an untrusted row followed
-by a trusted signed tip never appears as a display number or number redirect. Missing history/signatures
-yield x-id fallback. A workflow integration fixture confirms CI/deploy fetch history before consumers run
-and exposes a failed fetch as unreadable to merge_group checks, even with a stale local ledger ref.
-Repeat with a valid row followed by a partial final line: no display number or number redirect may come
-from the otherwise valid prefix, in either reader.
+
+Each security guarantee has a named test, in the same fixtures for both readers (slice (a)'s
+`rejectsUntrustedIntroducerBehindTrustedTip`, `trustRootReadFromBaseNotTreeUnderCheck` and partial-line
+fixtures), so the CJS twin cannot ship with weaker checks than the ESM resolver:
+
+- `we:scripts/backlog/__tests__/card-number.test.mjs` (ESM resolver and `show`):
+  - `esmRejectsUntrustedRowUnderTrustedTip` — the forged row gives no `displayNum` and no `idFor` mapping;
+    `show <forged number>` fails.
+  - `esmPartialFinalLineYieldsNoDisplayNumber` — a valid row then a partial line: x-id display for every
+    ledger-dependent card, including the valid-prefix one.
+  - `esmIgnoresTrustRootInTreeUnderCheck` — a key added in the working tree does not authenticate a row.
+  - `esmMissingHistoryFallsBackToXId`.
+- `we:src/_data/__tests__/backlog-card-number.test.ts` (CJS twin through the real loader):
+  `cjsRejectsUntrustedRowUnderTrustedTip`, `cjsPartialFinalLineYieldsNoDisplayNumber`,
+  `cjsIgnoresTrustRootInTreeUnderCheck`, `cjsMissingHistoryFallsBackToXId`, plus
+  `cjsAndEsmAgreeOnEveryFixture` (same input, same `displayNum` map).
+- `we:src/_data/__tests__/backlogRedirects.test.ts`: `redirectsEmitNothingForUnreadableLedger` (forged row,
+  partial line, missing history, failed fetch: no `/backlog/<NNN>/` or `/backlog/<x-id>/` ledger redirect),
+  and the ledgered/unledgered cases above.
+- `we:scripts/__tests__/ci-card-ledger-fetch.test.mjs` (workflow integration):
+  `ciFetchesLedgerHistoryBeforeConsumers` and `failedFetchIsUnreadableDespiteStaleRef` (CI and deploy fetch
+  full history before any consumer runs; a failed fetch reaches merge_group checks as unreadable even with a
+  stale local ledger ref).
 
 ## Proof plan
 
@@ -82,8 +99,11 @@ redirect lands on the canonical page, the page shows the number, and `show` reso
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/backlog/__tests__/card-number.test.mjs` fails before this
-  lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/backlog/__tests__/card-number.test.mjs
+  we:src/_data/__tests__/backlog-card-number.test.ts we:src/_data/__tests__/backlogRedirects.test.ts
+  we:scripts/__tests__/ci-card-ledger-fetch.test.mjs` fails before this lands and passes after.
+- [A2] The named ESM and CJS security tests above are required acceptance checks; a CJS twin that skips
+  introducer authentication, the base-ref trust root or the partial-line rule must make them red.
 
 ## Non-goals
 

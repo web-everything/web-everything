@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "xdlnylv"
 status: open
-scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
+scope: ["we:scripts/lib/card-number-ledger.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/settings/card-numbering.json", "we:scripts/settings/card-ledger-trust.json", "we:scripts/lib/policy-cascade.mjs", "we:scripts/backlog/seed-card-number-ledger.mjs", "we:scripts/lib/__tests__/card-number-ledger.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/policy-cascade.test.mjs"]
 dateOpened: "2026-10-13"
 tags: [backlog, drain, numbering, ledger, shadow]
 ---
@@ -25,9 +25,25 @@ Slice (a) of epic xdlnylv: an append-only id-to-number ledger on ops/card-number
     an explicitly trusted drain signing key. Author names and the row's `by` field are metadata, never
     authentication; checking only the tip is forbidden. This applies to seed, shadow and assign rows.
     Reject and report rows introduced by an untrusted or unsigned commit even beneath a trusted tip,
-    and mark the ledger unreadable for consumers; later trusted commits cannot clear that status.
+    and mark the ledger unreadable for consumers; later trusted commits cannot clear that status (only the
+    reviewed quarantine below can).
     Missing/shallow history, signature-verification failure or an exceeded history budget makes the ledger
     unreadable; assignment and merge checks fail closed. Display readers may fall back to x-ids.
+  - Trust root: we:scripts/settings/card-ledger-trust.json on `main`, holding `allowedSigners` (the drain
+    signing keys, each with an optional `validAfter`/`validBefore` for rotation, as in git's
+    `allowed_signers` format) and `quarantine` (below). Every reader takes it with `git show` from `<base>`,
+    which is `origin/main` (or the merge group's base sha). It is never read from the working tree or the
+    PR/merge-group tree under check, so a PR that adds its own key or quarantine entry gains nothing until it
+    is reviewed and merged. Missing or invalid trust root: unreadable. A PR that changes this file is held
+    for human security review, like any other trust change.
+  - Writers never publish an unsigned row: `appendCardLedgerRows` signs its commit and verifies that
+    signature against the trust root before pushing. A signing outage therefore refuses the write (shadow
+    warns, assignment refuses) and never poisons the ledger.
+  - Recovery (break-glass): an untrusted introducing commit is cleared by a reviewed PR to `main` adding
+    `{ "commit": "<sha>", "reason", "approval": "<operator URL>" }` to `quarantine`. Readers then drop the rows
+    that commit introduced and treat their numbers as burned (never reassigned, so nothing that cited them
+    is silently remapped); with every untrusted introducer quarantined the ledger is readable again. No force
+    push and no history rewrite. An affected x-card that lost its row is re-assigned through the normal path.
   - `assignCardNumbers({ repo, ids, pr, floor })` runs inside `withNumberingLock`
     (we:scripts/readiness/drain-lock.mjs). Ids that already have a row return their number (idempotent).
     New ids get `max(ledger, floor) + 1, +2, ...`. Append and push with a new `appendCardLedgerRows` in
@@ -73,7 +89,8 @@ One line per class: either the handling, or `n/a: <why>`.
 6. **State over time** — append-only; a re-enqueue after a dequeue re-reads the existing row instead of minting.
 7. **Who wrote it** — authenticate the commit that introduced each row using a trusted drain signing key,
    not a tip commit or `trustedDrainAuthors` author-name comparison. Seed and shadow writers must sign too.
-   Row removal/replacement violates append-only history and makes the ledger unreadable.
+   Row removal/replacement violates append-only history and makes the ledger unreadable. The key list comes
+   from the base ref's trust root, never the tree under check; recovery is a reviewed quarantine entry.
 
 ## Test plan
 
@@ -90,6 +107,16 @@ Required tests in that same suite:
   Assert `readable: false`, x-id display fallback and zero assignment/enqueue calls despite that trusted row.
   Repeat with a spoofed trusted author name but no trusted signature, and for seed/shadow/assign kinds.
 - **Capability (Red today)** — missing introducing history, invalid signatures and row removal/replacement refuse assignment; no writes.
+- **Capability (Red today)** — `trustRootReadFromBaseNotTreeUnderCheck`: the tree under check adds the forger's
+  key to the trust root file (and, separately, a quarantine entry for a legitimate commit); the forged row is
+  still rejected and the legitimate row kept, because the base ref's copy is the one read. A missing trust
+  root at the base is unreadable.
+- **Capability (Red today)** — `quarantineRestoresReadabilityAndBurnsNumbers`: with a forged row beneath a
+  trusted tip, the ledger is unreadable; after the base trust root quarantines the forging commit, it is
+  readable, the forged row's number is never allocated again, and an expired key (`validBefore` in the past)
+  does not authenticate a later commit.
+- **Capability (Red today)** — `writerRefusesUnsignedPush`: a signing failure makes `appendCardLedgerRows`
+  push nothing and return no number.
 - **Capability (Red today)** — `rejectsOversizedLedgerBeforeAllocation`: enforce a declared byte cap at the transport read boundary,
   fetching at most cap + 1 bytes (the one-byte overflow sentinel), never reading the whole file before checking.
   Assert the actual read range/bytes, zero allocation, append and push calls, and no number returned. Cover

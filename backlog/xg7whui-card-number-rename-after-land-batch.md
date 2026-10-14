@@ -16,7 +16,8 @@ Slice (f) of epic xdlnylv: in mode rename-after-land, a batch job opens one PR o
 ## Design
 
 - New job `we:scripts/card-rename-batch.mjs`, run only when `backlog.cardNumbering.mode` is
-  `rename-after-land`. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (default 60), in
+  `rename-after-land`. `--dry-run` builds the commit and prints it, the rename-set digest and the diff, but
+  pushes nothing and opens no PR. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (default 60), in
   we:scripts/settings/card-numbering.json through the same cascade.
 - Each run, in a fresh worktree from `origin/main`:
   1. List `x<6>` cards on main that have a ledger row. None: exit, no PR.
@@ -116,14 +117,26 @@ Unreadable introducing history/signatures and duplicate identities abort without
 
 ## Proof plan
 
-Live, after slice (d) has landed some x-id cards: before, `git ls-tree origin/main backlog/ | grep '/x'` lists
-them. Run the job; it opens one PR; after it lands through the queue the same command lists none of them and
-each renamed card shows its ledger number and `bornAs`. Paste both listings and the PR's CI run count (one).
+This slice lands BEFORE slice (d) (xk60q6s lists it in `blockedBy`), while the repo override still pins
+`rename-before-enqueue`, so real main has no ledgered x-id cards yet. Its proof therefore runs against a
+fixture, never real main, and the live landed batch is slice (d)'s proof:
+
+- In a lane, make a scratch clone whose `origin` is a local bare copy of the lane. On its main, commit two
+  fixture x-cards, one unledgered x-card and a fixture `ops/card-numbers` ledger signed by a test key that
+  the scratch's trust root (slice (a)) lists. Run the job by hand with `WE_CARD_NUMBERING_MODE=rename-after-land`
+  (env beats the repo override in the cascade) and `--dry-run` (push nothing, open nothing).
+- Before: `git ls-tree origin/main backlog/ | grep '/x'` lists the three x-cards. After: the dry-run prints the
+  commit it would push (parents, rename-set digest) and its `main...commit` diff renames exactly the two
+  ledgered cards with `bornAs`. A second dry-run reports the same digest and "no push". Then advance the
+  scratch main with an unrelated commit plus one more ledgered card and rerun without `--dry-run` against the
+  scratch remote: the push is a fast-forward. Paste the listings, both digests and the push line.
 
 ## Done when
 
-- One real batch PR has landed through the merge queue with a single CI run.
-- A second run with no new x-id cards on main opens nothing.
+- The fixture proof above is pasted, and the named tests pass.
+- The job is wired to the cadence and exits early outside `rename-after-land`, so landing it changes nothing
+  on real main until slice (d) flips the mode. The first real batch PR landing through the merge queue with
+  one CI run is in slice (d)'s Done-when.
 
 ## Acceptance
 

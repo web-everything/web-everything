@@ -95,12 +95,18 @@ merged head equals the judged head, the ledger has the row, and the daemon log s
 `rename-before-enqueue` on one pass and show branch numbering runs for a new unledgered card while a
 ledger-numbered x-card already on main keeps its number through repair and queue processing. Record the
 before/after ledger rows, filenames and CI wall times.
+After the flip and once real x-id cards have landed, run slice (f)'s rename batch live (it only proved
+itself on a fixture, since it lands before this slice): before, `git ls-tree origin/main backlog/ | grep '/x'`
+lists them; the job opens one PR; after it lands through the merge queue the same command lists none of them
+and each renamed card shows its ledger number and `bornAs`. Paste both listings and the PR's CI run count.
 
 ## Done when
 
 - The epic records an operator approval URL for the exact #5057 replacement invariant and the humanGate
   is cleared through the human process; this design PR supplies no approval or review verdict.
 - Three consecutive real PRs with new cards land at their judged head with one CI round each.
+- The first real rename batch PR (slice (f)) lands through the merge queue with a single CI run, and a second
+  run with no new x-id cards on main opens nothing.
 - Flipping the setting back to `rename-before-enqueue` restores pre-enqueue numbering for new unledgered
   cards with no additional code change; already ledger-numbered cards keep their numbers through all
   repair, queue and merge_group paths, as proved by the rollback integration fixture.

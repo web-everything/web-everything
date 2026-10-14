@@ -38,7 +38,12 @@ must accept ledger-numbered x-cards already on main. Unledgered cards keep today
 - The gate reads the ledger fetched by CI (slice (b), xy5r0uf wiring, hence blockedBy). Outside merge_group,
   offline/unreadable means warn and skip only the ledger-dependent checks, never "all clear"; duplicate
   file identities still error. Inside merge_group, unreadable (including failed fetch, missing history,
-  truncation/over-cap or failed authentication) is an error in every mode, with no window exemption.
+  truncation/over-cap or failed authentication) is an error, with no window exemption, only when the group
+  needs the ledger: the mode is not `rename-before-enqueue`, or the prospective merged tree holds an `x<6>`
+  backlog file, or the group adds or changes a card's `bornAs`. A numeric-only group in
+  `rename-before-enqueue` (today's state, and a rollback with no x-cards on main) does not depend on the ops
+  branch: the ledger-dependent checks warn and skip as outside merge_group, and duplicate file identities
+  and today's numeric rules still error. So an ops-branch outage never stops today's merge queue.
   Slice (d) replaces #5057's blanket x-file refusal; until then that refusal remains too.
 
 ## MVP
@@ -50,10 +55,11 @@ The `strandedHashesOnMain` change plus the ledger-collision check.
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — the gate consumes slice (a)'s validated rows only.
-2. **Truncated reads** — unreadable warns only outside merge_group; inside merge_group it errors.
+2. **Truncated reads** — unreadable warns outside merge_group; inside merge_group it errors whenever the
+   group needs the ledger (see Design), and warns for a numeric-only group in `rename-before-enqueue`.
 3. **Shared state files** — read-only.
-4. **Fail closed** — an unledgered x-card past the land window errors; in merge_group unreadable ledger
-   always errors and, once slice (d) replaces #5057, an unledgered x-card always errors, even inside the window.
+4. **Fail closed** — an unledgered x-card past the land window errors; in merge_group an unreadable ledger
+   errors for every group that needs it (an x-file, a `bornAs` change, or a ledger mode) and, once slice (d) replaces #5057, an unledgered x-card always errors, even inside the window.
 5. **Identity scoping** — check uniqueness across the prospective merged tree, keyed on x-id or `bornAs`,
    never the slug; seed/materialization equality is accepted only for the same identity.
 6. **State over time** — the land-window warning covers the gap between merge and the drain's row; slice (d)
@@ -76,7 +82,13 @@ Required tests in `we:scripts/__tests__/check-standards-rules.test.mjs`:
   Unchanged same-path files and a proper x-to-numeric rename pass.
 - **Capability (Red today)** — `unreadableLedgerInMergeGroupErrors` and `unreadableLedgerOutsideMergeGroupWarns`: paired context tests
   for failed fetch with stale ref, deleted/renamed ledger file, missing history, authentication failure and
-  over-cap/truncated read; repeat in all modes and inside the land window.
+  over-cap/truncated read; the error case repeats in `rename-after-land` and `ledger-only`, and in
+  `rename-before-enqueue` with an x-file in the merged tree and with a `bornAs` change, and inside the land
+  window.
+- **Capability (Red today)** — `unreadableLedgerNumericOnlyGroupPassesInRenameBeforeEnqueue`: the same
+  unreadable states, in merge_group, `rename-before-enqueue`, with only numeric cards in the merged tree and
+  no `bornAs` change: the gate passes with a ledger-skipped warning, while a duplicate numeric file still
+  errors (the unaffected population keeps working when the dependency is down).
 
 Integration in `we:scripts/__tests__/check-standards.test.mjs`: exercise the CI-fetched ledger through the
 real rule caller in merge_group, then fail the fetch and assert nonzero exit. An injected-ledger unit test
@@ -95,7 +107,8 @@ the same unreadable state outside merge_group warns. Record both outputs.
 - In every mode, a ledger-numbered x-card on main passes the gate and an unledgered one fails after the window.
 - In `rename-before-enqueue`, the gate output on today's numeric main is unchanged; ledgered x-cards added
   before a rollback remain accepted.
-- CI wiring is exercised, unreadable ledger errors in merge_group, duplicate x-ids fail, and same-identity
+- CI wiring is exercised, an unreadable ledger errors in every merge group that needs it and not in a
+  numeric-only `rename-before-enqueue` group, duplicate x-ids fail, and same-identity
   numeric/ledger equality passes in the named tests.
 
 ## Acceptance
