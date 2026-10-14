@@ -1,4 +1,4 @@
-/** PR #5273: a clear-human ceremony beyond the final read's first page must survive the sweep. */
+/** PR #5273: a clear-human ceremony beyond the final read's first page, or completed during the sweep's write, must survive the sweep. */
 import { readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,7 +11,8 @@ export default {
   card: 'PR #5273',
   fixedBy: { sha: 'HEAD', where: 'lane/human-surface-repark', paths: [SOURCE] },
   fixPresent(root) {
-    return readFileSync(join(root, SOURCE), 'utf8').includes("skipped: 'fresh comments may be truncated'");
+    const source = readFileSync(join(root, SOURCE), 'utf8');
+    return source.includes("skipped: 'fresh comments may be truncated'") && source.includes('landed during the write');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -45,6 +46,27 @@ export default {
     if (reads !== 2 || state.comments.length !== 102 || parseLatestHumanClearedSha(state.comments) !== head) violations.push('scenario did not expose valid clearance beyond the final state page');
     if (results.some(result => result.repark) || effects.length || !state.labels.includes('review:accepted') || state.labels.includes('review:human')) {
       violations.push(`concurrent clearance overwritten: labels=${state.labels.join(',')}; effects=${effects.join(',')}`);
+    }
+    // Red team round 2: the ceremony completes after the final read, while the sweep posts its comment.
+    const live = { state: 'OPEN', headRefOid: head, labels: ['review:accepted'], comments: [] };
+    sweepHumanSurfaceRepark({
+      repo: 'o/n', listPrs: () => [{ number: 5273, labels: live.labels }],
+      resolveSurfaces: () => 'narrow',
+      readComments: () => [...live.comments],
+      provider: {
+        readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),
+        readPrFiles: () => ['.github/workflows/ci.yml'],
+        postComment() {
+          live.comments.push({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
+        },
+        setLabels(_repo, _pr, { add, remove = [] }) {
+          live.labels = [...new Set([...live.labels.filter(label => !remove.includes(label)), add])];
+        },
+      },
+    });
+    if (parseLatestHumanClearedSha(live.comments) !== head) violations.push('in-flight scenario did not complete the ceremony');
+    if (!live.labels.includes('review:accepted') || live.labels.includes('review:human')) {
+      violations.push(`clearance completed during the re-park write was overwritten: labels=${live.labels.join(',')}`);
     }
     return { violations };
   },

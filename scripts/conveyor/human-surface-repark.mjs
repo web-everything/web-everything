@@ -86,6 +86,22 @@ export function sweepHumanSurfaceRepark({
         provider.setLabels(resolvedRepo, num, { add: plan.decision.addLabel,
           remove: plan.decision.removeLabels.filter(label => hasReviewLabel(state.labels, label)) });
       } catch (e) { entry.error = errorText(e); }
+      // PR #5273: GitHub has no conditional label write, so a clear-human ceremony can land between the final read
+      // and this write. Write first, then read for the other writer's effect (clear-human does the mirror image).
+      if (!entry.error) {
+        try {
+          const after = readComments(num, { repo: resolvedRepo });
+          if (!Array.isArray(after)) throw new Error('comments read returned no array');
+          const cleared = parseLatestHumanClearedSha(after);
+          if (cleared && cleared.toLowerCase() === String(state.headRefOid).toLowerCase()) {
+            provider.setLabels(resolvedRepo, num, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+            Object.assign(entry, { repark: 'withdrawn', reason: 'human clearance at the live head landed during the write' });
+          }
+        } catch (e) {
+          // Fail closed: the hold stays and the operator can clear it again.
+          entry.error = `post-write clearance check failed: ${errorText(e)}`;
+        }
+      }
     }
     results.push(entry);
   }

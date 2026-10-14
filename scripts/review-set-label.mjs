@@ -203,6 +203,25 @@ export function defaultReadHumanOnlyHold({ headSha, baseRefName, comments, exec 
 }
 
 /**
+ * PR #5273 — after a `clear-human` swap and comment, re-read the PR and remove a `review:human` that a concurrent
+ * re-park added at the same head, re-adding the `review:accepted` it took. Only that label: a concurrent bounce or
+ * other hold is left alone. A failed read is reported, not fatal: the clearance is already durable.
+ */
+export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+  try {
+    const fresh = provider.readPrState(repo, pr);
+    if (fresh.headRefOid !== headSha || !Array.isArray(fresh.labels)) return { reapplied: false };
+    // A concurrent `review:changes` bounce is a newer verdict, not a re-park: leave it to the operator.
+    if (!hasReviewLabel(fresh.labels, REVIEW_LABELS.human) || hasReviewLabel(fresh.labels, REVIEW_LABELS.changes)) return { reapplied: false };
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    return { reapplied: true };
+  } catch (e) {
+    warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
+    return { reapplied: false, error: true };
+  }
+}
+
+/**
  * we:scripts/review-set-label.mjs#REVIEW_LABEL_TARGETS — the CLOSED set of label-swap targets `decideSetLabel`
  * understands. Exported so anything that must be TOTAL over the targets (the comment-size projection below, and
  * its enum-totality test) enumerates this one list instead of hardcoding a member — PR #1056 review, M2: the
@@ -1710,6 +1729,11 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+        // PR #5273: a re-park (e.g. human-surface-repark) can add `review:human` after the first read; the
+        // clearance supersedes it at this head, so remove it too. Other concurrent labels keep the first read's view.
+        if (to === 'clear-human' && hasReviewLabel(fresh.labels, REVIEW_LABELS.human) && !removals.includes(REVIEW_LABELS.human)) {
+          removals = [...removals, REVIEW_LABELS.human];
+        }
       }
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
@@ -1778,6 +1802,10 @@ export function runReviewLabelCli({
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
+  // `review:human` after the swap. Read once more after the clearance comment and re-apply only that part.
+  // The re-park re-reads after its own write too, so at least one side sees the other.
+  if (to === 'clear-human') reassertHumanClearance({ provider, repo, pr, headSha });
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and

@@ -165,6 +165,50 @@ describe('human surface re-park sweep', () => {
     expect(f.run({ dryRun: true })[0].repark).toBe('would-repark');
     expect(f.calls).toEqual([]);
   });
+  // PR #5273 red team: the ceremony completes while the sweep's own write is in flight (after its final read).
+  function racing({ during = 'comment', readCommentsFails = false } = {}) {
+    const live = { state: 'OPEN', headRefOid: head, labels: [...labels], comments: [] };
+    const effects = [];
+    let reads = 0;
+    const clear = () => {
+      // The label-less clear-human ceremony: swap (accepted already live) then the trusted clearance comment.
+      live.labels = [...new Set([...live.labels.filter(l => l !== 'review:human'), 'review:accepted'])];
+      live.comments.push({ id: 'C_clear', ...clearance(head) });
+    };
+    const provider = {
+      readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),
+      readPrFiles: () => ['.github/workflows/ci.yml'],
+      postComment: () => { effects.push('comment'); if (during === 'comment') clear(); },
+      setLabels: (_r, _n, { add, remove = [] }) => {
+        effects.push(`labels:+${add}-${remove.join(',')}`);
+        live.labels = [...new Set([...live.labels.filter(l => !remove.includes(l)), add])];
+        if (during === 'labels') clear();
+      },
+    };
+    const readComments = () => {
+      reads++;
+      if (readCommentsFails && reads > 1) throw new Error('offline');
+      return [...live.comments];
+    };
+    const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels }], provider, readComments, resolveSurfaces: () => 'narrow' });
+    return { live, effects, results };
+  }
+  it.each(['comment', 'labels'])('keeps a clear-human ceremony that completes during the sweep %s write', during => {
+    const r = racing({ during });
+    expect(r.live.labels).toContain('review:accepted');
+    expect(r.live.labels).not.toContain('review:human');
+    expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, files: ['.github/workflows/ci.yml'], reason: 'human clearance at the live head landed during the write' }]);
+  });
+  it('leaves the hold (fail closed) and reports when the post-write read fails', () => {
+    const r = racing({ during: 'none', readCommentsFails: true });
+    expect(r.live.labels).toContain('review:human');
+    expect(r.results[0]).toMatchObject({ num: 7, repark: 'reparked', error: 'post-write clearance check failed: offline' });
+  });
+  it('re-parks when no clearance lands during the write', () => {
+    const r = racing({ during: 'none' });
+    expect(r.live.labels).toEqual(['ready-to-merge', 'review:human']);
+    expect(r.results).toEqual([{ num: 7, repark: 'reparked', head, files: ['.github/workflows/ci.yml'] }]);
+  });
   it('does not change labels after a failed comment', () => {
     const f = fixture({ postComment: () => { throw new Error('offline'); } });
     expect(f.run()[0].error).toBe('offline');

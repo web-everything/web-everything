@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { decideSetLabel, runReviewLabelCli, buildVerdictComment, defaultReadHumanOnlyHold } from '../review-set-label.mjs';
+import { decideSetLabel, runReviewLabelCli, buildVerdictComment, defaultReadHumanOnlyHold, reassertHumanClearance } from '../review-set-label.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../lib/review-escalation.mjs';
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
@@ -78,6 +78,49 @@ describe('clear-human CLI hold ceremony', () => {
     expect(r.payload.error).toContain('nothing to clear');
     expect(r.provider.setLabels).not.toHaveBeenCalled();
     expect(r.provider.postComment).not.toHaveBeenCalled();
+  });
+  // PR #5273 red team: a human-surface re-park that read before this ceremony lands `review:human` mid-ceremony.
+  function race(when, park = ['review:human']) {
+    let live = [...labels];
+    let reads = 0;
+    const repark = () => { live = [...live.filter(l => l !== 'review:accepted'), ...park]; };
+    const provider = {
+      currentRepo: () => 'o/n', name: 'stub',
+      readPrState: () => {
+        reads++;
+        if (when === 'before-swap' && reads === 2) repark();
+        return { state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: [...live], comments: [], body: '' };
+      },
+      readLabels: () => [...live],
+      setLabels: vi.fn((_r, _n, { add, remove = [] }) => { live = [...new Set([...live.filter(l => !remove.includes(l)), add])]; }),
+      postComment: vi.fn(() => { if (when === 'during-comment') repark(); }),
+    };
+    vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow'], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold: () => true, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: () => {} });
+    } catch (e) { if (e.exitCode !== 0) throw e; }
+    return live;
+  }
+  it.each(['before-swap', 'during-comment'])('removes a concurrent re-park landing %s', when => {
+    const live = race(when);
+    expect(live).toContain('review:accepted');
+    expect(live).not.toContain('review:human');
+  });
+  it('leaves a concurrent review:changes bounce alone', () => {
+    expect(race('during-comment', ['review:human', 'review:changes'])).toEqual(expect.arrayContaining(['review:human', 'review:changes']));
+  });
+  it('reports, without failing, an unreadable post-clearance state', () => {
+    const warn = vi.fn();
+    const provider = { readPrState: () => { throw new Error('offline'); }, setLabels: vi.fn() };
+    expect(reassertHumanClearance({ provider, repo: 'o/n', pr: 7, headSha: head, warn })).toEqual({ reapplied: false, error: true });
+    expect(warn.mock.calls[0][0]).toContain('offline');
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('does not re-apply at a moved head', () => {
+    const provider = { readPrState: () => ({ headRefOid: 'b'.repeat(40), labels: ['review:human'] }), setLabels: vi.fn() };
+    expect(reassertHumanClearance({ provider, repo: 'o/n', pr: 7, headSha: head })).toEqual({ reapplied: false });
+    expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('does not read a hold when review:human is present', () => {
     const r = run(false, ['review:human']);
