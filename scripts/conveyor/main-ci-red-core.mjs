@@ -43,6 +43,10 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   mainCiRedEnabled: true,
   /** Off = no automatic CI reruns. Each run is requested at most once. */
   mainCiRedFlakeRerun: true,
+  /** card 303: off = before this card, green merge groups supply no flake evidence. */
+  mainCiRedMergeGroupFlakeEvidence: true,
+  /** card 303: maximum merge-group runs to read; 0 = no merge-group read. */
+  mainCiRedMergeGroupRunLimit: 30,
   /** Case-insensitive error signature; empty = no signature rule. */
   mainCiRedFlakeSignaturePattern: 'Test timed out in \\d+ ?ms|Hook timed out in \\d+ ?ms',
   /** File or file > title substrings; empty = no known-flaky exceptions. */
@@ -101,10 +105,45 @@ export function mainCiRedSettings(config = {}) {
   const out = {};
   for (const [k, d] of Object.entries(MAIN_CI_RED_DEFAULTS)) {
     const v = config?.[k];
-    out[k] = v !== undefined && v !== null && typeof v === typeof d ? v : d;
+    out[k] = mainCiRedSettingSource(config, k) === 'health' ? v : d;
   }
   if (config?.mainCiRedPushBeforeGate !== undefined && config?.mainCiRedPushBeforeGate !== null) out.mainCiRedPushBeforeGate = config.mainCiRedPushBeforeGate;
   return out;
+}
+
+/** card 303: attribute only well-typed health overrides. PURE. */
+export function mainCiRedSettingSource(config, key) {
+  const v = config?.[key];
+  return Object.hasOwn(MAIN_CI_RED_DEFAULTS, key) && v !== undefined && v !== null
+    && typeof v === typeof MAIN_CI_RED_DEFAULTS[key] ? 'health' : 'standard';
+}
+
+/** card 303: the queue branch names its base, not its synthetic head commit. PURE. */
+export function parseMergeGroupBase(headBranch, branch = 'main') {
+  const prefix = `gh-readonly-queue/${branch}/`;
+  if (typeof headBranch !== 'string' || !headBranch.startsWith(prefix)) return null;
+  return /^pr-\d+-([0-9a-f]{40})$/i.exec(headBranch.slice(prefix.length))?.[1] ?? null;
+}
+
+/** card 303: newest green group covering every failing cause on this tip. PURE. */
+export function findMergeGroupFlakeEvidence({ groupRuns, tipSha, failedJobs, jobsOf, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedMergeGroupFlakeEvidence || !Array.isArray(groupRuns)
+    || typeof tipSha !== 'string' || !/^[0-9a-f]{7,40}$/i.test(tipSha)) return null;
+  const coveredJobs = [...new Set((failedJobs ?? []).filter((name) => !settings.mainCiRedSummaryJobs.includes(name)))];
+  if (!coveredJobs.length) return null;
+  const candidates = groupRuns.filter((r) => r?.status === 'completed' && r.conclusion === 'success')
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  for (const run of candidates) {
+    const baseSha = parseMergeGroupBase(run.headBranch, settings.mainCiRedBranch);
+    if (!baseSha || !baseSha.toLowerCase().startsWith(tipSha.toLowerCase())) continue;
+    const jobs = jobsOf(run.databaseId);
+    // Accept a complete raw list or readRunJobs' complete success projection.
+    const passed = Array.isArray(jobs) ? jobs.filter((j) => j.conclusion === 'success').map((j) => j.name)
+      : jobs?.complete === true && Array.isArray(jobs.passed) ? jobs.passed : null;
+    if (!passed || !coveredJobs.every((name) => passed.includes(name))) continue;
+    return { runId: run.databaseId, headBranch: run.headBranch, baseSha, completedAt: run.updatedAt, coveredJobs };
+  }
+  return null;
 }
 
 /** The operator's one-off override of `mainCiRed.pushBeforeGate` (the top layer of the cascade below). */
@@ -179,7 +218,7 @@ export function parseVitestFailures(logText) {
 /** Decide whether one first-attempt failure merits a flake rerun. Unreadable facts prove nothing. PURE.
  * @returns {{eligible:boolean, reason:string}}
  */
-export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, settings = MAIN_CI_RED_DEFAULTS }) {
+export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, groupEvidence, settings = MAIN_CI_RED_DEFAULTS }) {
   if (!settings.mainCiRedFlakeRerun) return { eligible: false, reason: 'rerun-off' };
   if (run?.attempt > 1) return { eligible: false, reason: 'already-rerun' };
   // failedJobs names (including summaries) are not signature evidence: only parsed test failures count.
@@ -190,6 +229,7 @@ export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, se
       entry && `${f?.file ?? ''} > ${f?.title ?? ''}`.includes(entry)))) return { eligible: true, reason: 'flaky-signature' };
   if (settings.mainCiRedRerunUnrelatedChange && prevRunGreen === true && Array.isArray(changedFiles) && changedFiles.length
     && changedFiles.every((f) => isNonCodeFile(f, settings.mainCiRedNonCodePaths))) return { eligible: true, reason: 'unrelated-change' };
+  if (groupEvidence) return { eligible: true, reason: 'merge-group-green-on-tip' };
   return { eligible: false, reason: 'not-flaky' };
 }
 
