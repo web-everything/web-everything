@@ -1787,10 +1787,16 @@ function operatorSendBackRearm(pr, operatorBudget) {
   return { verdictId: c.id, login: c.author.login, body };
 }
 
-/** True while any check on the head is not COMPLETED. GitHub rejects (HTTP 422) a re-run of a workflow that is still
+/** True while any check on the head is not COMPLETED, or when the rollup is known to be incomplete (a refused or
+ *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
-const hasLiveCheck = (pr) => (pr?.statusCheckRollup ?? []).some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED');
+const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRollup ?? []).some(c => {
+  if (!c) return false;
+  if (c.status) return String(c.status).toUpperCase() !== 'COMPLETED';
+  // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
+  return c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
+});
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
@@ -3007,10 +3013,16 @@ export function planReconcile({
       // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
       const staleRetry = pr.owedCiRerunRetry;
       if (staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
-          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber
-          && !hasLiveCheck(pr)) {
+          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = staleRetry.jobs.length;
+        if (staleSpent < staleCap && hasLiveCheck(pr)) {
+          // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
+          // head whose fresh result is still on its way) and re-plan next tick.
+          refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' });
+          continue;
+        }
         if (staleSpent < staleCap) {
           dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
             timeoutRetry: { ...staleRetry, variant: 'stale-ci-rerun', cap: staleCap },

@@ -42,6 +42,25 @@ describe('fix.staleCiRerun', () => {
       expect(plan(over).dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
     }
   });
+  // A live check defers the re-run; it must hold (no heal budget spent), and re-plan once the run completes.
+  it.each([
+    ['IN_PROGRESS check', { statusCheckRollup: [check(), { name: 'smoke', status: 'IN_PROGRESS', conclusion: '' }] }],
+    ['pending commit status', { statusCheckRollup: [check(), { __typename: 'StatusContext', context: 'ext', state: 'PENDING' }] }],
+    ['CheckRun without a status', { statusCheckRollup: [check(), { __typename: 'CheckRun', name: 'smoke' }] }],
+    ['incomplete rollup (refused or truncated read)', { rollupIncomplete: true }],
+  ])('holds instead of healing while a check is live: %s', (_label, over) => {
+    const out = plan(over);
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight', why: expect.stringMatching(/still running/) }));
+  });
+  it('a completed commit status is not live', () => {
+    const out = plan({ statusCheckRollup: [check(), { __typename: 'StatusContext', context: 'ext', state: 'SUCCESS' }] });
+    expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun' })]);
+  });
+  it('a spent budget still heals even while a check is live', () => {
+    const out = plan({ timeoutRetryBudget: { confirmed: 1, rejected: 0 }, rollupIncomplete: true });
+    expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(true);
+  });
   it('holds a request already in flight', () => {
     const out = plan({ timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true } });
     expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
