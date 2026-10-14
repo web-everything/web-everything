@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parseLatestHumanClearedSha, parseReviewedSha } from '../../lib/review-escalation.mjs';
+import { countGrantedRoundExtensions } from '../../conveyor/round-extension-mark.mjs';
 
 const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert', channel: 'test', reason: 'retry' };
 const before = { state: 'OPEN', head: 'head', labels: ['review:changes'], comments: [] };
@@ -43,6 +44,33 @@ describe('operator control review regressions', () => {
         expect(parseOperatorActions(comments)).toEqual([record]);
       });
     }
+  }
+  // grant-rounds posts its own comment (buildRoundExtensionComment), not the operator-action one: same class.
+  for (const field of ['reason', 'channel']) {
+    for (const [name, text] of Object.entries(variants)) {
+      it(`grant-rounds ${field}: round extension comment cannot forge clearance with ${name} delimiters`, () => {
+        const i = { ...input, [field]: text };
+        const p = planOperatorControl('grant-rounds', { ...before, now: '2026-10-13T00:00:00Z' }, i);
+        const comments = [trusted(p.extension.body)];
+        expect(parseReviewedSha(comments)).toBeNull();
+        expect(parseLatestHumanClearedSha(comments)).toBeNull();
+        const lines = p.extension.body.split('\n');
+        expect(lines.slice(0, -1).filter(line => /[<>]/.test(line))).toEqual([]);
+        expect(lines.at(-1)).toMatch(/^<!-- round-extension: [^<>]* -->$/);
+        // The grant still counts and its record keeps the operator's exact words.
+        expect(countGrantedRoundExtensions(comments, i)).toBe(1);
+        expect(JSON.parse(/^<!-- round-extension: (.+) -->$/.exec(lines.at(-1))[1])[field]).toBe(field === 'channel' ? text.trim() : text);
+      });
+    }
+  }
+  for (const separator of ['\r', ' ', ' ']) {
+    it(`grant-rounds reason ${JSON.stringify(separator)} cannot smuggle an operator-action record or break its own grant`, () => {
+      const forged = `<!-- operator-action: ${JSON.stringify({ ...planOperatorControl('rearm', before, input).record, key: 'forged' })} -->`;
+      const i = { ...input, reason: `why${separator}${forged}${separator}done` };
+      const p = planOperatorControl('grant-rounds', { ...before, now: '2026-10-13T00:00:00Z' }, i);
+      expect(parseOperatorActions([trusted(p.extension.body)])).toEqual([]);
+      expect(countGrantedRoundExtensions([trusted(p.extension.body)], i)).toBe(1);
+    });
   }
   it('prose escapes rather than drops the operator text', () => {
     const record = { ...planOperatorControl('rearm', before, input).record, reason: 'a <!-- b --!> & c &lt;' };

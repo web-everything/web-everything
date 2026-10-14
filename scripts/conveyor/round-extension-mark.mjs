@@ -13,12 +13,17 @@ export const MAX_TOTAL_ROUND_EXTENSIONS = 10;
 
 export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reason, at }) {
   const record = { version: 1, repo, pr, by, actor, channel, reason, at };
-  // Escape markup in the machine record without changing the parsed operator words.
-  const json = JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  // Escape markup in the machine record without changing the parsed operator words. U+2028/U+2029 are escaped too:
+  // the counter's `.`/`^`/`$` treat them as line breaks, so a raw one would stop this grant from counting.
+  const json = JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  // Quoted prose is still scanned for trusted review markers. Escape every angle bracket (not strip delimiters) so
+  // no HTML comment of any form (`-->`, `--!>`, nested, partial) can appear; the same rule as operator-action comments.
+  const prose = (value) => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return [
     ROUND_EXTENSION_MARKER, '',
-    `Operator @${actor} granted +${by} auto-repair round(s) via ${channel}`, '',
-    ...String(reason).split(/\r?\n/).map((line) => `> ${line}`), '',
+    `Operator @${prose(actor)} granted +${by} auto-repair round(s) via ${prose(channel)}`, '',
+    ...prose(reason).split(/\r\n|[\r\n\u2028\u2029]/).map((line) => `> ${line}`), '',
     `<!-- round-extension: ${json} -->`,
   ].join('\n');
 }
