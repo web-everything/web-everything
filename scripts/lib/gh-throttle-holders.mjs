@@ -1,5 +1,6 @@
 /** Holder attribution, bounded holds and caller admission for the shared gh semaphore. */
 import { basename } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
 import { slotPath } from '../readiness/heavy-admission.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -63,6 +64,18 @@ export function ghHoldersSummary(holders = []) {
   return holders.map((h) => `${h.caller}(${h.op.slice(0, 60).replace(/[\r\n]/g, ' ')}${h.op.length > 60 ? '…' : ''}, ${Math.round(h.heldMs / 1000)}s)`).join(' ');
 }
 
+/** A holder from older code has no meta. Only on a timeout (never per poll), name it from the process table:
+ *  its own command and its parent's, so the stall report still says who holds the slot. Best-effort. */
+export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', ['-o', 'ppid=,command=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 })) {
+  const look = (pid) => { try { const m = /^\s*(\d+)\s+(.*)$/.exec(ps(pid).trim()); return m ? { ppid: Number(m[1]), cmd: m[2].slice(0, 200) } : null; } catch { return null; } };
+  return holders.map((h) => {
+    if (h.caller !== 'unknown' || h.op || !h.alive) return h;
+    const self = look(h.pid); if (!self) return h;
+    const parent = self.ppid > 1 ? look(self.ppid) : null;
+    return { ...h, ppid: self.ppid, op: self.cmd, parent: parent ? parent.cmd : '' };
+  });
+}
+
 /** Each poll snapshots and checks attribution before attempting the existing atomic slot primitive. */
 export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {} }) {
   const startedAt = now();
@@ -83,7 +96,7 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
       if (!capped()) r = trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...meta, acquiredAt: new Date(nowMs).toISOString() } });
     }
     if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: nowMs - startedAt };
-    if (nowMs - startedAt >= timeoutMs) return { ok: false, slot: null, timedOut: true, waitedMs: nowMs - startedAt, holders };
+    if (nowMs - startedAt >= timeoutMs) return { ok: false, slot: null, timedOut: true, waitedMs: nowMs - startedAt, holders: describeLegacyHolders(holders) };
     sleep(pollMs);
   }
 }

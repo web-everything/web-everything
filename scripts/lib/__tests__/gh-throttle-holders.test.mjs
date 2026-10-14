@@ -133,3 +133,13 @@ describe('hold policy and execution', () => {
     expect(rows().filter((r) => r.outcome === 'call')).toMatchObject([{ timedOut: true }, { timedOut: true }]);
   });
 });
+
+describe('legacy holders without meta', () => {
+  it('are named from the process table on timeout only', async () => {
+    const { describeLegacyHolders } = await import('../gh-throttle-holders.mjs');
+    const ps = (pid) => (pid === 10 ? ' 20 node gh-throttle.mjs api x' : ' 1 node drain-daemon.mjs');
+    const out = describeLegacyHolders([{ slot: 0, pid: 10, alive: true, caller: 'unknown', op: '', parent: '', ppid: null, heldMs: 5 }, { slot: 1, pid: 11, alive: true, caller: 'w', op: 'pr list', parent: 'p', ppid: 2, heldMs: 1 }], ps);
+    expect(out[0]).toMatchObject({ ppid: 20, op: 'node gh-throttle.mjs api x', parent: 'node drain-daemon.mjs' });
+    expect(out[1]).toMatchObject({ caller: 'w', op: 'pr list' });
+  });
+});
