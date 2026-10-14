@@ -131,8 +131,13 @@ async function main(argv) {
   if (suite === 'unit') {
     files = await listUnitTestFiles();
   } else {
-    const { listAllSoakFiles } = await import('../conveyor/soak/shard-files.mjs');
-    files = listAllSoakFiles();
+    const { shardFiles } = await import('../conveyor/soak/shard-files.mjs');
+    // Use the soak allocator's baseline isolation for this CLI as well as run-shard.mjs.
+    if (argv.some((a) => a.startsWith('--group='))) throw new Error('shard-assign: --group only applies to --suite=unit');
+    const mine = shardFiles({ shard, total });
+    if (mine.some((f) => /\s/.test(f))) throw new Error('shard-assign: a test path contains whitespace; the workflow cannot pass it as a filter');
+    process.stdout.write(mine.length ? `${mine.join('\n')}\n` : '');
+    return 0;
   }
   const group = (argv.find((a) => a.startsWith('--group=')) ?? '').slice('--group='.length);
   if (group && suite !== 'unit') throw new Error('shard-assign: --group only applies to --suite=unit');
