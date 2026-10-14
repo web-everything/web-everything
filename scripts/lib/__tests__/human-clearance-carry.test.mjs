@@ -621,4 +621,39 @@ describe('human clearance numbering tier', () => {
     expect(d.reason).toContain('net diff changed');
     expect(d.reason).toContain('numbering tier: mixed change');
   });
+  // Red team #5233 (sibling writer): the slow proof runs between the drain's evidence read and its record write.
+  describe('re-reads the PR before posting the carry record', () => {
+    const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+    const apply = (over = {}) => {
+      const posted = [];
+      const exec = (cmd, args) => { if (cmd === 'gh') posted.push(args); return ''; };
+      const result = applyHumanClearanceCarry({ evidence, pr: 5233, exec, setting: ON, log: () => {},
+        proveNumbering: () => ({ ok: true, reason: 'verified renames' }), ...over });
+      return { result, posted };
+    };
+    const liveThread = (extra = {}) => () => ({ headSha: HEAD, comments: [clearHumanComment(CLEARED)], reviews: [], ...extra });
+    it('records a numbering carry when nothing changed', () => {
+      const { result, posted } = apply({ readLiveEvidence: liveThread() });
+      expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
+      expect(posted).toHaveLength(1);
+    });
+    it('never records a numbering carry without a live re-read', () => {
+      const { result, posted } = apply();
+      expect(result).toBeNull();
+      expect(posted).toEqual([]);
+    });
+    it.each([
+      ['an operator objection', liveThread({ comments: [clearHumanComment(CLEARED), objection] })],
+      ['a formal changes-requested review', liveThread({ reviews: [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-13T00:00:00Z' }] })],
+      ['a head move', liveThread({ headSha: 'f'.repeat(40) })],
+      ['a newer clearance', liveThread({ comments: [clearHumanComment(CLEARED), clearHumanComment(HEAD)] })],
+      ['unreadable reviews', liveThread({ reviews: null })],
+      ['a truncated thread', liveThread({ comments: null })],
+      ['a failed re-read', () => { throw Error('gh offline'); }],
+    ])('defers without a record after %s', (_name, readLiveEvidence) => {
+      const { result, posted } = apply({ readLiveEvidence });
+      expect(result).toMatchObject({ action: 'defer', applyLabel: null });
+      expect(posted).toEqual([]);
+    });
+  });
 });

@@ -569,7 +569,7 @@ it('re-reads the PR before posting, so an objection made during the numbering pr
   p.readPrReviews = () => [];
   const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [pr(5025, ['review:pending'])],
     numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: true, acceptCarry: 'on', guardReferrals: () => {},
-      prove: () => { proved = true; return { ok: true, reason: 'verified' }; } }) });
+      readNetDiff: () => null, prove: () => { proved = true; return { ok: true, reason: 'verified' }; } }) });
   expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'held' }));
   expect(p.calls.readPrState).toHaveLength(2);
   expect(p.calls.postComment).toEqual([]);

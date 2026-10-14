@@ -518,8 +518,9 @@ describe('numbering acceptance restamp', () => {
   };
   describe('a hold that arrives while the proof runs (red team #5233)', () => {
     const liveRead = (patch) => () => {
-      const state = { labels: ['review:pending'], headRefOid: TO, comments: liveComments() };
-      return patch({ state, reviews: [] }) ?? { state, reviews: [] };
+      const read = { state: { labels: ['review:pending'], headRefOid: TO, comments: liveComments() }, reviews: [] };
+      patch(read);
+      return read;
     };
     it.each([
       ['an operator objection', liveRead((l) => { l.state.comments.push(objection); })],

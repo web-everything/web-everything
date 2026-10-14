@@ -48,7 +48,8 @@ import {
   buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
-import { proveNumberingOnlyMove } from './numbering-carry.mjs';
+import { isNumberingTolerableLaterBody, proveNumberingOnlyMove } from './numbering-carry.mjs';
+import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const HUMAN_CLEARANCE_CARRY_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
@@ -285,6 +286,30 @@ export function logCarrySettingOnce(setting, write = (s) => process.stderr.write
 }
 
 /**
+ * IO: re-read the PR right before the carry record is posted. Returns why the proven carry no longer stands, or null.
+ * `readLiveEvidence()` → {headSha, comments, reviews}; an unreadable thread or formal reviews never let it stand.
+ */
+function liveCarryChange({ readLiveEvidence, carried }) {
+  let live;
+  try { live = readLiveEvidence(); }
+  catch (e) { return `live re-read failed: ${String(e?.message ?? e).split('\n')[0]}`; }
+  if (!live || !Array.isArray(live.comments)) return 'live re-read returned no complete thread';
+  if (String(live.headSha ?? '').toLowerCase() !== carried.toSha.toLowerCase()) return 'the head moved during the proof';
+  const clearance = latestHumanClearance(live.comments);
+  if (!clearance || clearance.sha !== carried.fromSha.toLowerCase() || clearance.actor !== carried.actor) {
+    return 'the recorded clearance changed during the proof';
+  }
+  const rec = latestAcceptRecord(live.comments);
+  if (!rec || rec.sha !== clearance.sha) return 'a later acceptance record changed during the proof';
+  if (rec.laterBodyDerivedHold || live.comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+    return 'a later verdict or unknown comment stands';
+  }
+  if (!Array.isArray(live.reviews)) return 'formal reviews unreadable';
+  if (laterReviewHold(live.reviews, rec.at)) return 'a formal review hold stands';
+  return null;
+}
+
+/**
  * IO: the drain's carry step, run once per gate decision on an ACCEPTED PR. Given the drain's acceptance evidence
  * (`readDrainAcceptance`, which carries `humanClearance` from {@link latestHumanClearance}, `headSha`, `headDiff`), decide the carry and — when it
  * holds — post the durable record BEFORE the caller honours it. Returns:
@@ -295,11 +320,11 @@ export function logCarrySettingOnce(setting, write = (s) => process.stderr.write
  * Every carry and every refused carry of a real clearance is logged to stderr (the daemon log).
  */
 export function applyHumanClearanceCarry({
-  evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main',
-  equivalence = resolveCarryEquivalenceSetting().value,
+  evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main', readLiveEvidence = null,
+  equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
-  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence });
+  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering });
   if (!d.applicable) return null;
   logCarrySettingOnce(setting, log);
   logEquivalenceSettingOnce(equivalence, log);
@@ -312,6 +337,20 @@ export function applyHumanClearanceCarry({
   if (dryRun) {
     log(`  human-clearance-carry ${tag}: WOULD carry ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; tier ${d.tier}; dry run, no record)\n`);
     return { carried };
+  }
+  // The proof is slow (fetches, blob reads): a hold posted meanwhile would sit BEFORE this record and read as
+  // superseded. The numbering tier (new with #5233) never records without a live re-read; the older tiers re-read
+  // whenever the caller supplies one.
+  if (typeof readLiveEvidence === 'function') {
+    const changed = liveCarryChange({ readLiveEvidence, carried: d });
+    if (changed) {
+      log(`  human-clearance-carry ${tag}: carry proven but NOT recorded — ${changed}; deferring, no label change\n`);
+      return { action: 'defer', applyLabel: null,
+        reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
+    }
+  } else if (d.tier === 'numbering') {
+    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the numbering tier records only after a live re-read\n`);
+    return null;
   }
   const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
   try {
