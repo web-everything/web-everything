@@ -85,6 +85,10 @@ GitHub App shim directories before scanning the host's tool PATH.
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
+Generated shims that embed functions with `Function#toString` must embed every dependency as well.
+Keep the resource classifier and its argv parsers together in `scripts/lib/gh-argv.mjs`: imported
+references inside a stringified function can retain Vite's SSR binding names. Exercise the emitted
+source in an empty VM context and the real shim after its generating checkout is removed.
 For Node subprocess script paths imported by Vitest's browser environment, use
 `join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
 import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.

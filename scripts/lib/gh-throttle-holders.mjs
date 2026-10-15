@@ -5,6 +5,8 @@ import { readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
 import { slotPath } from '../readiness/heavy-admission.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { ghCommandWords } from './gh-argv.mjs';
+export { ghCommandWords } from './gh-argv.mjs';
 
 export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
 const cached = new WeakMap();
@@ -26,23 +28,6 @@ export function ghHolderPolicy(env = process.env) {
 // payloads are deliberately omitted: a credential denylist cannot make arbitrary argv safe.
 const commands = new Set('api auth browse cache codespace completion config extension gist gpg-key issue label org pr project release repo ruleset run search secret ssh-key status variable workflow'.split(' '));
 const verbs = new Set('add archive cancel checks clone close comment create delete diff download edit export fork get import inspect list lock login logout merge pin ready rename reopen rerun restore review set setup-git show status sync unlock unpin upload view watch'.split(' '));
-// gh parses argv with cobra/pflag, so command words are not at fixed indices: flags may precede them
-// (`gh --repo o/r run watch`). Cobra's walk (stripFlags) skips a flag without `=` together with the
-// next argument unless the flag is a known boolean, and `--` ends it. Above the leaf only help/version
-// are boolean (`-R/--repo` takes a value).
-const groupBools = { long: new Set(['help', 'version']), short: new Set(['h']) };
-/** The first two command words with their argv indices (`[{ word: 'pr', at: 2 }, …]`). */
-export function ghCommandWords(args) {
-  const words = [];
-  for (let i = 0; Array.isArray(args) && i < args.length && words.length < 2; i++) {
-    const s = String(args[i]); // as spawn stringifies it, so every classifier sees the argv gh receives
-    if (s === '--') break;
-    const long = s.startsWith('--') && !groupBools.long.has(s.slice(2));
-    if (!s.includes('=') && (long || (s.length === 2 && s[0] === '-' && !groupBools.short.has(s[1])))) i++;
-    else if (s !== '' && !s.startsWith('-')) words.push({ word: s, at: i });
-  }
-  return words;
-}
 /** The first two command words (`['pr', 'merge']`) as gh itself finds them. */
 export function ghCommandPath(args) { return ghCommandWords(args).map(w => w.word); }
 export function ghOpLabel(args = []) {
