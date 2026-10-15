@@ -261,14 +261,14 @@ describe('#3383 daemon scenario simulator — self-sync sibling scenarios (I-15/
   }, 60_000);
 
   it('A1: fix-dispatch restarts within one tick on boot-HEAD drift from a sibling daemon self-syncing first (I-15)', async () => {
-    await runScenario(a1Def(), { timeoutMs: 180_000 });
+    await runScenario(a1Def(), { timeoutMs: 150_000, budgetMs: 150_000 });
   }, 180_000);
 
   it('A2: a mid-tick stale-main refusal re-syncs and restarts within the SAME tick (I-18)', async () => {
-    await runScenario(a2Def(), { timeoutMs: 180_000 });
+    await runScenario(a2Def(), { timeoutMs: 150_000, budgetMs: 150_000 });
   }, 180_000);
 
   it('A3: a main move touching no daemon import rebuilds the clone but restarts neither daemon (#4044)', async () => {
-    await runScenario(a3Def(), { timeoutMs: 180_000 });
+    await runScenario(a3Def(), { timeoutMs: 150_000, budgetMs: 150_000 });
   }, 180_000);
 });

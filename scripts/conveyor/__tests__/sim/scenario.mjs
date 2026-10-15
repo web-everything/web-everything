@@ -1,10 +1,12 @@
 /**
  * @file scenario.mjs — epic #3383 part 4 (Runner + DSL + snapshot + isolation check).
  *
- * `scenario(name, def)` just tags a definition object; `runScenario(def, {timeoutMs})` builds a `World`
+ * `scenario(name, def)` just tags a definition object; `runScenario(def, {timeoutMs, budgetMs})` builds a `World`
  * (`./world.mjs`), runs `def.setup(w)`, steps through `def.play`, takes a SNAPSHOT, runs `def.expect(snapshot,
  * ctx)`, then — always, on the throwing path too — tears every daemon host down, runs the ISOLATION CHECK
  * against the real `$HOME` state this simulator must never touch, and cleans up the world.
+ * `timeoutMs` bounds each daemon tick (default 60_000ms); optional `budgetMs` bounds the entire play list,
+ * including world/setup time (default Infinity, no whole-scenario budget). Step timings are always recorded.
  *
  * Play steps:
  *   - `'tick <daemon>'`      — lazily boot that daemon's host if it isn't already running, send it one
@@ -130,7 +132,9 @@ function diffRealState(before, after) {
 // the runner
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-export async function runScenario(def, { timeoutMs = 60_000 } = {}) {
+/** timeoutMs bounds each daemon tick; budgetMs optionally bounds the play list including world/setup time. */
+export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity } = {}) {
+  const deadline = Date.now() + budgetMs;
   const isolationBefore = snapshotRealState();
   const w = createWorld({ repos: def.repos, lanes: def.lanes ?? 3, clockStartOffsetMs: def.clockStartOffsetMs ?? 0 });
 
@@ -138,6 +142,7 @@ export async function runScenario(def, { timeoutMs = 60_000 } = {}) {
   const hostTails = new Map(); // daemon name -> recent stdout/stderr (debugging only)
   const bootCounts = new Map(); // daemon name -> {boots, restarts}
   const trace = [];
+  const stepTimings = [];
 
   function bump(name, field) {
     const c = bootCounts.get(name) ?? { boots: 0, restarts: 0 };
@@ -345,9 +350,38 @@ export async function runScenario(def, { timeoutMs = 60_000 } = {}) {
   let snapshot = null;
   try {
     const ctx = def.setup ? (def.setup(w) ?? {}) : {};
-    for (const step of def.play ?? []) {
-      // eslint-disable-next-line no-await-in-loop -- scenario steps run in the author's declared order
-      await runStep(step);
+    for (const [index, step] of (def.play ?? []).entries()) {
+      const startedAt = Date.now();
+      const label = `${typeof step === 'function' && step.name ? `fn ${step.name}: ` : ''}${String(step)}`
+        .replace(/\s+/g, ' ').trim();
+      const text = label.length > 100 ? `${label.slice(0, 99)}…` : label;
+      const remaining = deadline - startedAt;
+      const timeoutError = () => {
+        const timings = [...stepTimings, { index, text, ms: Date.now() - startedAt }];
+        const tail = [...hostTails].map(([name, chunks]) => `${name}:\n${chunks.join('')}`).join('\n');
+        return new Error(`scenario "${def.name ?? '(unnamed)'}" timed out (budget ${budgetMs}ms) at step ${index}: ${text}\n`
+          + `step timings (zero-based):\n${timings.map((t) => `${t.index}: ${t.text} → ${t.ms}ms`).join('\n')}\n`
+          + `recent host output:\n${tail || '(none)'}`);
+      };
+      let timer;
+      try {
+        if (budgetMs === Infinity) {
+          // eslint-disable-next-line no-await-in-loop -- scenario steps run in the author's declared order
+          await runStep(step);
+          continue;
+        }
+        if (remaining <= 0) throw timeoutError();
+        // eslint-disable-next-line no-await-in-loop -- scenario steps run in the author's declared order
+        await Promise.race([
+          runStep(step),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutError()), remaining); }),
+        ]);
+        // Synchronous mutations can block the timer; still report an exhausted budget at this step.
+        if (Date.now() >= deadline) throw timeoutError();
+      } finally {
+        clearTimeout(timer);
+        stepTimings.push({ index, text, ms: Date.now() - startedAt });
+      }
     }
     snapshot = buildSnapshot();
     if (def.expect) def.expect(snapshot, ctx);
