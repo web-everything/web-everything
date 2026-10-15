@@ -723,6 +723,19 @@ verify the committed stamp and submit via `open-pr --mode=label-on-green`; only 
 `prepare-unstamped`. Test fresh-main and existing-PR recovery, lane-local command paths, stale section
 observations, resolved cards, failed stamps, freeze/dry-run, and a fresh Node `--bogus-flag` boot.
 
+Duplicate-prepare guards must preserve recovery: cross OPEN/MERGED/CLOSED/no PR with main stamps,
+sections and worker liveness in daemon-tick tests. An OPEN unstamped PR with a dead worker recovers
+its stamp when sectioned and surfaces `prepare-unstamped` otherwise; a stamped OPEN PR awaits landing,
+and a MERGED PR never triggers an unstamped retry. Keep replaced-stamp and live-worker cases pinned.
+Offer two persistently refused candidates before a clean successor at cap two, across successive ticks:
+refusals must not consume worker capacity. Missing, non-callable, throwing or malformed PR-list effects
+must refuse dispatch. Reader integration fixtures must apply the actual search filters, including title-only
+PRs outside `lane/`, `bornAs` branches, saturated shared listings, date-floor fallback and async prefetch.
+Prepare launch fixtures, including grouped unit and soak scenarios, must supply `listPreparePrs: () => []`
+when modeling no existing prepare PR; omitting the effect models an unavailable listing and refuses launch.
+Every component search must be complete before its union can prove absence; cache by both identities.
+When replacing a regression test, identify the replacement covering its original recovery behavior during review.
+
 
 ### Probation prepare validation and fallback
 
@@ -794,6 +807,35 @@ applying the data. A later attempt is not covered by an earlier release. Route e
 before the latched route returns. Neither elapsed time nor a later successful run clears that latch.
 The incident report `reports/2026-09-30-prepare-failures-root-causes.md` distinguishes worker cause from
 claim retirement: dead-session cleanup frees capacity but does not prove why authoring failed.
+
+Prepare PR identity is shared in `we:scripts/conveyor/prepare-pr-match.mjs`: same-repo branches
+accept one uniqueness letter after the card number (or `bornAs`), with the `WE #<num>: prepare`
+title as a fallback. That fallback is refusal grade only (`isPreparePrFor`): it may refuse a launch,
+never drive a write. The status reader, whose result drives retirement, holds and the stamp worker,
+uses the write-grade `isLanePreparePrFor` (lane branch required). Test every write path with a
+title-only PR outside `lane/` and assert no stamp, hold or retirement comes from it.
+An ended attempt frees its prepare slot even while its PR is OPEN (that PR refuses the re-launch):
+test cap-many ended OPEN-PR cards and assert a clean card still launches.
+Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
+The launch guard must also run without a surviving claim, and refuse when PR listing throws.
+Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
+0 disables only the merged refusal); probe the time boundary with an injected clock.
+A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
+Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
+the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
+the releases store. Cover each clearing path, and an older park under a newer record, so an operator's
+hand stamp never re-parks the card (the stale-reprepare livelock).
+tick-core offers at most two item prepares and cannot see these launch refusals. The daemon keeps a
+refused card out of the plan, and out of a clean lead's prepare group, for `PREPARE_REFUSAL_HOLD_MS`,
+then checks it again. Build-backoff cards and group members in flight are held out the same way.
+Every group member passes the same launch admission as its lead (`refusePrepareLaunch`); test a member
+that was never refused before and has its own open PR. When nothing else tracks a card refused for its
+own lane prepare PR, the daemon reads THAT PR once per refusal (`prNumber`). A finished but unstamped
+result (open, with sections, no stamp, judged against the stamp a re-prepare replaces) goes to stamp
+recovery, and later reads stay on that PR while its hold stands; anything else
+stays a refusal that takes no prepare slot and places no hold. Test that capacity
+rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
+a clean third, across ticks.
 
 Stamp-recovery reservations do not expire. A terminal recovery error is recorded in its dispatch log,
 classified by the daemon, and cannot spawn again without a remaining transient budget or a cited fix.
