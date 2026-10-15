@@ -654,7 +654,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
  * take in the others' branches, so one PR carries every fix.
  *
  * @param {{mainFailingJobs:string[], fixPrs:Array<{number:number, createdAt?:string, headRefName?:string,
- *   ci:{status:'green'|'red'|'inconclusive'|'pending'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
+ *   ci:{status:'green'|'red'|'inconclusive'|'pending'|'missing'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
  *   `ci` is the PR's latest FINISHED CI run with a complete job list; anything else is `unknown` (never acted on).
  *   `passedJobs` = the jobs whose conclusion was `success` (skipped / cancelled / absent are NOT in it): the only
  *   evidence that this PR fixes a main cause.
@@ -778,14 +778,29 @@ export function assessOwnerProgress({ state, owner, ownerPrs = [], ledgerEntry, 
   if (rerunPending) return moving('rerun-pending');
   if (!Number.isFinite(now) || ownerPrs === null) return moving('progress-unknown');
   const recent = now - settings.mainCiRedOwnerStallMin * MINUTE;
-  if (ownerPrs.some((pr) => pr.ci?.pending || pr.ci?.status === 'pending')) return moving('owner-ci-pending');
+  if (ownerPrs.some((pr) => pr.ci?.pending === true)) return moving('owner-ci-pending');
   if (ownerPrs.some((pr) => ts(pr.ci?.completedAt) !== null && ts(pr.ci.completedAt) > recent)) return moving('owner-ci-recent');
   let reason, since;
   if (ownerPrs.length) {
+    // A legacy pending label without observed in-flight evidence also needs a deadline.
+    const missing = (pr) => ['missing', 'pending'].includes(pr.ci?.status);
     // Unknown or green CI is not proof of a stalled red owner.
-    if (ownerPrs.some((pr) => !['red', 'inconclusive'].includes(pr.ci?.status) || ts(pr.ci?.completedAt) === null)) return moving('owner-ci-not-red');
-    since = Math.max(...ownerPrs.map((pr) => ts(pr.ci.completedAt)));
-    reason = ownerPrs.some((pr) => pr.ci.status === 'inconclusive') ? 'owner-ci-inconclusive' : 'owner-ci-red';
+    if (ownerPrs.some((pr) => !missing(pr)
+      && (!['red', 'inconclusive'].includes(pr.ci?.status) || ts(pr.ci?.completedAt) === null))) return moving('owner-ci-not-red');
+    const hasMissing = ownerPrs.some(missing);
+    if (hasMissing && !(settings.mainCiRedOwnerPrDeadlineMin > 0)) return moving('owner-ci-deadline-off');
+    // Anchor the grace to PR creation, never a poll or PR updatedAt (comments can change it).
+    // Sparse callers fall back to dispatch, then the red episode's start; neither slides on polling.
+    const deadlines = ownerPrs.map((pr) => {
+      if (!missing(pr)) return ts(pr.ci.completedAt);
+      const started = ts(pr.createdAt) ?? (Number.isFinite(ledgerEntry?.at) ? ledgerEntry.at : state.redSinceMs);
+      return Number.isFinite(started) ? started + settings.mainCiRedOwnerPrDeadlineMin * MINUTE : null;
+    });
+    if (deadlines.some((at) => at === null)) return moving('progress-unknown');
+    since = Math.max(...deadlines);
+    if (now < since) return moving('owner-ci-deadline');
+    reason = hasMissing ? 'owner-ci-missing'
+      : ownerPrs.some((pr) => pr.ci.status === 'inconclusive') ? 'owner-ci-inconclusive' : 'owner-ci-red';
   } else {
     if (owner.kind !== 'dispatched' || !(settings.mainCiRedOwnerPrDeadlineMin > 0)
       || !Number.isFinite(ledgerEntry?.at)) return moving('dispatch-unknown');

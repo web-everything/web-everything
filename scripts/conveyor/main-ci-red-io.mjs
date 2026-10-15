@@ -227,21 +227,27 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
 
 /**
  * One fix PR's CI for the combine rule: its latest FINISHED ci.yml run on the PR head, with a complete job list.
- * `{status:'green'|'red'|'inconclusive'|'pending'|'unknown', failedJobs}` — completed runs without a verdict
- * are inconclusive, not in flight. They prove no job fixes to the combine rule.
+ * `{status:'green'|'red'|'inconclusive'|'pending'|'missing'|'unknown', failedJobs}` — completed runs without a verdict
+ * are inconclusive; a successful lookup with no current-head runs is missing. Neither proves CI is in flight
+ * or proves any job fixes to the combine rule. Unreadable responses remain unknown.
  */
 export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
   try {
+    // Filter before the server's limit: other heads must not crowd this head's runs out of the sample.
     const runs = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', String(pr.headRefName),
+      ...(pr.headRefOid ? ['--commit', String(pr.headRefOid)] : []),
       '--limit', '5', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha']);
-    const headRuns = (Array.isArray(runs) ? runs : []).filter((r) => !pr.headRefOid || r.headSha === pr.headRefOid);
+    if (!Array.isArray(runs)) return { status: 'unknown', failedJobs: [] };
+    const headRuns = runs.filter((r) => !pr.headRefOid || r.headSha === pr.headRefOid);
+    if (!headRuns.length) return { status: 'missing', failedJobs: [], completedAt: null };
     const done = headRuns.filter((r) => r.status === 'completed')
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     // card 302: a newer in-flight run supersedes the finished verdict for progress.
-    const pending = headRuns.some((r) => r.status !== 'completed'
+    const pending = headRuns.some((r) => ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(r.status)
       && (!done || Date.parse(r.createdAt) >= Date.parse(done.createdAt)));
     const progress = { completedAt: done?.updatedAt ?? null, ...(pending ? { pending: true } : {}) };
-    if (!done || pending) return { status: 'pending', failedJobs: [], ...progress };
+    if (pending) return { status: 'pending', failedJobs: [], ...progress };
+    if (!done) return { status: 'unknown', failedJobs: [], ...progress };
     if (classifyRun(done) === 'ignore') return { status: 'inconclusive', failedJobs: [], ...progress };
     if (classifyRun(done) === 'green') {
       // A green run can still have skipped jobs, so read the jobs: only the ones that SUCCEEDED prove a fix (F5). An
@@ -429,7 +435,10 @@ export async function probeAndOwnMainCi({
     const progressState = { ...state, firstRed: { ...state.firstRed, attempt: firstRun?.attempt,
       rerunRequested: Object.hasOwn(reruns, state.firstRed.runId) } };
     const full = new Map((prs || []).map((pr) => [Number(pr.number), pr]));
-    const progressPrs = prs === null ? null : ownerPrs.map((pr) => ({ ...pr, ci: ownerCi(full.get(pr.number) ?? pr) }));
+    const progressPrs = prs === null ? null : ownerPrs.map((pr) => {
+      const p = full.get(pr.number) ?? pr;
+      return { ...pr, createdAt: p.createdAt, ci: ownerCi(p) };
+    });
     const ownerStall = assessOwnerProgress({ state: progressState, owner: result.owner, ownerPrs: progressPrs,
       ledgerEntry: entry, now, rerunPending, settings });
     const escalation = planEscalation({ state, stall: ownerStall, now, settings });

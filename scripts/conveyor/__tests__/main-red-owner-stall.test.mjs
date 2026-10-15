@@ -121,6 +121,70 @@ describe('card 302 stalled red-main owner replay', () => {
   });
 });
 
+describe('owner head without CI runs', () => {
+  const read = (runs) => readFixPrCi(facts.pr, { exec: () => JSON.stringify(runs) });
+  const deadline = Date.parse(facts.pr.createdAt) + 45 * core.MINUTE;
+
+  it.each([[], [{ ...facts.ownerRun, headSha: 'old-head' }],
+    [{ ...facts.ownerRun, headSha: 'old-head', status: 'in_progress' }]].map((runs) => ({ runs })))
+  ('distinguishes missing current-head CI from an observed active run ($runs)', ({ runs }) => {
+    expect(read(runs)).toMatchObject({ status: 'missing', completedAt: null });
+    expect(read(runs).pending).not.toBe(true);
+  });
+
+  it('bounds missing CI through the real reader and owner-progress wiring', async () => {
+    const missing = read([]);
+    const early = (await replay('07:27:11', { ci: missing })).result;
+    expect(early.ownerStall).toMatchObject({ moving: true, reason: 'owner-ci-deadline' });
+    const expired = (await replay('07:27:12', { ci: missing })).result;
+    expect(expired.ownerStall).toMatchObject({ stalled: true, reason: 'owner-ci-missing', since: deadline });
+    expect(expired.escalation).not.toBeNull();
+    expect(expired.recovery).toBeNull();
+    const later = (await replay('12:00:00', { ci: missing })).result;
+    expect(later.escalation).not.toBeNull();
+    expect(later.recovery).toMatchObject({ kind: 'rerun', reason: 'owner-stalled' });
+    expect(assess({ ownerPrs: [{ ...facts.pr, ci: missing }], now: deadline + 7 * 24 * 60 * core.MINUTE }))
+      .toMatchObject({ stalled: true, reason: 'owner-ci-missing', since: deadline });
+    const repeated = (await replay('12:00:00', { ci: missing, reruns: { 38517676708: { kind: 'owner-stalled' } } })).result;
+    expect(repeated.recovery.kind).toBe('revert-proposal');
+  });
+
+  it('filters by current commit before limiting branch history', () => {
+    const otherHeads = Array.from({ length: 5 }, (_, i) => ({ ...facts.ownerRun, headSha: `other-${i}` }));
+    const ownerCi = readFixPrCi(facts.pr, { exec: (bin, args) => {
+      if (args[0] !== 'run') return JSON.stringify({ total_count: 1, jobs: [{ name: 'integration', conclusion: 'success' }] });
+      return JSON.stringify(args[args.indexOf('--commit') + 1] === facts.pr.headRefOid
+        ? [{ ...facts.ownerRun, conclusion: 'success' }] : otherHeads);
+    } });
+    expect(ownerCi.status).toBe('green');
+    expect(assess({ ownerPrs: [{ ...facts.pr, ci: ownerCi }], now: deadline + 7 * 24 * 60 * core.MINUTE }).moving).toBe(true);
+  });
+
+  it('requires observed pending evidence and handles multiple owners and timestamp fallbacks', () => {
+    const missing = { status: 'missing', completedAt: null };
+    for (const status of ['missing', 'pending']) {
+      expect(assess({ ownerPrs: [{ ...facts.pr, ci: { ...missing, status } }] }))
+        .toMatchObject({ stalled: true, reason: 'owner-ci-missing', since: deadline });
+    }
+    expect(assess({ ownerPrs: [{ ...facts.pr, ci: missing }, { ci }] }))
+      .toMatchObject({ stalled: true, since: deadline });
+    expect(assess({ ownerPrs: [{ ...facts.pr, ci: missing }, { ci: { status: 'pending', pending: true } }] }).moving).toBe(true);
+    expect(assess({ ownerPrs: [{ ci: missing }] }).since).toBe(facts.ledger['62da75ed3'].at + 45 * core.MINUTE);
+    expect(assess({ ownerPrs: [{ ci: missing }], ledgerEntry: null, owner: { kind: 'pr' } }).since)
+      .toBe(state.redSinceMs + 45 * core.MINUTE);
+    expect(assess({ ownerPrs: [{ ...facts.pr, ci: missing }], settings: { ...settings, mainCiRedOwnerPrDeadlineMin: 0 } }).moving).toBe(true);
+  });
+
+  it('keeps unreadable responses unknown and only recognizes active run statuses', () => {
+    for (const response of [null, {}, { status: 'deferred-low-budget' }]) expect(read(response).status).toBe('unknown');
+    expect(readFixPrCi(facts.pr, { exec: () => { throw new Error('unavailable'); } }).status).toBe('unknown');
+    expect(read([{ ...facts.ownerRun, status: 'unrecognized' }]).status).toBe('unknown');
+    for (const status of ['queued', 'in_progress', 'waiting', 'requested', 'pending']) {
+      expect(read([{ ...facts.ownerRun, status, conclusion: null }])).toMatchObject({ status: 'pending', pending: true });
+    }
+  });
+});
+
 describe('completed inconclusive owner CI', () => {
   const pr = { ...facts.pr, headRefOid: 'new-head' };
   const old = { ...facts.ownerRun, headSha: 'old-head', updatedAt: '2026-10-14T06:30:00Z' };
@@ -231,7 +295,7 @@ describe('card 302 pure boundaries', () => {
     expect(assess({ settings: { ...settings, mainCiRedOwnerStallMin: 0 } }).moving).toBe(true);
     expect(assess({ owner: null }).moving).toBe(true);
     expect(assess({ ownerPrs: null }).moving).toBe(true);
-    expect(assess({ ownerPrs: [{ ci }, { ci: { status: 'pending' } }] }).moving).toBe(true);
+    expect(assess({ ownerPrs: [{ ci }, { ci: { status: 'pending', pending: true } }] }).moving).toBe(true);
     expect(assess({ ownerPrs: [{ ci }, { ci: { ...ci, completedAt: '2026-10-14T07:20:00Z' } }] }).moving).toBe(true);
   });
   it('gates escalation and recovery at exact thresholds and honors off values', () => {
