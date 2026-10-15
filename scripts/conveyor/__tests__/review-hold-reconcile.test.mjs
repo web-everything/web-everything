@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
+import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
 import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
@@ -601,5 +601,39 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
       listPrs: () => [{ ...pr(5025, ['review:changes']), comments: [accept, record, objection] }],
       numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
     expect(seen).toEqual([]);
+  });
+  // Self-review (#5233): `gh pr list --json comments` stops at the first page, so a record past it is invisible there.
+  describe('a capped listing on a label-held PR', () => {
+    afterEach(_resetStrandedCheckMemo);
+    const filler = Array.from({ length: 100 }, (_, i) => ({ author: { login: 'stranger' }, body: `discussion ${i}` }));
+    const capped = (extra = {}) => ({ ...pr(5025, ['review:changes']), headRefOid: 'a'.repeat(40), comments: filler, ...extra });
+    it('reads the full thread live and withdraws a stranded record past the first page', () => {
+      const p = provider({ readPrState: () => ({ labels: [{ name: 'review:changes' }], comments: [accept, ...filler, objection, record] }) });
+      p.readPrReviews = () => [];
+      p.editComment = vi.fn();
+      const result = sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [capped()],
+        numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+      expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'withdrawn' }));
+      expect(p.editComment).toHaveBeenCalledWith('o/n', 'IC_stranded', expect.stringContaining('numbering-restamp-withdrawn:'), { pr: 5025 });
+    });
+    it('reads a capped head once, then not again until a pass on it writes or fails', () => {
+      const p = provider();
+      const seen = [];
+      const sweep = (r) => sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [capped()],
+        numberingRestamp: (opts) => { seen.push(opts.pr); return r; } });
+      sweep(null);
+      sweep(null);
+      expect(seen).toEqual([5025]);
+      _resetStrandedCheckMemo();
+      sweep({ action: 'error', reason: 'withdrawal failed: offline' });
+      sweep(null);
+      expect(seen).toEqual([5025, 5025, 5025]);
+    });
+    it('trusts a listing the complete reader marked complete', () => {
+      const seen = [];
+      sweepFixture({ repo: 'o/n', provider: provider(), listPrs: () => [capped({ commentsComplete: true })],
+        numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
+      expect(seen).toEqual([]);
+    });
   });
 });

@@ -143,6 +143,10 @@ export function needsReviewHoldCleanup(pr) {
  *   flagged?: string[], flagReason?: string, error?: string, skipped?: string}>} one entry per PR that
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
+/** Heads whose complete live thread a pass found with no stranded numbering re-stamp record (bounds the capped-listing reads). */
+const strandedChecked = new Set();
+export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
+
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
@@ -162,19 +166,24 @@ export function sweepReviewHoldLabels({
     const carryLabels = names.includes(REVIEW_LABELS.pending)
       && ![REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l));
     // A re-stamp record written over a hold before it is withdrawn whatever the labels or the settled memo say (the
-    // live read below re-checks it, with the formal reviews). A capped listing may hide one, so it is read live.
+    // live read below re-checks it, with the formal reviews). A capped listing may hide one past its first page, so it
+    // is read live — once per head, until a pass on that head writes or fails (`strandedChecked`).
+    const checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`;
     const listedState = () => {
       const listed = Array.isArray(pr.comments) ? pr.comments : null;
-      const complete = Boolean(listed) && listed.length < LIST_COMMENTS_CAP;
-      return { listed, complete, stranded: !complete || strandedNumberingRecords(listed).length > 0 };
+      const complete = Boolean(listed) && (pr.commentsComplete === true || listed.length < LIST_COMMENTS_CAP);
+      const shown = complete && strandedNumberingRecords(listed).length > 0;
+      // Off the carry path a PR listed with no comment field at all says nothing either way and is left alone.
+      return { listed, complete, shown,
+        stranded: shown || (!complete && (carryLabels || Boolean(listed)) && !strandedChecked.has(checkKey)) };
     };
     let view;
     if (carryLabels) view = listedState();
     else {
-      // Off the carry path, only a listed re-stamp record earns the live read; an unreadable listing is left to the
+      // Off the carry path, only a possible stranded record earns the live read; an unreadable listing is left to the
       // later legs, as before.
       try { view = listedState(); } catch { continue; }
-      if (!view.stranded || !view.listed?.some((c) => String(c?.body ?? '').includes(`<!-- ${NUMBERING_RESTAMP_MARKER}:`))) continue;
+      if (!view.stranded) continue;
     }
     const { listed, complete, stranded } = view;
     // Cheap pre-filter on the listing so the live re-read is spent only on a possible numbering carry: a complete listed
@@ -207,14 +216,17 @@ export function sweepReviewHoldLabels({
       try { origin = String(exec('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' })).trim(); } catch { /* other checkout */ }
       const originSlug = origin.replace(/^.*github\.com[:/]/i, '').replace(/\.git$/i, '').replace(/\/$/, '');
       const cwd = originSlug.toLowerCase() === slug.toLowerCase() ? undefined : defaultCloneDirFor(slug);
-      if (cwd === null) {
-        results.push({ num: pr.number, numberingRestamp: 'retry', detail: 'no checkout for repository' });
-        continue;
-      }
+      // No checkout: no proof can run, but a withdrawal needs none, so the pass still runs with a proof that retries.
+      const noCheckout = cwd === null;
       const readNetDiff = (sha) => readNetDiffAtHead({
         exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
       });
-      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd, readNetDiff, readLiveState, exec });
+      const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
+        readNetDiff, readLiveState, exec,
+        ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
+      // A clean pass (nothing withdrawn, posted or failed) settles the stranded check for this head.
+      if (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action))) strandedChecked.delete(checkKey);
+      else strandedChecked.add(checkKey);
       if (r) {
         results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });
         if (r.action === 'restamped' || (dryRun && r.action === 'would-restamp')) restamped.add(pr.number);
