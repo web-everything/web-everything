@@ -20,6 +20,8 @@ export default {
     const { sweepHumanSurfaceRepark } = await import(pathToFileURL(join(root, SOURCE)).href);
     const { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanClearedSha } = await import(pathToFileURL(join(root, 'scripts/lib/review-escalation.mjs')).href);
     const head = 'a'.repeat(40);
+    // The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
+    const clearanceBody = () => `✅ review — \`review:human\` cleared via the sanctioned path\n\n${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}`;
     const state = { state: 'OPEN', headRefOid: head, labels: ['review:accepted'],
       comments: Array.from({ length: 101 }, (_, i) => ({ id: `C_${i}`, body: `discussion ${i}` })) };
     const effects = [];
@@ -30,7 +32,7 @@ export default {
       readComments() {
         // Snapshot the old comments, then let the operator complete the ceremony.
         const old = [...state.comments];
-        state.comments.push({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
+        state.comments.push({ author: { login: 'web-everything' }, body: clearanceBody() });
         return old;
       },
       provider: {
@@ -58,7 +60,7 @@ export default {
         readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),
         readPrFiles: () => ['.github/workflows/ci.yml'],
         postComment() {
-          live.comments.push({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
+          live.comments.push({ author: { login: 'web-everything' }, body: clearanceBody() });
         },
         setLabels(_repo, _pr, { add, remove = [] }) {
           live.labels = [...new Set([...live.labels.filter(label => !remove.includes(label)), add])];

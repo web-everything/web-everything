@@ -87,7 +87,8 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : `sha-${number}`;
-    const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
+    // The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
+    const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
     const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
     if (approvedHeadPlan) {
       mkdirSync(cwd);

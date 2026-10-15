@@ -15,6 +15,8 @@ const PATCH = 'diff --git a/.github/workflows/test.yml b/.github/workflows/test.
   + '--- a/.github/workflows/test.yml\n+++ b/.github/workflows/test.yml\n'
   + '@@ -1 +1 @@\n-old: true\n+new: true\n';
 const trusted = body => ({ author: { login: 'chalbert' }, body });
+// The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
+const clearanceBody = sha => `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: operator -->`;
 
 export default {
   id: 'approved-human-head-review-churn',
@@ -50,7 +52,7 @@ export default {
       const { contributionPatchId, parseVerdictCarriedMarker } = await load('scripts/lib/rebase-verdict-carry.mjs');
       const { gateOutcomesForHead } = await load('scripts/lib/red-team-gate.mjs');
 
-      const clearance = trusted(`<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: operator -->`);
+      const clearance = trusted(clearanceBody(HEAD));
       const readHold = (overrides = {}) => {
         const facts = { setting: 'on', head: HEAD, mergeable: 'MERGEABLE', manifest: '',
           labels: ['review:accepted'], comments: [clearance], ...overrides };
@@ -86,7 +88,7 @@ export default {
       }
       check(rebuilds === 0 && reruns.join(',') === '1,2,3', 'freshness must rerun each stale pass without rebuilding');
       for (const facts of [{ setting: 'off' }, { mergeable: 'CONFLICTING' }, { manifest: '.lane-manifest.json' },
-        { labels: [] }, { comments: [] }, { comments: [trusted(`<!-- reviewed-sha: ${BASE} -->\n<!-- cleared-human: operator -->`)] }]) {
+        { labels: [] }, { comments: [] }, { comments: [trusted(clearanceBody(BASE))] }]) {
         check(!readHold(facts).hold, `unsafe approval retained: ${JSON.stringify(facts)}`);
       }
       for (const facts of [{ unreadable: true }, { head: NEXT }, { mergeable: 'UNKNOWN' }]) {
