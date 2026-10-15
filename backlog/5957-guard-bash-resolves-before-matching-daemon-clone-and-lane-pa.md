@@ -1,37 +1,61 @@
 ---
 bornAs: xj0teal
 kind: story
-size: 1
+size: 2
 status: open
-scope: ["we:scripts/guard-bash.mjs"]
+scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
 dateOpened: "2026-10-12"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
 ---
 
-# guard-bash resolves ~ before matching daemon-clone and lane paths
+# Guard-bash resolves home paths before matching daemon-clone and lane paths
 
-Held finding 248 (2026-10-11, safety). A worker ran git checkout --detach inside the drain clone via a cd ~/... form; it blocked every rebuild until #4964 taught the heal to reattach. guard-bash must expand ~ (and $HOME) before matching daemon-clone / lane paths; test the cd ~/... spelling.
+Held finding 248: a leading cd written with home shorthand must identify the same protected daemon clone or owned lane as its absolute spelling. Prevent the reported drain-clone detach bypass without executing shell expansion during inspection.
+
+## Progress
+
+- Rechecked at 37d55ee65. Original scope named only `we:scripts/guard-bash.mjs` and asked to expand tilde and HOME before matching paths. The defect remains: `we:scripts/guard-bash.mjs:2469` strips quotes, recognizes only whole-variable targets backed by command-local assignments, then resolves a tilde literally against the reported cwd. HOME with a suffix falls back to reported cwd. The CLI uses this result before both daemon-root and lane-lease classification at `we:scripts/guard-bash.mjs:4348`.
+- Corrected scope includes `we:scripts/__tests__/guard-bash.test.mjs`. Its daemon CLI harness at `we:scripts/__tests__/guard-bash.test.mjs:3421` already provides temporary registry roots and subprocess hook invocation. Keep this task on leading-cd resolution and downstream classification; direct git -C and arbitrary file operands are separate parser surfaces (`we:scripts/guard-bash.mjs:1863`, `we:scripts/guard-bash.mjs:1938`).
+- Increase size 1 to size 2: approximately 55 source lines for quote-aware, injectable home expansion and 100 test lines for resolver plus hook cases. Evidence: quote removal currently precedes expansion at `we:scripts/guard-bash.mjs:2470`, so blind string replacement would incorrectly expand quoted tilde and single-quoted HOME. The existing hook harness keeps proof within the same test file.
+
+## Design
+
+Resolve supported home forms in the leading cd argument before absolute/relative path normalization. Support bare tilde, unquoted tilde-slash, unquoted HOME/braced HOME with a suffix, and double-quoted HOME forms, including home paths containing spaces. Preserve quoting information until expansion is complete: quoted tilde and single-quoted HOME are literal shell text, not home aliases. Reuse the existing parser/token information where possible instead of evaluating shell text.
+
+Use the hook process's HOME as the shell's home source, with an injectable value for unit tests; honor applicable literal command-local HOME assignments in command order. Do not let a later assignment retroactively change an earlier cd. Preserve existing literal variable assignments used by lane commands. An unset HOME must not fabricate an absolute home target; unsupported substitutions retain the existing unresolved-target behavior. Never invoke a shell, expand arbitrary environment variables, or execute substitutions to discover a path.
+
+Feed the resolved path through the existing realpath, daemon registry and lane lease checks. Home spelling confers no authority: a registered daemon clone under the lane tree is still protected, and a foreign/contested lane remains subject to the same refusal as its absolute path.
+
+## MVP
+
+Implement home-aware leading-cd resolution in the existing guard, preserving the current public call shape with an optional injected home context if needed. Add pure resolver cases and real hook-process cases using temporary home/registry fixtures. No edits to actual daemon clones, leases or user HOME.
+
+## Test plan
+
+In `we:scripts/__tests__/guard-bash.test.mjs`, compare shorthand with absolute paths for tilde, HOME, braced HOME, double quotes, trailing slash, spaces and dot segments. Negative controls: quoted tilde, single-quoted HOME, unknown variables, command substitutions, heredoc body text, missing HOME and assignments after cd. Pin existing literal lane-variable behavior.
+
+Extend the temporary registry CLI harness: from an unrelated reported cwd, submit a home-spelled cd followed by git checkout --detach and require deny for the registered clone. Assert git status remains allowed. Check the resolver's lane root and the existing own/foreign/contested lane classification with equivalent absolute and home-spelled targets. Use inert command strings; the hook inspects them and must never execute the proposed checkout. Verify fixture cleanup and no changes to real registry files.
+
+Run the scoped suite and standards gate only through the host heavy queue.
+
+## Proof plan
+
+Capture the resolver's incorrect current result and hook decision for the isolated daemon fixture, then the corrected absolute target and deny output after implementation. Compare each with the already-protected absolute spelling. Include the read-only control and quoted-literal controls so the fix proves both protection and shell-compatible interpretation. No live detach or daemon restart is authorized or needed.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+Supported leading-cd home forms reach the same daemon and lane guards as their absolute equivalents. Quoting preserves literal paths, and no inspected command is executed.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+No general shell interpreter, named-user tilde lookup, arbitrary variable expansion, daemon registry redesign, lease-policy change or repair of an already detached clone. Direct git -C and explicit file-operand expansion remain outside this leading-cd fix.
 
-## Edge cases this change must handle
+## Edge cases
 
-One line per class: either the handling, or `n/a: <why>`.
+Treat input as untrusted syntax. Unterminated quoting and unresolved substitutions keep existing conservative handling; this patch must not introduce an allow override. Keep realpath matching and registry ownership intact. Tests use isolated temporary state; no production shared files are written. This is a local inspection hook, not a new network endpoint, so HTTP body/rate/CSRF controls do not apply.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Follow-ups
+
+Audit home expansion in direct git -C targets and filesystem operands separately; both currently use independent resolution sites. Do not claim this leading-cd fix closes every shell spelling of a protected path.

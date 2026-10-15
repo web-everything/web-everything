@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/conveyor/mechanical-round-cap.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/mechanical-round-cap.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-14"
-preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
 ---
 
@@ -16,9 +16,11 @@ A trusted mechanical marker must describe the latest round before it can authori
 
 ## Progress
 
+- Rechecked against 37d55ee65: old premise (stale mechanical markers survive ordinary rounds) remains present in `we:scripts/conveyor/mechanical-round-cap.mjs:270` and `we:scripts/conveyor/mechanical-round-cap.mjs:437`. Corrected the moved enrichment gate citation to `we:scripts/conveyor/reconcile-pass.mjs:1548`. Existing source-plus-test scope and size 2 remain appropriate; no new production surface or policy choice is needed.
+
 - Original scope named only the two source files and approximate :346/:88/:1375 locations. Corrected scope adds both existing matching tests.
-- Current evidence: we:scripts/conveyor/mechanical-round-cap.mjs:262 grants from the latest mechanical marker without comparing ordinary rearm events; :435 likewise compares mechanical markers only with verdicts despite its “latest round event” contract. The ordinary rearm matcher already exists at :432. The trust check follows body classification and mechanical regex execution at :206.
-- The reconcile enrichment gate moved to we:scripts/conveyor/reconcile-pass.mjs:1530: only WE with the resolved count-toward-cap setting false calls enrichment. Preserve that behavior and test it through the injected port.
+- Current evidence: we:scripts/conveyor/mechanical-round-cap.mjs:262 grants from the latest mechanical marker without comparing ordinary rearm events; `we:scripts/conveyor/mechanical-round-cap.mjs:435` likewise compares mechanical markers only with verdicts despite its “latest round event” contract. The ordinary rearm matcher already exists at `we:scripts/conveyor/mechanical-round-cap.mjs:432`. The trust check follows body classification and mechanical regex execution at `we:scripts/conveyor/mechanical-round-cap.mjs:206`.
+- The reconcile enrichment gate moved to we:scripts/conveyor/reconcile-pass.mjs:1548: only WE with the resolved count-toward-cap setting false calls enrichment. Preserve that behavior and test it through the injected port.
 - Claimed missing git-refusal tests are already present in we:scripts/conveyor/__tests__/mechanical-round-cap.test.mjs:530 (failed reads) and :543 (ancestry refusal); retain/run them rather than duplicate them. The remaining stale-round and trust-order defects keep this item open.
 - Size remains 2: roughly 35 source lines in the mechanical module, at most 5 integration lines, and 80 test lines across the two suites.
 
