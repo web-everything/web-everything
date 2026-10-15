@@ -554,10 +554,15 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd "$UNKNOWN" ~/clone && ls')).toBe(REPORTED);
   });
   it('a cd behind prefix assignments, builtin/command or quoting is still the cd', () => {
-    for (const cmd of ['FOO=1 cd ~/clone', '"cd" ~/clone', '\\cd ~/clone', 'builtin cd ~/clone', 'command cd ~/clone']) {
+    for (const cmd of [
+      'FOO=1 cd ~/clone', '"cd" ~/clone', '\\cd ~/clone', 'builtin cd ~/clone', 'command cd ~/clone',
+      'command -p cd ~/clone', 'command -- cd ~/clone', 'builtin -- cd ~/clone', '{ cd ~/clone', '! cd ~/clone',
+      'time cd ~/clone', 'time -p cd ~/clone', 'A=$(true) cd ~/clone',
+    ]) {
       expect(at(`${cmd} && git checkout --detach`), cmd).toBe(`${HOME}/clone`);
     }
     expect(at('command -v cd ~/clone && ls')).toBe(REPORTED);
+    expect(at('command -V cd ~/clone && ls')).toBe(REPORTED);
     // a prefix assignment is temporary and expands after the cd's own words: the earlier value wins
     expect(at('LANE=/protected/clone; LANE=/tmp cd "$LANE"')).toBe('/protected/clone');
   });
@@ -590,7 +595,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
     // an assignment we cannot evaluate makes HOME unknown rather than silently keeping the old one
     expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
-    expect(at('HOME=~/x; cd ~/clone')).toBe(REPORTED);
+    // an unquoted `~` in a HOME assignment expands with the previous HOME, as the shell does
+    expect(at('HOME=~/x; cd ~/clone')).toBe(`${HOME}/x/clone`);
+    expect(at('HOME=~/x; cd ~/clone', null)).toBe(REPORTED);
     expect(at('unset HOME; cd ~/clone')).toBe(REPORTED);
   });
   it('NEW in #5957: any variable assigned after the cd no longer resolves it (assignments apply in command order)', () => {
@@ -611,8 +618,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     }
     expect(at('unset -v HOME; cd ~/x')).toBe(REPORTED);
     expect(at('local HOME=/x; cd ~/x')).toBe(REPORTED);
-    // an unquoted `~` in ANY assignment is expanded by the shell, so it is unknown here; a quoted one is literal
-    expect(at('LANE=~/clone; cd "$LANE"')).toBe(REPORTED);
+    // an unquoted `~` in ANY assignment is expanded by the shell (with HOME); a quoted one is literal
+    expect(at('LANE=~/clone; cd "$LANE"')).toBe(`${HOME}/clone`);
+    expect(at('LANE=~someone/clone; cd "$LANE"')).toBe(REPORTED);
     expect(at('LANE="~/clone"; cd "$LANE"')).toBe(`${REPORTED}/~/clone`);
   });
   it('keeps a known value when a statement leaves it unchanged in bash', () => {
@@ -623,27 +631,61 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE" && git checkout --detach`), stmt).toBe('/protected/clone');
     }
-    // a readonly variable can no longer be rebound or unset
-    for (const stmt of ['LANE=/tmp', 'unset LANE', 'read LANE', 'declare LANE=/tmp', 'export LANE=/tmp']) {
-      expect(at(`LANE=/protected/clone; readonly LANE; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
-      expect(at(`readonly LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+    // a statement that never runs in this shell (skipped, piped, backgrounded) must not pin a later value
+    for (const stmt of ['true || readonly LANE=/tmp', 'readonly LANE=/tmp | cat', 'false && declare -r LANE']) {
+      expect(at(`${stmt}; LANE=/protected/clone; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
-    expect(at('HOME=/protected; readonly HOME; HOME=/tmp; cd ~/clone')).toBe('/protected/clone');
+    // `let` forgets only the names it assigns, never the ones it reads
+    for (const stmt of ['let Y=LANE+0', 'let "Y = LANE"', 'let "LANE == 1"', 'let "LANE <= 1"']) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+    }
+    for (const stmt of ['let LANE++', 'let "LANE += 1"', 'let ++LANE', 'let "Y = LANE = 2"']) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
   });
-  it('declaration builtins and multi-assignments bind every literal they assign', () => {
+  it('declaration builtins and multi-assignments bind every value they assign, left to right', () => {
     for (const stmt of [
       'declare LANE=/protected/clone', 'typeset -x LANE=/protected/clone', 'readonly LANE=/protected/clone',
       'export A=/x LANE=/protected/clone', 'A=/x LANE=/protected/clone', 'declare -- LANE="/protected/clone"',
+      'declare "LANE=/protected/clone"', 'readonly \'LANE=/protected/clone\'', 'A=/protected B=/clone LANE=$A$B',
+      'LANE=/protected/"clone"', 'LANE=/tmp export LANE; LANE=/protected/clone export LANE',
+      'LANE=/protected/clone readonly LANE', 'LANE=/protected/clone declare -x LANE',
     ]) {
       expect(at(`LANE=/tmp; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
+    // a prefix assignment to a declaration that does not export or freeze the name stays temporary
+    expect(at('LANE=/protected/clone; LANE=/tmp declare LANE; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('LANE=/protected/clone; LANE=/tmp export -n LANE; cd "$LANE"')).toBe('/protected/clone');
+    // home and variable spellings in an assignment expand like the shell's
+    expect(at('LANE=~/clone; cd "$LANE"')).toBe(`${HOME}/clone`);
+    expect(at('LANE=$HOME/clone; cd "$LANE"')).toBe(`${HOME}/clone`);
+    expect(at('LANE=x:~/clone; cd "$LANE"')).toBe(REPORTED);
   });
   it('a quoted or escaped name in a binding statement is still forgotten', () => {
-    for (const stmt of ['unset "LANE"', "unset 'LANE'", 'unset \\LANE', 'read -r "LANE"', 'read -p prompt LANE', 'declare "LANE=/b"', 'mapfile -t "LANE"']) {
+    for (const stmt of ['unset "LANE"', "unset 'LANE'", 'unset \\LANE', 'read -r "LANE"', 'read -p prompt LANE', 'declare "LANE=$X"', 'mapfile -t "LANE"']) {
       expect(at(`LANE=/a; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
     // an option argument is not a variable name
     expect(at('LANE=/a; read -p LANE OTHER; cd "$LANE"')).toBe('/a');
+  });
+  it('whitespace bash does not split on never splits an assignment or a cd word', () => {
+    for (const blank of [' ', '\r', ' ']) {
+      expect(at(`A=/x${blank}LANE=/lane; cd "$LANE"`), JSON.stringify(blank)).toBe(REPORTED);
+      expect(at(`LANE=/protected/clone; A=/x${blank}LANE=/lane; cd "$LANE"`), JSON.stringify(blank)).toBe('/protected/clone');
+      expect(at(`cd /lane${blank}x`), JSON.stringify(blank)).toBe(REPORTED);
+    }
+  });
+  it('a known-empty unquoted word disappears, and a temporary HOME steers a bare cd', () => {
+    expect(at('E=; cd $E ~/clone && git checkout --detach')).toBe(`${HOME}/clone`);
+    expect(at('E=; cd "$E" && ls')).toBe(REPORTED);
+    expect(at('HOME=/protected/clone cd && git checkout --detach')).toBe('/protected/clone');
+    // a tilde in the cd word expands before the temporary HOME applies
+    expect(at('HOME=/other cd ~/clone')).toBe(`${HOME}/clone`);
+  });
+  it('ANSI-C and locale quoting of a cd word are quote removal too', () => {
+    expect(at("cd $'/protected/clone' && ls")).toBe('/protected/clone');
+    expect(at('cd $"/protected/clone" && ls')).toBe('/protected/clone');
+    expect(at("cd $'/protected\\x2fclone' && ls")).toBe(REPORTED);
   });
   it('preserves a literal cd target across ordinary printf output', () => {
     for (const stmt of [
