@@ -89,22 +89,39 @@ describe('probation roster models reach the build runner parser', () => {
     expect(parsed).toMatchObject({ taskType: 'build-new-feature', worker: { id: 'antigravity-argon', checker: 'codex', simpleOnly: false } });
   });
 
-  it.each(['antigravity', 'codex'])('an inherited Argon feature pick checks %s executable availability before launch', missing => {
+  // A missing agy yields to the next eligible roster worker (Codex); a missing codex rules out both (Codex, and
+  // Argon's checker), so only then does the unchanged Claude path take it. A pinned model is always Claude.
+  it.each([
+    ['antigravity', null, 'codex'],
+    ['codex', null, 'claude'],
+    [null, 'pinned', 'claude'],
+  ])('an inherited Argon feature pick checks availability before launch: missing=%s pin=%s → %s', (missing, pin, expected) => {
     const routing = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
       scorecards: [{ subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' }],
     });
     expect(routing.policyRoute ?? null).toBeNull();
-    expect(routing.probationWorker?.id).toBe('antigravity-argon');
+    expect(routing.probationWorker).toMatchObject({ id: 'antigravity-argon', alternates: [{ id: 'codex' }] });
     const asked = [];
-    const request = { launchKind: 'build', repo: 'we', num: '9001', sessionSlug: 'feature-test', probationWorker: routing.probationWorker, table: { model: 'sonnet' } };
+    let argv;
+    const request = { launchKind: 'build', repo: 'we', num: '9001', sessionSlug: 'feature-test', probationWorker: routing.probationWorker,
+      table: { model: 'sonnet' }, ...(pin ? { modelReason: 'operator pin', extraArgs: ['--model', 'opus'] } : {}) };
     const handle = routeDispatchProvider(request, {
       probationLaunch: 'on', scriptExists: () => true,
       providerAvailable: provider => { asked.push(provider); return provider !== missing; },
-      probation: () => { throw new Error('unavailable probation worker launched'); },
+      probation: req => probationWorkerDetachedProvider(req, {
+        spawnDetached: args => { argv = args; return { pid: 123 }; }, logPathFor: () => '/tmp/feature-test.log',
+      }),
       agent: req => { expect(req.probationWorker).toBeNull(); return 'native-claude'; },
     });
-    expect(handle).toBe('native-claude');
-    expect(asked).toContain(missing);
+    if (expected === 'claude') {
+      expect(handle).toBe('native-claude');
+    } else {
+      expect(handle).toBe('pid:123');
+      const parsed = parseProbationBuildArgs(argv.slice(1));
+      expect(parsed).toMatchObject({ taskType: 'build-new-feature', worker: { id: expected } });
+      expect(JSON.parse(argv.find(a => a.startsWith('--worker=')).slice('--worker='.length))).not.toHaveProperty('alternates');
+    }
+    if (missing) expect(asked).toContain(missing);
   });
 
   it('an explicit Argon policy route checks its Codex checker executable before launch', () => {

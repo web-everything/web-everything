@@ -445,19 +445,22 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
   if (!candidates.length) return none(`no probation worker is eligible for '${taskType}'`);
   candidates.sort((a, b) => a.recentFailure - b.recentFailure || a.trials - b.trials || a.order - b.order);
   const pick = candidates[0];
-  const worker = Object.freeze({
-    id: pick.def.id,
-    provider: pick.def.provider,
-    model: pick.model,
-    executor: pick.def.executor,
-    launcher: pick.def.launcher,
-    checker: pick.def.checker,
+  const toWorker = (c) => Object.freeze({
+    id: c.def.id,
+    provider: c.def.provider,
+    model: c.model,
+    executor: c.def.executor,
+    launcher: c.def.launcher,
+    checker: c.def.checker,
     taskType,
-    trials: pick.trials,
+    trials: c.trials,
     supervision: SUPERVISION_LEVELS.FULL,
     review: 'full',
     runRating: 'required',
   });
+  // The other eligible workers, in rotation order: the launch boundary tries them when the pick's executable
+  // (or its checker's) is missing, before it falls back to Claude. Pure eligibility only — no binary probe here.
+  const worker = Object.freeze({ ...toWorker(pick), alternates: Object.freeze(candidates.slice(1).map(toWorker)) });
   const reason = `probation worker ${worker.id} (${worker.provider}/${worker.model}) for '${taskType}': last trial ${pick.recentFailure ? 'not clean' : 'clean or none'}, ${pick.trials} trial(s) so far; full review and a run rating are owed on the result`;
   auditTrail.push({ criterion: 'probation-worker', result: worker.id, dataConsulted: `roster=${roster.join(',')}, simple=${simple === true}`, reasoning: reason });
   return { worker, auditTrail, reason };

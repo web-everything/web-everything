@@ -54,18 +54,19 @@ export default {
         const parsed = parseArgs(argv.slice(1));
         check(parsed.taskType === 'build-new-feature' && parsed.worker.checker === 'codex'
           && parsed.worker.simpleOnly === false, 'feature identity or checker lost at the runner boundary');
-        // The inherited route has no policy fallback chain: a missing agy (worker) or codex (checker) binary
-        // must be caught before launch and take the unchanged Claude path, never a doomed detached run.
-        for (const missing of ['antigravity', 'codex']) {
+        // The inherited route has no policy fallback chain: a missing agy (worker) binary must yield to the
+        // next eligible roster worker (Codex); a missing codex (Codex itself, and Argon's checker) must take the
+        // unchanged Claude path — never a doomed detached run.
+        for (const [missing, expected] of [['antigravity', 'probation:codex'], ['codex', 'claude']]) {
           let launched = 'none';
           try {
             launched = routeDispatchProvider({ launchKind: 'build', num: '9001', sessionSlug: 'argon-soak',
               repo: 'we', probationWorker: route.probationWorker, table: { model: 'sonnet' } }, {
               probationLaunch: 'on', scriptExists: () => true, providerAvailable: provider => provider !== missing,
-              agent: () => 'claude', probation: () => 'probation',
+              agent: () => 'claude', probation: request => `probation:${request.probationWorker.id}`,
             });
           } catch (error) { launched = `refused: ${error.message}`; }
-          check(launched === 'claude', `${missing} unavailable but the inherited Argon pick launched '${launched}'`);
+          check(launched === expected, `${missing} unavailable: the inherited Argon pick launched '${launched}', expected '${expected}'`);
         }
       }
     } catch (error) { violations.push(error.message); }

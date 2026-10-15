@@ -1787,6 +1787,8 @@ export function routeDispatchProvider(request, {
   };
   // A probation worker's checker runs inside the same detached arc, so its executable is owed before launch too.
   const checkerAvailable = worker => !worker?.checker || providerAvailable(worker.checker, { provider: worker.checker });
+  // An operator's reasoned `--model` pin is a Claude pin on every route, policy or inherited.
+  const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
     let candidates = [request.policyRoute, ...request.policyRoute.fallback];
@@ -1804,7 +1806,6 @@ export function routeDispatchProvider(request, {
       if (!request.probationWorker || route.provider === 'claude') return null;
       return probationWorkerForRoute(route, request.probationWorker.taskType);
     };
-    const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
     const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && checkerAvailable(workerFor(route)) && (route.provider === 'claude'
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
         && scriptExists(PROBATION_LAUNCHABLE_KINDS[kind].runScript))
@@ -1843,15 +1844,20 @@ export function routeDispatchProvider(request, {
   }
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
   // worker (see `dispatch-providers/probation-worker.mjs#probationLaunchDecision` for every condition).
-  // An inherited pick has no policy fallback chain, so the same pre-launch availability check (worker and its
-  // checker) applies here; an unavailable pick takes the unchanged path below instead of a doomed detached run.
-  const inheritedWorker = request.probationWorker;
-  const unavailable = inheritedWorker && probationLaunchDecision(request, probationLaunch).launch
-    && (!providerAvailable(inheritedWorker.provider, { provider: inheritedWorker.provider, model: inheritedWorker.model, effort: inheritedWorker.effort })
-      ? inheritedWorker.provider : !checkerAvailable(inheritedWorker) ? inheritedWorker.checker : null);
-  if (unavailable) {
-    console.error(`routing-fallback: ${kind} → unchanged path (${unavailable} unavailable for probation worker ${inheritedWorker.id})`);
-    request = { ...request, probationWorker: null };
+  // An inherited pick has no policy fallback chain, so the same pre-launch checks apply here: a pinned model goes
+  // to Claude, and a pick whose executable (or checker's) is missing yields to the router's next eligible worker
+  // (`alternates`, rotation order), then to the unchanged path below — never a doomed detached run.
+  if (request.probationWorker && probationLaunchDecision(request, probationLaunch).launch) {
+    const { alternates = [], ...primary } = request.probationWorker;
+    const ready = w => probationLaunchDecision({ ...request, probationWorker: w }, probationLaunch).launch
+      && providerAvailable(w.provider, { provider: w.provider, model: w.model, effort: w.effort }) && checkerAvailable(w);
+    const chosenWorker = pinnedModel ? null : [primary, ...alternates].find(ready) ?? null;
+    if (chosenWorker?.id !== primary.id) {
+      const why = pinnedModel ? 'pinned model' : `${primary.id} executable or checker unavailable`;
+      console.error(chosenWorker ? `routing-fallback: ${kind} → probation worker ${chosenWorker.id} (${why})`
+        : `routing-fallback: ${kind} → unchanged path (${why})`);
+    }
+    request = { ...request, probationWorker: chosenWorker };
   }
   if (probationLaunchDecision(request, probationLaunch).launch) {
     if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
