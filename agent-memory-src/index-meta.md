@@ -94,4 +94,5 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [No Gemini reviews until v4](no-gemini-reviews-until-v4.md) — Gemini (also via Antigravity) takes no review seat until Gemini 4; false CONFIRMED findings looped #3432
 - [No long foreground commands](feedback-no-long-foreground-commands.md) — orchestrator foreground = quick reads only; verify, open-pr, card filing and fixes go to a background subagent (which runs verify in its own foreground); waits via background jobs or Monitor
 - 150. Hold New Cards While Busy — host busy or PR queue not draining: collect cards in cards-to-file.md, file in one lane+PR when quiet; blocking issues filed+fixed now
+- [Operator session is portable](operator-session-portable.md) — sweeps, needs-you watch and quiet rules must survive a session or account switch: bootstrap from product files (card 359), operator-queue from a fresh lane
 - [Prefer Codex workers, keep one Claude review](prefer-codex-keep-one-claude-review.md) — Claude quota is binding: unblock via Codex workers (codex-direct-task), Codex-first routing for fixers/builders; reviews keep ≥1 Claude seat
