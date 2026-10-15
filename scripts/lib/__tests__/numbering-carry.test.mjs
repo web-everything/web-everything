@@ -245,6 +245,44 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     changes[afterIndex].after = Buffer.concat([Buffer.from(changes[afterIndex].after), Buffer.from([0x81])]);
     refused(proofReader({ changes }).prove(), /UTF-8/);
   });
+  // Operator send-back (#5233, head 5479d2f): the proof compares exact bytes, so a change that only re-encodes a
+  // character (NFC → NFD, the same text to a reader) or only changes line endings is never a numbering rewrite.
+  it.each([
+    ['NFC → NFD in a modification', 0, 0, (t) => `${t}café\n`, (t) => `${t}café\n`],
+    ['NFC → NFD in a rename', 1, 2, (t) => `${t}café\n`, (t) => `${t}café\n`],
+    ['LF → CRLF in a modification', 0, 0, (t) => `${t}end\n`, (t) => `${t}end\r\n`],
+  ])('refuses a normalisation-only byte change: %s', (_name, beforeIndex, afterIndex, before, after) => {
+    const changes = live().changes;
+    changes[beforeIndex].before = before(changes[beforeIndex].before);
+    changes[afterIndex].after = after(changes[afterIndex].after);
+    expect(Buffer.from(changes[afterIndex].after).equals(Buffer.from(changes[beforeIndex].before))).toBe(false);
+    refused(proofReader({ changes }).prove(), /rewrite/);
+  });
+  it('accepts the same character in the same encoding on both sides (the control for the case above)', () => {
+    const changes = live().changes;
+    changes[0].before += 'café\n';
+    changes[0].after += 'café\n';
+    expect(proofReader({ changes }).prove().ok).toBe(true);
+  });
+  it.each([
+    ['a modification', [{ status: 'M', path: 'backlog/4815-a-not-real-ruling.md', beforeMode: '100644', afterMode: '100755' }]],
+    ['a rename', [{ status: 'D', path: 'backlog/xf74q20-hold-auto-land.md', beforeMode: '100644' },
+      { status: 'A', path: 'backlog/6053-hold-auto-land.md', afterMode: '100755' }]],
+  ])('refuses an executable-bit change riding on %s', (_name, modes) => {
+    const changes = live().changes;
+    const r = proofReader({ changes });
+    const exec = (cmd, args, opts) => {
+      if (args[0] !== 'diff') return r.exec(cmd, args, opts);
+      const lines = changes.map((c) => {
+        const m = modes.find((x) => x.path === c.path) ?? {};
+        const before = c.status === 'A' ? '000000' : (m.beforeMode ?? '100644');
+        const after = c.status === 'D' ? '000000' : (m.afterMode ?? '100644');
+        return `:${before} ${after} ${'c'.repeat(40)} ${'d'.repeat(40)} ${c.status}\0${c.path}\0`;
+      });
+      return Buffer.from(lines.join(''));
+    };
+    refused(proveNumberingOnlyMove({ exec, fromSha: r.from, toSha: r.head }), /mode/);
+  });
   it('preserves a UTF-8 BOM when comparing valid blob content', () => {
     const changes = live().changes;
     changes[1].before += '\ufeff';
@@ -351,6 +389,26 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.git(['update-index', '--chmod=+x', path]);
     r.git(['commit', '--amend', '--no-edit', '-q']);
     refused(r.prove(r.git(['rev-parse', 'HEAD'])), /mode/);
+  });
+  // Operator send-back (#5233, head 5479d2f): a mode-only change (same blob, executable bit flipped) on a card the
+  // numbering commit does not otherwise touch is still a change the proof must refuse.
+  it('refuses numbering combined with a mode-only change to an otherwise untouched card', () => {
+    const r = repo();
+    r.write('backlog/0002-other.md', 'unrelated\n');
+    const fromSha = r.commit('another card');
+    r.number();
+    r.git(['update-index', '--chmod=+x', 'backlog/0002-other.md']);
+    r.git(['commit', '--amend', '--no-edit', '-q']);
+    refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha: r.git(['rev-parse', 'HEAD']) }), /mode/);
+  });
+  it('refuses numbering combined with an NFC → NFD re-encoding of a card', () => {
+    const r = repo();
+    r.write('backlog/0001-parent.md', 'see #xabc123 café\n');
+    const fromSha = r.commit('accented parent');
+    r.number();
+    r.write('backlog/0001-parent.md', 'see #7001 café\n');
+    r.git(['add', '-A']); r.git(['commit', '--amend', '--no-edit', '-q']);
+    refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha: r.git(['rev-parse', 'HEAD']) }), /rewrite/);
   });
   it('proves a single numbering commit', () => {
     const r = repo();

@@ -201,14 +201,23 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
     // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
     // dropping it would itself conceal a non-numbering byte change.
     const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-    const git = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
+    const gitBytes = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
       const output = exec('git', args, {
         encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
         ...(cwd === undefined ? {} : { cwd }),
       }) ?? Buffer.alloc(0);
       if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
       if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
-      return decoder.decode(output);
+      return output;
+    };
+    const git = (args, maxBuffer) => decoder.decode(gitBytes(args, maxBuffer));
+    // Blob content is compared as text only once its text re-encodes to the exact bytes git stored, so no decoding
+    // step (a dropped BOM, a replaced byte, a normalisation) can make two different byte sequences compare equal.
+    const blobText = (object) => {
+      const bytes = gitBytes(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
+      const text = decoder.decode(bytes);
+      if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
+      return text;
     };
     ensureReadable(git, fromSha);
     ensureReadable(git, toSha);
@@ -272,7 +281,7 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
             return refuse(`blob byte limit exceeded at ${change.path}`);
           }
           totalBytes += size;
-          change[side] = git(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
+          change[side] = blobText(object);
         }
       }
       const result = checkNumberingCommit({ subject, parents, changes, extraMap });
