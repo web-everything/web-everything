@@ -72,8 +72,8 @@ Authorization controls are required at every boundary in the matrix below:
 Implement and report the following three separately named test cases, with both refusal results beside the successful positive result. A combined negative case cannot substitute for either refusal. Keep identities and reproduction evidence valid and identical across the controls:
 
 - Positive control (`trusted-author-leading-marker-accepted`): a trusted author with a leading marker satisfies both authorization requirements.
-- Trusted-author requirement — forged-author negative control (`forged-author-leading-marker-refused`): a forged (non-trusted) author with the same leading marker is refused; change only the author, keeping the marker and valid evidence identical to the positive control.
-- Leading-marker requirement — quoted-marker negative control (`trusted-author-quoted-marker-refused`): a trusted author with a quoted (not leading) marker is refused; change only the marker placement, keeping the trusted author and valid evidence identical to the positive control.
+- Trusted-author requirement — forged-author negative control (`forged-author-leading-marker-refused`): a forged (non-trusted) author with the same leading marker is refused; change only the comment author's identity in the injected forge response, keeping the entire comment body and valid evidence identical to the positive control. A claimed trusted identity inside the copied payload must not substitute for the forge-provided author.
+- Leading-marker requirement — quoted-marker negative control (`trusted-author-quoted-marker-refused`): a trusted author with a quoted (not leading) marker is refused; change only the marker placement, keeping the forge-provided trusted author and valid evidence identical to the positive control. Preserve the marker text and payload inside each blockquote, fenced-code or after-prose wrapper; do not corrupt them or leave a second leading marker that could authorize the fixture independently.
 
 | Authorization requirement | Positive control | Required negative control | Expected negative result |
 | --- | --- | --- | --- |
