@@ -195,7 +195,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { resolveFinishedCiCacheSettings, classifyFinishedCiRead, finishedCiStorable, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
+import { resolveFinishedCiCacheSettings, classifyFinishedCiRead, finishedCiStorable, finishedCiProofArgs, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
@@ -1765,6 +1765,7 @@ export function runGhSync(args, opts = {}) {
   if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
   const cache = finishedCiContext(throttle);
   const cls = cache.settings.enabled && !throttle.exec && execOpts.input === undefined ? classifyFinishedCiRead(args) : null;
+  if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
   if (cls) {
     const hit = lookupFinishedCi(cls, cache);
     if (hit !== null) {
@@ -1772,17 +1773,19 @@ export function runGhSync(args, opts = {}) {
       return execOpts.encoding && execOpts.encoding !== 'buffer' ? hit.toString(execOpts.encoding) : hit;
     }
   }
+  let completedBeforeRead = false;
+  const proofArgs = finishedCiProofArgs(cls);
+  if (proofArgs) {
+    try {
+      const proof = runGhSyncUnmemoized(proofArgs, { ...opts, encoding: 'utf8' });
+      completedBeforeRead = !isGhDeferred(proof) && JSON.parse(String(proof))?.status === 'completed';
+    } catch { /* Failed proof never fails the requested read. */ }
+  }
   // Eligible CI reads bypass the smoke memo: it must not defeat revalidation or cache running CI.
   const result = cls ? runGhSyncUnmemoized(args, opts) : runGhSyncReadMemo(args, opts);
   if (!isGhDeferred(result)) invalidateForWrite(args, cache);
   if (cls && (typeof result === 'string' || Buffer.isBuffer(result)) && !isGhDeferred(result)) {
-    let storable = finishedCiStorable(cls, result);
-    if (cls.kind === 'job-log') {
-      try {
-        const proof = runGhSyncUnmemoized(['api', `repos/${cls.repo}/actions/jobs/${cls.id}`], { ...opts, encoding: 'utf8' });
-        storable = JSON.parse(String(proof))?.status === 'completed';
-      } catch { /* A failed completion proof never fails the log fetch. */ }
-    }
+    const storable = cls.kind === 'job-log' ? completedBeforeRead : finishedCiStorable(cls, result, { runCompleted: completedBeforeRead });
     if (storable) storeFinishedCi(cls, Buffer.isBuffer(result) ? result : Buffer.from(result, execOpts.encoding || 'utf8'),
       { ...cache, nowMs: (throttle.now || Date.now)() });
   }
@@ -2088,6 +2091,7 @@ export function execFileSyncThrottled(file, args, opts = {}) {
 export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bin = 'gh' } = {}) {
   const cache = finishedCiContext(throttle);
   const cls = cache.settings.enabled && !isGhLocalOnly(argv) ? classifyFinishedCiRead(argv) : null;
+  if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
   if (cls) {
     const hit = lookupFinishedCi(cls, cache);
     if (hit !== null) {
@@ -2095,17 +2099,20 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
       return { status: 0, stdout: hit, stderr: Buffer.alloc(0) };
     }
   }
+  let completedBeforeRead = false;
+  const proofArgs = finishedCiProofArgs(cls);
+  if (proofArgs) {
+    try {
+      const proof = runGhCliPassthroughUncached(proofArgs, { throttle, spawn, bin });
+      completedBeforeRead = proof.status === 0 && !proof.deferred && !isGhDeferred(proof.stdout)
+        && JSON.parse(String(proof.stdout))?.status === 'completed';
+    } catch { /* Preserve the requested read even if proof fails. */ }
+  }
   const result = runGhCliPassthroughUncached(argv, { throttle, spawn, bin });
   if (result.status === 0 && !result.deferred && !isGhDeferred(result.stdout)) {
     invalidateForWrite(argv, cache);
     if (cls) {
-      let storable = finishedCiStorable(cls, result.stdout);
-      if (cls.kind === 'job-log') {
-        try {
-          const proof = runGhCliPassthroughUncached(['api', `repos/${cls.repo}/actions/jobs/${cls.id}`], { throttle, spawn, bin });
-          storable = proof.status === 0 && JSON.parse(String(proof.stdout))?.status === 'completed';
-        } catch { /* Preserve successful log output. */ }
-      }
+      const storable = cls.kind === 'job-log' ? completedBeforeRead : finishedCiStorable(cls, result.stdout, { runCompleted: completedBeforeRead });
       if (storable) storeFinishedCi(cls, result.stdout, { ...cache, nowMs: (throttle.now || Date.now)() });
     }
   }

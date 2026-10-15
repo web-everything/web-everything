@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { classifyFinishedCiRead, finishedCiStorable, resolveFinishedCiCacheSettings,
   lookupFinishedCi, storeFinishedCi, invalidateForWrite, finishedCiCacheDir } from '../finished-ci-cache.mjs';
 import { runGhSync, runGhCliPassthrough } from '../gh-throttle.mjs';
@@ -12,14 +13,14 @@ afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, f
 const jobs = ['api', 'repos/o/r/actions/runs/123/jobs?per_page=100'];
 const checks = ['api', `repos/o/r/commits/${'a'.repeat(40)}/check-runs?per_page=100`];
 const log = ['api', 'repos/o/r/actions/jobs/456/logs'];
-function fixture(output = '{"jobs":[{"status":"completed"}]}') {
+function fixture(output = '{"total_count":1,"jobs":[{"status":"completed"}]}') {
   const dir = mkdtempSync(join(tmpdir(), 'finished-ci-')); dirs.push(dir);
   let time = Date.now();
   const env = { ...process.env, WE_UNDER_TEST: '1', WE_FINISHED_CI_CACHE_DIR: join(dir, 'cache'),
     WE_FINISHED_CI_CACHE: '1', WE_GH_PERSONAL_READS: '0', WE_GH_THROTTLE_COST_HEADERS: '1' };
   delete env.WE_GH_READ_MEMO_DIR;
   const spawn = vi.fn((_bin, args, opts) => {
-    const text = args[1]?.endsWith('/456') ? '{"status":"completed"}' : output;
+    const text = /\/(456|123)$/.test(args[1]) ? '{"status":"completed"}' : output;
     return { status: 0, stdout: opts.encoding ? text : Buffer.from(text), stderr: Buffer.alloc(0) };
   });
   const throttle = { env, spawn, lockRoot: join(dir, 'locks'), logPath: join(dir, 'calls.jsonl'),
@@ -28,6 +29,7 @@ function fixture(output = '{"jobs":[{"status":"completed"}]}') {
     advance: ms => { time += ms; }, now: () => time,
     cacheOpts: () => ({ env, nowMs: time, settings: resolveFinishedCiCacheSettings(env) }),
     files: () => { try { return readdirSync(env.WE_FINISHED_CI_CACHE_DIR).filter(n => n.endsWith('.gz')); } catch { return []; } },
+    reads: () => spawn.mock.calls.filter(([, args]) => args[1] !== 'repos/o/r/actions/runs/123'),
     rows: () => readFileSync(throttle.logPath, 'utf8').trim().split('\n').map(JSON.parse) };
 }
 
@@ -44,48 +46,51 @@ describe('finished CI cache (card 309)', () => {
     expect(classifyFinishedCiRead(['api', 'repos/o/r/commits/abc/check-runs'])).toBeNull();
     expect(classifyFinishedCiRead([...log, '--jq', '.jobs'])).toBeNull();
   });
-  it('requires nonempty entirely completed JSON collections', () => {
+  it('requires proof of a closed, untruncated collection', () => {
     for (const [args, field] of [[jobs, 'jobs'], [checks, 'check_runs']]) {
       const cls = classifyFinishedCiRead(args);
       for (const text of ['oops', '{}', '[]', JSON.stringify({ [field]: [] }), JSON.stringify({ [field]: [{ status: 'in_progress' }] })])
         expect(finishedCiStorable(cls, text)).toBe(false);
-      expect(finishedCiStorable(cls, JSON.stringify({ [field]: [{ status: 'completed' }] }))).toBe(true);
-      expect(finishedCiStorable(classifyFinishedCiRead([...args, '--jq', '.' + field]), '[{"status":"completed"}]')).toBe(true);
+      const complete = JSON.stringify({ total_count: 1, [field]: [{ status: 'completed' }] });
+      expect(finishedCiStorable(cls, complete)).toBe(false);
+      expect(finishedCiStorable(cls, complete, { runCompleted: true })).toBe(field === 'jobs');
+      expect(finishedCiStorable(cls, JSON.stringify({ total_count: 2, [field]: [{ status: 'completed' }] }), { runCompleted: true })).toBe(false);
+      expect(finishedCiStorable(classifyFinishedCiRead([...args, '--jq', '.' + field]), '[{"status":"completed"}]', { runCompleted: true })).toBe(false);
     }
     expect(finishedCiStorable(classifyFinishedCiRead(log), 'completed')).toBe(false);
   });
-  it.each([[jobs, 'jobs'], [checks, 'check_runs']])('shares completed collections across both runners: %j', (args, field) => {
-    const f = fixture(JSON.stringify({ [field]: [{ status: 'completed' }] }));
+  it.each([[jobs, 'jobs']])('shares closed collections across both runners: %j', (args, field) => {
+    const f = fixture(JSON.stringify({ total_count: 1, [field]: [{ status: 'completed' }] }));
     const first = runGhSync(args, f.opts);
     expect(runGhSync(args, f.opts)).toBe(first);
     expect(runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).stdout).toEqual(Buffer.from(first));
-    expect(f.spawn).toHaveBeenCalledTimes(1);
+    expect(f.reads()).toHaveLength(1);
     expect(f.rows().filter(r => r.outcome === 'ci_cache_hit')).toHaveLength(2);
     expect(f.rows().at(-1)).toMatchObject({ points: 0, kind: classifyFinishedCiRead(args).kind, op: args.join(' '), caller: 'ci-cache-test' });
   });
-  it.each([[jobs, 'jobs'], [checks, 'check_runs']])('CLI stores completed reads: %j', (args, field) => {
-    const f = fixture(JSON.stringify({ [field]: [{ status: 'completed' }] }));
+  it.each([[jobs, 'jobs']])('CLI stores closed reads: %j', (args, field) => {
+    const f = fixture(JSON.stringify({ total_count: 1, [field]: [{ status: 'completed' }] }));
     const call = () => runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn });
-    expect(call().stdout).toEqual(call().stdout); expect(f.spawn).toHaveBeenCalledTimes(1);
+    expect(call().stdout).toEqual(call().stdout); expect(f.reads()).toHaveLength(1);
   });
   it.each([false, true])('does not store in-progress reads (CLI=%s)', cli => {
     for (const [args, field] of [[jobs, 'jobs'], [checks, 'check_runs']]) {
       const f = fixture(JSON.stringify({ [field]: [{ status: 'completed' }, { status: 'in_progress' }] }));
       const call = () => cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }) : runGhSync(args, f.opts);
-      call(); call(); expect(f.spawn).toHaveBeenCalledTimes(2); expect(f.files()).toHaveLength(0);
+      call(); call(); expect(f.reads()).toHaveLength(2); expect(f.files()).toHaveLength(0);
     }
   });
   it('revalidates by fetch age even when hits refresh LRU; zero never expires', () => {
     const f = fixture(); runGhSync(jobs, f.opts); f.advance(500000); runGhSync(jobs, f.opts);
-    f.advance(100001); runGhSync(jobs, f.opts); expect(f.spawn).toHaveBeenCalledTimes(2);
+    f.advance(100001); runGhSync(jobs, f.opts); expect(f.reads()).toHaveLength(2);
     f.env.WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS = '0'; f.advance(999999999);
-    runGhSync(jobs, f.opts); expect(f.spawn).toHaveBeenCalledTimes(2);
+    runGhSync(jobs, f.opts); expect(f.reads()).toHaveLength(2);
   });
   it.each([false, true])('job logs require completed proof and never expire (CLI=%s)', cli => {
     const f = fixture('log bytes\n');
     const call = () => cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout.toString() : runGhSync(log, f.opts);
     expect(call()).toBe('log bytes\n'); f.advance(999999999); expect(call()).toBe('log bytes\n');
-    expect(f.spawn).toHaveBeenCalledTimes(2); expect(f.spawn.mock.calls[1][1]).toEqual(['api', 'repos/o/r/actions/jobs/456']);
+    expect(f.spawn).toHaveBeenCalledTimes(2); expect(f.spawn.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/jobs/456']);
   });
   it.each([false, true])('failed/incomplete proof preserves output without storage (CLI=%s)', cli => {
     for (const failure of ['in_progress', 'failure']) {
@@ -96,12 +101,102 @@ describe('finished CI cache (card 309)', () => {
       expect(call()).toBe('logs'); expect(call()).toBe('logs'); expect(f.files()).toHaveLength(0);
     }
   });
+  it.each([false, true])('does not freeze a partial log when completion follows its fetch (CLI=%s)', cli => {
+    for (const initial of ['queued', 'in_progress']) {
+      const f = fixture(); let status = initial;
+      f.spawn.mockImplementation((_bin, args) => {
+        const proof = args[1].endsWith('/456');
+        const stdout = proof ? JSON.stringify({ status }) : status === 'completed' ? 'final log' : 'partial log';
+        if (!proof) status = 'completed';
+        return { status: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0) };
+      });
+      const call = () => String(cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(log, f.opts));
+      expect(call()).toBe('partial log');
+      expect(f.files()).toHaveLength(0);
+      expect(call()).toBe('final log');
+      expect(call()).toBe('final log');
+    }
+  });
+  it.each([false, true])('sees later jobs/checks after an all-completed prefix (CLI=%s)', cli => {
+    for (const [args, field] of [[jobs, 'jobs'], [checks, 'check_runs']]) {
+      const f = fixture(); let reads = 0;
+      f.spawn.mockImplementation((_bin, argv) => {
+        const proof = argv[1] === 'repos/o/r/actions/runs/123';
+        if (!proof) reads++;
+        const rows = reads > 1 ? [{ status: 'completed' }, { status: 'queued' }] : [{ status: 'completed' }];
+        const text = proof ? '{"status":"in_progress"}' : JSON.stringify({ total_count: rows.length, [field]: rows });
+        return { status: 0, stdout: Buffer.from(text), stderr: Buffer.alloc(0) };
+      });
+      const call = () => String(cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(args, f.opts));
+      expect(JSON.parse(call())[field]).toHaveLength(1); expect(f.files()).toHaveLength(0);
+      expect(JSON.parse(call())[field]).toHaveLength(2);
+    }
+  });
+  it.each([
+    ['run', 'rerun', '--failed', '123'],
+    ['-R', 'o/r', 'run', 'rerun', '123'],
+    ['--repo=o/r', 'run', 'rerun', '--job', '456', '123'],
+    ['run', 'rerun', '-dj', '456', '123'],
+    ['api', '--method=POST', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', 'repos/o/r/actions/runs/123/rerun-failed-jobs', '-XPOST'],
+    ['api', '-iXPOST', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', '-iX', 'POST', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', '-if', 'enable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', '--cache', '1h', '-XPOST', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', 'repos/o/r/actions/runs/123/rerun', '-F', 'enable_debug_logging=true'],
+    ['api', '--field=enable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', '-fenable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
+    ['run', 'rerun'],
+  ])('invalidates run jobs and check-runs for successful rerun %j', args => {
+    for (const cli of [false, true]) {
+      const f = fixture();
+      storeFinishedCi(classifyFinishedCiRead(jobs), Buffer.from('jobs'), f.cacheOpts());
+      storeFinishedCi(classifyFinishedCiRead(checks), Buffer.from('checks'), f.cacheOpts());
+      storeFinishedCi(classifyFinishedCiRead(log), Buffer.from('logs'), f.cacheOpts());
+      if (cli) runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }); else runGhSync(args, f.opts);
+      expect(f.files()).toHaveLength(1);
+      expect(f.files()[0]).toMatch(/^job-log-/);
+    }
+  });
+  it.each([false, true])('does not let a reader repopulate run jobs after a rerun (CLI=%s)', cli => {
+    const f = fixture(); const original = f.spawn.getMockImplementation(); let reran = false;
+    f.spawn.mockImplementation((bin, args, opts) => {
+      const result = original(bin, args, opts);
+      if (args[1] === jobs[1] && !reran) {
+        reran = true;
+        invalidateForWrite(['run', 'rerun', '123'], f.cacheOpts());
+      }
+      return result;
+    });
+    if (cli) runGhCliPassthrough(jobs, { throttle: f.throttle, spawn: f.spawn }); else runGhSync(jobs, f.opts);
+    expect(lookupFinishedCi(classifyFinishedCiRead(jobs), f.cacheOpts())).toBeNull();
+    f.spawn.mockReturnValue({ status: 0, stdout: Buffer.from('{"total_count":1,"jobs":[{"status":"queued"}]}'), stderr: Buffer.alloc(0) });
+    const next = cli ? runGhCliPassthrough(jobs, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(jobs, f.opts);
+    expect(JSON.parse(String(next)).jobs[0].status).toBe('queued');
+  });
+  it('restricts existing directories, payloads, and eviction markers', () => {
+    const f = fixture(); const dir = f.env.WE_FINISHED_CI_CACHE_DIR;
+    mkdirSync(dir, { mode: 0o755 }); chmodSync(dir, 0o755);
+    runGhSync(log, f.opts);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    for (const name of readdirSync(dir)) expect(statSync(join(dir, name)).mode & 0o777).toBe(0o600);
+  });
+  it('ignores legacy entries that may contain a permanently partial log', () => {
+    const f = fixture('fresh log'); const cls = classifyFinishedCiRead(log);
+    storeFinishedCi(cls, Buffer.from('partial log'), f.cacheOpts());
+    const path = join(f.env.WE_FINISHED_CI_CACHE_DIR, f.files()[0]);
+    // Legacy entries lack the proof-order version, even if their key and gzip are valid.
+    const entry = JSON.parse(gunzipSync(readFileSync(path)));
+    delete entry.version;
+    writeFileSync(path, gzipSync(JSON.stringify(entry)));
+    expect(runGhSync(log, f.opts)).toBe('fresh log');
+  });
   it.each([false, true])('successful rerun invalidates run entries (CLI=%s)', cli => {
     const f = fixture(); runGhSync(jobs, f.opts);
     const args = ['run', 'rerun', '123'];
     if (cli) runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }); else runGhSync(args, f.opts);
     expect(f.files()).toHaveLength(0);
-    runGhSync(jobs, f.opts); expect(f.spawn).toHaveBeenCalledTimes(3);
+    runGhSync(jobs, f.opts); expect(f.reads()).toHaveLength(3);
     invalidateForWrite(['api', 'repos/o/r/actions/runs/123/rerun-failed-jobs', '-X', 'POST'], f.cacheOpts());
     expect(f.files()).toHaveLength(0);
   });
@@ -136,19 +231,19 @@ describe('finished CI cache (card 309)', () => {
     expect(statSync(path).mtimeMs).toBeCloseTo(f.now(), 0);
     writeFileSync(path, 'bad gzip'); expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
   });
-  it('check-runs expires independently and honors zero TTL', () => {
+  it('check-runs stays live even with zero TTL because new workflows can appear', () => {
     const f = fixture('{"check_runs":[{"status":"completed"}]}');
     f.env.WE_FINISHED_CI_CACHE_CHECK_RUNS_REVALIDATE_MS = '100';
     runGhSync(checks, f.opts); f.advance(101); runGhSync(checks, f.opts);
     expect(f.spawn).toHaveBeenCalledTimes(2);
     f.env.WE_FINISHED_CI_CACHE_CHECK_RUNS_REVALIDATE_MS = '0'; f.advance(999999999);
-    runGhSync(checks, f.opts); expect(f.spawn).toHaveBeenCalledTimes(2);
+    runGhSync(checks, f.opts); expect(f.spawn).toHaveBeenCalledTimes(3);
   });
   it('injected exec and input calls bypass finished cache', () => {
     const f = fixture(); runGhSync(jobs, f.opts);
     const exec = vi.fn(() => 'injected');
     expect(runGhSync(jobs, { ...f.opts, throttle: { ...f.throttle, exec } })).toBe('injected');
-    runGhSync(jobs, { ...f.opts, input: 'body' }); expect(f.spawn).toHaveBeenCalledTimes(2);
+    runGhSync(jobs, { ...f.opts, input: 'body' }); expect(f.reads()).toHaveLength(2);
     expect(exec).toHaveBeenCalledTimes(1);
   });
   it('failed rerun and job rerun preserve run entries', () => {
