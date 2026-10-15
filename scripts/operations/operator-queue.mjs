@@ -1,4 +1,3 @@
-import { operatorSendBackHoldReasons } from '../lib/operator-send-backs.mjs';
 import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
 /**
  * @file Read-only operator queue: the SOLE authority on which human-gated PRs are worth the operator's time.
@@ -59,6 +58,15 @@ let humanReviewOnlyHold, parsePrResultTable;
 let mergeGateVerdictImportError;
 try { ({ humanReviewOnlyHold, parsePrResultTable } = await import('../lib/merge-gate-verdict.mjs')); }
 catch (error) { mergeGateVerdictImportError = String(error?.message ?? error).split('\n')[0]; }
+// Partial CLI copies may lack the send-back reader. Keep the queue runnable, but never
+// declare a PR ready when its operator requests could not be checked.
+let sendBackLedger = null;
+let sendBackLedgerError = null;
+try { sendBackLedger = await import('../lib/operator-send-backs.mjs'); }
+catch (error) { sendBackLedgerError = String(error?.message ?? error).split('\n')[0]; }
+const operatorSendBackHoldReasons = (pr) => sendBackLedger
+  ? sendBackLedger.operatorSendBackHoldReasons(pr)
+  : [`operator send-back check unavailable: ${sendBackLedgerError}`];
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -548,6 +556,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     ready: [], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
+  if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
     readFailures += 1;

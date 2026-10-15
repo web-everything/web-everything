@@ -1249,15 +1249,23 @@ export function postTakeoverVoid({ repo, pr, head, exec = execFileSyncThrottled 
   return true;
 }
 
-/** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
+// Successful posts on a planning snapshot, scoped to the caller's repo/PR/head/rung.
+// Keep these retry receipts separate from the thread-derived `noticedRungs`: a snapshot
+// may be reused for another dispatch target, and a failed post must remain retryable.
+const postedRulingNotices = new WeakMap();
+
+/** Post the send-back notice once per head and rung (the durable record the fixer reads on the thread). */
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
   // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
   if (!ruling?.matches?.length || (ruling.noticedRungs ?? []).includes(ruling.rung?.id ?? '*')) return false;
   const slug = ghRepoSlug(repo);
+  const receipt = JSON.stringify([repo, String(pr), ruling.head, ruling.rung?.id ?? '*']);
+  if (postedRulingNotices.get(ruling)?.has(receipt)) return false;
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', renderRulingNotAddressed(ruling)],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
   // A failed resume may cold-start from this same snapshot before the thread is read again.
-  ruling.noticedRungs = [...(ruling.noticedRungs ?? []), ruling.rung?.id ?? '*'];
+  if (!postedRulingNotices.has(ruling)) postedRulingNotices.set(ruling, new Set());
+  postedRulingNotices.get(ruling).add(receipt);
   return true;
 }
 

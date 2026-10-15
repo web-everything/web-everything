@@ -654,6 +654,9 @@ Acceptance labels alone never clear it. Keep evidence markers in fixer prompts; 
 quote those markers as instructions, or the trusted notice itself can masquerade as fix evidence. Verify the
 complete comment reader retains URLs, and exercise planning, resumed prompts, review reduction, red-team
 input fingerprints and both operator-queue entry paths. Unknown send-back heads remain open conservatively.
+Partial operator-queue CLI copies load the send-back reader optionally, report import errors, and withhold
+all readiness when it is unavailable. Notice retry receipts stay separate from thread-derived `noticedRungs`
+and are scoped to the dispatch target, head and rung; a failed post must remain retryable.
 
 `operator-notify` consumes only `operator-queue`'s `ready` rows. Tests inject the notifier,
 including child CLI probes; never exercise real desktop delivery in this suite. Persisted
