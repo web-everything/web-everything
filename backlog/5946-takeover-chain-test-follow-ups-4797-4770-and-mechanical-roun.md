@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs", "we:scripts/conveyor/__tests__/fix-takeover.test.mjs", "we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-14"
-preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
 ---
 
@@ -16,12 +16,14 @@ Held finding 233 requested enabled-takeover negative authorization tests, launch
 
 ## Progress
 
-- Current-checkout recheck at 6d77e9169: retain test-only scope and size 2. Some negative cases now use the enabled harness, but the partial/old-head pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:160` and forged/auto-policy pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:228` still use disabled defaults. Preserve the enabled withdrawn-ruling and truncated-thread regressions already present. Borrowed/wrapped launch-attempt assignments remain at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1477` and `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1541`; this remains a coverage task, not an implementation rewrite.
+- Rechecked against 37d55ee65: the prior test-only premise remains correct. The production launch sites moved to `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1527` and `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1591`; the current failure harness at `we:scripts/conveyor/__tests__/fix-takeover.test.mjs:439` still injects only the ordinary launcher. The disabled negative cases remain at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:160` and `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:228`. Scope and size 2 stay unchanged; this recheck does not refresh runner-owned stamps.
+
+- Current-checkout recheck at 6d77e9169: retain test-only scope and size 2. Some negative cases now use the enabled harness, but the partial/old-head pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:160` and forged/auto-policy pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:228` still use disabled defaults. Preserve the enabled withdrawn-ruling and truncated-thread regressions already present. Borrowed/wrapped launch-attempt assignments remain at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1527` and `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1591`; this remains a coverage task, not an implementation rewrite.
 
 - Checked at 17242a56d. Original scope was `we:scripts/conveyor/mechanical-round-cap.mjs` and `we:scripts/conveyor/reconcile-core.mjs`, with no tests. Corrected scope is test-only: the remaining work is in `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs` and `we:scripts/conveyor/__tests__/fix-takeover.test.mjs`; include `we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs` for preservation coverage. No production behavior change is justified by the observed gaps.
-- Mechanical-round delivery is commit 9596b78f1, subsequently hardened by ba1c61683, d152470dc and 6aa1cdfaa. `we:scripts/conveyor/mechanical-round-cap.mjs` now exports `readRoundCommits`; `we:scripts/conveyor/reconcile-core.mjs:507` distinguishes real work from a mechanical merge. Existing real-Git tests at `we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs:229` cover clean/drain merges versus repair, reverted-upstream and manifest edits. This is partial delivery, not grounds to stop the whole card as already done.
+- Mechanical-round delivery is commit 9596b78f1, subsequently hardened by ba1c61683, d152470dc and 6aa1cdfaa. `we:scripts/conveyor/mechanical-round-cap.mjs` now exports `readRoundCommits`; `we:scripts/conveyor/reconcile-core.mjs:515` distinguishes real work from a mechanical merge. Existing real-Git tests at `we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs:229` cover clean/drain merges versus repair, reverted-upstream and manifest edits. This is partial delivery, not grounds to stop the whole card as already done.
 - Negative ruling cases still call `planAt` with takeover defaults off (`we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:228`), while `planOn` at line 136 enables them. The new-head case at line 264 also directly invokes the planner without enabled takeover settings. Those tests can pass without exercising the intended authorization guard.
-- `launchAttempted` is already set before borrowed launch at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1477` and wrapped launch at line 1541. Existing failure coverage in `we:scripts/conveyor/__tests__/fix-takeover.test.mjs:439` principally injects `spawnAgent`; it does not pin those two branches.
+- `launchAttempted` is already set before borrowed launch at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1527` and wrapped launch at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1591`. Existing failure coverage in `we:scripts/conveyor/__tests__/fix-takeover.test.mjs:439` principally injects `spawnAgent`; it does not pin those two branches.
 - Retain size 2: about 60 changed ruling-test lines, 130 launch-test lines and 25 mechanical-test lines (only if a named refresh scenario needs an explicit preservation assertion). All scope entries are tests. No stamps or dependency edits.
 
 ## Design
