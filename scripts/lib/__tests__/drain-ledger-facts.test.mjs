@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
-  recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
+import { describe, it, expect, vi } from 'vitest';
+import { drainHomeTrustedFrom, drainLedgerReadStore, drainReadBoundPath, drainReviewGateFact, planDrainLedgerFacts,
+  readDrainLedgerSnapshot, recordDrainLedgerFacts, recordDrainReadBound } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -199,6 +199,35 @@ describe('drain ledger facts — the recorders read the store their writes land 
     // The merge did not land and the PR is held again while the shared read is down: home still shows the old hold.
     expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(false), append: s.append() })).toMatchObject({ ok: true, appended: true });
     expect(s.git.map(e => e.type)).toEqual(['hold', 'release', 'hold']);
+  }));
+  it('a partial release by a second drain process is seen by the first: the bound lives beside home, not in memory', () => withHome(async s => {
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(true), append: s.append() })).toMatchObject({ ok: true, appended: true });
+    // Drain B (the fast drain runs beside the resident one) is a separate module instance: no shared memory with A.
+    vi.resetModules();
+    const b = await import('../drain-ledger-facts.mjs');
+    const readB = await b.readDrainLedgerSnapshot([repo], { env: dual, readStore: async () => ({ status: 'ok', rows: [...s.git] }) });
+    expect(b.recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read: readB, append: s.append({ homeFails: true }) }))
+      .toMatchObject({ ok: false, appended: { released: 0 } });
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release']);
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(false), append: s.append() })).toMatchObject({ ok: true, appended: true });
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release', 'hold']);
+  }));
+  it('a good read whose bound cannot be recorded counts as failed, so no release follows it', () => withHome(async s => {
+    s.git.push(hold);
+    const read = await readDrainLedgerSnapshot([repo], { env: dual, readStore: async () => ({ status: 'ok', rows: [...s.git] }),
+      recordBound: () => { throw new Error('disk full'); } });
+    expect(() => read(repo)).toThrow(/disk full/);
+    expect(recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read, append: s.append() }))
+      .toMatchObject({ ok: false, appended: { released: 0 } });
+    expect(s.git.map(e => e.type)).toEqual(['hold']);
+    // A damaged bound vouches for no home rows.
+    writeFileSync(drainReadBoundPath(repo), 'garbage');
+    expect(drainHomeTrustedFrom(repo)).toBe(Infinity);
+  }));
+  it('the bound only moves forward', () => withHome(async () => {
+    recordDrainReadBound(repo, 2_000_000_000_000);
+    recordDrainReadBound(repo, 1_900_000_000_000);
+    expect(drainHomeTrustedFrom(repo)).toBe(2_000_000_000_000);
   }));
   it('a lasting read failure records the hold once, then dedups against the hold it wrote instead of appending every pass', () => withHome(async s => {
     writeFileSync(verdictLedgerPath(repo), `${JSON.stringify(hold)}\n`);

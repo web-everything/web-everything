@@ -3090,8 +3090,9 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
     const reasonCode = drainHoldReasonCode(reason);
     const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
     // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups only against the home
-    // rows the failed read vouches for (written since the last good shared read): home can lag a release that reached
-    // git but missed home, so an older home hold must not hide it. A lasting failure still appends the hold only once.
+    // rows the failed read vouches for (written after the last good shared read by any drain): home can lag a release
+    // that reached git but missed home, so an older home hold must not hide it. A lasting failure appends the hold once
+    // per home row it leaves; store=git leaves none on a good write, so there it re-appends each pass (never drops).
     let events;
     try { events = (read ?? readHome)(repo); } catch (e) { events = homeRowsTrustedAfterReadFailure(readHome(repo), e); }
     const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
