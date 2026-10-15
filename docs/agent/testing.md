@@ -948,3 +948,13 @@ resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS Y
 findings before the first ruling.
 The queue routes needs-judgment questions to NEEDS YOU
 by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.
+
+### Operator repair round replay
+
+Replay round-extension grants after an already over-cap thread, then a completed repair and the
+review of its new head. Fix admission uses `< cap`; the owed review uses `<= cap`.
+`fix.roundExtensionAnchor` defaults to `grant` (env `WE_FIX_ROUND_EXTENSION_ANCHOR`); `off`
+retains additive caps. Each cap anchors to its own counter on the thread prefix before the grant;
+never use the current durable count map as historical evidence. Open send-back allowances use
+trusted fix-end comments after the latest open operator ceremony and `fix.operatorRulingExtraRounds`.
+Set that allowance to zero in tests isolating the older `operatorFixBudget` mechanism.

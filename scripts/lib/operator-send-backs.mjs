@@ -25,7 +25,7 @@ export function operatorSendBacks(comments) {
     const time = Date.parse(c.createdAt ?? c.created_at);
     return [{ id: c.id == null ? null : String(c.id), url: c.url ?? c.html_url ?? null,
       at: Number.isFinite(time) ? new Date(time).toISOString() : null, login,
-      head: /\bat head\s+`?([a-f0-9]{7,40})\b/i.exec(text)?.[1]?.toLowerCase() ?? null,
+      head: /\b(?:at|on) head\s+`?([a-f0-9]{7,40})\b/i.exec(text)?.[1]?.toLowerCase() ?? null,
       etLabel: /~?\b\d{1,2}:\d{2}\s+ET\b/.exec(text)?.[0] ?? null,
       body: text.slice(0, 4000), index }];
   });
@@ -45,7 +45,7 @@ function namesSendBack(text, item, { carry = false } = {}) {
 function isFixEvidence(text) {
   // Preserve indentation: four leading spaces make a Markdown code example, not a heading.
   const start = text.replace(/\r\n?/g, '\n').replace(/^(?:[ \t]*\n)*/, '');
-  return /^ {0,3}## Fix evidence[ \t]*(?:\n|$)/.test(start)
+  return /^ {0,3}(?:#{1,6}[ \t]+)?(?:🔧[ \t]+)?(?:\*\*)?fix(?:-agent)? evidence(?:\*\*)?[ \t]*(?:[—–-][^\n]*|\n|$)/i.test(start)
     || /^(?: {0,3}Head:[ \t]*`[a-f0-9]{7,40}`[ \t]*\n(?:[ \t]*\n)*)? {0,3}<!--[ \t]*addresses-operator-send-back:[ \t]*[^\s<>]+[ \t]*-->[ \t]*(?:\n|$)/i.test(start);
 }
 
@@ -58,10 +58,23 @@ export function openOperatorSendBacks(pr) {
   const comments = commentsOf(pr), items = operatorSendBacks(comments);
   const resolved = new Set();
   for (const item of items) {
+    const next = items.find(later => later.index > item.index);
+    const superseded = items.some(later => later.index > item.index && (
+      differentHead(item.head, later.head)
+      || ((!item.head || !later.head) && comments.slice(item.index + 1, later.index).some(c =>
+        isTrustedMarkerAuthor(c) && /^(?:🔓 conveyor fix-end|🔧 conveyor fix)(?:\s|$)/.test(String(c?.body ?? '').trimStart())))
+    )) || comments.some((c, index) => {
+      if (index <= item.index || !isOperatorAuthored(c)) return false;
+      const accept = /^✅ review — accepted\r?\n\r?\nRecorded by ([^\s]+)[^\r\n]*(?:\r?\n|$)/.exec(c?.body ?? '');
+      return !!accept && accept[1].toLowerCase() === c.author.login.toLowerCase();
+    });
+    if (superseded) resolved.add(item.index);
     if (comments.some((c, index) => {
       if (index <= item.index || !isTrustedMarkerAuthor(c)) return false;
       const text = String(c?.body ?? '');
-      if (!isFixEvidence(text) || !namesSendBack(text, item)) return false;
+      const proseCoverage = index < (next?.index ?? comments.length)
+        && /\boperator send(?:-back|back| back)\b/i.test(stripComments(text));
+      if (!isFixEvidence(text) || !(namesSendBack(text, item) || proseCoverage)) return false;
       if (!item.head) return true;
       const namedHead = /\bHead:\s*`([a-f0-9]{7,40})`/i.exec(stripComments(text));
       return differentHead(item.head, namedHead ? namedHead[1] : pr?.headRefOid);
