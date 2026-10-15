@@ -5,7 +5,8 @@ import { decideReviewGate } from '../review-escalation.mjs';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord, probeOrigin, resolveLedgerBoard, resolveLedgerBoardDetail,
   verdictLedgerPath } from '../verdict-ledger.mjs';
 import { recordDrainHold } from '../../merge-ai-prs.mjs';
@@ -307,5 +308,30 @@ describe('drain ledger facts — head prefixes and numeric strings', () => {
   });
   it('accepts a numeric-string PR number', () => {
     expect(planDrainLedgerFacts({ verdicts: [{ ...v, num: '1' }], repo, events: [], now })).toHaveLength(1);
+  });
+});
+
+describe('drain ledger facts — wiring: written only after the cascade confirms the land', () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs'), 'utf8');
+  it('is never recorded on the pass-start decision, only inside the land cascade', () => {
+    expect(src.match(/recordDrainLedgerFacts\(/g)).toHaveLength(1);
+    const helper = src.indexOf('const recordLandedLedgerFacts = (c, headSha) => {');
+    expect(helper).toBeGreaterThan(src.indexOf('const merged = [];'));
+    expect(src.indexOf('recordDrainLedgerFacts(')).toBeGreaterThan(helper);
+    expect(src.match(/recordLandedLedgerFacts\(c, traceHeadSha\)/g)).toHaveLength(2);
+  });
+  it('each call follows every cascade refusal and a confirmed merge or enqueue', () => {
+    const refusals = ["if (revalidated.decision !== 'merge') {", 'if (!(await mergeQueueGate(c, revalidated.headSha))) {',
+      'if (landLock.ran === false) {', "if (landLock.result && landLock.result.skipped === 'already-merged') {"];
+    const enqueued = src.indexOf('if (landLock.result?.enqueued === true) {');
+    const merged = src.indexOf('merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;');
+    const calls = [src.indexOf('recordLandedLedgerFacts(c, traceHeadSha)'), src.lastIndexOf('recordLandedLedgerFacts(c, traceHeadSha)')];
+    for (const refusal of refusals) {
+      const at = src.indexOf(refusal);
+      expect(at, refusal).toBeGreaterThan(-1);
+      for (const call of calls) expect(call, refusal).toBeGreaterThan(at);
+    }
+    expect(calls[0]).toBeGreaterThan(enqueued); expect(calls[0] - enqueued).toBeLessThan(300);
+    expect(calls[1]).toBeGreaterThan(merged); expect(calls[1] - merged).toBeLessThan(200);
   });
 });

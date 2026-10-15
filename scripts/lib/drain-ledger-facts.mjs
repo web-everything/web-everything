@@ -1,7 +1,8 @@
 /**
  * The drain writes three facts: no-review head exemptions, carried-acceptance restamps,
- * and releases of its open holds, each only for a PR the drain finally decided to merge (a skipped head gets no
- * fact that could clear it). Additive and fail-soft: recording never throws or
+ * and releases of its open holds, each only for a `decision: 'merge'` verdict (a skipped head gets no fact that could
+ * clear it). The drain calls this per candidate after its merge or enqueue is confirmed, never on the pass-start
+ * decision, which the land cascade can still refuse. Additive and fail-soft: recording never throws or
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
 import { readFileSync } from 'node:fs';
@@ -32,7 +33,7 @@ function planRows({ verdicts, repo, events, now }, emit) {
   });
   for (const v of verdicts) {
     // One eligibility check for every fact kind: each one can clear the ledger, and the review gate that set
-    // `reviewGate` runs before the CI, CodeQL, conflict and red-main holds. Only the final merge decision counts.
+    // `reviewGate` runs before the CI, CodeQL, conflict and red-main holds, so only a merge decision is eligible.
     if (v?.decision !== 'merge') continue;
     const pr = Number(v?.num);
     if (slug(v.repo || repo) !== slug(repo) || !Number.isInteger(pr) || pr <= 0) continue;
