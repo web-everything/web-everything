@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const SOURCE = 'scripts/conveyor/ci-red-recovery-watch.mjs';
-const REPO = 'web-everything/web-everything';
+const REPO = 'ruleset-fixture/example';
 const done = name => ({ __typename: 'CheckRun', name, workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS' });
 
 export default {
