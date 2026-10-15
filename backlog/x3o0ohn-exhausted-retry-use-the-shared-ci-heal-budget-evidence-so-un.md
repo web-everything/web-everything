@@ -14,7 +14,7 @@ we:scripts/conveyor/exhausted-retry.mjs `exhaustionFacts` keeps its own copy of 
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/conveyor/__tests__/exhausted-retry.test.mjs` (through the heavy-admission queue) includes a case where three dated heals precede a trusted fixer push and one undated heal exists: `exhaustionFacts` counts two chargeable heals, not one. It fails before this item lands and passes after.
+- [A1] **Executable** — the test file we:scripts/conveyor/__tests__/exhausted-retry.test.mjs, run through the heavy-admission queue with `npx vitest run`, includes a case where three dated heals precede a trusted fixer push and one undated heal exists: `exhaustionFacts` treats exactly one heal (the undated one) as chargeable, where the old filter dropped it and counted zero. It fails before this item lands and passes after.
 - [A2] `exhaustionFacts` reads its count and its reset boundary from `ciHealBudgetEvidence`; no local copy of the reset filter remains.
 
 ## Non-goals
