@@ -1919,7 +1919,7 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
     if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
       while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
     }
-    const machineNote = isMachineNoteBody(body) || (isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(body));
+    const machineNote = isMachineNoteBody(c) || (isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(body));
     if (bodySha === null) {
       // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
       // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
@@ -2019,10 +2019,18 @@ const RESTAMP_LEAD_RE = /^\s*📌 review — /;
  * own comment counts only in its sanctioned shape ({@link isSanctionedAcceptRecordBody}). `isKnownMachineBody` reads
  * the re-stamp heading off the first line alone, so a pasted re-stamp followed by "REVOKED" passed as a note (PR #5237
  * operator ruling, self-review). Only narrows the machine shapes: anything failing here is a possible hold.
+ *
+ * Takes the COMMENT, not its body: every machine shape (🔔 conveyor —, fix-begin/fix-end, CI-heal, drain notes, advisory
+ * notes) is a note only from a trusted author ({@link isTrustedMarkerAuthor}: the delivery bot, or the operator whose
+ * login the drain also posts under). `isKnownMachineBody` matches the leading line from any author, so an outsider's
+ * comment that merely opened with one was ignored as a hold (PR #5237 operator ruling, 2026-10-15 ~07:25 ET). An empty
+ * comment says nothing whoever wrote it. A missing or unreadable author is untrusted (fail closed).
  */
-export function isMachineNoteBody(body) {
-  if (!isKnownMachineBody(body)) return false;
-  return !RESTAMP_LEAD_RE.test(typeof body === 'string' ? body : '') || isSanctionedAcceptRecordBody(body);
+export function isMachineNoteBody(comment) {
+  const body = typeof comment?.body === 'string' ? comment.body : '';
+  if (!body.trim()) return true;
+  if (!isTrustedMarkerAuthor(comment) || !isKnownMachineBody(body)) return false;
+  return !RESTAMP_LEAD_RE.test(body) || isSanctionedAcceptRecordBody(body);
 }
 
 /**

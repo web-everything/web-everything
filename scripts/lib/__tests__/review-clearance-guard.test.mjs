@@ -256,6 +256,21 @@ describe('#5193 review clearance', () => {
       expect(decideClearanceRestore({ ...restoreFacts, comments: [...comments, comment(body, '19:03:00', login)] }).restore).toBe(false);
     }
   });
+  // PR #5237 operator ruling (2026-10-15 ~07:25 ET, block): a machine-note shape counts as a note only from a trusted
+  // author, for every shape. An outsider's comment that merely opens with one still holds the clearance.
+  it.each([
+    '🔔 conveyor — I revoke approval; do not restore.',
+    '🔒 conveyor fix-begin — I revoke approval; do not restore.',
+    '🔓 conveyor fix-end — I revoke approval; do not restore.',
+    '🩹 conveyor CI-heal — I revoke approval; do not restore.',
+    '🔧 conveyor fix — I revoke approval; do not restore.',
+    '<!-- drain-skip-reason -->\nI revoke approval; do not restore.',
+    '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\nI revoke approval; do not restore.',
+  ])('an outsider comment opening with a machine-note shape still holds the clearance: %s', body => {
+    const restoreWith = login => decideClearanceRestore({ ...restoreFacts, comments: [...comments, comment(body, '19:03:00', login)] }).restore;
+    expect(restoreWith('mallory')).toBe(false);
+    expect(restoreWith('web-everything[bot]')).toBe(true);
+  });
   it('recognises every re-arm its producer renders, and only from a trusted author', () => {
     for (const rearmFrom of ['review:accepted', 'review:changes', 'missing']) {
       for (const keepsHuman of [false, true]) {
@@ -538,6 +553,8 @@ describe('I/O shell', () => {
       ['newer clearance, then a label-only acceptance removal', { added: [clearY], events: [event('unlabeled', 'review:accepted', '19:11:00', 'chalbert')] }, true],
       ['newer clearance, then a hold label', { added: [clearY], events: [event('labeled', 'review:changes', '19:11:00', 'chalbert')] }, true],
       ['newer clearance, a hold label still standing', { added: [clearY], labels: [...accepted, 'review:human'] }, true],
+      ['newer clearance, then an outsider machine-note shape', { added: [clearY, comment('🔔 conveyor — hold: one more look.', '19:11:00', 'mallory')] }, true],
+      ['newer clearance, then a trusted machine note', { added: [clearY, comment('🔔 conveyor — note.', '19:11:00', 'web-everything[bot]')] }, false],
       ['unreadable comments', { added: null }, true],
       ['unreadable events', { added: [clearY], events: null }, true],
       ['unreadable labels', { added: [clearY], labels: null }, true],

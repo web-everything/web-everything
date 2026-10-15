@@ -31,7 +31,7 @@ const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? ro
  * restoration-headed comment is a note only in the exact automation shape ({@link restoreNote}): a pasted one with a
  * revocation after it holds (PR #5237 round 9, self-review).
  */
-const holdsClearance = c => (starts(c, RESTORE_MARKER) ? !restoreNote(c) : !isMachineNoteBody(c?.body))
+const holdsClearance = c => (starts(c, RESTORE_MARKER) ? !restoreNote(c) : !isMachineNoteBody(c))
   && !(isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(c?.body));
 /**
  * Is `c` a re-arm comment exactly as `rearm-review.mjs#buildRearmComment` writes it, from a trusted author? Every line

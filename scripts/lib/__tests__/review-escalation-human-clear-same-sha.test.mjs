@@ -137,6 +137,35 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     expect(parseLatestHumanClearedSha([clear(X), note, accept(X)], { sameShaCarries: true })).toBe(X);
     expect(parseLatestHumanClearedSha([say('🔁 review — changes requested'), clear(X), accept(X)], { sameShaCarries: true })).toBe(X);
   });
+  // PR #5237 operator ruling (2026-10-15 ~07:25 ET, block): a machine-note shape read off the leading line alone, from
+  // ANY author, ended nothing: an outsider's "🔔 conveyor — ..." comment was ignored as a hold. Every shape now counts
+  // as a machine note only from a trusted author (the delivery bot or the operator, whose login the drain also uses).
+  const machineShapes = [
+    ['conveyor operator note', '🔔 conveyor — hold this, I revoke the approval'],
+    ['fix-begin', '🔒 conveyor fix-begin — claimed by fix-1'],
+    ['fix-end', '🔓 conveyor fix-end — released'],
+    ['CI-heal note', '🩹 conveyor CI-heal — healed'],
+    ['fix evidence', '🔧 conveyor fix — evidence'],
+    ['restack note', '✅ conveyor restack — done'],
+    ['queue note', '⏳ conveyor — waiting'],
+    ['recovery note', '🔀 conveyor rebase-onto-main — done'],
+    ['drain reason comment', '<!-- drain-skip-reason -->\nskipped'],
+    ['mechanical drain park', '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\nheld — a review hold stands'],
+    ['advisory note', '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\nlooks fine'],
+  ];
+  it.each(machineShapes)('a machine-note shape from an outsider is a possible hold, from automation it is not: %s', (_kind, body) => {
+    const run = login => parseLatestHumanClearedSha([clear(X), say(body, login), accept(X)], { sameShaCarries: true });
+    expect(run('mallory')).toBeNull();
+    expect(run('web-everything[bot]')).toBe(X);
+    expect(run('chalbert')).toBe(X);
+  });
+  it('an authorless or unreadable-author machine-note shape is a possible hold too (fail closed)', () => {
+    expect(parseLatestHumanClearedSha([clear(X), { body: '🔔 conveyor — hold this' }, accept(X)], { sameShaCarries: true })).toBeNull();
+    expect(parseLatestHumanClearedSha([clear(X), { author: null, body: '🔔 conveyor — hold this' }, accept(X)], { sameShaCarries: true })).toBeNull();
+  });
+  it('an empty comment says nothing, whoever wrote it', () => {
+    expect(parseLatestHumanClearedSha([clear(X), say('', 'mallory'), accept(X)], { sameShaCarries: true })).toBe(X);
+  });
   it('a revocation never voids the latest record itself when it is the clearance', () => {
     expect(parseLatestHumanClearedSha([accept(X), say('🔁 review — changes requested'), clear(X)], { sameShaCarries: true })).toBe(X);
   });
