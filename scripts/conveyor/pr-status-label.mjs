@@ -17,7 +17,7 @@ import { latestUnresolvedStandDown } from './stand-down-answer-core.mjs';
 
 export const PR_STATUS_PREFIX = 'status:';
 export const PR_STATUS_STATES = Object.freeze([
-  'needs-you', 'ci-red', 'red-team', 'ready-to-merge', 'takeover-running', 'fixing', 'escalated', 'stood-down',
+  'needs-you', 'ci-red', 'conflict', 'red-team', 'ready-to-merge', 'takeover-running', 'fixing', 'escalated', 'stood-down',
   'answered-waiting-fixer', 'sent-back-red-team', 'at-round-limit', 'waiting-on-base', 'awaiting-ci', 'awaiting-review', 'sent-back-review',
 ]);
 const LEGACY_PR_STATUS_STATES = Object.freeze(['awaiting-base']);
@@ -33,6 +33,7 @@ export const PR_STATUS_DESCRIPTIONS = Object.freeze({
   'red-team': 'Accepted; the post-accept red team is still running — auto-managed',
   'ready-to-merge': 'Accepted with no red required checks; waiting to land — auto-managed',
   'ci-red': 'Required CI is red; waiting for repair — auto-managed',
+  conflict: 'Merge conflicts need repair — auto-managed',
   escalated: 'Handed to a person; see the operator queue ESCALATIONS — auto-managed',
   'stood-down': 'A fixer stood down; no later human reply — auto-managed',
   'answered-waiting-fixer': 'The operator answered the stand-down; the fixer owes the next move — auto-managed',
@@ -119,6 +120,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   if (operatorQueueNeedsYou(subject, { humanAt })) return 'needs-you';
   const liveFix = (reviewStatus?.role === 'fix' || reviewStatus?.role === 'ci-heal') && rs !== 'needs-human';
   if (requiredCiRed(subject, l, ciChecks, settings)) return liveFix ? 'fixing' : 'ci-red';
+  if (subject.mergeable === 'CONFLICTING' || subject.mergeStateStatus === 'DIRTY') return liveFix ? 'fixing' : 'conflict';
   if (l.includes('review:accepted') && !l.includes('ready-to-merge')
     && reviewStatus?.role === 'review' && ['reviewing', 'review-stalled'].includes(rs)
     && settings.acceptedRedTeamStatus === 'red-team') return 'red-team';
