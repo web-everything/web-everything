@@ -65,6 +65,7 @@ import {
   strandedNumberingRecords,
 } from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
+import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
@@ -250,7 +251,7 @@ export function sweepReviewHoldLabels({
         exec: (c, a, o) => execFileSync(c, a, { ...o, ...(cwd ? { cwd } : {}) }), headSha: sha, headRef: sha,
       });
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
-        readNetDiff, readLiveState, exec,
+        readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
       // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
       // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.

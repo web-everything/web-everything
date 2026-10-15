@@ -10,9 +10,14 @@ import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
   MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
-  planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering, _resetNumberingRestampMemo, numberingWithdrawalOwed,
-  strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
+  planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering as restampWithoutGuard,
+  _resetNumberingRestampMemo, numberingWithdrawalOwed, strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
 } from '../numbering-carry.mjs';
+import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+
+// The writer supplies the referral guard (numbering-carry does not import the label writer: that would close an
+// import cycle through the drain). These tests supply the same real guard the sweep does, unless a test overrides it.
+const restampAfterNumbering = (o) => restampWithoutGuard({ guardReferrals: assertMandatoryReferralsCleared, ...o });
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const subject = 'drain: JIT-number xf74q20→#6053, xztd0mv→#6054 at land (#2288)';
@@ -581,6 +586,18 @@ describe('numbering acceptance restamp', () => {
     expect(planNumberingRestamp({ ...facts(), labels: ['review:pending', 'review:human'] }).candidate).toBe(false);
     expect(planNumberingRestamp({ ...facts(), headSha: FROM }).candidate).toBe(false);
     expect(planNumberingRestamp({ ...facts(), reviews: null })).toMatchObject({ candidate: false, retryable: true });
+  });
+  it('writes nothing when no referral guard is supplied (fails closed, retryable)', () => {
+    const writes = [];
+    const result = restampWithoutGuard({ repo: 'o/n', pr: 5025, state: { ...facts(), headRefOid: TO }, reviews: [],
+      enabled: true, acceptCarry: 'on', prove: () => ({ ok: true, reason: 'verified' }),
+      provider: { postComment: () => writes.push('comment'), setLabels: () => writes.push('labels') } });
+    expect(result).toMatchObject({ action: 'retry', reason: 'no mandatory-referral guard supplied' });
+    expect(writes).toEqual([]);
+  });
+  it('keeps the label writer out of the drain import graph (no cycle back through merge-ai-prs)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../numbering-carry.mjs'), 'utf8');
+    expect(src).not.toMatch(/from ['"][^'"]*review-set-label\.mjs['"]/);
   });
   it('writes a record every acceptance reader recognizes, with the original human actor', async () => {
     const { latestHumanClearance } = await import('../human-clearance-carry.mjs');

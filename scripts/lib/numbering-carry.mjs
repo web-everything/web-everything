@@ -15,7 +15,6 @@ import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
 import { resolveHumanClearanceCarrySetting } from './human-clearance-carry.mjs';
-import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import {
   REVIEW_LABELS, buildStaleAcceptHealComment, buildReviewedShaMarker, buildReviewedDiffMarker,
   buildReviewedContributionMarker, buildClearedHumanMarker,
@@ -573,11 +572,19 @@ function owedRecordsOn({ repo, pr, comments }) {
   return standing;
 }
 
+/**
+ * The referral guard is supplied by the writer (`review-set-label.mjs#assertMandatoryReferralsCleared`), not imported:
+ * that module imports the drain (`merge-ai-prs.mjs`), which imports this file through human-clearance-carry, so an
+ * import here would close a cycle and load the whole label writer into every drain run. Without one, nothing is
+ * written: the pass retries.
+ */
+function refuseWithoutReferralGuard() { throw Error('no mandatory-referral guard supplied'); }
+
 /** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
 export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFileSync, cwd, provider,
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
-  guardReferrals = assertMandatoryReferralsCleared } = {}) {
+  guardReferrals = refuseWithoutReferralGuard } = {}) {
   const key = `${repo}#${pr}@${state?.headRefOid}`;
   const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
   // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
