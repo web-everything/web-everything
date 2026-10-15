@@ -2493,7 +2493,8 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
     // Fast drain only: failed/truncated context cannot establish that an absent HASH blocker has landed. A numeric
     // id exists only post-land (arm (4) above), and no caller proves numerics, so those keep clearing by absence.
-    const absentUnproven = (b) => strictAbsentHashDependencies === true && contextComplete !== true && typeof b !== 'number';
+    // A malformed id coerces to NaN in `asItemId`; only a real positive NNN may clear by absence.
+    const absentUnproven = (b) => strictAbsentHashDependencies === true && contextComplete !== true && !(Number.isInteger(b) && b > 0);
     const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (openItems.has(b) || absentUnproven(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier

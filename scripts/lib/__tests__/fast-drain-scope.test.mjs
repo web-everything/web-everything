@@ -401,6 +401,12 @@ output({});
     expect(proven.plan.ready).toHaveLength(1);
   });
 
+  it.each(['XAAAAAA', '#xaaaaaa', 'abc', 0, -4])('fast drain: a malformed absent blockedBy %s is not cleared as a numeric', (item) => {
+    const { plan } = planDrainPass({ openPrContext: incomplete, verdicts: [absentDep('blockedBy', item)],
+      strictAbsentHashDependencies: true });
+    expect(plan.ready).toEqual([]);
+  });
+
   it('hydrates a sibling whose manifest changed at the same head SHA', () => {
     const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
     const staleA = { ...pr(8, 'xcccccc'), labels: [] };
