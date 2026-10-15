@@ -106,7 +106,7 @@ export function riskyLaneConfig(listOutput) {
 
 
 /**
- * Repair only lane-owned unsafe config before hand-out. Origin is always retained; the
+ * Repair only lane-owned unsafe config before hand-out. Only exact `origin` is always retained; the
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
  */
 export function scrubRiskyLaneConfig(dir, {
@@ -123,7 +123,7 @@ export function scrubRiskyLaneConfig(dir, {
       const [key] = riskyLaneConfig(`${scope}\0${entry}\0`);
       if (!key) continue;
       const remote = /^remote\.(.+)\.[^.]+$/i.exec(key);
-      if (remote?.[1].toLowerCase() === 'origin') { kept.push(key); continue; }
+      if (remote?.[1] === 'origin') { kept.push(key); continue; }
       try {
         if (remote) {
           const section = `remote.${remote[1]}`, id = `${scope}:${section}`;

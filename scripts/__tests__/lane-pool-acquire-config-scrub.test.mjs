@@ -27,11 +27,15 @@ it.each([false, true])('scrubs and journals a claimed lane (no-reset=%s)', noRes
     expect(provision.status, provision.stderr).toBe(0);
     const lane = join(pool, 'scrub', 'lane-1');
     git(['remote', 'add', 'primary', reference], lane);
+    git(['remote', 'add', 'Origin', reference], lane);
+    git(['remote', 'add', 'ORIGIN', reference], lane);
     const acquire = run(['acquire', '--lane=1', '--session=scrub-test', ...(noReset ? ['--no-reset'] : [])]);
     expect(acquire.status, acquire.stderr).toBe(0);
     expect(acquire.stdout.trim()).toBe(lane);
     expect(git(['remote'], lane)).toBe('origin');
     const events = readFileSync(join(pool, 'scrub', '.lane-journal.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(events.find(e => e.action === 'config-scrub')).toMatchObject({ removed: ['remote.primary.url'], kept: ['remote.origin.url'] });
+    expect(events.find(e => e.action === 'config-scrub')).toMatchObject({
+      removed: ['remote.primary.url', 'remote.Origin.url', 'remote.ORIGIN.url'], kept: ['remote.origin.url'],
+    });
   } finally { rmSync(base, { recursive: true, force: true }); }
 }, 60000);

@@ -32,6 +32,21 @@ it('keeps unsafe origin so the guard continues refusing it', () => {
   expect(scrubRiskyLaneConfig(dir)).toEqual({ removed: [], kept: ['remote.origin.url'] });
   expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual(['remote.origin.url']);
 });
+it.each(['local', 'worktree'])('scrubs differently cased origin remotes in %s config', scope => {
+  const { dir, git } = repo();
+  git(['remote', 'add', 'origin', 'https://github.com/x/y.git']);
+  if (scope === 'worktree') git(['config', 'extensions.worktreeConfig', 'true']);
+  for (const name of ['Origin', 'ORIGIN']) {
+    git(['config', `--${scope}`, `remote.${name}.url`, join(tmpdir(), `${name}-checkout`)]);
+  }
+  expect(scrubRiskyLaneConfig(dir)).toEqual({
+    removed: ['remote.Origin.url', 'remote.ORIGIN.url'], kept: [],
+  });
+  expect(git(['remote'])).toBe('origin\n');
+  expect(git(['remote', 'get-url', 'origin'])).toBe('https://github.com/x/y.git\n');
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
+  expect(scrubRiskyLaneConfig(dir)).toEqual({ removed: [], kept: [] });
+});
 it('unsets worktree keys in worktree scope', () => {
   const { dir, git } = repo();
   git(['config', 'extensions.worktreeConfig', 'true']);
@@ -43,15 +58,15 @@ it('reports runner errors without throwing', () => {
   expect(scrubRiskyLaneConfig('unused', { run: () => { throw new Error('read failed'); } }).kept.join()).toContain('read failed');
 });
 
-it('falls back to removing the local remote section if remote remove fails', () => {
+it.each(['primary', 'Origin', 'ORIGIN'])('falls back to removing the local %s remote section if remote remove fails', name => {
   const { dir, git } = repo();
-  git(['remote', 'add', 'primary', join(tmpdir(), 'primary-checkout')]);
+  git(['remote', 'add', name, join(tmpdir(), 'primary-checkout')]);
   const run = vi.fn(args => {
     if (args[0] === 'remote') throw new Error('remote removal failed');
     return git(args);
   });
-  expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: ['remote.primary.url'], kept: [] });
-  expect(run).toHaveBeenCalledWith(['config', '--local', '--remove-section', 'remote.primary'], expect.anything());
+  expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: [`remote.${name}.url`], kept: [] });
+  expect(run).toHaveBeenCalledWith(['config', '--local', '--remove-section', `remote.${name}`], expect.anything());
   expect(git(['remote'])).toBe('');
 });
 it('reports failed unsets as kept', () => {
