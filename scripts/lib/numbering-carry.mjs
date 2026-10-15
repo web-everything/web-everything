@@ -290,11 +290,46 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
 }
 
 export const NUMBERING_RESTAMP_MARKER = 'numbering-restamp';
-const RESTAMP_MARKER_RE = /<!--\s*numbering-restamp:\s*from=([0-9a-f]{40})\s+to=([0-9a-f]{40})\s*-->/i;
-/** PURE: the `from` sha of a numbering re-stamp record that names `head`, else null. */
-function restampMarkerFrom(body, head) {
-  const m = RESTAMP_MARKER_RE.exec(typeof body === 'string' ? body : '');
-  return m && m[2].toLowerCase() === head ? m[1].toLowerCase() : null;
+const RESTAMP_HEADLINE = '📌 review — acceptance re-stamped after a rebase (no new review)';
+const RESTAMP_MARKER_LINE_RE = /^<!-- numbering-restamp: from=([0-9a-f]{40}) to=([0-9a-f]{40}) -->$/i;
+/**
+ * PURE: `{from, to, rec}` when `c` is a trusted numbering re-stamp record, else null. Only the exact shape the writer
+ * emits counts — the headline as the first line and the marker as the last — so a quoted or juror-written marker
+ * inside another trusted comment is never mistaken for one.
+ */
+function restampRecord(c) {
+  const lines = (typeof c?.body === 'string' ? c.body.trimEnd().split(/\r?\n/) : []).map((l) => l.trimEnd());
+  const m = lines[0] === RESTAMP_HEADLINE ? RESTAMP_MARKER_LINE_RE.exec(lines[lines.length - 1]) : null;
+  const rec = m ? latestAcceptRecord([c]) : null;
+  return rec && rec.sha === m[2].toLowerCase() ? { from: m[1].toLowerCase(), to: rec.sha, rec } : null;
+}
+const sameClearance = (a, b) => Boolean(a.humanCleared) === Boolean(b.humanCleared)
+  && (!a.humanCleared || sanitizeActor(a.actor) === sanitizeActor(b.actor));
+const sourceKey = (comments, c, at) => (c?.id != null ? `id:${c.id}` : `at:${at ?? ''}#${comments.indexOf(c)}`);
+
+/**
+ * PURE: the thread with every numbering re-stamp record that does not carry exactly the acceptance before it dropped.
+ * A record counts only when the acceptance before it names its `from` sha with the same clearance and nothing but
+ * tolerable bodies stand between them; anything else (a newer acceptance or a hold posted in the gap before our
+ * record) makes it no acceptance at all, on this head and every later one. `carried` maps each kept record to the
+ * acceptance it carried, and `rootAt` maps each kept acceptance to the time of the review that started its chain.
+ */
+function validatedThread(comments) {
+  const view = [];
+  const carried = new Map();
+  const rootAt = new Map();
+  for (const c of comments) {
+    const r = restampRecord(c);
+    if (r) {
+      const prior = latestAcceptRecord(view);
+      if (!prior || prior.sha !== r.from || prior.laterBodyDerivedHold || !sameClearance(prior, r.rec)
+        || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body))) continue;
+      carried.set(c, { comment: view[prior.index], at: prior.at });
+      rootAt.set(c, rootAt.get(view[prior.index]) ?? prior.at);
+    }
+    view.push(c);
+  }
+  return { view, carried, rootAt };
 }
 const staleHealHeadline = buildStaleAcceptHealComment({}).split('\n')[0];
 const stalePark = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for review by the drain\*\*\s*\n\s*review:accepted /;
@@ -316,33 +351,31 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
     return { candidate: false, reason: 'labels do not permit numbering carry' };
   }
   if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return { candidate: false, reason: 'live head unknown' };
-  const latest = latestAcceptRecord(comments);
-  if (!latest) return { candidate: false, reason: 'no recorded acceptance' };
+  const list = Array.isArray(comments) ? comments : [];
   const head = headSha.toLowerCase();
-  // A numbering re-stamp whose label write failed after its record was posted: finish the labels only. The record is
-  // the trusted re-stamp itself (its own marker names this head), so no proof or second comment is owed.
-  const own = latest.sha === head ? restampMarkerFrom(comments[latest.index]?.body, head) : null;
-  if (latest.sha === head && !own) return { candidate: false, reason: 'already bound' };
-  // Our re-stamp records for this head are judged against the acceptance they carried, never as that acceptance: a
-  // newer acceptance posted just before our record (after the last re-read) supersedes it and is planned instead.
-  const ownRecord = (c) => restampMarkerFrom(c?.body, head) !== null && latestAcceptRecord([c])?.sha === head;
-  const view = comments.filter((c) => !ownRecord(c));
+  // A re-stamp record is judged against the acceptance it carried, never trusted as an acceptance on its own.
+  const { view, carried, rootAt } = validatedThread(list);
   const rec = latestAcceptRecord(view);
-  if (!rec) return { candidate: false, reason: 'the re-stamp record names no carried acceptance' };
-  if (rec.sha === head) return { candidate: false, reason: 'already bound' };
+  if (!rec) return { candidate: false, reason: 'no recorded acceptance' };
+  const src = view[rec.index];
+  // A numbering re-stamp whose label write failed after its record was posted: finish the labels only. The record was
+  // validated against the acceptance it carried, so no proof or second comment is owed.
+  const labelsOnly = rec.sha === head && carried.has(src);
+  if (rec.sha === head && !labelsOnly) return { candidate: false, reason: 'already bound' };
   if (rec.laterBodyDerivedHold) return { candidate: false, reason: 'later body-derived hold' };
   if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
     return { candidate: false, reason: 'later verdict or unknown comment stands' };
   }
   if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
-  if (laterReviewHold(reviews, rec.at)) return { candidate: false, reason: 'formal review hold stands' };
+  // From the review that started the chain: a re-stamp re-dates the record without being a review.
+  if (laterReviewHold(reviews, rootAt.get(src) ?? rec.at)) return { candidate: false, reason: 'formal review hold stands' };
   // The acceptance comment this plan carries: a newer record on the same sha is a different acceptance.
-  const src = view[rec.index];
-  const source = src?.id != null ? `id:${src.id}` : `at:${rec.at ?? ''}#${comments.indexOf(src)}`;
-  const plan = { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source };
-  const carriesRec = own === rec.sha && Boolean(latest.humanCleared) === Boolean(rec.humanCleared)
-    && (!rec.humanCleared || sanitizeActor(latest.actor) === sanitizeActor(rec.actor));
-  return carriesRec ? { ...plan, labelsOnly: true } : plan;
+  if (labelsOnly) {
+    const { comment, at } = carried.get(src);
+    return { candidate: true, labelsOnly: true, from: restampRecord(src).from, to: head, human: rec.humanCleared,
+      actor: rec.actor, source: sourceKey(list, comment, at) };
+  }
+  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source: sourceKey(list, src, rec.at) };
 }
 
 // Same allow-list as human-clearance-carry; local to avoid a circular dependency between the two carry tiers.

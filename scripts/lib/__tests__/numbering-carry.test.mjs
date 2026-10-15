@@ -599,6 +599,30 @@ describe('numbering acceptance restamp', () => {
       expect(plan).toMatchObject({ candidate: true, from: FROM, to: TO, human: false });
       expect(plan.labelsOnly).toBeUndefined();
     });
+    const H2 = 'f'.repeat(40);
+    const record = (from = FROM, to = TO) => ({ author: { login: 'chalbert' },
+      body: buildNumberingRestampBody({ fromSha: from, toSha: to, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' }) });
+    const planAt = (headSha, comments) => planNumberingRestamp({ labels: ['review:pending'], headSha, comments, reviews: [] });
+    it('a hold posted just before our record keeps refusing after the head moves again', () => {
+      const comments = [...liveComments(), objection, record()];
+      expect(planAt(TO, comments).candidate).toBe(false);
+      expect(planAt(H2, comments)).toMatchObject({ candidate: false, reason: 'later verdict or unknown comment stands' });
+    });
+    it('a valid record carries on to the next head, from that record', () => {
+      const comments = [...liveComments(), record()];
+      expect(planAt(H2, comments)).toMatchObject({ candidate: true, from: TO, to: H2, human: true, actor: 'chalbert' });
+      expect(planAt(H2, [...comments, record(TO, H2)])).toMatchObject({ candidate: true, labelsOnly: true, from: TO, to: H2 });
+    });
+    it.each([
+      ['a quoted record', (b) => `🧭 advisory note — changes\n\n${b.split('\n').map((l) => `> ${l}`).join('\n')}`],
+      ['markers under another headline', (b) => `🧭 advisory note — changes\n${b.split('\n').slice(1).join('\n')}`],
+      ['a marker that is not the last line', (b) => `${b}\nmore text`],
+    ])('a trusted comment carrying %s is no re-stamp record', (_name, shape) => {
+      const forged = { author: { login: 'chalbert' }, body: shape(record().body) };
+      const plan = planAt(TO, [...liveComments(), forged]);
+      expect(plan.labelsOnly).toBeUndefined();
+      expect(plan.candidate).toBe(false);
+    });
     it('a long actor cut at a separator still matches its own record', () => {
       const { calls, provider } = recording();
       const actor = `${'a'.repeat(63)} b`;
