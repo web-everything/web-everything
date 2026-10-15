@@ -4524,14 +4524,6 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
-  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
-    read: async () => {
-      const pr = await fetchFreshPrForRevalidation(repo, num);
-      return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
-        hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
-    }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
-  });
-
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -5191,6 +5183,14 @@ async function runCli() {
       return false;
     }
   };
+  // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
+  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    read: async () => {
+      const pr = await fetchFreshPrForRevalidation(repo, num);
+      return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
+        hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
+    }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
+  });
   const refreshApprovedHead = async (v, options) => {
     let hold = approvedHeadHold(v, options.expectedHead);
     try {
