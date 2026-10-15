@@ -3730,6 +3730,7 @@ describe('grouped PREPARE daemon ticks', () => {
       fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }), listHolds: () => held,
       listPrepareInFlight: () => busy, listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: root }),
+      listPreparePrs: () => [],
       readPrepareStatus: vi.fn(() => ({ preparedDate: null })),
       readPreparedStamp: vi.fn(() => ({ preparedDate: null })),
       acquirePrepareClaim: vi.fn(args => refuse.includes(args.num) ? { ok: false, reason: 'busy' }

@@ -731,6 +731,8 @@ Offer two persistently refused candidates before a clean successor at cap two, a
 refusals must not consume worker capacity. Missing, non-callable, throwing or malformed PR-list effects
 must refuse dispatch. Reader integration fixtures must apply the actual search filters, including title-only
 PRs outside `lane/`, `bornAs` branches, saturated shared listings, date-floor fallback and async prefetch.
+Prepare launch fixtures, including grouped unit and soak scenarios, must supply `listPreparePrs: () => []`
+when modeling no existing prepare PR; omitting the effect models an unavailable listing and refuses launch.
 Every component search must be complete before its union can prove absence; cache by both identities.
 When replacing a regression test, identify the replacement covering its original recovery behavior during review.
 
