@@ -536,7 +536,30 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd -@ ~/clone && ls')).toBe(`${HOME}/clone`);
     expect(at('cd -P /abs/clone && ls')).toBe('/abs/clone');
     expect(at('cd - && ls')).toBe(REPORTED);
-    expect(at('cd -P && ls')).toBe(REPORTED);
+    // with no directory operand, cd goes to HOME
+    expect(at('cd -P && ls')).toBe(HOME);
+    expect(at('cd && ls')).toBe(HOME);
+    expect(at('cd && ls', null)).toBe(REPORTED);
+  });
+  it('cd options are recognised after quote removal and expansion, as bash sees them', () => {
+    for (const cmd of [
+      'cd "-P" "$HOME/clone"', "cd '-P' ~/clone", 'cd \\-P ~/clone', 'cd -"P" ~/clone', 'cd "--" ~/clone',
+      'OPT=-P; cd "$OPT" ~/clone', 'cd "-P" -- "$HOME/clone"',
+    ]) {
+      expect(at(`${cmd} && git checkout --detach`), cmd).toBe(`${HOME}/clone`);
+    }
+    // after `--`, a dash word is the directory itself; an invalid option makes cd fail (cwd unchanged)
+    expect(at('cd -- "-P" && ls')).toBe(`${REPORTED}/-P`);
+    expect(at('cd "-x" ~/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$UNKNOWN" ~/clone && ls')).toBe(REPORTED);
+  });
+  it('a cd behind prefix assignments, builtin/command or quoting is still the cd', () => {
+    for (const cmd of ['FOO=1 cd ~/clone', '"cd" ~/clone', '\\cd ~/clone', 'builtin cd ~/clone', 'command cd ~/clone']) {
+      expect(at(`${cmd} && git checkout --detach`), cmd).toBe(`${HOME}/clone`);
+    }
+    expect(at('command -v cd ~/clone && ls')).toBe(REPORTED);
+    // a prefix assignment is temporary and expands after the cd's own words: the earlier value wins
+    expect(at('LANE=/protected/clone; LANE=/tmp cd "$LANE"')).toBe('/protected/clone');
   });
   it('quoted tilde and single-quoted HOME are literal shell text, not home aliases', () => {
     expect(at('cd "~/clone" && ls')).toBe(`${REPORTED}/~/clone`);
@@ -581,9 +604,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // statements that rebind a variable in ways the walk does not model make every name they mention unknown
     expect(at('LANE=/a; unset A LANE; cd "$LANE"')).toBe(REPORTED);
     expect(at('LANE=/a; read LANE; cd "$LANE"')).toBe(REPORTED);
-    expect(at('LANE=/a; declare LANE=/b; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE=/a; declare -i LANE=/b; cd "$LANE"')).toBe(REPORTED);
     expect(at('LANE=/a; LANE+=/b; cd "$LANE"')).toBe(REPORTED);
-    for (const stmt of ['readonly LANE', 'let LANE=2', 'typeset LANE=/b', 'printf -v LANE %s /b', 'mapfile LANE', 'readarray LANE', 'getopts ab LANE']) {
+    for (const stmt of ['let LANE=2', 'declare -n LANE', 'typeset -u LANE=/b', 'local LANE', 'printf -v LANE %s /b', 'mapfile LANE', 'readarray LANE', 'getopts ab LANE', 'LANE[0]=/b']) {
       expect(at(`LANE=/a; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
     expect(at('unset -v HOME; cd ~/x')).toBe(REPORTED);
@@ -591,6 +614,36 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // an unquoted `~` in ANY assignment is expanded by the shell, so it is unknown here; a quoted one is literal
     expect(at('LANE=~/clone; cd "$LANE"')).toBe(REPORTED);
     expect(at('LANE="~/clone"; cd "$LANE"')).toBe(`${REPORTED}/~/clone`);
+  });
+  it('keeps a known value when a statement leaves it unchanged in bash', () => {
+    for (const stmt of [
+      'readonly LANE', 'declare LANE', 'typeset -r LANE', 'declare -x LANE', 'declare -i LANE', 'export LANE',
+      'export -n LANE', 'declare -f LANE', 'unset -f LANE', 'readonly -f LANE', 'LANE=/tmp true',
+      'LANE=/tmp export OTHER', 'declare -p LANE',
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE" && git checkout --detach`), stmt).toBe('/protected/clone');
+    }
+    // a readonly variable can no longer be rebound or unset
+    for (const stmt of ['LANE=/tmp', 'unset LANE', 'read LANE', 'declare LANE=/tmp', 'export LANE=/tmp']) {
+      expect(at(`LANE=/protected/clone; readonly LANE; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+      expect(at(`readonly LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+    }
+    expect(at('HOME=/protected; readonly HOME; HOME=/tmp; cd ~/clone')).toBe('/protected/clone');
+  });
+  it('declaration builtins and multi-assignments bind every literal they assign', () => {
+    for (const stmt of [
+      'declare LANE=/protected/clone', 'typeset -x LANE=/protected/clone', 'readonly LANE=/protected/clone',
+      'export A=/x LANE=/protected/clone', 'A=/x LANE=/protected/clone', 'declare -- LANE="/protected/clone"',
+    ]) {
+      expect(at(`LANE=/tmp; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+    }
+  });
+  it('a quoted or escaped name in a binding statement is still forgotten', () => {
+    for (const stmt of ['unset "LANE"', "unset 'LANE'", 'unset \\LANE', 'read -r "LANE"', 'read -p prompt LANE', 'declare "LANE=/b"', 'mapfile -t "LANE"']) {
+      expect(at(`LANE=/a; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    // an option argument is not a variable name
+    expect(at('LANE=/a; read -p LANE OTHER; cd "$LANE"')).toBe('/a');
   });
   it('preserves a literal cd target across ordinary printf output', () => {
     for (const stmt of [

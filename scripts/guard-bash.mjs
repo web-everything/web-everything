@@ -2497,15 +2497,117 @@ function literalValue(raw) {
   return quoted || !/^~|\s/.test(val) ? val : null;
 }
 
-// Statements that (re)bind or unbind variables in ways this walk does not model: every name they mention
-// becomes unknown instead of keeping a stale literal.
-const BINDING_STATEMENT = /^(?:unset|read|declare|local|typeset|readonly|let|mapfile|readarray|getopts)\s/;
-
-function printfBindings(stmt) {
-  // Use shell words so quoted/escaped options agree, ignoring redirects and their operands.
-  const words = shellTokens(stmt, { preserveQuotes: true })
+// A statement's shell words — `raw` keeps the lexical spelling (for expansion), `text` is after quote removal
+// (what a builtin sees as an option or a name). Redirects and their operands are dropped.
+function shellWords(stmt) {
+  return shellTokens(stmt, { preserveQuotes: true })
     .filter((t, i, tokens) => !t.op && !tokens[i - 1]?.op)
     .map((t) => ({ raw: t.text, text: shellTokens(t.text)[0]?.text ?? '' }));
+}
+
+const ASSIGNMENT_WORD = /^([A-Za-z_]\w*)(\[[^\]]*\])?(\+?)=/;
+const NAME_PREFIX = /^[A-Za-z_]\w*/;
+// Builtins whose operands are `name` / `name=value`. The value-changing option letters (integer, case,
+// nameref) make an assigned name unknown; `-f`/`-F` (functions) and `-p` (print) never touch a variable.
+const DECLARATION_BUILTINS = { declare: /[ilun]/, typeset: /[ilun]/, local: /[ilun]/, readonly: null, export: null };
+// Option letters that take an argument, for the builtins that read into named variables.
+const OPTION_ARGS = { read: 'adinNptu', mapfile: 'dnOsuCc', readarray: 'dnOsuCc' };
+
+// A leading assignment word carrying a command substitution.
+function substitutedAssignment(words) {
+  for (const w of words) {
+    if (!ASSIGNMENT_WORD.test(w.raw)) return false;
+    if (/\$\(|`/.test(w.raw)) return true;
+  }
+  return false;
+}
+
+// The words from the command name on: temporary prefix assignments and a plain `builtin` / `command` wrapper
+// are skipped (`command -v …` only looks a name up, so it is left as the command).
+function commandWords(words) {
+  if (substitutedAssignment(words)) return [];
+  let i = 0;
+  while (i < words.length && ASSIGNMENT_WORD.test(words[i].raw)) i++;
+  while ((words[i]?.text === 'builtin' || words[i]?.text === 'command') && !words[i + 1]?.text.startsWith('-')) i++;
+  return words.slice(i);
+}
+
+// Split leading options off `words`: `opts` is each letter prefixed by its sign (`-r+x`), `optArgs` the
+// [letter, argument] pairs.
+function splitOptions(words, argLetters = '', signs = '-') {
+  let opts = '';
+  const optArgs = [];
+  let k = 0;
+  for (; k < words.length; k++) {
+    const t = words[k].text;
+    if (t === '--') { k++; break; }
+    if (t.length < 2 || !signs.includes(t[0])) break;
+    for (let c = 1; c < t.length; c++) {
+      opts += t[0] + t[c];
+      if (argLetters.includes(t[c])) { optArgs.push([t[c], t.slice(c + 1) || words[++k]?.text]); break; }
+    }
+  }
+  return { opts, optArgs, operands: words.slice(k) };
+}
+
+// One persisted `name=value` word: a literal value, or null (unknown) for an append, a subscript or a value
+// this walk cannot evaluate.
+function assignmentBinding(word) {
+  const a = ASSIGNMENT_WORD.exec(word.raw);
+  if (!a) return null;
+  return { name: a[1], val: a[2] || a[3] ? null : literalValue(word.raw.slice(a[0].length).trim()) };
+}
+
+// What a non-cd statement does to the walk's variables, in order: `{ name, val }` binds a literal (val null =
+// now unknown); `{ name, readonly: true }` marks a name bash will refuse to rebind. A name bash leaves unchanged
+// is NOT listed — forgetting a value bash still holds would send a later `cd "$VAR"` to the reported cwd and
+// miss the protected directory it really enters (an attribute-only `readonly LANE`, a command's temporary
+// prefix assignment, a function-only `unset -f`).
+function statementBindings(words) {
+  const forget = (n) => ({ name: n, val: null });
+  if (words.every((w) => ASSIGNMENT_WORD.test(w.raw))) return words.map(assignmentBinding); // persist, in order
+  // A command substitution in an assignment hides where its words end (`X=$(mktemp -d)` tokenizes as two
+  // words), so the rest of the statement cannot be read: every assigned name becomes unknown.
+  if (substitutedAssignment(words)) return words.map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean).map(forget);
+  const cmd = commandWords(words);
+  const name = cmd[0]?.text;
+  const args = cmd.slice(1);
+  const names = (ws) => ws.map((w) => w.text.match(NAME_PREFIX)?.[0]).filter(Boolean);
+  if (Object.hasOwn(DECLARATION_BUILTINS, name)) {
+    const { opts, operands } = splitOptions(args, '', '-+');
+    if (/[fFp]/.test(opts)) return [];
+    const transforms = DECLARATION_BUILTINS[name]?.test(opts) ?? false;
+    const readonly = name === 'readonly' || (name !== 'local' && opts.includes('-r'));
+    const out = [];
+    for (const w of operands) {
+      const bound = assignmentBinding(w);
+      if (bound) out.push(name === 'local' || transforms ? forget(bound.name) : bound);
+      else if (/^[A-Za-z_]\w*$/.test(w.text)) { if (name === 'local' || (transforms && opts.includes('n'))) out.push(forget(w.text)); }
+      else { const n = w.text.match(NAME_PREFIX)?.[0]; if (n) out.push(forget(n)); } // quoted `"N=v"`, `N[i]=v`
+      const n = bound?.name ?? w.text.match(NAME_PREFIX)?.[0];
+      if (readonly && n) out.push({ name: n, readonly: true });
+    }
+    return out;
+  }
+  if (name === 'unset') {
+    const { opts, operands } = splitOptions(args);
+    return opts.includes('f') && !opts.includes('v') ? [] : names(operands).map(forget);
+  }
+  if (name === 'read' || name === 'mapfile' || name === 'readarray') {
+    const { optArgs, operands } = splitOptions(args, OPTION_ARGS[name]);
+    const arr = optArgs.filter(([l]) => name === 'read' && l === 'a').map(([, v]) => v?.match(NAME_PREFIX)?.[0]).filter(Boolean);
+    const targets = name === 'read' ? names(operands) : names(operands).slice(0, 1);
+    const fallback = name === 'read' ? 'REPLY' : 'MAPFILE';
+    return [...(targets.length || arr.length ? targets : [fallback]), ...arr].map(forget);
+  }
+  if (name === 'getopts') return [...names(args.slice(1, 2)), 'OPTARG', 'OPTIND'].map(forget);
+  if (name === 'let') return args.flatMap((w) => [...w.text.matchAll(/[A-Za-z_]\w*/g)].map((m) => forget(m[0])));
+  if (name === 'printf') return printfBindings(cmd).map(forget);
+  return [];
+}
+
+function printfBindings(words) {
+  // Shell words so quoted/escaped options agree, ignoring redirects and their operands.
   if (words[0]?.text !== 'printf') return [];
   const names = [];
   let i = 1;
@@ -2559,31 +2661,42 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
-  // Walk the statements in command order: simple literal `VAR=value` / `export VAR=value` assignments (no
-  // command-subst/globs) feed the variable table, and the FIRST `cd <target>` statement wins (that is where the
+  // Walk the statements in command order, as shell words: literal assignments (bare, or through a declaration
+  // builtin) feed the variable table (`statementBindings`), and the FIRST `cd` statement wins (that is where the
   // command lands before the mutation runs). An assignment after the cd never changes it (#5957).
   const vars = Object.create(null);
+  const readonly = new Set();                                   // names bash refuses to rebind or unset
   let homeCtx = typeof home === 'string' && home.startsWith('/') ? home : null; // unset/relative → no home
+  const apply = (b) => {
+    if (!b || readonly.has(b.name)) return;
+    if (b.readonly) readonly.add(b.name);
+    else if (b.name === 'HOME') homeCtx = b.val?.startsWith('/') ? b.val : null;
+    else if (b.val !== null && !/\s/.test(b.val)) vars[b.name] = b.val; // single-token literal only
+    else delete vars[b.name];
+  };
   for (const stmt of parsed.segments) {
-    const t = stmt.trim();
-    const forget = (name) => { if (name === 'HOME') homeCtx = null; else delete vars[name]; };
-    if (BINDING_STATEMENT.test(t)) { for (const n of t.matchAll(/(?<![\w$])([A-Za-z_]\w*)(?=\+?=|\s|$)/g)) forget(n[1]); continue; }
-    for (const name of printfBindings(t)) forget(name);
-    const m = t.match(/^(?:export\s+)?([A-Za-z_]\w*)(\+?)=(.*)$/);
-    if (m) {
-      const [, name, append, raw] = m;
-      const val = append ? null : literalValue(raw.trim());
-      if (name === 'HOME') homeCtx = val?.startsWith('/') ? val : null;
-      else if (val !== null && !/\s/.test(val)) vars[name] = val; // single-token literal only
-      else forget(name);
+    const words = shellWords(stmt);
+    const cmd = commandWords(words);
+    if (cmd[0]?.text !== 'cd') {
+      for (const b of statementBindings(words)) apply(b);
       continue;
     }
-    const cd = t.match(/^cd\s+(.+)$/);
-    if (!cd) continue;
-    let rest = cd[1].trim();
-    for (let opt; (opt = rest.match(/^(?:--|-[PLe@]+)(?:\s+|$)/));) rest = rest.slice(opt[0].length); // `cd -P -- <dir>`
-    const target = expandCdTarget(rest, vars, homeCtx);
-    if (!target || target === '-') return reportedCwd;        // unresolved / globby / `cd -` / unsupported → fail safe
+    // Options are judged after quote removal and expansion, as bash's cd sees them (`"-P"`, `$OPT`).
+    let target = null;
+    let optionsDone = false;
+    for (const w of cmd.slice(1)) {
+      const v = expandCdTarget(w.raw, vars, homeCtx);
+      if (!v) return reportedCwd;                               // unresolved / globby / unsupported → fail safe
+      if (!optionsDone && v === '--') { optionsDone = true; continue; }
+      if (!optionsDone && v.length > 1 && v.startsWith('-')) {
+        if (!/^-[PLe@]+$/.test(v)) return reportedCwd;          // invalid option: cd fails, cwd unchanged
+        continue;
+      }
+      target = v;
+      break;
+    }
+    if (target === null) return homeCtx ?? reportedCwd;         // no directory operand → HOME
+    if (target === '-') return reportedCwd;                     // `cd -` (OLDPWD) is unknown
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
   return reportedCwd;
