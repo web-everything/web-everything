@@ -367,12 +367,14 @@ export function getRequiredStatusChecks({
       }
     }
     // The entry that outranked this write is what the cache now holds: answer with it, exactly as the next reader
-    // will, so this call never returns a policy (e.g. the declared defaults) the file already superseded.
+    // will, so this call never returns a policy (e.g. the declared defaults) the file already superseded. Every
+    // branch keeps this read's partial floor: a fresh winner may predate a check this read just saw required.
     if (winner) {
-      if (!isLiveCacheEntry(winner)) return withClassic({ checks: withPartial(winner.checks), source: winner.source }, winner);
+      const checks = withPartial(winner.checks);
+      if (!isLiveCacheEntry(winner)) return withClassic({ checks, source: winner.source }, winner);
       return (now - winner.fetchedAtMs) < ttlMs
-        ? withClassic({ checks: winner.checks, source: 'cache' }, winner)
-        : withClassic({ checks: withPartial(winner.checks), source: 'stale-cache', cacheAgeMs: now - winner.fetchedAtMs }, winner);
+        ? withClassic({ checks, source: 'cache' }, winner)
+        : withClassic({ checks, source: 'stale-cache', cacheAgeMs: now - winner.fetchedAtMs }, winner);
     }
     return withClassic({ checks, source }, { classic });
   };

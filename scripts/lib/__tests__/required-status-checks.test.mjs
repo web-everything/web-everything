@@ -759,6 +759,18 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
         .toEqual({ checks: ['test', 'security-scan', 'merge-gate'], source: 'stale-cache', cacheAgeMs: 4000 });
     });
 
+    it('a denied reader answers with a FRESH winning live entry plus its partial floor, never the entry alone', () => {
+      const cachePath = join(dir, 'cache.json');
+      // B (t=1000) caches ['test'] while A (t=2000) is in flight; A then sees a newly required check through rules.
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: () => ['test'] });
+        throw Object.assign(new Error('Resource not accessible by integration (HTTP 403)'), { partialChecks: ['security-scan'] });
+      };
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'security-scan'], source: 'cache' });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test'], source: 'live', fetchedAtMs: 1000 });
+    });
+
     it('an older live read never moves a newer live entry backwards', () => {
       const cachePath = join(dir, 'cache.json');
       const readA = () => {
