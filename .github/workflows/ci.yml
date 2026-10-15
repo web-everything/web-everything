@@ -110,7 +110,10 @@ jobs:
     # this; a HUNG one now gets killed by GitHub itself within the hour instead of waiting 6h, and the
     # new `scripts/conveyor/ci-red-recovery-watch.mjs` hung-run sweep (see its own header) no longer has
     # to out-wait this job to reclaim the PR.
-    timeout-minutes: 15
+    # 2026-10-14 RE-SIZED 15 -> 25: the 2026-09-25 sample above is stale (shards then ran ~4 min; they now take ~9-11 min
+    # on a normal runner). Main went red at 8cd0b3d12 with no code cause: shard 2 needed ~14 min on a slow runner and the
+    # 15-min cap cancelled it. 25 min = ~1.8x the slowest observed; a HUNG shard is still killed within the half hour.
+    timeout-minutes: 25
     strategy:
       # Don't cancel sibling shards when one fails — the `test` aggregator reports the combined red, and
       # cancelling would hide which other shards also failed.
@@ -324,6 +327,12 @@ jobs:
         working-directory: web-everything
         run: npm run check:standards
 
+      # Operator rule 2026-10-13: never commit a host-local home path. Ratchet against
+      # scripts/settings/host-path-baseline.json (may only shrink). Runs on card-only PRs too.
+      - name: Host-local path ratchet
+        working-directory: web-everything
+        run: node scripts/lint-host-paths.mjs
+
   # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
   # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
   # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
@@ -460,9 +469,14 @@ jobs:
 
       - name: Does this PR touch daemon code?
         id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          changed="$(git diff --name-only '${{ github.event.pull_request.base.sha }}' HEAD)"
+          # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
+          # --no-renames preserves the source path when daemon code is moved outside the scope.
+          changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
           hits="$(printf '%s\n' "$changed" | grep -E '^(skills-src/conveyor/|scripts/conveyor/|scripts/lib/daemon-|scripts/lib/gh-app-shim|scripts/lib/main-staleness|scripts/lane-pool|scripts/review-set-label\.mjs$|scripts/operations/[^/]*dispatch[^/]*$|vitest\.soak\.config\.ts$)' || true)"
           if [ -n "$hits" ]; then
             echo "Daemon code touched — running the soak:"; printf '  %s\n' $hits
@@ -481,9 +495,10 @@ jobs:
     if: needs.daemon-soak-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
     # Measured (PR #5195): the stored timings put each break shard at ~17 min on 4 runners (shards 2-4 timed out
-    # at 15 min with every completed test green) and ~13 min on 5 runners, plus install. 20 min keeps headroom
-    # over the 5-runner split instead of sitting a minute under the old cap.
-    timeout-minutes: 20
+    # at 15 min with every completed test green) and ~13 min on 5 runners, plus install.
+    # 2026-10-14 RE-SIZED 15 -> 25: shard 1's 50-tick baseline took 550s on the last green run and 615s (vitest's 10-min
+    # cap) on the run that turned main red at 8cd0b3d12. The vitest timeout (`vitest.soak.config.ts`) must stay below this.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

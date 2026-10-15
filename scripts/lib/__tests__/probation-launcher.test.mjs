@@ -22,6 +22,13 @@ const agyGemini = { ...agyClaude, id: 'antigravity-gemini', model: 'gemini-3.8-f
 const docFixCodex = { id: 'codex', provider: 'codex', model: 'gpt-6-astra', executor: 'codex', launcher: 'scripts/codex-direct-task.mjs', checker: null, taskType: 'doc-fix' };
 
 describe('buildWorkerArgv', () => {
+  it('forwards Codex task attribution and known card/PR without adding Codex flags to other providers', () => {
+    const argv = buildWorkerArgv({ worker: { ...codex, taskType: 'prepare' }, weRoot: '/we', dir: '/lane', taskFile: '/task', card: 17, caller: 'probation-build-run.mjs' });
+    expect(argv.some(arg => arg.startsWith('--task-kind='))).toBe(false);
+    expect(argv).toContain('--usage-task-kind=prepare'); expect(argv).toContain('--card=17'); expect(argv).toContain('--caller=probation-build-run.mjs');
+    expect(buildCheckerArgv({ checker: 'codex', weRoot: '/we', dir: '/lane', taskFile: '/task', pr: 42 })).toContain('--pr=42');
+  });
+
   it('runs the worker\'s own launcher synchronously in the lane, with its model, no gate, JSON out', () => {
     expect(buildWorkerArgv({ worker: agyClaude, weRoot: '/we', dir: '/lane', taskFile: '/lane/.git/t.md', timeoutMs: 1000 })).toEqual([
       '/we/scripts/gemini-direct-task.mjs', '--dir=/lane', '--task-file=/lane/.git/t.md', '--model=claude-sonnet-4-6', '--effort=medium', '--timeout-ms=1000', '--gate=none', '--json',
@@ -33,7 +40,7 @@ describe('buildWorkerArgv', () => {
     expect(() => buildWorkerArgv({ worker: codex, weRoot: '/we', dir: '', taskFile: '/t' })).toThrow(/dir is required/);
   });
   it('the checker is Codex in read-only review mode', () => {
-    expect(buildCheckerArgv({ checker: 'codex', weRoot: '/we', dir: '/l', taskFile: '/c' })).toEqual(['/we/scripts/codex-direct-task.mjs', '--review', '--dir=/l', '--task-file=/c', '--gate=none', '--json']);
+    expect(buildCheckerArgv({ checker: 'codex', weRoot: '/we', dir: '/l', taskFile: '/c' })).toEqual(['/we/scripts/codex-direct-task.mjs', '--review', '--dir=/l', '--task-file=/c', '--gate=none', '--json', '--usage-task-kind=review-checker', '--caller=probation-launcher.mjs']);
     expect(() => buildCheckerArgv({ checker: 'gemini', weRoot: '/we', dir: '/l', taskFile: '/c' })).toThrow();
   });
 });

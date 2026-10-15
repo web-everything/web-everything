@@ -73,6 +73,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
@@ -249,6 +250,25 @@ export function describeReconcileError(e) {
   return describeDispatchFailure(e, m ? m[1] : 'reconcile read');
 }
 
+const REVIEW_TICK_SHARING_STANDARD = Object.freeze({ reusePlan: true, repoConcurrency: 3, phaseTimings: true });
+
+/** Resolve each sharing setting through the policy cascade; malformed overrides keep the lower layer. */
+export function resolveReviewTickSharing(env = process.env) {
+  const source = { reusePlan: 'standard', repoConcurrency: 'standard', phaseTimings: 'standard' };
+  try {
+    const bool = (key) => env?.[key] === '1' ? true : env?.[key] === '0' ? false : undefined;
+    const value = env?.WE_REVIEW_REPO_CONCURRENCY;
+    const n = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : undefined;
+    const r = cascadePolicy('reviewTickSharing', undefined, {
+      env, standard: REVIEW_TICK_SHARING_STANDARD,
+      envValues: { reusePlan: bool('WE_REVIEW_REUSE_PLAN'), repoConcurrency: n, phaseTimings: bool('WE_REVIEW_PHASE_TIMINGS') },
+      valid: { reusePlan: (v) => typeof v === 'boolean', phaseTimings: (v) => typeof v === 'boolean',
+        repoConcurrency: (v) => Number.isInteger(v) && v >= 1 && v <= 8 },
+    });
+    return { ...REVIEW_TICK_SHARING_STANDARD, ...r.value, source: { ...source, ...r.sources } };
+  } catch { return { ...REVIEW_TICK_SHARING_STANDARD, source }; }
+}
+
 /**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
@@ -313,15 +333,24 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
   promoteDrafts = null,
   notePromotions = null,
+  onPlan = null,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
+  const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
+  let rawPrs = null;
+  let rawPrsError = null;
+  let rawPrsFailed = false;
+  if (sharedReads) {
+    try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
+  }
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
-    holdReconcileResults = holdReconcile({ repo }) ?? [];
+    // Both hold sweeps nominate candidates from number/labels; all mutations still use fresh live reads.
+    holdReconcileResults = holdReconcile({ repo, ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];
   }
@@ -343,17 +372,13 @@ export function runReviewTick({
   // channel (`reconcileError`) and — the real functional cost of the old behavior — stops it from silently
   // discarding whatever this repo's tick WOULD have dispatched had the read succeeded; the caller can still
   // retry next tick, exactly as before, just without the double, contradictory report.
-  // #4133 — read ONCE, here, and hand the SAME data into `reconcile` (via injected `readPrs`/`readAgents`
-  // closures) so its own internal fetch is a reuse, not a second call. Isolated in the SAME try/catch as
-  // `reconcile` itself always was — a fetch hiccup here is the identical failure class #xvzwiew's own comment
-  // documents (a flaky `claude`/`gh` spawn under load), just now caught one call frame earlier.
-  const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
+  // Shared PRs were read before the hold sweep; agent discovery and any captured PR-read failure
+  // are isolated with reconcile here. Its injected readers reuse those same snapshots.
   let plan;
-  let rawPrs = null;
   let rawAgents = null;
   try {
     if (sharedReads) {
-      rawPrs = readPrs({ repo });
+      if (rawPrsFailed) throw rawPrsError;
       rawAgents = readAgents({});
       plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents: () => rawAgents });
     } else {
@@ -376,6 +401,7 @@ export function runReviewTick({
     ({ plan, rawPrs } = out);
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
   }
+  try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Keyed by PR number so `tagRound`/`tagStatus` below can look up EACH PR's own already-fetched labels rather
   // than asking `gh` again — `undefined` (a PR the tick's own listing somehow missed, a rare open-PR-appeared-
   // mid-tick race) falls through to each helper's own fresh-read default, never a hard failure.
@@ -590,9 +616,12 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // `authGateOverride` to test the gate itself.
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
-  const perRepo = forEachRepo(repos, (repo) => tick({
-    ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason,
-  }));
+  const perRepoMs = {};
+  const perRepo = forEachRepo(repos, (repo) => {
+    const started = Date.now();
+    try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
+    finally { perRepoMs[repo] = Date.now() - started; }
+  });
   const dispatched = [];
   const failed = [];
   const notStarted = [];
@@ -638,7 +667,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     for (const prNumber of (result.liveProcessPrs ?? [])) liveProcessPrs.push({ repo, prNumber });
   }
   return {
-    repos: perRepo, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes,
+    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
     liveProcessPrs, // #3383 follow-up — see `runReviewTick`'s own field for the why; consumed by `buildCliDaemonEffects`
@@ -674,13 +703,15 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
  */
 export async function runConvertAdvisoryTick({
   reconcile = runReconcilePass, convertAdvisory = dispatchConvertAdvisory, repo = WE_SLUG,
-  readPrs = null, readAgents = null, dryRun = false,
+  readPrs = null, readAgents = null, dryRun = false, plans = null,
 } = {}) {
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let plan;
   let rawPrs = null;
   try {
-    if (sharedReads) {
+    if (plans?.has(repo)) {
+      ({ plan, rawPrs } = plans.get(repo));
+    } else if (sharedReads) {
       rawPrs = readPrs({ repo });
       const rawAgents = readAgents({});
       plan = reconcile({ repo, readPrs: () => rawPrs, readAgents: () => rawAgents });
@@ -735,24 +766,30 @@ export async function runConvertAdvisoryTick({
 /**
  * {@link runConvertAdvisoryTick}, once per watched repo — the SAME per-repo isolation
  * {@link runReviewTickAllRepos} gives `runReviewTick` (a plateau-app outage must never stop WE's own converts),
- * just its own tiny async loop rather than a reuse of `forEachRepo` (that helper is deliberately synchronous —
+ * using a bounded promise pool rather than a reuse of `forEachRepo` (that helper is deliberately synchronous —
  * `fn(repo)`'s return value is captured inline, so an async `fn`'s REJECTION would surface after the loop's own
  * try/catch already returned, as an unhandled rejection rather than a captured `{repo, error}` entry).
- * @param {{repos?:string[], tick?:Function}} [o] - every other option forwards to `tick` for every repo.
+ * @param {{repos?:string[], tick?:Function, concurrency?:number}} [o] - every other option forwards to `tick` for every repo.
  * @returns {Promise<{repos:Array<{repo:string, result?:object, error?:string}>, convertAdvisoriesOwed:number,
  *   posted:Array<object>, skipped:Array<object>, failed:Array<object>, reconcileFailed:Array<{repo:string, error:string}>}>}
  */
 export async function runConvertAdvisoryTickAllRepos({
-  repos = REVIEW_DAEMON_REPOS, tick = runConvertAdvisoryTick, ...tickOpts
+  repos = REVIEW_DAEMON_REPOS, tick = runConvertAdvisoryTick,
+  concurrency = resolveReviewTickSharing().repoConcurrency, ...tickOpts
 } = {}) {
-  const perRepo = [];
-  for (const repo of repos) {
-    try {
-      perRepo.push({ repo, result: await tick({ ...tickOpts, repo }) });
-    } catch (e) {
-      perRepo.push({ repo, error: String((e && e.message) || e).split('\n')[0] });
+  const perRepo = new Array(repos.length);
+  const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
+    ? concurrency : resolveReviewTickSharing().repoConcurrency;
+  let next = 0;
+  const worker = async () => {
+    while (next < repos.length) {
+      const index = next++;
+      const repo = repos[index];
+      try { perRepo[index] = { repo, result: await tick({ ...tickOpts, repo }) }; }
+      catch (e) { perRepo[index] = { repo, error: String((e && e.message) || e).split('\n')[0] }; }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, repos.length) }, worker));
   let convertAdvisoriesOwed = 0;
   const posted = [];
   const skipped = [];
@@ -979,6 +1016,12 @@ export function buildCliDaemonEffects({
   return {
     intervalMs,
     tickOnce: async () => {
+      const started = Date.now();
+      const sharing = resolveReviewTickSharing();
+      const plans = new Map();
+      const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
+      let phaseStarted = Date.now();
+      const phaseMs = {};
       // Live-caught 2026-09-26: the reap runs BEFORE discovery, not after. A hung fix/ci-heal session bound to a
       // `review:pending` PR makes reconcile refuse it (`live-process`); reaping it first lets THIS tick's
       // discovery see the PR free, instead of the next tick — which, while the reaper re-stopped ~1,500 finished
@@ -1002,9 +1045,14 @@ export function buildCliDaemonEffects({
       } catch (e) {
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
+      phaseMs.reap = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
       const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
       log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
-      const result = await runReview();
+      phaseMs.facts = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
+      const result = await runReview({ plans, onPlan });
+      phaseMs.review = Date.now() - phaseStarted;
       // Refreshed for the NEXT tick's own reap call, above — always recomputed from THIS tick's fresh
       // discovery, never accumulated, so a PR that frees up (or a new one that blocks) is reflected within
       // one 120s cycle either way.
@@ -1012,10 +1060,11 @@ export function buildCliDaemonEffects({
       // #xconv1 — its OWN best-effort try/catch, mirroring the session-reap discipline immediately above: a
       // convert-advisory failure (a `gh`/judge hiccup) must never take down the tick's real job (dispatching/
       // tagging reviews), which has already completed by the time this runs.
+      phaseStarted = Date.now();
       let convertAdvisory = null;
       if (convertAdvisoryEnabled) {
         try {
-          convertAdvisory = await runConvertAdvisories();
+          convertAdvisory = await runConvertAdvisories({ plans: sharing.reusePlan ? plans : null, concurrency: sharing.repoConcurrency });
         } catch (e) {
           log.error(`review-daemon: convert-advisory tick failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
         }
@@ -1023,11 +1072,19 @@ export function buildCliDaemonEffects({
         log.error('review-daemon: convert-advisory stage disabled (convertAdvisory.enabled=false) — any PR owed a convert-advisory is stranded');
       }
       // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
+      phaseMs.convert = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
       let prepReview = null;
       try {
         prepReview = await runPrepReview();
       } catch (e) {
         log.error(`review-daemon: prep-review stage failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
+      }
+      phaseMs.prep = Date.now() - phaseStarted;
+      if (sharing.phaseTimings) {
+        const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
+        const repos = Object.entries(result?.perRepoMs ?? {}).map(([repo, ms]) => `${repo.split('/').at(-1)} ${seconds(ms)}`).join(', ');
+        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
       }
       return { ...result, sessionReap, convertAdvisory, prepReview };
     },
