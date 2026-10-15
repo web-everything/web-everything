@@ -1,14 +1,15 @@
 ---
+bornAs: xx6mou1
 kind: task
 status: open
-scope: ["we:scripts/conveyor/__tests__/helpers/fake-gh.mjs"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# fake-gh lock: make the ownership check and rename atomic
+# build-dispatch: per-card PR search must also match by title and bornAs
 
-Ruling card from PR #5270 (operator, 2026-10-15). In we:scripts/conveyor/__tests__/helpers/fake-gh.mjs the stale-lock takeover checks ownership and then renames; a replacement lock acquired between the check and the rename can be renamed away. Test-only race; make check-and-rename atomic (or re-verify after rename) with a test that forces the interleaving.
+Ruling card from PR #5366 (operator, 2026-10-15). In we:skills-src/conveyor/build-dispatch-daemon.mjs (~1792) the per-card PR search excludes PRs that match a card only by title or bornAs, so the duplicate guard can miss an existing PR and dispatch again. Match on title and bornAs too, with a test per match kind.
 
 ## Acceptance
 
