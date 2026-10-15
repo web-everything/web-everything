@@ -1893,9 +1893,18 @@ export function parseClearedHumanProse(body) {
   const m = new RegExp(CLEARED_HUMAN_PROSE_RE.source).exec(text);
   const actor = m ? m[1].trim() : '';
   if (!actor) return null;
-  let reviewedSha = '';
-  for (const s of text.matchAll(new RegExp(REVIEWED_SHA_RE.source, 'g'))) reviewedSha = s[1].toLowerCase();
-  return { actor, end: m.index + m[0].length, reviewedSha };
+  return { actor, end: m.index + m[0].length, reviewedSha: parseReviewedShaMarker(text) };
+}
+
+/**
+ * The `reviewed-sha` MARKER of ONE comment body, lower-cased, last match wins (as `parseReviewedSha`), or ''. Pure.
+ * Only the marker shape counts: `buildVerdictComment` escapes `<!--` in every caller field, so a quoted or prose
+ * `reviewed-sha: …` in a verdict write-up can never be read as the reviewed head.
+ */
+export function parseReviewedShaMarker(body) {
+  let sha = '';
+  for (const m of String(typeof body === 'string' ? body : '').matchAll(new RegExp(REVIEWED_SHA_RE.source, 'g'))) sha = m[1].toLowerCase();
+  return sha;
 }
 
 // The `--to=changes` sibling of `CLEARED_HUMAN_PROSE_RE`: the heading and attribution `buildVerdictComment` renders

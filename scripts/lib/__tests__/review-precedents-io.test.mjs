@@ -8,6 +8,7 @@ import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
 import { FENCED_DATA_RULE } from '../mandate-fence.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { parseChangesVerdictProse } from '../review-escalation.mjs';
+import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -165,6 +166,17 @@ describe('settings and drafting', () => {
     const result = io.recordCitationsFromComments({ repo, pr: 5184, at, info: { ...info, comments: [comment(body, AUTOMATION_LOGINS[0]), comment(body)] } });
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({ kind: 'citation', verdict: 'changes', head: 'abcdef987', ids: ['prec-5184-bulk-link-integrity'], seat: 'panel' });
+  });
+  it('reads the reviewed head from the producer slot, never from quoted reviewed-sha prose', () => {
+    const real = 'abcdef1234567890abcdef1234567890abcdef12', prHead = 'fedcba9876543210fedcba9876543210fedcba98';
+    const quoted = `[precedent:${seeds[0].id}] An earlier round said reviewed-sha: 1111111 and <!-- reviewed-sha: 2222222 -->.`;
+    const automation = body => ({ ...comment(body, AUTOMATION_LOGINS[0]), id: body.length });
+    const accept = buildVerdictComment({ to: 'accepted', actor: 'review-bot', headSha: real, body: quoted });
+    const changes = buildVerdictComment({ to: 'changes', actor: 'review-bot', body: quoted });
+    const advisory = [ADVISORY_NOTE_MARKER, quoted, 'Raw quote: <!-- reviewed-sha: 3333333 -->', '', '---', '',
+      `Net basis: \`0000000..${real}\` — 1 net changed file(s) vs current main (#2450).`].join('\n');
+    const events = io.recordCitationsFromComments({ repo, pr: 9, at, info: { headRefOid: prHead, comments: [accept, changes, advisory].map(automation) } });
+    expect(events.map(e => [e.verdict, e.head])).toEqual([['accept', real], ['changes', prHead], ['advisory', real]]);
   });
   it('round-trips advisory and recurring panel verdicts without losing the latest evidence', () => {
     const bodies = ['**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**', '🔁 review — changes requested', '✅ review — accepted', '🔁 review — changes requested'];

@@ -22,7 +22,8 @@ import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 import { OPERATOR_LOGINS, AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { parseOperatorRulingComment } from './jury-core.mjs';
-import { parseChangesVerdictProse, parseClearedHumanProse } from './review-escalation.mjs';
+import { parseChangesVerdictProse, parseClearedHumanProse, parseReviewedShaMarker } from './review-escalation.mjs';
+import { judgedHead } from '../conveyor/advisory-round-count.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const PRECEDENT_TRANSPORT_BRANCH = 'ops/review-requests';
@@ -232,8 +233,10 @@ export function recordCitationsFromComments({ repo, pr, info, at, stored = [] })
     if (!ids.length) continue;
     const seat = verdict === 'advisory' ? 'advisory' : 'panel';
     const source = comment.id ?? comment.url ?? comment.createdAt;
+    // The reviewed head comes only from the producer's own slot: the `reviewed-sha` marker of a verdict comment,
+    // or the advisory note's `Net basis` footer. Quoted or prose `reviewed-sha:` text is never a head.
     // One spelling per head, so a short or upper-case reviewed-sha folds into the same seat as the full one.
-    const reviewed = /reviewed-sha:\s*([0-9a-f]{7,40})\b/i.exec(body)?.[1]?.toLowerCase();
+    const reviewed = (verdict === 'advisory' ? judgedHead(body) : parseReviewedShaMarker(body)) || undefined;
     const recorded = source == null ? undefined : recordedHead.get(JSON.stringify([source, seat]));
     const prHead = String(info.headRefOid ?? '').toLowerCase();
     const head = reviewed ? [recorded, prHead].find(full => full?.toLowerCase().startsWith(reviewed)) ?? reviewed
