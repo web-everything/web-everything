@@ -778,7 +778,7 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
       const cachePath = join(dir, 'cache.json');
       if (seed) getRequiredStatusChecks({ repo: WE, cachePath, now: 100, readChecks: () => ['old'] });
       const readA = () => {
-        getRequiredStatusChecks({ repo: WE, cachePath, now: 1990, readChecks: () => ['test', 'merge-gate'] });
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1990, ttlMs: 1000, readChecks: () => ['test', 'merge-gate'] });
         throw Object.assign(makeError(), { partialChecks: ['security-scan'] });
       };
       expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, ttlMs: 1000, readChecks: readA }))
