@@ -1927,15 +1927,21 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [] } = {}) {
+export function daemonCloneWriteReason(segment, { cwd = null, roots = [], cdLandings = [] } = {}) {
   if (!roots.length) return null;
   const s = String(segment || '');
+  // PR #5403 review — the segment may run in any directory a `cd` of the command lands in, not only `cwd`
+  // (`cd && cd <clone> && git checkout`, `cd /tmp && cd <clone> && …`): judge it against each of them.
+  const dirs = [cwd, ...cdLandings.filter((d) => d && d !== cwd)];
   const sub = gitSubcommand(s);
   if (sub) {
     if (sub === 'fetch') return null; // #xpt9fvd — diagnosis stays allowed; fetch never touches the working tree
     if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
-    const effectiveDir = gitDashCTarget(s, cwd) || cwd;
-    return isDaemonCloneRealpath(effectiveDir, roots) ? daemonCloneWriteMessage(effectiveDir) : null;
+    for (const dir of dirs) {
+      const effectiveDir = gitDashCTarget(s, dir) || dir;
+      if (isDaemonCloneRealpath(effectiveDir, roots)) return daemonCloneWriteMessage(effectiveDir);
+    }
+    return null;
   }
   const prog = programWord(s);
   const isWrite = isFileWriteRedirect(s);
@@ -1944,10 +1950,12 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [] } = {})
   const targets = isWrite
     ? fileWriteTargets(s)
     : fileOperands(shellTokens(canonicalCommand(s)).filter((t) => !t.op).slice(1));
-  if (!targets.length) return isDaemonCloneRealpath(cwd, roots) ? daemonCloneWriteMessage(cwd) : null;
-  for (const t of targets) {
-    const abs = resolve(cwd || '.', t);
-    if (isDaemonCloneRealpath(abs, roots)) return daemonCloneWriteMessage(abs);
+  for (const dir of dirs) {
+    if (!targets.length && isDaemonCloneRealpath(dir, roots)) return daemonCloneWriteMessage(dir);
+    for (const t of targets) {
+      const abs = resolve(dir || '.', t);
+      if (isDaemonCloneRealpath(abs, roots)) return daemonCloneWriteMessage(abs);
+    }
   }
   return null;
 }
@@ -2974,17 +2982,32 @@ function printfBindings(words) {
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
 // #5957 — `home` is the shell's home source (see `expandCdTarget`); `null` means unset.
 export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
+  return walkCds(command, reportedCwd, resolvePath, home).cwd;
+}
+
+// PR #5403 review — one cwd for the whole command cannot be right for both orders of two cds: the first landing
+// hides a later `cd <clone>`, and any later one hides an earlier. So the daemon-clone arm, whose false denies are
+// cheap, checks EVERY directory a `cd` in the command may land in (the absolute paths only; a relative target
+// after an unknown landing is also read against the reported cwd, as an extra candidate). Pure.
+export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
+  return walkCds(command, reportedCwd, resolvePath, home).landings;
+}
+
+function walkCds(command, reportedCwd, resolvePath, home) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
   // is the conservative answer (the primary-cwd arms stay armed) — and `decide` denies it outright anyway.
   const cmd = stripHeredocBodies(String(command || ''));
-  if (!cmd) return reportedCwd;
+  if (!cmd) return { cwd: reportedCwd, landings: [] };
   const parsed = parseSegments(cmd);
-  if (parsed.unterminated) return reportedCwd;
+  if (parsed.unterminated) return { cwd: reportedCwd, landings: [] };
   // Walk the statements in command order, as shell words: literal assignments (bare, or through a declaration
-  // builtin) feed the variable table (`statementBindings`), and the FIRST `cd` statement wins (that is where the
-  // command lands before the mutation runs). An assignment after the cd never changes it (#5957).
+  // builtin) feed the variable table (`statementBindings`), and the FIRST `cd` statement with a directory
+  // operand decides the cwd (that is where the command lands before the mutation runs). An assignment after
+  // the cd never changes it (#5957). A cd with no directory operand goes to HOME and does not decide: a later
+  // `cd <dir>` still does, as on main, where such a cd was skipped (PR #5403 review). The walk goes on past the
+  // deciding cd only to collect every landing for `resolveCdLandings`.
   // Values of names a readonly surely froze live in `pinned`, the prototype of `vars`: lookups see them, and a
   // clear-all only has to start a fresh `vars` (constant time, however many names are pinned).
   const pinned = Object.create(null);
@@ -3049,6 +3072,17 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     background[j] = /^&(?!&)/.test(seps[j]) || (/^(?:&&|\|\|)/.test(seps[j]) && background[j + 1] === true);
   }
   const subshell = (k) => /^\|(?!\|)/.test(seps[k - 1] ?? '') || /^\|(?!\|)/.test(seps[k] ?? '') || background[k];
+  // `cur` is where the walk has reached: undefined while no cd moved it, null once a cd went somewhere unknown.
+  // `decided` is the effective cwd, fixed by the first cd with a directory operand.
+  let cur;
+  let decided;
+  const landings = [];
+  const land = (dir) => {
+    cur = dir;
+    if (dir !== null && !landings.includes(dir)) landings.push(dir);
+  };
+  // A relative path from an unknown place is read from the reported cwd, as main's resolver read it.
+  const from = (p) => (p.startsWith('/') ? p : resolvePath(cur ?? (reportedCwd || '.'), p));
   let structured = false;
   for (const [k, stmt] of parsed.segments.entries()) {
     if (parsed.commented[k]) continue;                          // begins inside a `#` comment
@@ -3057,7 +3091,11 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     const words = shellWords(stmt);
     const statement = parseStatement(words);
     const { prefix, cmd } = statement;
-    if (statement.opaque && statement.cd) return reportedCwd;   // a cd whose words cannot be trusted
+    if (statement.opaque && statement.cd) {                     // a cd whose words cannot be trusted
+      decided ??= reportedCwd;
+      land(null);
+      continue;
+    }
     if (!subshell(k)) for (const op of expansionOps(stmt)) apply(op, sure);
     if (cmd[0]?.text !== 'cd' || statement.invalid || statement.opaque) {
       if (!subshell(k)) {
@@ -3073,32 +3111,40 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     }
     // Options are judged after quote removal and expansion, as bash's cd sees them (`"-P"`, `$OPT`).
     let target = null;
+    let unknown = false;
     let optionsDone = false;
     for (const w of cmd.slice(1)) {
-      if (w.raw.includes(OPAQUE_BLANK)) return reportedCwd;
+      if (w.raw.includes(OPAQUE_BLANK)) { unknown = true; break; }
       const bare = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w.raw);
       const bareName = bare && (bare[1] ?? bare[2]);
       if (bare && (bareName === 'HOME' ? homeCtx : vars[bareName]) === '') continue; // unquoted empty: no word at all
       const v = expandCdTarget(w.raw, vars, homeCtx);
-      if (!v) return reportedCwd;                               // unresolved / globby / unsupported → fail safe
+      if (!v) { unknown = true; break; }                        // unresolved / globby / unsupported → fail safe
       if (!optionsDone && v === '--') { optionsDone = true; continue; }
       if (!optionsDone && v.length > 1 && v.startsWith('-')) {
-        if (!/^-[PLe@]+$/.test(v)) return reportedCwd;          // invalid option: cd fails, cwd unchanged
+        if (!/^-[PLe@]+$/.test(v)) { unknown = true; break; }   // invalid option: cd fails, cwd unchanged
         continue;
       }
       target = v;
       break;
     }
-    if (target === null) {                                      // no directory operand → HOME, as cd runs
+    if (target === '-') unknown = true;                         // `cd -` (OLDPWD) is unknown
+    if (target === null && !unknown) {                          // no directory operand → HOME, as cd runs
       const temp = prefixValues(prefix);
       const h = temp.has('HOME') ? temp.get('HOME') : homeCtx;
-      if (!h) return reportedCwd;                               // unknown, or empty (cd then stays put)
-      return h.startsWith('/') ? h : resolvePath(reportedCwd || '.', h);
+      if (h === null) land(null);                               // unknown HOME
+      else if (h) land(from(h));                                // an empty HOME leaves cd where it was
+      continue;
     }
-    if (target === '-') return reportedCwd;                     // `cd -` (OLDPWD) is unknown
-    return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
+    if (unknown) {                                              // unknown target, `cd -` or a cd that fails
+      decided ??= reportedCwd;
+      land(null);
+      continue;
+    }
+    land(from(target));
+    decided ??= cur;
   }
-  return reportedCwd;
+  return { cwd: decided ?? cur ?? reportedCwd, landings };
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -3930,7 +3976,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, cdLandings = [], daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3942,7 +3988,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, cdLandings });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4936,6 +4982,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
+  let cdLandings = [];
   let daemonRoots = [];
   let hookSessionId = null;
   try {
@@ -4972,6 +5019,7 @@ if (IS_CLI) {
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
     const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
+    cdLandings = resolveCdLandings(cmd, ev.cwd || process.cwd()).map(rp);
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
@@ -4994,7 +5042,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, cdLandings, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

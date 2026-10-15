@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
-  decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd,
+  decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd, resolveCdLandings,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
   isVerificationRun, isBackgrounded, backgroundedVerificationReason, dispatchedAgentVerificationReason,
@@ -540,6 +540,34 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd -P && ls')).toBe(HOME);
     expect(at('cd && ls')).toBe(HOME);
     expect(at('cd && ls', null)).toBe(REPORTED);
+  });
+  // PR #5403 review: on main a bare `cd` was skipped, so a later `cd <clone>` still decided the cwd. A cd with
+  // no directory operand goes to HOME without deciding; the first cd with an operand decides, as before.
+  it('a cd with no directory operand does not decide: a later cd with one still does', () => {
+    expect(at('cd && cd /abs/clone && git checkout --detach')).toBe('/abs/clone');
+    expect(at('cd -P; cd /abs/clone && git checkout --detach')).toBe('/abs/clone');
+    expect(at('E=; cd $E && cd /abs/clone && ls')).toBe('/abs/clone');
+    expect(at('cd && cd clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd && cd /abs/clone && ls', null)).toBe('/abs/clone');
+    expect(at('cd && cd clone && ls', null)).toBe(`${REPORTED}/clone`);
+    expect(at('HOME=/h; cd; cd -P; cd /abs/clone')).toBe('/abs/clone');
+    // the first cd with an operand still decides, whatever its spelling
+    expect(at('cd /lane && cd /abs/clone && ls')).toBe('/lane');
+    expect(at('command cd /tmp && cd /abs/clone && ls')).toBe('/tmp');
+    expect(at('command cd "$UNKNOWN" && cd /abs/clone && ls')).toBe(REPORTED);
+    expect(at('FOO=1 cd /abs/clone && git checkout --detach; cd /bin')).toBe('/abs/clone');
+  });
+  it('resolveCdLandings lists every directory a cd of the command may land in', () => {
+    const lands = (cmd, home = HOME) => resolveCdLandings(cmd, REPORTED, undefined, home);
+    expect(lands('ls')).toEqual([]);
+    expect(lands('cd && cd /abs/clone && ls')).toEqual([HOME, '/abs/clone']);
+    expect(lands('cd /tmp && cd /abs/clone && ls')).toEqual(['/tmp', '/abs/clone']);
+    expect(lands('command cd /tmp && cd clone && ls')).toEqual(['/tmp', '/tmp/clone']);
+    expect(lands('HOME=/abs/clone; cd && ls; cd /tmp')).toEqual(['/abs/clone', '/tmp']);
+    // after an unknown landing, a relative target is read from the reported cwd
+    expect(lands('cd "$UNKNOWN" && cd clone')).toEqual([`${REPORTED}/clone`]);
+    expect(lands('cd && cd clone', null)).toEqual([`${REPORTED}/clone`]);
+    expect(lands('cd - && cd /abs/clone')).toEqual(['/abs/clone']);
   });
   it('cd options are recognised after quote removal and expansion, as bash sees them', () => {
     for (const cmd of [
@@ -3943,6 +3971,21 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
       ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
     ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+    it.each([
+      ['bare cd', `cd && cd ${fakeClone} && git checkout --detach`],
+      ['option-only cd', `cd -P && cd ${fakeClone} && git checkout --detach`],
+      ['command cd', `command cd /tmp && cd ${fakeClone} && git checkout --detach`],
+      ['prefixed cd', `FOO=1 cd /tmp && cd ${fakeClone} && git checkout --detach`],
+      ['plain cd', `cd /tmp && cd ${fakeClone} && git checkout --detach`],
+    ])('DENIES checkout when a later cd lands in the clone after a %s', (_n, cmd) => denies(cmd));
+    it.each([
+      ['bare cd into a HOME set to the clone', `HOME=${fakeClone}; cd && git checkout --detach; cd /tmp`],
+      ['prefixed cd into the clone', `FOO=1 cd ${fakeClone} && git checkout --detach; cd /bin`],
+      ['relative cd after an unknown one', 'cd "$UNKNOWN_DIR" && cd ../some-new-daemon-clone && rm f'],
+    ])('DENIES a write when an earlier cd lands in the clone: %s', (_n, cmd) => denies(cmd));
+    it('keeps a read in the clone followed by a lane listing allowed', () => {
+      expect(runHook(`cd ${fakeClone} && git status; cd ${lane} && ls`, lane, root)).toBeNull();
+    });
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
     });
