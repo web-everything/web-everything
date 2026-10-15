@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
+  extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
@@ -1519,5 +1519,30 @@ describe('concurrent catch-up rounds', () => {
     expect(s.line).toContain('catchUp.concurrency=1 (tool)');
     expect(s.line).toContain('catchUp.busyIntervalSeconds=30 (platform)');
     expect(resolveSetting({ catchUp: { concurrency: 0, busyIntervalSeconds: -1 } }).catchUp).toMatchObject({ concurrency: 3, busyIntervalSeconds: 60 });
+  });
+});
+
+
+describe('child pass timings', () => {
+  const phases = 'listing=1ms listing.snapshot=2ms listing.target=3ms verdicts=4ms total=10ms';
+  it('extracts the last pass timings from stderr with trailing skip reasons', () => {
+    expect(extractPassTimings(`starting\nmerge-ai-prs · pass timings: listing=9ms total=20ms (considered 2)\nother\nmerge-ai-prs · pass timings: ${phases} (considered 1, merged 0)\n{"skipReasons":[]}\n`)).toBe(phases);
+  });
+  it('returns null when stderr contains no pass timings', () => {
+    expect(extractPassTimings('starting\n{"skipReasons":[]}\n')).toBeNull();
+  });
+  it.each(['close', 'error'])('logs split timings after they leave the stderr tail on child %s', async (event) => {
+    const { handle, lines, advance, children } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    const tick = handle.tick();
+    await new Promise((r) => setImmediate(r));
+    const child = children[0];
+    child.stderr.emit('data', 'merge-ai-prs · pass tim');
+    child.stderr.emit('data', `ings: ${phases} (considered 1)\n${'x'.repeat(2500)}\n`);
+    child.stdout.emit('data', JSON.stringify({ considered: 1, toMerge: [{ num: 42 }], failed: [], skipReasons: [] }));
+    child.emit(event, event === 'close' ? 0 : new Error('fake child error'));
+    await tick;
+    expect(lines.find((line) => line.includes('fast drain exit'))).toContain(` · phases: ${phases}`);
   });
 });

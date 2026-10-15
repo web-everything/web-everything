@@ -3399,6 +3399,11 @@ describe('#101 operator send-back re-arms a red-CI PR once as a fix', () => {
     expect(r.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'operator-send-back',
       operatorSendBack: expect.objectContaining({ login: 'chalbert', body: 'MUST FIX: rename the export.' }) })]);
   });
+  it('keeps comment removal from forming a new comment in the operator re-arm body', () => {
+    const r = plan([sendBack({ body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\n<!<!-- hidden -->-- MUST FIX: rename the export. -->' })]);
+    expect(r.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'operator-send-back',
+      operatorSendBack: expect.objectContaining({ body: '<! -- MUST FIX: rename the export. -->' }) })]);
+  });
   it('is one-shot: a recorded repair round afterwards returns the PR to ci-heal', () => {
     const r = plan([sendBack(), { body: REARM_COMMENT_MARKER, author: AUTOMATION }]);
     expect(r.dispatch.map((d) => d.mode)).not.toContain('operator-send-back');

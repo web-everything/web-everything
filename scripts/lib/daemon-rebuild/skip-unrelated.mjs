@@ -137,47 +137,52 @@ function collectSpawnedScripts({ root, files, readFile, exists, byName }) {
  * scanned once; the walk ends when no new script appears, bounded by `MAX_SPAWN_HOPS` — past it the closure is
  * reported incomplete so the caller falls back to "any code file"). Returns the closure with `spawnedNames`
  * (see {@link collectSpawnedScripts}), or `null` when the walk has no usable entry.
+ * `stopWhenIncomplete` avoids further spawn scans when only that conservative decision is needed:
+ * decideSkipRebuild ignores members and spawned names for an incomplete closure.
  */
 export function collectRunClosure({
   root, entries, importClosure = collectImportClosure,
   readFile = (p) => readFileSync(p, 'utf8'),
   exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
   byName = trackedScriptIndex(resolvePath(root)),
+  stopWhenIncomplete = false,
 }) {
   const absRoot = resolvePath(root);
-  // Every hop examines the same pre-move tree. Reuse its reads and path probes across the import
-  // walks and the spawn scan; a shared dependency otherwise gets read again at every spawn depth.
-  // Keep these caches local to this walk so the next rebuild sees changes to the tree.
+  // Each spawn hop re-walks the growing import graph. Reuse this walk's filesystem reads across
+  // hops and the spawn scan; a new invocation gets fresh caches so later tree moves remain visible.
   const sources = new Map();
-  const paths = new Map();
-  const readSource = (p) => {
-    if (!sources.has(p)) sources.set(p, readFile(p));
-    return sources.get(p);
+  const presence = new Map();
+  const parsed = new Map();
+  const readOnce = (path) => {
+    if (!sources.has(path)) sources.set(path, readFile(path));
+    return sources.get(path);
   };
-  const fileExists = (p) => {
-    if (!paths.has(p)) paths.set(p, exists(p));
-    return paths.get(p);
+  const existsOnce = (path) => {
+    if (!presence.has(path)) presence.set(path, exists(path));
+    return presence.get(path);
   };
-  const imports = (starts) => importClosure({ root, entries: starts, readFile: readSource, exists: fileExists });
+  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce, parsed });
   const walked = new Set(entries);
-  let closure = imports([...walked]);
+  let closure = imports();
   if (!closure) return null;
   const spawnedNames = new Set();
   const scanned = new Set();
   let unreadable = false;
   for (let hop = 0; ; hop++) {
+    if (stopWhenIncomplete && !closure.complete) break;
     // package.json's `scripts` entries are commands the daemon (or its npm wrappers) run by name.
-    const unscanned = [...closure.files, ...(hop === 0 && fileExists(join(absRoot, 'package.json')) ? ['package.json'] : [])]
+    const unscanned = [...closure.files, ...(hop === 0 && existsOnce(join(absRoot, 'package.json')) ? ['package.json'] : [])]
       .filter((f) => !scanned.has(f));
     for (const f of unscanned) scanned.add(f);
-    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned, readFile: readSource, exists: fileExists, byName });
+    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned, readFile: readOnce, exists: existsOnce, byName });
     unreadable ||= bad;
     for (const n of names) spawnedNames.add(n);
+    if (stopWhenIncomplete && unreadable) break;
     const fresh = [...targets].filter((t) => !closure.files.has(t) && !walked.has(t));
     if (!fresh.length) break;
     if (hop >= MAX_SPAWN_HOPS) { closure = { ...closure, complete: false }; break; }
     for (const t of fresh) walked.add(t);
-    closure = imports([...walked]) || closure;
+    closure = imports() || closure;
   }
   return { ...closure, complete: closure.complete && !unreadable, spawnedNames };
 }
@@ -232,7 +237,7 @@ export function makeSkipCheck({
       // caller entry the closure stays unknown (null) and the decision falls back to "any code file changed".
       const own = (entries || []).filter(Boolean);
       const smoked = surface(env);
-      try { closure = own.length ? collectRunClosure({ root, entries: [...own, ...smoked], importClosure, readFile, exists }) : null; } catch { closure = null; }
+      try { closure = own.length ? collectRunClosure({ root, entries: [...own, ...smoked], importClosure, readFile, exists, stopWhenIncomplete: true }) : null; } catch { closure = null; }
       // The walk drops an entry that does not exist in the PRE-move tree, so a smoke-surface file the move itself
       // ADDS would read as unrelated: name every surface path as a closure member regardless.
       if (closure?.files instanceof Set) for (const e of smoked) closure.files.add(e);

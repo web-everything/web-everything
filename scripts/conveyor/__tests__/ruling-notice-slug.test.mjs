@@ -41,6 +41,31 @@ describe('ruling notice gh boundary', () => {
     expect(argv).not.toContain('we');
   });
 
+  it('keeps retry receipts separate from the thread snapshot and scopes them to the dispatch target', () => {
+    const snapshot = Object.freeze({ ...ruling, noticedRungs: Object.freeze([]), rung: { id: 'resend' } });
+    const exec = vi.fn();
+    const post = (repo, pr, notice = snapshot) => postRulingNotice({ repo, pr, ruling: notice, exec });
+    expect(post('we', 3794)).toBe(true);
+    expect(post('we', 3794)).toBe(false);
+    expect(post('we', 3795)).toBe(true);
+    expect(post('another-owner/another-repo', 3794)).toBe(true);
+    expect(snapshot.noticedRungs).toEqual([]);
+    expect(post('we', 3794, { ...snapshot, noticedRungs: ['resend'] })).toBe(false);
+    expect(post('we', 3794, { ...snapshot, rung: { id: 'stronger-model' } })).toBe(true);
+    expect(post('we', 3794, { ...snapshot, head: H1 })).toBe(true);
+    expect(exec).toHaveBeenCalledTimes(5);
+  });
+
+  it('retries a notice whose post failed', () => {
+    const snapshot = { ...ruling };
+    const exec = vi.fn().mockImplementationOnce(() => { throw new Error('comment failed'); });
+    const post = () => postRulingNotice({ repo: 'we', pr: 3794, ruling: snapshot, exec });
+    expect(post).toThrow('comment failed');
+    expect(post()).toBe(true);
+    expect(post()).toBe(false);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
   it('releases the claim and classifies a failed notice as an environment fault before spawning', () => {
     const failure = Object.assign(new Error('Command failed: gh pr comment'), {
       status: 1, stderr: 'expected the "[HOST/]OWNER/REPO" format, got "we"',

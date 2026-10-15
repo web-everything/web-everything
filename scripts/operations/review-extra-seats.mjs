@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
 import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '../lib/provider-quota-hold.mjs';
@@ -295,7 +296,7 @@ const capText = (text, max) => {
  * points at the checkout and the input files.
  * @param {{pr:number, repo:string, title:string, dir?:string, diffFile?:string, bodyFile?:string, inline?:{diffText:string, body:string}, changedFiles:string[], seats:Array<object>}} o
  */
-export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline = null, changedFiles = [], seats }) {
+export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline = null, changedFiles = [], seats, openOperatorSendBacks: open = [] }) {
   const keys = seats.map((s) => s.key);
   const example = Object.fromEntries(keys.map((k) => [k, { verdict: 'accept', findings: [] }]));
   const where = inline
@@ -321,6 +322,7 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
     'Other reviewers cover the mandatory lenses; you cover ONLY the seat(s) below. Your findings are recorded as evidence and never block the PR on their own.',
     '',
     ...where,
+    renderOperatorSendBackReviewBlock(open),
     '',
     'YOUR SEAT(S):',
     ...seats.map((s) => `- ${lensDescription(s)}`),
@@ -615,7 +617,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         const taskFile = join(inputDir, `task-${provider}${suffix}.md`);
         const inline = INLINE_BRIEF_PROVIDERS.includes(provider) ? { diffText: read.diffText, body: read.body ?? '' } : null;
         io.writeFile(taskFile, buildSeatTask({
-          pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], seats: group,
+          pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], seats: group, openOperatorSendBacks: read.openOperatorSendBacks,
         }));
         const { model, effort } = group[0];
         const t0 = io.now();
@@ -984,7 +986,7 @@ export function resolveBuilder({ body = '', headMessage = '' } = {}) {
  * The red team's brief. PURE. Same two shapes as {@link buildSeatTask}: `inline` for a tool-free seat (Gemini),
  * else the read-only checkout (Codex).
  */
-export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inline = null, changedFiles = [], claudeFindings = null }) {
+export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inline = null, changedFiles = [], claudeFindings = null, openOperatorSendBacks: open = [] }) {
   const files = changedFiles.length ? `Changed files: ${changedFiles.slice(0, 60).join(', ')}${changedFiles.length > 60 ? ', …' : ''}` : '';
   const where = inline
     ? [
@@ -1012,6 +1014,7 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     'Your findings are advisory evidence; each will be re-checked independently, so report only breaks you can justify.',
     '',
     ...where,
+    renderOperatorSendBackReviewBlock(open),
     ...known,
     '',
     'For every break: name the exact input or sequence that fails, what happens, and what should happen instead.',
@@ -1278,7 +1281,7 @@ export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = proces
  */
 export function redTeamReadFingerprint(read) {
   if (!read || typeof read !== 'object') return null;
-  const basis = JSON.stringify([read.netBasis?.rev ?? null, String(read.diffText ?? ''), read.title ?? '', read.body ?? '', read.netChangedFiles ?? []]);
+  const basis = JSON.stringify([read.netBasis?.rev ?? null, String(read.diffText ?? ''), read.title ?? '', read.body ?? '', read.netChangedFiles ?? [], read.openOperatorSendBacks ?? []]);
   return createHash('sha256').update(basis).digest('hex');
 }
 
@@ -1369,7 +1372,7 @@ export async function speculateRedTeam({
       const taskFile = join(inputDir, `task-red-team-${provider}.md`);
       const inline = INLINE_BRIEF_PROVIDERS.includes(provider) ? { diffText: read.diffText, body: read.body ?? '' } : null;
       io.writeFile(taskFile, buildRedTeamTask({
-        pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], claudeFindings,
+        pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], claudeFindings, openOperatorSendBacks: read.openOperatorSendBacks,
       }));
       const t0 = io.now();
       let run;
@@ -1584,6 +1587,7 @@ export function replayPayload({ view, diffText }) {
         title: view?.title ?? '', body: view?.body ?? '', diffText: String(diffText ?? ''),
         netChangedFiles: (view?.files ?? []).map((f) => f.path).filter(Boolean),
         netBasis: { rev: view?.headRefOid ?? null },
+        openOperatorSendBacks: openOperatorSendBacks(view),
       },
     },
   };
@@ -1663,7 +1667,10 @@ if (IS_CLI) {
     const pr = Number(flag('pr'));
     const view = JSON.parse(ghRead(['pr', 'view', String(pr), `--repo=${flag('repo')}`, '--json', 'title,body,headRefOid,files']));
     const diffText = ghRead(['pr', 'diff', String(pr), `--repo=${flag('repo')}`]);
-    runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view, diffText }), post: false, record: false })
+    // Card 341: the open operator send-backs come from the COMPLETE thread (the shared reader), never a truncated view.
+    import('../conveyor/pr-comments-complete.mjs')
+      .then(({ readCompletePrComments }) => readCompletePrComments(pr, { repo: flag('repo') }))
+      .then((comments) => runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view: { ...view, comments }, diffText }), post: false, record: false }))
       .then((result) => emit(result, renderRedTeamSummary));
   } else {
     process.stderr.write('usage: review-extra-seats.mjs run|red-team --pr=<n> --repo=<owner/repo> --lane=<path> --loop-json=<file> [--no-post]\n'

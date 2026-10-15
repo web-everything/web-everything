@@ -29,16 +29,26 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
  * Never throws: an unreadable entry returns `null` (the caller's conservative fallback).
- * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean}} o
+ * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
+ * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
+ * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
  * @returns {{files:Set<string>, complete:boolean, bareDeps:boolean, jsonNames:Set<string>}|null}
  */
 export function collectImportClosure({
   root, entries, readFile = (p) => readFileSync(p, 'utf8'),
   exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
+  parsed = new Map(),
 }) {
   const absRoot = resolvePath(root);
+  // Shared dependencies occur on many edges. Cache probes for this tree snapshot only;
+  // a later invocation must observe added/deleted files, including prior misses.
+  const presence = new Map();
+  const existsOnce = (path) => {
+    if (!presence.has(path)) presence.set(path, exists(path));
+    return presence.get(path);
+  };
   const starts = (entries || []).filter(Boolean).map((e) => (isAbsolute(e) ? e : resolvePath(absRoot, e)))
-    .filter((e) => !relative(absRoot, e).startsWith('..') && exists(e));
+    .filter((e) => !relative(absRoot, e).startsWith('..') && existsOnce(e));
   if (!starts.length) return null;
   const seen = new Set();
   const jsonNames = new Set();
@@ -49,23 +59,34 @@ export function collectImportClosure({
     const file = stack.pop();
     if (seen.has(file)) continue;
     seen.add(file);
-    let src;
-    try { src = readFile(file); } catch { complete = false; continue; }
-    for (const m of src.matchAll(IMPORT_SPEC_RE)) {
-      const spec = m[2];
-      if (spec.startsWith('./') || spec.startsWith('../')) {
-        const hit = resolveRelativeSpec(file, spec, exists);
-        if (hit && !relative(absRoot, hit).startsWith('..')) stack.push(hit);
-      } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
-        bareDeps = true;
+    let info = parsed.get(file);
+    if (!info) {
+      info = { imports: [], jsonNames: new Set(), complete: true, bareDeps: false };
+      let src;
+      try { src = readFile(file); } catch { info.complete = false; }
+      if (src !== undefined) {
+        for (const m of src.matchAll(IMPORT_SPEC_RE)) {
+          const spec = m[2];
+          if (spec.startsWith('./') || spec.startsWith('../')) {
+            const hit = resolveRelativeSpec(file, spec, existsOnce);
+            if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
+          } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
+            info.bareDeps = true;
+          }
+        }
+        for (const m of src.matchAll(JSON_LITERAL_RE)) info.jsonNames.add(basename(m[1]));
+        for (const line of src.split('\n')) {
+          const t = line.trim();
+          if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) continue;
+          if (NONLITERAL_DYNAMIC_IMPORT_RE.test(t.replace(/\/\/.*$/, ''))) { info.complete = false; break; }
+        }
       }
+      parsed.set(file, info);
     }
-    for (const m of src.matchAll(JSON_LITERAL_RE)) jsonNames.add(basename(m[1]));
-    for (const line of src.split('\n')) {
-      const t = line.trim();
-      if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) continue;
-      if (NONLITERAL_DYNAMIC_IMPORT_RE.test(t.replace(/\/\/.*$/, ''))) { complete = false; break; }
-    }
+    stack.push(...info.imports);
+    for (const name of info.jsonNames) jsonNames.add(name);
+    complete &&= info.complete;
+    bareDeps ||= info.bareDeps;
   }
   return { files: new Set([...seen].map((f) => relative(absRoot, f))), complete, bareDeps, jsonNames };
 }

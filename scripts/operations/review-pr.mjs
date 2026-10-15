@@ -1,3 +1,4 @@
+import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
@@ -1364,6 +1365,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     ...(referralVerified.length ? { referralVerified } : {}),
     ...(referralOpenHeads.length ? { referralOpenHeads } : {}),
     hasReferralRecord: JSON.stringify(raw.comments ?? []).includes('mandatory-referrals-v1'),
+    openOperatorSendBacks: openOperatorSendBacks({ comments: raw.comments, headRefOid: pinnedSha(net.revSha) ?? pinnedSha(net.rev) }),
     priorRounds: Number(raw?.priorRounds) || 0,
     latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
     // Card 5469 — the scoped re-review shadow mode, resolved by the io shell from the declared setting. Absent when
@@ -1444,6 +1446,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
 /** The material a juror sees: the PR's description and the NET diff, and nothing else (#2336 context isolation). */
 export function renderJudgeInput(read) {
   const lines = [
+    ...(read.openOperatorSendBacks?.length ? [renderOperatorSendBackReviewBlock(read.openOperatorSendBacks)] : []),
     `PR ${read.repo}#${read.pr} — ${read.title}`,
     '',
     '## PR description',
@@ -2226,7 +2229,7 @@ export function deriveAdvisoryOutcome(verdict) {
  */
 export function advisoryLabelOutcome({ read, verdict } = {}) {
   if (!read || read.degraded || !read.netBasis?.rev) return null;
-  return deriveAdvisoryOutcome(verdict);
+  return operatorSendBackVerdict(deriveAdvisoryOutcome(verdict), read.openOperatorSendBacks);
 }
 
 /**
@@ -3029,7 +3032,7 @@ export function reviewPrOperation({
         const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
           known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims,
           reasons: knownVerificationReasons(read.referralVerified, read.netBasis?.rev) });
-        const panelVerdict = derivePanelVerdict({
+        const panelVerdict = operatorSendBackVerdict(derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
           humanRequired: read.humanRequired === true,
           // #xu2pp2m — THE BASIS THIS PANEL ACTUALLY JUDGED ON. `read.degraded` is already the fact every
@@ -3047,7 +3050,7 @@ export function reviewPrOperation({
           // be undone one gate later.
           // It is the verdict basis WITHOUT the advisory Codex seat.
           findings: buildPanelFindings(verdictAdmitted),
-        });
+        }), read.openOperatorSendBacks);
         // Held: every verdict the loop can turn into an accept by itself — a clean accept, and a prevention-outstanding one (the loop
         // files the guard, then accepts). A `changes` verdict still bounces to the fixer; the round-cards accept refuses it
         // (`roundCardsRefusal`), and `planRecordDecision` refuses any agent-addressed accept while this list is non-empty.
