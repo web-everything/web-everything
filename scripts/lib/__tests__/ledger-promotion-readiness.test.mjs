@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { PROMOTION_DEFAULTS, resolvePromotionSettings, formatPromotionSettings, reclassifyRow, readShadowRuns, measureReadiness, formatReadinessLine } from '../ledger-promotion-readiness.mjs';
+import { PROMOTION_DEFAULTS, COUNT_RECORDS_AFTER_DEFAULT, splitAtCutoff, resolvePromotionSettings, formatPromotionSettings, reclassifyRow, readShadowRuns, measureReadiness, formatReadinessLine } from '../ledger-promotion-readiness.mjs';
 describe('promotion settings', () => {
   it('cascades with sources and ignores invalid layers', () => {
     expect(resolvePromotionSettings()).toMatchObject({ settings: PROMOTION_DEFAULTS, sources: { windowDays: 'standard' } });
@@ -34,7 +34,7 @@ describe('promotion evidence', () => {
     const runs = [{ input: { at: '2026-10-13T12:00:00Z', schema: 2 }, findings: {
       rows: [{ repo: 'o/r', pr: 1, ...legacy('hold:drain:codeql') }], rowsTruncated: true,
     } }];
-    const m = measureReadiness(runs, { now: '2026-10-13T14:00:00Z', settings: PROMOTION_DEFAULTS });
+    const m = measureReadiness(runs, { now: '2026-10-13T14:00:00Z', settings: { ...PROMOTION_DEFAULTS, countRecordsAfter: null } });
     expect(m.disagree).toBe(1);
     expect(m.transient).toBe(0);
     expect(m.blockers).toContain('incompleteRecords');
@@ -44,13 +44,36 @@ describe('promotion evidence', () => {
     const r = { repo: 'O/R', pr: 1, status: 'agree' };
     const runs = [run('2026-10-11T03:00:00Z', [r]), run('2026-10-12T12:00:00Z', [r, { ...r, pr: 2, ...legacy('hold:drain:codeql') }], 1),
       run('2026-10-13T12:00:00Z', [r, { ...r, pr: 3, status: 'disagree', direction: 'ledger-clears-label-holds', reason: 'unsafe' }, { ...r, pr: 4, status: 'unreadable' }])];
-    const m = measureReadiness(runs, { now: '2026-10-13T14:00:00Z', settings: { ...PROMOTION_DEFAULTS, windowDays: 2 } });
+    const m = measureReadiness(runs, { now: '2026-10-13T14:00:00Z', settings: { ...PROMOTION_DEFAULTS, windowDays: 2, countRecordsAfter: null } });
     expect(m).toMatchObject({ window: { from: '2026-10-12', to: '2026-10-13' }, records: 2, shadowDays: 2, comparedPRs: 4, rows: 5, agree: 2, disagree: 1, unreadable: 1, transient: 1, unsafe: 1, agreementPct: 50, ready: false });
     expect(m.topDisagreeReasons).toEqual([{ reason: 'unsafe', n: 1 }]);
     expect(formatReadinessLine(m, resolvePromotionSettings())).toContain('NOT READY');
-    expect(measureReadiness([], { now: '2026-10-13', settings: PROMOTION_DEFAULTS }).ready).toBe(false);
-    const ready = measureReadiness([run('2026-10-13T12:00:00Z', [r])], { now: '2026-10-13T14:00:00Z', settings: { ...PROMOTION_DEFAULTS, minComparedPRs: 1, minShadowDays: 1 } });
+    expect(measureReadiness([], { now: '2026-10-13', settings: { ...PROMOTION_DEFAULTS, countRecordsAfter: null } }).ready).toBe(false);
+    const ready = measureReadiness([run('2026-10-13T12:00:00Z', [r])], { now: '2026-10-13T14:00:00Z', settings: { ...PROMOTION_DEFAULTS, minComparedPRs: 1, minShadowDays: 1, countRecordsAfter: null } });
     expect(ready.ready).toBe(true);
     expect(formatReadinessLine(ready, resolvePromotionSettings())).toContain('operator flips');
+  });
+});
+
+describe('countRecordsAfter cutoff', () => {
+  const at = (t) => ({ input: { at: t, schema: 2 }, findings: { rows: [{ repo: 'o/r', pr: 1, status: 'disagree', direction: 'ledger-clears-label-holds', reason: 'ledger clears' }] } });
+  it('defaults to the #5174 merge time, cascades repo/env, and rejects junk', () => {
+    expect(resolvePromotionSettings({}).settings.countRecordsAfter).toBe(COUNT_RECORDS_AFTER_DEFAULT);
+    expect(COUNT_RECORDS_AFTER_DEFAULT).toBe('2026-10-13T15:10:00Z');
+    const r = resolvePromotionSettings({ repo: { verdictLedger: { promotion: { countRecordsAfter: null } } } });
+    expect(r.settings.countRecordsAfter).toBeNull(); expect(r.sources.countRecordsAfter).toBe('repo');
+    const e = resolvePromotionSettings({ env: { WE_LEDGER_PROMOTION_COUNT_RECORDS_AFTER: 'garbage' } });
+    expect(e.settings.countRecordsAfter).toBe(COUNT_RECORDS_AFTER_DEFAULT); expect(e.invalid).toEqual(['env.WE_LEDGER_PROMOTION_COUNT_RECORDS_AFTER']);
+    expect(resolvePromotionSettings({ env: { WE_LEDGER_PROMOTION_COUNT_RECORDS_AFTER: '2026-10-14T00:00:00Z' } }).sources.countRecordsAfter).toBe('env');
+    expect(formatPromotionSettings(r)).toMatch(/countRecordsAfter=null \(repo\)/);
+  });
+  it('excludes only records at or before the cutoff and reports them; never drops later or undated ones', () => {
+    const runs = [at('2026-10-13T15:09:59Z'), at('2026-10-13T15:10:00Z'), at('2026-10-13T15:10:01Z')];
+    const m = measureReadiness(runs, { now: '2026-10-13T20:00:00Z', settings: { ...PROMOTION_DEFAULTS, countRecordsAfter: '2026-10-13T15:10:00Z' } });
+    expect(m.records).toBe(1); expect(m.unsafe).toBe(1);
+    expect(m.excluded).toMatchObject({ records: 2, rows: 2, countRecordsAfter: '2026-10-13T15:10:00Z' });
+    expect(formatReadinessLine(m, resolvePromotionSettings({}))).toMatch(/excluded 2 record\(s\)/);
+    expect(splitAtCutoff([{ input: { at: 'bad' } }], '2026-10-13T15:10:00Z').kept).toHaveLength(1);
+    expect(splitAtCutoff(runs, null).kept).toHaveLength(3);
   });
 });
