@@ -14,7 +14,12 @@ vi.mock('../../lib/marker-authorship.mjs', async (original) => ({
 import {
   evaluateLandGates, planLandHumanOnly, landHumanOnlyOperation, buildLandComment, finishLandOutcome, LAND_HUMAN_ONLY_EFFECT, LAND_HUMAN_ONLY_MARKER,
 } from '../land-human-only.mjs';
-import { cloneFor, createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv } from '../land-human-only-io.mjs';
+import { cloneFor, createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv, operatorTerminalPresent } from '../land-human-only-io.mjs';
+import { driveRun, renderOutcome } from '../cli-adapter.mjs';
+import { createRegistry } from '../registry.mjs';
+import { startRun } from '../engine.mjs';
+import { evaluatePrGates } from '../../lib/merge-gate-ci.mjs';
+import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const head = 'a'.repeat(40);
 const repo = 'o/r';
@@ -158,9 +163,34 @@ const cred = () => ({ login: 'chalbert', token: 'tok-operator', bin: '/real/gh' 
 describe('land-human-only — the sink', () => {
   const verdict = (over = {}) => planLandHumanOnly(read(over), input());
 
+  it('refuses an unattended invocation with a matching actor before reading credentials or writing', async () => {
+    const { exec, calls } = scriptedExec();
+    const credential = vi.fn(cred);
+    await expect(createLandHumanOnlySinks({ exec, credential, interactive: () => false })[LAND_HUMAN_ONLY_EFFECT]({
+      verdict: verdict(),
+    })).rejects.toThrow(/operator terminal/i);
+    expect(credential).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    [{ enqueueErrors: [{ message: 'GraphQL enqueue refused' }] }, 'GraphQL enqueue refused'],
+    [{ inQueue: false }, 'enqueue returned but isInMergeQueue is false'],
+  ])('renders the enqueue failure in the terminal (%j)', async (options, error) => {
+    const { exec } = scriptedExec(options);
+    const result = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    const run = { id: 'land-failed', op: 'land-human-only', findings: {}, verdict: verdict(),
+      effects: [{ type: LAND_HUMAN_ONLY_EFFECT, step: 'write', status: 'applied', result }] };
+    const rendered = renderOutcome({ outcome: { run, stopped: 'complete', applied: run.effects } });
+    const finished = finishLandOutcome({ run, ...rendered });
+    expect(finished.code).toBe(1);
+    expect(finished.lines.join('\n')).toContain(`failed — ${error}`);
+    expect(finished.lines.join('\n')).not.toContain('undefined');
+  });
+
   it.each([true, false])('preserves the enqueue outcome when the audit comment throws (queued=%s)', async (inQueue) => {
     const { exec } = scriptedExec({ inQueue, commentError: 'audit unavailable' });
-    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
     expect(out).toMatchObject({ outcome: inQueue ? 'applied' : 'failed', ok: inQueue, queued: inQueue,
       commentUrl: null, commentError: 'audit unavailable' });
     if (!inQueue) expect(out.error).toContain('isInMergeQueue is false');
@@ -171,7 +201,7 @@ describe('land-human-only — the sink', () => {
 
   it('enqueues with expectedHeadOid on the real gh with the operator token, verifies, then comments', async () => {
     const { exec, calls } = scriptedExec();
-    const sinks = createLandHumanOnlySinks({ exec, credential: cred });
+    const sinks = createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true });
     const out = await sinks[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
     expect(out).toMatchObject({ outcome: 'applied', ok: true, queued: true, labelled: false });
     const enqueue = calls.find((c) => c.args.join(' ').includes('enqueuePullRequest'));
@@ -187,7 +217,7 @@ describe('land-human-only — the sink', () => {
 
   it('labels first when ready-to-merge is absent', async () => {
     const { exec, calls } = scriptedExec({ labels: [] });
-    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict({ labelPresent: false, labelDecision: { label: true } }) });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict({ labelPresent: false, labelDecision: { label: true } }) });
     expect(out.labelled).toBe(true);
     expect(calls[1].args).toEqual(['pr', 'edit', '7', '--repo', repo, '--add-label', 'ready-to-merge']);
     expect(calls[1].bin).toBe('gh');
@@ -195,20 +225,20 @@ describe('land-human-only — the sink', () => {
 
   it('a head that moved refuses before any write', async () => {
     const { exec, calls } = scriptedExec({ liveHead: 'b'.repeat(40) });
-    await expect(createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/head moved/);
+    await expect(createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/head moved/);
     expect(calls).toHaveLength(1);
   });
 
   it('does not confirm the planned head queued when the verification head moved', async () => {
     const { exec, calls } = scriptedExec({ queueHead: 'b'.repeat(40) });
-    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
     expect(out).toMatchObject({ outcome: 'failed', ok: false, queued: false, error: expect.stringContaining('head moved') });
     expect(calls.at(-1).body).toContain('not queued: PR head moved');
   });
 
   it('refuses a forged actor at the sink before any write', async () => {
     const { exec, calls } = scriptedExec();
-    await expect(createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({
+    await expect(createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({
       verdict: { ...verdict(), actor: 'another-operator' },
     })).rejects.toThrow(/credential changed/);
     expect(calls).toHaveLength(1);
@@ -216,37 +246,69 @@ describe('land-human-only — the sink', () => {
 
   it('isInMergeQueue false is a failure, recorded on the PR', async () => {
     const { exec, calls } = scriptedExec({ inQueue: false });
-    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
     expect(out).toMatchObject({ outcome: 'failed', ok: false, queued: false });
     expect(calls.at(-1).body).toContain('not queued: enqueue returned but isInMergeQueue is false');
   });
 
   it('a GraphQL refusal is a failure, recorded on the PR', async () => {
     const { exec, calls } = scriptedExec({ enqueueErrors: [{ message: 'Required status check "merge-gate" is failing' }] });
-    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred, interactive: () => true })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
     expect(out.outcome).toBe('failed');
     expect(calls.at(-1).body).toContain('merge-gate');
   });
 
   it('a changed credential refuses before any write', async () => {
     const { exec, calls } = scriptedExec();
-    const sinks = createLandHumanOnlySinks({ exec, credential: () => ({ login: 'other', token: 't', bin: '/real/gh' }) });
+    const sinks = createLandHumanOnlySinks({ exec, credential: () => ({ login: 'other', token: 't', bin: '/real/gh' }), interactive: () => true });
     await expect(sinks[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/credential changed/);
     expect(calls).toHaveLength(1);
   });
 });
 
 describe('land-human-only — the operator credential', () => {
+  it.each([
+    [{}, {}, false], [{ isTTY: true }, {}, false], [{}, { isTTY: true }, false],
+    [{ isTTY: true }, { isTTY: true }, true],
+  ])('requires both terminal streams (%j, %j)', (input, output, expected) => {
+    expect(operatorTerminalPresent({ input, output, env: {} })).toBe(expected);
+  });
+  it.each(['CODEX_THREAD_ID', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CI'])(
+    'refuses an agent/CI pseudo-terminal marked by %s', (key) => {
+      const interactive = () => operatorTerminalPresent({ input: { isTTY: true }, output: { isTTY: true }, env: { [key]: 'session' } });
+      expect(interactive()).toBe(false);
+      const resolveBin = vi.fn(() => '/real/gh');
+      expect(resolveOperatorCredential({ interactive, resolveBin }).error).toMatch(/operator terminal/i);
+      expect(resolveBin).not.toHaveBeenCalled();
+    },
+  );
+  it('checks the terminal again when applying a saved plan', async () => {
+    const { exec, calls } = scriptedExec();
+    const credential = vi.fn(cred);
+    const interactive = () => operatorTerminalPresent({ input: { isTTY: true }, output: { isTTY: true }, env: { CODEX_THREAD_ID: 'agent' } });
+    const verdict = planLandHumanOnly(read(), input());
+    await expect(createLandHumanOnlySinks({ exec, credential, interactive })[LAND_HUMAN_ONLY_EFFECT]({ verdict })).rejects.toThrow(/operator terminal/i);
+    expect(credential).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+  it('does not resolve the real gh or its stored login without an operator terminal', () => {
+    const resolveBin = vi.fn(() => '/real/gh');
+    const readToken = vi.fn(() => 'tok');
+    const out = resolveOperatorCredential({ resolveBin, readToken, interactive: () => false });
+    expect(out.error).toMatch(/operator terminal/i);
+    expect(resolveBin).not.toHaveBeenCalled();
+    expect(readToken).not.toHaveBeenCalled();
+  });
   it('resolves the login with the real gh and the stored token, never the App token', () => {
     const seen = [];
-    const out = resolveOperatorCredential({ resolveBin: () => '/real/gh', readToken: ({ bin }) => (bin === '/real/gh' ? 'tok' : null),
+    const out = resolveOperatorCredential({ interactive: () => true, resolveBin: () => '/real/gh', readToken: ({ bin }) => (bin === '/real/gh' ? 'tok' : null),
       exec: (bin, args, opts) => { seen.push({ bin, args, env: opts.env }); return 'chalbert\n'; } });
     expect(out).toEqual({ login: 'chalbert', token: 'tok', bin: '/real/gh' });
     expect(seen[0].env.GH_TOKEN).toBe('tok');
   });
   it('no real gh or no stored login is an error, not a fallback', () => {
-    expect(resolveOperatorCredential({ resolveBin: () => null }).error).toMatch(/no real gh/);
-    expect(resolveOperatorCredential({ resolveBin: () => '/real/gh', readToken: () => null }).error).toMatch(/no stored login/);
+    expect(resolveOperatorCredential({ interactive: () => true, resolveBin: () => null }).error).toMatch(/no real gh/);
+    expect(resolveOperatorCredential({ interactive: () => true, resolveBin: () => '/real/gh', readToken: () => null }).error).toMatch(/no stored login/);
   });
   it('operatorEnv drops an inherited GITHUB_TOKEN', () => {
     expect(operatorEnv('t', { GITHUB_TOKEN: 'app', PATH: '/bin' })).toEqual({ GH_TOKEN: 't', PATH: '/bin' });
@@ -254,6 +316,69 @@ describe('land-human-only — the operator credential', () => {
 });
 
 describe('land-human-only — the reader', () => {
+  async function runWithCeremony(clearedHead) {
+    const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head,
+      body: 'Land the approved workflow update.', title: 'Workflow update', headRefName: 'lane/workflow',
+      labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], commits: [],
+      mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    const exec = (_bin, args) => {
+      if (args[0] === 'pr') return JSON.stringify(live);
+      if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
+      if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
+        pullRequest: { isInMergeQueue: false, headRefOid: head },
+      } } });
+      throw new Error(`unexpected read: ${args.join(' ')}`);
+    };
+    // The transport supplies the recorded ceremony; the drain parses its real markers and evaluates all gates.
+    const comments = clearedHead ? [{ author: { login: 'chalbert' }, body:
+      `<!-- reviewed-sha: ${clearedHead} -->\n<!-- cleared-human: chalbert -->` }] : [];
+    const acceptance = readDrainAcceptance({ pr: 7, repo, carrySetting: 'off',
+      exec: () => JSON.stringify({ headRefOid: head, headRefName: live.headRefName, comments }) });
+    const gather = vi.fn(({ expectedHeadSha, defaultBranch }) => ({
+      repo, num: 7, defaultBranch, pr: live, pinnedHead: { sha: expectedHeadSha },
+      gatePaths: { files: ['.github/workflows/ci.yml'] }, acceptance,
+      manifest: { live: null }, bodyHistory: { bodies: [live.body], complete: true },
+      duplicateIds: { main: [] }, redMain: { source: 'ops/red-main', frozen: false },
+      ledger: { authority: 'labels', folded: null, derived: null }, enqueueClearance: null,
+      netSignals: { scored: true, changedFiles: ['.github/workflows/ci.yml'], diffLines: 2,
+        humanBasisFiles: ['.github/workflows/ci.yml'], cumulativeDiffLines: 2, basisNarrowed: true,
+        netDiffText: { text: '', scored: true }, diffHunks: '' },
+    }));
+    const reader = createLandHumanOnlyReader({ exec, credential: cred, clone: () => '/clone', gather,
+      evaluate: (facts, options) => evaluatePrGates(facts, { ...options, carrySetting: { value: 'off', source: 'test' } }),
+      requiredChecks: () => ['test'], loadPolicy: () => null, redMainOf: () => null, mainCiOf: () => null,
+      ledgerConfigOf: () => ({ authority: 'labels' }), blockOnCodeQLOf: () => true, warn: () => {} });
+    const registry = createRegistry();
+    registry.register(landHumanOnlyOperation({ readLandContext: reader }));
+    const write = vi.fn(() => ({ outcome: 'applied' }));
+    const outcome = await driveRun({ registry, store: { write: () => {} }, sinks: { [LAND_HUMAN_ONLY_EFFECT]: write },
+      run: startRun({ op: 'land-human-only', id: 'ceremony-head', input: input(), registry }) });
+    expect(gather).toHaveBeenCalledWith(expect.objectContaining({ expectedHeadSha: head }));
+    return { outcome, write };
+  }
+
+  it('refuses a clear-human ceremony for a previous head', async () => {
+    const { outcome, write } = await runWithCeremony('b'.repeat(40));
+    expect(String(outcome.error?.message ?? outcome.error)).toMatch(/review-acceptance hold: human-only/);
+    expect(outcome.run.effects).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('permits the write only for a clear-human ceremony at the current head', async () => {
+    const { outcome, write } = await runWithCeremony(head);
+    expect(outcome.error).toBeNull();
+    expect(outcome.stopped).toBe('complete');
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a missing clear-human ceremony with no write effects', async () => {
+    const { outcome, write } = await runWithCeremony(null);
+    expect(String(outcome.error?.message ?? outcome.error)).toMatch(/review-acceptance hold: human-only/);
+    expect(outcome.run.effects).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it('refuses a queued snapshot for a newer head instead of planning a no-op', () => {
     const exec = (_bin, args) => {
       if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, labels: [] });

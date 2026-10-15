@@ -56,13 +56,23 @@ const errLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').p
 const ghJsonWith = (exec) => (args, opts = {}) => JSON.parse(String(exec('gh', args,
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, maxBuffer: 64 * 1024 * 1024, ...opts }) || 'null'));
 
+/** Require terminal streams and reject recognized agent/CI sessions, including ones with a pseudo-terminal. */
+export function operatorTerminalPresent({ input = process.stdin, output = process.stdout, env = process.env } = {}) {
+  const automated = ['CODEX_THREAD_ID', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CI']
+    .some((key) => !!String(env[key] ?? '').trim());
+  return input?.isTTY === true && output?.isTTY === true && !automated;
+}
+const TERMINAL_REQUIRED = 'land-human-only requires an interactive operator terminal (stdin and stdout TTY, outside agent/CI sessions); run the command yourself';
+
 /**
  * The operator's own `gh` login, resolved by name: the first REAL `gh` on PATH (generated App shims skipped) and the
  * token from its stored login (`GH_TOKEN`/`GITHUB_TOKEN` stripped). Never throws, never returns the token to a
  * caller that only asked for the login.
  * @returns {{login:string|null, token:string|null, bin:string|null, error?:string}}
  */
-export function resolveOperatorCredential({ resolveBin = resolveRealGhBinary, readToken = personalGhToken, exec = execFileSync } = {}) {
+export function resolveOperatorCredential({ resolveBin = resolveRealGhBinary, readToken = personalGhToken, exec = execFileSync,
+  interactive = operatorTerminalPresent } = {}) {
+  if (!interactive()) return { login: null, token: null, bin: null, error: TERMINAL_REQUIRED };
   const bin = resolveBin();
   if (!bin) return { login: null, token: null, bin: null, error: 'no real gh binary on PATH' };
   const token = readToken({ bin });
@@ -158,7 +168,8 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
  * The sink. Order: head re-check → label → enqueue (operator credential) → verify → comment. A head that moved
  * throws before anything is written; an enqueue or verify failure is recorded on the PR and returned `failed`.
  */
-export function createLandHumanOnlySinks({ exec = execFileSync, credential = () => resolveOperatorCredential({ exec }) } = {}) {
+export function createLandHumanOnlySinks({ exec = execFileSync, credential = () => resolveOperatorCredential({ exec }),
+  interactive = operatorTerminalPresent } = {}) {
   const readJson = ghJsonWith(exec);
   const gh = (args) => exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 });
   const comment = (repo, pr, body) => {
@@ -171,6 +182,8 @@ export function createLandHumanOnlySinks({ exec = execFileSync, credential = () 
   };
   return {
     [LAND_HUMAN_ONLY_EFFECT]: async ({ verdict }) => {
+      // Check here as well as at credential resolution: a resumed run or another adapter may supply a saved plan.
+      if (!interactive()) throw new Error(TERMINAL_REQUIRED);
       const { repo, pr, head } = verdict;
       const live = readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'id,headRefOid,labels']);
       if (live?.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${live?.headRefOid} since the plan (${head}); nothing written — re-run against the new head`);

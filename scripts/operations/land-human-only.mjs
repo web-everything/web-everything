@@ -33,6 +33,8 @@
  *
  * RUN ONLY ON AN EXPLICIT OPERATOR INSTRUCTION:
  *   node scripts/operations/run.mjs land-human-only --pr=<n> --actor=<login> --channel=<where you said it> --reason='<your words>' [--dry-run]
+ * Run this yourself in an interactive terminal (stdin and stdout must be TTYs). Recognized agent/CI sessions
+ * are refused at credential resolution and at the write, including when resuming a saved plan.
  * `--dry-run` reads every gate and prints the plan; it writes nothing.
  *
  * PURE. The reader and the sink live in `./land-human-only-io.mjs`.
