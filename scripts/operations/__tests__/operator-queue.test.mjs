@@ -60,6 +60,16 @@ it('does not surface an answered hold that lapsed on a new head', () => {
   expect(report.standDownAnswered ?? []).toEqual([]);
 });
 
+it.each([true, false])('omits stale stand-downs from the queue (recorded head: %s)', recorded => {
+  const head = 'b'.repeat(40);
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'fix-loop-exhausted',
+    ...(recorded ? { head: 'a'.repeat(40) } : {}) }) };
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(5195, [held]), headRefOid: head,
+    commits: [{ oid: head, committedDate: '2026-10-15T13:00:00Z' }] }]));
+  run(['--json']);
+  expect(JSON.parse(stdout()).stoodDown).toEqual([]);
+});
+
 it('answers the latest live hold rather than a newer lapsed hold', () => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
   vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');

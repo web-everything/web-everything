@@ -9,14 +9,14 @@
  * `review-status:stood-down` label. Alert-only: the fix for each PR is a human judgment, and the aggregate fix
  * is someone reading the queue.
  */
-import { standDownComments, standDownReason, STAND_DOWN_LABEL } from '../stand-down.mjs';
+import { standDownComments, standDownReason, standDownHeadChangeAt, STAND_DOWN_LABEL } from '../stand-down.mjs';
 import { fmtAge } from '../health-watch-core.mjs';
 
 const hasLabel = (pr, name) => (pr?.labels || []).some((l) => (typeof l === 'string' ? l : l?.name) === name);
 
 /** PURE: `{standDownAt, reason}` for a stood-down PR, or null when it is not stood down. */
 export function standDownOf(pr) {
-  const matches = standDownComments(pr?.comments, { headRefOid: pr?.headRefOid });
+  const matches = standDownComments(pr?.comments, { headRefOid: pr?.headRefOid, headChangedAt: standDownHeadChangeAt(pr) });
   const raw = standDownComments(Array.isArray(pr?.comments)
     ? pr.comments.map((c) => c?.standDownLapsed ? { ...c, standDownLapsed: undefined } : c) : []);
   // All recorded holds lapsed; the remaining label is stale.
