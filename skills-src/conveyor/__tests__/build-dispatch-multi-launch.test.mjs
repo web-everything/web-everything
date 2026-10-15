@@ -35,6 +35,7 @@ function effectsFor(lockRoot, over = {}) {
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
     acquireClaim: ({ num, scope }) => acquireBuildDispatchClaim({ num, scope, owner: 'h:1', pid: process.pid, lockRoot }),
     listRunStoreInFlight: () => [],
+    listPreparePrs: () => [],
     listSettledBuilds: () => [],
     killSwitch: () => ({ engaged: false }),
     // Detached launches (the live path): a pending launch is a success the next tick settles.

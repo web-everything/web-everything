@@ -1455,7 +1455,7 @@ describe('#3606 — dispatchFix always passes the dispatched-agent system prompt
         readBrief: () => '# fix brief for {{PR_NUM}} (item {{ITEM_NUM}}) lane {{LANE}} {{SESSION_SLUG}} {{SCOPE}} {{LANE_REF}}',
         mintSessionId: () => '11111111-1111-4111-8111-111111111111',
         spawnAgent: (argv) => { calls.push(argv); return ''; },
-        extraArgs: ['--model', 'sonnet'],
+        extraArgs: ['--verbose'],
       },
     );
     const argv = calls[0];
@@ -1463,7 +1463,7 @@ describe('#3606 — dispatchFix always passes the dispatched-agent system prompt
     expect(at).toBeGreaterThan(-1);
     expect(argv[at + 1]).toBe(DISPATCHED_AGENT_SYSTEM_PROMPT_FILE);
     // Order matters the same way it does for every other dispatch: identity, then operator flags, then prompt.
-    expect(at).toBeLessThan(argv.indexOf('--model'));
+    expect(at).toBeLessThan(argv.indexOf('--verbose'));
     expect(argv[argv.length - 1]).toContain('fix brief for 1764');
   });
 });

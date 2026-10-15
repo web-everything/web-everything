@@ -204,11 +204,12 @@ function structuredMarkerLines(body) {
  * the verdict judged and which kind it is are read from unquoted structure only ({@link reviewedHeadsOf}, {@link verdictKind}).
  */
 export function isReviewVerdictComment(c) {
+  if (!isTrustedMarkerAuthor(c)) return false;
   const body = bodyOf(c);
   const lead = body.trimStart();
   const shaped = lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER)
     || lead.startsWith(BOUNCE_PREFIX) || ANY_REVIEWED_MARKER.test(body);
-  return shaped && !isMechanicalBounce(c) && isTrustedMarkerAuthor(c);
+  return shaped && !isMechanicalBounce(c);
 }
 
 /**
@@ -248,7 +249,24 @@ export function reviewedHeadsOf(c) {
 /** Did this verdict judge `sha` (a full 40-hex head)? Matches a full or abbreviated structured sha, never prose. */
 export const verdictJudged = (c, sha) => SHA40.test(sha) && reviewedHeadsOf(c).some((h) => sha.startsWith(h));
 
-const isMechanicalRoundMarker =(c) => bodyOf(c).trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER) && isTrustedMarkerAuthor(c);
+const isMechanicalRoundMarker = (c) => isTrustedMarkerAuthor(c) && bodyOf(c).trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER);
+
+/** Latest mechanical candidate, independent of input order. Incomplete or tied chronology grants nothing. */
+function latestMechanicalRoundAt(comments) {
+  let mechanicalAt = -Infinity;
+  let ordinaryAt = -Infinity;
+  for (const c of comments) {
+    if (!isTrustedMarkerAuthor(c)) continue;
+    const mechanical = isMechanicalRoundMarker(c);
+    const ordinary = isRearmMarker(c);
+    if (!mechanical && !ordinary && !isReviewVerdictComment(c)) continue;
+    const at = timeOf(c);
+    if (!Number.isFinite(at)) return null;
+    if (mechanical) mechanicalAt = Math.max(mechanicalAt, at);
+    if (ordinary) ordinaryAt = Math.max(ordinaryAt, at);
+  }
+  return mechanicalAt > ordinaryAt ? mechanicalAt : null;
+}
 
 /**
  * PURE: may the PR's CURRENT head, produced by a mechanical round, get past the review round cap?
@@ -268,14 +286,13 @@ export function mechanicalRoundGrant({ pr, countTowardCap = MECHANICAL_ROUNDS_ST
   if (!m.proven) return { ok: false, reason: 'not-mechanical', detail: m.reason ?? null };
   const priorHead = lc(m.priorHead);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const markers = comments.filter(isMechanicalRoundMarker).map(timeOf).filter(Number.isFinite);
-  if (!markers.length) return { ok: false, reason: 'no-marker' };
-  const roundAt = Math.max(...markers);
+  const roundAt = latestMechanicalRoundAt(comments);
+  if (roundAt === null) return { ok: false, reason: 'no-marker' };
   const verdicts = comments.filter(isReviewVerdictComment);
   // Fail closed both ways: a verdict that names the head in prose OR by a structured (possibly abbreviated) sha.
   if (verdicts.some((c) => lc(bodyOf(c)).includes(head) || verdictJudged(c, head))) return { ok: false, reason: 'head-already-reviewed' };
   // A review landing after the round already used this head's allowance (it named an older sha, e.g. a stale read).
-  if (verdicts.some((c) => timeOf(c) > roundAt)) return { ok: false, reason: 'mechanical-review-spent' };
+  if (verdicts.some((c) => timeOf(c) >= roundAt)) return { ok: false, reason: 'mechanical-review-spent' };
   const onPrior = verdicts.filter((c) => verdictJudged(c, priorHead));
   // The parent head was never judged: the mechanical round did not take anything from it. Its own standing (a
   // takeover allowance, or the cap) governs, not this exemption.
@@ -429,15 +446,15 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
 
 // Same leading-line/authorship match as countRearmComments; avoid importing its label CLI dependency.
 // Pinned to REARM_COMMENT_MARKER by the enrichment regression in mechanical-rebase-rounds.test.mjs.
-const isRearmMarker = (c) => bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review') && isTrustedMarkerAuthor(c);
+const isRearmMarker = (c) => isTrustedMarkerAuthor(c) && bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review');
 
 /** The cheap pre-filter: a trusted mechanical-round marker is the latest round event after the latest verdict. */
 export function hasPendingMechanicalRound(pr) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const markers = comments.filter(isMechanicalRoundMarker).map(timeOf).filter(Number.isFinite);
-  if (!markers.length) return false;
+  const roundAt = latestMechanicalRoundAt(comments);
+  if (roundAt === null) return false;
   const verdicts = comments.filter(isReviewVerdictComment).map(timeOf).filter(Number.isFinite);
-  return Math.max(...markers) > (verdicts.length ? Math.max(...verdicts) : -Infinity);
+  return roundAt > (verdicts.length ? Math.max(...verdicts) : -Infinity);
 }
 
 // Keep in sync with reconcile-core.mjs#resolveRoundCap; importing it here would create a cycle.

@@ -66,6 +66,9 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
+import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
+const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
+
 import { DEFAULT_ROUTING_POLICY } from './dispatch-routing-policy.mjs';
 export { DEFAULT_ROUTING_POLICY, resolveOperationRoute } from './dispatch-routing-policy.mjs';
 
@@ -277,7 +280,7 @@ export function externalTierEquivalent(provider, model) {
  *
  *   1. the task's `taskType` row in `openForNonCritical` is `true` (an explicit, per-taskType operator switch;
  *      `doc-fix` and `ci-heal` are open on probation since 2026-09-27, `bugfix` since 2026-09-29,
- *      and `build-new-feature` (Codex only) since 2026-09-30;
+ *      and `build-new-feature` since 2026-09-30 (Argon added 2026-10-15);
  *      `prepare` and `test-fix` are also open, while `conflict-resolution` stays closed);
  *   2. the caller supplied the critical-work verdict (`context.criticalWork`, from
  *      `we:scripts/lib/critical-work.mjs#criticalWorkVerdict`) and it says NOT critical — a missing verdict
@@ -339,6 +342,7 @@ export function decideCriticalWorkGate(gate, kind, taskType, context) {
 export const PROBATION_WORKERS = Object.freeze({
   codex: Object.freeze({ id: 'codex', provider: 'codex', model: CODEX_MODEL, executor: 'codex', launcher: 'scripts/codex-direct-task.mjs', simpleOnly: false, checker: null }),
   'antigravity-claude': Object.freeze({ id: 'antigravity-claude', provider: 'antigravity', model: null, executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', simpleOnly: false, checker: null }),
+  'antigravity-argon': Object.freeze({ id: 'antigravity-argon', provider: 'antigravity', model: BUILD_ARGON_SETTINGS.value.model, executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', simpleOnly: false, checker: 'codex' }),
   'antigravity-gemini': Object.freeze({ id: 'antigravity-gemini', provider: 'antigravity', model: AGY_GEMINI_SIMPLE_MODEL, executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', simpleOnly: true, checker: 'codex' }),
 });
 
@@ -348,13 +352,20 @@ export const PROBATION_WORKERS = Object.freeze({
  */
 // @test-only-export-ok: Shared library exported for the probation launcher (agy-launcher-probation) and its own test
 export const PROBATION_ROSTER = Object.freeze({
-  'build-new-feature': Object.freeze(['codex']),
+  'build-new-feature': Object.freeze(['codex', 'antigravity-argon']),
   'prepare': Object.freeze(['codex', 'antigravity-gemini']),
   'test-fix': Object.freeze(['antigravity-gemini']),
   'doc-fix': Object.freeze(['antigravity-claude', 'codex']),
   'ci-heal': Object.freeze(['antigravity-claude', 'codex', 'antigravity-gemini']),
   'bugfix': Object.freeze(['codex', 'antigravity-claude', 'antigravity-gemini']),
 });
+
+/** Preserve worker authorization and checker identity across explicit policy hand-offs. */
+export function probationWorkerForRoute({ provider, model, effort }, taskType) {
+  const id = provider === 'codex' ? 'codex' : model.startsWith('claude-') ? 'antigravity-claude'
+    : resolveBuildArgonModel(model) ? 'antigravity-argon' : 'antigravity-gemini';
+  return { ...PROBATION_WORKERS[id], model, effort, taskType };
+}
 
 /**
  * PICK ONE PROBATION WORKER for an opened, non-critical task. PURE and deterministic over its arguments.
@@ -372,12 +383,17 @@ export const PROBATION_ROSTER = Object.freeze({
  * Every pick is supervised `full`, fully reviewed, and owes a run rating — probation never lightens either.
  *
  * @param {{taskType: string, tier?: string, simple?: boolean, filesTouched?: string[], estimatedSize?: number,
- *   scorecards?: Array<object>, vetoes?: Array<object>}} o
+ *   scorecards?: Array<object>, vetoes?: Array<object>, availability?: object, argonSettings?: object}} o
  * @returns {{worker: object|null, auditTrail: Array<object>, reason: string}}
  */
 // @test-only-export-ok: Shared library exported for the probation launcher (agy-launcher-probation) and its own test
-export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, simple = false, filesTouched = [], estimatedSize = 0, scorecards = [], vetoes = [], availability = {} } = {}) {
+export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, simple = false, filesTouched = [], estimatedSize = 0, scorecards = [], vetoes = [], availability = {}, argonSettings = BUILD_ARGON_SETTINGS } = {}) {
+  availability ??= {};
+  argonSettings ??= BUILD_ARGON_SETTINGS;
   const auditTrail = [];
+  // Settings may be JSON objects: audit malformed leaves without invoking their coercion hooks.
+  const settingLabel = (value) => typeof value === 'string' ? JSON.stringify(value.slice(0, 200))
+    : typeof value === 'boolean' ? String(value) : `<${typeof value}>`;
   const none = (reason) => ({ worker: null, auditTrail, reason });
   const roster = PROBATION_ROSTER[taskType];
   if (!roster) return none(`taskType '${taskType}' has no probation roster`);
@@ -393,12 +409,24 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
   const candidates = [];
   roster.forEach((id, order) => {
     const def = PROBATION_WORKERS[id];
-    const held = availability[id] || (def.checker && availability[def.checker]);
+    if (id === 'antigravity-argon') {
+      const value = argonSettings.value ?? {};
+      const sources = argonSettings.sources ?? {};
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: value.enabled === true ? 'enabled' : 'disabled', dataConsulted: `build.argon.enabled=${settingLabel(value.enabled)} (${settingLabel(sources.enabled)}), build.argon.model=${settingLabel(value.model)} (${settingLabel(sources.model)})`, reasoning: 'build probation cascade setting' });
+      if (value.enabled !== true) return;
+    }
+    const held = availability[id] || availability[def.provider] || (def.checker && availability[def.checker]);
     if (held) {
-      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'quota-held', dataConsulted: String(held), reasoning: 'active backend or checker hold; availability otherwise unknown' });
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'quota-held', dataConsulted: settingLabel(held), reasoning: 'active backend or checker hold; availability otherwise unknown' });
       return;
     }
-    const model = def.model ?? AGY_CLAUDE_MODEL_BY_TIER[tier] ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet;
+    const model = id === 'antigravity-argon'
+      ? resolveBuildArgonModel(argonSettings.value?.model)
+      : def.model ?? AGY_CLAUDE_MODEL_BY_TIER[tier] ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet;
+    if (!model) {
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'invalid-model', dataConsulted: settingLabel(argonSettings.value?.model), reasoning: 'build.argon.model must be approved for non-simple Argon builds' });
+      return;
+    }
     if (def.simpleOnly && simple !== true && taskType !== 'test-fix') {
       auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'skipped', dataConsulted: `simple=${simple === true}`, reasoning: 'offered only for a simple task' });
       return;
@@ -417,19 +445,22 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
   if (!candidates.length) return none(`no probation worker is eligible for '${taskType}'`);
   candidates.sort((a, b) => a.recentFailure - b.recentFailure || a.trials - b.trials || a.order - b.order);
   const pick = candidates[0];
-  const worker = Object.freeze({
-    id: pick.def.id,
-    provider: pick.def.provider,
-    model: pick.model,
-    executor: pick.def.executor,
-    launcher: pick.def.launcher,
-    checker: pick.def.checker,
+  const toWorker = (c) => Object.freeze({
+    id: c.def.id,
+    provider: c.def.provider,
+    model: c.model,
+    executor: c.def.executor,
+    launcher: c.def.launcher,
+    checker: c.def.checker,
     taskType,
-    trials: pick.trials,
+    trials: c.trials,
     supervision: SUPERVISION_LEVELS.FULL,
     review: 'full',
     runRating: 'required',
   });
+  // The other eligible workers, in rotation order: the launch boundary tries them when the pick's executable
+  // (or its checker's) is missing, before it falls back to Claude. Pure eligibility only — no binary probe here.
+  const worker = Object.freeze({ ...toWorker(pick), alternates: Object.freeze(candidates.slice(1).map(toWorker)) });
   const reason = `probation worker ${worker.id} (${worker.provider}/${worker.model}) for '${taskType}': last trial ${pick.recentFailure ? 'not clean' : 'clean or none'}, ${pick.trials} trial(s) so far; full review and a run rating are owed on the result`;
   auditTrail.push({ criterion: 'probation-worker', result: worker.id, dataConsulted: `roster=${roster.join(',')}, simple=${simple === true}`, reasoning: reason });
   return { worker, auditTrail, reason };
@@ -931,6 +962,7 @@ export function selectProvider(task, context) {
   if (probationTask) {
     const picked = selectProbationWorker({
       taskType, tier: claudeTier, simple: context?.simple === true, filesTouched, estimatedSize, scorecards, vetoes,
+      availability: context?.availability ?? {}, argonSettings: context?.argonSettings ?? BUILD_ARGON_SETTINGS,
     });
     auditTrail.push(...picked.auditTrail);
     if (!picked.worker) auditTrail.push({ criterion: 'probation-worker', result: 'none', dataConsulted: `taskType='${taskType}'`, reasoning: picked.reason });

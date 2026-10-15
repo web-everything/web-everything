@@ -5,7 +5,7 @@
  *   own modules, its own launch path) and makes the same request `createDispatchSinks` hands `defaultClaudeProvider`
  *   for a ci-heal/fix dispatch. Prints `{handle, wrapperPid, cwd}` as its last line.
  *
- *   argv: <tree> <slug> <kind> <pr> <sessionId> <prompt>
+ *   argv: <tree> <slug> <kind> <pr> <sessionId> <prompt> <model>
  *
  * It is spawned as a process by `we:scripts/lib/daemon-load-overlay.mjs#runRealDispatchSmoke` and NEVER imported:
  * it loads modules from a computed path, and a computed `import(...)` in a file the review code path reaches makes
@@ -16,7 +16,8 @@
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 
-const [tree, slug, kind, pr, sessionId, prompt] = process.argv.slice(2);
+const [tree, slug, kind, pr, sessionId, prompt, model] = process.argv.slice(2);
+if (!model) throw new Error('dispatch smoke requires an explicit policy model');
 const imp = (p) => import(pathToFileURL(join(tree, p)).href);
 const io = await imp('scripts/operations/dispatch-lane-io.mjs');
 const iso = await imp('scripts/lib/dispatch-bg-isolation.mjs');
@@ -26,6 +27,7 @@ const resolveEnv = io.resolveDispatchSettingsEnv || io.resolveGhShimSettingsEnv;
 let wrapperPid = null;
 const handle = io.defaultClaudeProvider({
   sessionId, cwd, prompt, sessionSlug: slug, launchKind: kind, pr,
+  table: { model, reason: 'overlay smoke: routing-policy cheapest Claude alias' },
   systemPromptFile: io.DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, settingsEnv: resolveEnv(cwd),
   worktreeSettings: (isolated && isolated.worktreeSettings) || null,
   reportWrapped: (pid) => { wrapperPid = pid; },

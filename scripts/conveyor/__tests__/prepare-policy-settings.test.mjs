@@ -4,8 +4,31 @@ import { resolvePreparePolicy, readPreparePolicy } from '../prepare-policy-setti
 
 describe('prepare policy cascade', () => {
   it('defaults booleans to true and runner to codex', () => {
-    expect(resolvePreparePolicy()).toEqual({ retryUnstampedOnce: true, autoSize: true, runner: 'codex',
-      sources: { retryUnstampedOnce: 'standard', autoSize: 'standard', runner: 'standard' } });
+    expect(resolvePreparePolicy()).toEqual({ retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24,
+      sources: { retryUnstampedOnce: 'standard', autoSize: 'standard', runner: 'standard', mergedGuardHours: 'standard' } });
+  });
+  it('cascades mergedGuardHours with numeric validation and sources', () => {
+    const env = { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/prepare-test.json' };
+    expect(resolvePreparePolicy()).toMatchObject({ mergedGuardHours: 24, sources: { mergedGuardHours: 'standard' } });
+    expect(resolvePreparePolicy({ platform: { mergedGuardHours: 48 } }))
+      .toMatchObject({ mergedGuardHours: 48, sources: { mergedGuardHours: 'platform' } });
+    expect(readPreparePolicy({ env, read: () => ({ prepare: { mergedGuardHours: 12 } }) }))
+      .toMatchObject({ mergedGuardHours: 12, sources: { mergedGuardHours: 'tool' } });
+    expect(resolvePreparePolicy({ platform: { mergedGuardHours: 48 }, tool: { mergedGuardHours: 12 } }))
+      .toMatchObject({ mergedGuardHours: 12, sources: { mergedGuardHours: 'tool' } });
+    for (const hours of ['0', '1.5', '72']) {
+      expect(readPreparePolicy({ env: { ...env, WE_PREPARE_MERGED_GUARD_HOURS: hours },
+        read: () => ({ prepare: { mergedGuardHours: 12 } }) }))
+        .toMatchObject({ mergedGuardHours: Number(hours), sources: { mergedGuardHours: 'env' } });
+    }
+    for (const hours of [-1, Infinity, NaN, '12', true, null, {}]) {
+      expect(resolvePreparePolicy({ platform: { mergedGuardHours: hours }, tool: { mergedGuardHours: hours } }))
+        .toMatchObject({ mergedGuardHours: 24, sources: { mergedGuardHours: 'standard' } });
+    }
+    for (const hours of ['-1', 'Infinity', 'NaN', 'oops', '', ' ']) {
+      expect(resolvePreparePolicy({ tool: { mergedGuardHours: 12 }, env: { WE_PREPARE_MERGED_GUARD_HOURS: hours } }))
+        .toMatchObject({ mergedGuardHours: 12, sources: { mergedGuardHours: 'tool' } });
+    }
   });
   it('cascades runner independently with exact validation', () => {
     expect(resolvePreparePolicy({ platform: { runner: 'scope' }, tool: { runner: 'claude' } }))
@@ -14,7 +37,7 @@ describe('prepare policy cascade', () => {
       .toMatchObject({ runner: 'scope', sources: { runner: 'env' } });
     for (const runner of ['gpt', 'Codex', ' codex ', true, {}]) {
       expect(resolvePreparePolicy({ platform: { runner }, tool: { runner }, env: { WE_PREPARE_RUNNER: runner } }))
-        .toMatchObject({ runner: 'codex', sources: { runner: 'standard' } });
+        .toMatchObject({ runner: 'codex', mergedGuardHours: 24, sources: { runner: 'standard', mergedGuardHours: 'standard' } });
     }
     expect(resolvePreparePolicy({ tool: { runner: 'claude' }, env: { WE_PREPARE_RUNNER: 'gpt' } }))
       .toMatchObject({ runner: 'claude', sources: { runner: 'tool' } });
@@ -22,14 +45,14 @@ describe('prepare policy cascade', () => {
   it('layers each boolean independently', () => {
     expect(resolvePreparePolicy({ platform: { autoSize: false, retryUnstampedOnce: false },
       tool: { autoSize: true }, env: { WE_PREPARE_RETRY_UNSTAMPED_ONCE: '1', WE_PREPARE_AUTO_SIZE: '0' } }))
-      .toEqual({ autoSize: false, retryUnstampedOnce: true, runner: 'codex', sources: { autoSize: 'env', retryUnstampedOnce: 'env', runner: 'standard' } });
+      .toEqual({ autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, sources: { autoSize: 'env', retryUnstampedOnce: 'env', runner: 'standard', mergedGuardHours: 'standard' } });
     expect(resolvePreparePolicy({ platform: { autoSize: false }, tool: { retryUnstampedOnce: false } }).sources)
-      .toEqual({ autoSize: 'platform', retryUnstampedOnce: 'tool', runner: 'standard' });
+      .toEqual({ autoSize: 'platform', retryUnstampedOnce: 'tool', runner: 'standard', mergedGuardHours: 'standard' });
   });
   it('ignores invalid values at their layer', () => {
     expect(resolvePreparePolicy({ platform: { autoSize: false, retryUnstampedOnce: 'false' },
       tool: { autoSize: 'true', retryUnstampedOnce: 0 }, env: { WE_PREPARE_AUTO_SIZE: 'oops' } }))
-      .toEqual({ autoSize: false, retryUnstampedOnce: true, runner: 'codex', sources: { autoSize: 'platform', retryUnstampedOnce: 'standard', runner: 'standard' } });
+      .toEqual({ autoSize: false, retryUnstampedOnce: true, runner: 'codex', mergedGuardHours: 24, sources: { autoSize: 'platform', retryUnstampedOnce: 'standard', runner: 'standard', mergedGuardHours: 'standard' } });
     expect(resolvePreparePolicy({ env: { WE_PREPARE_AUTO_SIZE: 'false', WE_PREPARE_RETRY_UNSTAMPED_ONCE: 'true' } }).autoSize).toBe(false);
   });
   it('uses the cascade source logger', () => {
@@ -38,7 +61,7 @@ describe('prepare policy cascade', () => {
     try {
       readPreparePolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/prepare-test.json',
         WE_POLICY_CASCADE_LOG: '1', WE_PREPARE_AUTO_SIZE: 'false' }, read: () => ({ prepare: { retryUnstampedOnce: false } }) });
-      expect(log).toHaveBeenCalledWith('policy-cascade · prepare: retryUnstampedOnce=false (tool), runner="codex" (standard), autoSize=false (env)');
+      expect(log).toHaveBeenCalledWith('policy-cascade · prepare: retryUnstampedOnce=false (tool), runner="codex" (standard), mergedGuardHours=24 (standard), autoSize=false (env)');
     } finally { log.mockRestore(); resetCascadeLogForTest(); }
   });
   it('reads the feature block and tolerates unreadable settings', () => {

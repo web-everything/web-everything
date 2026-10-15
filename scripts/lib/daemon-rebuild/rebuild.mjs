@@ -27,10 +27,11 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
  * (UNLOCKED — the live smoke never runs against `root` and never holds its write lock) →
  * {@link finalizeRebuild} (locked, fast, reached only after a passing smoke). A lock refusal at either locked
- * step is reported, never treated as an error.
+ * step is reported, never treated as an error. `admissionWaitMs` overrides only the initial prepare wait;
+ * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
- *   mainOnly?:boolean, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
+ *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — `dispatchSmoke` (xhiqxz3): injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
@@ -39,7 +40,7 @@ export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob,
+  asJob, admissionWaitMs,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -49,7 +50,7 @@ export async function rebuildClone({
       root, env, log, mainOnly, entries,
       adopt: (o = {}) => rebuildClone({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, ...o, adoptOnly: true, asJob: false,
+        dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
       }),
     });
   }
@@ -90,6 +91,9 @@ export async function rebuildClone({
   // writer reservation refuses every NEW read slot meanwhile, so this only outlasts ticks already in flight.
   const finalizeWaitMs = Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0 ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS;
   const finalizeLockOpts = { ...finalLockOpts, waitMs: lockOpts.waitMs ?? Math.max(waitMs, finalizeWaitMs) };
+  // Explicit loads bound admission, while a passed smoke still earns the full finalize/starvation wait.
+  // Keep lockOpts.waitMs as the existing all-phase override for other callers.
+  const admissionLockOpts = { ...finalLockOpts, waitMs: admissionWaitMs ?? finalLockOpts.waitMs };
 
   // ── Phase 1 (locked, fast) ───────────────────────────────────────────────────────────────────────────────
   // A passed candidate waiting on THIS head (an unlocked peek — prepareRebuild re-checks it under the lock) is
@@ -100,7 +104,7 @@ export async function rebuildClone({
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
     root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
-  }), readyOnHead ? finalizeLockOpts : finalLockOpts);
+  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
