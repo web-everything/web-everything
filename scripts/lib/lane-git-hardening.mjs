@@ -110,7 +110,7 @@ export function riskyLaneConfig(listOutput) {
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
  */
 export function scrubRiskyLaneConfig(dir, {
-  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000 }),
+  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
 } = {}) {
   const removed = [], kept = [];
