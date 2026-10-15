@@ -73,9 +73,9 @@ export function classifyGhResource(args) {
   const cmd = first?.word;
   if (['issue', 'pr', 'repo', 'project', 'search'].includes(cmd)) return 'graphql';
   if (cmd === 'api') {
-    // The endpoint is the first positional of the pflag parse without the `api` word, so neither leading flags
-    // (`-R o/r api graphql`) nor clustered short flags (`-iq .x graphql`, `-iH graphql r`) can shift it.
-    return parseGhApiArgs(a.filter((_, i) => i !== first.at)).positionals[0] === 'graphql' ? 'graphql' : 'core';
+    // Parse only the arguments after `api`: leading global flags (e.g. `-R o/r`) are not API flags,
+    // and their values must not become endpoints. Still parse API flags such as `-iq .x` or `-iH graphql`.
+    return parseGhApiArgs(a.slice(first.at + 1)).positionals[0] === 'graphql' ? 'graphql' : 'core';
   }
   return 'core';
 }

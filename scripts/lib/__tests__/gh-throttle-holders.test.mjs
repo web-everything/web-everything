@@ -222,6 +222,11 @@ describe('hold policy and execution', () => {
     [['api', '-iXDELETE', 'repos/o/r/git/refs/heads/x'], true], [['api', '-iX', 'POST', 'repos/o/r'], true], [['api', '-if', 'title=x', 'repos/o/r/issues'], true],
     // the graphql read exemption: endpoint by parse, every --input spelling, every query spelling (gh sends the last)
     [['--hostname', 'graphql', 'api', 'repos/o/r/issues', '-f', 'query={x}'], true], [['api', 'graphql', '--input=q.json', '-f', 'query={viewer{login}}'], true],
+    [['-R', 'graphql', 'api', 'repos/o/r/issues', '-f', 'query={viewer{login}}'], true],
+    [['--repo', 'graphql', 'api', 'repos/o/r/issues', '-f', 'query={viewer{login}}'], true],
+    [['-R', 'o/r', 'api', 'graphql', '-f', 'query={viewer{login}}'], false],
+    [['-X', 'POST', 'api', 'graphql', '-f', 'query={viewer{login}}'], true],
+    [['--input', 'q.json', 'api', 'graphql', '-f', 'query={viewer{login}}'], true],
     [['api', 'graphql', '-f', 'query={viewer{login}}', '-F', 'query=mutation{x}'], true], [['api', 'graphql', '-f', 'query={viewer{login}}', '-f', 'query=mutation{x}'], true],
     [['api', 'graphql', '-fquery={viewer{login}}'], false], [['api', 'graphql', '--raw-field=query={viewer{login}}'], false], [['api', 'graphql', '--jq', '.x', '-f', 'query={viewer{login}}'], false],
     [['api', 'graphql', '-F', 'query=@q.graphql'], true], [['api', 'graphql', '-f', 'owner=o'], true],

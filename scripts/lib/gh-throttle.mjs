@@ -326,7 +326,9 @@ export function classifyGhWrite(args) {
     // is `graphql`, there is no `--input`, and EVERY `query` field (any spelling; gh sends the last) is inline
     // text with no mutation. A `query=@file` value or `--input` hides the text, so it stays a write.
     const queries = p.fields.filter((f) => f.startsWith('query=')).map((f) => f.slice(6));
-    if (p.positionals[0] === 'graphql' && !p.input && queries.length && queries.every((q) => !q.startsWith('@') && !/\bmutation\b/i.test(q))) return false;
+    // Leading global flag values are not endpoints; retain the full parse above for method/payload flags.
+    const endpoint = parseGhApiArgs(a.slice(words[0].at + 1)).positionals[0];
+    if (endpoint === 'graphql' && !p.input && queries.length && queries.every((q) => !q.startsWith('@') && !/\bmutation\b/i.test(q))) return false;
     return true;
   }
   return false;
