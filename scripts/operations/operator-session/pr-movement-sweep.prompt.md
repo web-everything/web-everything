@@ -1,0 +1,1 @@
+Run `node scripts/operations/operator-queue.mjs` from the operating checkout. Report NEEDS YOU and RULING NEEDED items with their reasons and suggested commands. Honour the operator's quiet hours: defer routine notifications during quiet hours according to the handoff rules. Report read failures as unknown; never infer that the queue is clear from an incomplete read.

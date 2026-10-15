@@ -134,6 +134,128 @@ function prepareGitFixture(cards, prs = []) {
 }
 
 describe('prepare status batched', () => {
+  it.each(['shared', 'saturated', 'date fallback', 'prefetched'])('discovers every identity through query-aware %s reads and refuses dispatch', async mode => {
+    for (const [headRefName, title, bornAs, fromCard] of [
+      ['lane/5028d-prepare-x', 'ordinary', undefined],
+      ['custom-prepare-x', 'WE #5028: prepare — scope', undefined],
+      ['lane/1234d-prepare-x', 'ordinary', '1234'],
+      ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12'],
+      ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12', true],
+    ]) {
+      const identity = fromCard ? undefined : bornAs;
+      const card = `---\nstatus: open\n${fromCard ? `bornAs: ${bornAs}\n` : ''}---\nquery-aware`;
+      const pr = { number: 95028, state: 'OPEN', headRefName, title, headRefOid: 'e'.repeat(40),
+        createdAt: '2026-10-10', isCrossRepository: false };
+      const git = prepareGitFixture({ 5028: card });
+      const answer = (cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ content: Buffer.from(card).toString('base64') });
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1] ?? '';
+        const head = /head:([^ ]+)/.exec(search)?.[1];
+        const phrase = /"([^"]+)"/.exec(search)?.[1];
+        const floor = /created:>=(\S+)/.exec(search)?.[1];
+        const matches = (!head || headRefName.startsWith(head)) && (!phrase || title.includes(phrase))
+          && (!floor || pr.createdAt >= floor);
+        const perItem = /^head:lane\/\S+$/.test(search) || search.includes('in:title');
+        if (['saturated', 'prefetched'].includes(mode) && !perItem) {
+          return JSON.stringify(Array.from({ length: Number(args[args.indexOf('--limit') + 1]) }, (_, i) =>
+            ({ number: i, state: 'CLOSED', headRefName: `lane/unrelated-${i}`, createdAt: '2026-10-14' })));
+        }
+        return JSON.stringify(matches ? [pr] : []);
+      };
+      const reader = createPrepareStatusReader({ exec: answer,
+        ...(mode === 'prefetched' ? { execAsync: async (...args) => answer(...args) } : {}) });
+      const claimedAt = mode === 'date fallback' ? '2026-10-14' : '2026-10-01';
+      await reader.prime([{ num: 5028, bornAs: identity, claimedAt }]);
+      const read = reader.read({ num: 5028, bornAs: identity, claimedAt: '2026-10-01' }).pr;
+      // Write grade (PR #5366 round 7): the status reader drives stamps and holds, so a title-only PR is not its PR;
+      // the launch guard below still refuses on it.
+      if (headRefName.startsWith('lane/')) expect(read).toMatchObject({ number: pr.number, state: 'OPEN' });
+      else expect(read).toBeNull();
+      const dispatch = vi.fn();
+      const tick = await runBuildDispatchTick({ live: true, effects: {
+        planTick: () => ({ decisions: { itemPrepareSpawns: [{ num: '5028', bornAs: identity }] }, nextState: {} }),
+        fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+        killSwitch: () => ({ engaged: false }), listPreparePrs: args => reader.listPrs(args), dispatch,
+        readPreparedStamp: args => reader.stamp(args),
+        acquirePrepareClaim: vi.fn(() => ({ ok: true })),
+      } });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(tick.prepare.refused).toEqual([{ num: '5028', reason: `open prepare PR #${pr.number} (${headRefName})` }]);
+    }
+  });
+  it('does not reuse an item fallback cached without its bornAs identity', () => {
+    const searches = [];
+    const pr = { number: 91, state: 'OPEN', headRefName: 'lane/abc.12d-prepare-x' };
+    const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\nidentity cache' });
+    const reader = createPrepareStatusReader({ exec(cmd, args, opts) {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      expect(cmd).toBe('gh');
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      if (search === '') return JSON.stringify(Array.from({ length: 1000 }, (_, number) => ({ number })));
+      return JSON.stringify(search === 'head:lane/abc.12' ? [pr] : []);
+    } });
+    expect(reader.listPrs({ num: '#05028' })).toEqual([]);
+    expect(reader.listPrs({ num: 5028, bornAs: 'ABC.12' })).toEqual([pr]);
+    expect(searches).toContain('head:lane/abc.12');
+  });
+  it.each(['title saturated', 'bornAs saturated', 'title failed', 'title malformed'])(
+    'refuses incomplete component searches after async prefetch: %s', async failure => {
+      const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\npartial query' });
+      const answer = (cmd, args, opts) => {
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1];
+        const badComponent = search.includes('in:title') ? failure.startsWith('title')
+          : search === 'head:lane/1234' && failure.startsWith('bornAs');
+        if (badComponent && failure.endsWith('failed')) throw new Error('listing unavailable');
+        if (badComponent && failure.endsWith('malformed')) return '{}';
+        if (search === '' || badComponent) return JSON.stringify(Array.from({ length: Number(args[args.indexOf('--limit') + 1]) },
+          (_, number) => ({ number })));
+        return '[]';
+      };
+      const reader = createPrepareStatusReader({ exec: answer, execAsync: async (...args) => answer(...args) });
+      await reader.prime([{ num: 5028, bornAs: '1234' }]);
+      expect(() => reader.listPrs({ num: 5028, bornAs: '1234' })).toThrow(/saturated|unavailable/);
+    });
+  it('recovers a dead worker’s alias-only PR through the real reader without an explicit bornAs argument', async () => {
+    const main = '---\nstatus: open\nbornAs: abc.12\n---\ncard identity';
+    const sectioned = '---\nstatus: open\n---\n' + ['Design', 'MVP', 'Test plan', 'Proof plan']
+      .map(heading => `## ${heading}\nSubstantive completed work.\n`).join('\n');
+    const pr = { number: 95029, state: 'OPEN', headRefName: 'lane/abc.12d-prepare-x',
+      title: 'ordinary', headRefOid: 'f'.repeat(40), createdAt: '2026-10-14' };
+    const git = prepareGitFixture({ 5028: main }, [pr]);
+    const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => cmd === 'gh' && args[0] === 'api'
+      ? JSON.stringify({ content: Buffer.from(sectioned).toString('base64') }) : git(cmd, args, opts) });
+    const stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects: {
+      planTick: () => ({ decisions: {}, nextState: {} }), fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }),
+      listPrepareInFlight: () => [{ num: '5028', row: { runId: 'alias', entry: { key: 'alias', live: false, expectedBy: '2020-01-01' } } }],
+      readPrepareStatus: args => reader.read(args), placePrepareHold: vi.fn(), stampPrepare,
+    } });
+    expect(stampPrepare).toHaveBeenCalledWith(expect.objectContaining({ num: '5028', status: expect.objectContaining({
+      pr: expect.objectContaining({ number: pr.number, hasSections: true }),
+    }) }));
+    expect(tick.prepare.inFlight).not.toContain('5028');
+  });
+  it.each([
+    ['lane/5028d-prepare-x', undefined],
+    ['lane/5028e-prepare-x', undefined],
+    ['lane/custom-prepare-x', 'WE #5028: prepare — scope'],
+  ])('reads an OPEN prepare PR with head %s', (headRefName, title) => {
+    const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\ncard' }, [{ number: 91,
+      state: 'OPEN', headRefName, title, headRefOid: 'd'.repeat(40), createdAt: '2026-10-14' }]);
+    const exec = (cmd, args, opts) => cmd === 'gh' && args[0] === 'api'
+      ? JSON.stringify({ content: Buffer.from('---\nstatus: open\n---\ncard').toString('base64') })
+      : git(cmd, args, opts);
+    const reader = createPrepareStatusReader({ exec });
+    // Write grade (PR #5366 round 7): a title-only PR off the card's lane prepare branch never reaches the status
+    // reader, which drives stamps and holds; it still refuses a launch through `listPrs` (refusal grade).
+    if (title) expect(reader.read({ num: 5028 }).pr).toBeNull();
+    else expect(reader.read({ num: 5028 }).pr).toMatchObject({ number: 91, state: 'OPEN', preparedDate: null });
+    expect(reader.listPrs({ num: 5028 })).toHaveLength(1);
+  });
   it.each([false, true])('batches 50 tracked prepares (unstamped=%s)', unstamped => {
     const items = Array.from({ length: 50 }, (_, i) => ({ num: String(6000 + i), claimedAt: '2026-09-28T12:00:00Z' }));
     const cards = Object.fromEntries(items.map(({ num }) => [num,
@@ -152,7 +274,7 @@ describe('prepare status batched', () => {
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
     expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/ created:>=2026-09-28', '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -167,7 +289,8 @@ describe('prepare status batched', () => {
     const answer = (cmd, args, opts) => {
       if (cmd === 'gh' && args[0] === 'pr') {
         const search = args[args.indexOf('--search') + 1];
-        const m = /^head:lane\/(\d+)-prepare-$/.exec(search);
+        const m = /^head:lane\/(\d+)$/.exec(search);
+        if (search.includes('in:title')) return '[]';
         return JSON.stringify(m ? [own(m[1])] : filler); // the shared listing is capped (saturated), so it cannot answer
       }
       if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ encoding: 'base64', content: Buffer.from('---\nstatus: open\n---\nx').toString('base64') });
@@ -189,12 +312,12 @@ describe('prepare status batched', () => {
     const syncExec = vi.fn(answer);
     const fast = createPrepareStatusReader({ exec: syncExec, execAsync });
     await fast.prime(items);
-    const syncItemCallsAfterPrime = syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /prepare-$/.test(a[a.indexOf('--search') + 1])).length;
+    const syncItemCallsAfterPrime = syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /^head:lane\/\d+$/.test(a[a.indexOf('--search') + 1])).length;
     const actual = items.map(i => fast.read(i));
     expect(actual).toEqual(expected);
     expect(syncItemCallsAfterPrime).toBe(0);
-    expect(syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /prepare-$/.test(a[a.indexOf('--search') + 1]))).toHaveLength(0);
-    expect(execAsync).toHaveBeenCalledTimes(nums.length);
+    expect(syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /^head:lane\/\d+$/.test(a[a.indexOf('--search') + 1]))).toHaveLength(0);
+    expect(execAsync).toHaveBeenCalledTimes(nums.length * 2); // branch + title, still bounded by eight workers
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(8);
   });
@@ -202,7 +325,7 @@ describe('prepare status batched', () => {
     const git = prepareGitFixture({ 7700: '---\nstatus: open\n---\nfail' });
     const filler = Array.from({ length: 1000 }, (_, i) => ({ number: i, state: 'MERGED', headRefName: `lane/o-${i}`, createdAt: '2026-09-29', isCrossRepository: false }));
     const exec = vi.fn((cmd, args, opts) => {
-      if (cmd === 'gh' && /prepare-$/.test(args[args.indexOf('--search') + 1] ?? '')) throw new Error('item listing unavailable');
+      if (cmd === 'gh' && /^head:lane\/\d+$/.test(args[args.indexOf('--search') + 1] ?? '')) throw new Error('item listing unavailable');
       return cmd === 'gh' ? JSON.stringify(filler) : git(cmd, args, opts);
     });
     const execAsync = vi.fn(async () => { throw new Error('item listing unavailable'); });
@@ -217,7 +340,7 @@ describe('prepare status batched', () => {
     expect(reader.read({ num: 7100 }).pr).toBeNull();
     expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
     const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
-    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/');
+    expect(args[args.indexOf('--search') + 1]).toBe('');
     expect(args[args.indexOf('--limit') + 1]).toBe('1000');
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
     expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
@@ -257,7 +380,7 @@ describe('prepare status batched', () => {
   describe('shared listing completeness', () => {
     const prFor = (num, createdAt = '2026-10-02') => ({ number: Number(num), state: 'CLOSED', headRefName: `lane/${num}-prepare-x`, createdAt, isCrossRepository: false });
     const filler = n => Array.from({ length: n }, (_, i) => ({ number: 90000 + i, state: 'MERGED', headRefName: `lane/${80000 + i}-build`, createdAt: '2026-10-05', isCrossRepository: false }));
-    /** gh answers per `--search`: the shared `head:lane/` listing vs a per-item `head:lane/<n>-prepare-` one. */
+    /** gh answers per `--search`: the shared `head:lane/` listing vs a per-item `head:lane/<n>` one. */
     function searchExec(cards, answer) {
       const git = prepareGitFixture(cards);
       return vi.fn((cmd, args, opts) => {
@@ -267,7 +390,7 @@ describe('prepare status batched', () => {
     }
     it('rejects saturated shared PR listings instead of reporting absent PRs', () => {
       const exec = searchExec({ 7500: '---\nstatus: open\n---\nsaturated' }, (search, limit) =>
-        search.includes('-prepare-') ? [prFor(7500)] : filler(limit));
+        /^head:lane\/\d+$/.test(search) ? [prFor(7500)] : search.includes('in:title') ? [] : filler(limit));
       const reader = createPrepareStatusReader({ exec });
       reader.prime([{ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }]);
       expect(reader.read({ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
@@ -279,7 +402,7 @@ describe('prepare status batched', () => {
     });
     it('does not trust the dated shared listing for a read claimed before its date floor', () => {
       const exec = searchExec({ 7502: '---\nstatus: open\n---\nprimed', 7503: '---\nstatus: open\n---\nearlier' }, search =>
-        search.includes('7503-prepare-') ? [prFor(7503, '2026-10-02')] : [prFor(7502, '2026-10-04T01:00:00Z')]);
+        search === 'head:lane/7503' ? [prFor(7503, '2026-10-02')] : [prFor(7502, '2026-10-04T01:00:00Z')]);
       const reader = createPrepareStatusReader({ exec });
       reader.prime([{ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }]);
       expect(reader.read({ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }).pr.state).toBe('CLOSED');
@@ -1652,6 +1775,7 @@ describe('automatic item preparation', () => {
       fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }),
       listPrepareInFlight: () => inFlight,
+      listPreparePrs: () => [],
       listPrepareClaims: () => listBuildDispatchClaims({ lockRoot }),
       acquirePrepareClaim: (o) => acquireBuildDispatchClaim({ ...o, lockRoot, owner: `host:${pid}`, pid }),
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
@@ -1665,9 +1789,330 @@ describe('automatic item preparation', () => {
     effects.readPrepareStatus = () => ({ preparedDate: null });
     effects.placePrepareHold = vi.fn();
   }
+  it('refuses a duplicate prepare when Codex left an OPEN letter-suffixed PR', async () => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = vi.fn(() => [{ number: 91, state: 'OPEN',
+      headRefName: 'lane/5028d-prepare-x', createdAt: '2026-10-14', isCrossRepository: false }]);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.launched).toEqual([]);
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(effects.listPrepareClaims()).toEqual([]);
+      expect(tick.prepare.refused).toEqual([{ num: '5028', reason: 'open prepare PR #91 (lane/5028d-prepare-x)' }]);
+      expect(log).toHaveBeenCalledWith('build-dispatch-daemon: prepare launch of #5028 refused: open prepare PR #91 (lane/5028d-prepare-x)');
+    } finally { log.mockRestore(); }
+  });
+  it.each(['park', 'open PR', 'listing failure'])('refused %s candidates leave capacity for a clean successor across ticks', async kind => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: ['5028', '5029', '5030'].map(num => ({ num })) }, nextState: {} });
+    effects.listPrepareFailures = () => kind === 'park' ? ['5028', '5029'].map(num => ({ num,
+      held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
+    effects.listPreparePrs = ({ num }) => {
+      if (num === '5030' || kind === 'park') return [];
+      if (kind === 'listing failure') throw new Error('unavailable');
+      return [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}-prepare-x` }];
+    };
+    for (let i = 0; i < 2; i++) {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.refused.map(r => r.num)).toEqual(['5028', '5029']);
+      expect(tick.prepare.launched.map(r => r.num)).toEqual(['5030']);
+      effects.releasePrepareClaim({ num: '5030' });
+    }
+  });
+  // PR #5366 review round 5: the REAL tick-core offers at most two item prepares. Two cards the daemon refuses at
+  // launch (an OPEN Codex prepare PR tick-core cannot see) must not hold both picks on every later tick.
+  it.each(['open PR', 'park', 'listing failure'])('the real tick-core rotates past two persistently refused %s cards to a clean third', async kind => {
+    const { planTick } = await import('../../../scripts/conveyor/tick-core.mjs');
+    const effects = fixture();
+    let nowMs = Date.parse('2026-10-15T12:00:00Z');
+    effects.now = () => nowMs;
+    let pending = ['5028', '5029', '5030'];
+    effects.planTick = (bk, { config } = {}) => planTick({
+      state: { queue: pending.map(num => ({ num })), lanes: [], prs: [] },
+      plan: { launch: [], held: pending.map(num => ({ num, reason: 'needs-prepare' })) },
+      freeLanes: [1, 2, 3, 4, 5, 6], bookkeeping: bk, config: { maxConcurrentLanes: 1_000_000, ...config },
+    });
+    effects.listPrepareFailures = () => kind === 'park' ? ['5028', '5029'].map(num => ({ num,
+      held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
+    let refusing = true;
+    effects.listPreparePrs = ({ num }) => {
+      if (num === '5030' || kind === 'park' || !refusing) return [];
+      if (kind === 'listing failure') throw new Error('unavailable');
+      return [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}d-prepare-x` }];
+    };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let bookkeeping = {};
+      const ticks = [];
+      for (let i = 0; i < 3; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        ticks.push({ refused: tick.prepare.refused.map(r => r.num), launched: tick.prepare.launched.map(r => r.num) });
+        bookkeeping = tick.nextBookkeeping;
+        nowMs += 60_000;
+      }
+      // Tick 1 spends both picks on the refused cards; afterwards they are held while the refusal is fresh, so the
+      // clean third gets a pick instead of the same two being refused again every tick.
+      expect(ticks).toEqual([
+        { refused: ['5028', '5029'], launched: [] },
+        { refused: [], launched: ['5030'] },
+        { refused: [], launched: [] },
+      ]);
+      if (kind === 'park') return; // a needs-you park is lifted by the operator, not by time
+      // Once the refusal ages out the card is re-checked; with its PR gone it launches. 5030 got prepared meanwhile.
+      refusing = false;
+      pending = ['5028', '5029'];
+      effects.releasePrepareClaim({ num: '5030' });
+      nowMs += 60 * 60_000;
+      const after = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+      expect(after.prepare.launched.map(r => r.num).sort()).toEqual(['5028', '5029']);
+    } finally { log.mockRestore(); }
+  });
+  // Same class: a card the daemon already knows it will skip after planning (a build backoff, a prepare group
+  // member in flight under its lead) is held out of tick-core's two picks before planning.
+  // PR #5366 operator send-back (item 2): a card with NO surviving claim, run row, hold or guard whose OPEN prepare
+  // PR has sections but no stamp was refused at launch forever and never reached the stamp-recovery arm.
+  it.each([
+    ['open, sections, unstamped', { state: 'OPEN', hasSections: true, preparedDate: null }, {}, true],
+    ['open, no sections', { state: 'OPEN', hasSections: false, preparedDate: null }, {}, false],
+    ['open, stamped on the PR branch (awaiting landing)', { state: 'OPEN', hasSections: true, preparedDate: '2026-10-15' }, {}, false],
+    ['a different PR read back', { state: 'OPEN', hasSections: true, preparedDate: null, number: 92 }, {}, false],
+  ])('probes an untracked refused card\'s own prepare PR once: %s', async (_name, pr, main, recovers) => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }, { num: '5029' }] }, nextState: {} });
+    effects.listPrepareFailures = () => pr.state === 'MERGED' ? [{ num: '5028', recordedAt: '2026-10-15T10:00:00Z' }] : [];
+    effects.listPreparePrs = ({ num }) => num === '5028'
+      ? [{ number: 91, state: pr.state, headRefName: 'lane/5028d-prepare-x', createdAt: pr.createdAt }] : [];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, ...main, pr: { number: 91, ...pr } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let bookkeeping = {};
+      const ticks = [];
+      for (let i = 0; i < 3; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        ticks.push(tick);
+        bookkeeping = tick.nextBookkeeping;
+        effects.releasePrepareClaim({ num: '5029' });
+      }
+      expect(ticks[0].prepare.refused.map(r => r.num)).toEqual(['5028']);
+      // Exactly one read, of the refused PR itself — never a per-tick search, never the newest attempt's PR.
+      const reads = effects.readPrepareStatus.mock.calls.map(([a]) => a).filter(a => a.num === '5028');
+      expect(reads).toEqual([expect.objectContaining({ num: '5028', prNumber: 91 })]);
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(recovers ? 1 : 0);
+      if (recovers) expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending' });
+      else expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      // A refusal-held card never takes a prepare slot: the clean card launches every tick.
+      for (const tick of ticks) {
+        expect(tick.prepare.inFlight).not.toContain('5028');
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(['5029']);
+      }
+      expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('5028');
+    } finally { log.mockRestore(); }
+  });
+  // Self-review: after the probe started recovery, later reads must stay on that PR. The default read takes the newest
+  // attempt's PR (here a newer CLOSED duplicate) and would file a false `prepare-unstamped` failure.
+  it('keeps follow-up reads of a probe-started stamp recovery on the probed PR', async () => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.readPrepareStatus = vi.fn(({ prNumber }) => ({ preparedDate: null, pr: prNumber === 91
+      ? { number: 91, state: 'OPEN', preparedDate: null, hasSections: true }
+      : { number: 95, state: 'CLOSED', preparedDate: null } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    effects.recordPrepareFailure = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      const second = await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(1);
+      effects.listHolds = () => [{ num: '5028', reason: 'prepare-stamp-pending' }];
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: second.nextBookkeeping });
+      const followUps = effects.readPrepareStatus.mock.calls.map(([a]) => a).slice(1);
+      expect(followUps.length).toBeGreaterThan(0);
+      expect(followUps.every(a => a.prNumber === 91 && a.claimedAt === undefined)).toBe(true);
+      expect(effects.recordPrepareFailure).not.toHaveBeenCalled();
+      expect(effects.placePrepareHold).not.toHaveBeenCalledWith(expect.objectContaining({ reason: 'prepare-unstamped' }));
+    } finally { log.mockRestore(); }
+  });
+  // A re-prepare (`prepare-stale`): main still carries the stamp this attempt replaces. The probe and the hold must
+  // carry that stamp, or the old stamp reads as this PR's result and the open sectioned PR is never stamped.
+  it('recovers an untracked re-prepare\'s open sectioned PR against the stamp it replaces', async () => {
+    const effects = fixture();
+    const old = { preparedDate: '2026-09-01', preparedAgainstSha: 'abc1234' };
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.readPreparedStamp = () => old;
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.readPrepareStatus = vi.fn(({ replacesStamp }) => ({
+      ...(replacesStamp?.preparedDate === old.preparedDate ? { preparedDate: null, replacedPreparedDate: old.preparedDate } : old),
+      pr: { number: 91, state: 'OPEN', preparedDate: null, hasSections: true } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.readPrepareStatus).toHaveBeenCalledWith(expect.objectContaining({ num: '5028', prNumber: 91, replacesStamp: old }));
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(1);
+      expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending', replacesStamp: old });
+    } finally { log.mockRestore(); }
+  });
+  it('never probes a refusal whose PR is not a lane prepare branch (a title-only match)', async () => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'someone/manual-prepare',
+      title: 'WE #5028: prepare — manual', isCrossRepository: false }];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, pr: { number: 91, state: 'OPEN', hasSections: true } }));
+    effects.stampPrepare = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      // The title still refuses the launch, so the exclusion below is exercised, not vacuous.
+      expect(first.prepare.refused).toEqual([{ num: '5028', reason: 'open prepare PR #91 (someone/manual-prepare)' }]);
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.readPrepareStatus.mock.calls.filter(([a]) => a.num === '5028' && a.prNumber != null)).toEqual([]);
+      expect(effects.stampPrepare).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+  // PR #5366 review round 7: a title-only match may refuse a launch, never drive a write. The retirement pass reads a
+  // TRACKED card's PR through the status reader; a non-lane PR titled `WE #<num>: prepare` must not be stamped from.
+  it.each(['OPEN', 'CLOSED'])('never stamp-recovers or retires a tracked prepare from a title-only %s non-lane PR', async state => {
+    const sectioned = '---\nstatus: open\n---\n' + ['Design', 'MVP', 'Test plan', 'Proof plan']
+      .map(h => `## ${h}\nCompleted substantive work.\n`).join('\n');
+    const pr = { number: 91, state, headRefName: 'someone/manual', title: 'WE #5028: prepare — manual',
+      headRefOid: '9'.repeat(40), createdAt: '2026-10-14T12:00:00Z', isCrossRepository: false };
+    const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\nunprepared on main' }, [pr]);
+    const exec = vi.fn((cmd, args, opts) => cmd === 'gh' && args[0] === 'api'
+      ? JSON.stringify({ content: Buffer.from(sectioned).toString('base64') }) : git(cmd, args, opts));
+    const reader = createPrepareStatusReader({ exec });
+    const effects = fixture({ inFlight: [{ num: '5028', row: { runId: 'dead', entry: {
+      key: 'dead', live: false, expectedBy: '2020-01-01' } } }] });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [] }, nextState: {} });
+    effects.readPrepareStatus = args => reader.read(args);
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.stampPrepare).not.toHaveBeenCalled();
+    expect(effects.placePrepareHold).not.toHaveBeenCalledWith(expect.objectContaining({ reason: 'prepare-stamp-pending' }));
+    expect(tick.prepare.retired.map(r => r.why)).not.toContain('prepare PR closed');
+    // The same PR still refuses a launch (refusal grade).
+    expect(reader.listPrs({ num: '5028' }).map(p => p.number)).toEqual([91]);
+  });
+  // PR #5366 review round 7: an ended attempt whose PR is still OPEN is settled (claim released, row retired). Its
+  // OPEN PR already refuses a re-launch, so it must not keep a prepare slot: two of them would block every prepare.
+  it.each(['retry failure', 'held ledger record'])('an ended prepare with a still-OPEN PR frees its slot (%s): a clean third launches', async kind => {
+    const effects = fixture({ inFlight: ['5028', '5029'].map(num => ({ num, row: { runId: `dead-${num}`, entry: {
+      key: `dead-${num}`, live: false, expectedBy: '2020-01-01' } } })) });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: ['5028', '5029', '5030'].map(num => ({ num })) }, nextState: {} });
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: null,
+      pr: { number: Number(num), state: 'OPEN', preparedDate: null, hasSections: false } });
+    effects.listPreparePrs = ({ num }) => num === '5030' ? []
+      : [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}-prepare-x` }];
+    if (kind === 'retry failure') effects.recordPrepareFailure = input => ({ ...input, cause: 'infra-transient', retry: true, held: false });
+    else effects.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, attempt: `a-${num}`, held: true, recordedAt: '2026-10-14' }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.inFlight).not.toEqual(expect.arrayContaining(['5028']));
+    expect(tick.prepare.inFlight).not.toEqual(expect.arrayContaining(['5029']));
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5030']);
+  });
+  it('holds build-backoff cards and in-flight group members out of tick-core\'s prepare picks', async () => {
+    const effects = fixture();
+    acquireBuildDispatchClaim({ num: '4501', lockRoot, owner: 'host:10', pid: 10 });
+    acquireBuildDispatchClaim({ num: '4503', groupLead: '4501', lockRoot, owner: 'host:10', pid: 10 });
+    effects.listBuildBackoffs = () => [{ num: '4504', exhausted: true }];
+    const plan = effects.planTick;
+    const seen = [];
+    effects.planTick = (bk, opts) => { seen.push(bk.prepareHeldNums); return plan(bk, opts); };
+    await runBuildDispatchTick({ live: true, effects });
+    expect(seen[0]).toEqual(expect.arrayContaining(['4503', '4504']));
+    expect(seen[0]).not.toContain('4501'); // a lead keeps its tick-core guard; holding it would drop that guard
+  });
+  it.each([
+    ['listing unavailable', () => { throw new Error('network failed'); }, [], 'prepare PR listing unavailable'],
+    ['listing effect absent', undefined, [], 'prepare PR listing unavailable'],
+    ['listing effect not callable', true, [], 'prepare PR listing unavailable'],
+    ['listing result absent', () => undefined, [], 'prepare PR listing unavailable'],
+    ['listing result invalid', () => ({}), [], 'prepare PR listing unavailable'],
+    ['merged after dispatch', () => [{ number: 92, state: 'MERGED', headRefName: 'lane/5028e-prepare-x',
+      createdAt: '2026-10-15' }], [{ num: '5028', recordedAt: '2026-10-14' }], 'merged prepare PR #92 after last dispatch (within 24h guard)'],
+    ['held needs-you park', () => [], [{ num: '5028', recordedAt: '2026-10-14',
+      held: true, holdReason: 'needs-you: decide scope' }], 'parked needs-you: needs-you: decide scope'],
+  ])('fails closed at launch: %s', async (_name, list, records, reason) => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.listPreparePrs = list;
+    effects.listPrepareFailures = () => records;
+    effects.acquirePrepareClaim = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.refused).toEqual([{ num: '5028', reason }]);
+      expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
+      expect(effects.dispatch).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+  // PR #5366 review: the operator's reviewed release (releases store) lifts a needs-you park at launch too.
+  it.each([[[{ target: '5028', attempt: 'run x' }], true], [[], false]])(
+    'a reviewed release of a held needs-you record launches the card (releases=%j, launches=%s)', async (releases, launches) => {
+      const effects = fixture();
+      effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+      effects.listPreparePrs = () => [];
+      effects.listPrepareFailures = () => [{ num: '5028', attempt: 'run x', stage: 'result', cause: 'needs-you',
+        held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }];
+      effects.listPrepareReleases = () => releases;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const tick = await runBuildDispatchTick({ live: true, effects });
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(launches ? ['5028'] : []);
+        expect(tick.prepare.refused).toEqual(launches ? [] : [{ num: '5028', reason: 'parked needs-you: needs-you: decide scope' }]);
+      } finally { log.mockRestore(); }
+    });
+  // PR #5366 review (round 4): an operator resolves a needs-you card by stamping it on main; the daemon then completes
+  // the record. When main moves on and the stamp goes stale, the prepare-stale re-prepare must launch, not stay parked.
+  it.each([[true, true], [false, false]])(
+    'a stamp-completed needs-you record does not park a prepare-stale re-prepare (completed=%s, launches=%s)', async (completed, launches) => {
+      const effects = fixture();
+      effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+      effects.listPreparePrs = () => [];
+      effects.readPreparedStamp = () => ({ preparedDate: '2026-09-01', preparedAgainstSha: 'aaaa1111' });
+      effects.listPrepareFailures = () => [{ num: '5028', attempt: 'run x', stage: 'result', cause: 'needs-you',
+        held: true, completed, recordedAt: '2026-08-30', holdReason: 'needs-you: decide scope' }];
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const tick = await runBuildDispatchTick({ live: true, effects });
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(launches ? ['5028'] : []);
+        expect(tick.prepare.refused).toEqual(launches ? [] : [{ num: '5028', reason: 'parked needs-you: needs-you: decide scope' }]);
+      } finally { log.mockRestore(); }
+    });
+  it.each([[12, false], [6, true], [0, true]])(
+    'uses the tick policy merged guard (%sh, launches=%s)', async (mergedGuardHours, launches) => {
+      const effects = fixture();
+      effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+      effects.preparePolicy = vi.fn(() => resolvePreparePolicy({ tool: { mergedGuardHours } }));
+      effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+      effects.listPreparePrs = () => [{ number: 92, state: 'MERGED', headRefName: 'lane/5028e-prepare-x',
+        createdAt: '2026-10-15T00:00:00Z' }];
+      effects.listPrepareFailures = () => [{ num: '5028', recordedAt: '2026-10-14' }];
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.preparePolicy).toHaveBeenCalledTimes(1);
+      expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
+      expect(tick.prepare.refused).toHaveLength(launches ? 0 : 1);
+    });
+  it('retires a merged unstamped PR without recording an unstamped failure', async () => {
+    const effects = fixture();
+    claimed(effects);
+    effects.readPrepareStatus = () => ({ preparedDate: null, pr: { state: 'MERGED' } });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.retired[0].why).toBe('prepare PR merged');
+    expect(tick.prepare.failures).toEqual([]);
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+    expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
+  });
   it('forces the Claude prepare fallback from the runner setting', async () => {
     const effects = fixture();
-    effects.preparePolicy = vi.fn(() => ({ runner: 'claude', sources: { runner: 'tool' } }));
+    effects.preparePolicy = vi.fn(() => resolvePreparePolicy({ tool: { runner: 'claude' } }));
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(effects.preparePolicy).toHaveBeenCalledTimes(1);
     expect(tick.prepare).toMatchObject({ runner: 'claude', runnerSource: 'tool' });
@@ -1689,7 +2134,7 @@ describe('automatic item preparation', () => {
         const kind = mode === 'on' ? 'prepare-item' : 'prepare';
         const prefix = `build-dispatch-daemon: ${kind} launch of #4501 ${admit ? 'admitted:' : 'deferred ('}`;
         expect(log.mock.calls.some(([line]) => line.startsWith(prefix)
-          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from})`))).toBe(true);
+          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from}) · mergedGuardHours=24 (from standard)`))).toBe(true);
       } finally { log.mockRestore(); }
     });
   it('passes its tick to dispatch-lane', async () => {
@@ -1920,7 +2365,9 @@ describe('automatic item preparation', () => {
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(effects.stampPrepare).not.toHaveBeenCalled();
     expect(tick.prepare.stamping).toEqual([]);
-    expect(tick.prepare.held).toEqual([{ num: '4501', reason: 'prepare-unstamped' }]);
+    expect(tick.prepare.held).toEqual([]);
+    expect(tick.prepare.failures).toEqual([]);
+    expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
   });
   it('holds incomplete results without attempting a mechanical stamp', async () => {
     const effects = fixture();
@@ -2014,7 +2461,8 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.inFlight).not.toContain('4501');
     expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4502']);
   });
-  it.each(['MERGED', 'CLOSED'])('retires a %s prepare PR and durably holds its unstamped card across restart', async (state) => {
+  it('retires a CLOSED prepare PR and durably holds its unstamped card across restart', async () => {
+    const state = 'CLOSED';
     const effects = fixture();
     claimed(effects);
     const holdRoot = join(lockRoot, 'holds');
@@ -2187,15 +2635,39 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.failures).toContainEqual(expect.objectContaining({ num: '4501', stage: 'retirement' }));
     expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4502']);
   });
-  it('retires a dead worker whose open PR carries no stamp, holding it', async () => {
+  it.each([false, true])('recovers or holds a dead worker’s open unstamped PR (sections=%s)', async hasSections => {
     const effects = fixture();
     claimed(effects);
-    effects.readPrepareStatus = () => ({ preparedDate: null, pr: { state: 'OPEN', preparedDate: null } });
+    effects.readPrepareStatus = () => ({ preparedDate: null, pr: { state: 'OPEN', preparedDate: null, hasSections } });
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
     const tick = await runBuildDispatchTick({ live: true, effects });
-    expect(tick.prepare.retired).toHaveLength(1);
-    expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: 'prepare-unstamped' });
+    expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501',
+      reason: hasSections ? 'prepare-stamp-pending' : 'prepare-unstamped' });
+    expect(effects.stampPrepare).toHaveBeenCalledTimes(hasSections ? 1 : 0);
     expect(tick.prepare.inFlight).not.toContain('4501');
+    expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
   });
+  it.each(['OPEN', 'MERGED', 'CLOSED', null].flatMap(state => [false, true].flatMap(stamped =>
+    [false, true].flatMap(hasSections => [false, true].map(workerLive => ({ state, stamped, hasSections, workerLive }))))))(
+    'settles prepare state matrix %j', async ({ state, stamped, hasSections, workerLive }) => {
+      const effects = fixture({ inFlight: [{ num: '4501', row: { runId: 'matrix', entry: {
+        key: 'matrix', live: workerLive, expectedBy: '2020-01-01',
+      } } }] });
+      claimed(effects);
+      effects.readPrepareStatus = () => ({ preparedDate: stamped ? '2026-10-15' : null,
+        hasSections: state === 'OPEN' ? false : hasSections,
+        pr: state ? { state, preparedDate: null, hasSections } : null });
+      effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      const recovery = !workerLive && !stamped && state !== 'MERGED' && hasSections;
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(recovery ? 1 : 0);
+      const hold = !workerLive && !stamped && !hasSections && ['OPEN', 'CLOSED'].includes(state);
+      if (recovery || hold) expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501',
+        reason: recovery ? 'prepare-stamp-pending' : 'prepare-unstamped' });
+      else expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      expect(tick.prepare.inFlight.includes('4501')).toBe(workerLive);
+      expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('4501');
+    });
   it('keeps a dead-owner claim whose open PR is stamped (valid run awaiting landing)', async () => {
     const effects = fixture();
     claimed(effects);
@@ -2619,10 +3091,8 @@ describe('automatic item preparation', () => {
       expect(effects.placePrepareHold).not.toHaveBeenCalled();
     } else expect(effects.settlePrepareRow).not.toHaveBeenCalled();
   });
-  it.each([
-    ['sections on disk', { preparedDate: null, hasSections: true }],
-    ['an open unstamped PR with sections', { preparedDate: null, pr: { state: 'OPEN', preparedDate: null, hasSections: true } }],
-  ])('a dead session with %s recovers the stamp instead of retiring as session-dead', async (_n, status) => {
+  it('a dead session with sections on disk recovers the stamp instead of retiring as session-dead', async () => {
+    const status = { preparedDate: null, hasSections: true };
     const now = Date.now();
     const effects = fixture({ inFlight: [{ num: '4501', row: { runId: 'run', entry: {
       key: 'dispatch:0:0', live: false, handle: 'worker-session',
@@ -3506,6 +3976,7 @@ describe('grouped PREPARE daemon ticks', () => {
       fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }), listHolds: () => held,
       listPrepareInFlight: () => busy, listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: root }),
+      listPreparePrs: () => [],
       readPrepareStatus: vi.fn(() => ({ preparedDate: null })),
       readPreparedStamp: vi.fn(() => ({ preparedDate: null })),
       acquirePrepareClaim: vi.fn(args => refuse.includes(args.num) ? { ok: false, reason: 'busy' }
@@ -3526,6 +3997,48 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204'] })]);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
     expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #5366 review round 5 self-review: a card held out of tick-core for a fresh launch refusal (an open prepare
+  // PR) must not ride into a clean lead's group either — members are claimed under the lead, never refusal-checked.
+  // PR #5366 operator send-back (item 1): every group member passes the SAME launch refusal as the lead. A member
+  // that was never refused before (so no refusal hold) but has an OPEN prepare PR is dropped, not claimed.
+  it.each([
+    ['open prepare PR', { prs: num => num === '7203' ? [{ number: 93, state: 'OPEN', headRefName: 'lane/7203d-prepare-x' }] : [] },
+      'open prepare PR #93 (lane/7203d-prepare-x)'],
+    ['merged prepare PR', { prs: num => num === '7203' ? [{ number: 94, state: 'MERGED', headRefName: 'lane/7203e-prepare-x',
+      createdAt: '2026-10-15T11:00:00Z' }] : [], failures: [{ num: '7203', recordedAt: '2026-10-15T10:00:00Z' }] },
+    'merged prepare PR #94 after last dispatch (within 24h guard)'],
+    ['needs-you park', { failures: [{ num: '7203', recordedAt: '2026-10-14', held: true, holdReason: 'needs-you: decide scope' }] },
+      'parked needs-you: needs-you: decide scope'],
+    ['listing failure', { prs: num => { if (num === '7203') throw new Error('unavailable'); return []; } },
+      'prepare PR listing unavailable'],
+  ])('refuses a not-yet-refused group member with a(n) %s through the lead\'s launch admission', async (_name, { prs, failures = [] }, reason) => {
+    const effects = fixture({ spawns: [rows[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    if (prs) effects.listPreparePrs = vi.fn(({ num }) => prs(num));
+    effects.listPrepareFailures = () => failures;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204', '7205'] })]);
+      expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
+      expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', groupMembers: ['7202', '7204', '7205'] }));
+      expect(tick.prepare.refused).toEqual([{ num: '7203', reason }]);
+      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7203']);
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps a refusal-held card out of a clean lead\'s prepare group', async () => {
+    const effects = fixture({ spawns: [rows[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    const bookkeeping = { prepareRefusals: [{ num: '7202', reason: 'open prepare PR #91 (lane/7202d-prepare-x)', at: '2026-10-15T11:50:00Z' }] };
+    const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+    expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7203', '7204', '7205'] })]);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7202');
+    expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7202']);
   });
 
   it('keeps agent and unknown prepare routes single-card before claiming members', async () => {

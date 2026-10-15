@@ -129,6 +129,7 @@ export default defineConfig({
       'scripts/operations/__tests__/fake-claude-sessions.test.mjs',
       // #3383 — the stateful fake-GitHub's own proof: real bare origin/clone + real `execFileSync('gh', …)`.
       'scripts/conveyor/__tests__/fake-gh-state.test.mjs',
+      'scripts/conveyor/__tests__/fake-gh-lock.test.mjs',
       // #xpc3krl — the #2949 fidelity qualifier against the REAL `gh` binary (see the file's own header):
       // moved here from the default suite because its whole point is a real, unauthenticated `gh` failure,
       // which `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH) would otherwise mask — this tier
@@ -141,6 +142,7 @@ export default defineConfig({
       // same many-real-child-process cost tier as their tracer sibling above, pinned to `forks` below for the
       // identical contention reason.
       'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs',
+      'scripts/conveyor/__tests__/sim-world-git.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
     ].filter((f) => !LIVE_SUITE.has(f)),
@@ -162,6 +164,7 @@ export default defineConfig({
       // isolated here for the identical contention reason as this array's other members.
       ['scripts/conveyor/__tests__/sim-scenarios-smoke.test.mjs', 'forks'],
       ['scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs', 'forks'],
+      ['scripts/conveyor/__tests__/sim-world-git.test.mjs', 'forks'],
       ['scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs', 'forks'],
       ['scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs', 'forks'],
       // #x01b2gj — a fifth join, for the identical CORRECTNESS reason as the four above: its TTL-backdating

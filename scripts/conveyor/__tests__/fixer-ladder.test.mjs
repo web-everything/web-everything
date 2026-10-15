@@ -21,8 +21,8 @@ const rungOf = (p) => p.dispatch[0]?.rulingNotAddressed?.rung?.id ?? (p.refusals
 
 describe('ladder loaded from the routing policy', () => {
   const ladder = loadFixerLadder({ override: null });
-  it('models come from the routing policy, never hand-set: the stronger rung resolves to opus', () => {
-    expect(ladder.routes['stronger-model']).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5', source: 'routing-policy' });
+  it('models come from the routing policy, never hand-set: the stronger rung resolves to sonnet', () => {
+    expect(ladder.routes['stronger-model']).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5', source: 'routing-policy' });
     expect(ladder.routes.resend).toBeNull();
   });
   it('the critical-work gate keeps fix on Claude, so the cross-provider rung is dormant and the ladder asks the operator at miss 3', () => {
@@ -38,7 +38,7 @@ describe('ladder loaded from the routing policy', () => {
   });
   it('the routing policy entries exist for both escalation task types', () => {
     const policy = readRoutingPolicy();
-    expect(resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger', available: ['claude'], gateClosed: true, policy }).model).toBe('claude-opus-5-5');
+    expect(resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger', available: ['claude'], gateClosed: true, policy }).model).toBe('claude-sonnet-5-5');
     expect(resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-cross-provider', available: ['claude', 'codex'], gateClosed: false, policy }).provider).toBe('codex');
   });
   it('a local override is read, merged, and an invalid one is reported and ignored', () => {
@@ -66,8 +66,8 @@ describe('each rung of the ladder, planned', () => {
     const p = plan(3, ladder);
     expect(rungOf(p)).toBe('stronger-model');
     const r = p.dispatch[0].rulingNotAddressed;
-    expect(r.route).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
-    expect(r.rung).toMatchObject({ instruction: 'test-first', model: 'claude-opus-5-5' });
+    expect(r.route).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5' });
+    expect(r.rung).toMatchObject({ instruction: 'test-first', model: 'claude-sonnet-5-5' });
     expect(p.dispatch[0].why).toMatch(/escalation rung 2 \(stronger-model\)/);
   });
   it('rung 3 (miss 3): operator, because the cross-provider rung is unavailable by default', () => {
@@ -105,11 +105,11 @@ describe('what the dispatch does with a rung', () => {
   const ladder = loadFixerLadder({ override: null });
   const ruling = (n) => plan(n, ladder).dispatch[0].rulingNotAddressed;
   it('resend: no table (the ordinary fix route)', () => expect(fixerTableFor(ruling(2))).toBeNull());
-  it('stronger model: the routing-policy table, which buildAgentArgv turns into --model opus', () => {
+  it('stronger model: the routing-policy table, which buildAgentArgv turns into --model sonnet', () => {
     const table = fixerTableFor(ruling(3));
-    expect(table).toMatchObject({ model: 'claude-opus-5-5', effort: 'high', reason: 'fixer-escalation rung stronger-model' });
+    expect(table).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high', reason: 'fixer-escalation rung stronger-model' });
     const argv = buildAgentArgv({ sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix' }, table });
-    expect(argv[argv.indexOf('--model') + 1]).toBe('opus');
+    expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
     const plain = buildAgentArgv({ sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix' } });
     expect(plain).toContain('--model');
   });

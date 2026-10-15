@@ -2,9 +2,11 @@
 bornAs: x0wgz6d
 kind: story
 size: 1
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "24d9ebca8ca0b935093575ddbcac52f217c0a6d2"
 tags: []
@@ -15,6 +17,11 @@ tags: []
 Held finding 237 reported an immediate rebuild-in-progress result despite an explicit wait budget. Preserve that goal for an explicit overlay load: wait within the configured budget, retry through the existing rebuild machinery, and report adoption only after verifying the requested overlay is installed.
 
 ## Progress
+
+- Validation complete: all 110 tests in `we:scripts/lib/__tests__/daemon-load-overlay.test.mjs` pass through heavy admission. Both new core regressions failed against the original loader before implementation. With the new loader, busy → busy → adopted makes three attempts with budgets 600/350/100ms, sleeps 250/250ms, and returns adopted true only with installed tip `tip` at head `fresh`. Perpetual busy makes three attempts with the same budgets, sleeps 250/250/100ms, and returns adopted false with `rebuild-in-progress` and 600ms elapsed. Coverage also includes shared-deadline stale follow-ups, exhaustion before follow-up, invalid budget fallback, other refusals/errors, failed-smoke removal/recovery after waiting, missing/advanced-tip evidence, dry-run/versioned isolation, and an admitted rebuild completing beyond the budget.
+- Operational live-adoption proof was not performed; the tests use injected rebuilds and launch dependencies, with no live worker dispatch. Standards/gate execution and commit are left to the wrapper as directed by the delivery brief. No shared rebuild machinery or ordinary daemon-tick behavior changed.
+
+- Implementation sanity read: the legacy loader still returns the first live-sibling refusal; the spec remains coherent. Edge cases named before implementation: repeated busy refusal, deadline reached during an admitted rebuild, stale adoption sharing the deadline, invalid/non-finite/non-positive budgets, other refusal/throw, missing installed evidence or advancing ref, and dry-run/versioned isolation. Implemented the legacy-only monotonic deadline loop with asynchronous sleeps capped at 250ms, remaining-budget lock options, first-wait/final-outcome logging, installed-tip verification and unchanged rollback recovery.
 
 - Rechecked at 24d9ebca8: original premise was an explicit wait yielding immediately; corrected scope remains the legacy explicit loader plus its existing matching test, not ordinary daemon ticks or the versioned waiter. The initial call at `we:scripts/lib/daemon-load-overlay.mjs:642` still has no busy retry; the follow-up at `we:scripts/lib/daemon-load-overlay.mjs:662` requires an adopted result first. The live-lease refusal is at `we:scripts/lib/daemon-rebuild/prepare.mjs:484`, and the remaining-budget injection is supported by `we:scripts/lib/daemon-rebuild/rebuild.mjs:86`. Retain size 1 (approximately 70 source + 110 test lines). All five preparation sections below remain applicable; no implementation or live adoption was performed. Runner-owned stamps are unchanged.
 

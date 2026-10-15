@@ -3,9 +3,10 @@ bornAs: xzztr1a
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs"]
 dateOpened: "2026-10-07"
+dateResolved: "2026-10-15"
 tags: []
 ---
 

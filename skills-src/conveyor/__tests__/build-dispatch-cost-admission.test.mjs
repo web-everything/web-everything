@@ -31,6 +31,7 @@ function fixture({ openPrs = 3, killSwitch = false, spawns = ['4501', '4502', '4
     listClaims: () => [], listRunStoreInFlight: () => [],
     killSwitch: () => ({ engaged: killSwitch }),
     listPrepareInFlight: () => [],
+    listPreparePrs: () => [],
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot }),
     acquirePrepareClaim: (o) => acquireBuildDispatchClaim({ ...o, lockRoot, owner: 'host:10', pid: 10 }),
     releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),

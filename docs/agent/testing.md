@@ -731,6 +731,19 @@ verify the committed stamp and submit via `open-pr --mode=label-on-green`; only 
 `prepare-unstamped`. Test fresh-main and existing-PR recovery, lane-local command paths, stale section
 observations, resolved cards, failed stamps, freeze/dry-run, and a fresh Node `--bogus-flag` boot.
 
+Duplicate-prepare guards must preserve recovery: cross OPEN/MERGED/CLOSED/no PR with main stamps,
+sections and worker liveness in daemon-tick tests. An OPEN unstamped PR with a dead worker recovers
+its stamp when sectioned and surfaces `prepare-unstamped` otherwise; a stamped OPEN PR awaits landing,
+and a MERGED PR never triggers an unstamped retry. Keep replaced-stamp and live-worker cases pinned.
+Offer two persistently refused candidates before a clean successor at cap two, across successive ticks:
+refusals must not consume worker capacity. Missing, non-callable, throwing or malformed PR-list effects
+must refuse dispatch. Reader integration fixtures must apply the actual search filters, including title-only
+PRs outside `lane/`, `bornAs` branches, saturated shared listings, date-floor fallback and async prefetch.
+Prepare launch fixtures, including grouped unit and soak scenarios, must supply `listPreparePrs: () => []`
+when modeling no existing prepare PR; omitting the effect models an unavailable listing and refuses launch.
+Every component search must be complete before its union can prove absence; cache by both identities.
+When replacing a regression test, identify the replacement covering its original recovery behavior during review.
+
 
 ### Probation prepare validation and fallback
 
@@ -802,6 +815,35 @@ applying the data. A later attempt is not covered by an earlier release. Route e
 before the latched route returns. Neither elapsed time nor a later successful run clears that latch.
 The incident report `reports/2026-09-30-prepare-failures-root-causes.md` distinguishes worker cause from
 claim retirement: dead-session cleanup frees capacity but does not prove why authoring failed.
+
+Prepare PR identity is shared in `we:scripts/conveyor/prepare-pr-match.mjs`: same-repo branches
+accept one uniqueness letter after the card number (or `bornAs`), with the `WE #<num>: prepare`
+title as a fallback. That fallback is refusal grade only (`isPreparePrFor`): it may refuse a launch,
+never drive a write. The status reader, whose result drives retirement, holds and the stamp worker,
+uses the write-grade `isLanePreparePrFor` (lane branch required). Test every write path with a
+title-only PR outside `lane/` and assert no stamp, hold or retirement comes from it.
+An ended attempt frees its prepare slot even while its PR is OPEN (that PR refuses the re-launch):
+test cap-many ended OPEN-PR cards and assert a clean card still launches.
+Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
+The launch guard must also run without a surviving claim, and refuse when PR listing throws.
+Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
+0 disables only the merged refusal); probe the time boundary with an injected clock.
+A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
+Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
+the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
+the releases store. Cover each clearing path, and an older park under a newer record, so an operator's
+hand stamp never re-parks the card (the stale-reprepare livelock).
+tick-core offers at most two item prepares and cannot see these launch refusals. The daemon keeps a
+refused card out of the plan, and out of a clean lead's prepare group, for `PREPARE_REFUSAL_HOLD_MS`,
+then checks it again. Build-backoff cards and group members in flight are held out the same way.
+Every group member passes the same launch admission as its lead (`refusePrepareLaunch`); test a member
+that was never refused before and has its own open PR. When nothing else tracks a card refused for its
+own lane prepare PR, the daemon reads THAT PR once per refusal (`prNumber`). A finished but unstamped
+result (open, with sections, no stamp, judged against the stamp a re-prepare replaces) goes to stamp
+recovery, and later reads stay on that PR while its hold stands; anything else
+stays a refusal that takes no prepare slot and places no hold. Test that capacity
+rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
+a clean third, across ticks.
 
 Stamp-recovery reservations do not expire. A terminal recovery error is recorded in its dispatch log,
 classified by the daemon, and cannot spawn again without a remaining transient budget or a cited fix.
@@ -956,6 +998,57 @@ resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS Y
 findings before the first ruling.
 The queue routes needs-judgment questions to NEEDS YOU
 by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.
+
+### PR movement health job (card 335)
+
+`health-pr-sweep` runs the deterministic PR sweep separately from health gh probes. The health tick only
+queues, reattaches and consumes; the child writes `pr-sweep.json` beside health `state.json` and appends
+one ET line to the handoff home's `pr-sweep.log`. The sweep never writes health `episodes` or `daemons`.
+Its worker keeps synchronous session/log reads off the durable job's heartbeat loop. Reuse the health
+job's detached prewarm and trash eviction paths: cold snapshots and npm installs must not block a tick.
+The reused reconcile agent-reader graph needs npm dependencies (`js-yaml`, `markdown-it`).
+
+Settings resolve through `cascadePolicy('prSweep')`: standard/platform defaults, `scripts/settings/pr-sweep.json`,
+the health `config.json` `prSweep` block, then `WE_PR_SWEEP_*` env values (for example
+`WE_PR_SWEEP_IDLE_MINUTES`, `WE_PR_SWEEP_DISPATCH_DIAGNOSIS`, and comma-separated `WE_PR_SWEEP_REPOS`).
+Sources are logged and carried into the child report. Diagnosis defaults off and delegates exclusively to
+`stuck-pr-watch.mjs sweep`; alerts use the existing checked desktop/quiet-hours gate.
+
+A session owns a PR only while it is actively running: every listed `state`/`status` value is
+`working`, `running` or `busy`, its pid probes alive, and its transcript (or its start) is newer than
+`sessionActiveWithinMinutes` (default 30). Finished fixers are listed `idle`, `offline`, `blocked` or
+`waiting`, so those and any unknown state never own a PR. A PR is `unknown` when a session named for it
+is running and alive but its transcript cannot be read (a review job has none; this lasts at most
+`stuckAfterMinutes` after the session starts), or when the agent listing could not read that session's
+record. An `unknown` PR is never owned: its episode clock keeps running and it alerts after twice
+`stuckAlertMinutes`, so a brief unreadable tick never alerts and a permanent one still does. Item
+sessions (`conveyor-N`, `prepare-N`) and unnamed rows never make a PR `unknown`.
+
+A failed owner read pauses stuck-alert episode updates, and so does a listing gap that names no session,
+since a missing session is unknown, not gone. An incomplete operator queue also pauses them,
+since operator-owned PRs cannot safely be distinguished, and preserves the previous NEEDS YOU set.
+A complete first queue sample records the set without alerting. A PR move or head change resets its
+unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due
+for retry. Dry runs and fixture health ticks never dispatch the sweep against the host.
+
+Sessions marked `hung`, `idleFinished`, `authExpired` or `selfReportedDone`, and sessions whose pid is dead
+or unprobed, cannot refresh sweep ownership. Recent daemon evidence still counts. Replay the PR #5323 findings
+with the `pr-sweep-unhealthy-owner-and-symlink-entry` soak break: successive dry sweeps must alert once
+after the delay (including for idle, offline, blocked and waiting fixers), and the three CLI entry points
+(`pr-sweep-job.mjs`, `pr-sweep.mjs`, `health-watch.mjs`) must execute when reached through a symlink.
+
+Dispatch refusals from health memory or daemon logs are diagnostic signals, never ownership or progress
+(including review-daemon's `not dispatched`, `no review dispatched` and failed-dispatch formats).
+Log ownership requires a recognized work event (start, dispatch, applied action, or completed movement);
+rankings, repeated notes, dry runs and unknown diagnostic wording cannot renew ownership.
+The same soak break refreshes refusals on every sweep through 24 hours and requires exactly one stalled
+alert. Qualified daemon references (`repo#number`, `repo PR #number`, and GitHub PR URLs) override the
+clone's default repository; replay colliding PR numbers to catch cross-repository ownership attribution.
+
+Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the heavy-admission queue.
+Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
+agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall
+through to the host's live agents or daemon clones.
 
 ### Fix verification infrastructure retries
 

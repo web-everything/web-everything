@@ -269,13 +269,20 @@ it('preserves Claude build and documentation effort and fallback', () => {
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix', available: ['claude'] }).effort).toBe('low');
 });
 
-it('routes build-new-feature task work like build, including inherited operations and fallback', () => {
+it('inherits feature probation by default and preserves explicit operator pins and fallback', () => {
   const policy = copy();
-  expect(policy.taskTypes['build-new-feature']).toEqual({
+  expect(policy.taskTypes['build-new-feature']).toEqual({ inherit: true });
+  expect(policy.operations['build:build-new-feature']).toEqual({ inherit: true });
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toBeNull();
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, policy })).toMatchObject({
+    provider: 'claude', model: 'claude-sonnet-5-5', fallback: [],
+  });
+  expect(() => resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, availability: { claude: 'held' }, policy })).toThrow(/no available route/);
+  policy.taskTypes['build-new-feature'] = {
     provider: 'codex', model: 'sol',
     effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
     fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
-  });
+  };
   expect(policy.taskTypes['build-new-feature']).toMatchObject({
     provider: policy.operations.build.provider, model: policy.operations.build.model,
     effort: { codex: policy.operations.build.effort.codex },
@@ -295,8 +302,8 @@ it('preserves operator-protected Astra and ruling escalation routes', () => {
   const policy = copy();
   for (const k of ['prepare', 'prepare-decision', 'prepare-item', 'investigate']) expect(policy.operations[k].model).toBe('astra');
   for (const k of ['design', 'diagnosis']) expect(policy.taskTypes[k].model).toBe('astra');
-  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'opus', fallback: [] });
-  expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'opus', effort: 'high' }] });
+  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
+  expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }] });
 });
 
 it('honours a configured retry array at the real launch boundary', async () => {
