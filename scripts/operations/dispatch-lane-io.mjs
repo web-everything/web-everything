@@ -1841,6 +1841,16 @@ export function routeDispatchProvider(request, {
   }
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
   // worker (see `dispatch-providers/probation-worker.mjs#probationLaunchDecision` for every condition).
+  // An inherited pick has no policy fallback chain, so the same pre-launch availability check (worker and its
+  // checker) applies here; an unavailable pick takes the unchanged path below instead of a doomed detached run.
+  const inheritedWorker = request.probationWorker;
+  const unavailable = inheritedWorker && probationLaunchDecision(request, probationLaunch).launch
+    && [inheritedWorker.provider, inheritedWorker.checker].filter(Boolean)
+      .find(provider => !providerAvailable(provider, { provider, model: inheritedWorker.model, effort: inheritedWorker.effort }));
+  if (unavailable) {
+    console.error(`routing-fallback: ${kind} → unchanged path (${unavailable} unavailable for probation worker ${inheritedWorker.id})`);
+    request = { ...request, probationWorker: null };
+  }
   if (probationLaunchDecision(request, probationLaunch).launch) {
     if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
     const runScript = PROBATION_LAUNCHABLE_KINDS[kind].runScript;

@@ -89,6 +89,24 @@ describe('probation roster models reach the build runner parser', () => {
     expect(parsed).toMatchObject({ taskType: 'build-new-feature', worker: { id: 'antigravity-argon', checker: 'codex', simpleOnly: false } });
   });
 
+  it.each(['antigravity', 'codex'])('an inherited Argon feature pick checks %s executable availability before launch', missing => {
+    const routing = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+      scorecards: [{ subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' }],
+    });
+    expect(routing.policyRoute ?? null).toBeNull();
+    expect(routing.probationWorker?.id).toBe('antigravity-argon');
+    const asked = [];
+    const request = { launchKind: 'build', repo: 'we', num: '9001', sessionSlug: 'feature-test', probationWorker: routing.probationWorker, table: { model: 'sonnet' } };
+    const handle = routeDispatchProvider(request, {
+      probationLaunch: 'on', scriptExists: () => true,
+      providerAvailable: provider => { asked.push(provider); return provider !== missing; },
+      probation: () => { throw new Error('unavailable probation worker launched'); },
+      agent: req => { expect(req.probationWorker).toBeNull(); return 'native-claude'; },
+    });
+    expect(handle).toBe('native-claude');
+    expect(asked).toContain(missing);
+  });
+
   it('explicit Gemini policy routes and fallback chains honour the Codex checker hold', () => {
     const policy = structuredClone(inheritedRoutingPolicy);
     policy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-3.8-flash-high', fallback: [

@@ -11,11 +11,12 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/argon-build', paths: [
     'scripts/lib/dispatch-contracts.mjs', 'scripts/lib/dispatch-routing-policy-io.mjs',
     'scripts/lib/dispatch-routing-policy.json', 'scripts/operations/dispatch-providers/probation-worker.mjs',
-    'scripts/operations/probation-build-run.mjs',
+    'scripts/operations/probation-build-run.mjs', 'scripts/operations/dispatch-lane-io.mjs',
   ] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/operations/dispatch-providers/probation-worker.mjs'), 'utf8')
-      .includes("taskTypes: Object.freeze(['doc-fix', 'test-fix', 'build-new-feature'])");
+      .includes("taskTypes: Object.freeze(['doc-fix', 'test-fix', 'build-new-feature'])")
+      && readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('routing-fallback: ${kind} → unchanged path');
   },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
@@ -53,6 +54,19 @@ export default {
         const parsed = parseArgs(argv.slice(1));
         check(parsed.taskType === 'build-new-feature' && parsed.worker.checker === 'codex'
           && parsed.worker.simpleOnly === false, 'feature identity or checker lost at the runner boundary');
+        // The inherited route has no policy fallback chain: a missing agy (worker) or codex (checker) binary
+        // must be caught before launch and take the unchanged Claude path, never a doomed detached run.
+        for (const missing of ['antigravity', 'codex']) {
+          let launched = 'none';
+          try {
+            launched = routeDispatchProvider({ launchKind: 'build', num: '9001', sessionSlug: 'argon-soak',
+              repo: 'we', probationWorker: route.probationWorker, table: { model: 'sonnet' } }, {
+              probationLaunch: 'on', scriptExists: () => true, providerAvailable: provider => provider !== missing,
+              agent: () => 'claude', probation: () => 'probation',
+            });
+          } catch (error) { launched = `refused: ${error.message}`; }
+          check(launched === 'claude', `${missing} unavailable but the inherited Argon pick launched '${launched}'`);
+        }
       }
     } catch (error) { violations.push(error.message); }
     return { violations };
