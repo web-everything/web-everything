@@ -22,6 +22,7 @@ Run every scoped test through the host heavy-run queue using the invocation desc
 
 - [A2] **Must** — on error (shape unscorable, settings unreadable, advisory comment unreadable) the code refuses to reuse and re-runs the advisory; it never reuses on a failed read.
 - [A3] **Must** — the shape scoring and the reuse check treat docs, config, data and backlog paths exactly as `buildShapePlan` does today (no path kind is waived); reuse only ever loosens the re-run, never the `review:human` hold.
+- [A4] **Must — reachable at human parks** — for a real high-care shape with `earnedShape.rounds === 3`, one same-head accepted pass with `completedRounds === 1` and every mandatory-floor lens completed must satisfy the advisory wait at all three park sites. The round predicate is `completedRounds >= 1`; `earnedShape.rounds` is not an input to that predicate. Preserve the earned three-round obligation and `review:human`. Prove this through both real renderers and the park callers in `ordinary accepted review round-trips into park reuse` below.
 
 ## Non-goals
 
@@ -55,6 +56,16 @@ The reuse target is explicitly **one completed advisory pass with at least one s
 Add pure `decideAdvisoryReuse({ advisories, headSha, earnedShape, setting })`: reuse only when the setting is on, the latest trusted advisory is an `accept` covering this head (`advisoryCoversHead`), with both parsed and live heads validated as full 40-hex SHAs and equal (the existing helper alone also accepts prefixes), its completed lenses include every lens of the validated nonempty `earnedShape.mandatoryFloor`, and its completed rounds prove the one-pass advisory target (`completedRounds >= 1`, not `completedRounds >= earnedShape.rounds`). A newer changes/inconclusive note blocks reuse of an older accept. At all three park-to-human sites in we:scripts/merge-ai-prs.mjs (we:scripts/merge-ai-prs.mjs:5531, we:scripts/merge-ai-prs.mjs:5651, we:scripts/merge-ai-prs.mjs:5753), share one reuse/awaiting-label decision using fresh complete comments and the scored net shape; never infer earned shape from the hold label alone. On those paths, successful reuse explicitly removes any existing `review:awaiting-advisory` and omits adding it; failed reuse ensures it is present. No new advisory comment is posted. Also close the existing ordinary-verdict fallback in `planAdvisoryRepairLabels` (we:scripts/lib/advisory-labels.mjs:168): it currently clears awaiting on a prefix head match with no coverage or setting check. Distinguish actual advisory records from ordinary verdict records in the parser. For an ordinary record, require the same successful reuse decision before clearing awaiting or deriving advisory labels; absent decision inputs refuse that repair. The existing sweep caller (we:scripts/conveyor/advisory-label-sweep.mjs:129) supplies no shape/settings, so it must conservatively leave ordinary records alone rather than undo a park refusal. Preserve repair of actual advisory notes, which records an advisory that already ran, independently of the ordinary-accept reuse switch. No sweep edit is required. Preserve `review:human` on both branches, regardless of who added it, and keep merge disallowed (N1).
 
 (c) Labels: `stripReadyOnPark` (we:scripts/merge-ai-prs.mjs:5336, via `decideParkReadyStrip`) already strips `status:ready-to-merge` at all three park sites (we:scripts/merge-ai-prs.mjs:5537, we:scripts/merge-ai-prs.mjs:5657, we:scripts/merge-ai-prs.mjs:5733). The Must here is only a regression test replaying the #4763 order (accepted, ready-to-merge, then a gate-self park) proving the strip and the `review:accepted` removal both happen; if that test is RED, fix `stripReadyOnPark` for the missed case.
+
+The round decision must satisfy this table at each human park, for both ordinary accepts and advisory accepts. Assume trusted latest same-head accept, enabled reuse, successful reads and a valid mandatory floor; the remaining identity and trust checks still apply.
+
+| Earned rounds (care high) | Completed rounds in one record | Mandatory-floor coverage | Advisory reuse |
+| --- | --- | --- | --- |
+| 3 | 1 | Complete | Yes; clear awaiting, retain human and the full review shortfall |
+| 3 | 0 or unknown | Complete | No; ensure awaiting |
+| 3 | 1 | Missing a required lens | No; ensure awaiting |
+
+The positive row must work with one record from one judging pass. Do not require three passes, aggregate records, lower the scored care, or report three completed rounds to reach it. The named renderer/park test and `reuse requires latest trusted same-head sufficient coverage` must pin these rows (A4).
 
 ## Preparation review checks
 
