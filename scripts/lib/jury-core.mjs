@@ -3126,6 +3126,10 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
     // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
     if (!finding || !sameFindingForClearing(finding, target)) continue;
+    // A BLOCK is never carried (#5942): unchanged cited lines cannot show the defect still holds on this head (a fixed
+    // surrounding dependency leaves them identical). The latest ruling still decides, so a block also ends the search:
+    // the finding stays live for the current-head reviewer, who is asked with the earlier ruling as evidence.
+    if (o.result === 'block') return null;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;
@@ -3367,6 +3371,10 @@ export function referralRecordState(record, options = {}) {
     const counted = active.length > 0 && ((outcomes.size === 1 && !cardUnreadable) || active.some(r => r.result === 'block'));
     const carried = counted ? undefined : (record.carried ?? []).find(c => c.key === f.key);
     if (carried) {
+      // #5942 — a legacy operator-backed BLOCK carry no longer counts: an earlier head's block is not a verdict on this
+      // head. It stays pending, so the withdrawn-carry re-ask hands the finding to the current-head reviewer (a counted
+      // ruling above, or a current-head operator ruling, still decides first).
+      if (carried.result === 'block' && carried.from.rulingId === undefined) { pending.push(f.key); continue; }
       const backing = carried.from.rulingId !== undefined
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
           target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
@@ -3450,14 +3458,36 @@ export function linkedBlockedFindingIds(records = [], options = {}) {
 
 export const REFERRAL_RECORD_MARKER = 'mandatory-referrals-v1';
 
+/**
+ * Who ruled a `carried` entry, named from its backing discriminator — never from free text. `from.rulingId` is a
+ * reviewer backing. An operator backing is a human operator, except a block whose latest backing ruling (found in the
+ * optional `operatorRulings`) was recorded by the automatic policy. A block with no backing to look at is `earlier`:
+ * the stored reason is the legacy literal "the operator ruled", which cannot be trusted to name its actor. PURE.
+ */
+export function carriedActor(carried, { operatorRulings = [] } = {}) {
+  if (carried.from.rulingId !== undefined) return 'reviewer';
+  if (carried.result !== 'block') return 'operator'; // the automatic policy can only ever rule `block`
+  const backing = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.head === carried.from.head
+    && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
+  if (!backing) return 'earlier';
+  return String(backing.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR ? 'automatic policy' : 'operator';
+}
+
+/** The carry's reason as shown: the stored literal (kept so old records validate) with its actor corrected. */
+export function carriedReasonText(carried, options) {
+  const actor = carriedActor(carried, options);
+  if (actor === 'operator') return carried.reason;
+  return `carried: ${actor === 'earlier' ? 'an earlier head ruled' : `the ${actor} ruled`} this finding on an earlier head; its cited lines are unchanged`;
+}
+
 /** Encode data so a finding cannot close the structured comment delimiter. */
-export function renderReferralRecord(record) {
+export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
     + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
-    + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
+    + (record.carried ?? []).map(c => `\n- ${c.key}: ${carriedReasonText(c, { operatorRulings })} (${carriedActor(c, { operatorRulings })} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
     + (record.verified ?? []).map(v => `\n- ${v.key}: verified by a tool-bearing seat: ${v.outcome}${v.reason ? ` (${foldUntrusted(v.reason)})` : ''}`).join('')
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`

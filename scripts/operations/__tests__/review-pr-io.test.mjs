@@ -1356,6 +1356,41 @@ describe('#4315 durable referral effects', () => {
     expect(result.pending).toContain(current.referrals[0].key);
   });
 
+  // #5942 — an earlier head's operator BLOCK is evidence for the current-head reviewer, never a copied verdict.
+  it('does not carry an earlier operator block over unchanged lines (even an empty changed set): the reviewer is asked', async () => {
+    const h = harness({ readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'block' } });
+    const key = current.referrals[0].key;
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(currentOf(h).carried).toBeUndefined();
+    expect(askedKeys(h)).toContain(key);
+    expect(h.lines.join('\n')).not.toContain('referral carried');
+    expect(out.pending).not.toContain(key);                   // the fresh not-real ruling decided
+  });
+
+  it('a failed re-check of an earlier operator block stays held, never cleared', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'block' } });
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(currentOf(h).carried).toBeUndefined();
+    expect(out.pending).toContain(current.referrals[0].key);
+  });
+
+  it('an existing legacy operator-block carry is held and re-asked once, never counted', async () => {
+    const h = harness({ readChangedLines: () => new Set() });
+    const { old, current } = seedCarry(h, { attempted: true, operatorRuling: { result: 'block' } });
+    const key = current.referrals[0].key;
+    const carried = [{ key, reason: REFERRAL_CARRY_REASON, result: 'block',
+      from: { head: old.head, runId: old.runId, key: old.referrals[0].key } }];
+    h.state.comments.push({ body: renderReferralRecord({ ...current, carried }), author: { login: 'web-everything' } });
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid, body: h.state.body, cardReadable: () => true }).pending).toContain(key);
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);
+    expect(out.pending).not.toContain(key);
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);                      // bounded: no second ask
+  });
+
   // #76c — the mandatory reviewer's OWN earlier counted ruling carries onto the same finding (moved line, same
   // identity) on the new head, with no operator involved, and never a block, never over changed cited lines.
   const reviewerCarryHarness = (h, result, { curLine = 12, card, summary, ruled = [] } = {}) => {
