@@ -2461,6 +2461,7 @@ function expandCdTarget(rest, vars, home) {
   let out = '';
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
+    if ((ch === '<' || ch === '>') && s[i + 1] === '(') return null;      // a process substitution's path
     if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
     if (ch === "'") {                                                      // single quotes: all literal
       const close = s.indexOf("'", i + 1);
@@ -2526,23 +2527,27 @@ const OPAQUE_BLANK = String.fromCharCode(0xe000);
 function shellWords(stmt) {
   const s = String(stmt).replace(ODD_BLANK, OPAQUE_BLANK);
   const tokens = shellTokens(s, { preserveQuotes: true });
-  // Where each token starts in `s` (-1 when it cannot be placed, e.g. across a line continuation).
+  // Where each token starts in `s` (-1 once one cannot be placed, e.g. across a line continuation: the scan
+  // then stops, so it stays linear).
   const at = [];
   for (let i = 0, pos = 0; i < tokens.length; i++) {
-    const idx = s.indexOf(tokens[i].text, pos);
+    const idx = pos < 0 ? -1 : s.indexOf(tokens[i].text, pos);
     at.push(idx);
-    if (idx >= 0) pos = idx + tokens[i].text.length;
+    pos = idx < 0 ? -1 : idx + tokens[i].text.length;
   }
   const words = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    // `<(…)` / `>(…)` starting a word is a process substitution — a word (`/dev/fd/63`), not a redirect. As a
-    // redirect's target (`< <(cmd)`) it stays a dropped redirect operand; glued to a word, it belongs to it.
-    const startsWord = at[i] === 0 || (at[i] > 0 && /\s/.test(s[at[i] - 1]));
-    if (t.op && (t.text === '<' || t.text === '>') && startsWord && !tokens[i - 1]?.op
+    // `<(…)` / `>(…)` is a process substitution, not a redirect: a word of its own (`/dev/fd/63`) when it starts
+    // one, part of the word it is glued to (`X=/etc<(true)`), and a dropped operand as a redirect's target
+    // (`< <(cmd)`).
+    if (t.op && (t.text === '<' || t.text === '>') && !tokens[i - 1]?.op && at[i] >= 0
       && tokens[i + 1]?.text.startsWith('(') && at[i + 1] === at[i] + 1) {
+      const prev = words[words.length - 1];
+      const glued = i > 0 && at[i - 1] >= 0 && at[i - 1] + tokens[i - 1].text.length === at[i] && prev && !prev.redir;
       const raw = t.text + tokens[++i].text;
-      words.push({ raw, text: raw, redir: false });
+      if (glued) words[words.length - 1] = { raw: prev.raw + raw, text: prev.text + raw, redir: false };
+      else words.push({ raw, text: raw, redir: false });
       continue;
     }
     words.push({ raw: t.text, text: t.op ? t.text : shellTokens(t.text)[0]?.text ?? '', redir: t.op || !!tokens[i - 1]?.op });
