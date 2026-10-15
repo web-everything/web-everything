@@ -7,7 +7,7 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
   id: 'argon-feature-dispatch',
   title: 'feature builds launch Argon with Codex checking and honour backend/checker holds',
-  card: 'PR #5370 / xt30u37',
+  card: 'PR #5370 / 6163',
   fixedBy: { sha: 'HEAD', where: 'lane/argon-build', paths: [
     'scripts/lib/dispatch-contracts.mjs', 'scripts/lib/dispatch-routing-policy-io.mjs',
     'scripts/lib/dispatch-routing-policy.json', 'scripts/operations/dispatch-providers/probation-worker.mjs',
