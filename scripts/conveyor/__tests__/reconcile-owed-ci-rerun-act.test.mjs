@@ -59,6 +59,24 @@ describe('owed CI rerun action', () => {
   it('respects the off switch', () => {
     expect(plan({}, { rerun: 'off', maxRerunsPerHead: 1 }).refusals[0].kind).toBe('owed-ci-rerun');
   });
+  // A re-run of a workflow that is still running is rejected (HTTP 422), which would spend the head's only retry.
+  it.each([
+    ['IN_PROGRESS', { status: 'IN_PROGRESS', conclusion: '' }],
+    ['QUEUED', { status: 'QUEUED', conclusion: '' }],
+    ['lowercase status', { status: 'in_progress', conclusion: '' }],
+    ['pending commit status', { __typename: 'StatusContext', state: 'PENDING' }],
+    ['CheckRun without a status', { __typename: 'CheckRun' }],
+  ])('holds the rerun while another check on the head is still running: %s', (_label, live) => {
+    const out = plan({ statusCheckRollup: [check(), { name: 'smoke', ...live }] });
+    expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun')).toBe(false);
+    expect(out.dispatch.some(r => r.kind === 'ci-heal')).toBe(false);
+    expect(out.refusals[0]).toMatchObject({ kind: 'owed-ci-rerun', why: expect.stringMatching(/still running/) });
+  });
+  it('holds the rerun on an incomplete rollup (refused or truncated hydration)', () => {
+    const out = plan({ rollupIncomplete: true });
+    expect(out.dispatch.some(r => r.kind === 'ci-timeout-rerun' || r.kind === 'ci-heal')).toBe(false);
+    expect(out.refusals[0]).toMatchObject({ kind: 'owed-ci-rerun', why: expect.stringMatching(/still running/) });
+  });
   it.each([{ timeoutRetryBudget: undefined }, { owedCiRerunRetry: { ...evidence, head: 'old' } },
     { owedCiRerunRetry: { ...evidence, pr: 99 } }, { owedCiRerunRetry: { eligible: false } }])('fails closed on missing or stale evidence: %j', over => {
     expect(plan(over).refusals[0].kind).toBe('owed-ci-rerun');

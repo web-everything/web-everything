@@ -21,6 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
+import { renderOperatorSendBackBrief, renderOperatorSendBackReviewBlock } from './operator-send-backs.mjs';
 import { readReferralRecords, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isRestackOf } from './restack-equivalence.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
@@ -375,7 +376,10 @@ export const hasSentBack = (comments, head) => sentBackAt(comments, head) !== nu
 
 const where = (f) => `${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}`;
 /** The PR comment that goes with the send-back: the durable record AND what the fixer reads. */
-export function renderRulingNotAddressed({ head, matches, rung = null }) {
+export function renderRulingNotAddressed({ head, matches, rung = null, source = null, items = [] }) {
+  if (source === 'operator-send-back') return `${RULING_NOT_ADDRESSED_MARKER}\n\n`
+    + 'The last fix left an operator send-back unaddressed; this goes back to a fixer.\n\n'
+    + renderOperatorSendBackReviewBlock(items) + sentBackLine(head, rung?.id);
   return `${RULING_NOT_ADDRESSED_MARKER}\n\nThe last fix did not satisfy a ruling the operator already gave. `
     + 'A review on the new head reports the same confirmed finding again, so this goes straight back to a fixer.\n\n'
     + (rung ? `**Escalation rung ${rung.at} (${rung.id}):** ${rung.label}${rung.model ? ` — model ${rung.model}` : ''}.\n\n` : '')
@@ -386,7 +390,8 @@ export function renderRulingNotAddressed({ head, matches, rung = null }) {
 }
 
 /** The text put in front of the fixer's brief. */
-export function fixerRulingBrief({ matches, rung = null }) {
+export function fixerRulingBrief({ matches, rung = null, source = null, items = [] }) {
+  if (source === 'operator-send-back') return renderOperatorSendBackBrief(items);
   return '# Ruling not addressed — read this first\n\n'
     + 'The operator already ruled on the finding(s) below, and your predecessor\'s last push did not satisfy the ruling. '
     + 'This is the whole ask: change the code so each finding is actually fixed as ruled. '

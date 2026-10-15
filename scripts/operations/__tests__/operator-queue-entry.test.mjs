@@ -107,6 +107,31 @@ describe('operator-queue CLI entry guard', () => {
     expect(isCliEntry(undefined)).toBe(false);
   });
 
+  it('reports a missing send-back reader and withholds otherwise ready PRs in a partial copy', () => {
+    stage(join(dir, 'real'));
+    const head = 'b'.repeat(40);
+    const prs = ['review:human', 'review:accepted'].map((label, index) => ({
+      number: index + 1, title: `PR ${index + 1}`, headRefOid: head, mergeable: 'MERGEABLE',
+      labels: [{ name: label }, { name: 'advisory:accepted' }],
+      comments: [{ author: { login: 'web-everything' },
+        body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${'a'.repeat(40)}..${head}\`` }],
+      statusCheckRollup: label === 'review:human' ? []
+        : [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    }));
+    writeFileSync(join(dir, 'bin', 'gh'), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(prs))});\n`);
+    const result = spawnSync(process.execPath,
+      [join(dir, 'real', 'operations', 'operator-queue.mjs'), '--repo=x/y', '--json'],
+      { encoding: 'utf8', env: { ...env, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') } });
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.errors).toContainEqual(expect.stringMatching(/operator send-back check unavailable:.*operator-send-backs\.mjs/));
+    expect(report.ready).toEqual([]);
+    expect(report.notReady.map(row => row.number)).toEqual([1, 2]);
+    for (const row of report.notReady) {
+      expect(row.reasons).toContainEqual(expect.stringMatching(/^operator send-back check unavailable:/));
+    }
+  });
+
   it('isCliEntry falls back to the raw path when argv[1] does not exist', () => {
     expect(isCliEntry(join(dir, 'missing.mjs'), 'file:///nowhere.mjs')).toBe(false);
   });

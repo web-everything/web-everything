@@ -69,6 +69,8 @@ import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
+import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
@@ -86,6 +88,8 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
+import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
@@ -712,7 +716,7 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
  *   unpaused — the login break does not touch them.
  */
 export async function runTickAllRepos({
-  repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, notesTick, notesDryRun,
+  repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
   // #5137 slices 2+3 — the verify-verdict pass (we:scripts/conveyor/await-verify-pass.mjs). Injectable like every
   // other half; a test tick (fixTick/ciHealTick injected) never runs the real one.
@@ -736,6 +740,8 @@ export async function runTickAllRepos({
   now = Date.now,
 } = {}) {
   const passStart = now();
+  const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
+    promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
   const phaseMs = {};
   const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
   const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
@@ -767,6 +773,20 @@ export async function runTickAllRepos({
   // No Claude session is spawned, so the auth gate never pauses it.
   const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
     : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
+  const rulingStandDown = await timedAsync('ruling-stand-down', async () => {
+    const setting = resolveReviewSettings().rulingResolvesStandDown;
+    const settingSource = resolveReviewSettingSource('rulingResolvesStandDown');
+    if (!repos.includes(CONSTELLATION_REPOS.we.slug) || (anyTickInjected && !rulingStandDownTick)) {
+      return { rows: [], setting, settingSource };
+    }
+    try {
+      return await (rulingStandDownTick ?? runRulingResolvesStandDownPass)({
+        repo: CONSTELLATION_REPOS.we.slug, setting, settingSource, log: () => {},
+      });
+    } catch (e) {
+      return { rows: [{ repo: CONSTELLATION_REPOS.we.slug, pr: null, action: 'error', why: String(e?.message ?? e) }], setting, settingSource };
+    }
+  });
   const pausedDispatchResult = () => ({
     repos: repos.map((repo) => ({ repo, result: { dispatched: [], refusals: [] } })),
     dispatched: [], refusals: [], reconcileRefusals: [],
@@ -786,9 +806,11 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
+  const chain = resolveFixExecutorChain();
   const fixSettings = resolveFixSettings();
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
-    setting: executorSetting, fixSettings, launcherAvailable: fixLauncherAvailable('codex'),
+    setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
+    criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
   });
   const routedCiHealTick = (options) => {
     let entries = [];
@@ -860,6 +882,7 @@ export async function runTickAllRepos({
     hungCi, // the hung-ci-recovery half's own detail, same reason
     mainRedRebase, // the main-red-rebase half's own detail, same reason
     missingRun, // the missing-run-recovery half's own detail, same reason (xi4od2p, #4075/#3383)
+    rulingStandDown,
     promoteDraft, // the promote-draft half's own detail, same reason (draft-first PRs, 2026-09-27)
     authPaused: authGate.paused, // card x5kagse — fix/ci-heal dispatch skipped outright this tick
     authPauseReason: authGate.reason,
@@ -1079,6 +1102,11 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
         authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null, stuckFixers = null, supersede = null,
       } = result || {};
+      if (result?.rulingStandDown) {
+        const { setting, settingSource, rows = [] } = result.rulingStandDown;
+        log.error(`ruling-resolves-stand-down: setting=${setting} (source: ${settingSource})`);
+        for (const row of rows) log.error(`ruling-resolves-stand-down: ${row.repo}#${row.pr} ${row.action} stand-down=${row.standDownId ?? '?'}${row.why ? ` — ${row.why}` : ''}`);
+      }
       // card xiqtf7w — one line per supersede hold planned or posted.
       for (const line of formatSupersedeLines(supersede)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.

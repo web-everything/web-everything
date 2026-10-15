@@ -17,6 +17,7 @@ export const STANDARD_BATCHING_SETTINGS = Object.freeze({
   failureWindowMinutes: 120,
   strictModeMinutes: 60,
   isolateTimeoutMinutes: 60,
+  soleSurvivorCulprit: true,
   cancelIntermediateRuns: 'auto',
   rulesetId: 24883772,
 });
@@ -30,6 +31,7 @@ const ENV_KEYS = Object.freeze({
   failureWindowMinutes: 'WE_MQ_BATCHING_FAILURE_WINDOW_MINUTES',
   strictModeMinutes: 'WE_MQ_BATCHING_STRICT_MODE_MINUTES',
   isolateTimeoutMinutes: 'WE_MQ_BATCHING_ISOLATE_TIMEOUT_MINUTES',
+  soleSurvivorCulprit: 'WE_MQ_BATCHING_SOLE_SURVIVOR_CULPRIT',
   cancelIntermediateRuns: 'WE_MQ_BATCHING_CANCEL_INTERMEDIATE_RUNS',
   rulesetId: 'WE_MQ_BATCHING_RULESET_ID',
 });
@@ -45,7 +47,7 @@ function readPlatformSettings() {
 }
 
 function envValue(key, value) {
-  if (key === 'enabled') {
+  if (key === 'enabled' || key === 'soleSurvivorCulprit') {
     if (value === 'true' || value === '1') return true;
     if (value === 'false' || value === '0') return false;
     return value;
@@ -56,7 +58,7 @@ function envValue(key, value) {
 }
 
 function validValue(key, value) {
-  if (key === 'enabled') return typeof value === 'boolean';
+  if (key === 'enabled' || key === 'soleSurvivorCulprit') return typeof value === 'boolean';
   if (key === 'cancelIntermediateRuns') return ['auto', 'on', 'off'].includes(value);
   if (!Number.isSafeInteger(value)) return false;
   if (key === 'rulesetId') return true;
@@ -134,6 +136,18 @@ function expireIsolation(state, nowMs, settings, closed = new Set(), merged = ne
   }
 }
 
+// Upgrade persisted singleton recovery using the caller's fresh queue snapshot.
+function healSoleSurvivors(state, inQueue, nowMs, settings) {
+  if (settings.soleSurvivorCulprit === false) return;
+  state.isolate = state.isolate.filter(num => {
+    if (inQueue.has(num) || !state.groups.some(g => g.status === 'failed'
+      && g.recoveryRetired?.length === 1 && g.recoveryRetired[0] === num)) return true;
+    if (!state.culprits.some(c => c.num === num)) state.culprits.push({ num, atMs: nowMs });
+    if (state.isolateSinceMs) delete state.isolateSinceMs[num];
+    return false;
+  });
+}
+
 /** PURE: strict overrides isolation until its injected deadline passes. */
 export function currentMode(state, nowMs, settings) {
   if (!settings.enabled) return 'off';
@@ -166,7 +180,10 @@ function openGroup(state, num, nowMs, mode, size) {
  */
 export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
   const state = structuredClone(input);
-  if (settings.enabled) expireIsolation(state, nowMs, settings);
+  if (settings.enabled) {
+    healSoleSurvivors(state, inQueue, nowMs, settings);
+    expireIsolation(state, nowMs, settings);
+  }
   const mode = currentMode(state, nowMs, settings);
   const result = (admit, groupId = null, reason = null) => ({ admit, mode, groupId, reason, state });
   if (mode === 'off') return result(true);
@@ -219,12 +236,22 @@ function recordQueueExit({ state, g, ejected, inQueue, merged, closed, nowMs, se
   state.failures.push({ atMs: nowMs, groupId: g.id, prs: [...g.prs] });
   if (g.mode === 'grouped' && g.prs.length > 1) {
     const nums = g.prs.filter(n => !merged.has(n) && !closed.has(n));
-    state.isolate = [...new Set([...state.isolate, ...nums])];
-    state.isolateSinceMs ??= {};
-    for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
-    g.recoveryRetired = [...nums];
+    const soleCulprit = settings.soleSurvivorCulprit !== false && nums.length === 1;
+    if (soleCulprit) {
+      const [num] = nums;
+      if (!state.culprits.some(c => c.num === num)) state.culprits.push({ num, atMs: nowMs });
+      state.isolate = state.isolate.filter(n => n !== num);
+      if (state.isolateSinceMs) delete state.isolateSinceMs[num];
+      events.push({ type: 'culprit', num });
+    } else {
+      state.isolate = [...new Set([...state.isolate, ...nums])];
+      state.isolateSinceMs ??= {};
+      for (const num of nums) state.isolateSinceMs[num] ??= nowMs;
+    }
+    g.recoveryRetired = soleCulprit ? nums.filter(n => inQueue.has(n)) : [...nums];
     state.pendingDequeues = [...new Set([...(state.pendingDequeues ?? []), ...nums.filter(n => inQueue.has(n))])];
-    events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) }, { type: 'isolate', nums });
+    events.push({ type: 'dequeue', nums: nums.filter(n => inQueue.has(n)) });
+    if (!soleCulprit) events.push({ type: 'isolate', nums });
   } else {
     for (const num of ejected) {
       state.culprits.push({ num, atMs: nowMs });
@@ -254,6 +281,7 @@ export function observeQueue({ state: input, inQueue, merged, closed = new Set()
   }
   const cutoff = nowMs - settings.failureWindowMinutes * MINUTE_MS;
   state.failures = state.failures.filter(f => f.atMs >= cutoff);
+  healSoleSurvivors(state, inQueue, nowMs, settings);
   expireIsolation(state, nowMs, settings, closed, merged);
   // Recovery effects survive terminal-group pruning and isolation expiry. Queue
   // absence also acknowledges a dequeue whose response/persistence was lost.

@@ -5,7 +5,7 @@
  * today's App, and says so loudly (log + per-caller status the github-app-config smell reads).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -138,12 +138,24 @@ describe('key by name — resolved on the host, never a committed path', () => {
   });
   it('the dry-run CLI: reviewer App with the dir set, a loud FALLBACK without it or with the file missing (never reads the key)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'keydir-'));
-    writeFileSync(join(dir, 'plateau-reviewer.pem'), 'not-a-key');
-    const run = (extra) => spawnSync(process.execPath, [join(process.cwd(), 'scripts/lib/github-app-identity.mjs'), '--caller=review-daemon.mjs'],
-      { encoding: 'utf8', env: { ...process.env, WE_DELIVERY_IDENTITY: JSON.stringify({ reviewer: NAMED }), [KEY_DIR_ENV]: '', ...extra } }).stdout;
-    expect(run({ [KEY_DIR_ENV]: dir })).toMatch(/→ reviewer App 900001 {2}\[reviewer:900001 → legacy\]/);
-    expect(run({})).toMatch(/today's App {2}FALLBACK \(reviewer: key-dir-unset, worker: unconfigured\)/);
-    expect(run({ [KEY_DIR_ENV]: join(dir, 'nope') })).toMatch(/FALLBACK \(reviewer: key-unreadable/);
+    // Env JSON overlays repo settings: supply both links so the live worker config cannot leak into this fixture.
+    const identity = { reviewer: NAMED, worker: { ...WORKER, key: { name: 'plateau-worker' } } };
+    const run = (extra) => {
+      const result = spawnSync(process.execPath, [join(process.cwd(), 'scripts/lib/github-app-identity.mjs'), '--caller=review-daemon.mjs'],
+        { encoding: 'utf8', env: { ...process.env, WE_DELIVERY_IDENTITY: JSON.stringify(identity), [KEY_DIR_ENV]: '', ...extra } });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe('');
+      return result.stdout;
+    };
+    try {
+      writeFileSync(join(dir, 'plateau-reviewer.pem'), 'not-a-key');
+      writeFileSync(join(dir, 'plateau-worker.pem'), 'not-a-key');
+      expect(run({ [KEY_DIR_ENV]: dir })).toMatch(/→ reviewer App 900001 {2}\[reviewer:900001 → worker:900003 → legacy\]/);
+      expect(run({})).toMatch(/today's App {2}FALLBACK \(reviewer: key-dir-unset, worker: key-dir-unset\)/);
+      expect(run({ [KEY_DIR_ENV]: join(dir, 'nope') })).toMatch(/today's App {2}FALLBACK \(worker: key-unreadable, reviewer: key-unreadable\) {2}\[legacy\]/);
+      rmSync(join(dir, 'plateau-reviewer.pem'));
+      expect(run({ [KEY_DIR_ENV]: dir })).toMatch(/→ worker App 900003 {2}FALLBACK \(reviewer: key-unreadable\) {2}\[worker:900003 → legacy\]/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

@@ -60,10 +60,11 @@ export function acquireBuildDispatchClaim({
   repo = 'we', num, scope = [], owner = buildDispatchClaimOwner(), pid = process.pid,
   nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(),
   leaseMinutes = DEFAULT_BUILD_DISPATCH_CLAIM_TTL_MINUTES, lockRoot = buildDispatchClaimRoot(),
-  replacesStamp,
+  replacesStamp, groupLead,
 } = {}) {
   const resource = buildDispatchResource({ repo, num });
   const meta = { repo, num: normNum(num), kind: 'build', scope: Array.isArray(scope) ? scope.map(String) : [], claimedAt: nowIso,
+    ...(groupLead !== undefined ? { groupLead: normNum(groupLead) } : {}),
     // A prepare claim records the card's stamp at spawn (`null` = unstamped) so its result can be told from it.
     ...(replacesStamp !== undefined ? { replacesStamp } : {}) };
   const result = reserve(lockRoot, resource, owner, nowMs, nowIso, pid, 'unknown', leaseMinutes, meta);

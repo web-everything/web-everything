@@ -27,3 +27,9 @@ create a cycle; the runner refuses the run if it does.
 Do not claim, resolve, acquire another lane, stamp, commit, push, or open a PR.
 The runner owns stamping and checks, then opens a parked review:pending PR.
 If you cannot honestly prepare it, leave no diff and explain why.
+
+When the runner adds `## Also prepare #<num>` sections, prepare each listed card in this
+same lane using its own brief. The card-only permissions above apply to every listed card.
+A refusal stops work on that card only; continue preparing the others. For each declined member,
+include a separate final-report line `Not prepared: #<num> — <reason>`, even if you left a partial
+diff. The runner restores that member's pre-run bytes and reports it in the lead's single PR.
