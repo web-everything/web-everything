@@ -33,6 +33,18 @@ describe('soak shard-files — isolated baseline and time-balanced breaks', () =
     }
   }
 
+  it('keeps the baseline alone even when its timing is missing or underestimates its cost', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
+      for (const baselineTiming of [{}, { 'base.soak.test.mjs': 1 }]) {
+        const timings = { 'a.soak.test.mjs': 100, 'b.soak.test.mjs': 50, 'c.soak.test.mjs': 50, ...baselineTiming };
+        const shards = [1, 2, 3].map((shard) => shardFiles({ ...opts, shard, timings }));
+        expect(shards[0]).toEqual(['base.soak.test.mjs']);
+        expect(shards.slice(1)).toEqual([['a.soak.test.mjs'], ['b.soak.test.mjs', 'c.soak.test.mjs']]);
+      }
+    });
+  });
+
   it('isolates the baseline even when missing or understated timings would co-schedule breaks', () => {
     withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs'], (dir) => {
       for (const timings of [{}, { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 100 }]) {

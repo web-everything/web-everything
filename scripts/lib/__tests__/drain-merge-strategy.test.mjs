@@ -17,12 +17,14 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
+  let mutated = false;
   const exec = (cmd, args) => {
     calls.push([cmd, ...args]);
+    if (args.includes('--slurp')) return JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
@@ -31,6 +33,9 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: mutated && (inQueue ?? true), headRefOid: HEAD } } } });
+      mutated = true;
+      if (mutation) return JSON.stringify(mutation);
       if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
       return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
     }
@@ -41,7 +46,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const s = createDrainMergeStrategy({
     dryRun, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
-    resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
+    postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
   // `peer` = a second drain process writing the same state file (its own enqueue) at any moment, as `onView` does mid-collect.
   const peerEnqueue = (entry) => { const cur = stored ? JSON.parse(JSON.stringify(stored)) : { pending: [], followedUp: [] }; cur.pending.push(entry); stored = cur; };
@@ -82,14 +87,68 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(calls.some((c) => c[1] === 'pr' && c[2] === 'merge')).toBe(false);
     const comment = calls.find((c) => c[1] === 'pr' && c[2] === 'comment');
     expect(comment).toContain(buildClearanceComment(HEAD));
-    const gql = calls.find((c) => c[1] === 'api' && c[2] === 'graphql');
+    const gql = calls.find((c) => c.includes('id=PR_NODE'));
     expect(gql).toEqual(expect.arrayContaining(['id=PR_NODE', `sha=${HEAD}`]));
-    expect(calls.findIndex((c) => c[2] === 'comment')).toBeLessThan(calls.findIndex((c) => c[1] === 'api' && c[2] === 'graphql'));
+    expect(calls.findIndex((c) => c[2] === 'comment')).toBeGreaterThan(calls.findIndex((c) => c[1] === 'api' && c[2] === 'graphql'));
     expect(state().pending).toEqual([expect.objectContaining({ num: 42, repo: null, headSha: HEAD, item: 'x1' })]);
   });
 
+  it('routes the exact #5169 refusal to conflict repair without a clearance', () => {
+    const findings = [];
+    const message = 'Pull request has merge conflicts and Pull request not in mergeable state';
+    const h = harness({ strategy: 'github-merge-queue', mutation: { errors: [{ type: 'UNPROCESSABLE', message }], data: { enqueuePullRequest: null } }, postConflictFinding: x => findings.push(x) });
+    expect(() => h.s.enqueue({ num: 5169 }, HEAD)).toThrow(message);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+    expect(findings).toEqual([expect.objectContaining({ pr: expect.objectContaining({ number: 5169 }), repo: LOCAL })]);
+    expect(h.logs.join('')).toContain(message);
+    expect(h.state().enqueueFailures['cwd#5169']).toMatchObject({ error: message, kind: 'conflict' });
+  });
+
+  it('does not stamp a success contradicted by live queue membership', () => {
+    const h = harness({ strategy: 'github-merge-queue', inQueue: false });
+    expect(() => h.s.enqueue({ num: 42 }, HEAD)).toThrow(/unconfirmed/);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+    expect(h.state().pending).toEqual([]);
+  });
+
+  it('dedupes clearance across passes even with stale or unread comments', () => {
+    const h = harness({ strategy: 'github-merge-queue' });
+    h.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    const next = harness({ strategy: 'github-merge-queue', initial: h.state() });
+    next.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+    expect(next.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+  });
+
+  it('backs off across restarts, surfaces a health smell at the cascade threshold, and resets on a new head', () => {
+    const mutation = { errors: [{ message: 'GitHub temporarily unavailable\nretry later' }] };
+    const first = harness({ strategy: 'github-merge-queue', mutation, now: () => 0 });
+    expect(() => first.s.enqueue({ num: 42 }, HEAD)).toThrow('GitHub temporarily unavailable');
+    const wait = harness({ strategy: 'github-merge-queue', mutation, initial: first.state(), now: () => 1 });
+    expect(wait.s.enqueue({ num: 42 }, HEAD)).toMatchObject({ enqueued: false, kind: 'enqueue-backoff' });
+    expect(wait.calls).toEqual([]);
+    const second = harness({ strategy: 'github-merge-queue', mutation, initial: wait.state(), now: () => 60_000 });
+    expect(() => second.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(second.state().enqueueFailures['cwd#42'].retryAt).toBe(180_000);
+    const third = harness({ strategy: 'github-merge-queue', mutation, initial: second.state(), now: () => 180_000 });
+    expect(() => third.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(third.state().enqueueFailures['cwd#42']).toMatchObject({ count: 3, healthSmell: true, smellSource: 'standard', error: mutation.errors[0].message });
+    expect(third.logs.join('')).toContain('enqueueFailureSmellAfter=3, standard');
+    const changed = structuredClone(third.state());
+    changed.enqueueFailures['cwd#42'].headSha = 'c'.repeat(40);
+    const next = harness({ strategy: 'github-merge-queue', mutation, initial: changed, now: () => 180_001 });
+    expect(() => next.s.enqueue({ num: 42 }, HEAD)).toThrow();
+    expect(next.state().enqueueFailures['cwd#42'].count).toBe(1);
+  });
+
+  it('uses a live trusted clearance after a crash before the local stamp record', () => {
+    const h = harness({ strategy: 'github-merge-queue', liveComments: stampedBy(DRAIN) });
+    h.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(0);
+  });
+
   it('does not re-stamp a clearance already on the PR for this head', () => {
-    const { s, calls } = harness({ strategy: 'github-merge-queue' });
+    const { s, calls } = harness({ strategy: 'github-merge-queue', liveComments: stampedBy(DRAIN) });
     s.enqueue({ num: 42, repo: null }, HEAD, { comments: stampedBy(DRAIN) });
     expect(calls.some((c) => c[2] === 'comment')).toBe(false);
   });
@@ -128,7 +187,8 @@ describe('drain merge strategy — github-merge-queue', () => {
     const { s, calls, state } = harness({ strategy: 'github-merge-queue', enqueueFails: true });
     expect(() => s.enqueue({ num: 42, repo: null }, HEAD, { comments: [] })).toThrow(/enqueue FAILED .*NOT merged directly/);
     expect(calls.some((c) => c[1] === 'pr' && c[2] === 'merge')).toBe(false);
-    expect(state()).toBeNull();
+    expect(state().pending).toEqual([]);
+    expect(calls.filter(c => c[2] === 'comment')).toHaveLength(0);
   });
 
   it('refuses an unpinned head and a sibling-repo PR', () => {
@@ -247,7 +307,9 @@ describe('drain merge strategy — github-merge-queue', () => {
       if (args[0] === 'pr' && args[1] === 'comment') return '';
       if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
-      if (args[0] === 'api' && args[1] === 'graphql') { broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
+      if (args[0] === 'api' && args[1] === 'graphql') {
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: broken, headRefOid: HEAD } } } });
+      broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };
     const logs = [];
@@ -263,7 +325,7 @@ describe('drain merge strategy — github-merge-queue', () => {
 
     // the file is fixed; the next pass finds the PR already queued and records it, keeping #9
     broken = false;
-    const exec2 = (cmd, args) => (args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ errors: [{ message: 'Pull request is already in the merge queue' }] }) : exec(cmd, args));
+    const exec2 = (cmd, args) => (args.some(a => a.includes('isInMergeQueue')) ? JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: HEAD } } } }) : exec(cmd, args));
     const s2 = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
       log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),

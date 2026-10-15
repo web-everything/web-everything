@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
+  proveHumanClearanceCarry, decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
@@ -594,5 +594,66 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         expect(logs.join('')).toContain('tier contribution');
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('human clearance numbering tier', () => {
+  const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
+    headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
+  it.each(['off', 'missing recorded diff', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
+    let calls = 0;
+    const e = { ...evidence, humanClearance: { ...evidence.humanClearance } };
+    if (kind === 'missing recorded diff') e.humanClearance.diff = null;
+    if (kind === 'unread live diff') e.headDiff = null;
+    const d = proveHumanClearanceCarry({ evidence: e, enabled: kind !== 'off',
+      proveNumbering: () => { calls++; return { ok: true }; } });
+    expect(d.carry).toBe(false);
+    expect(calls).toBe(0);
+  });
+  it('carries a fingerprint mismatch only with a numbering proof', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: true, reason: 'verified renames' }) });
+    expect(d).toMatchObject({ carry: true, tier: 'numbering', actor: 'chalbert' });
+    expect(buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff })).toContain('card-numbering');
+  });
+  it('keeps the original refusal when numbering also refuses', () => {
+    const d = proveHumanClearanceCarry({ evidence, proveNumbering: () => ({ ok: false, reason: 'mixed change' }) });
+    expect(d.carry).toBe(false);
+    expect(d.reason).toContain('net diff changed');
+    expect(d.reason).toContain('numbering tier: mixed change');
+  });
+  // Red team #5233 (sibling writer): the slow proof runs between the drain's evidence read and its record write.
+  describe('re-reads the PR before posting the carry record', () => {
+    const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+    const apply = (over = {}) => {
+      const posted = [];
+      const exec = (cmd, args) => { if (cmd === 'gh') posted.push(args); return ''; };
+      const result = applyHumanClearanceCarry({ evidence, pr: 5233, exec, setting: ON, log: () => {},
+        proveNumbering: () => ({ ok: true, reason: 'verified renames' }), ...over });
+      return { result, posted };
+    };
+    const liveThread = (extra = {}) => () => ({ headSha: HEAD, comments: [clearHumanComment(CLEARED)], reviews: [], ...extra });
+    it('records a numbering carry when nothing changed', () => {
+      const { result, posted } = apply({ readLiveEvidence: liveThread() });
+      expect(result).toMatchObject({ carried: { tier: 'numbering', recorded: true } });
+      expect(posted).toHaveLength(1);
+    });
+    it.each([false, true])('never records a numbering carry without a live re-read (dry run: %s)', (dryRun) => {
+      const { result, posted } = apply({ dryRun });
+      expect(result).toBeNull();
+      expect(posted).toEqual([]);
+    });
+    it.each([
+      ['an operator objection', liveThread({ comments: [clearHumanComment(CLEARED), objection] })],
+      ['a formal changes-requested review', liveThread({ reviews: [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-13T00:00:00Z' }] })],
+      ['a head move', liveThread({ headSha: 'f'.repeat(40) })],
+      ['a newer clearance', liveThread({ comments: [clearHumanComment(CLEARED), clearHumanComment(HEAD)] })],
+      ['unreadable reviews', liveThread({ reviews: null })],
+      ['a truncated thread', liveThread({ comments: null })],
+      ['a failed re-read', () => { throw Error('gh offline'); }],
+    ])('defers without a record after %s', (_name, readLiveEvidence) => {
+      const { result, posted } = apply({ readLiveEvidence });
+      expect(result).toMatchObject({ action: 'defer', applyLabel: null });
+      expect(posted).toEqual([]);
+    });
   });
 });

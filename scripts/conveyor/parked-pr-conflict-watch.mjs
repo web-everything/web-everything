@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
+export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
  * @file scripts/conveyor/parked-pr-conflict-watch.mjs
  * @description The PARKED-PR CONFLICT WATCH (`#xw0odtv`) — a standing, mechanical pass that catches an open,
@@ -113,12 +115,9 @@
  * — inventing a parallel per-sha marker here would duplicate a cap this population already inherits for free.
  */
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
-import { resolve, join } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -126,7 +125,9 @@ import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { REVIEW_LABELS, hasReviewLabel, hasUnclearedReviewLabel, isDeclarativeLeashPath, isStatutePath } from '../lib/review-escalation.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
+// Resolve paths locally: dispatch-lane-io participates in the review/reconcile import cycle
+// and its root may still be uninitialized when this module's adapters are called.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 import {
   standDownComments, WATCHER_STAND_DOWN_ACTOR, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded,
 } from './stand-down.mjs';
@@ -148,8 +149,8 @@ import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflic
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
 // much heavier transitive import graph (`rearm-review.mjs` → `review-set-label.mjs` → `merge-ai-prs.mjs`, which
 // calls `promisify(execFile)` at module load — the exact hazard `stuck-pr-dispatch-marker.mjs`'s own header
-// documents avoiding). `defaultListAgents` is already this file's own sibling import (`REPO_ROOT` already comes
-// from the same module) — no new heavy dependency, just one more named export off it.
+// documents avoiding). The agent-list adapter comes from the existing dispatch IO module;
+// filesystem paths are resolved locally to avoid depending on that module's initialization order.
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { deriveReviewStatus } from './review-status-tag.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -1184,73 +1185,6 @@ export { defaultListPrComments };
  * @param {{num:number|string, headRefName?:string}} pr
  * @returns {string}
  */
-export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false } = {}) {
-  const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
-  // #3383-append-only-statute — an EXPLICIT, narrower instruction for the one case this file's classifier proves
-  // mechanical: both sides only ADDED a new `### ` section at the same spot in a statute doc. Stated as its own
-  // paragraph, ahead of the generic "read both sides' intent" instruction, so a fixer never has to re-derive from
-  // the raw conflict markers that no existing rule text is actually in dispute here.
-  const appendOnlyInstruction = appendOnlyStatute
-    ? [
-      '',
-      "**Append-only statute conflict: resolve by keeping `main`'s version of the file unchanged and " +
-        "re-inserting this PR's new `###` section(s), in the same place relative to the neighbouring sections, " +
-        "after `main`'s new ones. Change no existing rule text.**",
-    ]
-    : [];
-  // #xu2krte Fork 2 (review-human statute amendment) — this PR already carries `review:human`: a human reviews
-  // the FINAL merged result regardless, so resolving the git-level conflict mechanically does not skip that
-  // ceremony. Stated as its own explicit instruction (mirrors the append-only case above) so a fixer never has
-  // to guess it is allowed to touch a statute file here, or forgets the scope boundary.
-  const reviewHumanInstruction = reviewHumanFixable
-    ? [
-      '',
-      '**Review-human statute amendment: resolve the CONFLICT ONLY.** `main` did not independently touch the ' +
-        "same hunk this PR amends — verified by comparing diff hunks, not guessed — so keep this PR's own " +
-        "intended amendment and reconcile it against whatever ELSE `main` added nearby. Make NO other edits " +
-        'beyond resolving this conflict, and do **not** touch any `review:*` label — `review:human` stays; a ' +
-        'human still reviews the final merged result before it can land. **Post a comment showing the ' +
-        'conflicting hunk BEFORE your resolution and the resolved hunk AFTER** as before/after evidence of what ' +
-        'you changed.',
-    ]
-    : [];
-  if (resync) {
-    return [
-      `PR #${pr?.num ?? pr?.number ?? '?'}${ref} is behind \`main\`: GitHub reports \`mergeable: CONFLICTING\`, ` +
-        'but `git merge-tree` finds NO conflict against current `main`. This is the WHOLE finding.',
-      '',
-      '**Re-sync with `main` — nothing to resolve.** Merge `main` into this branch (no rebase, no force-push), ' +
-        'push it, and let GitHub recompute mergeability and run CI on the new head. If the merge unexpectedly ' +
-        'conflicts, resolve only that conflict. Make no other edits and touch no `review:*` label.',
-      '',
-      '_Auto-detected by the parked-PR conflict watch (`we:scripts/conveyor/parked-pr-conflict-watch.mjs`)._',
-    ].join('\n');
-  }
-  return [
-    `PR #${pr?.num ?? pr?.number ?? '?'}${ref} has drifted into a real GIT merge conflict against \`main\` — ` +
-      "GitHub reports `mergeable: CONFLICTING`. This is the WHOLE finding; there is no separate reviewer comment " +
-      'to read on this PR for it.',
-    '',
-    sameLineConflict
-      ? '**Resolving the conflict IS the task.** Merge `main` into this branch (no rebase, no force-push), then return it to independent review.'
-      : '**Resolving the conflict IS the task.** Rebase or merge `main` into this branch, resolve every conflicted ' +
-      "hunk by reading BOTH sides' intent (this diff's own and whatever landed on `main` since), push the " +
-      'resolution, and let the normal fix-agent flow (this bounce) carry it back to independent review.',
-    ...(sameLineConflict ? [
-      '',
-      '**Genuine same-line conflict with `main` in a statute/leash-tier file.** Resolve each conflicting hunk ' +
-        "by keeping BOTH sides' intent: main's newer rule text plus this PR's addition. Make no unrelated edits. " +
-        'If a hunk is a true either/or choice of rule text you cannot reconcile safely, stand down ' +
-        `with \`node scripts/conveyor/stand-down.mjs ${pr?.num ?? pr?.number ?? '?'} --reason=conflict\`, ` +
-        'naming the hunk rather than guessing. Post before/after of each resolved hunk as evidence.',
-    ] : []),
-    ...appendOnlyInstruction,
-    ...reviewHumanInstruction,
-    '',
-    '_Auto-detected by the parked-PR conflict watch (`we:scripts/conveyor/parked-pr-conflict-watch.mjs`, ' +
-      '`#xw0odtv`), dispatched per `#xu2krte`._',
-  ].join('\n');
-}
 
 // ── IO SHELL (gh only past this point — the CLI, gated on the main-module check) ───────────────────────────
 
@@ -1372,21 +1306,6 @@ export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null
  * path (`we:scripts/review-set-label.mjs#bodyFileRoots`) and removed afterward either way.
  * @param {{pr:object, repo:string|null, exec?:Function}} o
  */
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false }) {
-  const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
-  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict }), 'utf8');
-  try {
-    const argv = [
-      join(REPO_ROOT, 'scripts', 'conveyor', 'reconcile-finding.mjs'), String(pr?.number),
-      `--body-file=${bodyPath}`, '--agent=parked-pr-conflict-watch', '--channel=the parked-PR conflict watch (#xw0odtv, dispatched per #xu2krte)',
-    ];
-    if (repo) argv.push(`--repo=${repo}`);
-    // #x5n4zn3 — was bare (no timeout).
-    exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-  } finally {
-    try { unlinkSync(bodyPath); } catch { /* best-effort cleanup only */ }
-  }
-}
 
 /**
  * we:scripts/conveyor/parked-pr-conflict-watch.mjs#defaultPostConflictStandDown — Fork 2's exception path: a

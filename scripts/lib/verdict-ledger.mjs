@@ -531,6 +531,7 @@ export const LEDGER_EVENT_VERSION = 2;
  *  repo + PR + append order. Transitions are NOT a type: they are derived from these events plus GitHub facts. */
 export const EVENT_TYPES = Object.freeze({
   VERDICT: 'verdict',       // the v1 row, unchanged
+  REVIEW_EXEMPT: 'review-exempt', // the drain decided this head needs no review (no escalation signal, no review label); keyed to the head sha
   REFERRAL: 'referral',     // findings opened on a head, with finding keys
   RULING: 'ruling',         // a ruling on one finding key
   REVIEW_RUN: 'review-run', // a review run on a head (counts visits; bears on nothing else)
@@ -572,6 +573,10 @@ function delegationOrNull(v) {
 }
 
 const EVENT_PAYLOAD = Object.freeze({
+  [EVENT_TYPES.REVIEW_EXEMPT]: [
+    ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
+    ['basis', isStr, (v) => oneLine(v, 200)],
+  ],
   [EVENT_TYPES.REFERRAL]: [
     ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
     ['findingKeys', (v) => Array.isArray(v) && v.length > 0 && v.every(isStr), (v) => v.map((k) => oneLine(k, 200))],
@@ -633,7 +638,7 @@ const EVENT_DEFAULTS = Object.freeze({ posted: null, delegation: null, lines: Ob
 /** Which event types BEAR on whether a PR may land (plan 3.1). `review-run` bears on caps only; the others that
  *  bear do so through the derive function, which is a later slice. Pure. */
 export function eventBears(type) {
-  return [EVENT_TYPES.VERDICT, EVENT_TYPES.REFERRAL, EVENT_TYPES.RULING, EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE,
+  return [EVENT_TYPES.VERDICT, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.REFERRAL, EVENT_TYPES.RULING, EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE,
     EVENT_TYPES.APPROVAL, EVENT_TYPES.SEND_BACK].includes(String(type ?? ''));
 }
 
@@ -1140,8 +1145,10 @@ export function verdictLedgerPath(repo) {
 }
 
 /** Whether a normalized ledger event CLEARS a hold (so a git miss must not leave a home row, F4). A verdict follows
- *  {@link verdictClears}; a v2 event has no `verdict`, and a ruling that is not `block` clears its finding's hold. */
+ *  {@link verdictClears}; a v2 event has no `verdict`: a review exemption, a release and an approval clear, and a
+ *  ruling that is not `block` clears its finding's hold. A home-only clearing row would suppress the caller's retry. */
 function eventClears(row) {
+  if ([EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.RELEASE, EVENT_TYPES.APPROVAL].includes(row?.type)) return true;
   if (row?.type === EVENT_TYPES.RULING) return row.ruling !== 'block';
   return verdictClears(row?.verdict);
 }
@@ -1337,13 +1344,24 @@ function refuseClearingOnGitMiss({ g, store, loud, record }) {
 
 /** `owner/name` of a checkout's `origin` (canonical current slug), or '' when unreadable. Never throws. */
 function originRepoOf(cwd) {
+  return probeOrigin(cwd).slug;
+}
+
+/** {@link originRepoOf} plus whether an empty answer is TRANSIENT: the probe timed out, was killed, or could not
+ *  start (other than git missing). A git exit (no `origin` remote, not a repo, dubious ownership) and a URL that is
+ *  not `owner/name` are permanent answers: that checkout is certainly not a board. Never throws.
+ *  @returns {{slug: string, transient: boolean}} */
+export function probeOrigin(cwd, run = execFileSync) {
   try {
-    const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], {
+    const url = String(run('git', ['remote', 'get-url', 'origin'], {
       encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, maxBuffer: 64 * 1024,
     })).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
-    return m ? canonicalizeSlug(m[1]) : '';
-  } catch { return ''; }
+    return { slug: m ? canonicalizeSlug(m[1]) : '', transient: false };
+  } catch (e) {
+    const exited = typeof e?.status === 'number' && !e?.signal;
+    return { slug: '', transient: !exited && e?.code !== 'ENOENT' };
+  }
 }
 
 /** The checkout this module lives in (`scripts/lib/..` → repo root), or null where `import.meta.url` is not a file URL. */
@@ -1381,22 +1399,33 @@ function candidateBoardRoots() {
  * @returns {string|null}
  */
 export function resolveLedgerBoard(repo, opts = {}, env = process.env) {
+  return resolveLedgerBoardDetail(repo, opts, env).board;
+}
+
+/** {@link resolveLedgerBoard} plus whether a null board is CERTAIN. A candidate checkout whose `origin` probe failed
+ *  TRANSIENTLY (timed out or could not start; {@link probeOrigin}; never cached) might be the board, so its null is
+ *  not certain: a caller choosing a store from it must not treat "unknown" as "no board". A checkout with no origin,
+ *  or one that is not a git repo, is certainly not the board. An `opts.originRepo` seam's '' counts as unknown.
+ *  @returns {{board: string|null, certain: boolean}} */
+export function resolveLedgerBoardDetail(repo, opts = {}, env = process.env) {
   const named = String(opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? '').trim();
-  if (named) return named;
-  if (opts.boardRoot === undefined && (isUnderTest(env) || String(env.GITHUB_ACTIONS ?? '').toLowerCase() === 'true')) return null;
+  if (named) return { board: named, certain: true };
+  if (opts.boardRoot === undefined && (isUnderTest(env) || String(env.GITHUB_ACTIONS ?? '').toLowerCase() === 'true')) return { board: null, certain: true };
   const want = canonicalizeSlug(String(repo ?? '').trim()).toLowerCase();
-  if (!want) return null;
+  if (!want) return { board: null, certain: true };
   const roots = opts.boardRoot !== undefined ? [opts.boardRoot].filter(Boolean) : candidateBoardRoots();
+  let certain = true;
   for (const root of roots) {
-    let have = '';
-    if (opts.originRepo) have = opts.originRepo(root);
+    let have = '', transient = false;
+    if (opts.originRepo) { have = opts.originRepo(root); transient = !have; }
     else {
       have = originMemo.get(root) ?? '';
-      if (!have) { have = originRepoOf(root); if (have) originMemo.set(root, have); }
+      if (!have) { ({ slug: have, transient } = probeOrigin(root)); if (have) originMemo.set(root, have); }
     }
-    if (have && String(have).toLowerCase() === want) return root;
+    if (have && String(have).toLowerCase() === want) return { board: root, certain: true };
+    if (transient) certain = false;
   }
-  return null;
+  return { board: null, certain };
 }
 
 /** The `verdictLedger.store` setting (declared in `config/platformDefaults.ts`, mirrored here because .mjs cannot

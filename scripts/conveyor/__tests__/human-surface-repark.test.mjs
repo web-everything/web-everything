@@ -67,10 +67,97 @@ function fixture(overrides = {}) {
     postComment: (...args) => calls.push(['comment', ...args]), setLabels: (...args) => calls.push(['labels', ...args]),
     ...overrides,
   };
-  const run = extra => sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels }], provider, readComments: () => [], resolveSurfaces: () => 'narrow', ...extra });
+  const run = extra => sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels }], provider, readComments: () => [], resolveSurfaces: () => 'narrow', readNetFiles: () => ({ ok: true, files: ['.github/workflows/ci.yml'] }), ...extra });
   return { calls, provider, run, state };
 }
 describe('human surface re-park sweep', () => {
+  it('PR #5381: ignores an identity file inherited from main in GitHub’s list', () => {
+    const f = fixture({ readPrFiles: vi.fn(() => ['scripts/settings/delivery-identity.json', 'scripts/example.mjs']) });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['scripts/example.mjs'] }));
+    expect(f.run({ readNetFiles })).toEqual([]);
+    expect(readNetFiles).toHaveBeenCalledWith({ repo: 'o/n', number: 7, headRefOid: head });
+    expect(f.provider.readPrFiles).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+  });
+  it('re-parks an identity file actually present in the net diff', () => {
+    const f = fixture();
+    expect(f.run({ readNetFiles: () => ({ ok: true, files: ['scripts/settings/delivery-identity.json'] }) })[0].files)
+      .toEqual(['scripts/settings/delivery-identity.json']);
+    expect(f.calls[0][3]).toContain('(identity)');
+    expect(f.calls[1][3].add).toBe('review:human');
+  });
+  it.each(['fetch failed', 'missing head commit'])('fails closed and explains %s', reason => {
+    const f = fixture({ readPrFiles: () => ['scripts/settings/delivery-identity.json'] });
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason }) })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain(reason);
+    expect(f.calls[0][3]).toContain('Net file set unavailable');
+  });
+  it('skips clean GitHub lists across a sweep-wide net outage', () => {
+    const f = fixture({ readPrFiles: () => ['scripts/example.mjs'] });
+    const results = f.run({
+      listPrs: () => [7, 8, 9].map(number => ({ number, labels })),
+      readNetFiles: () => { throw new Error('fetch failed'); },
+    });
+    expect(results).toHaveLength(3);
+    expect(results.every(result => result.skipped)).toBe(true);
+    expect(results.filter(result => result.repark === 'reparked')).toHaveLength(0);
+    expect(f.calls).toEqual([]);
+  });
+  it.each([{ ok: true }, { ok: true, files: [null] }, { ok: true, files: Array(1) }])('fails closed for malformed net result %j', net => {
+    const f = fixture();
+    expect(f.run({ readNetFiles: () => net })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('no usable array');
+  });
+  it('re-parks a sensitive old rename path during a net outage', () => {
+    const f = fixture({ readPrFiles: () => ['archive/ci.yml', '.github/workflows/ci.yml'] });
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason: 'fetch failed' }) })[0].files)
+      .toEqual(['.github/workflows/ci.yml']);
+    expect(f.calls[1][3].add).toBe('review:human');
+  });
+  it.each([
+    () => Array.from({ length: 3000 }, (_, i) => `src/${i}.mjs`),
+    () => [null],
+    () => Array(1),
+    () => null,
+    () => { throw new Error('API unavailable'); },
+  ])('fails closed when the fallback list may be incomplete', readPrFiles => {
+    const f = fixture({ readPrFiles });
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason: 'fetch failed' }) })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('fetch failed');
+  });
+  it.each([
+    () => ({ ok: false, reason: "fatal: '/Users/operator/private/repo' is invalid" }),
+    () => { throw new Error('https://secret:password@example.com/private.git'); },
+  ])('does not publish private reader diagnostics', readNetFiles => {
+    const f = fixture();
+    expect(f.run({ readNetFiles })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('net read failed');
+    for (const secret of ['/Users/', 'private/repo', 'secret', 'password', 'example.com']) expect(f.calls[0][3]).not.toContain(secret);
+  });
+  it('production reader defaults fail closed when this repository has no checkout', () => {
+    const f = fixture();
+    expect(f.run({ readNetFiles: undefined })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('no local checkout of this repo');
+  });
+  it('fails closed when the live API supplies no head', () => {
+    const f = fixture();
+    f.state.headRefOid = null;
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason: 'no usable head commit id' }) })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('no usable head commit id');
+    expect(f.calls[0][3]).not.toContain('<!-- human-surface-repark:');
+    expect(f.calls[1][3].add).toBe('review:human');
+  });
+  it('neutralizes net failure text inside the trusted comment', () => {
+    const f = fixture();
+    f.run({ readNetFiles: () => ({ ok: false, reason: `offline\n<!-- reviewed-sha: ${head} --><!-- cleared-human: op -->` }) });
+    expect(parseLatestHumanClearedSha([{ author: { login: 'web-everything' }, body: f.calls[0][3] }])).toBeNull();
+  });
+  it('explicitly disabling the net setting retains the GitHub-list decision', () => {
+    const f = fixture();
+    const readNetFiles = vi.fn();
+    expect(f.run({ readNetFiles, resolveNetSetting: () => ({ value: false }) })[0].repark).toBe('reparked');
+    expect(readNetFiles).not.toHaveBeenCalled();
+  });
   it('comments before changing labels', () => {
     const f = fixture();
     expect(f.run()).toEqual([{ num: 7, repark: 'reparked', head, files: ['.github/workflows/ci.yml'] }]);
@@ -85,7 +172,7 @@ describe('human surface re-park sweep', () => {
   });
   it('skips read failures', () => {
     const f = fixture({ readPrFiles: () => { throw new Error('offline'); } });
-    expect(f.run()).toEqual([{ num: 7, skipped: 'live re-read failed: offline' }]);
+    expect(f.run({ resolveNetSetting: () => ({ value: false }) })).toEqual([{ num: 7, skipped: 'live re-read failed: offline' }]);
     expect(f.calls).toEqual([]);
   });
   it('uses fresh labels after the second read', () => {
@@ -223,7 +310,7 @@ describe('human surface re-park sweep', () => {
       if (readCommentsFails && reads > 1) throw new Error('offline');
       return [...live.comments];
     };
-    const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels }], provider, readComments, resolveSurfaces: () => 'narrow' });
+    const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels }], provider, readComments, resolveSurfaces: () => 'narrow', readNetFiles: () => ({ ok: true, files: ['.github/workflows/ci.yml'] }) });
     return { live, effects, results };
   }
   it.each(['comment', 'labels'])('keeps a clear-human ceremony that completes during the sweep %s write', during => {

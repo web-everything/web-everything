@@ -74,6 +74,8 @@ import {
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
   roundCardsFindingsMarker, roundCardsHeadMarker,
 } from '../lib/review-loop-policy.mjs';
+import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -508,10 +510,10 @@ export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) 
 }
 
 function defaultReadResumePr({ repo, pr }) {
-  const { headRefOid } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid'],
+  const { headRefOid, body, createdAt } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
   // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
-  return { headRefOid, comments: readCompletePrComments(pr, { repo }) };
+  return { headRefOid, body, createdAt, comments: readCompletePrComments(pr, { repo }) };
 }
 
 /**
@@ -551,9 +553,40 @@ export async function runReviewLoopOnce({
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
   parallelJudges = false, seatLanes = null,
+  readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
+  acceptPolicy = unattendedAcceptPolicy(),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
-  const drive = (o) => driveRun({ ...o, parallelJudges, seatLanes });
+  const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
+  // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:
+  // the run's own filing receipt names this reviewed head and this finding set. A bare `--answer=accept` has none.
+  const acceptHold = (run, { filed = false } = {}) => {
+    if (!requiresCleanReferrals) return null;
+    try {
+      // A `changes` round the round-cards rule cards and accepts goes through the same live-referral gate.
+      const decision = roundCardsDecision(run);
+      const receipt = run?.input?.roundCardsFiling;
+      const roundCards = decision.apply === true && (!filed || (Boolean(receipt?.head)
+        && receipt.head === run.findings?.read?.netBasis?.rev
+        && receipt.fingerprint === roundCardsFindingsFingerprint(decision.cards)));
+      const live = unattendedAcceptableVerdict(run?.verdict, { roundCards }) ? readAcceptancePr(run.input) : {};
+      return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
+        expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
+    } catch (error) { return `live referrals unavailable: ${error.message}`; }
+  };
+  const drive = (o) => {
+    const guardedConfirm = (pending, current) => {
+      const answer = o.autoConfirm?.(pending, current);
+      return answer?.value === 'accept' && acceptHold(current, { filed: true }) ? null : answer;
+    };
+    // Explicit unattended resumes and the card-filing paths obey the same boundary as auto-confirm. A held resume
+    // is reported on the outcome (`acceptHeld`), so a filing branch never claims an accept that did not happen.
+    const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
+    const resume = acceptHeld ? null : o.resume;
+    return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
+      .then((out) => (acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out));
+  };
+  const heldLine = (held) => `Unattended accept parked after filing: ${held}.`;
   if (parsed.control.help) {
     const { buildCliSpec } = await import('./cli-adapter.mjs');
     return { code: 0, lines: [buildCliSpec(declaration).usage], run: null, stopped: 'help' };
@@ -655,6 +688,15 @@ export async function runReviewLoopOnce({
     run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
   });
 
+  if (outcome.stopped === 'confirm') {
+    const hold = acceptHold(outcome.run);
+    if (hold) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, lines: parsed.control.json ? rendered.lines
+        : [...rendered.lines, `Unattended accept parked: ${hold}.`], run: outcome.run, stopped: outcome.stopped };
+    }
+  }
+
   // ── THE MECHANIZED PREVENTION-FILING BRANCH (#2749 fix, 2026-09-26 scope ruling) ─────────────────────────
   // `reviewLoopAutoConfirm` DECLINES a `prevention-outstanding` verdict (it must — filing a card is impure
   // I/O, and the policy stays pure). Filing the owed guard(s) is NOT a decision for an operator, so this is
@@ -741,6 +783,7 @@ export async function runReviewLoopOnce({
           ...(alreadyFiled ? { alreadyFiled: true } : {}),
           ...(filedQueued ? { queued: true, handle: filedHandle } : {}),
         },
+        ...(acceptedOutcome.acceptHeld ? { acceptParked: acceptedOutcome.acceptHeld } : {}),
       };
       return { code: rendered.code, lines: [JSON.stringify(payload, null, 2)], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
     }
@@ -748,6 +791,7 @@ export async function runReviewLoopOnce({
       code: rendered.code,
       lines: [
         ...rendered.lines, '',
+        ...(acceptedOutcome.acceptHeld ? [heldLine(acceptedOutcome.acceptHeld)] : []),
         alreadyFiled
           ? `prevention guard(s) ALREADY filed by an earlier round — ${filedRel} (#${filedNum}); not filed again.`
           : filedQueued
@@ -824,16 +868,19 @@ export async function runReviewLoopOnce({
     });
     const rendered = renderOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
     const summaryLine = `round-cards: ${repo}#${pr} round ${decision.round ?? '?'} (${decision.rule}${decision.k ? `, K=${decision.k}` : ''}): `
-      + `accepted; ${decision.cards.length} finding(s) carded → ${where}${alreadyFiled ? ' (already filed)' : ''}`;
+      + `${acceptedOutcome.acceptHeld ? 'NOT accepted' : 'accepted'}; ${decision.cards.length} finding(s) carded → ${where}`
+      + `${alreadyFiled ? ' (already filed)' : ''}`;
     if (parsed.control.json) {
       const payload = {
         ...JSON.parse(rendered.lines[0]),
         roundCardsFiled: { rule: decision.rule, round: decision.round, k: decision.k, count: decision.cards.length, num, path,
           ...(alreadyFiled ? { alreadyFiled: true } : {}), ...(queued ? { queued: true, handle } : {}) },
+        ...(acceptedOutcome.acceptHeld ? { acceptParked: acceptedOutcome.acceptHeld } : {}),
       };
       return { code: rendered.code, lines: [JSON.stringify(payload, null, 2)], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
     }
-    return { code: rendered.code, lines: [...rendered.lines, '', summaryLine], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
+    return { code: rendered.code, lines: [...rendered.lines, '', summaryLine,
+      ...(acceptedOutcome.acceptHeld ? [heldLine(acceptedOutcome.acceptHeld)] : [])], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
   }
 
   // ── THE QUEUED-ACCEPT BRANCH — the one behaviour `runOperationCli` does not have ──────────────────────────

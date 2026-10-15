@@ -3,9 +3,10 @@ bornAs: xwmnqy6
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/required-status-checks.mjs", "we:scripts/lib/__tests__/required-status-checks.test.mjs"]
 dateOpened: "2026-10-06"
+dateResolved: "2026-10-15"
 tags: []
 ---
 
