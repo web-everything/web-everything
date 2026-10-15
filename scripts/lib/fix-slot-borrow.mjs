@@ -26,6 +26,7 @@ import { BUILD_DISPATCH_POLICY } from '../conveyor/build-dispatch-policy.mjs';
 import { gateLaunch } from './resource-gate.mjs';
 import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
+import { pickChainRung } from './fix-executor-chain.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
@@ -60,18 +61,26 @@ export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddress
 }
 
 /** Pure; provider-routing leaves existing provider/borrow selection in control. */
-export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, ...entry } = {}) {
+export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, chain, critical = false, ...entry } = {}) {
   const source = setting.source ?? 'default';
   const claude = (reason) => ({ executor: 'claude', reason, source });
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
+  const available = typeof launcherAvailable === 'function' ? launcherAvailable : executor => executor === 'codex' ? launcherAvailable : true;
+  if (chain && setting.value === 'codex-first' && !entry.mainFix) {
+    const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
+      : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;
+    return { ...pickChainRung({ chain: chain.value, trigger, codexUnproductive: entry.codexUnproductive,
+      critical, launcherAvailable: available }), source: chain.source ?? 'default' };
+  }
   const only = claudeOnlyReason(entry);
   if (only) return claude(only);
-  if (!launcherAvailable) return claude('codex launcher unavailable, fallback');
+  if (!available('codex')) return claude('codex launcher unavailable, fallback');
   return { executor: 'codex', reason: 'codex-first ordinary repair', source };
 }
 
-export const formatFixExecutorLog = ({ executor, reason, source }) => `fix executor: ${executor} (${reason}, source ${source})`;
+export const formatFixExecutorLog = ({ executor, rung, policyRoute, reason, source }) =>
+  `fix executor: ${executor}${rung ? ` rung=${rung} model=${policyRoute?.model ?? 'default'} effort=${policyRoute?.effort ?? 'default'}` : ''} (${reason}, source ${source})`;
 
 /** Stamp routing separately from `borrowed`: builder accounting must never count this as a borrowed slot. */
 export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fixDispatchClaimRoot(), decision }) {
@@ -85,8 +94,8 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
 /**
  * Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping.
  * Carry the repair kind to the launcher: card 5947 (live #5045, 2026-10-13).
- * ONLY a Codex decision replaces the sink's provider and heal router. EVERY Claude outcome (fix.executor=claude,
- * provider-routing, takeover, main-fix, stronger-model, launcher unavailable) leaves both in place, so it launches
+ * Any non-Claude decision replaces the sink's provider and heal router. EVERY Claude outcome (fix.executor=claude,
+ * provider-routing, main-fix, critical escalation, chain exhausted) leaves both in place, so it launches
  * exactly as before this routing existed: `routeDispatchProvider` (model/effort table, registry providers, probation
  * worker, injected `spawnAgent`) and `routeAvailableCiHeal` (including the native-Claude quota-hold refusal).
  */
@@ -100,8 +109,8 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       if (gate?.held) return { held: true, reason: gate.reason };
     }
     const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
-    const codex = decision.executor === 'codex';
-    const sinks = createSinks({ ...options, ...(codex ? { provider: (request) => {
+    const nonClaude = decision.executor !== 'claude';
+    const sinks = createSinks({ ...options, ...(nonClaude ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
       const profile = profileFor(options.repo ?? planned.repo ?? 'we');
       stampExecutor({ repo: options.repo ?? planned.repo ?? 'we', pr: planned.pr, kind: 'ci-heal',
@@ -111,12 +120,12 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         const handle = launchCodex({ ...request, repairKind: 'ci-heal', cwd: options.root, promptFile, ref: planned.laneRef,
           mergeOnto: mergeOntoFor(planned),
           repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
-          scope: planned.scope.join(','), policyRoute: { provider: 'codex' } });
+          scope: planned.scope.join(','), policyRoute: decision.policyRoute ?? { provider: 'codex' } });
         request.reportWrapped?.(Number(String(handle).replace(/^pid:/, '')));
         return handle;
       } catch (error) { removePrompt(promptFile); throw error; }
     } } : {}) });
-    if (!codex) {
+    if (!nonClaude) {
       // Observe the existing provider's actual choice without changing that choice.
       const entries = Object.entries(sinks);
       for (const [key, sink] of entries) sinks[key] = async (...args) => {
@@ -125,7 +134,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         return out;
       };
     }
-    return dispatch(planned, { ...options, sinks, ...(codex ? { routeHeal: () => null } : {}) });
+    return dispatch(nonClaude ? { ...planned, strongerModel: false } : planned, { ...options, sinks, ...(nonClaude ? { routeHeal: () => null } : {}) });
   };
 }
 
