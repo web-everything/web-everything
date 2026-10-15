@@ -8,7 +8,8 @@ import { buildHumanSurfaceReparkComment } from '../conveyor/human-surface-repark
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../lib/review-escalation.mjs';
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
-const clearance = { author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
+// The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
+const clearance = { author: { login: 'web-everything' }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
 
 describe('clear-human hold decision', () => {
   it('requires a label or proven hold', () => {

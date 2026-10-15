@@ -33,7 +33,7 @@ describe('live approval proof and same-head refresh', () => {
       return '';
     };
     const read = () => readApprovedHumanSurfaceHold({ setting: 'on', pr: 1, repo: 'owner/repo', expectedHead: sha, exec,
-      readComments: () => [{ author: { login: author }, body: `<!-- reviewed-sha: ${cleared} -->\n<!-- cleared-human: operator -->` }] });
+      readComments: () => [{ author: { login: author }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${cleared} -->\n<!-- cleared-human: operator -->` }] });
     expect(read().hold).toBe(true);
     author = 'stranger'; expect(read().hold).toBe(false); author = 'chalbert';
     manifest = '.lane-manifest.json'; expect(read().hold).toBe(false); manifest = '';

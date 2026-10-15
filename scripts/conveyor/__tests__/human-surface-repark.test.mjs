@@ -4,7 +4,8 @@ import { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanCleare
 
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
-const clearance = sha => ({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` });
+// The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
+const clearance = sha => ({ author: { login: 'web-everything' }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` });
 const plan = extra => planHumanSurfaceRepark({ currentLabels: labels, files: ['.github/workflows/ci.yml'], headSha: head, comments: [], surfaces: 'narrow', ...extra });
 
 describe('human surface re-park plan', () => {
