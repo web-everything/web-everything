@@ -100,6 +100,11 @@ describe('#5193 review clearance', () => {
       ['a revocation after a restoration', { comments: [...restoredThread, comment('Hold this PR; I revoke my approval.', '19:05:00')], events: restoredEvents }],
       ['a forged restoration (untrusted author)', { comments: [...comments, comment(restoreBody, '19:03:31', 'mallory')], events: restoredEvents }],
       ['a restoration of another head', { comments: [...comments, comment(restoreBody.replaceAll(head, 'c'.repeat(40)), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
+      // Self-review: the re-grant is the exact automation note for THIS record, and it skips only the re-arm before it.
+      ['an operator paste of the restoration note with a revocation', { comments: [...comments, comment(`${restoreBody}\n\nThis restoration is wrong — I revoke.`, '19:03:31')], events: restoredEvents }],
+      ['an automation restoration note with text after it', { comments: [...comments, comment(`${restoreBody}\n\nREVOKED`, '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
+      ['a restoration of another record', { comments: [...comments, comment(restoreBody.replace(acceptance.url, `${acceptance.url}x`), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
+      ['a revocation between the re-arm and the restoration', { comments: [...comments, comment('Hold this PR; I revoke my approval.', '19:03:10'), restoredThread.at(-1)], events: restoredEvents }],
     ])('lets a re-arm through after %s', (_kind, patch) => {
       expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(false);
     });

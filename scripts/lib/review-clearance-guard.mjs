@@ -24,8 +24,12 @@ const starts = (c, marker) => typeof c?.body === 'string' && c.body.split(/\r?\n
 const sameHead = (record, prHead, refHead) => /^[0-9a-f]{40}$/.test(record?.sha ?? '') && record.sha === prHead && record.sha === refHead;
 const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());
-/** Could this comment hold a clearance? Anything but a known machine note or the trusted approval-prevention notice. */
-const holdsClearance = c => !isMachineNoteBody(c?.body)
+/**
+ * Could this comment hold a clearance? Anything but a known machine note or the trusted approval-prevention notice. A
+ * restoration-headed comment is a note only in the exact automation shape ({@link restoreNote}): a pasted one with a
+ * revocation after it holds (PR #5237 round 9, self-review).
+ */
+const holdsClearance = c => (starts(c, RESTORE_MARKER) ? !restoreNote(c) : !isMachineNoteBody(c?.body))
   && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.trimStart().startsWith('<!-- approval-prevention-filed:'));
 /**
  * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation
@@ -106,16 +110,17 @@ const changeRequestStands = (reviews, record) => !Array.isArray(reviews) || late
 /**
  * PR #5237 round 9: was the clearance in `record` revoked since, with no head move? Any later comment that could hold
  * it (a marker-free "Hold, I revoke my approval" or a changes verdict included), or a hold label or acceptance removal
- * since. A trusted restoration of this head re-grants it, so only what follows the latest one counts (the re-arm it
- * undid lies behind it). Unreadable counts as revoked.
+ * since. A restoration of this record re-grants it: the trusted re-arm comments before it, and the label events of the
+ * swap it undid, no longer count. Every other comment between the record and the restoration still does. Unreadable
+ * counts as revoked.
  */
 const revokedSinceRecord = ({ comments, events, record, prHead }) => {
   if (!Array.isArray(comments) || !Array.isArray(events) || !Number.isInteger(record?.index)) return true;
-  let from = record.index + 1, since = Date.parse(record.at);
-  comments.forEach((c, i) => {
-    if (i >= from && starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c) && c.body.includes(prHead)) { from = i + 1; since = Date.parse(at(c)); }
-  });
-  if (!Number.isFinite(since) || comments.slice(from).some(holdsClearance)) return true;
+  const later = comments.slice(record.index + 1);
+  const restoredAt = later.reduce((last, c, i) => (isRestoreOf(c, record, comments[record.index]?.url, prHead) ? i : last), -1);
+  if (later.some((c, i) => holdsClearance(c) && !(i < restoredAt && starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c)))) return true;
+  const since = Date.parse(restoredAt >= 0 ? at(later[restoredAt]) : record.at);
+  if (!Number.isFinite(since)) return true;
   return events.some(e => ((e.event === 'unlabeled' && e.label?.name === 'review:accepted')
     || (e.event === 'labeled' && holds.includes(e.label?.name))) && !(Date.parse(at(e)) < since));
 };
@@ -166,6 +171,23 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
     && e !== swapPending)) return no('intervening label hold');
   return { restore: true, record: { ...record, url: comments[record.index]?.url }, rearmComment, why: 'trusted no-push re-arm removed the original clearance' };
 }
+
+/**
+ * Is `c` the restoration note {@link buildRestoreComment} wrote for THIS record and head? Automation-authored, exactly
+ * its shape (marker line, head, the record's URL and time, ending on the setting line), so an operator's raw paste of
+ * a note with a revocation after it is never a re-grant (PR #5237 round 9, self-review).
+ */
+const restoreNote = c => {
+  if (!isAutomationAuthored(c) || typeof c?.body !== 'string') return null;
+  const lines = c.body.trimEnd().split(/\r?\n/);
+  const m = /^Head: ([0-9a-f]{40})\. Original clearance carried from (\S+) at (\S+)\.$/.exec(lines[2] ?? '');
+  return lines.length === 6 && lines[0] === RESTORE_MARKER && m && lines[3].startsWith('Re-arm: ')
+    && /^reviewClearance\.restoreNoPushRearm=on \(source: [^)\n]*\)\.$/.test(lines[5]) ? { head: m[1], url: m[2], at: m[3] } : null;
+};
+const isRestoreOf = (c, record, url, prHead) => {
+  const note = restoreNote(c);
+  return !!note && note.head === prHead && note.url === url && note.at === record.at;
+};
 
 export function buildRestoreComment({ head, record, rearm, setting }) {
   return `${RESTORE_MARKER}\n\nHead: ${head}. Original clearance carried from ${record.url} at ${record.at}.\nRe-arm: ${rearm.url} at ${at(rearm)} removed \`review:accepted\` with no push (the head is still the cleared head).\nNo new verdict or acceptance marker is written; the original clearance record above stands.\nreviewClearance.restoreNoPushRearm=${typeof setting === 'string' ? setting : setting.value} (source: ${setting.source ?? 'standard'}).`;
