@@ -604,7 +604,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd "/abs with space/x" && ls')).toBe('/abs with space/x');
   });
   it('a home-spelled cd lands in the same lane root and ownership classification as the absolute spelling', () => {
-    const LANE_HOME = '/home/dev/.lanes/web-everything/lane-9';
+    const LANE_HOME = `${HOME}/.lanes/web-everything/lane-9`;
     const viaHome = at('cd ~/.lanes/web-everything/lane-9/scripts && ls');
     const viaAbs = at(`cd ${LANE_HOME}/scripts && ls`);
     expect(viaHome).toBe(viaAbs);
