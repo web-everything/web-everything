@@ -10,6 +10,10 @@ tags: []
 
 PR #5370 class sweep found existing feature launch blockers outside its repair scope: we:scripts/operations/dispatch-providers/probation-worker.mjs rejects and fails to forward build-new-feature; we:scripts/operations/probation-build-run.mjs rejects that task type and applies simple-only metadata and checker language to all Gemini workers; we:scripts/lib/probation-launcher.mjs describes feature work as bugfix work. Connect the feature route while preserving full review, Codex approval, critical-work refusals, and bounded scope. Prove the actual dispatcher argv reaches the runner and checker for a non-simple Argon feature, and retain Flash restrictions.
 
+PR #5370's subsequent review repair implements this wiring, including the production feature policy, raw-scorecard holds, worker identity through explicit policy fallbacks, and the runner's feature/checker hand-off. Verification remains pending; this card stays open until that evidence is available.
+
+Prevention coverage added in the repair: dispatcher tests exercise backend and checker holds from production scorecards; an invariant accounts for every roster task type as launchable or explicitly record-only; settings and runner tests reject Flash/Pro under the non-simple Argon identity. The soak case `argon-feature-dispatch` replays the production routing and launch boundary without starting a worker.
+
 ## Acceptance
 
 - [A1] **Executable** — Add a regression in we:scripts/operations/__tests__/dispatch-lane-routing-record.test.mjs that routes a non-simple feature to Argon, captures the real probation provider argv, and passes it through the real runner parser with taskType and Codex checker preserved. Run that file with the scoped unit-test command; it must fail before the wiring repair and pass after it.

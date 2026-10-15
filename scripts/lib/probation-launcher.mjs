@@ -130,10 +130,10 @@ export function buildCheckerTask({ pr, reason, diff, failingChecks = '' }) {
 }
 
 /**
- * The task text a worker gets for one probation BUILD (doc-fix by default, or bugfix). PURE. Mirrors {@link buildCiHealTask}'s
+ * The task text a worker gets for one probation BUILD (doc-fix by default). PURE. Mirrors {@link buildCiHealTask}'s
  * shape (name the surface, state the rules, forbid commit/push/PR, hand over what the worker needs) for a
  * BUILD rather than a REPAIR: the worker has no brief of its own, so the item's own spec text is the whole task.
- * @param {{num: string|number, title?: string, spec: string, scope?: string[], taskType?: 'doc-fix'|'bugfix'}} o
+ * @param {{num: string|number, title?: string, spec: string, scope?: string[], taskType?: 'doc-fix'|'bugfix'|'test-fix'|'build-new-feature'}} o
  * @returns {string}
  */
 export function buildDocFixTask({ num, title = '', spec, scope = [], taskType = 'doc-fix' }) {
@@ -150,6 +150,8 @@ export function buildDocFixTask({ num, title = '', spec, scope = [], taskType = 
       ? '- Touch ONLY test files or test fixtures. If production code is wrong, stop and report it; do not change production code.'
       : taskType === 'doc-fix'
       ? '- This is a `doc-fix` task: touch ONLY documentation/prose files. Do not change source code, tests, or config.'
+      : taskType === 'build-new-feature'
+      ? '- Implement only the requested feature and its acceptance criteria, within the declared scope.'
       : '- This is a bugfix task: repair only the specified bug. Simple mechanical work only when using Gemini Flash.',
     `- Stay inside the item's own scope: ${scope.length ? scope.join(', ') : '(no declared scope — stay inside documentation paths only)'}.`,
     `- Keep the change small: at most ${PROVEN_TASK_ENVELOPES[taskType].maxFiles} files and about ${PROVEN_TASK_ENVELOPES[taskType].maxLoc} changed lines (the proven \`${taskType}\` envelope). A bigger`,

@@ -115,7 +115,7 @@ import { assertMainNotStale, behindFiles, gitRun, isCodePath } from '../lib/main
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
-import { workerTierFor, PROBATION_WORKERS } from '../lib/provider-routing.mjs';
+import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
 import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
@@ -1800,8 +1800,7 @@ export function routeDispatchProvider(request, {
       veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider)));
     const workerFor = route => {
       if (!request.probationWorker || route.provider === 'claude') return null;
-      const id = route.provider === 'codex' ? 'codex' : route.model.startsWith('claude-') ? 'antigravity-claude' : 'antigravity-gemini';
-      return { ...PROBATION_WORKERS[id], taskType: request.probationWorker.taskType, model: route.model, effort: route.effort };
+      return probationWorkerForRoute(route, request.probationWorker.taskType);
     };
     const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
     const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && (route.provider === 'claude'

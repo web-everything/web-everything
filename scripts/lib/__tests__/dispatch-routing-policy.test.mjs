@@ -269,13 +269,16 @@ it('preserves Claude build and documentation effort and fallback', () => {
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix', available: ['claude'] }).effort).toBe('low');
 });
 
-it('routes build-new-feature task work like build, including inherited operations and fallback', () => {
+it('inherits feature probation by default and preserves explicit operator pins and fallback', () => {
   const policy = copy();
-  expect(policy.taskTypes['build-new-feature']).toEqual({
+  expect(policy.taskTypes['build-new-feature']).toEqual({ inherit: true });
+  expect(policy.operations['build:build-new-feature']).toEqual({ inherit: true });
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toBeNull();
+  policy.taskTypes['build-new-feature'] = {
     provider: 'codex', model: 'sol',
     effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
     fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
-  });
+  };
   expect(policy.taskTypes['build-new-feature']).toMatchObject({
     provider: policy.operations.build.provider, model: policy.operations.build.model,
     effort: { codex: policy.operations.build.effort.codex },

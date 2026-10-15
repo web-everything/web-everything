@@ -360,6 +360,13 @@ export const PROBATION_ROSTER = Object.freeze({
   'bugfix': Object.freeze(['codex', 'antigravity-claude', 'antigravity-gemini']),
 });
 
+/** Preserve worker authorization and checker identity across explicit policy hand-offs. */
+export function probationWorkerForRoute({ provider, model, effort }, taskType) {
+  const id = provider === 'codex' ? 'codex' : model.startsWith('claude-') ? 'antigravity-claude'
+    : resolveBuildArgonModel(model) ? 'antigravity-argon' : 'antigravity-gemini';
+  return { ...PROBATION_WORKERS[id], model, effort, taskType };
+}
+
 /**
  * PICK ONE PROBATION WORKER for an opened, non-critical task. PURE and deterministic over its arguments.
  *
@@ -417,7 +424,7 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
       ? resolveBuildArgonModel(argonSettings.value?.model)
       : def.model ?? AGY_CLAUDE_MODEL_BY_TIER[tier] ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet;
     if (!model) {
-      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'invalid-model', dataConsulted: settingLabel(argonSettings.value?.model), reasoning: 'build.argon.model must resolve to a catalogued Antigravity Gemini model' });
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'invalid-model', dataConsulted: settingLabel(argonSettings.value?.model), reasoning: 'build.argon.model must be approved for non-simple Argon builds' });
       return;
     }
     if (def.simpleOnly && simple !== true && taskType !== 'test-fix') {

@@ -10,7 +10,7 @@ import {
 import { decideDispatchRoute as currentRoute } from '../dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
-import { readBuildArgonSettings } from '../build-argon-settings.mjs';
+import { BUILD_ARGON_MODELS, readBuildArgonSettings, resolveBuildArgonModel } from '../build-argon-settings.mjs';
 import { resolvePolicyModel } from '../dispatch-routing-policy.mjs';
 import { taskTypeFor } from '../dispatch-task-type.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
@@ -329,6 +329,43 @@ describe('Argon probation builds', () => {
 
 
 describe('build.argon settings cascade', () => {
+  it('preserves the ci-heal refusal when every backend/checker is held', () => {
+    expect(decideDispatchRoute({ kind: 'ci-heal', scopePaths: ['we:scripts/example.mjs'] }, {
+      ciHealAvailability: { antigravity: 'held', codex: 'held' },
+    })).toMatchObject({ outcome: 'refused', probationWorker: null });
+  });
+  it('no unrestricted Gemini worker can carry a model outside the non-simple allowlist', () => {
+    for (const worker of Object.values(PROBATION_WORKERS)) {
+      if (worker.model?.startsWith('gemini-') && !worker.simpleOnly) expect(BUILD_ARGON_MODELS).toContain(worker.model);
+    }
+    for (const model of BUILD_ARGON_MODELS) {
+      expect(resolveBuildArgonModel(model)).toBe(model);
+      expect(model).toBe('gemini-4-argon-high');
+    }
+  });
+  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'])('rejects non-simple model overrides through settings and injection: %s', (model) => {
+    for (const settings of [
+      { read: () => ({ build: { argon: { model } } }), platform: {} },
+      { read: () => ({}), platform: { argon: { model } } },
+    ]) {
+      expect(readBuildArgonSettings({ ...settings, env: {} }).value.model).toBe('gemini-4-argon-high');
+    }
+    const picked = selectProbationWorker({ taskType: 'build-new-feature', simple: false,
+      argonSettings: { value: { enabled: true, model }, sources: {} },
+      scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
+    });
+    expect(picked.worker?.id).not.toBe('antigravity-argon');
+  });
+
+  it.each(['antigravity', 'antigravity-argon', 'codex'])('dispatcher honours build availability for %s', (provider) => {
+    const route = decideDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+      availability: { [provider]: 'held' },
+      scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
+    });
+    expect(route.probationWorker?.id).not.toBe('antigravity-argon');
+    if (provider === 'codex') expect(route.probationWorker).toBeNull();
+  });
+
   it('defaults enabled and logs standard sources', () => {
     const messages = [];
     const result = readBuildArgonSettings({ read: () => ({}), platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log: message => messages.push(message) });
@@ -338,14 +375,14 @@ describe('build.argon settings cascade', () => {
 
   it('resolves platform and tool independently per leaf, including the model used for routing', () => {
     const result = readBuildArgonSettings({
-      read: () => ({ build: { argon: { model: 'gemini-3.8-flash-high' } } }),
+      read: () => ({ build: { argon: { model: 'gemini-4-argon-high' } } }),
       platform: { argon: { enabled: false, model: 'gemini-4-argon-high' } }, env: {},
     });
-    expect(result).toEqual({ value: { enabled: false, model: 'gemini-3.8-flash-high' }, sources: { enabled: 'platform', model: 'tool' } });
+    expect(result).toEqual({ value: { enabled: false, model: 'gemini-4-argon-high' }, sources: { enabled: 'platform', model: 'tool' } });
     const enabled = { ...result, value: { ...result.value, enabled: true } };
     expect(selectProbationWorker({ taskType: 'build-new-feature', argonSettings: enabled,
       scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
-    }).worker.model).toBe('gemini-3.8-flash-high');
+    }).worker.model).toBe('gemini-4-argon-high');
   });
 
   it.each([
@@ -355,7 +392,7 @@ describe('build.argon settings cascade', () => {
     'gemini-../4', 'ｇｅｍｉｎｉ-4-argon-high', 'gemini-4-argon-\u200bhigh',
     'gemini-4-argon-high' + '--x',
   ])('ignores off-catalogue or malformed strings at both cascade layers: %j', (model) => {
-    const fallback = { enabled: true, model: 'gemini-3.8-flash-high' };
+    const fallback = { enabled: true, model: 'gemini-4-argon-high' };
     const tool = readBuildArgonSettings({ read: () => ({ build: { argon: { model } } }), platform: { argon: fallback }, env: {} });
     expect(tool.value.model).toBe(fallback.model);
     expect(tool.sources.model).toBe('platform');

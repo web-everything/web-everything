@@ -33,15 +33,106 @@ import {
 } from '../dispatch-lane.mjs';
 import {
   REPO_ROOT, readTick, createDispatchSinks, buildAgentArgv, workerModelTable, resolveWorkerModel,
-  defaultReadScorecards, defaultClaudeProvider,
+  defaultReadScorecards, defaultClaudeProvider, routeDispatchProvider,
 } from '../dispatch-lane-io.mjs';
 import { decideDispatchRoute as currentRoute } from '../../lib/dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from '../../lib/__tests__/inherited-routing-policy.mjs';
+import { resolveDispatchRoute } from '../../lib/dispatch-routing-policy-io.mjs';
 import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS } from '../../lib/provider-routing.mjs';
 import { parseArgs as parseProbationBuildArgs } from '../probation-build-run.mjs';
+import { probationLaunchDecision, probationWorkerDetachedProvider, PROBATION_LAUNCHABLE_KINDS, PROBATION_RECORD_ONLY_TASK_TYPES } from '../dispatch-providers/probation-worker.mjs';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
 
 describe('probation roster models reach the build runner parser', () => {
+  it.each([null, { records: null }, { records: [null, 42] }, [null, false]])('production hold reader tolerates malformed scorecard rows: %j', scorecards => {
+    expect(() => resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, { scorecards })).not.toThrow();
+  });
+  it.each(['antigravity', 'codex'])('production routing derives the %s hold from raw scorecards', provider => {
+    const route = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+      scorecards: [
+        { subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' },
+        { provider, status: 'quota-exhausted', scoredAt: '2026-10-15T10:00:00Z', quotaResetsAt: '2099-01-01T00:00:00Z' },
+      ],
+    });
+    expect(route.probationWorker?.id).not.toBe('antigravity-argon');
+    if (provider === 'codex') expect(route.probationWorker).toBeNull();
+    else expect(route.probationWorker?.id).toBe('codex');
+  });
+
+  it('accounts for every roster task type as launchable or explicitly record-only', () => {
+    const launchable = Object.values(PROBATION_LAUNCHABLE_KINDS).flatMap(entry => entry.taskTypes ?? [entry.taskType]);
+    for (const taskType of Object.keys(PROBATION_ROSTER)) {
+      expect(launchable.includes(taskType) || Object.hasOwn(PROBATION_RECORD_ONLY_TASK_TYPES ?? {}, taskType), taskType).toBe(true);
+    }
+  });
+
+  it.each(['default', 'explicit'])('launches a non-simple Argon feature through the real provider argv and runner parser: %s', mode => {
+    const policy = structuredClone(inheritedRoutingPolicy);
+    policy.operations['build:build-new-feature'] = { provider: 'antigravity', model: 'gemini-4-argon-high', fallback: [] };
+    const routing = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+      ...(mode === 'explicit' ? { routingPolicy: policy } : {}),
+      scorecards: [{ subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' }],
+    });
+    expect(routing.probationWorker?.id).toBe('antigravity-argon');
+    const request = { launchKind: 'build', repo: 'we', num: '9001', sessionSlug: 'feature-test', probationWorker: routing.probationWorker, policyRoute: routing.policyRoute };
+    expect(probationLaunchDecision(request, 'on').launch).toBe(true);
+    let argv;
+    const handle = routeDispatchProvider(request, {
+      probationLaunch: 'on', scriptExists: () => true,
+      agent: () => { throw new Error('feature fell back to Claude'); },
+      probation: req => probationWorkerDetachedProvider(req, {
+        spawnDetached: args => { argv = args; return { pid: 123 }; }, logPathFor: () => '/tmp/feature-test.log',
+      }),
+    });
+    expect(handle).toBe('pid:123');
+    const parsed = parseProbationBuildArgs(argv.slice(1));
+    expect(parsed).toMatchObject({ taskType: 'build-new-feature', worker: { id: 'antigravity-argon', checker: 'codex', simpleOnly: false } });
+  });
+
+  it('explicit Gemini policy routes and fallback chains honour the Codex checker hold', () => {
+    const policy = structuredClone(inheritedRoutingPolicy);
+    policy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-3.8-flash-high', fallback: [
+      { provider: 'antigravity', model: 'gemini-3.8-flash-high' }, { provider: 'claude', model: 'sonnet' },
+    ] };
+    const route = currentRoute({ kind: 'build', size: 1, scopePaths: ['we:scripts/__tests__/example.test.mjs'] }, {
+      routingPolicy: policy, availability: { codex: 'held' },
+    });
+    expect(route).toMatchObject({ outcome: 'routed', routed: 'claude', probationWorker: null });
+    expect(route.policyRoute.fallback).toEqual([]);
+  });
+
+  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'claude-sonnet-4-6'])('explicit feature policy refuses non-roster %s before spawn', model => {
+    const policy = structuredClone(inheritedRoutingPolicy);
+    policy.operations['build:build-new-feature'] = { provider: 'antigravity', model, fallback: [] };
+    expect(currentRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, { routingPolicy: policy }))
+      .toMatchObject({ outcome: 'refused', probationWorker: null });
+  });
+
+  it('the sink skips non-roster feature fallbacks before starting a process', () => {
+    const request = { launchKind: 'build', repo: 'we', probationWorker: {
+      ...PROBATION_WORKERS['antigravity-argon'], taskType: 'build-new-feature',
+    }, policyRoute: { provider: 'antigravity', model: 'gemini-4-argon-high', fallback: [
+      { provider: 'antigravity', model: 'gemini-3.8-flash-high' },
+      { provider: 'antigravity', model: 'claude-sonnet-4-6' },
+      { provider: 'claude', model: 'claude-sonnet-5-5' },
+    ] } };
+    expect(routeDispatchProvider(request, {
+      probationLaunch: 'on', scriptExists: () => true,
+      providerAvailable: (_provider, route) => route.model !== 'gemini-4-argon-high',
+      probation: () => { throw new Error('non-roster fallback launched'); },
+      agent: () => 'native-claude',
+    })).toBe('native-claude');
+  });
+
+  it.each(['antigravity', 'codex'])('readTick carries real scorecard holds into build routing: %s', provider => {
+    const read = runReadTick('build', { scorecards: [
+      { subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' },
+      { provider, status: 'quota-exhausted', scoredAt: '2026-10-15T10:00:00Z', quotaResetsAt: '2099-01-01T00:00:00Z' },
+    ] });
+    expect(read.routing.probationWorker?.id).not.toBe('antigravity-argon');
+    if (provider === 'codex') expect(read.routing.probationWorker).toBeNull();
+  });
+
   // Exercise both standalone ids and the JSON hand-off used by the dispatcher. Claude's model is tier-derived.
   it.each([...new Set(Object.values(PROBATION_ROSTER).flat())])('accepts the %s worker through the real parser', (id) => {
     const def = PROBATION_WORKERS[id];

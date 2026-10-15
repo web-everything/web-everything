@@ -138,6 +138,28 @@ function fakeIo({
 // that needs a DIFFERENT scope (or none) overrides it via `extra.scope` (including `''`, which parses to `[]`).
 const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:docs/probation/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
 
+describe('Argon feature build checker boundary', () => {
+  it.each(['APPROVE', 'REJECT', 'unparseable'])('requires Codex approval before delivering a non-simple feature: %s', async verdict => {
+    const { io, calls } = fakeIo({ itemScope: ['we:scripts/feature.mjs'], numstat: '20\t1\tscripts/feature.mjs' });
+    const tasks = [];
+    io.diffText = () => 'feature diff';
+    io.writeTaskFile = (_dir, name, text) => { tasks.push({ name, text }); return `/tmp/${name}`; };
+    io.runChecker = () => verdict;
+    const parsed = args({ id: 'antigravity-argon', model: 'gemini-4-argon-high' }, { taskType: 'build-new-feature', scope: 'we:scripts/feature.mjs' });
+    expect(parsed.worker).toMatchObject({ checker: 'codex', simpleOnly: false });
+    const result = await runProbationBuild(parsed, io);
+    expect(tasks.find(t => t.name === 'probation-build-task.md').text).toContain('Implement only the requested feature');
+    expect(tasks.find(t => t.name === 'probation-build-check.md').text).not.toContain('work that is not simple and mechanical');
+    expect(result.outcome).toBe(verdict === 'APPROVE' ? 'opened-pr' : 'gate-red');
+    expect(calls.some(c => c[0] === 'commit')).toBe(verdict === 'APPROVE');
+    expect(calls.some(c => c[0] === 'openPr')).toBe(verdict === 'APPROVE');
+  });
+
+  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'])('rejects %s under the Argon worker id at the runner boundary', model => {
+    expect(() => args({ id: 'antigravity-argon', model }, { taskType: 'build-new-feature' })).toThrow(/disallowed model/);
+  });
+});
+
 describe('probationHoldIdentityEnv — card xmh9mtr: every heavy hold of an external build carries its dispatch identity', () => {
   it('names the dispatch session, the kind, and the run id', () => {
     expect(probationHoldIdentityEnv({ session: 'conveyor-4420', runId: 'r1', taskType: 'test-fix' }))

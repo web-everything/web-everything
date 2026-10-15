@@ -4,12 +4,14 @@ import { readSettings } from './settings-files.mjs';
 import { resolvePolicyModel } from './dispatch-routing-policy.mjs';
 
 const STANDARD = { argon: { enabled: true, model: 'gemini-4-argon-high' } };
-/** Both cascade leaves and injected routing settings must name a catalogued Gemini model. */
+/** Models approved for non-simple Argon builds; catalogue membership alone grants no such permission. */
+export const BUILD_ARGON_MODELS = Object.freeze(['gemini-4-argon-high']);
+/** Both cascade leaves and injected routing settings retain the worker's non-simple authorization. */
 export function resolveBuildArgonModel(model) {
-  if (typeof model !== 'string' || !/^gemini-[a-z0-9.-]+$/.test(model)) return null;
+  if (!BUILD_ARGON_MODELS.includes(model)) return null;
   try {
     const resolved = resolvePolicyModel('antigravity', model);
-    return resolved.startsWith('gemini-') ? resolved : null;
+    return BUILD_ARGON_MODELS.includes(resolved) ? resolved : null;
   } catch { return null; }
 }
 
