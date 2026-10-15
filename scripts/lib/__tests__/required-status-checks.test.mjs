@@ -860,6 +860,49 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
     const okReply = (body, etag) => `HTTP/2.0 200 OK\r\netag: ${etag}\r\ncontent-type: application/json\r\n\r\n${body}`;
     const NOT_MODIFIED = () => Object.assign(new Error('Command failed: gh api'), { stdout: 'HTTP/2.0 304 Not Modified\r\netag: "e"\r\n\r\n', stderr: 'gh: HTTP 304' });
 
+    it('isolates anonymous ETag reads across working directories', () => {
+      const etagDir = join(dir, 'etag'); // Shared across both checkouts, just like the production REST cache.
+      const cwdA = mkdtempSync(join(dir, 'repo-a-'));
+      const cwdB = mkdtempSync(join(dir, 'repo-b-'));
+      const calls = [];
+      const replies = [];
+      const exec = (_bin, argv) => {
+        const path = argv[argv.length - 1];
+        const kind = path.includes('/rules/') ? 'rules' : 'classic';
+        const repo = process.cwd() === cwdA ? 'a' : 'b';
+        calls.push({ cwd: process.cwd(), argv });
+        // ETags are scoped to resources: two repositories may return the same tag for different bodies.
+        if (argv.includes(`If-None-Match: "${kind}"`)) throw NOT_MODIFIED();
+        const body = kind === 'rules' ? JSON.stringify([requiredRule(`${repo}-rules`)]) : classicBranch(`${repo}-classic`);
+        return okReply(body, `"${kind}"`);
+      };
+      const restGet = (path, options) => {
+        const reply = ghRestGetJson(path, { ...options, exec, dir: etagDir, env: { HOME: dir } });
+        replies.push(reply.status);
+        return reply;
+      };
+      // Vitest workers cannot chdir; only the cwd lookup is substituted. Cache keying, disk I/O and 304
+      // body reuse all run through the real REST reader; the transport alone supplies deterministic replies.
+      const cwd = vi.spyOn(process, 'cwd');
+      try {
+        for (const [checkout, repo] of [[cwdA, 'a'], [cwdB, 'b'], [cwdA, 'a'], [cwdB, 'b']]) {
+          cwd.mockReturnValue(checkout);
+          expect(readRequiredStatusChecksDetailed({ restGet })).toEqual({
+            checks: [`${repo}-rules`, `${repo}-classic`], classic: [`${repo}-classic`],
+          });
+        }
+        expect(replies).toEqual([200, 200, 200, 200, 304, 304, 304, 304]);
+        expect(calls).toHaveLength(8);
+        for (const [index, call] of calls.entries()) {
+          const path = index % 2 === 0
+            ? 'repos/{owner}/{repo}/rules/branches/main?per_page=100&page=1'
+            : 'repos/{owner}/{repo}/branches/main';
+          const headers = index < 4 ? [] : ['-H', `If-None-Match: "${index % 2 === 0 ? 'rules' : 'classic'}"`];
+          expect(call).toEqual({ cwd: index % 4 < 2 ? cwdA : cwdB, argv: ['api', '-i', ...headers, path] });
+        }
+      } finally { cwd.mockRestore(); }
+    });
+
     it('after the TTL the revalidating read sends If-None-Match and a 304 keeps the set, refreshing fetchedAtMs', () => {
       const etagDir = join(dir, 'etag');
       const cachePath = join(dir, 'cache.json');
