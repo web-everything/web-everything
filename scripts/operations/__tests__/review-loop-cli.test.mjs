@@ -1216,6 +1216,28 @@ describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files i
     expect(text).toMatch(/Unattended accept parked after filing: live head does not match the reviewed head/);
   });
 
+  it('a bare --answer=accept on a parked round-cards run cannot accept before its card is filed', async () => {
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    const readAcceptancePr = () => ({ headRefOid: HEAD_A, comments: [] });
+    const parked = await driveReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks([]), makeJudge: cannedJudge(DEGRADED_ANSWER),
+      mintRunId: () => 'r-budget-bare-answer', fileItem: async () => ({ code: 1, lines: ['lane pool exhausted'] }),
+      findFiledRoundCards: () => null, readAcceptancePr,
+    });
+    expect(parked.stopped).toBe('confirm');
+    const seen = [];
+    const out = await driveReviewLoopOnce({
+      declaration, registry, argv: ['--resume=r-budget-bare-answer', '--answer=accept'], store, sinks: recordingSinks(seen),
+      makeJudge: cannedJudge(DEGRADED_ANSWER), mintRunId: () => 'unused', fileItem: async () => ({ code: 1, lines: ['still down'] }),
+      findFiledRoundCards: () => null, readAcceptancePr,
+    });
+    expect(out.run.findings.confirm).toBeUndefined();
+    expect(seen.some((s) => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+  });
+
   it('--json carries roundCardsFiled', async () => {
     const { out } = await run({ answer: DEGRADED_ANSWER, round: 4, json: true, fileItem: stubFileItem([]) });
     const payload = JSON.parse(out.lines[0]);

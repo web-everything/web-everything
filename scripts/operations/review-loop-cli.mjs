@@ -558,11 +558,17 @@ export async function runReviewLoopOnce({
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
-  const acceptHold = (run) => {
+  // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:
+  // the run's own filing receipt names this reviewed head and this finding set. A bare `--answer=accept` has none.
+  const acceptHold = (run, { filed = false } = {}) => {
     if (!requiresCleanReferrals) return null;
     try {
       // A `changes` round the round-cards rule cards and accepts goes through the same live-referral gate.
-      const roundCards = roundCardsDecision(run).apply === true;
+      const decision = roundCardsDecision(run);
+      const receipt = run?.input?.roundCardsFiling;
+      const roundCards = decision.apply === true && (!filed || (Boolean(receipt?.head)
+        && receipt.head === run.findings?.read?.netBasis?.rev
+        && receipt.fingerprint === roundCardsFindingsFingerprint(decision.cards)));
       const live = unattendedAcceptableVerdict(run?.verdict, { roundCards }) ? readAcceptancePr(run.input) : {};
       return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
@@ -571,11 +577,11 @@ export async function runReviewLoopOnce({
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {
       const answer = o.autoConfirm?.(pending, current);
-      return answer?.value === 'accept' && acceptHold(current) ? null : answer;
+      return answer?.value === 'accept' && acceptHold(current, { filed: true }) ? null : answer;
     };
     // Explicit unattended resumes and the card-filing paths obey the same boundary as auto-confirm. A held resume
     // is reported on the outcome (`acceptHeld`), so a filing branch never claims an accept that did not happen.
-    const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run) : null;
+    const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
     const resume = acceptHeld ? null : o.resume;
     return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
       .then((out) => (acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out));
