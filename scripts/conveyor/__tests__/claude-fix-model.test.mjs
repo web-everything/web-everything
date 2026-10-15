@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { dispatchFix, launchTableFor } from '../reconcile-fix-dispatch.mjs';
 import { resolveFixSettings } from '../fix-takeover.mjs';
-import { DEFAULT_ROUTING_POLICY, resolveOperationRoute } from '../../lib/dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, resolvePolicyModel, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
+import * as routingPolicyIO from '../../lib/dispatch-routing-policy-io.mjs';
 
 const ruling = { rung: { id: 'stronger-model', at: 2 }, route: { provider: 'claude', model: 'opus', effort: 'high' } };
 const ordinary = { pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] };
@@ -63,5 +64,24 @@ describe('daemon Claude fix models', () => {
       expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
       expect(log.mock.calls.flat().join('\n')).toContain('fix.claudeEscalationModel=sonnet (source platform)');
     } finally { log.mockRestore(); }
+  });
+
+  it.each(['inherited', 'missing', 'inherited-no-opus-alias', 'missing-no-opus-alias'])('critical fixes retain a critical model with a %s policy route', (variant) => {
+    const input = structuredClone(DEFAULT_ROUTING_POLICY);
+    if (variant.startsWith('inherited')) input.operations['fix:critical-work'] = { inherit: true };
+    else delete input.operations['fix:critical-work'];
+    if (variant.endsWith('no-opus-alias')) delete input.aliases.claude.opus;
+    const policy = validateRoutingPolicy(input);
+    const resolveRoute = vi.spyOn(routingPolicyIO, 'resolveOperationRoute')
+      .mockImplementation(options => resolveOperationRoute({ ...options, policy }));
+    const resolveModel = vi.spyOn(routingPolicyIO, 'resolvePolicyModel')
+      .mockImplementation((provider, model) => resolvePolicyModel(provider, model, policy));
+    try {
+      expect(resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy })).toBeNull();
+      for (const escalation of [null, ruling]) {
+        expect(launchTableFor({ ...ordinary, scope: ['we:scripts/lib/provider-routing.mjs'] }, escalation))
+          .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.opus, effort: 'high' });
+      }
+    } finally { resolveRoute.mockRestore(); resolveModel.mockRestore(); }
   });
 });

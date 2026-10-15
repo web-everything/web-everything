@@ -163,6 +163,7 @@ import { loadFixerLadder } from './fixer-ladder.mjs';
 import { mainRedPriorityRank } from './main-ci-red-core.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
+import { CLAUDE_NATIVE_MODEL_BY_TIER } from '../lib/dispatch-contracts.mjs';
 import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routing-policy-io.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
@@ -1214,8 +1215,9 @@ export function launchTableFor(planned, roundEscalation, { fixSettings = resolve
   const verdict = criticalWorkVerdict({ ...planned, taskType: 'fix', filesTouched: planned.scope ?? [] });
   if (verdict.critical) {
     const route = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', available: ['claude'], gateClosed: true });
-    return { ...table, model: route.model, effort: route.effort,
-      reason: `routing-policy fix:critical-work (${verdict.reasons.map(r => r.proxy).join(', ')})` };
+    // Inherited (including omitted) routes retain the critical-work model, never the escalation rung's model.
+    return { ...table, model: route?.model ?? CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: route?.effort ?? 'high',
+      reason: `${route ? 'routing-policy fix:critical-work' : 'critical-work fallback'} (${verdict.reasons.map(r => r.proxy).join(', ')})` };
   }
   const configured = fixSettings.claudeEscalationModel ?? 'sonnet';
   const model = ['haiku', 'sonnet'].includes(configured) ? configured : 'sonnet';
