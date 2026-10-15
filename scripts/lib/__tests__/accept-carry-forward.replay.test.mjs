@@ -436,6 +436,29 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expectHandedOff(restamp({ comments: [clearComment(), later] }));
   });
 
+  // PR #5273: the hand-off's race undo (marker + post-write re-check) must not fire on a deliberate override.
+  it('a hand-off over an older clearance carries the race marker for its head', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    const r = restamp({ comments: [clearComment(), later], fullComments: [clearComment(), later] });
+    expect(r.writes.postComment[0]).toContain(`<!-- mechanical-hold-handoff: ${heads.head} -->`);
+  });
+  it('a hand-off that overrides a clearance of the live head carries no marker and is not undone by that clearance', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    const thread = [clearComment(), later];
+    const r = restamp({ comments: thread, fullComments: thread, headRefOid: heads.cleared });
+    expect(r.writes.postComment).toHaveLength(1);
+    expect(r.writes.postComment[0]).toMatch(/mechanical hold handed to the operator/);
+    expect(r.writes.postComment[0]).not.toContain('mechanical-hold-handoff:');
+    expect(r.writes.setLabels.at(-1)).toEqual({ add: 'review:human', remove: [MECH] });
+  });
+  it('a hand-off without the complete thread (carry-forward off, a full first page) carries no race marker', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    const page = [clearComment(), ...filler(98), later];
+    const r = restamp({ comments: page, fullComments: page, setting: 'off' });
+    if (r.writes.postComment.length) expect(r.writes.postComment[0]).not.toContain('mechanical-hold-handoff:');
+    expect(r.writes.setLabels.filter(s => s.add === 'review:accepted')).toEqual([]);
+  });
+
   it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR still keeps cleared-human', () => {
     const r = restamp({ comments: [clearComment()], labels: ['review:accepted'] });
     expect(r.exitCode).toBe(0);
@@ -601,7 +624,8 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the carry (no accept)', () => {
     const page = [clearComment(), ...filler(99)];
     const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
-    expect(r.reads.comments).toBe(1);
+    // One complete read for the carry decision, one after the hand-off's write (PR #5273 clearance re-check).
+    expect(r.reads.comments).toBe(2);
     expectHandedOff(r);
   });
 
