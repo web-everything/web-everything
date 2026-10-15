@@ -20,7 +20,7 @@ export default {
   id: 'prepare-stamped-needs-you-park',
   title: 'A needs-you card resolved by a hand stamp is refused at launch forever when it goes stale',
   card: '347 / PR 5366',
-  fixedBy: { sha: 'HEAD', where: 'lane/prepare-dup-guard', paths: [GUARD] },
+  fixedBy: { sha: '40cdd857b', where: 'lane/prepare-dup-guard', paths: [GUARD] },
   fixPresent(root) {
     const p = join(root, GUARD);
     return existsSync(p) && readFileSync(p, 'utf8').includes('latest.held === true && latest.completed !== true');
