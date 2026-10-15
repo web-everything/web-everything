@@ -66,7 +66,7 @@ describe('un-nested gh call on a full pool', () => {
     const spawn = vi.fn(ok);
     const warn = vi.fn();
     const r = runGhCliPassthrough(['pr', 'list'], {
-      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV }, now: tickingClock(), sleep, acquireTimeoutMs: 5_000, warn },
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' }, now: tickingClock(), sleep, acquireTimeoutMs: 5_000, warn },
       spawn,
     });
     expect(r.status).toBe(0); // fail OPEN after the timeout — unchanged
