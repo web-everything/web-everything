@@ -711,8 +711,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('ls # ; cd /protected/clone')).toBe(REPORTED);
   });
   it('a statement whose words cannot be trusted forgets every name it assigns', () => {
-    expect(at('M=/a; export L=$(true M=/protected/clone ); cd "$M"')).toBe(REPORTED);
-    expect(at('M=/a; export L=`true M=/protected/clone `; cd "$M"')).toBe(REPORTED);
+    // the segment split cuts `$( … && … )` apart: the open fragment forgets what it assigns
+    expect(at('L=/a; L=$( cd /q && pwd ); cd "$L"')).toBe(REPORTED);
+    expect(at('M=/a; export L=`true M=/protected/clone `; cd "$M"')).toBe('/a');
     expect(at('cd $(dirname /x/y) ; cd /protected/clone')).toBe(REPORTED);
   });
   it('prefix assignments, -p and dynamic names follow bash', () => {
@@ -745,6 +746,43 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('X=`cd /q`; cd /protected/clone')).toBe('/protected/clone');
     expect(at('cd "/protected/a(" && ls')).toBe('/protected/a(');
     expect(at('export D=/protected/clone T=$(mktemp -d); cd "$D"')).toBe('/protected/clone');
+  });
+  it('words split inside a substitution are one word again', () => {
+    expect(at('X=$(echo a b) cd /protected/clone; touch f; cd /bin')).toBe('/protected/clone');
+    expect(at('X="$(echo "a b")" cd /protected/clone; cd /bin')).toBe('/protected/clone');
+    expect(at('Y=/a; X="$(git log -1 --format="%h %s")" Y=/protected/clone; cd "$Y"')).toBe('/protected/clone');
+    expect(at('X=/a; X="$(echo "/b x")"; cd "$X"')).toBe(REPORTED);
+    expect(at('X=/a; X="`echo "/b x"`"; cd "$X"')).toBe(REPORTED);
+    // a prefix before an expansion in command position is temporary, or persists if it expands to nothing
+    expect(at('X=/bin; X=/etc $(echo true a); cd "$X"')).toBe(REPORTED);
+    expect(at('X=/bin; X=/etc `echo true a`; cd "$X"')).toBe(REPORTED);
+    expect(at('X=/bin; X=/etc $CMD; cd "$X"')).toBe(REPORTED);
+    expect(at('X=/bin; X=/etc true; cd "$X"')).toBe('/bin');
+    // an assignment inside a substitution runs in a subshell
+    expect(at('M=/a; export L=$(true M=/protected/clone ); cd "$M"')).toBe('/a');
+    // a substitution left open (the segment was cut inside it) or a stray `)` hides any cd after it
+    expect(at('$(true a) ) cd /protected/clone; cd /bin')).toBe(REPORTED);
+  });
+  it('arithmetic inside `${…}` and nested `((…))` forgets what it assigns; quoting is read in context', () => {
+    for (const stmt of [
+      ': ${a[LANE=0]}', 'Z=abc; : ${Z:LANE=1}', '((LANE=(0)))', 'echo "a\'b" $((LANE=0)) "c\'d"', "echo \\' $((LANE=0)) \\'",
+      'let ${N:-LANE}=0', 'let "$(echo LANE)=0"', 'let "${!N}=0"', 'let ${N}LANE=0', '(( ${N}X = 0 ))', 'let "$N++"',
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    for (const stmt of ['echo hi # ${LANE:=/bin}', 'echo hi # ((LANE=0))', ": '${LANE:=/x}'", 'let "i = $i + 1"']) {
+      expect(at(`LANE=/protected/clone; ${stmt}\ncd "$LANE"`), stmt).toBe('/protected/clone');
+    }
+  });
+  it('the substitution, expansion and and-or scans stay linear', () => {
+    const t0 = Date.now();
+    at(`a${'&&a'.repeat(33333)}`);
+    at(`a${' && a'.repeat(20000)}`);
+    at(`echo ${'\\"'.repeat(50000)}`);
+    at(`: ${'${a['.repeat(25000)}`);
+    at(`${'${a[x '.repeat(12000)}]}`);
+    at(`echo ${'"$(echo '.repeat(20000)}`);
+    expect(Date.now() - t0).toBeLessThan(3000);
   });
   it('an and-or list ending in `&` runs in the background, and literal parens are not a function', () => {
     expect(at('D=/protected/clone; D=/lane && true & cd "$D"')).toBe('/protected/clone');

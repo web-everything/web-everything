@@ -2541,52 +2541,153 @@ const OPTION_ARGS = { read: 'adinNptu', mapfile: 'dnOsuCc', readarray: 'dnOsuCc'
 // starts a match only at the head of a name, so the scan stays linear; LET_MAX_CHARS bounds the subscript scan.
 const LET_ASSIGNED = /(?<![\w$])([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--|(?:[-+*/%&^|]|<<|>>)?=(?!=))|(?:\+\+|--)\s*([A-Za-z_]\w*)/g;
 const LET_MAX_CHARS = 4096;
-// A `let` / `((…))` expression that names its assigned variable through an expansion (`$N=1`, `++$N`).
-const ARITH_DYNAMIC_TARGET = /\$\{?[A-Za-z_]\w*\}?\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--|(?:[-+*/%&^|]|<<|>>)?=(?!=))|(?:\+\+|--)\s*\$|`/;
+// How many `${` / `((` one statement may carry before its expansions are read as unknown (bounds the scan).
+const EXPANSION_SCAN_MAX = 256;
 // The ops a statement's words can make: `{ name, raw }` binds (raw null = unknown), `{ name, readonly: true }`
 // freezes a name, `{ all: true }` makes every variable (and HOME) unknown.
 const CLEAR_ALL = { all: true };
+const ARITH_ASSIGN_OP = /(?:<<|>>|[-+*/%&^|])?=(?!=)/g;
 
-// The names an arithmetic expression assigns, or [CLEAR_ALL] when it cannot be read statically.
+// The names an arithmetic expression assigns, or [CLEAR_ALL] when its targets cannot be read statically: an
+// expression with an expansion in it whose assignment target is not a plain name (`$N=1`, `${N}X=1`,
+// `$(echo X)=1`, `${!N}=1`), or that increments anything (`$N++`).
 function arithmeticOps(expr) {
-  if (expr.length > LET_MAX_CHARS || ARITH_DYNAMIC_TARGET.test(expr)) return [CLEAR_ALL];
+  if (expr.length > LET_MAX_CHARS) return [CLEAR_ALL];
+  if (/[$`]/.test(expr)) {
+    if (/\+\+|--/.test(expr)) return [CLEAR_ALL];
+    for (const m of expr.matchAll(ARITH_ASSIGN_OP)) {
+      if (m[0] === '=' && /[=!<>]/.test(expr[m.index - 1] ?? '')) continue; // `==`, `!=`, `<=`, `>=` compare
+      let j = m.index;
+      while (j > 0 && /\s/.test(expr[j - 1])) j--;
+      if (expr[j - 1] === ']') j = expr.lastIndexOf('[', j - 1);
+      let s = j;
+      while (s > 0 && /\w/.test(expr[s - 1])) s--;
+      if (j < 0 || s === j || /^\d/.test(expr[s]) || /[$}\w)`\]]/.test(expr[s - 1] ?? '')) return [CLEAR_ALL];
+    }
+  }
   return [...expr.matchAll(LET_ASSIGNED)].map((m) => ({ name: m[1] ?? m[2], raw: null }));
 }
 
-// A word's spelling without its quoted runs (whose `(`, `)`, `` ` `` and `${` are literal text). Double-quoted
-// runs are dropped too: shellTokens keeps each of them inside one word, so they never break word boundaries.
-const unquoted = (raw) => raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '');
+// The segment text in which expansions happen: single-quoted runs and escaped characters blanked (a `'` inside
+// double quotes is literal), cut at a word-initial unquoted `#` comment. Linear.
+function expandableText(stmt) {
+  const s = String(stmt);
+  let out = '';
+  let dq = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; out += ' '; continue; }
+    if (!dq && c === "'") {
+      const close = s.indexOf("'", i + 1);
+      if (close < 0) break;
+      i = close;
+      out += ' ';
+      continue;
+    }
+    if (c === '"') dq = !dq;
+    else if (!dq && c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;
+    out += c;
+  }
+  return out;
+}
 
-// What expansions inside a statement assign while they expand: `${N=v}` / `${N:=v}` and arithmetic
-// `((…))` / `$((…))`. Read from the segment text (the word split would take `<<=` for a redirect);
-// single-quoted text is literal and never expands.
+// What expansions inside a statement assign while they expand: `${N=v}` / `${N:=v}`, arithmetic in a `${…}`
+// subscript or substring offset (`${a[N=0]}`, `${Z:N=1}`), and `((…))` / `$((…))` (nested parens included).
+// Read from the segment text, since the word split would take `<<=` for a redirect.
 function expansionOps(stmt) {
-  const text = String(stmt).replace(/'[^']*'/g, '');
-  const ops = [...text.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]]*\])?:?=/g)].map((m) => ({ name: m[1], raw: null }));
-  for (const m of text.matchAll(/\(\(([^()]*)\)\)/g)) ops.push(...arithmeticOps(m[1]));
+  const text = expandableText(stmt);
+  const ops = [];
+  let count = 0;
+  for (let i = text.indexOf('${'); i >= 0; i = text.indexOf('${', i + 2)) {
+    if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
+    const close = text.indexOf('}', i + 2);
+    const body = text.slice(i + 2, close < 0 ? Math.min(text.length, i + 3 + LET_MAX_CHARS) : close);
+    if (body.length > LET_MAX_CHARS) return [CLEAR_ALL];
+    const m = /^!?([A-Za-z_]\w*|\d+|[@*#?$!-])(?:\[([^\]]*)\])?([^]*)$/.exec(body);
+    if (!m) { if (body.includes('=')) return [CLEAR_ALL]; continue; }
+    if (m[2] !== undefined) ops.push(...arithmeticOps(m[2]));
+    if (/^:?=/.test(m[3])) ops.push({ name: m[1], raw: null });
+    else if (/^:(?![-+=?])/.test(m[3])) ops.push(...arithmeticOps(m[3].slice(1)));
+  }
+  count = 0;
+  for (let i = text.indexOf('(('); i >= 0; i = text.indexOf('((', i + 2)) {
+    if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
+    let depth = 0;
+    let j = i + 2;
+    for (; j < text.length && j - i <= LET_MAX_CHARS; j++) {
+      if (text[j] === '(') depth++;
+      else if (text[j] === ')') { if (depth === 0) break; depth--; }
+    }
+    if (j - i > LET_MAX_CHARS) return [CLEAR_ALL];
+    ops.push(...arithmeticOps(text.slice(i + 2, j)));
+  }
   return ops;
 }
 
-// A substitution left open inside one word (`X=$(mktemp -d)` tokenizes as two words): word boundaries after it
-// cannot be trusted. Only unquoted parens and backticks count.
-const unbalancedSubstitution = (raw) => {
-  const u = unquoted(raw);
-  return u.split('(').length !== u.split(')').length || (u.match(/`/g) || []).length % 2 === 1;
-};
+// Scan one word's spelling for substitutions, carrying the open-context `stack` (`)` for `$(`/`(`, `"`, `` ` ``)
+// across the statement's words: tokenizing splits an unquoted `$(echo a b)` into several words. Quotes nest the
+// way bash nests them (`"$(echo "a b")"`). false = a `)` that closes nothing. Linear.
+function scanSubstitutions(raw, stack) {
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    const top = stack[stack.length - 1];
+    if (c === '\\') { i++; continue; }
+    if (top === '"') {
+      if (c === '"') stack.pop();
+      else if (c === '`') stack.push('`');
+      else if (c === '$' && raw[i + 1] === '(') { stack.push(')'); i++; }
+      continue;
+    }
+    if (c === "'") {
+      const close = raw.indexOf("'", i + 1);
+      if (close < 0) return false;
+      i = close;
+    } else if (c === '"') stack.push('"');
+    else if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); }
+    else if (c === '(') stack.push(')');
+    else if (c === ')') { if (top !== ')') return false; stack.pop(); }
+  }
+  return true;
+}
 
 // Split a statement into its persisting-or-temporary prefix assignments and the command words. Reserved words
 // that run the command in this shell (`{`, `!`, `time [-p]` — only when unquoted) and a `builtin` / `command`
 // wrapper are skipped (`command -v`/`-V` only looks a name up, so it stays the command). From the first word
-// that leaves a substitution open, the words cannot be trusted: `opaque` lists the names they assign, and `cd`
-// says the statement itself is a cd (a `cd` nested inside the open substitution is not). `invalid` marks a
-// statement bash rejects before running.
-function parseStatement(words) {
-  const open = words.findIndex((w) => unbalancedSubstitution(w.raw));
+// that leaves a substitution open, the words cannot be trusted: `opaque` lists the names they could assign, and
+// `cd` says the statement may itself be a cd (a `cd` nested inside the open substitution is not). `invalid`
+// marks a statement bash rejects before running.
+function parseStatement(tokens) {
+  // Re-join the words tokenizing split inside a substitution (`X=$(echo a b)` is ONE shell word).
+  const words = [];
+  const stack = [];
+  let open = -1;
+  let broken = false;
+  let cdAfterOpen = false;
+  for (const w of tokens) {
+    if (broken) {
+      if (w.text === 'cd') cdAfterOpen = true;
+      words.push(w);
+      continue;
+    }
+    const inside = stack.length > 0;
+    if (!scanSubstitutions(w.raw, stack)) broken = true;
+    if (inside) {
+      const prev = words[words.length - 1];
+      words[words.length - 1] = { raw: `${prev.raw} ${w.raw}`, text: `${prev.text} ${w.text}` };
+    } else {
+      words.push(w);
+      if (broken || stack.length) open = words.length - 1;
+    }
+    if (broken && open < 0) open = words.length - 1;
+  }
+  if (!broken && !stack.length) open = -1;                      // every substitution closed
   if (open >= 0) {
     const head = parseStatement(words.slice(0, open));
     const opaque = words.slice(open).map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
-    const cd = head.cmd[0]?.text === 'cd' || (!head.cmd.length && words[open].text === 'cd');
-    return { ...head, opaque, cd };
+    // bare prefix assignments before the open word may be temporary (it is the command) or persist (it expands
+    // to nothing): unknown either way
+    if (!head.cmd.length) opaque.push(...head.prefix.map((w) => assignmentOp(w).name));
+    return { ...head, prefix: head.cmd.length ? head.prefix : [], opaque, cd: head.cmd[0]?.text === 'cd' || cdAfterOpen };
   }
   let i = 0;
   for (;;) {
@@ -2669,6 +2770,8 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
   if (opaque) return [...statementBindings({ invalid, prefix, cmd }), ...opaque.map(forget)];
   if (invalid) return [];
   if (!cmd.length) return prefix.map(assignmentOp);              // bare assignments persist, in order
+  // A command word that is an expansion may expand to nothing, and then the prefix assignments persist.
+  if (/^(?:\$|`)/.test(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
   const name = cmd[0].text;
   const args = cmd.slice(1);
   const names = (ws) => ws.map((w) => w.text).filter((t) => VALID_NAME.test(t)).map((t) => t.match(NAME_PREFIX)[0]);
@@ -2823,12 +2926,11 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // this shell. One after `&&`/`||`, or once a compound command or function definition has appeared (whose body
   // statements are walked here as if they ran in order), may not run: its readonly is only 'maybe'.
   const seps = parsed.separators;
-  const background = (k) => {
-    let j = k;
-    while (/^(?:&&|\|\|)/.test(seps[j] ?? '')) j++;
-    return /^&(?!&)/.test(seps[j] ?? '');
-  };
-  const subshell = (k) => /^\|(?!\|)/.test(seps[k - 1] ?? '') || /^\|(?!\|)/.test(seps[k] ?? '') || background(k);
+  const background = [];                                        // computed from the end: linear
+  for (let j = seps.length - 1; j >= 0; j--) {
+    background[j] = /^&(?!&)/.test(seps[j]) || (/^(?:&&|\|\|)/.test(seps[j]) && background[j + 1] === true);
+  }
+  const subshell = (k) => /^\|(?!\|)/.test(seps[k - 1] ?? '') || /^\|(?!\|)/.test(seps[k] ?? '') || background[k];
   let structured = false;
   for (const [k, stmt] of parsed.segments.entries()) {
     if (parsed.commented[k]) continue;                          // begins inside a `#` comment
