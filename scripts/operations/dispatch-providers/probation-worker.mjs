@@ -3,9 +3,8 @@
  * @description THE PROBATION-WORKER DISPATCH PROVIDER (agy-launcher-probation, operator 2026-09-27) — runs an
  *   opened, non-critical task on the probation worker the router picked (Codex, Antigravity-Claude or
  *   Antigravity-Gemini — `we:scripts/lib/provider-routing.mjs#selectProbationWorker`), instead of a
- *   `claude --bg` session. Two launch kinds are wired today: `ci-heal` (repair an existing PR's red CI,
- *   `we:scripts/operations/probation-heal-run.mjs`) and, since #4291, `build` for an opened `doc-fix` taskType
- *   only (build a fresh backlog item to spec, `we:scripts/operations/probation-build-run.mjs`).
+ *   `claude --bg` session. Heal work uses `probation-heal-run.mjs`; documentation, test and feature builds,
+ *   plus card preparation, use `probation-build-run.mjs`. Each kind's accepted task types are listed below.
  *
  * SAME PORT CONTRACT AS EVERY OTHER PROVIDER — `(request, io?) => 'pid:<n>'`, read from {@link ../dispatch-providers/build.mjs}'s
  * own docblock rather than restated. It spawns the launch kind's own run script ({@link PROBATION_LAUNCHABLE_KINDS})
@@ -13,10 +12,7 @@
  *
  * WHEN IT RUNS. `../dispatch-lane-io.mjs#routeDispatchProvider` hands a request here only when ALL hold:
  *   1. the request carries a `probationWorker` (the router's pick — so the gate was open and the task not critical);
- *   2. the launch kind is in {@link PROBATION_LAUNCHABLE_KINDS} AND the worker's own `taskType` is the ONE
- *      taskType that kind may launch (#4291: `build` launches a `doc-fix` worker only — a `ci-heal` worker
- *      offered under a `build` request, or vice versa, is never launched, only recorded — see
- *      {@link probationLaunchDecision});
+ *   2. the launch kind and worker's `taskType` match {@link PROBATION_LAUNCHABLE_KINDS};
  *   3. the repo is WE (both run scripts resolve every tool through WE's own checkout);
  *   4. {@link probationLaunchFromEnv} says `on`.
  * Anything else takes the unchanged path. So the pick is always RECORDED; it is only LAUNCHED where it can run.
@@ -26,6 +22,7 @@
  */
 
 import { isUnderTest } from '../../lib/under-test.mjs';
+import { PROBATION_ROSTER } from '../../lib/provider-routing.mjs';
 import { beginHealAttempt, bindHealAttempt, failHealAttempt } from '../probation-heal-run.mjs';
 import { join } from 'node:path';
 import { normNum } from '../../conveyor/queue-store.mjs';
@@ -35,20 +32,24 @@ import { DETACHED_HANDLE_PREFIX, REPO_ROOT, defaultSpawnDetached, deliveryDispat
 /** The per-dispatch process the `ci-heal` kind starts. Resolved by script location, never cwd. */
 export const PROBATION_HEAL_RUN_SCRIPT = join(REPO_ROOT, 'scripts', 'operations', 'probation-heal-run.mjs');
 
-/** The per-dispatch process the `build` kind starts, for an opened `doc-fix` taskType only (#4291). */
+/** The per-dispatch process for supported builds and card preparation. */
 export const PROBATION_BUILD_RUN_SCRIPT = join(REPO_ROOT, 'scripts', 'operations', 'probation-build-run.mjs');
 
 /**
- * Every launch kind a probation worker can be LAUNCHED for today, keyed to the ONE `taskType` that kind may
- * carry (see the file docblock point 2) and the run script that owns that kind's whole arc. A kind not listed
+ * Every launch kind, its accepted taskTypes and its run script. `taskType` retains the original default.
+ * A kind not listed
  * here still RECORDS a `probationWorker` pick (`selectProbationWorker` is unconditional); it just never runs
  * one — the unchanged `claude --bg` path takes it instead.
  */
 export const PROBATION_LAUNCHABLE_KINDS = Object.freeze({
-  'ci-heal': Object.freeze({ taskType: 'ci-heal', runScript: PROBATION_HEAL_RUN_SCRIPT }),
-  'prepare-item': Object.freeze({ taskType: 'prepare', runScript: PROBATION_BUILD_RUN_SCRIPT }),
-  build: Object.freeze({ taskType: 'doc-fix', runScript: PROBATION_BUILD_RUN_SCRIPT }),
+  'ci-heal': Object.freeze({ taskType: 'ci-heal', taskTypes: Object.freeze(['ci-heal', 'test-fix']), runScript: PROBATION_HEAL_RUN_SCRIPT }),
+  'prepare-item': Object.freeze({ taskType: 'prepare', taskTypes: Object.freeze(['prepare']), runScript: PROBATION_BUILD_RUN_SCRIPT }),
+  build: Object.freeze({ taskType: 'doc-fix', taskTypes: Object.freeze(['doc-fix', 'test-fix', 'build-new-feature']), runScript: PROBATION_BUILD_RUN_SCRIPT }),
 });
+
+/** Fix dispatch still uses its existing repair path; its probation pick is evidence only. */
+// @test-only-export-ok: invariant against new roster entries silently becoming record-only
+export const PROBATION_RECORD_ONLY_TASK_TYPES = Object.freeze({ bugfix: 'fix dispatch has no probation launcher' });
 
 /** The launch kinds a probation worker can be LAUNCHED for today. Kept as its own export — named in
  *  `../dispatch-lane-io.mjs`'s own docblock. */
@@ -86,9 +87,11 @@ export function probationLaunchDecision(request, launch) {
   if (!worker) return { launch: false, why: 'no probation worker on the request' };
   const entry = PROBATION_LAUNCHABLE_KINDS[kind];
   if (!entry) return { launch: false, why: `kind '${kind}' has no probation launcher yet` };
-  // Each kind keeps its original taskType; both existing launchers also enforce the test-fix envelope (#4551).
-  if (worker.taskType !== entry.taskType && !(kind !== 'prepare-item' && worker.taskType === 'test-fix')) {
-    return { launch: false, why: `kind '${kind}' only launches a '${entry.taskType}' worker, got taskType '${worker.taskType}'` };
+  if (!entry.taskTypes.includes(worker.taskType)) {
+    return { launch: false, why: `kind '${kind}' only launches ${entry.taskTypes.join(', ')} workers, got taskType '${worker.taskType}'` };
+  }
+  if (worker.taskType === 'build-new-feature' && (!PROBATION_ROSTER[worker.taskType].includes(worker.id) || worker.simpleOnly)) {
+    return { launch: false, why: 'feature builds require a non-simple feature roster worker' };
   }
   const repo = String(request?.repo ?? 'we');
   if (repo !== 'we') return { launch: false, why: `repo '${repo}' — the probation launcher runs WE '${entry.taskType}' work only` };
@@ -153,7 +156,7 @@ export function probationWorkerDetachedProvider(request, {
   } else {
     throw notApplied(`dispatch-lane: refusing a probation launch for kind '${kind}' — this provider has no argv shape for it`);
   }
-  if (['test-fix', 'prepare'].includes(worker.taskType)) argv.push(`--taskType=${worker.taskType}`);
+  if (['test-fix', 'prepare', 'build-new-feature'].includes(worker.taskType)) argv.push(`--taskType=${worker.taskType}`);
   if (kind === 'prepare-item' && request?.runId && request?.effectKey) {
     argv.push(`--run-id=${request.runId}`, `--effect-key=${request.effectKey}`);
   }
