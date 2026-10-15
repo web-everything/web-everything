@@ -27,6 +27,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
   planPriority, admitMainFixDispatch, parseVitestFailures, classifyFlakeRun, planMainCiRerun, hexSha, FLAKE_RERUN_ROUNDS,
+  findMergeGroupFlakeEvidence, mainCiRedSettingSource,
 } from './main-ci-red-core.mjs';
 import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
 
@@ -128,7 +129,7 @@ export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_R
  * "only cancelled / no runner" (`infraOnly`, not a code failure), plus the failing jobs and tests of the latest real
  * red run. Throws on an unreadable runs read (= unknown).
  */
-export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings(), readRequired = getRequiredStatusChecks } = {}) {
+export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, config = {}, settings = mainCiRedSettings(config), readRequired = getRequiredStatusChecks } = {}) {
   const list = (limit) => ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', settings.mainCiRedBranch,
     '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName,attempt']);
   let runs = list(settings.mainCiRedRunLimit);
@@ -183,6 +184,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     if (!candidate || jobsRead.has(candidate.databaseId)) break; // already inspected: genuine, or unreadable
     if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
+  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired });
   if (settings.mainCiRedFlakeRerun && failingRun) {
     // Rerun evidence is best-effort: unreadable logs/diffs never poison the primary runs probe.
     failing.failures = null;
@@ -193,14 +195,33 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     const previous = sorted.slice(sorted.indexOf(failingRun) + 1).find((r) => r.status === 'completed' && classifyRun(r) !== 'ignore');
     failing.prevRunGreen = !!previous && classifyRun(previous) === 'green';
     const classify = () => classifyFlakeRun({ run: failingRun, failedJobs: failing.jobs, failures: failing.failures,
-      prevRunGreen: failing.prevRunGreen, changedFiles: failing.changedFiles, settings });
+      prevRunGreen: failing.prevRunGreen, changedFiles: failing.changedFiles, groupEvidence: failing.groupEvidence, settings });
     if (!classify().eligible && failing.prevRunGreen && settings.mainCiRedRerunUnrelatedChange) {
       try { failing.changedFiles = readChangedFiles(previous.headSha, failingRun.headSha, { exec, repoSlug }); }
       catch { failing.changedFiles = null; }
     }
-    failing.flake = { runId: failingRun.databaseId, sha: failingRun.headSha, ...classify() };
+    // card 303: one list read and at most two complete job reads; evidence never clears main red.
+    failing.groupEvidence = null;
+    if (settings.mainCiRedMergeGroupFlakeEvidence && settings.mainCiRedMergeGroupRunLimit > 0 && tip?.sha) {
+      try {
+        const groupRuns = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow,
+          '--event', 'merge_group', '--limit', String(settings.mainCiRedMergeGroupRunLimit), '--json',
+          'databaseId,conclusion,status,createdAt,updatedAt,headBranch,headSha,event,attempt']);
+        let groupReads = 0;
+        failing.groupEvidence = findMergeGroupFlakeEvidence({ groupRuns, tipSha: tip.sha, failedJobs: failing.jobs, settings,
+          jobsOf: (runId) => {
+            if (groupReads >= 2) return null;
+            groupReads += 1;
+            return readRunJobs(runId, { exec, repoSlug });
+          } });
+      } catch { failing.groupEvidence = null; }
+      if (failing.groupEvidence) {
+        const e = failing.groupEvidence;
+        process.stderr.write(`main-ci-red: flake evidence — merge-group run ${e.runId} (${e.headBranch}) passed ${e.coveredJobs.join(', ')} on main tip ${tip.sha.slice(0, 9)} (setting mainCiRedMergeGroupFlakeEvidence=${settings.mainCiRedMergeGroupFlakeEvidence}, source ${mainCiRedSettingSource(config, 'mainCiRedMergeGroupFlakeEvidence')})\n`);
+      }
+    }
+    failing.flake = { runId: failingRun.databaseId, sha: failingRun.headSha, ...classify(), groupEvidence: failing.groupEvidence };
   }
-  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired });
   return { runs: sorted, failing, ...(tip ? { tip } : {}) };
 }
 
@@ -287,7 +308,7 @@ export async function probeAndOwnMainCi({
   readPrCi = (pr) => readFixPrCi(pr, { repoSlug }),
 } = {}) {
   const settings = mainCiRedSettings(config);
-  const probe = readRuns({ repoSlug, settings });
+  const probe = readRuns({ repoSlug, settings, config });
   const ledgerPath = ledgerPathIn(dir);
   let reruns;
   const loadReruns = () => { reruns = readOwnerLedger(ledgerPath)._reruns ?? {}; };
