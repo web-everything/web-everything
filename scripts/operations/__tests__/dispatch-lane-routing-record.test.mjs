@@ -132,6 +132,7 @@ describe('(a) the no-op proof — critical-work gate keeps build/fix/ci-heal on 
       expect(read.routing.executed).toBe('claude');
       expect(read.routing.tier).toBe('sonnet');
       expect(read.plannedWorkerModel).toMatchObject({ tier: 'sonnet', model: 'sonnet' });
+      expect(read.routing.probationWorker).toMatchObject({ id: 'codex', trials: 0, supervision: 'full', review: 'full' });
     });
 
     it('fix and ci-heal → routed/executed claude, tier sonnet', () => {
@@ -180,7 +181,11 @@ describe('(a) the no-op proof — critical-work gate keeps build/fix/ci-heal on 
         if (launchKind === 'fix') {
           expect(read.routing.probationWorker).toMatchObject({ id: 'antigravity-claude', supervision: 'full', review: 'full' });
         } else {
-          expect(read.routing.probationWorker).toMatchObject({ id: 'codex', supervision: 'full', review: 'full' });
+          // Six Codex build trials rotate probation to the untried Argon worker; Claude stays the fallback.
+          expect(read.routing.probationWorker).toMatchObject({
+            id: 'antigravity-argon', provider: 'antigravity', checker: 'codex', trials: 0,
+            supervision: 'full', review: 'full', runRating: 'required',
+          });
         }
       }
       // agy-launcher-probation — `ci-heal` is its own taskType now, opened on probation: the gate opens for this
