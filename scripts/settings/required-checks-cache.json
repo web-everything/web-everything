@@ -1,0 +1,6 @@
+{
+  "$comment": "How long a cached required-status-checks read (we:scripts/lib/required-status-checks.mjs) is trusted before it is revalidated (an ETag 304 is free). One shared cache file per host, not per checkout.",
+  "requiredChecksCache": {
+    "ttlMinutes": 15
+  }
+}

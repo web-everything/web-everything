@@ -155,12 +155,13 @@ describe('missing-run recovery — ruleset-only required checks (live #5060)', (
   });
 
   it('uses the attributed reader by default', () => {
-    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify(CLASSIC_CONTEXTS));
-    getRequiredStatusChecks.mockReturnValueOnce({ checks: ATTRIBUTED_CONTEXTS });
+    // Both default readers go through the ONE shared cache entry (rules ∪ classic, plus its classic subset): the
+    // classic reader takes `classic`, the attributed reader the union — and neither shells a protection read itself.
+    getRequiredStatusChecks.mockReturnValue({ checks: ATTRIBUTED_CONTEXTS, classic: CLASSIC_CONTEXTS, source: 'cache' });
     const { trigger } = sweep({ readRequiredContexts: undefined, readAttributedRequiredChecks: undefined });
     expect(trigger).toHaveBeenCalledTimes(1);
     expect(getRequiredStatusChecks).toHaveBeenCalledWith({ repo: REPO, branch: 'main' });
-    expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
+    expect(execFileSyncThrottled).not.toHaveBeenCalled();
   });
 
   it('reuses an injected protection reader without live ruleset access', () => {
