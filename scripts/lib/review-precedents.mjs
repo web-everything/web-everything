@@ -323,15 +323,27 @@ export function extractCitations(findings) {
 // rest of the attribution line, a blank line, `--reason` as `> ` lines, the fixed "What this record proves"
 // paragraph, an optional independence note, the `--body-file` text, then the marker block.
 const CLEAR_HUMAN_BOILERPLATE = [/^What this record proves: /, /^(🧑 Cleared by the HUMAN CEREMONY|⚠️ Independence NOT established)/];
-const MARKER_LINE = /^<!--[^\r\n]*-->$/;
+function stripTrailingMarkerComments(text) {
+  const trimmed = text.trimEnd();
+  let end = trimmed.length, cutoff = end;
+  // Walk complete comments backwards, across line and paragraph breaks. Only commit a removal at a
+  // line boundary, so inline comments (and prose between comments on one line) remain operator notes.
+  while (trimmed.slice(0, end).endsWith('-->')) {
+    const start = trimmed.lastIndexOf('<!--', end - 3);
+    if (start < 0 || trimmed.indexOf('-->', start + 4) !== end - 3) break;
+    const lineStart = trimmed.lastIndexOf('\n', start) + 1;
+    if (!trimmed.slice(lineStart, start).trim()) cutoff = lineStart;
+    end = trimmed.slice(0, start).trimEnd().length;
+  }
+  return trimmed.slice(0, cutoff).trimEnd();
+}
 function clearHumanNotes(rest) {
   const lines = rest.split(/\r?\n/).slice(1);
   while (lines.length && !lines[0].trim()) lines.shift();
   const quotes = [];
   while (lines[0]?.startsWith('> ') || lines[0] === '>') quotes.push(lines.shift().slice(2));
-  const paragraphs = lines.join('\n').replace(/^\s+/, '').split(/\n(?:[ \t]*\n)+/).filter((p) => p.trim());
+  const paragraphs = stripTrailingMarkerComments(lines.join('\n')).replace(/^\s+/, '').split(/\n(?:[ \t]*\n)+/).filter((p) => p.trim());
   for (const re of CLEAR_HUMAN_BOILERPLATE) if (re.test(paragraphs[0] ?? '')) paragraphs.shift();
-  while (paragraphs.length && paragraphs.at(-1).trim().split('\n').every((l) => MARKER_LINE.test(l.trim()))) paragraphs.pop();
   return { reason: quotes.join(' ').trim(), text: paragraphs.join('\n\n').trim() };
 }
 

@@ -203,6 +203,34 @@ describe('recorded operator capture', () => {
       expect(p.scopeHintsFromBody(capture.body).paths).toEqual(['scripts/lib/foo.mjs']);
     }
   });
+  it.each([
+    '<!-- single-line metadata -->',
+    '<!-- first marker --> <!-- second marker -->',
+    '<!--\n**Hidden marker content must never become a precedent pattern**\n-->',
+    '<!--\r\n**Hidden marker content must never become a precedent pattern**\r\n-->',
+    '<!--\n\n**Hidden marker content must never become a precedent pattern**\n\n-->',
+    '  <!--\n**Hidden marker content must never become a precedent pattern**\n-->  \n\n<!-- another marker -->',
+  ])('excludes trailing marker comments from captured notes: %j', (marker) => {
+    const writeUp = 'The cache stays within this process and cannot outlive its inputs.';
+    const clear = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA,
+      reason: 'These ten words explain why this finding needs no changes.', body: writeUp });
+    const [capture] = p.captureFromComment(comment(`${clear}\n\n${marker}`), clearOptions);
+    expect(capture.body).toBe(writeUp);
+    expect(p.fallbackPattern(capture)).toBe(writeUp);
+  });
+  it.each([
+    'Operator notes <!-- inline metadata -->',
+    '<!-- first marker --> ordinary operator prose <!-- second marker -->',
+    '<!--\nhidden metadata\n-->\n\nKeep these operator notes in the capture.',
+    'Operator notes\n\n<!-- unfinished metadata',
+  ])('preserves inline comments and operator prose: %j', (writeUp) => {
+    const clear = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA,
+      reason: 'These ten words explain why this finding needs no changes.', body: writeUp });
+    // Probe raw thread text too; the producer normally escapes caller-supplied comment delimiters.
+    const raw = clear.replaceAll('&lt;!--', '<!--').replaceAll('--&gt;', '-->');
+    const [capture] = p.captureFromComment(comment(raw), clearOptions);
+    expect(capture.body).toBe(writeUp);
+  });
   it('groups distinct operator ruling results and excludes auto-policy', () => {
     const record = { actor: 'chalbert', head: 'abcdef123', reason: 'lesson', channel: 'console', rulings: [{ key: '["seat","first summary"]', result: 'block' }, { key: 'opaque', result: 'not-real' }, { key: '["seat","second summary"]', result: 'block' }] };
     const parseRuling = () => ({ record });
