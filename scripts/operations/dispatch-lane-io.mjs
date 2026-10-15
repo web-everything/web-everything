@@ -1785,6 +1785,8 @@ export function routeDispatchProvider(request, {
     if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
     return agent(r);
   };
+  // A probation worker's checker runs inside the same detached arc, so its executable is owed before launch too.
+  const checkerAvailable = worker => !worker?.checker || providerAvailable(worker.checker, { provider: worker.checker });
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
     let candidates = [request.policyRoute, ...request.policyRoute.fallback];
@@ -1803,7 +1805,7 @@ export function routeDispatchProvider(request, {
       return probationWorkerForRoute(route, request.probationWorker.taskType);
     };
     const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
-    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && (route.provider === 'claude'
+    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && checkerAvailable(workerFor(route)) && (route.provider === 'claude'
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
         && scriptExists(PROBATION_LAUNCHABLE_KINDS[kind].runScript))
       || (route.provider === 'codex' && registry[kind]?.runScript && scriptExists(registry[kind].runScript))));
@@ -1845,8 +1847,8 @@ export function routeDispatchProvider(request, {
   // checker) applies here; an unavailable pick takes the unchanged path below instead of a doomed detached run.
   const inheritedWorker = request.probationWorker;
   const unavailable = inheritedWorker && probationLaunchDecision(request, probationLaunch).launch
-    && [inheritedWorker.provider, inheritedWorker.checker].filter(Boolean)
-      .find(provider => !providerAvailable(provider, { provider, model: inheritedWorker.model, effort: inheritedWorker.effort }));
+    && (!providerAvailable(inheritedWorker.provider, { provider: inheritedWorker.provider, model: inheritedWorker.model, effort: inheritedWorker.effort })
+      ? inheritedWorker.provider : !checkerAvailable(inheritedWorker) ? inheritedWorker.checker : null);
   if (unavailable) {
     console.error(`routing-fallback: ${kind} → unchanged path (${unavailable} unavailable for probation worker ${inheritedWorker.id})`);
     request = { ...request, probationWorker: null };

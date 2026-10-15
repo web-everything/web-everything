@@ -107,6 +107,18 @@ describe('probation roster models reach the build runner parser', () => {
     expect(asked).toContain(missing);
   });
 
+  it('an explicit Argon policy route checks its Codex checker executable before launch', () => {
+    const request = { launchKind: 'build', repo: 'we', probationWorker: {
+      ...PROBATION_WORKERS['antigravity-argon'], taskType: 'build-new-feature',
+    }, policyRoute: { provider: 'antigravity', model: 'gemini-4-argon-high', fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5' }] } };
+    expect(routeDispatchProvider(request, {
+      probationLaunch: 'on', scriptExists: () => true,
+      providerAvailable: provider => provider !== 'codex',
+      probation: () => { throw new Error('checker-less Argon launched'); },
+      agent: () => 'native-claude',
+    })).toBe('native-claude');
+  });
+
   it('explicit Gemini policy routes and fallback chains honour the Codex checker hold', () => {
     const policy = structuredClone(inheritedRoutingPolicy);
     policy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-3.8-flash-high', fallback: [
