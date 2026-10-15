@@ -94,6 +94,7 @@ Require the authorization controls at every boundary below. For each row, use th
 | Boundary and test home | Trusted author + leading marker (positive) | Forged (non-trusted) author + leading marker (refused) | Trusted author + quoted (not leading) marker (refused) |
 | --- | --- | --- | --- |
 | Base-request enrichment — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | Verified request reaches base-fix planning | No verified request and no base fix | No verified request and no base fix |
+| Base-fix planning — `we:scripts/conveyor/__tests__/reconcile-core.test.mjs` | Verified pair yields one base fix while the child waits | No base fix; original child hold unchanged | No base fix; original child hold unchanged |
 | Machine stand-down reclassification — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | Exact incident-bound machine hold becomes inherited waiting | Original child hold remains authoritative | Original child hold remains authoritative |
 | Child-incident discovery — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | Eligible incident enters delivery or guarded refresh | No delivery or refresh authorized by the comment | No delivery or refresh authorized by the comment |
 | Base-note read-back — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | Matching note acknowledges delivery and suppresses duplicate posting | Delivery remains unacknowledged; legitimate retry is not suppressed | Delivery remains unacknowledged; legitimate retry is not suppressed |
