@@ -11,7 +11,7 @@
  *     to the lane's tree now           → the harness pushes THAT sha (never force) to the recorded `lane/*` ref,
  *                                        then resumes the SAME session to finish its hand-back
  *   - no verdict (absent, infrastructure failure, unproven tree, overdue) → re-request, up to `maxRetries`,
- *                                        then resume with the blocked-on-infra exit
+ *                                        then schedule backoff verify-only retries for fixes (other kinds resume with the blocked-on-infra exit)
  *   - red only on timeouts the gate already re-ran alone → resume with a saved-fix hold in WE, a re-dispatch hold elsewhere
  *                                        (the existing quiet-host reverify pass then owns the saved fix)
  *   - red on attempt `maxReds`         → resume with the gate-red exit (the escalation ladder counts it)
@@ -39,6 +39,7 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
+import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
@@ -325,7 +326,7 @@ const LOGGED_POLICY_LINE = { value: null };
  */
 export async function runAwaitVerifyPass({
   io, nowMs = Date.now(), ttlMs = resolveAwaitVerifyTtlMs(), limits = AWAIT_VERIFY_LIMITS, allowResume = true,
-  resumedUnclearable = UNCLEARABLE_DONE, pushPolicy = null, loggedPolicyLine = LOGGED_POLICY_LINE,
+  resumedUnclearable = UNCLEARABLE_DONE, pushPolicy = null, retryPolicy = null, loggedPolicyLine = LOGGED_POLICY_LINE,
 } = {}) {
   const rows = [];
   /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
@@ -337,10 +338,15 @@ export async function runAwaitVerifyPass({
   };
   // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
   const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
+  const recovery = retryPolicy ?? io.retryPolicy?.() ?? loadVerifyRecoverySettings();
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
     try {
+      // Adopt an infra resume left by an older daemon before it can spend another model turn.
+      if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra') {
+        record = { ...record }; delete record.pendingResume;
+      }
       const lane = isHarnessRecord(record) && !record.pendingResume ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
       const marker = lane ? io.readMarker(record.lane) : null;
       const d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
@@ -352,6 +358,34 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}persist-failed`;
         return false;
       };
+      if (record?.kind === 'fix' && (d.resume === 'infra' || (record.infraRetry?.scheduled && d.action === 'wait'))) {
+        const { maxAttempts, backoffMinutes } = recovery.value.infraRetry;
+        const source = key => recovery.sources?.[`infraRetry.${key}`] ?? 'standard';
+        row.reason = `${d.reason}; verify.infraRetry.maxAttempts=${maxAttempts} (${source('maxAttempts')}), backoffMinutes=${backoffMinutes} (${source('backoffMinutes')})`;
+        const retry = record.infraRetry;
+        if ((retry?.attempts ?? 0) >= maxAttempts) {
+          row.action = retry?.exhausted ? 'wait' : 'infra-retry-exhausted';
+          // Preserve the same-head wait. Exhaustion is an infrastructure hold, never new fixer work.
+          if (!retry?.exhausted) persist({ ...record, infraRetry: { ...retry, exhausted: true } });
+        } else if (!retry?.scheduled) {
+          row.action = 'infra-retry-scheduled';
+          persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
+            attempts: retry?.attempts ?? 0, scheduled: true,
+            nextAttemptAt: new Date(nowMs + backoffMinutes * 60_000).toISOString(),
+          } });
+        } else if (nowMs < Date.parse(retry.nextAttemptAt)) {
+          row.action = 'wait';
+        } else {
+          row.action = 'infra-retry';
+          if (persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
+            ...retry, attempts: retry.attempts + 1, scheduled: false,
+          } })) {
+            const r = io.rerequest(record.lane);
+            row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
+          }
+        }
+        rows.push(row); continue;
+      }
       if (isEarlyPushOwed({ record, decision: d, policy, limits })) {
         const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
         // `record` now carries `earlyPush`; the rest of this record's handling (re-request, resume) keeps it.
@@ -657,6 +691,7 @@ export async function defaultAwaitVerifyIo({
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     pushPolicy: () => loadFixPushPolicy({ env }),
+    retryPolicy: () => loadVerifyRecoverySettings({ env }),
     // fix.selfReviewParallel (card xloi1c0): the PR's self-review record, read fresh every pass.
     readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env) }),
     listRecords: () => listStoredAwaitVerify(),
