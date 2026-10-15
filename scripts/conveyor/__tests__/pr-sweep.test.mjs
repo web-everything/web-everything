@@ -257,4 +257,14 @@ describe('only an actively running session owns a PR', () => {
     expect(report.errors.join(' ')).toContain('incomplete'); expect(report.alerts).toEqual([]);
     expect(report.nextState.episodes).toEqual(first.nextState.episodes);
   });
+  it('the default reader carries unreadable wrapped records into the listing', async () => {
+    const { readSweepAgents } = await import('../pr-sweep.mjs');
+    const gaps = [{ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }];
+    const torn = await readSweepAgents({ listWrapped: () => Object.defineProperty([], 'incomplete', { value: gaps }), readRows: () => [running()] });
+    expect(torn).toHaveLength(1); expect(torn.incomplete).toEqual(gaps);
+    expect((await readSweepAgents({ listWrapped: () => [], readRows: () => [running()] })).incomplete).toBeUndefined();
+    const errors = [];
+    await collectOwnerSignals({ prs: [pr], dir: tmpdir(), env: {}, errors, readAgents: () => torn, cloneRoots: () => [], readHealth: () => ({}) });
+    expect(errors.join(' ')).toContain('agent listing incomplete: wrapped record fix-12 unreadable');
+  });
 });

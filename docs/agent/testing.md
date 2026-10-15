@@ -922,10 +922,11 @@ A complete first queue sample records the set without alerting. A PR move or hea
 unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due
 for retry. Dry runs and fixture health ticks never dispatch the sweep against the host.
 
-Sessions marked `hung: true` or `pidAlive: false` cannot refresh sweep ownership. Missing liveness fields
-remain unknown; healthy sessions and recent daemon evidence still count. Replay the PR #5323 findings
+Sessions marked `hung`, `idleFinished`, `authExpired` or `selfReportedDone`, and sessions whose pid is dead
+or unprobed, cannot refresh sweep ownership. Recent daemon evidence still counts. Replay the PR #5323 findings
 with the `pr-sweep-unhealthy-owner-and-symlink-entry` soak break: successive dry sweeps must alert once
-after the delay, and both CLI entry points must execute when their directory is reached through a symlink.
+after the delay (including for idle, offline, blocked and waiting fixers), and the three CLI entry points
+(`pr-sweep-job.mjs`, `pr-sweep.mjs`, `health-watch.mjs`) must execute when reached through a symlink.
 
 Dispatch refusals from health memory or daemon logs are diagnostic signals, never ownership or progress
 (including review-daemon's `not dispatched`, `no review dispatched` and failed-dispatch formats).

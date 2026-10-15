@@ -59,15 +59,20 @@ const isDispatchRefusal = (line) => /\b(?:refus(?:ed|al|ing)|not dispatched|no r
 const isDaemonProgress = (line) => !isDispatchRefusal(line)
   && !/\b(?:scope-rank|note(?:-comment)?|dry-run|would|skipp(?:ed|ing)|held|waiting)\b/i.test(line)
   && /\b(?:start(?:ed|ing)|dispatched|promoted|merged|landed|applied|pushed|resumed|rebased|tagged)\b/i.test(line);
-export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
-  readAgents = async () => {
+/** The reconcile agent listing, carrying the wrapped store's unreadable records as `incomplete`. */
+export async function readSweepAgents({ env, listWrapped, readRows } = {}) {
+  listWrapped ??= (await import('../operations/worker-wrapper-launch.mjs')).listWrappedWorkerAgents;
+  readRows ??= async () => {
     const { defaultReadAgents, enrichAgents } = await import('./reconcile-pass.mjs');
-    const { listWrappedWorkerAgents } = await import('../operations/worker-wrapper-launch.mjs');
-    // The merged listing drops `incomplete` while mapping, so ask the wrapped store directly.
-    const gaps = listWrappedWorkerAgents().incomplete ?? [];
-    const rows = enrichAgents(defaultReadAgents({ env }));
-    return gaps.length ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
-  }, readActivity = async (agent) => {
+    return enrichAgents(defaultReadAgents({ env }));
+  };
+  // The merged listing drops `incomplete` while mapping, so ask the wrapped store directly.
+  const gaps = listWrapped().incomplete ?? [];
+  const rows = await readRows();
+  return gaps.length && Array.isArray(rows) ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
+}
+export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
+  readAgents = () => readSweepAgents({ env }), readActivity = async (agent) => {
     const { readTranscriptTailActivity } = await import('./hung-session.mjs');
     return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
