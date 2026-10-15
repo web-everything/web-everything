@@ -79,6 +79,16 @@ try { ({ readCompletePrComments, LIST_COMMENTS_PAGE_SIZE = 100 } = await import(
 catch (error) { completeCommentsImportError = error; }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
+/** Both GraphQL rollup variants, in the CheckRun shape used by every queue classifier. */
+function queueChecks(pr) {
+  return (pr?.statusCheckRollup ?? []).map((check) => {
+    if (check.status !== undefined || typeof check.state !== 'string') return check;
+    const state = check.state.toUpperCase();
+    return { ...check, name: check.context,
+      status: ['SUCCESS', 'FAILURE', 'ERROR'].includes(state) ? 'COMPLETED' : 'IN_PROGRESS', conclusion: state };
+  }).filter((check) => check.name !== 'review-gate');
+}
+
 /**
  * RULING NEEDED row (live 2026-10-04, PR #3794: parked about 8 h with confirmed findings awaiting a ruling and no
  * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
@@ -187,7 +197,7 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
   const redTeam = redTeamQueueReason(pr, redTeamSetting);
   if (redTeam) reasons.push(redTeam);
 
-  const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  const checks = queueChecks(pr);
   const pending = checks.filter((check) => check.status !== 'COMPLETED');
   let failing = checks.filter((check) => check.status === 'COMPLETED'
     && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
@@ -238,7 +248,7 @@ export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEF
   }
   const redTeam = redTeamQueueReason(pr, redTeamSetting);
   if (redTeam) reasons.push(redTeam);
-  const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  const checks = queueChecks(pr);
   if (checks.some((check) => check.status !== 'COMPLETED')) reasons.push('CI pending');
   const failing = checks.filter((check) => check.status === 'COMPLETED'
     && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
@@ -331,7 +341,8 @@ export function standDownRow(repo, pr) {
 // person may land it), so an approved, all-green one sat silent (#5193, #5253, #5298). Optional like the siblings
 // above: a staged CLI copy without the enqueue module simply shows no such rows.
 let workflowEditHold = null;
-try { ({ workflowEditHold } = await import('../lib/merge-queue-enqueue.mjs')); } catch { /* no needs-your-merge rows */ }
+let readMergeQueueState = null;
+try { ({ workflowEditHold, readMergeQueueState } = await import('../lib/merge-queue-enqueue.mjs')); } catch { /* no needs-your-merge rows */ }
 
 const NEEDS_YOUR_MERGE_BLOCKING_LABELS = ['review:human', 'review:changes', 'review:pending', 'ci:failed', 'merge-status:conflicting'];
 
@@ -343,10 +354,11 @@ const NEEDS_YOUR_MERGE_BLOCKING_LABELS = ['review:human', 'review:changes', 'rev
 export function needsYourMergePrecheck(pr) {
   const reasons = [];
   if (pr?.isDraft) reasons.push('draft PR');
+  if (pr?.isInMergeQueue === true) reasons.push('already in merge queue');
   if (!hasLabel(pr, 'review:accepted')) reasons.push('no review:accepted label');
   for (const label of NEEDS_YOUR_MERGE_BLOCKING_LABELS) if (hasLabel(pr, label)) reasons.push(`${label} label`);
   if (pr?.mergeable !== 'MERGEABLE') reasons.push('not MERGEABLE');
-  const checks = (pr?.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  const checks = queueChecks(pr);
   if (!checks.length) reasons.push('no checks');
   if (checks.some((check) => check.status !== 'COMPLETED' || !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion))) {
     reasons.push('checks not all green');
@@ -684,6 +696,12 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         } catch (error) { failedRead(`${repo}#${pr.number}`, error); continue; }
         const result = evaluateNeedsYourMerge(pr, changed);
         if (!result.owed) continue;
+        const queue = readMergeQueueState({ repo, pr: pr.number, readJson: (args) => read(args, (value) => value && typeof value === 'object') });
+        if (queue.error || queue.head !== pr.headRefOid) {
+          failedRead(`${repo}#${pr.number}`, new Error(queue.error || 'PR head moved since the listing; re-run'));
+          continue;
+        }
+        if (queue.inQueue) continue;
         (report.needsYourMerge ??= []).push({ repo, number: pr.number, title: pr.title, paths: result.paths,
           command: needsYourMergeCommand({ repo, number: pr.number }) });
         readyNumbersThisRepo.add(pr.number);

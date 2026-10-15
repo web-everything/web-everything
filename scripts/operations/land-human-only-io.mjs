@@ -14,10 +14,11 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { workflowEditHold, requestOperatorQueueEntry, isAlreadyQueuedError } from '../lib/merge-queue-enqueue.mjs';
+import { workflowEditHold, requestOperatorQueueEntry, isAlreadyQueuedError, readMergeQueueState } from '../lib/merge-queue-enqueue.mjs';
+export { readMergeQueueState } from '../lib/merge-queue-enqueue.mjs';
 import { readQueueRequiredChecks } from '../lib/drain-merge-strategy.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { labelOnGreenVerdict } from '../merge-ai-prs.mjs';
@@ -51,7 +52,6 @@ const fromMergeGate = (name) => (...args) => {
 };
 
 const PR_FIELDS = 'number,state,isDraft,baseRefName,headRefOid,labels,commits,mergeable,mergeStateStatus,statusCheckRollup,id';
-const QUEUE_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){isInMergeQueue headRefOid}}}';
 const errLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJsonWith = (exec) => (args, opts = {}) => JSON.parse(String(exec('gh', args,
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, maxBuffer: 64 * 1024 * 1024, ...opts }) || 'null'));
@@ -83,26 +83,17 @@ export function operatorEnv(token, env = process.env) {
 
 /** A checkout of `repo` to run the pinned git reads in: the cwd's repo, else this repo's root. */
 export function cloneFor(repo, { candidates = [process.cwd(), REPO_ROOT], exec = execFileSync } = {}) {
-  const name = String(repo).split('/')[1];
+  const identity = String(repo).trim().toLowerCase();
+  // These operations address github.com owner/name slugs. Local paths and other hosts cannot establish that identity.
+  const originPattern = /^(?:https?:\/\/github\.com\/|git:\/\/github\.com\/|ssh:\/\/(?:git@)?github\.com(?::22)?\/|git@github\.com:)([a-z0-9_-][a-z0-9_.-]*\/[a-z0-9_-][a-z0-9_.-]*?)(?:\.git)?\/?$/i;
   for (const dir of candidates) {
     try {
       const top = String(exec('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
       const url = String(exec('git', ['-C', top, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-      if (basename(url).replace(/\.git$/, '') === name) return top;
+      if (originPattern.exec(url)?.[1].toLowerCase() === identity) return top;
     } catch { /* try the next candidate */ }
   }
   return null;
-}
-
-/** Is the PR in the merge queue right now? `{inQueue, head}` or `{error}`. */
-export function readMergeQueueState({ repo, pr, readJson }) {
-  const [o, n] = String(repo).split('/');
-  try {
-    const d = readJson(['api', 'graphql', '-f', `query=${QUEUE_QUERY}`, '-f', `o=${o}`, '-f', `n=${n}`, '-F', `pr=${pr}`]);
-    const p = d?.data?.repository?.pullRequest;
-    if (!p) return { error: 'pull request not found' };
-    return { inQueue: p.isInMergeQueue === true, head: p.headRefOid ?? null };
-  } catch (e) { return { error: errLine(e) }; }
 }
 
 const labelNames = (pr) => (pr?.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
@@ -126,6 +117,7 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
     try { defaultBranch = readJson(['repo', 'view', repo, '--json', 'defaultBranchRef'])?.defaultBranchRef?.name ?? null; } catch { /* gate fails closed */ }
     const cred = credential();
     const queue = readMergeQueueState({ repo, pr: num, readJson });
+    const queueError = queue.error || (queue.head !== head ? 'PR head moved since the initial read; re-run' : null);
     const labelPresent = labelNames(live).includes(READY_LABEL);
     const labelDecision = labelPresent ? { label: false, reason: null } : labelOnGreenVerdict(live, { requiredCheck: 'test', label: READY_LABEL });
 
@@ -156,7 +148,7 @@ export function createLandHumanOnlyReader({ exec = execFileSync, credential = ()
       repo, number: num, head, defaultBranch, nodeId: live?.id ?? null,
       pr: { state: live?.state, isDraft: live?.isDraft === true, baseRefName: live?.baseRefName, mergeable: live?.mergeable, mergeStateStatus: live?.mergeStateStatus },
       operatorLogin: cred.login ?? null, ...(cred.error ? { credentialError: cred.error } : {}),
-      inMergeQueue: queue.inQueue === true, ...(queue.error ? { queueError: queue.error } : {}),
+      inMergeQueue: !queueError && queue.inQueue === true, ...(queueError ? { queueError } : {}),
       labelPresent, labelDecision, surface, gateRows, gateRowsError, requiredChecks: ci,
     };
   };
@@ -183,7 +175,8 @@ export function createLandHumanOnlySinks({ exec = execFileSync, credential = () 
       const live = readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'id,headRefOid,labels']);
       if (live?.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${live?.headRefOid} since the plan (${head}); nothing written — re-run against the new head`);
       const cred = credential();
-      if (!cred.token || cred.login !== verdict.operatorLogin) {
+      const login = String(cred.login ?? '').trim().toLowerCase();
+      if (!cred.token || login !== verdict.operatorLogin || login !== verdict.actor) {
         throw new Error(`the operator credential changed since the plan (${cred.login ?? cred.error ?? 'none'} vs ${verdict.operatorLogin}); nothing written`);
       }
       let labelled = false;
@@ -197,12 +190,16 @@ export function createLandHumanOnlySinks({ exec = execFileSync, credential = () 
       if (!error) {
         const q = readMergeQueueState({ repo, pr, readJson });
         if (q.error) error = `isInMergeQueue unreadable: ${q.error}`;
+        else if (q.head !== head) error = 'PR head moved during enqueue verification; the planned head is not confirmed queued';
         else if (!q.inQueue) error = 'enqueue returned but isInMergeQueue is false';
       }
       const queued = !error;
-      const commentUrl = comment(repo, pr, buildLandComment(verdict, { queued, error }));
-      return queued ? { outcome: 'applied', ok: true, queued, labelled, commentUrl }
-        : { outcome: 'failed', ok: false, queued, labelled, commentUrl, error };
+      let commentUrl = null, commentError = null;
+      try { commentUrl = comment(repo, pr, buildLandComment(verdict, { queued, error })); }
+      catch (e) { commentError = errLine(e); }
+      const audit = { commentUrl, ...(commentError ? { commentError } : {}) };
+      return queued ? { outcome: 'applied', ok: true, queued, labelled, ...audit }
+        : { outcome: 'failed', ok: false, queued, labelled, ...audit, error };
     },
   };
 }

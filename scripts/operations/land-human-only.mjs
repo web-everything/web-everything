@@ -19,7 +19,7 @@
  *
  * WHAT IT REFUSES (a thrown error naming why; nothing is written):
  *   - an actor that is not a registered operator login, a blank `--reason`, a blank or multi-line `--channel`;
- *   - an operator credential that does not resolve, or resolves to a login that is not an operator's;
+ *   - an operator credential that does not resolve, is not an operator's, or does not match the actor;
  *   - a PR that is not open, is a draft, or does not target the default branch;
  *   - a PR whose pinned change list touches no workflow or action file (the drain lands those);
  *   - any `hold` or `fail-closed` row from the drain's own merge-time gates on the exact head
@@ -70,6 +70,8 @@ export function evaluateLandGates(read) {
       : isOperator(r.operatorLogin) ? `enqueue runs as ${r.operatorLogin}`
         : `the operator credential is ${r.operatorLogin || 'nobody'}, not a registered operator login (${OPERATOR_LOGINS.join(', ')})`);
 
+  add('merge-queue-state', !r.queueError, r.queueError ? `merge queue state unreadable: ${r.queueError}` : `queue state read on ${short(r.head)}`);
+
   const pr = r.pr ?? {};
   const openOk = pr.state === 'OPEN' && !pr.isDraft && !!r.defaultBranch && pr.baseRefName === r.defaultBranch;
   add('open-on-default-branch', openOk, openOk ? `open, base ${pr.baseRefName}`
@@ -113,15 +115,20 @@ export function evaluateLandGates(read) {
 export function planLandHumanOnly(read, input) {
   const { actor, channel, reason } = input ?? {};
   if (!isOperator(actor)) throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); only a person may land this`);
+  const actorLogin = String(actor).trim().toLowerCase();
+  const credentialLogin = String(read?.operatorLogin ?? '').trim().toLowerCase();
+  if (credentialLogin && actorLogin !== credentialLogin) {
+    throw new Error('operator-credential: --actor must equal the resolved credential login');
+  }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's instruction, verbatim");
   if (!String(channel ?? '').trim() || /[\r\n]/.test(String(channel))) throw new Error('--channel is required and must be one line');
   if (!/^[0-9a-f]{40}$/.test(String(read?.head ?? ''))) throw new Error('the PR head could not be read');
   const repo = String(read.repo ?? input.repo ?? DEFAULT_REPO);
   const pr = Number(read.number ?? input.pr);
   const gates = evaluateLandGates(read);
-  const base = { repo, pr, head: read.head, actor: String(actor).trim().toLowerCase(), channel: String(channel).trim(),
-    reason: String(reason), operatorLogin: read.operatorLogin ?? null, dryRun: input['dry-run'] === true, gates };
-  if (read.inMergeQueue === true) return { ...base, noop: true, plan: [], summary: `${repo}#${pr} is already in the merge queue — nothing to do` };
+  const base = { repo, pr, head: read.head, actor: actorLogin, channel: String(channel).trim(),
+    reason: String(reason), operatorLogin: credentialLogin || null, dryRun: input['dry-run'] === true, gates };
+  if (read.inMergeQueue === true && !read.queueError) return { ...base, noop: true, plan: [], summary: `${repo}#${pr} is already in the merge queue — nothing to do` };
   const failed = gates.filter((g) => !g.ok);
   if (failed.length) {
     throw new Error(`land-human-only refuses ${repo}#${pr} at ${short(read.head)}:\n`
@@ -159,8 +166,12 @@ export function renderLandVerdict(v) {
 
 /** `finish` for the CLI: the gates and plan first in plain mode. */
 export function finishLandOutcome({ run, code, lines, json = false } = {}) {
-  if (json || !run?.verdict) return { code, lines };
-  return { code, lines: [...renderLandVerdict(run.verdict), '', ...lines] };
+  const landing = run?.effects?.find((e) => e.type === LAND_HUMAN_ONLY_EFFECT && e.status === 'applied')?.result;
+  if (json) return landing
+    ? { code, lines: [JSON.stringify({ ...JSON.parse(lines[0]), landing }, null, 2)] } : { code, lines };
+  if (!run?.verdict) return { code, lines };
+  const audit = landing?.commentError ? [`${landing.queued ? 'PR queued' : 'PR not queued'}; audit comment failed: ${landing.commentError}`] : [];
+  return { code, lines: [...renderLandVerdict(run.verdict), '', ...lines, ...audit] };
 }
 
 export function landHumanOnlyOperation({ readLandContext } = {}) {

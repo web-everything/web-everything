@@ -5,13 +5,16 @@
  *   effect plan, and the sink order: head re-check → label → enqueue as the operator → verify → comment
  *   (we:scripts/operations/land-human-only-io.mjs).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+vi.mock('../../lib/marker-authorship.mjs', async (original) => ({
+  ...await original(), OPERATOR_LOGINS: ['chalbert', 'another-operator'],
+}));
 
 import {
-  evaluateLandGates, planLandHumanOnly, landHumanOnlyOperation, buildLandComment, LAND_HUMAN_ONLY_EFFECT, LAND_HUMAN_ONLY_MARKER,
+  evaluateLandGates, planLandHumanOnly, landHumanOnlyOperation, buildLandComment, finishLandOutcome, LAND_HUMAN_ONLY_EFFECT, LAND_HUMAN_ONLY_MARKER,
 } from '../land-human-only.mjs';
-import { createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv } from '../land-human-only-io.mjs';
+import { cloneFor, createLandHumanOnlySinks, createLandHumanOnlyReader, resolveOperatorCredential, operatorEnv } from '../land-human-only-io.mjs';
 
 const head = 'a'.repeat(40);
 const repo = 'o/r';
@@ -31,6 +34,26 @@ function read(over = {}) {
 }
 const input = (over = {}) => ({ repo, pr: 7, actor: 'chalbert', channel: 'chat', reason: 'land #7 please', 'dry-run': false, ...over });
 
+describe('land-human-only — checkout identity', () => {
+  const find = (origin) => cloneFor(repo, { candidates: ['/clone/nested'],
+    exec: (_bin, args) => args.includes('rev-parse') ? '/clone\n' : origin });
+  it.each(['https://github.com/o/r.git', 'git@github.com:o/r.git', 'ssh://git@github.com/o/r.git',
+    'https://github.com/O/R/', 'https://github.com/o/r'])('accepts the full GitHub identity in %s', (origin) => {
+    expect(find(origin)).toBe('/clone');
+  });
+  it.each(['https://github.com/other/r.git', 'git@github.com:other/r.git', 'ssh://git@github.com/other/r.git',
+    'https://elsewhere.test/o/r.git', 'git@elsewhere.test:o/r.git', 'ssh://git@elsewhere.test/o/r.git',
+    '/tmp/o/r.git', 'https://github.com/o/r.git?other', 'https://github.com/o/r.git#other'])('refuses %s', (origin) => {
+    expect(find(origin)).toBeNull();
+  });
+  it('continues to a matching candidate after a different owner', () => {
+    expect(cloneFor(repo, { candidates: ['/fork', '/correct'], exec: (_bin, args) => {
+      if (args.includes('rev-parse')) return args[1];
+      return args[1] === '/fork' ? 'https://github.com/other/r.git' : 'git@github.com:o/r.git';
+    } })).toBe('/correct');
+  });
+});
+
 describe('land-human-only — refusals (nothing is written)', () => {
   it.each([
     ['a non-operator actor', {}, { actor: 'someone-else' }, /registered operator login/],
@@ -38,6 +61,8 @@ describe('land-human-only — refusals (nothing is written)', () => {
     ['a multi-line channel', {}, { channel: 'a\nb' }, /--channel is required/],
     ['a credential that is not an operator', { operatorLogin: 'web-everything[bot]' }, {}, /operator-credential/],
     ['an unreadable credential', { operatorLogin: null, credentialError: 'no stored login' }, {}, /operator credential unreadable/],
+    ['an unreadable queue snapshot', { queueError: 'missing queue state' }, {}, /merge-queue-state/],
+    ['a stale queued snapshot', { inMergeQueue: true, queueError: 'PR head moved' }, {}, /merge-queue-state/],
     ['a PR with no human-only surface', { surface: { hold: false } }, {}, /not a human-only PR/],
     ['an unreadable change list', { surface: { hold: true, humanOnly: false, error: 'listed 1 of 2' } }, {}, /change list unreadable/],
     ['a drain gate hold', { gateRows: [{ id: 'review-acceptance', status: 'hold', reason: 'human-only: needs clear-human' }] }, {}, /review-acceptance hold/],
@@ -48,6 +73,8 @@ describe('land-human-only — refusals (nothing is written)', () => {
     ['a conflicting PR', { pr: { ...read().pr, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } }, {}, /not-conflicting/],
     ['uncomputed mergeability', { pr: { ...read().pr, mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } }, {}, /re-run/],
     ['a draft PR', { pr: { ...read().pr, isDraft: true } }, {}, /draft/],
+    ['a closed PR', { pr: { ...read().pr, state: 'CLOSED' } }, {}, /open-on-default-branch/],
+    ['a PR targeting a non-default branch', { pr: { ...read().pr, baseRefName: 'release' } }, {}, /open-on-default-branch/],
     ['an absent label the drain would not add', { labelPresent: false, labelDecision: { label: false, reason: 'held' } }, {}, /refuses it \(held\)/],
   ])('refuses %s', (_name, readOver, inputOver, message) => {
     expect(() => planLandHumanOnly(read(readOver), input(inputOver))).toThrow(message);
@@ -69,8 +96,18 @@ describe('land-human-only — the plan', () => {
     expect(v.plan[0]).toBe('ready-to-merge already present');
   });
 
+  it('binds the actor to the credential even when the PR is already queued', () => {
+    for (const inMergeQueue of [false, true]) {
+      expect(() => planLandHumanOnly(read({ operatorLogin: 'another-operator', inMergeQueue }), input())).toThrow(/actor.*credential/i);
+    }
+  });
+
+  it('normalizes actor and credential logins consistently', () => {
+    expect(planLandHumanOnly(read({ operatorLogin: 'Chalbert' }), input({ actor: ' CHALBERT ' })).actor).toBe('chalbert');
+  });
+
   it('every gate id is reported', () => {
-    expect(evaluateLandGates(read()).map((g) => g.id)).toEqual(['operator-credential', 'open-on-default-branch', 'human-only-surface',
+    expect(evaluateLandGates(read()).map((g) => g.id)).toEqual(['operator-credential', 'merge-queue-state', 'open-on-default-branch', 'human-only-surface',
       'ready-to-merge-label', 'drain-gates', 'required-checks-green', 'not-conflicting']);
   });
 
@@ -97,15 +134,16 @@ describe('land-human-only — the plan', () => {
 });
 
 // A scripted `exec`: records every call, answers by argv shape.
-function scriptedExec({ liveHead = head, labels = [{ name: 'ready-to-merge' }], inQueue = true, enqueueErrors = null } = {}) {
+function scriptedExec({ liveHead = head, queueHead = liveHead, labels = [{ name: 'ready-to-merge' }], inQueue = true, enqueueErrors = null, commentError = null } = {}) {
   const calls = [];
   const exec = (bin, args, opts = {}) => {
     calls.push({ bin, args, env: opts.env });
     const a = args.join(' ');
     if (a.startsWith('pr view')) return JSON.stringify({ id: 'PR_node', headRefOid: liveHead, labels });
-    if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: inQueue, headRefOid: liveHead } } } });
+    if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: inQueue, headRefOid: queueHead } } } });
     if (a.includes('enqueuePullRequest')) return JSON.stringify(enqueueErrors ? { errors: enqueueErrors } : { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
     if (a.startsWith('pr comment')) {
+      if (commentError) throw new Error(commentError);
       const path = args[args.indexOf('--body-file') + 1];
       calls.at(-1).body = readFileSync(path, 'utf8');
       return 'https://example.test/c/1\n';
@@ -119,6 +157,17 @@ const cred = () => ({ login: 'chalbert', token: 'tok-operator', bin: '/real/gh' 
 
 describe('land-human-only — the sink', () => {
   const verdict = (over = {}) => planLandHumanOnly(read(over), input());
+
+  it.each([true, false])('preserves the enqueue outcome when the audit comment throws (queued=%s)', async (inQueue) => {
+    const { exec } = scriptedExec({ inQueue, commentError: 'audit unavailable' });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    expect(out).toMatchObject({ outcome: inQueue ? 'applied' : 'failed', ok: inQueue, queued: inQueue,
+      commentUrl: null, commentError: 'audit unavailable' });
+    if (!inQueue) expect(out.error).toContain('isInMergeQueue is false');
+    const run = { verdict: verdict(), effects: [{ type: LAND_HUMAN_ONLY_EFFECT, status: 'applied', result: out }] };
+    expect(finishLandOutcome({ run, code: 0, lines: [] }).lines.join('\n')).toContain('audit comment failed: audit unavailable');
+    expect(JSON.parse(finishLandOutcome({ run, code: 0, lines: ['{}'], json: true }).lines[0]).landing).toEqual(out);
+  });
 
   it('enqueues with expectedHeadOid on the real gh with the operator token, verifies, then comments', async () => {
     const { exec, calls } = scriptedExec();
@@ -147,6 +196,21 @@ describe('land-human-only — the sink', () => {
   it('a head that moved refuses before any write', async () => {
     const { exec, calls } = scriptedExec({ liveHead: 'b'.repeat(40) });
     await expect(createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() })).rejects.toThrow(/head moved/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does not confirm the planned head queued when the verification head moved', async () => {
+    const { exec, calls } = scriptedExec({ queueHead: 'b'.repeat(40) });
+    const out = await createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({ verdict: verdict() });
+    expect(out).toMatchObject({ outcome: 'failed', ok: false, queued: false, error: expect.stringContaining('head moved') });
+    expect(calls.at(-1).body).toContain('not queued: PR head moved');
+  });
+
+  it('refuses a forged actor at the sink before any write', async () => {
+    const { exec, calls } = scriptedExec();
+    await expect(createLandHumanOnlySinks({ exec, credential: cred })[LAND_HUMAN_ONLY_EFFECT]({
+      verdict: { ...verdict(), actor: 'another-operator' },
+    })).rejects.toThrow(/credential changed/);
     expect(calls).toHaveLength(1);
   });
 
@@ -190,6 +254,17 @@ describe('land-human-only — the operator credential', () => {
 });
 
 describe('land-human-only — the reader', () => {
+  it('refuses a queued snapshot for a newer head instead of planning a no-op', () => {
+    const exec = (_bin, args) => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, labels: [] });
+      if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
+      return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: 'b'.repeat(40) } } } });
+    };
+    const context = createLandHumanOnlyReader({ exec, credential: cred, clone: () => null, requiredChecks: () => ['test'] })({ repo, pr: 7 });
+    expect(context.inMergeQueue).toBe(false);
+    expect(context.queueError).toContain('head moved');
+    expect(() => planLandHumanOnly(context, input())).toThrow(/merge-queue-state/);
+  });
   it('reads the gates with ready-to-merge added only when the drain would add it', () => {
     const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head, labels: [{ name: 'review:accepted' }],
       commits: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',

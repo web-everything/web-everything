@@ -9,7 +9,7 @@ vi.mock('../../lib/gh-throttle.mjs', async (original) => ({
   ...await original(), execFileSyncThrottled: (...args) => execFileSync(...args),
 }));
 import { execFileSync } from 'node:child_process';
-import { evaluateNeedsYourMerge, needsYourMergeCommand, needsYourMergePrecheck, main } from '../operator-queue.mjs';
+import { evaluatePr, evaluateCeremonyOwed, evaluateNeedsYourMerge, needsYourMergeCommand, needsYourMergePrecheck, main } from '../operator-queue.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'c'.repeat(40);
@@ -20,10 +20,26 @@ const pr = (over = {}) => ({ number: 5298, title: 'fix red main: CI caps', headR
 const WF = [{ filename: '.github/workflows/ci.yml' }, { filename: 'scripts/x.mjs' }];
 const COMMAND = `node scripts/operations/run.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
 
+const originalExitCode = process.exitCode;
 beforeEach(() => { execFileSync.mockReset(); });
-afterEach(() => { vi.restoreAllMocks(); });
+afterEach(() => { vi.restoreAllMocks(); process.exitCode = originalExitCode; });
 
 describe('needs your merge — evaluation', () => {
+  it('accepts successful StatusContext checks alongside CheckRun checks', () => {
+    expect(needsYourMergePrecheck(pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] }))).toEqual([]);
+  });
+  it('also accepts successful StatusContext checks in the human-review and ceremony paths', () => {
+    const candidate = pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] });
+    expect(evaluatePr(candidate).reasons.some((reason) => reason.startsWith('CI '))).toBe(false);
+    candidate.statusCheckRollup.push({ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
+    expect(evaluateCeremonyOwed(candidate).needsMergeGateVerdict).toBe(true);
+  });
+  it.each(['PENDING', 'FAILURE', 'ERROR', undefined])('refuses a %s StatusContext alongside CheckRun checks', (state) => {
+    expect(needsYourMergePrecheck(pr({ statusCheckRollup: [green('test'), { context: 'legacy', state }] }))).toContain('checks not all green');
+  });
+  it('does not need another merge when already queued', () => {
+    expect(evaluateNeedsYourMerge(pr({ isInMergeQueue: true }), { files: WF, changedFiles: 2 }).owed).toBe(false);
+  });
   it('an approved, green, mergeable PR touching a workflow file is owed', () => {
     expect(evaluateNeedsYourMerge(pr(), { files: WF, changedFiles: 2 })).toEqual({ owed: true, paths: ['.github/workflows/ci.yml'], reasons: [] });
     expect(evaluateNeedsYourMerge(pr(), { files: [{ path: '.github/actions/x/action.yml' }], changedFiles: 1 }).owed).toBe(true);
@@ -54,12 +70,13 @@ describe('needs your merge — evaluation', () => {
   });
 });
 
-const run = (args = [], listing = [pr()], files = WF) => {
+const run = (args = [], listing = [pr()], files = WF, queue = { isInMergeQueue: false, headRefOid: HEAD }) => {
   execFileSync.mockImplementation((cmd, argv) => {
     const a = argv.join(' ');
     if (a.startsWith('pr list')) return JSON.stringify(listing);
     if (a.startsWith('pr view') && a.includes('changedFiles')) return JSON.stringify({ changedFiles: files.length });
     if (a.startsWith('api --paginate --slurp')) return JSON.stringify([files]);
+    if (a.startsWith('api graphql')) return JSON.stringify({ data: { repository: { pullRequest: queue } } });
     throw new Error(`unexpected ${cmd} ${a}`);
   });
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -69,6 +86,19 @@ const run = (args = [], listing = [pr()], files = WF) => {
 };
 
 describe('needs your merge — under NEEDS YOU', () => {
+  it('omits a ready-to-merge PR already in the queue', () => {
+    const report = JSON.parse(run(['--json'], [pr()], WF, { isInMergeQueue: true, headRefOid: HEAD }));
+    expect(report.needsYourMerge).toBeUndefined();
+    expect(execFileSync.mock.calls.some(([, args]) => args.join(' ').includes('isInMergeQueue'))).toBe(true);
+  });
+  it.each([null, {}, { isInMergeQueue: false, headRefOid: 'd'.repeat(40) }])('reports unknown or stale queue state instead of a merge command (%j)', (queue) => {
+    const report = JSON.parse(run(['--json'], [pr()], WF, queue));
+    expect(report.needsYourMerge).toBeUndefined();
+    expect(report.errors.length).toBeGreaterThan(0);
+  });
+  it('prints the merge command with successful legacy status checks', () => {
+    expect(run([], [pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] })])).toContain(COMMAND);
+  });
   it('prints the row with the one command, and NEEDS YOU is not "(none)"', () => {
     const out = run();
     const section = out.slice(out.indexOf('NEEDS YOU'), out.indexOf('RULING NEEDED'));

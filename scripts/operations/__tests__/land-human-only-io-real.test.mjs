@@ -3,9 +3,11 @@
  * @file scripts/operations/__tests__/land-human-only-io-real.test.mjs
  * @description Card 334 — the #2949 fidelity qualifier for `land-human-only-io.mjs`: its real non-GitHub mechanism is
  *   finding a checkout of the PR's repo to run the pinned git reads in (`cloneFor`). Exercised against a REAL clone of
- *   a bare origin named like the repo; only GitHub is out of scope here (the stubbed suite covers those calls).
+ *   a bare origin. Git discovers the real clone and reads its origin; the origin's GitHub spelling is injected
+ *   because the fixture's transport is a local path. No fetch or network call is made.
  */
 import { it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withBareOrigin, withRealRepo } from './helpers/real-repo.mjs';
@@ -15,8 +17,19 @@ it('finds the clone of the repo from inside it, and refuses a checkout of anothe
   await withBareOrigin(async ({ clone, slug }) => {
     const nested = join(clone, 'scripts', 'deep');
     mkdirSync(nested, { recursive: true });
-    expect(cloneFor(slug, { candidates: [nested] })).toBe(clone);
-    expect(cloneFor('someone/other-repo', { candidates: [nested] })).toBeNull();
+    const withOrigin = (origin) => (bin, args, opts) => {
+      const real = execFileSync(bin, args, opts);
+      return args.includes('get-url') ? origin : real;
+    };
+    for (const origin of [`https://github.com/${slug}.git`, `git@github.com:${slug}.git`, `ssh://git@github.com/${slug}.git`]) {
+      const options = { candidates: [nested], exec: withOrigin(origin) };
+      expect(cloneFor(slug, options)).toBe(clone);
+      expect(cloneFor(`someone/${slug.split('/')[1]}`, options)).toBeNull();
+      expect(cloneFor('someone/other-repo', options)).toBeNull();
+    }
+    expect(cloneFor(slug, { candidates: [nested], exec: withOrigin(`https://elsewhere.test/${slug}.git`) })).toBeNull();
+    // A local path cannot establish the GitHub host even when owner/name matches.
+    expect(cloneFor(slug, { candidates: [nested] })).toBeNull();
   });
   // A checkout with no origin at all is never mistaken for the repo.
   await withRealRepo(async ({ root }) => {
