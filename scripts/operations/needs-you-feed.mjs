@@ -2,7 +2,7 @@
 /** Card 359 — session-independent operator attention feed. */
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -106,14 +106,27 @@ export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z' } = {
   const threshold = Date.parse(since); if (!Number.isFinite(threshold)) throw new Error('needs-you-feed: invalid --since timestamp');
   return readOptional(path, '').split('\n').map(parseFeedLine).filter(e => e && Date.parse(e.at) >= threshold);
 }
+const statePathOf = path => join(dirname(path), 'needs-you-feed-state.json');
+/** Capture only published events, serialized with publication; timestamps are not publication order. */
+export function acknowledge({ path = feedPath(), ackPath = join(dirname(path), 'needs-you-ack') } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${statePathOf(path)}.lock`, () => {
+    const cursor = { publishedEvents: replay({ path }).length };
+    writeJsonAtomic(ackPath, cursor);
+    return cursor;
+  });
+}
 export function unacknowledged({ path = feedPath(), ackPath = join(dirname(path), 'needs-you-ack') } = {}) {
   const ack = readOptional(ackPath, '1970-01-01T00:00:00Z').trim();
+  // Continue to read legacy timestamp cursors; the next ack upgrades them to a publication cursor.
+  const cursor = ack.startsWith('{') ? JSON.parse(ack).publishedEvents : null;
+  if (ack.startsWith('{') && (!Number.isSafeInteger(cursor) || cursor < 0)) throw new Error('needs-you-feed: invalid acknowledgement cursor');
   const open = new Map();
-  for (const event of replay({ path })) {
+  for (const [index, event] of replay({ path }).entries()) {
     const key = keyOf(event.kind === 'cleared' ? { ...event, kind: event.was } : event);
-    if (event.kind === 'cleared') open.delete(key); else open.set(key, event);
+    if (event.kind === 'cleared') open.delete(key); else open.set(key, { event, index });
   }
-  return [...open.values()].filter(e => Date.parse(e.at) > Date.parse(ack));
+  return [...open.values()].filter(({ event, index }) => cursor === null ? Date.parse(event.at) > Date.parse(ack) : index >= cursor).map(({ event }) => event);
 }
 export function monitorCommand(path = feedPath()) {
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
@@ -145,7 +158,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
       log(`needs-you-feed ${item.repo}#${item.pr} head lookup failed: ${error.message}`);
     }
   }
-  const path = settings.path.value, statePath = join(dirname(path), 'needs-you-feed-state.json');
+  const path = settings.path.value, statePath = statePathOf(path);
   mkdirSync(dirname(path), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
@@ -163,7 +176,7 @@ export async function main(argv = process.argv.slice(2)) {
   const path = settings.path.value;
   if (verb === 'monitor-command') console.log(monitorCommand(path));
   else if (verb === 'replay') console.log(JSON.stringify(replay({ path, since: flags.find(f => f.startsWith('--since='))?.slice(8) }), null, 2));
-  else if (verb === 'ack') { mkdirSync(dirname(path), { recursive: true }); writeFileSync(join(dirname(path), 'needs-you-ack'), new Date().toISOString() + '\n'); }
+  else if (verb === 'ack') acknowledge({ path });
   else if (verb === 'once' || verb === 'loop') {
     assertProducerCheckout(CHECKOUT_ROOT, { settings });
     do {

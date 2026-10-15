@@ -358,7 +358,9 @@ tail -n 0 -F "$(node scripts/operations/handoff-home.mjs path)/needs-you-events.
 ```
 
 `node scripts/operations/needs-you-feed.mjs monitor-command` resolves overrides too. After reading, run
-`node scripts/operations/needs-you-feed.mjs ack`; the timestamp cursor is shared, without session IDs.
+`node scripts/operations/needs-you-feed.mjs ack`; the published-event cursor is shared, without session IDs.
+Acknowledgement covers only events already appended, so a poll still collecting items cannot hide its later
+events. Legacy timestamp cursors remain readable and are upgraded on the next acknowledgement.
 Settings cascade env > `scripts/settings/needs-you-feed.json` > defaults (`enabled`, `intervalMinutes`,
 `path`, `allowPrimary`), logging values and sources once per run. Env names are `WE_NEEDS_YOU_FEED_ENABLED`,
 `WE_NEEDS_YOU_FEED_INTERVAL_MINUTES`, `WE_NEEDS_YOU_FEED`, `WE_NEEDS_YOU_FEED_ALLOW_PRIMARY`.

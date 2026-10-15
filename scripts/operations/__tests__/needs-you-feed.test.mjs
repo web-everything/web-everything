@@ -3,14 +3,17 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, resolveSettings, runOnce, assertProducerCheckout } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, assertProducerCheckout, main } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'needs-feed-')); dirs.push(d); return d; };
-afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })));
+afterEach(() => {
+  vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks();
+  dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true }));
+});
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
@@ -101,6 +104,62 @@ describe('feed', () => {
     writeFileSync(ackPath, '2026-10-14');
     appendLines(path, diffFeed([`${item.repo}#12@abc:needs-you`], [], '2026-10-15T13:00:00Z').lines);
     expect(unacknowledged({ path, ackPath })).toEqual([]);
+  });
+  it.each([
+    ['queue read', at], ['head lookup', at],
+    ['queue read', '2026-10-15T12:01:00.000Z'], ['head lookup', '2026-10-15T12:01:00.000Z'],
+  ])('ack during an in-flight %s preserves subsequently published events (ack at %s)', async (phase, ackAt) => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(at));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const path = feedPath({ home, env: {} });
+    vi.stubEnv('WE_NEEDS_YOU_FEED', path);
+    const existing = { repo: item.repo, number: item.pr, head: item.head };
+    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    await runOnce({ ...opts, exec: () => JSON.stringify({ ready: [existing] }) });
+    let resume, entered;
+    const paused = new Promise(resolve => { resume = resolve; });
+    const collecting = new Promise(resolve => { entered = resolve; });
+    const report = JSON.stringify({ ready: [existing, { repo: item.repo, number: 13, ...(phase === 'queue read' ? { head: 'new' } : {}) }] });
+    const pause = async result => { entered(); await paused; return result; };
+    const poll = runOnce({ ...opts,
+      exec: () => phase === 'queue read' ? pause(report) : report,
+      gh: () => pause(JSON.stringify({ headRefOid: 'new' })),
+    });
+    await collecting;
+    vi.setSystemTime(new Date(ackAt));
+    await main(['ack']);
+    expect(unacknowledged({ path })).toEqual([]);
+    resume(); await poll;
+    expect(unacknowledged({ path }).map(event => event.pr)).toEqual([13]);
+    expect(bootstrapPlan({ home, env: { WE_NEEDS_YOU_FEED: path }, log: vi.fn() }).unacknowledged.map(event => event.pr)).toEqual([13]);
+    await main(['ack']);
+    expect(unacknowledged({ path })).toEqual([]);
+  });
+  it('acknowledges an empty feed and counts clears and reopens independently of event timestamps', () => {
+    const path = join(temp(), 'events');
+    expect(acknowledge({ path })).toEqual({ publishedEvents: 0 });
+    const first = diffFeed([], [item], at);
+    appendLines(path, first.lines);
+    expect(unacknowledged({ path })).toEqual([{ at, ...item }]);
+    expect(acknowledge({ path })).toEqual({ publishedEvents: 1 });
+    appendLines(path, diffFeed(first.openKeys, [], at).lines);
+    appendLines(path, first.lines);
+    expect(unacknowledged({ path })).toEqual([{ at, ...item }]);
+    expect(acknowledge({ path })).toEqual({ publishedEvents: 3 });
+    expect(unacknowledged({ path })).toEqual([]);
+    // A later publication can have an older timestamp after a clock correction or a slow poll.
+    appendLines(path, diffFeed([], [{ ...item, pr: 13 }], '2026-10-14').lines);
+    expect(unacknowledged({ path }).map(event => event.pr)).toEqual([13]);
+  });
+  it('upgrades a legacy timestamp acknowledgement without replaying already acknowledged items', () => {
+    const path = join(temp(), 'events'), ackPath = join(dirname(path), 'ack');
+    appendLines(path, diffFeed([], [item], at).lines);
+    writeFileSync(ackPath, at);
+    expect(unacknowledged({ path, ackPath })).toEqual([]);
+    expect(acknowledge({ path, ackPath })).toEqual({ publishedEvents: 1 });
+    appendLines(path, diffFeed([], [{ ...item, pr: 13 }], at).lines);
+    expect(unacknowledged({ path, ackPath }).map(event => event.pr)).toEqual([13]);
   });
   it('resolves settings env > file > defaults with source', () => {
     expect(resolveSettings({ env: {}, file: {} }).intervalMinutes).toEqual({ value: 2, source: 'default' });
