@@ -978,3 +978,11 @@ Set that allowance to zero in tests isolating the older `operatorFixBudget` mech
 An open send-back allowance must preserve the takeover gate predicate: a reviewed head with zero
 open defects and an own-gate hold still goes through cap handling for its advisory or operator note.
 Replay human, awaiting-base, stacked-base, review-gate and merge-gate holds alongside the allowance.
+
+### Stand-down head lifetime
+
+Terminal stand-downs hold on their recorded head. Reconcile and operator/health listings use the shared
+`stand-down.mjs` head reader; legacy unbound comments lapse with later current-head commit evidence, never
+from PR `updatedAt` (comments also update it). `fix.standDownHoldsAcrossHeads` defaults to false through
+the standard → platform → tool → env cascade and logs its source. Replay both raw planner inputs and
+queue listings; include same-head holds, abbreviated legacy Head markers and missing/older timestamps.

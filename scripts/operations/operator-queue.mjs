@@ -48,7 +48,7 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 // `merge-ai-prs.mjs`), which broke this file's own mocked `node:child_process` test setup. See
 // `we:scripts/conveyor/stuck-pr-dispatch-marker.mjs`'s own header for the full story.
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
-import { standDownComments, standDownReason, annotateLapsedStandDowns, standDownTrailerReason, STAND_DOWN_REASONS } from '../conveyor/stand-down.mjs';
+import { standDownComments, standDownReason, standDownHeadChangeAt, annotateLapsedStandDowns, standDownTrailerReason, STAND_DOWN_REASONS } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
@@ -90,10 +90,10 @@ let rulingHumanAt;
 try { rulingHumanAt = (await import('../conveyor/fixer-ladder.mjs')).loadFixerLadder().humanAt; } catch { /* default */ }
 // Staged CLI copies may omit the complete reader. Capped listings and the split fallback need it;
 // an unavailable reader must fail that read, never substitute an empty comment thread.
-let readCompletePrComments;
+let readCompletePrComments, enrichStandDownHeadChange;
 let LIST_COMMENTS_PAGE_SIZE = 100;
 let completeCommentsImportError;
-try { ({ readCompletePrComments, LIST_COMMENTS_PAGE_SIZE = 100 } = await import('../conveyor/pr-comments-complete.mjs')); }
+try { ({ readCompletePrComments, enrichStandDownHeadChange, LIST_COMMENTS_PAGE_SIZE = 100 } = await import('../conveyor/pr-comments-complete.mjs')); }
 catch (error) { completeCommentsImportError = error; }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
@@ -340,7 +340,7 @@ export function stuckInspectedRow(repo, pr) {
  * @returns {{repo:string, number:number, title:string, standDownAt: ?string, reason: ?string, alsoReviewHuman: boolean}|null}
  */
 export function standDownRow(repo, pr) {
-  const matches = standDownComments(pr.comments, { headRefOid: pr.headRefOid });
+  const matches = standDownComments(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) });
   if (!matches.length) return null;
   const latest = matches
     .map((c, index) => ({ ...c, time: Date.parse(c.createdAt) || 0, index }))
@@ -666,6 +666,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         prs = read([...listing, fields], Array.isArray);
         prs = prs.flatMap(completePr);
       }
+      prs = prs.map(pr => enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr);
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
@@ -748,7 +749,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       // YOU above. `standDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        if (standDownComments(pr.comments, { headRefOid: pr.headRefOid }).length === 0) continue;
+        if (standDownComments(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) }).length === 0) continue;
         const comments = [...annotateLapsedStandDowns(pr, { onLapse: () => {} }).comments]
           .sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
         const unresolved = standDownAnswers?.latestUnresolvedStandDown(comments);
