@@ -61,6 +61,46 @@ describe('operator send-backs, PR #5243 replay', () => {
     expect(openOperatorSendBacks(fixture({ comments: [original, c] }))).toEqual([]);
     expect(openOperatorSendBacks(fixture({ headRefOid: OLD, comments: [original, c] }))).toHaveLength(1);
   });
+  it.each([
+    "**Verdict:** changes\n\n1001 remains unaddressed. The fixer must post a comment headed '## Fix evidence' after repairing authorization.",
+    '**Verdict:** changes\n\n1001 remains unaddressed. Use this heading:\n\n## Fix evidence',
+    '1001 remains unaddressed.\n\n> ## Fix evidence',
+    '```markdown\n## Fix evidence\n1001\n```',
+    '~~~markdown\n## Fix evidence\n1001\n~~~',
+    '    ## Fix evidence\n    1001',
+    '\t## Fix evidence\n\t1001',
+    '\\## Fix evidence\n1001',
+    '＃＃ Fix evidence\n1001',
+    '\u200b## Fix evidence\n1001',
+    '## Fix evidence is the heading to post after repairing 1001.',
+    '## Fix evidence\u2028is the heading to post after repairing 1001.',
+    'Post `<!-- addresses-operator-send-back: 1001 -->` after repairing authorization.',
+    '> <!-- addresses-operator-send-back: 1001 -->',
+    '```markdown\n<!-- addresses-operator-send-back: 1001 -->\n```',
+    '    <!-- addresses-operator-send-back: 1001 -->',
+    '<!-- addresses-operator-send-back: 1001 --> is the marker to post after repairing authorization.',
+    `Head: \`${HEAD}\`\n\n~~~markdown\n<!-- addresses-operator-send-back: 1001 -->\n~~~`,
+  ])('keeps quoted evidence instructions unresolved through queue and review wiring: %s', body => {
+    const pr = fixture({ comments: [original, mechanical, ended,
+      comment('review', 'web-everything', '23:00', body)] });
+    const open = openOperatorSendBacks(pr);
+    expect(open.map(x => x.id)).toEqual(['1001']);
+    expect(sendBackNotAddressed(pr)?.items.map(x => x.id)).toEqual(['1001']);
+    expect(evaluatePr(pr)).toMatchObject({ ready: false,
+      reasons: expect.arrayContaining([expect.stringContaining('operator send-back')]) });
+    expect(advisoryLabelOutcome({ read: { netBasis: { rev: HEAD }, openOperatorSendBacks: open },
+      verdict: { verdict: 'accept', lensVerdicts: { correctness: 'accept', security: 'accept' } } })).toBe('changes');
+  });
+  it.each([
+    `## Fix evidence\nHead: \`${HEAD}\`\n1001 repaired.`,
+    `\n \r\n## Fix evidence\r\nHead: \`${HEAD}\`\r\n1001 repaired.`,
+    '<!-- addresses-operator-send-back: 1001 -->',
+    `Head: \`${HEAD}\`\n\n<!-- addresses-operator-send-back: 1001 -->`,
+    `Head: \`${HEAD}\`\r\n\r\n<!-- addresses-operator-send-back: 1001 -->`,
+  ])('recognizes genuine evidence comments with LF or CRLF: %s', body => {
+    expect(openOperatorSendBacks(fixture({ comments: [original,
+      comment('fix', 'web-everything', '23:00', body)] }))).toEqual([]);
+  });
   it('accepts marker-only evidence and stays unresolved when the send-back head is unknown', () => {
     const c = { ...evidence(), body: `Head: \`${HEAD}\`\n<!-- addresses-operator-send-back: 1001 -->` };
     expect(openOperatorSendBacks(fixture({ comments: [original, c] }))).toEqual([]);

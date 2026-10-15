@@ -40,6 +40,14 @@ function namesSendBack(text, item, { carry = false } = {}) {
       && containsToken(prose, item.etLabel.replace(/^~/, '')));
 }
 
+/** Recognize a fix comment, not reviewer prose quoting the evidence format. */
+function isFixEvidence(text) {
+  // Preserve indentation: four leading spaces make a Markdown code example, not a heading.
+  const start = text.replace(/\r\n?/g, '\n').replace(/^(?:[ \t]*\n)*/, '');
+  return /^ {0,3}## Fix evidence[ \t]*(?:\n|$)/.test(start)
+    || /^(?: {0,3}Head:[ \t]*`[a-f0-9]{7,40}`[ \t]*\n(?:[ \t]*\n)*)? {0,3}<!--[ \t]*addresses-operator-send-back:[ \t]*[^\s<>]+[ \t]*-->[ \t]*(?:\n|$)/i.test(start);
+}
+
 /** Only later trusted fix evidence on a different head resolves a request. Labels carry no resolution evidence. */
 export function openOperatorSendBacks(pr) {
   const comments = commentsOf(pr), items = operatorSendBacks(comments);
@@ -48,9 +56,7 @@ export function openOperatorSendBacks(pr) {
     if (comments.some((c, index) => {
       if (index <= item.index || !isTrustedMarkerAuthor(c)) return false;
       const text = String(c?.body ?? '');
-      // A notice can quote an operator's example "## Fix evidence"; that quotation is never a fix run.
-      if (text.trimStart().startsWith('⛔ conveyor — ruling not addressed')) return false;
-      if (!/## Fix evidence\b|<!--\s*addresses-operator-send-back:/.test(text) || !namesSendBack(text, item)) return false;
+      if (!isFixEvidence(text) || !namesSendBack(text, item)) return false;
       const namedHead = /\bHead:\s*`([a-f0-9]{7,40})`/i.exec(stripComments(text));
       return differentHead(item.head, namedHead ? namedHead[1] : pr?.headRefOid);
     })) resolved.add(item.index);
@@ -81,7 +87,8 @@ export function renderOperatorSendBackBrief(open) {
   if (!open?.length) return '';
   return '# Operator send-backs not yet addressed — read this first\n\n'
     + 'EACH item must be fixed regardless of any newer mechanical bounce. Read every quoted must-fix body below.\n'
-    + 'The fix-evidence comment MUST include the following marker per item it addressed (one line each):\n'
+    + 'Begin the fix-evidence comment with the standalone heading "## Fix evidence". '
+    + 'It MUST include the following marker per item it addressed (one line each):\n'
     + open.map(item => `<!-- addresses-operator-send-back: ${item.id ?? 'UNKNOWN'} -->`).join('\n')
     + '\nAlso include Head: `<fixed head sha>` and the concrete repair and verification evidence.\n\n'
     + quotedItems(open) + '\n\n';
