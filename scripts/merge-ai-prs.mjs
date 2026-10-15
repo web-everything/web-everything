@@ -200,7 +200,7 @@ import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBra
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
-import { drainReviewGateFact, homeRowsTrustedAfterReadFailure, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
+import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
@@ -3089,12 +3089,12 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
-    // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups only against the home
-    // rows the failed read vouches for (written after the last good shared read by any drain): home can lag a release
-    // that reached git but missed home, so an older home hold must not hide it. A lasting failure appends the hold once
-    // per home row it leaves; store=git leaves none on a good write, so there it re-appends each pass (never drops).
+    // An unreadable shared ledger still records the hold, and never dedups it (F4: a hold is never dropped). Home cannot
+    // stand in for the shared store: a release can reach git and then miss home, and another drain can interleave its
+    // own hold and release, so no home row proves git still holds the PR. The cost is one hold row per pass while the
+    // shared read is down; a dropped hold would leave the shared store showing the PR released while the drain holds it.
     let events;
-    try { events = (read ?? readHome)(repo); } catch (e) { events = homeRowsTrustedAfterReadFailure(readHome(repo), e); }
+    try { events = (read ?? readHome)(repo); } catch { events = []; }
     const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
     if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({

@@ -3,12 +3,10 @@
  * and releases of its open holds. Additive and fail-soft: recording never throws or
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
+import { readFileSync } from 'node:fs';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord, DEFAULT_VERDICT_LEDGER_STORE, EVENT_TYPES, foldVerdictLedger,
-  parseLedgerEvents, processWriterId, readLedgerEventsFromStore, resolveLedgerBoard, resolveLedgerStoreChoice, validateLedgerEvent,
-  VERDICT_LEDGER_LEASE_MINUTES, VERDICT_LEDGER_STORES, verdictLedgerLockRoot, verdictLedgerPath } from './verdict-ledger.mjs';
+  parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoard, resolveLedgerStoreChoice, validateLedgerEvent,
+  VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
 export const DRAIN_FACTS_SOURCE = 'merge-ai-prs';
 export const EXEMPT_BASIS = 'no escalation signal and no review label';
@@ -80,92 +78,27 @@ export function drainLedgerReadStore(repo, env = process.env) {
   return VERDICT_LEDGER_STORES.includes(store) ? 'git' : store;
 }
 
-// Home can lag the shared store: a release that reached git but then missed home (a partial release) leaves home
-// showing a hold git has released. So a read failure vouches only for home rows written after the latest good shared
-// read of that repo by ANY drain on this machine (they all share the home ledger; the fast drain runs beside the
-// resident one). That bound lives in a file beside the home ledger, recorded before the pass may write a release; a
-// read whose bound could not be recorded counts as failed, so no release follows it. A release is planned only from a
-// good read and written after it, so a hold written after the bound is newer than any release home could be missing.
-// Before any bound exists, this process's start is the bound (an older process's release predates it).
-const PROCESS_START_MS = Date.now();
-const BOUND_LOCK_PATH = '<verdict-ledger:drain-read-bound>';
-
-/** The file holding a repo's latest good shared-read start (ms), beside its home ledger (readers enumerate `.jsonl`). */
-export function drainReadBoundPath(repo) {
-  return verdictLedgerPath(repo).replace(/\.jsonl$/, '.drain-read-at');
-}
-
-/** The recorded bound, `-Infinity` when none exists yet. Throws when the file is unreadable or not a number. */
-function readBound(repo) {
-  let text;
-  try { text = readFileSync(drainReadBoundPath(repo), 'utf8'); }
-  catch (error) { if (error?.code === 'ENOENT') return -Infinity; throw error; }
-  const ms = Number(text.trim());
-  if (!Number.isFinite(ms)) throw new Error('drain read bound is not a number');
-  return ms;
-}
-
-/** Raise the repo's bound to `startedAt` (never lower it: a slow read can finish after a later one). Under a lock,
- *  written by rename. Throws when the lock is held or the write fails; the caller then treats the read as failed. */
-export function recordDrainReadBound(repo, startedAt) {
-  const lockRoot = verdictLedgerLockRoot();
-  mkdirSync(lockRoot, { recursive: true });
-  const lock = reserve(lockRoot, BOUND_LOCK_PATH, processWriterId(), Date.now(), new Date().toISOString(),
-    process.pid, 'unknown', VERDICT_LEDGER_LEASE_MINUTES);
-  if (lock?.ok !== true) throw new Error(`drain read bound lock is held (${lock?.reason ?? 'unknown'})`);
-  try {
-    let prior;
-    try { prior = readBound(repo); } catch { prior = -Infinity; } // a damaged file is replaced by this read's bound
-    if (prior >= startedAt) return;
-    const path = drainReadBoundPath(repo), tmp = `${path}.${process.pid}.tmp`;
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(tmp, `${startedAt}\n`, 'utf8');
-    renameSync(tmp, path);
-  } finally { try { releaseLockDir(lockRoot, BOUND_LOCK_PATH); } catch { /* the short TTL reclaims it */ } }
-}
-
-/** The time after which home rows are trusted for `repo` when its shared read failed; `Infinity` (trust nothing)
- *  when the recorded bound cannot be read. */
-export function drainHomeTrustedFrom(repo) {
-  try { return Math.max(readBound(repo), PROCESS_START_MS); } catch { return Infinity; }
-}
-
-/** The home rows a failed shared read still vouches for: those strictly after `error.homeTrustedFrom` (a row in the
- *  same millisecond as the read may predate it, so it is not trusted; the cost is one extra hold). An error without
- *  a finite bound (a plain seam error, an unreadable bound) vouches for none, so the caller records its hold. */
-export function homeRowsTrustedAfterReadFailure(rows, error) {
-  const from = Number(error?.homeTrustedFrom);
-  if (!Number.isFinite(from) || !Array.isArray(rows)) return [];
-  return rows.filter(row => Date.parse(row?.at) > from);
-}
-
 /** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. Keyed by the
  *  exact repo text the writes use (the git path and the store read are case-sensitive). A failed read throws from the
- *  reader: releases then write nothing, and `recordDrainHold` still records its hold (F4). The thrown error carries
- *  `homeTrustedFrom` (see {@link homeRowsTrustedAfterReadFailure}). A good shared read records its bound first
- *  ({@link recordDrainReadBound}); a home-store read needs none (its writes cannot miss home). */
-export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore,
-  clock = Date.now, recordBound = recordDrainReadBound } = {}) {
+ *  reader: releases then write nothing, and `recordDrainHold` records its hold without deduping it (F4). */
+export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore } = {}) {
   const snapshot = new Map();
   const exact = repo => String(repo ?? '').trim();
   for (const repo of repos) {
     const key = exact(repo);
     if (!key || snapshot.has(key)) continue;
-    const startedAt = clock();
     try {
       // Home keeps the whole-file read (the recorders filter by slug); the store read filters by the exact repo text.
       const store = drainLedgerReadStore(key, env);
       const read = store === 'home' ? { status: 'ok', rows: readHome(key) } : await readStore(key, { store, env });
-      const ok = read?.status === 'ok' && Array.isArray(read.rows);
-      if (ok && store !== 'home') recordBound(key, startedAt);
-      snapshot.set(key, ok ? { rows: read.rows } : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
+      snapshot.set(key, read?.status === 'ok' && Array.isArray(read.rows) ? { rows: read.rows }
+        : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
     } catch (error) { snapshot.set(key, { error: String(error?.message ?? error).split('\n')[0] }); }
   }
-  const failure = (repo, message) => Object.assign(new Error(message), { homeTrustedFrom: drainHomeTrustedFrom(exact(repo)) });
   return repo => {
     const entry = snapshot.get(exact(repo));
-    if (!entry) throw failure(repo, `ledger not read for ${repo}`);
-    if (entry.error) throw failure(repo, `ledger unreadable for ${repo}: ${entry.error}`);
+    if (!entry) throw new Error(`ledger not read for ${repo}`);
+    if (entry.error) throw new Error(`ledger unreadable for ${repo}: ${entry.error}`);
     return entry.rows;
   };
 }
