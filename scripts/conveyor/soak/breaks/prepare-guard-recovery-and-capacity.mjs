@@ -48,7 +48,7 @@ export default {
       }
     }
     const parked = fixture(['5028', '5029', '5030']);
-    parked.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, completed: true, held: false,
+    parked.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, held: true,
       recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }));
     for (let i = 0; i < 2; i++) {
       const tick = await runBuildDispatchTick({ live: true, effects: parked });

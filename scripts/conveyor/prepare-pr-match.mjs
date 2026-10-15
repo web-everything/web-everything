@@ -38,7 +38,8 @@ export function prepareLaunchRefusal({ num, bornAs, prs = [], lastDispatchAt,
   // Pick the latest record BEFORE testing its hold/release flags; an old park must not resurface.
   const latest = ledgerFailures.filter(f => normNum(f.num) === key)
     .sort((a, b) => String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')))[0];
-  if (latest?.holdReason?.startsWith('needs-you') && (latest.held === true || latest.completed === true)
+  // Same `held && !completed` view as the needs-you list: a stamp on main completes the record and resolves the park.
+  if (latest?.holdReason?.startsWith('needs-you') && latest.held === true && latest.completed !== true
     && !latest.releasedAt && !latest.releasedBy && !releasedAttempt(releases, key, latest.attempt)) {
     return { reason: `parked needs-you: ${latest.holdReason.slice(0, 120)}` };
   }

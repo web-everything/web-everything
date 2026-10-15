@@ -67,16 +67,22 @@ describe('prepare launch refusal', () => {
   it('refuses a live run', () => {
     expect(refuse({ liveRows: [{ num: 5028, runId: 'run-1' }] })).toEqual({ reason: 'live prepare run (run-1)' });
   });
-  it.each([{ held: true }, { held: false, completed: true }])('keeps a needs-you park, including completion by stamp: %j', flags => {
-    expect(refuse({ ledgerFailures: [{ num: '5028', recordedAt: '2026-10-14', holdReason: `needs-you: ${'x'.repeat(150)}`, ...flags }] }))
+  it('keeps a held needs-you park', () => {
+    expect(refuse({ ledgerFailures: [{ num: '5028', recordedAt: '2026-10-14', holdReason: `needs-you: ${'x'.repeat(150)}`, held: true }] }))
       .toEqual({ reason: `parked needs-you: ${`needs-you: ${'x'.repeat(150)}`.slice(0, 120)}` });
   });
+  // PR #5366 review (round 4): a hand stamp completes the record (`completePrepareFailures`); that resolves the park,
+  // so a later prepare-stale re-prepare must launch. Same `held && !completed` view as the needs-you list.
+  it.each([{ held: true, completed: true }, { held: false, completed: true }, { held: false }])(
+    'does not park on a resolved needs-you record: %j', flags => {
+      expect(refuse({ ledgerFailures: [{ num: '5028', recordedAt: '2026-10-14', holdReason: 'needs-you: call', ...flags }] })).toBeNull();
+    });
   it.each(['releasedAt', 'releasedBy'])('honors an explicit %s release', field => {
-    expect(refuse({ ledgerFailures: [{ num: '5028', held: true, completed: true, holdReason: 'needs-you: call', [field]: 'release' }] })).toBeNull();
+    expect(refuse({ ledgerFailures: [{ num: '5028', held: true, holdReason: 'needs-you: call', [field]: 'release' }] })).toBeNull();
   });
   // PR #5366 review: a reviewed release lives in the releases store, not on the ledger record.
-  it.each([{ held: true }, { held: false, completed: true }])('honors a reviewed release of the newest attempt: %j', flags => {
-    const ledgerFailures = [{ num: '5028', attempt: 'run x', recordedAt: '2026-10-14', holdReason: 'needs-you: call', ...flags }];
+  it('honors a reviewed release of the newest attempt', () => {
+    const ledgerFailures = [{ num: '5028', attempt: 'run x', recordedAt: '2026-10-14', holdReason: 'needs-you: call', held: true }];
     expect(refuse({ ledgerFailures, releases: [{ target: '5028', attempt: 'run x' }] })).toBeNull();
   });
   it.each([

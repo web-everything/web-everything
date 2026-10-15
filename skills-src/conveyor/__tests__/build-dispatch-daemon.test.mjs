@@ -1801,7 +1801,7 @@ describe('automatic item preparation', () => {
     const effects = fixture();
     effects.planTick = () => ({ decisions: { itemPrepareSpawns: ['5028', '5029', '5030'].map(num => ({ num })) }, nextState: {} });
     effects.listPrepareFailures = () => kind === 'park' ? ['5028', '5029'].map(num => ({ num,
-      completed: true, held: false, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
+      held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
     effects.listPreparePrs = ({ num }) => {
       if (num === '5030' || kind === 'park') return [];
       if (kind === 'listing failure') throw new Error('unavailable');
@@ -1822,8 +1822,8 @@ describe('automatic item preparation', () => {
     ['listing result invalid', () => ({}), [], 'prepare PR listing unavailable'],
     ['merged after dispatch', () => [{ number: 92, state: 'MERGED', headRefName: 'lane/5028e-prepare-x',
       createdAt: '2026-10-15' }], [{ num: '5028', recordedAt: '2026-10-14' }], 'merged prepare PR #92 after last dispatch (within 24h guard)'],
-    ['completed needs-you park', () => [], [{ num: '5028', recordedAt: '2026-10-14', completed: true,
-      held: false, holdReason: 'needs-you: decide scope' }], 'parked needs-you: needs-you: decide scope'],
+    ['held needs-you park', () => [], [{ num: '5028', recordedAt: '2026-10-14',
+      held: true, holdReason: 'needs-you: decide scope' }], 'parked needs-you: needs-you: decide scope'],
   ])('fails closed at launch: %s', async (_name, list, records, reason) => {
     const effects = fixture();
     effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
@@ -1849,6 +1849,23 @@ describe('automatic item preparation', () => {
       effects.listPrepareFailures = () => [{ num: '5028', attempt: 'run x', stage: 'result', cause: 'needs-you',
         held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }];
       effects.listPrepareReleases = () => releases;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const tick = await runBuildDispatchTick({ live: true, effects });
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(launches ? ['5028'] : []);
+        expect(tick.prepare.refused).toEqual(launches ? [] : [{ num: '5028', reason: 'parked needs-you: needs-you: decide scope' }]);
+      } finally { log.mockRestore(); }
+    });
+  // PR #5366 review (round 4): an operator resolves a needs-you card by stamping it on main; the daemon then completes
+  // the record. When main moves on and the stamp goes stale, the prepare-stale re-prepare must launch, not stay parked.
+  it.each([[true, true], [false, false]])(
+    'a stamp-completed needs-you record does not park a prepare-stale re-prepare (completed=%s, launches=%s)', async (completed, launches) => {
+      const effects = fixture();
+      effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+      effects.listPreparePrs = () => [];
+      effects.readPreparedStamp = () => ({ preparedDate: '2026-09-01', preparedAgainstSha: 'aaaa1111' });
+      effects.listPrepareFailures = () => [{ num: '5028', attempt: 'run x', stage: 'result', cause: 'needs-you',
+        held: true, completed, recordedAt: '2026-08-30', holdReason: 'needs-you: decide scope' }];
       const log = vi.spyOn(console, 'error').mockImplementation(() => {});
       try {
         const tick = await runBuildDispatchTick({ live: true, effects });

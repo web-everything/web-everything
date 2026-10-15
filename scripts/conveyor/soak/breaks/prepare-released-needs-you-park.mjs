@@ -19,7 +19,7 @@ export default {
   id: 'prepare-released-needs-you-park',
   title: 'A reviewed release of a needs-you prepare park is ignored at launch, refusing the card forever',
   card: '347 / PR 5366',
-  fixedBy: { sha: 'HEAD', where: 'lane/prepare-dup-guard', paths: [DAEMON, GUARD] },
+  fixedBy: { sha: '2d742e9a0', where: 'lane/prepare-dup-guard', paths: [DAEMON, GUARD] },
   fixPresent(root) {
     const p = join(root, GUARD);
     return existsSync(p) && readFileSync(p, 'utf8').includes('releasedAttempt(releases, key, latest.attempt)');
