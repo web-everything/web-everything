@@ -83,6 +83,7 @@ import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync } from 'node:fs';
+import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -444,8 +445,9 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
     const alive = probe(Number.isInteger(a?.pid) ? a.pid : null);
+    const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
-      ...a,
+      ...fresh,
       laneHeadOid: cwd ? headCache.get(cwd) : null,
       ...(alive === null ? {} : { pidAlive: alive }),
     };
@@ -1470,6 +1472,7 @@ export function runReconcilePass({
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
   loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
   loadRoundExtensionAnchorSetting = loadRoundExtensionAnchor,
+  loadStandDownHoldsAcrossHeads = resolveStandDownHoldsAcrossHeads,
   // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
@@ -1550,7 +1553,10 @@ export function runReconcilePass({
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
   const staleCiRerunSetting = loadStaleCiRerunSetting({ env });
   console.error(`fix.staleCiRerun=${staleCiRerunSetting.value} (${staleCiRerunSetting.source})`);
+  const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
+  console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const plan = planReconcile({
+    standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),

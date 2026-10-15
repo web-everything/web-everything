@@ -15,7 +15,8 @@ vi.mock('node:child_process', async (importOriginal) => ({
 import { readGh } from '../../lib/proc-read.mjs';
 import { spawnSync } from 'node:child_process';
 import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
-import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, operatorQueueNeedsYou } from '../pr-status-label.mjs';
+import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_LABEL_RE, PR_STATUS_DESCRIPTIONS, operatorQueueNeedsYou } from '../pr-status-label.mjs';
+import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } from '../review-status-tag.mjs';
 import { evaluatePr } from '../../operations/operator-queue.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
@@ -107,6 +108,64 @@ const verdict = (head = HEAD, outcome = 'accept') => ({ author: BOT, createdAt: 
   body: `**Verdict:** ${outcome}\n**Advisory outcome:** ${outcome}\nNet basis: \`${'0'.repeat(40)}..${head}\`` });
 const stand = (h = 7) => ({ author: BOT, createdAt: at(h), body: STAND_DOWN_MARKER });
 const human = (h = 8, login = 'chalbert') => ({ author: { login }, createdAt: at(h), body: 'Please continue.' });
+
+describe('known merge conflicts (#5950)', () => {
+  const conflicts = [{ mergeable: 'CONFLICTING' }, { mergeStateStatus: 'DIRTY' },
+    { mergeable: 'CONFLICTING', mergeStateStatus: 'CLEAN' }, { mergeable: 'MERGEABLE', mergeStateStatus: 'DIRTY' }];
+  const subject = (fields) => pr(['review:accepted', 'ready-to-merge', 'status:ready-to-merge'], [], {
+    statusCheckRollup: [check('test')], ...fields,
+  });
+  it.each(conflicts)('explicit conflict overrides acceptance and active red-team review: %j', fields => {
+    for (const reviewStatus of [null, { role: 'review', state: 'reviewing' }, { role: 'review', state: 'review-stalled' }]) {
+      expect(derive({ pr: subject(fields), reviewStatus })).toBe('conflict');
+      expect(derive({ pr: { ...subject(fields), labels: [{ name: 'review:accepted' }] }, reviewStatus })).toBe('conflict');
+    }
+  });
+  it.each(conflicts)('keeps live repair and required red CI ahead of conflict: %j', fields => {
+    for (const role of ['fix', 'ci-heal']) {
+      expect(derive({ pr: subject(fields), reviewStatus: { role, state: 'fixing' } })).toBe('fixing');
+      expect(derive({ pr: subject(fields), reviewStatus: { role, state: 'needs-human' } })).toBe('conflict');
+    }
+    const red = subject({ ...fields, statusCheckRollup: [check('test', 'FAILURE')] });
+    expect(derive({ pr: red })).toBe('ci-red');
+    expect(derive({ pr: red, reviewStatus: { role: 'ci-heal', state: 'healing-ci' } })).toBe('fixing');
+  });
+  it('keeps an unresolved operator ruling ahead of conflict and red CI', () => {
+    const original = { summary: 'A policy decision needs a ruling', file: 'policy.md', line: 1, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const record = { version: 1, repo: 'web-everything/web-everything', pr: 7, head: HEAD, runId: 'conflict-ruling',
+      reviewer: mandatoryReferralReviewer('conflict-ruling'), authorBody: '<!-- authored-by-actor: author -->', attempted: true,
+      referrals: [{ key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) }], rulings: [] };
+    const comments = [{ author: BOT, createdAt: at(5), body: renderReferralRecord(record) }];
+    for (const fields of conflicts) {
+      expect(derive({ pr: pr([], comments, { ...fields, statusCheckRollup: [check('test', 'FAILURE')] }),
+        reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('needs-you');
+    }
+  });
+  it.each([{}, { mergeable: 'UNKNOWN' }, { mergeStateStatus: 'UNKNOWN' },
+    { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }])('preserves readiness without explicit conflict: %j', fields => {
+    expect(derive({ pr: subject(fields) })).toBe('ready-to-merge');
+  });
+  it.each(conflicts)('replays conflict and clearance through the sole label writer: %j', fields => {
+    const setLabels = vi.fn();
+    const ensureLabel = vi.fn();
+    const run = (snapshot) => tagReviewStatus({ pr: 7, repo: 'web-everything/web-everything', agents: [],
+      prState: snapshot, currentLabels: snapshot.labels, planRows: [], readFixClaim: () => null,
+      provider: { ensureLabel, setLabels }, legacyReviewStatus: false });
+    expect(run(subject(fields)).prStatus).toBe('status:conflict');
+    expect(setLabels).toHaveBeenCalledWith('web-everything/web-everything', 7,
+      { add: 'status:conflict', remove: ['status:ready-to-merge'] });
+    expect(PR_STATUS_LABEL_RE.test('status:conflict')).toBe(true);
+    expect(PR_STATUS_DESCRIPTIONS.conflict).toMatch(/merge conflicts.*repair/i);
+    expect(ensureLabel).toHaveBeenCalledWith('web-everything/web-everything', 'status:conflict',
+      { color: 'fbca04', description: PR_STATUS_DESCRIPTIONS.conflict });
+    expect(planPrStatusLabel({ state: 'conflict', currentLabels: ['status:conflict'] })).toEqual({ add: null, remove: [] });
+    const cleared = subject({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' });
+    cleared.labels = cleared.labels.filter(l => l.name !== 'status:ready-to-merge').concat({ name: 'status:conflict' });
+    expect(run(cleared).prStatus).toBe('status:ready-to-merge');
+    expect(setLabels).toHaveBeenLastCalledWith('web-everything/web-everything', 7,
+      { add: 'status:ready-to-merge', remove: ['status:conflict'] });
+  });
+});
 
 describe('accepted PRs in the post-accept red team (#5241, #5258, #5268)', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];

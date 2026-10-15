@@ -1484,3 +1484,19 @@ it('cards 273/278 threads resolved ownership settings and keeps pure defaults on
   expect(runReconcilePass(options).dispatch).toContainEqual(expect.objectContaining({ kind: 'review', advisoryReview: expect.objectContaining({ ciWaived: true }) }));
   expect(runReconcilePass({ ...options, loadPrOwnership: () => { throw Error('unreadable'); } }).dispatch.some(d => d.kind === 'review')).toBe(false);
 });
+
+
+it('re-probes a bound PID on each pass, discarding an earlier live result even when the new probe is unknown', async () => {
+  const { enrichAgents, probePid } = await import('../reconcile-pass.mjs');
+  const { assessLiveness } = await import('../reconcile-core.mjs');
+  const row = { sessionId: 'bound-fix', pid: 123, pidAlive: true, state: 'working' };
+  let exists = true;
+  const probe = pid => probePid(pid, () => { if (!exists) throw Object.assign(Error('exited'), { code: 'ESRCH' }); });
+  const live = enrichAgents([row], { probe })[0];
+  expect(assessLiveness([{ agent: live }]).kind).toBe('live-process');
+  exists = false;
+  const dead = enrichAgents([row], { probe })[0];
+  expect(dead.pidAlive).toBe(false);
+  expect(assessLiveness([{ agent: dead }])).toBeNull();
+  expect(enrichAgents([row], { probe: () => null })[0]).not.toHaveProperty('pidAlive');
+});

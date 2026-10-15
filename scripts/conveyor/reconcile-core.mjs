@@ -36,9 +36,9 @@
  *
  * THE DISPATCH IS THE EASY HALF — THE FOUR REFUSALS ARE THE ITEM:
  *
- *   1. `stood-down` is TERMINAL. An agent that stopped to ask a question is never restarted; re-running it
+ *   1. `stood-down` is TERMINAL on its recorded head. An agent that stopped to ask a question is not restarted there; re-running it
  *      re-asks the question forever and burns tokens. Read from the durable marker
- *      `we:scripts/conveyor/stand-down.mjs` posts — no decay, no clock, so the verdict is identical a week later.
+ *      `we:scripts/conveyor/stand-down.mjs` posts — no time decay; a new head releases the hold by default.
  *   2. NO FINDINGS, NO FIXER. A PR with nothing to fix must never receive a fix agent; it will invent work. The
  *      right answer for a `review:pending` PR with no findings is a REVIEW, not a fix.
  *   3. THE ROUND CAP SURVIVES A RESTART, OR IT IS NOT A CAP. The attempt count is derived from the PR and ONLY
@@ -136,6 +136,7 @@ import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
   standDownComments,
+  standDownHeadChangeAt,
 } from './stand-down.mjs';
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
@@ -855,12 +856,12 @@ export function isAwaitingPermission(agent) {
  * @param {Array<{body?:string, viewerDidAuthor?:boolean, author?:{login?:string}}|string>|null|undefined} comments
  * @returns {number}
  */
-export function countUnresolvedStandDowns(comments) {
+export function countUnresolvedStandDowns(comments, options = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
-    if (!standDownComments([c]).length) continue;
+    if (!standDownComments([c], options).length) continue;
     if (!isTrustedMarkerAuthor(c)) continue; // #3383 — a forged stand-down from an untrusted login is never terminal.
     // fix procedure — a concurrent-author stand-down (the #2811 shape) is reclassified as a re-armable pause,
     // handled by {@link concurrentAuthorPauseState}, never terminal here.
@@ -1857,8 +1858,7 @@ const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRo
  * exists to remove, so it is not allowed to reappear in this pass's own output.
  *
  * THE ORDER OF THE CHECKS, and why each sits where it does:
- *   1. `stood-down` FIRST, because it is terminal. Nothing that follows can revive a PR a fixer walked away
- *      from, so nothing that follows should even be computed.
+ *   1. `stood-down` FIRST, because a current-head hold is terminal. Nothing that follows can revive that head.
  *   2. LIVENESS SECOND. If something is already working this PR, no further question is worth asking — and
  *      asking anyway is how two agents end up in one lane.
  *   3. PHASE, borrowed from `classifyPr`. What is owed, and by whom.
@@ -1991,6 +1991,7 @@ export function planReconcile({
   // the resolved cascade; the default is the standard layer alone.
   operatorRulingExtraRounds = resolveOperatorRulingExtraRounds(),
   roundExtensionAnchor = resolveRoundExtensionAnchor(),
+  standDownHoldsAcrossHeads = { value: false, source: 'standard' },
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -2348,8 +2349,8 @@ export function planReconcile({
       setting: `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}`, source: operatorRulingExtraRounds.source } } : {};
     const sendBackRoundWhy = `open operator send-back grants a repair round via fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;
 
-    // ── REFUSAL 1 — `stood-down` is TERMINAL. No decay, no clock: `now` is not read on this path, so the same
-    // PR returns the same refusal a week later unless an operator answer or supersede resolves it.
+    // ── REFUSAL 1 — `stood-down` is terminal on the recorded head by default. Legacy unbound holds release
+    // only with evidence of a head change after the comment; elapsed time alone never clears a question.
     //
     // `countUnresolvedStandDowns`, NOT the raw stand-down count — #xu2krte Fork 2 (review-human statute
     // amendment), the advisory-mechanism supersede, and the explicit operator-answer ceremony. Three independent
@@ -2368,11 +2369,14 @@ export function planReconcile({
     // A stand-down none of these predicates excludes — including an unanswered fix agent's genuine
     // needs-judgment/gate-red/lane-ref-gone escalation outside the advisory-fix shape above, and any human
     // `/finish` stand-down — stays terminal exactly as before.
-    const stoodDown = countUnresolvedStandDowns(pr?.comments);
+    const stoodDown = countUnresolvedStandDowns(pr?.comments, {
+      headRefOid: pr?.headRefOid, headChangedAt: standDownHeadChangeAt(pr),
+      lapseOnNewHead: standDownHoldsAcrossHeads.value ? 'off' : 'on',
+    });
     if (stoodDown > 0) {
       refuse('stood-down', {
         standDowns: stoodDown,
-        why: 'a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal until an explicit operator answer is recorded with stand-down-answer.mjs.',
+        why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
       continue;
     }

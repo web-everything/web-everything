@@ -218,7 +218,13 @@ export const HEALTH_WATCH_JOB_CAP = 2;
 export const HEALTH_GH_PROBE_KIND = defineJobKind({
   kind: 'health-gh-probe', entry: 'scripts/conveyor/health-watch-job.mjs', codeMode: 'readonly-tree', nodeModules: true,
 });
-export const HEALTH_WATCH_JOB_KINDS = kindRegistry([HEALTH_GH_PROBE_KIND]);
+/** Card 335 — deterministic PR sweep, isolated from gh probes by its own serial job store.
+ * The reused reconcile-pass agent-reader graph reaches js-yaml and markdown-it, so this needs node_modules.
+ */
+export const HEALTH_PR_SWEEP_KIND = defineJobKind({
+  kind: 'health-pr-sweep', entry: 'scripts/conveyor/pr-sweep-job.mjs', codeMode: 'readonly-tree', serial: true, nodeModules: true,
+});
+export const HEALTH_WATCH_JOB_KINDS = kindRegistry([HEALTH_GH_PROBE_KIND, HEALTH_PR_SWEEP_KIND]);
 export const HEALTH_WATCH_JOB_SWITCHES = Object.freeze({ ghProbes: false });
 
 /** A script path may be `undefined` is never intended; it must be a plain repo-relative path with no `..`

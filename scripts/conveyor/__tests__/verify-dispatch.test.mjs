@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
+import { resolveGateCeiling, runLaneGate, laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -1387,5 +1387,26 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
     expect(effects.inFlight.get(laneDir)).toMatchObject({ jobId: a.id });
     expect(result.dispatched).toMatchObject([{ lane: 2 }]);
     expect(spawnGate).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('load-scaled gate ceiling (#5233)', () => {
+  const settings = mode => ({ value: { gateCeiling: mode }, sources: { gateCeiling: 'platform' } });
+  it('scales by load/core with the rebuild smoke factor and cap; fixed and explicit overrides stay absolute', () => {
+    const host = { load: () => 48, cores: () => 12 };
+    expect(resolveGateCeiling({ env: {}, policy: settings('load-scaled'), ...host })).toMatchObject({ ms: 120 * 60_000, factor: 4, source: 'platform' });
+    expect(resolveGateCeiling({ env: {}, policy: settings('fixed'), ...host }).ms).toBe(30 * 60_000);
+    expect(resolveGateCeiling({ env: { VERIFY_DISPATCH_TIMEOUT_MS: '25' }, policy: settings('load-scaled'), ...host }).ms).toBe(25);
+    expect(resolveGateCeiling({ env: {}, policy: settings('load-scaled'), load: () => 6, cores: () => 12 }).ms).toBe(30 * 60_000);
+    expect(resolveGateCeiling({ env: {}, policy: settings('load-scaled'), load: () => { throw Error('no probe'); }, cores: () => 12 }).ms).toBe(30 * 60_000);
+  });
+  it('passes the resolved ceiling to the real supervision port and logs its source', async () => {
+    const lines = [], seen = [];
+    await runLaneGate({ pool: 'fixture', lane: 1, dir: 'unused', headSha: 'abc', marker: {}, runId: 'r',
+      gateCeiling: { ms: 120 * 60_000, factor: 4, source: 'platform', mode: 'load-scaled' },
+      log: line => lines.push(line), spawnGate: (args, opts) => { seen.push(opts); return Promise.resolve({ pid: 1 }); } });
+    expect(seen[0].gateCeilingMs).toBe(120 * 60_000);
+    expect(lines.join(' ')).toMatch(/load-scaled.*platform/);
   });
 });

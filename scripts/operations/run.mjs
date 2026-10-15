@@ -30,6 +30,8 @@ import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs'
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
+import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry } from './registry.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
@@ -391,6 +393,7 @@ export const OPERATIONS = Object.freeze({
   }),
   // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
   // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.
+  'operator-session-bootstrap': () => ({ declaration: operatorSessionBootstrapOperation({ collect: bootstrapPlan }), sinks: {}, finish: finishBootstrap }),
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},

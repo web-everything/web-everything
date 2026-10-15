@@ -49,6 +49,18 @@
           "name": "plateau-observer"
         },
         "botLogin": "plateau-observer[bot]"
+      },
+      "merger": {
+        "appId": "5267489",
+        "installations": {
+          "web-everything": "170085807",
+          "plateauapp": "170085790",
+          "frontier-ui": "170085775"
+        },
+        "key": {
+          "name": "plateau-merger"
+        },
+        "botLogin": "plateau-merger[bot]"
       }
     }
   }

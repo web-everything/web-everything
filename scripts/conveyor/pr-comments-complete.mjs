@@ -12,7 +12,7 @@
  */
 import { readFixLoopRows, fixLoopConfig, fixLoopRedMainLapse } from './fix-loop-ledger.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { annotateLapsedStandDowns, STAND_DOWN_MARKER } from './stand-down.mjs';
+import { annotateLapsedStandDowns, standDownComments, standDownHead, standDownHeadChangeAt, resolveStandDownHoldsAcrossHeads, STAND_DOWN_MARKER } from './stand-down.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs'; // the leaf — parked-pr-conflict-watch would close an import cycle via rearm-review
 
@@ -22,6 +22,19 @@ export const LIST_COMMENTS_PAGE_SIZE = 100;
 /** Complete, paginated read of one PR's comments; throws ProcReadError on any failed read. */
 export function readCompletePrComments(number, { repo = null, exec = execRead } = {}) {
   return defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
+}
+
+/** Read commits per PR only for a legacy unbound hold. A matching current-head commit date proves a later head. */
+export function enrichStandDownHeadChange(pr, { repo = null, exec = execRead } = {}) {
+  if (!/^[0-9a-f]{7,40}$/i.test(pr?.headRefOid ?? '') || standDownHeadChangeAt(pr)
+    || !standDownComments(pr?.comments).some(c => !standDownHead(c.body) && Number.isFinite(Date.parse(c.createdAt)))
+    || resolveStandDownHoldsAcrossHeads().value) return pr;
+  try {
+    const args = ['pr', 'view', String(pr.number), '--json', 'commits'];
+    if (repo) args.push('--repo', repo);
+    const { commits } = JSON.parse(exec('gh', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
+    return Array.isArray(commits) ? { ...pr, commits } : pr;
+  } catch { return pr; } // Missing evidence leaves the operator's question visible.
 }
 
 /**
@@ -42,7 +55,7 @@ export function enrichPrsWithCompleteComments(prs, {
       try { context = { rows: readRows(), config: readConfig(), repo: repoKeyForSlug(repo) }; }
       catch { context = null; }
     }
-    return annotateLapsedStandDowns(pr, context ? {
+    return annotateLapsedStandDowns(enrichStandDownHeadChange(pr, { repo }), context ? {
       redMainLapse: head => fixLoopRedMainLapse({ ...context, pr: pr.number, head }),
     } : {});
   });
