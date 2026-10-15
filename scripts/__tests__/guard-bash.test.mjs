@@ -667,11 +667,32 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
         .toBe('/protected/clone');
       expect(at(`A=/protected/clone; ${b} A=/tmp LANE="$A/x"; cd "$LANE"`), b).toBe('/protected/clone/x');
     }
-    // …and before a prefix assignment applies; prefix assignments themselves chain left to right
+    // …and before a prefix assignment applies
     expect(at('A=/protected/clone; A=/tmp export LANE=$A; cd "$LANE"')).toBe('/protected/clone');
-    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A export LANE; cd "$LANE"')).toBe('/protected/clone');
-    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A readonly LANE; cd "$LANE"')).toBe('/protected/clone');
-    expect(at('D=/x; D=/protected/clone HOME=$D cd && git checkout --detach')).toBe('/protected/clone');
+    // bash 3.2 chains a builtin's prefixes only once the shell has run a command: a value that differs
+    // between the two readings is unknown; one that does not is kept
+    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A export LANE; cd "$LANE"')).toBe(REPORTED);
+    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A readonly LANE; cd "$LANE"')).toBe(REPORTED);
+    expect(at('D=/x; D=/protected/clone HOME=$D cd && git checkout --detach')).toBe(REPORTED);
+    expect(at('A=/protected/clone; A=/protected/clone LANE=$A export LANE; cd "$LANE"')).toBe('/protected/clone');
+    // a readonly name keeps its value inside the prefix chain (bash refuses the assignment)
+    expect(at('readonly A=/protected/clone; A=/tmp LANE=$A export LANE; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('readonly D=/protected/clone; D=/tmp HOME=$D cd')).toBe('/protected/clone');
+    expect(at('readonly HOME=/protected/clone; HOME=/tmp cd')).toBe('/protected/clone');
+    // an operand that assigns a name wins over a later bare operand of the same name
+    expect(at('LANE=/x; LANE=/tmp export LANE=/protected/clone LANE; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('LANE=/x; LANE=/tmp declare -x LANE=/protected/clone LANE; cd "$LANE"')).toBe('/protected/clone');
+    // an assigned operand with a same-name prefix persists for export (even -n), readonly, declare -x/-r/-a …
+    for (const b of ['export', 'export -n', 'readonly', 'declare -x', 'declare -a']) {
+      expect(at(`LANE=/x; LANE=/tmp ${b} LANE=/protected/clone; cd "$LANE"`), b).toBe('/protected/clone');
+    }
+    // …and is absorbed by the prefix for plain declare/typeset
+    for (const b of ['declare', 'typeset', 'declare -t']) {
+      expect(at(`LANE=/protected/clone; LANE=/tmp ${b} LANE=/x; cd "$LANE"`), b).toBe('/protected/clone');
+    }
+    // an option bash 3.2 rejects assigns nothing; one only a newer bash knows leaves the operand unknown
+    expect(at('LANE=/protected/clone; export -z LANE=/tmp; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('LANE=/protected/clone; declare -A LANE=/tmp; cd "$LANE"')).toBe(REPORTED);
     // bare assignments (no command) still bind left to right
     expect(at('A=/x; A=/protected/clone LANE=$A; cd "$LANE"')).toBe('/protected/clone');
     // a prefix assignment to a declaration that does not export or freeze the name stays temporary

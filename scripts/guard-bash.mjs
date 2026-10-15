@@ -2562,6 +2562,9 @@ const NAME_PREFIX = /^[A-Za-z_]\w*/;
 // Builtins whose operands are `name` / `name=value`. The value-changing option letters (integer, case,
 // nameref) make an assigned name unknown; `-f`/`-F` (functions) and `-p` (print) never touch a variable.
 const DECLARATION_BUILTINS = { declare: /[ilun]/, typeset: /[ilun]/, local: /[ilun]/, readonly: null, export: null };
+// The option letters each declaration builtin accepts in bash 3.2, and the ones only a newer bash adds.
+const DECLARATION_OPTIONS_32 = { declare: 'afFiprtx', typeset: 'afFiprtx', local: 'afFiprtx', export: 'fnp', readonly: 'afp' };
+const DECLARATION_OPTIONS_NEWER = 'AgIlnuc';
 // Option letters that take an argument, for the builtins that read into named variables.
 const OPTION_ARGS = { read: 'adinNptu', mapfile: 'dnOsuCc', readarray: 'dnOsuCc' };
 // Names `let` assigns: `N=`, `N op=`, `N++`/`N--`, `++N`/`--N` (`==`, `<=`, `!=` only compare). The lookbehind
@@ -2854,31 +2857,43 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
   // A same-name temporary prefix absorbs what unset/declare do to that name (`L=v unset L`); read, getopts,
   // printf -v and let assign through it in bash 3.2, so their ops stand.
   let absorbs = false;
-  let keepsPrefix = false;
   if (Object.hasOwn(DECLARATION_BUILTINS, name)) {
-    absorbs = true;
     const { opts, operands } = splitOptions(args, '', '-+');
     // -f/-F name functions; -p only prints for declare/typeset/local (bash still assigns `export -p N=v`)
     if (/[fF]/.test(opts) || (opts.includes('p') && name !== 'export' && name !== 'readonly')) return [];
     if (dynamic(operands)) return [CLEAR_ALL];
+    // An option bash 3.2 rejects assigns nothing there; one only a newer bash knows (`-A`, `-g`, `-l`, …)
+    // leaves the operands version-dependent, so unknown.
+    const letters = opts.replace(/[-+]/g, '');
+    if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l))) {
+      if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l) && !DECLARATION_OPTIONS_NEWER.includes(l))) return [];
+      return operands.map((w) => declarationOperand(w)?.name).filter(Boolean).map(forget);
+    }
     const transforms = DECLARATION_BUILTINS[name]?.test(opts) ?? false;
-    // `L=v export L` (also readonly, declare -x/-r) keeps the prefix value; other prefixes stay temporary
-    keepsPrefix = (name === 'export' && !opts.includes('-n')) || name === 'readonly'
+    // With a same-name temporary prefix (bash 3.2): a bare operand takes the prefix value for export (not -n),
+    // readonly and declare -x/-r, and stays temporary otherwise; an assigned operand persists for export,
+    // readonly and declare -x/-r/-a, and is absorbed by the prefix otherwise (`L=v declare L=w`).
+    const keepsBare = (name === 'export' && !opts.includes('-n')) || name === 'readonly'
       || (name !== 'local' && /-[xr]/.test(opts));
+    const keepsAssigned = name === 'export' || name === 'readonly' || (name !== 'local' && /-[xra]/.test(opts));
     const freezes = name === 'readonly' || (name !== 'local' && opts.includes('-r'));
     const prefixNames = new Set(prefix.map((w) => assignmentOp(w).name));
+    const assigned = new Set();                                 // names an earlier operand already assigned
     for (const w of operands) {
       const op = declarationOperand(w);
       if (!op) continue;
+      const temporary = prefixNames.has(op.name);
       if (op.bare) {
-        if (name === 'local' || (transforms && opts.includes('n'))) out.push(forget(op.name));
-        else if (keepsPrefix && prefixNames.has(op.name)) out.push({ name: op.name, fromPrefix: true });
-      } else {
+        if (name === 'local' || (transforms && opts.includes('n'))) { if (!temporary) out.push(forget(op.name)); }
+        else if (keepsBare && temporary && !assigned.has(op.name)) out.push({ name: op.name, fromPrefix: true });
+      } else if (!temporary || keepsAssigned) {
         // bash expands every operand before the builtin assigns any: `export A=/x L=$A` reads the old A
         out.push(name === 'local' || transforms ? forget(op.name) : { ...op, snapshot: true });
+        assigned.add(op.name);
       }
       if (freezes) out.push({ name: op.name, readonly: true });
     }
+    return out;
   } else if (name === 'unset') {
     absorbs = true;
     const { opts, operands } = splitOptions(args);
@@ -2903,7 +2918,7 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
     }
     out = printfBindings(cmd).map(forget);
   }
-  if (!absorbs || keepsPrefix) return out;
+  if (!absorbs) return out;
   const temporary = new Set(prefix.map((w) => assignmentOp(w).name));
   return out.filter((op) => op.all || !temporary.has(op.name));
 }
@@ -2979,13 +2994,23 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const valueOf = (op) => (op.raw === null ? null : assignmentValue(op.raw, vars, homeCtx));
   // The values a statement's prefix assignments take: they chain left to right in a scope over the current
   // variables (`A=/x L=$A cmd` gives L=/x for that command), without touching them.
+  // A name a readonly surely froze keeps its value (bash refuses the assignment); a maybe-frozen one is unknown.
+  // bash 3.2 chains a builtin's prefixes only once the shell has run a command before it, so a value that differs
+  // between the chained and the unchained reading is unknown.
   const prefixValues = (prefix) => {
     const scope = Object.create(vars);
     let h = homeCtx;
     const out = new Map();
     for (const w of prefix) {
       const op = assignmentOp(w);
-      const v = op.raw === null ? null : assignmentValue(op.raw, scope, h);
+      const state = frozen.get(op.name);
+      let v;
+      if (state === 'sure') v = op.name === 'HOME' ? homeCtx : vars[op.name] ?? null;
+      else if (state === 'maybe' || op.raw === null) v = null;
+      else {
+        const chained = assignmentValue(op.raw, scope, h);
+        v = chained === assignmentValue(op.raw, vars, homeCtx) ? chained : null;
+      }
       if (op.name === 'HOME') h = v;
       else scope[op.name] = v ?? undefined;                     // an unknown value shadows the outer one
       out.set(op.name, v);
