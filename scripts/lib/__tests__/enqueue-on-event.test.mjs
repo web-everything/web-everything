@@ -1074,3 +1074,142 @@ describe('actual enqueue outcomes and membership', () => {
     expect(result).toMatchObject({ ok: false, error: expect.any(String) });
   });
 });
+
+
+describe('BLOCKED catch-up back-off', () => {
+  const reason = 'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase; required-checks-not-successful: merge-gate (failure); merge-gate hold review-acceptance not cleared on this head';
+  const head = { ...READY_PR, headRefOid: 'abcdef123456789', statusCheckRollup: [...READY_PR.statusCheckRollup, { context: 'merge-gate', state: 'FAILURE' }] };
+  const blockedSetup = (extra = {}) => catchUpSetup({
+    resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 2 } }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(5193, 0), candidate(42, 1), candidate(43, 2), candidate(44, 3)] }),
+    readPr: async () => head,
+    drainResult: num => num === 5193 ? { considered: 1, skipReasons: [{ num, reason }] } : { toMerge: [{ num }] },
+    ...extra,
+  });
+  const nums = calls => calls.map(c => Number(c.args[1].split('=')[1]));
+
+  it('resolves the default, cascade overrides, zero, and invalid leaves', () => {
+    expect(ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds).toBe(6);
+    expect(resolveSetting().catchUp.blockedBackoffRounds).toBe(6);
+    expect(resolveSetting({}, { platform: { catchUp: { blockedBackoffRounds: 4 } } }).catchUp.blockedBackoffRounds).toBe(4);
+    for (const blockedBackoffRounds of [0, 2]) {
+      const s = resolveSetting({ catchUp: { blockedBackoffRounds } });
+      expect(s.catchUp.blockedBackoffRounds).toBe(blockedBackoffRounds);
+      expect(s.line).toContain(`catchUp.blockedBackoffRounds=${blockedBackoffRounds} (tool)`);
+    }
+    for (const blockedBackoffRounds of [-1, 1.5, 'x', true]) {
+      const s = resolveSetting({ catchUp: { blockedBackoffRounds } });
+      expect(s.catchUp.blockedBackoffRounds).toBe(6);
+      expect(s.invalid.join(' ')).toContain('catchUp.blockedBackoffRounds=');
+    }
+  });
+
+  it('signs the head and sorted check states, and returns null for unreadable heads', () => {
+    const signature = enqueueModule.prHeadSignature(head);
+    expect(signature).toEqual(enqueueModule.prHeadSignature({ ...head, statusCheckRollup: [...head.statusCheckRollup].reverse() }));
+    expect(signature).not.toEqual(enqueueModule.prHeadSignature({ ...head, headRefOid: 'different' }));
+    expect(signature).not.toEqual(enqueueModule.prHeadSignature({ ...head, statusCheckRollup: [{ ...head.statusCheckRollup[0], conclusion: 'FAILURE' }] }));
+    for (const pr of [null, undefined, {}, { headRefOid: '' }, { headRefOid: 42 }]) expect(enqueueModule.prHeadSignature(pr)).toBeNull();
+  });
+
+  it('reads the head SHA with the wake checks', async () => {
+    await enqueueModule.readPrForWake({ repo: REPO, num: 5193, execFileImpl: (_cmd, args, _opts, cb) => {
+      expect(args[args.indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRefOid', 'statusCheckRollup']));
+      cb(null, JSON.stringify(head));
+    } });
+  });
+
+  it('continues and refills every round, skips the next N listings, then retries and re-arms', async () => {
+    const { handle, calls, lines, advance } = blockedSetup();
+    await handle.catchUp();
+    expect(nums(calls)).toEqual([5193, 42, 43, 44]);
+    expect(handle.blocked().has(5193)).toBe(true);
+    handle.blocked().clear();
+    expect(handle.blocked().has(5193)).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      advance(600_000);
+      const ran = await handle.catchUp();
+      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: expect.stringMatching(/^backed off:/) });
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+      expect(nums(calls).slice(-3)).toEqual([42, 43, 44]);
+      expect(lines).toContain(`enqueue-on-event: catch-up #5193 — backed off: BLOCKED at head abcdef123 (${2 - i} of 2 catch-up(s) left; retried sooner if its head or checks change)`);
+      await handle.tick(); // another tick is not another listing
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+    }
+    advance(600_000);
+    await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(true);
+  });
+
+  it.each(['head', 'checks', 'unreadable'])('retries when the %s changes', async (change) => {
+    let pr = head;
+    const { handle, calls, advance } = blockedSetup({ readPr: async () => pr });
+    await handle.catchUp(); advance(600_000);
+    pr = change === 'head' ? { ...head, headRefOid: 'new-head' } : change === 'checks' ? { ...head, statusCheckRollup: [{ ...head.statusCheckRollup[0], conclusion: 'FAILURE' }] } : null;
+    await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    if (!pr) expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it('disables back-off at zero', async () => {
+    const { handle, calls, advance } = blockedSetup({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 0 } }) });
+    await handle.catchUp(); advance(600_000); await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().size).toBe(0);
+  });
+
+  it('runs an event wake despite back-off and clears it on enqueue', async () => {
+    let blocked = true;
+    const { handle, calls, advance } = blockedSetup({ drainResult: num => blocked && num === 5193 ? { skipReasons: [{ num, reason }] } : { toMerge: [{ num }] } });
+    await handle.catchUp();
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(true);
+    blocked = false;
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('only backs off the targeted gate skips (%s)', async (skip) => {
+    const { handle, calls, advance } = blockedSetup({ drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
+    await handle.catchUp(); advance(600_000); await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(skip.startsWith('merge-gate hold') ? 1 : 2);
+  });
+
+  it('bypasses back-off for an event folded into retained catch-up work', async () => {
+    let closeDuringRead = false;
+    let allowed = true;
+    const { handle, calls, advance } = blockedSetup({ allowed: () => allowed, readPr: async ({ num }) => {
+      if (num === 5193 && closeDuringRead) allowed = false;
+      return head;
+    } });
+    await handle.catchUp(); advance(600_000);
+    closeDuringRead = true;
+    await handle.catchUp();
+    expect(handle.pending().some(p => p.num === 5193 && p.catchUp)).toBe(true);
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    closeDuringRead = false; allowed = true;
+    await handle.tick();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+  });
+
+  it.each(['CLOSED', 'MERGED', 'unlabeled'])('clears back-off on a %s wake read', async (state) => {
+    let pr = head;
+    const { handle, advance } = blockedSetup({ readPr: async () => pr });
+    await handle.catchUp();
+    pr = state === 'unlabeled' ? { ...head, labels: [] } : { ...head, state };
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it('clears entries for PRs absent from the next listing', async () => {
+    let prs = [candidate(5193)];
+    const { handle, advance } = blockedSetup({ readCandidates: async () => ({ ok: true, queued: 0, prs }) });
+    await handle.catchUp(); prs = []; advance(600_000); await handle.catchUp();
+    expect(handle.blocked().size).toBe(0);
+  });
+});
