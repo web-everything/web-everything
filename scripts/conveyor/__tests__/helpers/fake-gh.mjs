@@ -46,7 +46,7 @@
 
 import {
   mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, renameSync, chmodSync, rmSync, statSync, readdirSync,
-  unlinkSync, rmdirSync,
+  unlinkSync, rmdirSync, existsSync,
 } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -226,8 +226,9 @@ function sweepLockSiblings(lockPath) {
 }
 
 /**
- * Publish a complete holder record with atomic rename. Retry contention with a short randomized backoff;
- * each generation has a unique holder filename. Retirement unlinks only that filename and
+ * Create the lock directory with exclusive mkdir, then move in a complete, uniquely named holder
+ * record. The caller owns the lock only if that record is the directory's sole entry. Retry
+ * contention with a short randomized backoff. Retirement unlinks only one holder filename and
  * atomically removes the directory only if empty, so it cannot retire a replacement owner.
  *
  * @param {string} storePath
@@ -243,20 +244,32 @@ export function acquireStoreLock(storePath) {
     try { lockStat = statSync(lockPath); } catch (err) {
       if (err.code !== 'ENOENT') throw err;
     }
-    // POSIX rename can replace an EMPTY directory, so check legacy orphan locks before publishing.
+    // Never rename onto lockPath: POSIX rename replaces an EMPTY directory, and no prior check
+    // can stop one appearing before the rename. mkdir is exclusive, so it never replaces anything.
     if (!lockStat) {
-      const tmp = siblingPath(lockPath, 'tmp');
+      const staged = siblingPath(lockPath, 'tmp');
       const token = randomUUID();
+      const entry = holderName(token);
       try {
-        mkdirSync(tmp);
-        writeFileSync(join(tmp, holderName(token)), JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
-        renameSync(tmp, lockPath);
-        lockTokens.set(lockPath, token);
-        return lockPath;
+        writeFileSync(staged, JSON.stringify({ pid: process.pid, at: realNowMs(), token }), 'utf8');
+        mkdirSync(lockPath);
+        // A stale-empty takeover may remove our directory before this rename. We then land in a
+        // successor's directory or none; only the sole-entry check below grants ownership.
+        try { renameSync(staged, join(lockPath, entry)); } catch (err) {
+          if (err.code === 'ENOENT') continue;
+          throw err;
+        }
+        if (readdirSync(lockPath).join('/') === entry) {
+          lockTokens.set(lockPath, token);
+          return lockPath;
+        }
+        // Another publisher shares this directory: withdraw our entry. rmdir removes only an
+        // empty directory; a publisher whose directory disappears retries.
+        try { retireStoreLock(lockPath, entry); } catch { /* still held by the other entry */ }
       } catch (err) {
-        if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(err.code)) throw err;
+        if (!['EEXIST', 'ENOENT', 'ENOTEMPTY', 'EPERM'].includes(err.code) || !existsSync(dirname(lockPath))) throw err;
       } finally {
-        try { removeLockDir(tmp); } catch { /* best effort */ }
+        try { removeLockDir(staged); } catch { /* best effort */ }
       }
       continue;
     }
@@ -285,9 +298,9 @@ export function acquireStoreLock(storePath) {
       throw err;
     }
     // Age is not permission to evict a live writer: it can resume and commit its old snapshot
-    // after a successor has updated the store. This also protects a publisher paused between
-    // stamping its candidate and renaming it into place. Death is monotonic for this owner;
-    // a replacement's unique entry is still protected by retireStoreLock below.
+    // after a successor has updated the store. A publisher paused between mkdir and adding its
+    // entry may lose its empty directory here; its sole-entry check then fails safe. Death is
+    // monotonic for this owner; a replacement's unique entry is still protected by retireStoreLock.
     if (realNowMs() - at > LOCK_STALE_MS && !(holderPid && processIsAlive(holderPid))) {
       try {
         retireStoreLock(lockPath, entry);

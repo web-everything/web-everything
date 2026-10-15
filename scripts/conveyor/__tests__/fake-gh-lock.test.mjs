@@ -188,6 +188,81 @@ describe('fake-gh store lock recovery', () => {
     expect(waiting.acquired()).toBe(true);
   }, 5_000);
 
+  it('never replaces a lock directory created between the acquire check and publish', () => {
+    const store = fixture();
+    // Pause the acquirer right after it saw no lock, create a fresh empty lock there, then resume.
+    // Hook both publish shapes (rename onto the lock, or exclusive mkdir of it).
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { acquireStoreLock } from ${JSON.stringify(helper)};
+      const lock = ${JSON.stringify(`${store}.lock`)};
+      const saved = { renameSync: fs.renameSync, mkdirSync: fs.mkdirSync };
+      let injected = false;
+      function inject() { if (!injected) { injected = true; saved.mkdirSync(lock); } }
+      fs.renameSync = (from, to) => { if (to === lock) inject(); return saved.renameSync(from, to); };
+      fs.mkdirSync = (path, options) => { if (path === lock) inject(); return saved.mkdirSync(path, options); };
+      syncBuiltinESMExports();
+      const wait = Atomics.wait;
+      Atomics.wait = () => { throw new Error('replacement is still held'); };
+      let outcome = 'acquired';
+      try { acquireStoreLock(${JSON.stringify(store)}); } catch (err) {
+        if (err.message !== 'replacement is still held') throw err;
+        outcome = 'blocked';
+      } finally {
+        Object.assign(fs, saved);
+        syncBuiltinESMExports();
+        Atomics.wait = wait;
+      }
+      process.stdout.write(JSON.stringify({ injected, outcome, entries: fs.readdirSync(lock) }));
+    `], { encoding: 'utf8', timeout: 10_000 }));
+    expect(result.injected).toBe(true);
+    expect(result.outcome).toBe('blocked');
+    expect(result.entries).toEqual([]);
+  });
+
+  it('withdraws from a replacement owner after its own empty lock was retired mid-publish', () => {
+    const store = fixture();
+    // Pause the publisher after its mkdir: retire its empty directory as a stale takeover would,
+    // let another process acquire, then resume the publisher's move into the shared path.
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { execFileSync } from 'node:child_process';
+      import { acquireStoreLock } from ${JSON.stringify(helper)};
+      const lock = ${JSON.stringify(`${store}.lock`)};
+      const saved = { renameSync: fs.renameSync };
+      let replacement;
+      fs.renameSync = (from, to) => {
+        if (!replacement && to.startsWith(lock + '/')) {
+          fs.rmdirSync(lock);
+          execFileSync(process.execPath, ['--input-type=module', '-e',
+            'import { acquireStoreLock } from ' + ${JSON.stringify(JSON.stringify(helper))} +
+            '; acquireStoreLock(' + JSON.stringify(${JSON.stringify(store)}) + ');'
+          ], { timeout: 5_000 });
+          replacement = fs.readdirSync(lock)[0];
+        }
+        return saved.renameSync(from, to);
+      };
+      syncBuiltinESMExports();
+      const wait = Atomics.wait;
+      Atomics.wait = () => { throw new Error('replacement is still held'); };
+      let outcome = 'acquired';
+      try { acquireStoreLock(${JSON.stringify(store)}); } catch (err) {
+        if (err.message !== 'replacement is still held') throw err;
+        outcome = 'blocked';
+      } finally {
+        Object.assign(fs, saved);
+        syncBuiltinESMExports();
+        Atomics.wait = wait;
+      }
+      process.stdout.write(JSON.stringify({ replacement, outcome, entries: fs.readdirSync(lock) }));
+    `], { encoding: 'utf8', timeout: 10_000 }));
+    expect(result.replacement).toMatch(/^holder-/);
+    expect(result.outcome).toBe('blocked');
+    expect(result.entries).toEqual([result.replacement]);
+  });
+
   it('does not release a replacement acquired by another process after stale takeover', () => {
     const store = fixture();
     const lock = acquireStoreLock(store);
