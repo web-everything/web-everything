@@ -175,6 +175,36 @@ describe('fake-gh store lock recovery', () => {
     expect(existsSync(lock)).toBe(false);
   });
 
+  it('recovers two crashed holders left in one directory but keeps a live one', () => {
+    const store = fixture();
+    const lock = `${store}.lock`;
+    mkdirSync(lock);
+    const dead = (n) => JSON.stringify({ pid: deadPid(), at: realNowMs() - 60_000, token: `dead-${n}` });
+    writeFileSync(join(lock, 'holder-00000000-0000-0000-0000-000000000001.json'), dead(1));
+    writeFileSync(join(lock, 'holder-00000000-0000-0000-0000-000000000002.json'), dead(2));
+    const started = realNowMs();
+    expect(acquireStoreLock(store)).toBe(lock);
+    expect(realNowMs() - started).toBeLessThan(2_000);
+    expect(readdirSync(lock)).toHaveLength(1);
+    releaseStoreLock(lock);
+
+    mkdirSync(lock);
+    const live = JSON.stringify({ pid: process.pid, at: realNowMs() - 60_000, token: 'live' });
+    writeFileSync(join(lock, 'holder-00000000-0000-0000-0000-000000000003.json'), dead(3));
+    writeFileSync(join(lock, 'holder-00000000-0000-0000-0000-000000000004.json'), live);
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { acquireStoreLock } from ${JSON.stringify(helper)};
+      let waits = 0;
+      Atomics.wait = () => { if (++waits > 3) throw new Error('live holder'); return 'timed-out'; };
+      try { acquireStoreLock(${JSON.stringify(store)}); process.stdout.write('acquired'); } catch (err) {
+        if (err.message !== 'live holder') throw err;
+        process.stdout.write('blocked');
+      }
+    `], { encoding: 'utf8', timeout: 5_000 });
+    expect(result).toBe('blocked');
+    expect(readdirSync(lock)).toEqual(['holder-00000000-0000-0000-0000-000000000004.json']);
+  });
+
   it('waits for a fresh orphan instead of replacing the empty directory', async () => {
     const store = fixture();
     const lock = `${store}.lock`;

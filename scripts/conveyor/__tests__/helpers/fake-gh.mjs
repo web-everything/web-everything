@@ -278,13 +278,35 @@ export function acquireStoreLock(storePath) {
     let entry;
     try {
       const entries = readdirSync(lockPath);
-      // A published lock has exactly one entry. Unknown contents fail closed rather than
-      // removing files we cannot attribute to a holder.
-      if (entries.length > 1 || (entries.length === 1 && !isHolderName(entries[0]))) {
+      // Unknown contents fail closed rather than removing files we cannot attribute to a holder.
+      if (entries.some((name) => !isHolderName(name))) {
+        sleepSyncMs(5 + Math.floor(Math.random() * 15));
+        continue;
+      }
+      // Two holder entries share a directory only while a publisher withdraws. If both were
+      // killed, unlink each dead one by its unique name so the directory can age out.
+      if (entries.length > 1) {
+        let removed = 0;
+        for (const name of entries) {
+          const path = join(lockPath, name);
+          let stale = realNowMs() - statSync(path).mtimeMs > LOCK_STALE_MS;
+          try {
+            const holder = JSON.parse(readFileSync(path, 'utf8'));
+            if (Number.isFinite(holder?.at)) stale = realNowMs() - holder.at > LOCK_STALE_MS;
+            if (Number.isSafeInteger(holder?.pid) && holder.pid > 0 && processIsAlive(holder.pid)) stale = false;
+          } catch (err) {
+            if (err.code === 'ENOENT') continue;
+          }
+          if (stale) try { unlinkSync(path); removed++; } catch { /* already withdrawn */ }
+        }
+        // Every listed holder was dead: retire the directory now. rmdir fails if anyone arrived.
+        if (removed === entries.length) try { rmdirSync(lockPath); continue; } catch { /* reoccupied */ }
         sleepSyncMs(5 + Math.floor(Math.random() * 15));
         continue;
       }
       entry = entries[0];
+      // An empty directory's age must come from the generation we just listed, not the earlier stat.
+      if (!entry) at = statSync(lockPath).mtimeMs;
       if (entry) {
         const raw = readFileSync(join(lockPath, entry), 'utf8');
         try {
