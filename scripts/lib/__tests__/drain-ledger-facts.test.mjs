@@ -315,10 +315,23 @@ describe('drain ledger facts — wiring: written only after the cascade confirms
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs'), 'utf8');
   it('is never recorded on the pass-start decision, only inside the land cascade', () => {
     expect(src.match(/recordDrainLedgerFacts\(/g)).toHaveLength(1);
-    const helper = src.indexOf('const recordLandedLedgerFacts = (c, headSha) => {');
+    const helper = src.indexOf('const recordLandedLedgerFacts = async (c, headSha) => {');
     expect(helper).toBeGreaterThan(src.indexOf('const merged = [];'));
     expect(src.indexOf('recordDrainLedgerFacts(')).toBeGreaterThan(helper);
-    expect(src.match(/recordLandedLedgerFacts\(c, traceHeadSha\)/g)).toHaveLength(2);
+    expect(src.match(/await recordLandedLedgerFacts\(c, traceHeadSha\)/g)).toHaveLength(2);
+  });
+  it('re-reads the ledger at write time, so a verdict appended mid-cascade is seen before a restamp', () => {
+    const helper = src.indexOf('const recordLandedLedgerFacts = async (c, headSha) => {');
+    const reread = src.indexOf('const read = await readDrainLedgerSnapshot([c.repo || localSlug]);', helper);
+    expect(helper).toBeGreaterThan(-1);
+    expect(reread).toBeGreaterThan(helper);
+    expect(src.indexOf('recordDrainLedgerFacts(', helper)).toBeGreaterThan(reread);
+    expect(src.slice(src.indexOf('recordDrainLedgerFacts(', helper)).split('\n')[0]).toContain('read }');
+  });
+  it('a restamp planned on a fresh read never follows a newer rejection of the same head', () => {
+    const gate = { reviewGate: { acceptedMerge: true } };
+    expect(plan([verdict('accepted')], gate)).toHaveLength(1);
+    for (const kind of ['changes', 'human', 'pending']) expect(plan([verdict('accepted'), verdict(kind, head)], gate)).toEqual([]);
   });
   it('each call follows every cascade refusal and a confirmed merge or enqueue', () => {
     const refusals = ["if (revalidated.decision !== 'merge') {", 'if (!(await mergeQueueGate(c, revalidated.headSha))) {',

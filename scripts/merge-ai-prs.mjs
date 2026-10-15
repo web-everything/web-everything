@@ -6177,12 +6177,11 @@ async function runCli() {
   // dropped the record for those two kinds); a collision-heal in flight (`v.collisionHealed` — self-fixing, CI
   // is re-running on the renumbered tip, nothing for a human to act on yet); an uncertified PR (not a producer
   // PR the drain owns — never comment on an unrelated human PR).
-  let readDrainLedger = null;
   if (!DRY_RUN) {
     // E3 (#3929, plan R8) — a held/skipped PR whose drain reason CHANGED gets exactly one `drain-hold` event.
-    // Additive and fail-soft: runs before, and never alters, the stamping below. Both recorders dedup against one
-    // read of the store their writes land in, taken before they write, so a shared-store miss is retried next pass.
-    readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
+    // Additive and fail-soft: runs before, and never alters, the stamping below. It dedups against one read of the
+    // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
+    const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of skipped) {
       if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
@@ -6210,10 +6209,13 @@ async function runCli() {
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once the cascade below CONFIRMS its merge or enqueue. The
   // pass-start `decision` is not enough: the fresh re-read, merge-queue freshness, branch preparation, the merge
-  // lock and the merge itself can each still refuse it. Fail-soft: a failed write never changes the landing.
-  const recordLandedLedgerFacts = (c, headSha) => {
-    if (!readDrainLedger) return;
-    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read: readDrainLedger });
+  // lock and the merge itself can each still refuse it. The ledger is re-read right before the write, never reused
+  // from pass start: a `changes`/`human` row appended mid-cascade must not be followed by a clearing restamp.
+  // Fail-soft: an unreadable ledger writes nothing, and a failed write never changes the landing.
+  const recordLandedLedgerFacts = async (c, headSha) => {
+    if (DRY_RUN) return;
+    const read = await readDrainLedgerSnapshot([c.repo || localSlug]);
+    const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
     if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
   };
   const failedMerges = [];
@@ -6697,7 +6699,7 @@ async function runCli() {
           }
           if (landLock.result?.enqueued === true) {
             enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
-            recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+            await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
           }
           if (landLock.result?.enqueued === false) {
             enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'batching-deferred', reason: landLock.result.reason });
@@ -6705,7 +6707,7 @@ async function runCli() {
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
-          recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
+          await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
           // #2393 — a WE-carrier merge (the PR carrying its OWN manifest = the resolve carrier + where `bornAs`
