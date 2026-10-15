@@ -82,12 +82,12 @@ Keep all other evidence identical to the positive control so each refusal indepe
 
 Require the authorization controls at every boundary below. For each row, use the same otherwise-valid identities and reproduction evidence in four fixtures: trusted author with a leading marker (positive), untrusted author with that leading marker (forged-author negative), trusted author with only a quoted/fenced/embedded marker (quoted-marker negative), and untrusted author with only that non-leading marker (combined negative). Run the blockquote, fenced-code and after-prose forms separately. Each negative must preserve the refusal shown; only the positive may permit the listed transition.
 
-| Boundary and test home | Negative-control result | Positive-control transition |
-| --- | --- | --- |
-| Base-request enrichment — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | No verified request and no base fix | Verified request reaches base-fix planning |
-| Machine stand-down reclassification — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | Original child hold remains authoritative | Exact incident-bound machine hold becomes inherited waiting |
-| Child-incident discovery — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | No delivery or refresh authorized by the comment | Eligible incident enters delivery or guarded refresh |
-| Base-note read-back — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | Delivery remains unacknowledged; legitimate retry is not suppressed | Matching note acknowledges delivery and suppresses duplicate posting |
+| Boundary and test home | Trusted author + leading marker (positive) | Forged (non-trusted) author + leading marker (refused) | Trusted author + quoted (not leading) marker (refused) |
+| --- | --- | --- | --- |
+| Base-request enrichment — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | Verified request reaches base-fix planning | No verified request and no base fix | No verified request and no base fix |
+| Machine stand-down reclassification — `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` | Exact incident-bound machine hold becomes inherited waiting | Original child hold remains authoritative | Original child hold remains authoritative |
+| Child-incident discovery — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | Eligible incident enters delivery or guarded refresh | No delivery or refresh authorized by the comment | No delivery or refresh authorized by the comment |
+| Base-note read-back — `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs` | Matching note acknowledges delivery and suppresses duplicate posting | Delivery remains unacknowledged; legitimate retry is not suppressed | Delivery remains unacknowledged; legitimate retry is not suppressed |
 
 ## Proof plan
 
