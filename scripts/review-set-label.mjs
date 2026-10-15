@@ -1517,7 +1517,12 @@ export function runReviewLabelCli({
     const clearer = parseOperatorClearance((Array.isArray(thread.comments) ? thread.comments : []).filter(isTrustedMarkerAuthor));
     const clearance = humanCarry.action === 'carry' && humanCarry.human === true
       ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
-    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable };
+    // PR #5273: whether this read saw the complete thread, and the latest clearance in it (for the hand-off's race undo).
+    // Complete when a full re-read replaced the page, or the page itself was short (nothing past it).
+    const threadComplete = Array.isArray(thread.comments)
+      && (thread.comments !== prComments || prComments.length < PR_COMMENTS_PAGE_SIZE);
+    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable,
+      threadComplete, latestClearedSha: threadComplete ? parseLatestHumanClearedSha(thread.comments) : null };
   };
   // PR #4631 (ruling a): a DECIDED refusal to carry across the drain's mechanical park (the diff changed, a later
   // verdict or objection stands, the clearance has no fingerprint) means a review of the change is owed — exactly what
@@ -1563,9 +1568,12 @@ export function runReviewLabelCli({
       // `retryable`: the refusal is a read miss (unreadable diff / reviews / thread), not a decision about the PR.
       // PR #5273: a refusal that overrides a clearance already naming the live head (a later verdict or hold) is a
       // deliberate park, not a race; it must not be withdrawn on that clearance.
-      // `from` is the latest accept record in the complete thread; the first page is checked too.
+      // Proven only from the complete thread: without it (carry-forward off, a first page only) a live-head clearance
+      // past comment 100 could hide, so the hand-off is treated as deliberate (no undo; the hold stays).
       const liveHead = String(headSha).toLowerCase();
-      const overridesLiveClearance = String(humanCarry.from ?? '').toLowerCase() === liveHead
+      const overridesLiveClearance = !derived.threadComplete
+        || String(humanCarry.from ?? '').toLowerCase() === liveHead
+        || String(derived.latestClearedSha ?? '').toLowerCase() === liveHead
         || String(parseLatestHumanClearedSha(prComments) ?? '').toLowerCase() === liveHead;
       if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason, { overridesLiveClearance });
       if (humanCarry.retryable || handOffRetryable) decision = { ...decision, retryable: true };

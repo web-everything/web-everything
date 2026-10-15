@@ -451,6 +451,13 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(r.writes.postComment[0]).not.toContain('mechanical-hold-handoff:');
     expect(r.writes.setLabels.at(-1)).toEqual({ add: 'review:human', remove: [MECH] });
   });
+  it('a hand-off without the complete thread (carry-forward off, a full first page) carries no race marker', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    const page = [clearComment(), ...filler(98), later];
+    const r = restamp({ comments: page, fullComments: page, setting: 'off' });
+    if (r.writes.postComment.length) expect(r.writes.postComment[0]).not.toContain('mechanical-hold-handoff:');
+    expect(r.writes.setLabels.filter(s => s.add === 'review:accepted')).toEqual([]);
+  });
 
   it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR still keeps cleared-human', () => {
     const r = restamp({ comments: [clearComment()], labels: ['review:accepted'] });
