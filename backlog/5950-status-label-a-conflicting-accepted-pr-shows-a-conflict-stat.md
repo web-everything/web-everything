@@ -3,35 +3,52 @@ bornAs: xdohuyg
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/conveyor/pr-status-label.mjs"]
+scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/__tests__/pr-status-label.test.mjs"]
 dateOpened: "2026-10-12"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
 tags: []
 ---
 
 # Status label: a conflicting accepted PR shows a conflict state, not ready-to-merge
 
-Held finding 244 (2026-10-11). derivePrStatusLabel returns ready-to-merge on review:accepted before checking merge conflicts (ci-red is now checked first, conflicts are not). Live: #4792 CONFLICTING + red CI, labelled ready. Fix: a conflict state (mergeable CONFLICTING / mergeStateStatus DIRTY) ahead of the accepted check; test.
+A PR with a known merge conflict must not be described as ready to merge just because review is accepted. Add a conflict status before the accepted-readiness branch while preserving existing higher-priority operator and CI states.
+
+## Progress
+
+- Original scope omitted the existing matching test; corrected scope includes it. Original incident #4792 described red CI plus conflict showing ready; that is historical evidence, not a current live observation.
+- Current code already checks required red CI before acceptance in we:scripts/conveyor/pr-status-label.mjs:120–124. The remaining defect is a known conflict with no higher-priority CI/operator state: the accepted branch returns readiness without checking either mergeability field.
+- The status vocabulary and descriptions are declared in we:scripts/conveyor/pr-status-label.mjs:18–42; add the new state there so existing label planning recognizes and removes it normally. Current readiness/CI tests live in we:scripts/conveyor/__tests__/pr-status-label.test.mjs:63 and :163.
+- Size remains 1: approximately 8 source lines and 45 test lines across two files.
+
+## Design
+
+Add `conflict` to the state vocabulary with a description explaining that merge conflicts need repair. After existing operator and red-CI checks, but before accepted/red-team readiness, treat either `mergeable === 'CONFLICTING'` or `mergeStateStatus === 'DIRTY'` as conflict. If a fix/CI-heal worker is active, report `fixing`; otherwise report `conflict`. Preserve operator attention and red-CI precedence. Unknown or missing mergeability is not positive conflict evidence and keeps existing behavior.
+
+## MVP
+
+Register the new label state, insert the conflict branch, and test both classification and the existing add/remove label plan. Keep the normal tagger as the only label writer.
+
+## Test plan
+
+Extend we:scripts/conveyor/__tests__/pr-status-label.test.mjs with accepted+CONFLICTING and accepted+DIRTY, each without the other field; explicit ready-to-merge labels must not hide either conflict. Cover active fixer, active review/red-team, operator attention, red required CI, unknown/missing mergeability, and contradictory fields (either explicit conflict wins). Assert the transition removes `status:ready-to-merge`, adds `status:conflict`, and reverses after conflict clearance; the new label is recognized by the regex and has a description. Run the suite through the host heavy-admission queue.
+
+## Proof plan
+
+Replay an accepted green-CI snapshot with DIRTY through the real derivation and label planner: before, readiness; after, conflict with one add and one remove. Repeat with CONFLICTING only, then clear the conflict and observe readiness returning. Use injected snapshots without live label mutations; red CI must still report its existing higher-priority state.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+Neither explicit conflict representation can yield ready-to-merge. Existing operator, CI and running-repair states retain priority, and the managed status label remains singular across transitions.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+No merge permission change, conflict repair dispatch, polling/schema expansion, or reordering of operator/CI policy.
 
-## Edge cases this change must handle
+## Edge cases
 
-One line per class: either the handling, or `n/a: <why>`.
+Missing snapshot fields are not invented conflicts. Stale managed labels are removed by the existing planner. Explicit contradictory conflict evidence prevents readiness. No untrusted text parsing, new shared file, endpoint or authorship decision is introduced.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Follow-ups
+
+If a future snapshot producer omits both mergeability fields, fix that producer separately with evidence; this item handles the existing two supported representations.
