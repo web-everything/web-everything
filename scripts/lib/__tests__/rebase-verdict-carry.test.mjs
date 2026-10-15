@@ -17,7 +17,7 @@ describe('verdict carry', () => {
   });
   it('trusts authors and refuses superseding holds', () => {
     const accept = comment(`<!-- reviewed-sha: ${a} -->`);
-    expect(findCarriableVerdict({ comments: [accept], headSha: b }).sha).toBe(a);
+    expect(findCarriableVerdict({ comments: [accept], headSha: b })).toBeNull();
     expect(findCarriableVerdict({ comments: [accept], headSha: a })).toBeNull();
     expect(findCarriableVerdict({ comments: [{ ...accept, author: { login: 'stranger' } }], headSha: b })).toBeNull();
     for (const body of ['🔁 review — changes requested', '<!-- drain-park-reason -->\nnew policy park', 'review paused: revoke']) expect(findCarriableVerdict({ comments: [accept, comment(body)], headSha: b })).toBeNull();
@@ -27,10 +27,26 @@ describe('verdict carry', () => {
       expect(findCarriableVerdict({ comments: [accept, comment(`<!-- we:red-team-gate pr=1 rev=${a} outcome=${outcome} -->`)], headSha: b, pr: 1 })).toBeNull();
     }
     const carried = comment(buildVerdictCarriedMarker({ fromSha: b, toSha: a, patchId: p }));
-    expect(findCarriableVerdict({ comments: [accept, carried], headSha: b })?.sha).toBe(a);
+    expect(findCarriableVerdict({ comments: [accept, gate, carried], headSha: b })?.sha).toBe(a);
     const advisoryBody = `<!-- we:red-team-advisory pr=1 rev=${a} -->\nNo confirmed breaks.`;
     const combined = comment(`${buildVerdictCarriedMarker({ fromSha: b, toSha: a, patchId: p })}\n${advisoryBody}`);
     expect(findCarriableVerdict({ comments: [accept, combined], headSha: b })?.advisoryBody).toBe(advisoryBody);
+  });
+  it('requires a trusted completed red-team record for the accepted PR and head', () => {
+    const accept = comment(`<!-- reviewed-sha: ${a} -->`);
+    for (const record of [null,
+      comment(`<!-- we:red-team-gate pr=2 rev=${a} outcome=card-queued -->`),
+      comment(`<!-- we:red-team-gate pr=1 rev=${b} outcome=card-queued -->`),
+      comment(`<!-- we:red-team-advisory pr=2 rev=${a} -->`),
+      comment(`<!-- we:red-team-advisory pr=1 rev=${b} -->`),
+      { author: { login: 'stranger' }, body: `<!-- we:red-team-advisory pr=1 rev=${a} -->` },
+    ]) {
+      expect(findCarriableVerdict({ comments: [record, accept].filter(Boolean), headSha: b, pr: 1 }), record?.body).toBeNull();
+    }
+    for (const body of [`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`,
+      `<!-- we:red-team-advisory pr=1 rev=${a} -->\nNo confirmed breaks.`]) {
+      expect(findCarriableVerdict({ comments: [accept, comment(body)], headSha: b, pr: 1 })?.sha).toBe(a);
+    }
   });
   it('drops only trusted same-sha provenance and preserves later holds', () => {
     const accept = comment(`<!-- reviewed-sha: ${a} -->`);
@@ -38,7 +54,7 @@ describe('verdict carry', () => {
     const gate = (sha, outcome) => `<!-- we:red-team-gate pr=1 rev=${sha} outcome=${outcome} -->`;
     const advisory = (sha, finding = '') => `<!-- we:red-team-advisory pr=1 rev=${sha} -->\n${finding}`;
     const broken = '1. [**confirmed**] (correctness, broken) — Breaks approval';
-    const find = c => findCarriableVerdict({ comments: [accept, c], headSha: b, pr: 1 });
+    const find = c => findCarriableVerdict({ comments: [accept, comment(gate(a, 'card-queued')), c], headSha: b, pr: 1 });
     for (const body of [carry, `${gate(a, 'card-queued')}\n${carry}\nReview verdict carried across an identical contribution.\n${advisory(a)}`, gate(a, 'card-queued'), advisory(a), advisory(a, '1. [**confirmed**] (quality, degraded) — Cosmetic'), advisory(a, '1. [not confirmed] (correctness, broken) — Unproven')]) {
       expect(find(comment(body))?.sha, body).toBe(a);
       expect(find({ ...comment(body), author: { login: 'stranger' } }), body).toBeNull();
@@ -47,6 +63,31 @@ describe('verdict carry', () => {
       expect(find(comment(body)), body).toBeNull();
     }
     expect(find({ ...comment('unknown hold'), author: { login: 'stranger' } })).toBeNull();
+    for (const marker of [gate(a, 'card-queued'), carry, advisory(a),
+      `${gate(a, 'card-queued')}\n${carry}\nReview verdict carried across an identical contribution.\n${advisory(a)}`]) {
+      for (const sep of ['\n', '\r\n', '\r', '\u2028', '\u2029']) {
+        for (const body of [`unknown hold${sep}${marker}`, `${marker}${sep}unknown hold`]) {
+          expect(find(comment(body)), body).toBeNull();
+        }
+      }
+    }
+  });
+  it('recognizes producer-rendered provenance and preserves text outside it', async () => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const { buildGateComment } = await import('../../operations/red-team-gate-apply.mjs');
+    const accept = comment(`<!-- reviewed-sha: ${a} -->`);
+    const gate = buildGateComment({ pr: 1, head: a, outcome: 'card-queued',
+      plan: { sendBack: [], card: [{ index: 1 }], advisory: [{ index: 2 }] }, cardResult: { ok: true, session: 'red-team-card' } });
+    const advisory = findings => renderRedTeamComment({ pr: 1, rev: a, provider: 'claude', model: 'test',
+      findings, recheckStatus: 'complete', foldedVerdict: 'accept' });
+    const find = body => findCarriableVerdict({ comments: [accept, comment(body)], headSha: b, pr: 1 });
+    for (const body of [gate, advisory([]), advisory([{ confirmedByRecheck: true, category: 'quality',
+      impactIfUnfixed: 'degraded', summary: 'Cosmetic', failure_scenario: 'Visible text', recheckReason: 'Confirmed' }])]) {
+      expect(find(body)?.sha, body).toBe(a);
+      expect(find(`unknown hold\n${body}`)).toBeNull();
+      expect(find(`${body}\nunknown hold`)).toBeNull();
+    }
+    expect(find(gate.replace(':\n', ': unknown hold\n'))).toBeNull();
   });
   it('settings cascade falls back on invalid values', () => {
     const readFile = () => '{"carryAcrossRebase":"on"}';

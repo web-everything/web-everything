@@ -29,6 +29,10 @@ if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => 
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
+  if (process.env.MQ_PROOF_THROWS && a[a.indexOf('--json') + 1] === 'headRefOid,labels,mergeable') {
+    fs.appendFileSync(F + '.proof-errors', a[2] + '\\n');
+    process.stderr.write('approval proof unavailable'); process.exit(1);
+  }
   // MQ_UNKNOWN_FIRST: GitHub is still recomputing mergeability — the FIRST fresh read (the one that carries
   // mergeStateStatus) of each PR answers UNKNOWN, every later read answers the fixture's real value.
   const fresh = (a[a.indexOf('--json') + 1] || '').includes('mergeStateStatus');
@@ -36,7 +40,8 @@ if (a[0] === 'pr' && a[1] === 'view') {
   const n = fs.existsSync(seen) ? Number(fs.readFileSync(seen, 'utf8')) : 0;
   if (fresh) fs.writeFileSync(seen, String(n + 1));
   const unknown = process.env.MQ_UNKNOWN_FIRST && fresh && n === 0;
-  out({ ...p, ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-09T00:00:00Z' : null });
+  const revalidation = (a[a.indexOf('--json') + 1] || '').endsWith('reviewDecision,labels,commits');
+  out({ ...p, ...(revalidation && process.env.MQ_FRESH_BEHIND ? { mergeStateStatus: 'BEHIND' } : {}), ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-09T00:00:00Z' : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { fs.appendFileSync(F + '.attempts', a[2] + '\\n'); fs.writeFileSync(F + '.merged-' + a[2], ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
@@ -56,13 +61,17 @@ if (a[0] === 'api') {
 process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
+const fs = require('node:fs');
 const a = process.argv.slice(2);
+if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-pins', a.join(' ') + '\\n');
+if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
+if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-mq.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, env: extraEnv = {} }) {
+function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
@@ -73,7 +82,7 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus,
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAt: iso(age),
       commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
@@ -104,11 +113,33 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
     const refreshed = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : null;
-    return { result, stderr: r.stderr, attempts: read('.attempts').map(Number), api: read('.api'), refreshed };
+    return { result, stderr: r.stderr, attempts: read('.attempts').map(Number), api: read('.api'), refreshed,
+      proofErrors: read('.proof-errors'), refreshPins: read('.refresh-pins'), rebaseFetches: read('.rebase-fetches'), rebaseTrees: read('.rebase-trees') };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () => {
+  const throwingProof = { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', MQ_PROOF_THROWS: '1' };
+  it('an unreadable enabled approval proof still calls the legacy stale refresh', () => {
+    const out = runCli({ hookOn: true, ages: [[3002, 120]], env: throwingProof });
+    expect(out.proofErrors).toContain('3002');
+    expect(out.refreshPins.some(line => line.includes('lane/leaf-3002'))).toBe(true);
+    expect(JSON.stringify(out.result)).toContain('head-moved');
+    expect(JSON.stringify(out.result)).not.toContain('approval-proof-unreadable');
+  }, 30000);
+  it('an unreadable enabled approval proof still attempts legacy rebase-drop', () => {
+    const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', env: throwingProof });
+    expect(out.proofErrors).toContain('3001');
+    expect(out.rebaseFetches.some(line => line.includes('lane/leaf-3001'))).toBe(true);
+    expect(out.rebaseTrees.some(line => line.includes('origin/lane/leaf-3001'))).toBe(true);
+    expect(JSON.stringify(out.result)).not.toContain('approved-head proof unreadable');
+  }, 30000);
+  it('an unreadable enabled approval proof preserves the fresh PR for legacy revalidation', () => {
+    const out = runCli({ hookOn: false, ages: [[3001, 5]], env: { ...throwingProof, MQ_FRESH_BEHIND: '1' } });
+    expect(out.proofErrors).toContain('3001');
+    expect(out.result.revalidationAborted?.[0]?.reason).toContain('merge state BEHIND');
+    expect(out.attempts).toEqual([]);
+  }, 30000);
   it('hook ON: the fresh PR merges, the stale-pass PR never reaches gh pr merge and is refreshed instead', () => {
     const { result, stderr, attempts, api } = runCli({ hookOn: true });
     expect(attempts).toEqual([3001]);

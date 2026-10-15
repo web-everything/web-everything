@@ -102,7 +102,7 @@ export default {
       const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
       check(revalidateForMerge(retainApprovedHumanQueueHead(red, { hold: true, queueOwnsFreshness: true })).decision === 'skip', 'queue retention bypassed a red required check');
 
-      for (const mode of ['identical', 'whitespace', 'changed', 'unreadable', 'restamp-failed', 'off']) {
+      for (const mode of ['identical', 'whitespace', 'changed', 'unreadable', 'restamp-failed', 'off', 'red-team-pending', 'gate-with-hold']) {
         const calls = [];
         const posted = [];
         const io = {
@@ -112,7 +112,8 @@ export default {
           updateRecord: () => {}, releaseLane: () => {},
           carryAcrossRebaseSetting: () => ({ value: mode === 'off' ? 'off' : 'on', source: 'soak' }),
           readCarryEvidence: () => ({ headSha: NEXT, comments: [clearance,
-            trusted(`<!-- we:red-team-gate pr=5354 rev=${HEAD} outcome=card-queued -->`)] }),
+            ...(mode === 'red-team-pending' ? [] : [trusted(`<!-- we:red-team-gate pr=5354 rev=${HEAD} outcome=card-queued -->`
+              + (mode === 'gate-with-hold' ? '\nunknown hold' : ''))])] }),
           contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec(tool, args, options) {
             if (tool !== 'git') throw Error(`unexpected tool: ${tool}`);
             if (mode === 'unreadable') throw Error('objects unavailable');

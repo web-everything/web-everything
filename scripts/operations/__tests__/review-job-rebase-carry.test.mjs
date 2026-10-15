@@ -25,14 +25,18 @@ describe('review job rebase carry', () => {
     for (const key of ['runLoop', 'runExtraSeats', 'runRedTeam', 'startSpeculativeRedTeam']) expect(io[key]).not.toHaveBeenCalled();
     expect(io.restampVerdict.mock.invocationCallOrder[0]).toBeLessThan(io.postCarryComment.mock.invocationCallOrder[0]);
   });
-  it.each(['off', 'unequal', 'unreadable', 'restamp-failed'])('%s runs the normal arc without a carry comment', mode => {
+  it.each(['off', 'unequal', 'unreadable', 'restamp-failed', 'red-team-pending', 'gate-with-hold'])('%s runs the normal arc without a carry comment', mode => {
     const io = fixture();
     if (mode === 'off') io.carryAcrossRebaseSetting = () => ({ value: 'off' });
     if (mode === 'unequal') io.contributionPatchId = ({ sha }) => sha === a ? p : a;
     if (mode === 'unreadable') io.readCarryEvidence = () => { throw Error('read failed'); };
     if (mode === 'restamp-failed') io.restampVerdict.mockReturnValue({ ok: false, reason: 'own proof refused' });
+    if (mode === 'red-team-pending') io.readCarryEvidence = () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`)] });
+    if (mode === 'gate-with-hold') io.readCarryEvidence = () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+      trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->\nunknown hold`)] });
     const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).not.toBe('carried'); expect(io.runLoop).toHaveBeenCalledTimes(1); expect(io.postCarryComment).not.toHaveBeenCalled();
+    if (['red-team-pending', 'gate-with-hold'].includes(mode)) expect(io.restampVerdict).not.toHaveBeenCalled();
   });
 });
 
@@ -41,7 +45,8 @@ describe('human clearance remains owned by restamp', () => {
     const { decideRestampHumanClearance, buildVerdictComment } = await import('../../review-set-label.mjs');
     const { parseLatestHumanClearedSha, parseReviewedSha, decideContradictoryVerdictHeal } = await import('../../lib/review-escalation.mjs');
     const oldDiff = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n';
-    const comments = [trusted(buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: a, reviewedDiff: oldDiff }))];
+    const comments = [trusted(buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: a, reviewedDiff: oldDiff })),
+      trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)];
     const io = fixture(); io.readCarryEvidence = () => ({ headSha: b, comments });
     io.restampVerdict = vi.fn(() => {
       const humanClearance = decideRestampHumanClearance({ comments, headSha: b, headDiff: agrees ? oldDiff : oldDiff.replace('+new', '+changed') });
