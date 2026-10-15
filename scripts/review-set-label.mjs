@@ -59,6 +59,8 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
 // #x9xqexm's base-independent third marker. Independent concerns.
@@ -92,6 +94,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
@@ -186,6 +189,107 @@ import {
 } from './lib/reasonless-bounce.mjs';
 
 /**
+ * Whether the merge gate's human-only `review-acceptance` hold applies at `headSha` — the same rule as
+ * merge-gate-ci.mjs#workflowEditFact (not imported: that module pulls in merge-ai-prs.mjs, a cycle). Read at the exact
+ * head; an unreadable change list is `false`, so `clear-human` keeps refusing a label-less PR (fail closed). Live
+ * #5193: the gate demanded a clear-human ceremony on a PR with no `review:human`, and the ceremony refused.
+ */
+export function defaultReadHumanOnlyHold({ headSha, baseRefName, comments, exec = execFileSync, cwd = process.cwd() }) {
+  const read = readPinnedChangedFiles({ headSha, base: baseRefName || 'main', cwd, exec });
+  if (!Array.isArray(read.files)) return false;
+  const hold = workflowEditHold({ files: read.files, expectedCount: read.files.length });
+  return hold.hold === true && hold.humanOnly === true
+    && parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase();
+}
+
+/**
+ * PR #5273 — the markers stamped by the two automatic parks that read labels, then write `review:human` (no
+ * conditional write exists): `human-surface-repark.mjs#buildHumanSurfaceReparkMarker` (duplicated, not imported, so
+ * this CLI does not load that daemon module's graph; the tests pin the two together) and the mechanical-hold
+ * hand-off below. A concurrent `clear-human` of the marked head undoes only these parks.
+ */
+export const HUMAN_SURFACE_REPARK_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
+// Only a 40-hex head is ever embedded (anything else yields no marker, so nothing undoes the hand-off).
+export const buildMechanicalHandoffMarker = headSha => (/^[0-9a-f]{40}$/i.test(String(headSha))
+  ? `<!-- mechanical-hold-handoff: ${String(headSha).toLowerCase()} -->` : '');
+
+/**
+ * PR #5273 — after a marked park's own label write, read the complete thread and the live labels. When a trusted
+ * clearance names this unchanged head, the park lost a race with `clear-human`: remove its `review:human` and restore
+ * `review:accepted`. A bounce or mechanical hold is left alone. A failed read keeps the hold (fail closed) and is
+ * reported on stderr. Returns whether it withdrew.
+ */
+export function withdrawParkOnLiveClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+  try {
+    const thread = typeof provider.readComments === 'function' ? provider.readComments(repo, pr) : null;
+    const fresh = provider.readPrState(repo, pr);
+    const comments = Array.isArray(thread) ? thread : fresh?.comments;
+    if (!Array.isArray(comments) || !Array.isArray(fresh?.labels)) throw new Error('thread or labels unreadable');
+    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) return false;
+    return restoreClearanceOverRacedPark({ provider, repo, pr, headSha, comments, labels: fresh.labels });
+  } catch (e) {
+    warn(`review-set-label: post-park clearance re-check failed (${String(e?.message ?? e).split('\n')[0]}); the hold stays\n`);
+    return false;
+  }
+}
+
+/**
+ * PR #5273 — THE single-home write that undoes a park which lost a race with `clear-human`: remove `review:human` and
+ * restore the `review:accepted` the ceremony stamped. Callers outside this file (the human-surface sweep) read the
+ * live state and pass it in; this re-checks it before writing. Writes only when the latest trusted clearance in
+ * `comments` names `headSha`, `review:human` is present, and no bounce or mechanical hold stands. Returns whether it
+ * wrote. Read errors are the caller's; a write error throws.
+ */
+export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, comments, labels }) {
+  if (!Array.isArray(comments) || !Array.isArray(labels)) return false;
+  if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
+  if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
+    || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
+  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+  return true;
+}
+
+/**
+ * PR #5273 — is `review:human` on `labels` the human-surface sweep's park of `headSha`? That park stamps its marker
+ * BEFORE its label write, so the marker is already readable. `review:accepted` may sit beside it: this ceremony's own
+ * swap can re-add it after the park removed it. A PR the sweep never parked at this head, a bounce or a mechanical
+ * hold is not. Reads the complete thread when the provider can; an unreadable thread is `false` (the hold stays).
+ * Called only inside a clear-human run of this head, so another hold landing on a swept PR in those seconds is the
+ * one residual it can remove.
+ */
+export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, comments = null }) {
+  if (!hasReviewLabel(labels, REVIEW_LABELS.human)
+    || hasReviewLabel(labels, REVIEW_LABELS.changes) || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
+  let thread = comments;
+  try {
+    if (typeof provider.readComments === 'function') thread = provider.readComments(repo, pr);
+  } catch { return false; }
+  const want = String(headSha).toLowerCase();
+  return (Array.isArray(thread) ? thread : []).some(c => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
+    return [...c.body.matchAll(HUMAN_SURFACE_REPARK_RE)].some(m => m[1].toLowerCase() === want);
+  });
+}
+
+/**
+ * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
+ * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
+ * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
+ */
+export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+  try {
+    const fresh = provider.readPrState(repo, pr);
+    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
+    if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    return { reapplied: true };
+  } catch (e) {
+    warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
+    return { reapplied: false, error: true };
+  }
+}
+
+/**
  * we:scripts/review-set-label.mjs#REVIEW_LABEL_TARGETS — the CLOSED set of label-swap targets `decideSetLabel`
  * understands. Exported so anything that must be TOTAL over the targets (the comment-size projection below, and
  * its enum-totality test) enumerates this one list instead of hardcoding a member — PR #1056 review, M2: the
@@ -247,7 +351,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, humanOnlyHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
@@ -257,7 +361,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -292,7 +396,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // a barrier.
   if (to === 'clear-human') {
     // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
-    if (!isHuman && !isHeldMechanical) {
+    if (!isHuman && !isHeldMechanical && !humanOnlyHold) {
       return {
         allowed: false,
         addLabel: '',
@@ -327,7 +431,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
         ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
-      reason: 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
+      reason: humanOnlyHold && !isHuman && !isHeldMechanical
+        ? 'merge-gate human-only hold at the live head cleared via --to=clear-human'
+        : 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
     };
   }
 
@@ -929,6 +1035,7 @@ export function runReviewLabelCli({
   successResult,
   refusalResult,
   allowClearHuman = false,
+  readHumanOnlyHold = defaultReadHumanOnlyHold,
   // The findings write-up, so this function can REFUSE an empty bounce (see the `--to=changes` guard below).
   // The rendered comment still gets its body from the caller's `buildComment` closure — this is the same text,
   // handed over separately so the refusal lives with the other pre-flight validation instead of in one CLI
@@ -1131,6 +1238,7 @@ export function runReviewLabelCli({
   let currentLabels;
   let headSha = '';
   let headRefName = '';
+  let baseRefName = '';
   let prState = '';
   let prBody = '';
   let prTitle = '';
@@ -1149,6 +1257,7 @@ export function runReviewLabelCli({
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
     // one more json field, no extra hop.
     headRefName = typeof parsed.headRefName === 'string' ? parsed.headRefName : '';
+    baseRefName = typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '';
     prState = typeof parsed.state === 'string' ? parsed.state : '';
     // #2844 — the PR body carries the `authored-by-actor` stamp pr-land wrote at open. Same gh call, one more
     // json field, no extra hop — the same "ride the existing read" pattern #2953 used for `state`.
@@ -1269,12 +1378,18 @@ export function runReviewLabelCli({
   const restampAcrossHold = to === 'restamp' && !guardedRestamp
     && hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical) && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
+  // Live #5193: the merge gate's human-only hold demands a clear-human ceremony even when no `review:human` label was
+  // ever set. Asked only for that label-less case, at the head this verdict stamps.
+  const humanOnlyHold = to === 'clear-human' && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
+    && readHumanOnlyHold({ headSha, baseRefName, comments: prComments }) === true;
   let decision = decideSetLabel({
     to,
     currentLabels,
     findingCount: bounceEvidence.findingCount,
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
+    humanOnlyHold,
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
@@ -1416,7 +1531,12 @@ export function runReviewLabelCli({
     const clearer = parseOperatorClearance((Array.isArray(thread.comments) ? thread.comments : []).filter(isTrustedMarkerAuthor));
     const clearance = humanCarry.action === 'carry' && humanCarry.human === true
       ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
-    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable };
+    // PR #5273: whether this read saw the complete thread, and the latest clearance in it (for the hand-off's race undo).
+    // Complete when a full re-read replaced the page, or the page itself was short (nothing past it).
+    const threadComplete = Array.isArray(thread.comments)
+      && (thread.comments !== prComments || prComments.length < PR_COMMENTS_PAGE_SIZE);
+    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable,
+      threadComplete, latestClearedSha: threadComplete ? parseLatestHumanClearedSha(thread.comments) : null };
   };
   // PR #4631 (ruling a): a DECIDED refusal to carry across the drain's mechanical park (the diff changed, a later
   // verdict or objection stands, the clearance has no fingerprint) means a review of the change is owed — exactly what
@@ -1426,7 +1546,7 @@ export function runReviewLabelCli({
   // hold and removes only the drain's own label; it never removes `review:human`. Re-read live first: a PR whose labels
   // moved since this run read them is left alone. Any write miss marks the refusal retryable, so the sweep comes back.
   let handOffRetryable = false;
-  const handMechanicalHoldToOperator = (why) => {
+  const handMechanicalHoldToOperator = (why, { overridesLiveClearance = false } = {}) => {
     try {
       const live = provider.readLabels(repo, pr);
       if (!hasReviewLabel(live, REVIEW_LABELS.heldMechanical) || hasReviewLabel(live, REVIEW_LABELS.human)) return;
@@ -1437,9 +1557,15 @@ export function runReviewLabelCli({
         '',
         `The drain's \`${REVIEW_LABELS.heldMechanical}\` park could not be lifted by carrying the operator's clearance: ${String(why || 'the carry was refused')}.`,
         `A review of this head is owed, so the hold is now \`${REVIEW_LABELS.human}\` (card xu7kxtt, PR #4631 ruling a).`,
+        // The marker lets clear-human and the sweep's heal undo this park if it lost a race; a deliberate override
+        // of a live-head clearance carries none, so nothing undoes it.
+        ...(overridesLiveClearance ? [] : ['', buildMechanicalHandoffMarker(headSha)]),
       ].join('\n'));
       if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
       provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
+      // PR #5273: the same read-then-write race as the human-surface park. Read for a concurrent clear-human of this
+      // head after the write; clear-human recognises this park by its marker for the mirror-image case.
+      if (!overridesLiveClearance) withdrawParkOnLiveClearance({ provider, repo, pr, headSha });
     } catch (e) {
       handOffRetryable = true;
       process.stderr.write(`review-set-label: mechanical-hold hand-off failed (retryable) — ${String((e && e.message) || e).split('\n')[0]}\n`);
@@ -1454,7 +1580,16 @@ export function runReviewLabelCli({
     decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
     if (!decision.allowed) {
       // `retryable`: the refusal is a read miss (unreadable diff / reviews / thread), not a decision about the PR.
-      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason);
+      // PR #5273: a refusal that overrides a clearance already naming the live head (a later verdict or hold) is a
+      // deliberate park, not a race; it must not be withdrawn on that clearance.
+      // Proven only from the complete thread: without it (carry-forward off, a first page only) a live-head clearance
+      // past comment 100 could hide, so the hand-off is treated as deliberate (no undo; the hold stays).
+      const liveHead = String(headSha).toLowerCase();
+      const overridesLiveClearance = !derived.threadComplete
+        || String(humanCarry.from ?? '').toLowerCase() === liveHead
+        || String(derived.latestClearedSha ?? '').toLowerCase() === liveHead
+        || String(parseLatestHumanClearedSha(prComments) ?? '').toLowerCase() === liveHead;
+      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason, { overridesLiveClearance });
       if (humanCarry.retryable || handOffRetryable) decision = { ...decision, retryable: true };
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
@@ -1682,6 +1817,12 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+        // PR #5273: the human-surface sweep can park `review:human` after the first read; this clearance supersedes
+        // that park at this head, so remove it too. Any other concurrent hold keeps the first read's view.
+        if (to === 'clear-human' && !removals.includes(REVIEW_LABELS.human)
+          && isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) {
+          removals = [...removals, REVIEW_LABELS.human];
+        }
       }
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
@@ -1750,6 +1891,11 @@ export function runReviewLabelCli({
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
+  // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
+  // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
+  // The re-park re-reads after its own write too, so at least one side sees the other.
+  if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and

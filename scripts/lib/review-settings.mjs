@@ -35,11 +35,22 @@ export const isValidRoundBudget = (v) => Number.isInteger(v) && v >= 1 && v <= R
  * An integer 0..{@link TAKEOVER_REVIEW_ATTEMPTS_MAX} from the file, or its decimal string from the env.
  */
 export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
+/**
+ * `review.rulingResolvesStandDown` — `on` (built-in) relays a later operator referral ruling as an answer
+ * when no findings remain held and every explicit stand-down finding subject is ruled.
+ * Unbound questions still require the explicit stand-down-answer ceremony; `off` requires it for all holds.
+ * Env: WE_REVIEW_RULING_RESOLVES_STAND_DOWN.
+ *
+ * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions
+ * under NEEDS YOU. `stood-down` keeps the legacy section. Env: WE_REVIEW_STAND_DOWN_QUEUE_SECTION.
+ */
 export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
-  takeoverReviewAttempts: 1 });
+  takeoverReviewAttempts: 1, rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
 export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
-  roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS' });
-const ALLOWED = Object.freeze({ referralDefault: REFERRAL_DEFAULTS, scopedRereview: SCOPED_REREVIEW_MODES });
+  roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS',
+  rulingResolvesStandDown: 'WE_REVIEW_RULING_RESOLVES_STAND_DOWN', standDownQueueSection: 'WE_REVIEW_STAND_DOWN_QUEUE_SECTION' });
+const ALLOWED = Object.freeze({ referralDefault: REFERRAL_DEFAULTS, scopedRereview: SCOPED_REREVIEW_MODES,
+  rulingResolvesStandDown: ['on', 'off'], standDownQueueSection: ['needs-you', 'stood-down'] });
 /** Each key's parser: the valid value, or `undefined` to keep the lower layer. `fromEnv` reads a string. */
 const PARSERS = Object.freeze({
   ...Object.fromEntries(Object.entries(ALLOWED).map(([key, allowed]) => [key, (v) => (allowed.includes(v) ? v : undefined)])),
@@ -81,4 +92,16 @@ export function resolveReviewSettings({ fileConfig = loadReviewSettingsFile(), e
     if (override !== undefined) values[key] = override;
   }
   return values;
+}
+
+/** Source of the winning valid layer, using raw file data so defaults never masquerade as file values. */
+export function resolveReviewSettingSource(key, { fileRaw, env = process.env } = {}) {
+  const parse = PARSERS[key];
+  if (!parse) throw new Error(`unknown review setting: ${key}`);
+  if (parse(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true }) !== undefined) return 'env';
+  if (fileRaw === undefined) {
+    try { fileRaw = JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); }
+    catch { fileRaw = null; }
+  }
+  return parse(fileRaw?.[key]) !== undefined ? 'file' : 'built-in';
 }

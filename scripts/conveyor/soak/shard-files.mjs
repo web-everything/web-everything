@@ -2,9 +2,9 @@
  * @file shard-files.mjs — #4200-ish CI speed-up (card x0zg44l's own harness). Deterministic file-level sharding
  * for `npm run test:soak`, used by `.github/workflows/ci.yml`'s `soak-shard` matrix.
  *
- * Card 11 (perf sweep 2026-10-07): files are assigned to shards by MEASURED time (`scripts/ci/test-timings.json`,
- * greedy longest-first, `scripts/ci/shard-assign.mjs`). The old split pinned the 50-tick baseline alone in shard 1 and
- * round-robined the breaks by sorted index, blind to cost, so the soak shards ran 4.9-13.4 min. A file with no stored
+ * Shard 1 runs the 50-tick baseline alone: sibling scenarios fork enough daemon/git children to slow it past
+ * its test timeout when they share a runner. Breaks are assigned to the remaining shards by MEASURED time
+ * (`scripts/ci/test-timings.json`, greedy longest-first, `scripts/ci/shard-assign.mjs`). A file with no stored
  * timing gets the median, so a new break (one file, discovered from disk — never from `breaks/index.mjs`'s registry)
  * lands in a shard automatically with no shard-list edit. The 50-tick baseline keeps shard 1 to itself:
  * balancing file durations alone put it beside concurrent worlds; CI exhausted its 10-minute budget with
@@ -21,7 +21,7 @@ export const REPO_ROOT = resolve(HERE, '..', '..', '..');
 export const BASELINE_FILE = join(HERE, 'daemon-soak.soak.test.mjs');
 export const BREAKS_DIR = join(HERE, 'breaks');
 
-/** Every `breaks/*.soak.test.mjs` scenario file, sorted for deterministic assignment. */
+/** Every `breaks/*.soak.test.mjs` scenario file, sorted for deterministic discovery. */
 export function listBreakTestFiles(breaksDir = BREAKS_DIR) {
   return readdirSync(breaksDir)
     .filter((f) => f.endsWith('.soak.test.mjs'))
@@ -38,7 +38,7 @@ function toRepoRelative(absPath, repoRoot) {
  *
  * `shard` is 1-based. `total === 1` runs everything (baseline + all breaks) — the single-shard fallback used by
  * `npm run test:soak` (no sharding) and by a local "does the split still work" smoke check. Otherwise the
- * baseline runs alone on shard 1 and the breaks are balanced across the remaining shards by measured time.
+ * baseline is isolated in shard 1 and breaks are balanced across shards 2..N by measured time.
  */
 export function listAllSoakFiles({ breaksDir = BREAKS_DIR, baselineFile = BASELINE_FILE, repoRoot = REPO_ROOT } = {}) {
   return [baselineFile, ...listBreakTestFiles(breaksDir)].map((f) => toRepoRelative(f, repoRoot));

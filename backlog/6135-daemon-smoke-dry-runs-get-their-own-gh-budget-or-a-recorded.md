@@ -3,7 +3,7 @@ bornAs: xstapna
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs"]
+
 dateOpened: "2026-10-14"
 tags: []
 ---
@@ -35,3 +35,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — the smoke pool and snapshot are keyed to the smoke run id; production callers never read them.
 6. **State over time** — the snapshot is used only within one smoke run and discarded after.
 7. **Who wrote it** — n/a: the snapshot is recorded by the smoke itself from gh.
+
+## Findings (standalone worker, 2026-10-14)
+
+The build-dispatch daemon held #6135 with:
+
+> worker-declined: **could-not-prepare** — a genuine design choice remains: allocate additional live GitHub capacity to smoke runs, or require recorded inputs and define what happens when those inputs are unavailable. Current code already shares per-smoke memoized reads ('we:scripts/lib/daemon-live-smoke.mjs:902'), but memo misses still make live calls ('we:scripts/lib/gh-throttle.mjs:1782'). Missing or expired PR snapshots also trigger live fetching ('we:scripts/lib/pr-snapshot.mjs:253'). These mechanisms therefore do not guarantee independence from a saturated production pool. The unresolved choice is whether co…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

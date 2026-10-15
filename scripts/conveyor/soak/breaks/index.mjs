@@ -23,6 +23,7 @@
  * `<id>.mjs` is the WHOLE registration step (no more index-edit merge conflicts when several PRs add a break in
  * the same window). See `we:scripts/check-standards-rules.mjs#findHandMaintainedRegistryIndex` for the standing
  * guard against this file (or `health-smells/index.mjs`) regressing back to a hand-maintained import list.
+ * `codex-unproductive-jumps-to-claude.mjs` is registered through this discovery path as well.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and

@@ -1324,7 +1324,7 @@ describe('fix daemon pass timing', () => {
     });
     expect(Object.keys(result.phaseMs).sort()).toEqual([
       'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
-      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede',
+      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down',
     ].sort());
     for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
     expect(result.passMs).toBeGreaterThanOrEqual(Object.values(result.phaseMs).reduce((a, b) => a + b, 0));

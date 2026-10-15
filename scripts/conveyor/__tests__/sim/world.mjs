@@ -292,9 +292,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     SIM_NPM_MODULES: nodeModulesSrc,
     SIM_NPM_LOCKFILE: join(INVOKING_ROOT, 'package-lock.json'),
     LANE_POOL_ROOT: lanePoolRoot,
-    // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
+    // vitest.setup.ts supplies a per-file throttle root, which takes precedence over LANE_POOL_ROOT.
     // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
     // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    // Cleanup owns this root.
     WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     // Each world owns a different simulated clock. Sharing the test file's throttle store lets
     // an earlier world's clock advance leave a future points window (and leases) for the next
