@@ -1079,3 +1079,15 @@ Terminal stand-downs hold on their recorded head. Reconcile and operator/health 
 from PR `updatedAt` (comments also update it). `fix.standDownHoldsAcrossHeads` defaults to false through
 the standard → platform → tool → env cascade and logs its source. Replay both raw planner inputs and
 queue listings; include same-head holds, abbreviated legacy Head markers and missing/older timestamps.
+
+## Drain enqueue confirmation
+
+Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
+followed by GraphQL `isInMergeQueue` plus the judged head. The installed `gh pr view --json` does not
+expose `isInMergeQueue`; use `readMergeQueueState`, not an invented CLI field. GraphQL errors (including
+“already queued”), null payloads and missing entries are failures. An already queued PR is recovered
+only by observing membership at the pinned head before mutation. Clearance comments follow confirmed
+membership, with trusted live comments plus the shared follow-up state's `clearanceHead` deduping retries.
+Failure counts/backoff live in that same state file; preserve them during follow-up writes. Exercise false
+membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
+with injected IO, never a live enqueue.

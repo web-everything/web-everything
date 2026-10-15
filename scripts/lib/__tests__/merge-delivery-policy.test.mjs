@@ -10,8 +10,15 @@ describe('merge delivery policy cascade', () => {
     const policy = resolveMergeDeliveryPolicy();
     expect(policy).toMatchObject(STANDARD_MERGE_DELIVERY);
     expect(policy.strategy).toBe('drain-direct');
-    expect(policy.sources).toEqual({ strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard', 'concurrency.gateReads': 'standard', 'concurrency.enqueue': 'standard' });
+    expect(policy.sources).toEqual({ enqueueFailureSmellAfter: 'standard', enqueueRetrySeconds: 'standard', strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard', 'concurrency.gateReads': 'standard', 'concurrency.enqueue': 'standard' });
     expect(policy.invalid).toEqual([]);
+  });
+
+  it('resolves enqueue retry and smell settings independently and logs their sources', () => {
+    const policy = resolveMergeDeliveryPolicy({ platform: { enqueueFailureSmellAfter: 5, enqueueRetrySeconds: 30 }, tool: { enqueueFailureSmellAfter: 2, enqueueRetrySeconds: 0 } });
+    expect(policy).toMatchObject({ enqueueFailureSmellAfter: 2, enqueueRetrySeconds: 30, sources: { enqueueFailureSmellAfter: 'tool', enqueueRetrySeconds: 'platform' } });
+    expect(policy.invalid).toContain('tool.enqueueRetrySeconds=0');
+    expect(formatMergeDeliverySourcesLine(policy)).toContain('enqueueFailureSmellAfter=2 (tool)');
   });
 
   it('resolves the shared red-main freeze branch through the cascade and refuses a non-ops branch (xyd06qo)', () => {

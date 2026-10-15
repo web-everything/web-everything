@@ -281,6 +281,9 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
   const read = readPinnedChangedFiles({ headSha, base: pr?.baseRefName || 'main', cwd, exec });
   const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
   if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
+  const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
+  const existing = queueState();
+  if (existing.inQueue === true && existing.head === headSha) return { ok: true, already: true };
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
     const errs = out?.errors;
@@ -288,14 +291,17 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
       const msg = errs.map((x) => x?.message).join('; ');
       const refusal = errs.find((x) => isRequiredWorkflowsUnsatisfiedError(x?.message));
       if (refusal) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: msg, ...(refusal.type != null ? { type: refusal.type } : {}), ...(refusal.code != null ? { code: refusal.code } : {}) };
-      return isAlreadyQueuedError(msg) ? { ok: true, already: true } : { ok: false, error: msg };
+      return { ok: false, error: msg };
     }
     const entry = out?.data?.enqueuePullRequest?.mergeQueueEntry ?? null;
-    return entry ? { ok: true, entry } : { ok: false, error: 'no merge queue entry returned' };
+    if (!entry?.id) return { ok: false, error: 'no merge queue entry returned' };
+    const queue = queueState();
+    if (queue.inQueue !== true || queue.head !== headSha) return { ok: false, unconfirmed: true, error: `enqueue unconfirmed: ${queue.error || (queue.inQueue === false ? 'isInMergeQueue is false' : 'queue head does not match judged head')}` };
+    return { ok: true, entry };
   } catch (e) {
-    const t = errText(e);
+    const t = String(e?.stderr || e?.message || e).trim();
     if (isRequiredWorkflowsUnsatisfiedError(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: t };
-    return isAlreadyQueuedError(t) ? { ok: true, already: true } : { ok: false, error: t };
+    return { ok: false, error: t };
   }
 }
 

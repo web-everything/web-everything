@@ -6675,8 +6675,8 @@ async function runCli() {
           }
           if (landLock.result?.enqueued === true) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
           if (landLock.result?.enqueued === false) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'batching-deferred', reason: landLock.result.reason });
-            if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: batching-deferred: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
+            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
+            if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
@@ -6690,7 +6690,8 @@ async function runCli() {
           for (const id of landedIdsForCandidate(c, { isLocalRepo, openPrNums: otherOpenPrNums(c.repo, c.num) })) landedThisPass.add(id);
           if (!AS_JSON) process.stderr.write(`  ✓ merged ${repoTag(c.repo)}${c.num}${c.item ? ` (#${c.item})` : ''}\n`);
         } catch (e) {
-          const detail = ghListErrText(e);
+          const detail = e.githubMessage ?? ghListErrText(e);
+          if (e.enqueueFailure) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure });
           // #2683 — CONTENDED-FALLBACK idempotency recovery. If the merge write raced past the mutex (the
           // never-hang fallback ran `fn` un-locked) and LOST to a concurrent lander, `gh pr merge` throws here on
           // an already-merged PR. Re-probe: if it is now MERGED, this is the SAME safe idempotent no-op as the
