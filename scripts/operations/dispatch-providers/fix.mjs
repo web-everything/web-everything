@@ -56,12 +56,18 @@ import {
 import { readItemDeliveryAgentMarker } from '../delivery-agent-marker.mjs';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { AGY_FIX_CONFINEMENT } from '../agy-fix-provider.mjs';
 
-/** Executors `fix-run.mjs` can launch today (each needs a write-capable delivery provider). Defined HERE, in the
+/** Executor ports understood by `fix-run.mjs`; production availability also requires confinement below. Defined HERE, in the
  *  leaf, and imported by `fix-run.mjs` — never the reverse: `fix-run.mjs` is a CLI entry with a top-level `await`
  *  that lazily imports the wrapper chain reaching this file, so a `fix.mjs -> fix-run.mjs` import deadlocks it
  *  (exit 13, "unsettled top-level await"). */
-export const FIX_RUN_EXECUTORS = Object.freeze(['codex']);
+export const FIX_RUN_EXECUTORS = Object.freeze(['codex', 'antigravity']);
+/** Availability is conditional on a declared confinement boundary for untrusted PR and CI input. */
+export const FIX_RUN_CONFINEMENT = Object.freeze({
+  codex: Object.freeze({ mode: 'sandboxed', boundary: 'workspace' }),
+  antigravity: AGY_FIX_CONFINEMENT,
+});
 
 /** The per-dispatch process {@link fixDetachedProvider} starts. Resolved by SCRIPT LOCATION, never cwd — same
  *  reason {@link REPO_ROOT} is. */
@@ -69,7 +75,8 @@ export const FIX_RUN_SCRIPT = join(REPO_ROOT, 'scripts', 'operations', 'fix-run.
 
 /** Card 87 follow-up — can a borrowed fix launch on `executor` from this checkout? Claude never needs the run script. */
 export function fixLauncherAvailable(executor, { exists = existsSync, runScript = FIX_RUN_SCRIPT } = {}) {
-  return executor === 'claude' || (FIX_RUN_EXECUTORS.includes(executor) && exists(runScript));
+  return executor === 'claude' || (FIX_RUN_EXECUTORS.includes(executor)
+    && FIX_RUN_CONFINEMENT[executor]?.mode === 'sandboxed' && exists(runScript));
 }
 
 /**
