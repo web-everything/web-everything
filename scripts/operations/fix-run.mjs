@@ -744,21 +744,27 @@ export async function runFixCli(argv = [], {
       const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
-    const spawned = await provider.spawn({
-      taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-      sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
-        ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-        : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
-      ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
-    }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
-      spawnAgent: async (...args) => {
-        try {
-          const result = await spawnCodex(...args);
-          finalMessage = agentFinalMessage(result);
-          return result;
-        } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
-      },
-    } : {}) });
+    let spawned;
+    try {
+      spawned = await provider.spawn({
+        taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
+        sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+          ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
+          : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+        ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
+      }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
+        spawnAgent: async (...args) => {
+          try {
+            const result = await spawnCodex(...args);
+            finalMessage = agentFinalMessage(result);
+            return result;
+          } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
+        },
+      } : {}) });
+    } catch (e) {
+      finalMessage = agentFinalMessage(e) || finalMessage;
+      throw e;
+    }
     finalMessage = agentFinalMessage(spawned) || finalMessage;
     const configAfterAgent = laneConfig();
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');

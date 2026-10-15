@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
-import { fixDetachedProvider } from '../../operations/dispatch-providers/fix.mjs';
+import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
 import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
@@ -477,6 +477,19 @@ describe('CI-heal stale-base dispatch seam', () => {
 
 describe('fallback chain routing', () => {
   const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
+  it('skips opted-in Argon while its production confinement contract is unavailable', () => {
+    expect(chooseFixExecutor({ setting, chain, codexUnproductive: 3, launcherAvailable: fixLauncherAvailable }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', reason: expect.stringContaining('argon launcher unavailable') });
+  });
+  it.each(['fix', 'ci-heal'])('round 3 %s with two unproductive runs still tries codex-alt', kind => {
+    const head = 'a'.repeat(40);
+    const decision = routeFixExecutor({ repo: 'we', pr: 42, kind, round: 3, headRefOid: head }, {
+      setting, chain, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null,
+      launcherAvailable: () => true, criticalFor: () => false,
+      readRouted: () => ({ 'we#42': [{ head, outcome: 'failed' }, { head, outcome: 'no-change' }] }),
+    });
+    expect(decision).toMatchObject({ rung: 'codex-alt', executor: 'codex' });
+  });
   it('routes triggers through the chain and keeps main-fix on Claude', () => {
     const decision = chooseFixExecutor({setting,chain,strongerModel:true,launcherAvailable:()=>true});
     expect(decision).toMatchObject({rung:'codex-alt',source:'repo',policyRoute:{model:'gpt-6-astra',effort:'high'}});

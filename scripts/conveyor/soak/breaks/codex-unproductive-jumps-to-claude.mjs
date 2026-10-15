@@ -4,7 +4,7 @@
  * stronger-model fixes. The fallback chain must try codex-alt first without weakening the critical-work gate.
  *
  * SCENARIO: route an ordinary fix with two unproductive Codex runs on its head, a round-3 ordinary fix
- * with none, and a critical fix with two. RED = either ordinary fix picks Claude; GREEN = both pick
+ * with none, a round-3 fix with two, and a critical fix with two. RED = an ordinary fix skips codex-alt; GREEN = all pick
  * codex-alt, while critical escalation still picks Claude.
  */
 import { execFileSync } from 'node:child_process';
@@ -36,6 +36,7 @@ const options = {
 const out = {
   unproductive: routeFixExecutor(planned, options),
   strongerModel: routeFixExecutor({ ...planned, pr: 5281, round: 3 }, options),
+  combined: routeFixExecutor({ ...planned, round: 3 }, options),
   critical: routeFixExecutor(planned, { ...options, criticalFor: () => true }),
 };
 process.stdout.write(JSON.stringify(out));
@@ -66,6 +67,7 @@ export default {
       for (const [key, invariant, detail] of [
         ['unproductive', 'unproductive-tries-codex-alt', 'two unproductive Codex runs on this head'],
         ['strongerModel', 'stronger-model-tries-codex-alt', 'round-3 ordinary fix with no unproductive runs'],
+        ['combined', 'combined-triggers-try-codex-alt', 'round-3 ordinary fix with two unproductive runs'],
       ]) {
         const decision = out[key];
         if (decision.executor !== 'codex' || decision.rung !== 'codex-alt') {

@@ -11,7 +11,7 @@ export const FIX_EXECUTOR_RUNGS = Object.freeze({
   argon: rung('argon', 'antigravity', { provider: 'antigravity', model: 'gemini-4-argon-high' }),
   claude: rung('claude', 'claude'),
 });
-export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(['codex', 'codex-alt', 'argon', 'claude']);
+export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(['codex', 'codex-alt', 'claude']);
 const valid = value => Array.isArray(value) && value.length > 0 && value.at(-1) === 'claude'
   && new Set(value).size === value.length && value.every(id => Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
 const platformPreferences = () => {
@@ -34,10 +34,9 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
 
 export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = null, codexUnproductive = 0,
   critical = false, launcherAvailable = () => true }) {
-  let index = trigger ? 1 : 0;
   const unproductive = codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE;
-  if (unproductive) index += codexUnproductive - 1;
-  index = Math.min(index, chain.length - 1);
+  // Triggers and failure history describe the same progress: take their floor, never add them.
+  let index = Math.min(Math.max(trigger ? 1 : 0, unproductive ? codexUnproductive - 1 : 0), chain.length - 1);
   const prefix = trigger === 'takeover' ? 'takeover round' : trigger === 'ruling-not-addressed' ? 'ruling-not-addressed send-back'
     : unproductive ? `codex unproductive on this head (${codexUnproductive} unproductive runs)`
       : trigger === 'stronger-model' ? 'stronger-model rung' : 'codex-first ordinary repair';
