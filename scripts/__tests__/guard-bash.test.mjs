@@ -719,17 +719,36 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     for (const stmt of ['export -p LANE=/protected/clone', 'readonly -p LANE=/protected/clone', 'LANE=/protected/clone export -p LANE']) {
       expect(at(`LANE=/tmp; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
-    // a same-name prefix absorbs what a non-exporting command does to that name
-    for (const stmt of ['LANE=/x declare LANE=/tmp', 'LANE=/x unset LANE', 'LANE=/x read LANE']) {
+    // a same-name prefix absorbs what unset/declare do to that name; read, printf -v and let assign through it
+    for (const stmt of ['LANE=/x declare LANE=/tmp', 'LANE=/x unset LANE']) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
-    // a name spelled through an expansion, or an assigning expansion, could be any variable
-    for (const stmt of ['N=LANE; export $N=/tmp', 'read $N', 'unset "$N"', 'let "$N=5"', ': ${LANE:=/tmp}', '((LANE=0))', 'echo $((LANE=0))']) {
+    for (const stmt of ['LANE=/x read LANE', 'LANE=/x printf -v LANE /tmp', 'LANE=/x let LANE=5', 'LANE=/x getopts a LANE']) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
-    for (const stmt of [': ${LANE}', '((LANE==0))', 'echo $((LANE+1))', 'export LANE-x', 'unset LANE-x']) {
+    // a name spelled through an expansion could be any variable; an assigning expansion forgets what it assigns
+    for (const stmt of [
+      'N=LANE; export $N=/tmp', 'read $N', 'unset "$N"', 'let "$N=5"', 'printf -v "$N" /tmp', 'printf -v$N /tmp',
+      'read -a "$N"', ': ${LANE:=/tmp}', ': ${LANE=/tmp}', '((LANE=0))', 'echo $((LANE=0))', '(( LANE <<= 1 ))',
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    for (const stmt of [
+      ': ${LANE}', '((LANE==0))', 'echo $((LANE+1))', 'export LANE-x', 'unset LANE-x', 'v=${kv#*=}', 'v=${kv%%=*}',
+      'x ${V:+--opt=$V}', 'x ${x:-a=b}', "git commit -m 'set ${LANE:=1}'", 'let i=$i+1', '((n+=1))', 'read -p "$P" OTHER',
+    ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
+  });
+  it('a cd nested in a command substitution or quoted parens is not the statement cd', () => {
+    expect(at('X=$( cd /q && pwd ); cd /protected/clone && ls')).toBe('/protected/clone');
+    expect(at('X=`cd /q`; cd /protected/clone')).toBe('/protected/clone');
+    expect(at('cd "/protected/a(" && ls')).toBe('/protected/a(');
+    expect(at('export D=/protected/clone T=$(mktemp -d); cd "$D"')).toBe('/protected/clone');
+  });
+  it('an and-or list ending in `&` runs in the background, and literal parens are not a function', () => {
+    expect(at('D=/protected/clone; D=/lane && true & cd "$D"')).toBe('/protected/clone');
+    expect(at('echo "()"; readonly D=/protected/clone; D=/lane; cd "$D"')).toBe('/protected/clone');
   });
   it('the let and expansion scans stay linear on adversarial input', () => {
     const t0 = Date.now();
@@ -738,6 +757,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     at(`let "${'a['.repeat(40000)}"; cd /x`);
     at(`: ${'${'.repeat(40000)}; cd /x`);
     at(`: ${'(('.repeat(40000)}; cd /x`);
+    // clearing the table does not rescan every frozen name
+    const names = Array.from({ length: 8000 }, (_, i) => `a${i}=`).join(' ');
+    at(`readonly ${names}; ${'let "$N=1";'.repeat(8000)} cd /x`);
     expect(Date.now() - t0).toBeLessThan(2000);
     expect(at(`LANE=/protected/clone; let "${'a['.repeat(4000)}"; cd "$LANE"`)).toBe(REPORTED);
   });
