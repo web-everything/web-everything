@@ -2304,7 +2304,7 @@ export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, only
  * Pure.
  * @returns {{prsByRepo:Map, verdicts:Array, carrierHealth:Map, plan:{ready:Array, deferred:Array, staleLandedOpenItems:Array}}}
  */
-export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), overlapContext = null, overlapSkips = null, readyOrder = null } = {}) {
+export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), strictAbsentHashDependencies = false, overlapContext = null, overlapSkips = null, readyOrder = null } = {}) {
   let prsByRepo = null;
   let vs = verdicts;
   if (!Array.isArray(vs)) {
@@ -2326,7 +2326,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // `landedThisPass` by construction and can never change an answer: the tests would pass (they hand-seed the set)
   // while production behaviour stayed byte-identical. The live derivation belongs in the CASCADE, against refs
   // that ACTUALLY merged — see `deriveCoupleIncomplete`. The disjointness/reachability test pins this.
-  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
+  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, strictAbsentHashDependencies, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
   return { prsByRepo, verdicts: vs, carrierHealth, plan };
 }
 
@@ -2413,10 +2413,12 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  * orphan the per-carrier gate structurally misses (an unreadable/unlisted carrier has no `manifestRefs` to key a
  * join on). #xc7p3q9 (R2) — a verdict's `waitOn` is NEVER allowed to name its OWN item (a self-referential wait is
  * structurally unsatisfiable — the livelock); such an edge is stripped.
- * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
+ * `strictAbsentHashDependencies` (fast drain `--only` only; default off) — on incomplete context, a HASH `blockedBy`
+ * absent from the open set defers until positively proven; numerics and full passes keep the absence rule.
+ * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, strictAbsentHashDependencies?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
  * @returns {{ready:Array, deferred:Array<{num,item,waitOn:Array<number|string>}>, staleLandedOpenItems:Array<number|string>}}  ready is ordered (item asc, then PR#); staleLandedOpenItems = items proven landed yet still named by an open PR (#999/xq985wu F2 stale-PR diagnostic).
  */
-export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
+export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
   // Every candidate still in play keeps its item "open" — a red/skip blocker must still defer its dependents,
   // so the open set is ALL candidate items, not just the mergeable ones. (A merged item is removed by the
@@ -2458,7 +2460,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     if (landedThisPass.has(id)) return !coupleIncomplete.has(id);   // (1) — landed this run, unless its couple is provably NOT whole (#3004)
     if (openItems.has(id)) return false;       // (2)
     if (provenOnMain.has(id)) return true;     // (3)
-    return contextComplete === true && typeof id === 'number' && Number.isFinite(id); // (4) needs trustworthy absence
+    return typeof id === 'number' && Number.isFinite(id); // (4); a hash → false (5)
   };
   // #999/xq985wu LIVENESS FIX — an item is a LIVE blocker only if it is open AND not proven landed. This mirrors
   // `stackProven`'s landedThisPass-BEFORE-openItems precedence on the `blockedBy` path, which it lacked: the
@@ -2489,8 +2491,10 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
       continue;
     }
     if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
-    // Failed/truncated context cannot establish that an absent dependency has landed.
-    const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (contextComplete !== true || openItems.has(b)) && !provenLanded(b));
+    // Fast drain only: failed/truncated context cannot establish that an absent HASH blocker has landed. A numeric
+    // id exists only post-land (arm (4) above), and no caller proves numerics, so those keep clearing by absence.
+    const absentUnproven = (b) => strictAbsentHashDependencies === true && contextComplete !== true && typeof b !== 'number';
+    const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (openItems.has(b) || absentUnproven(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier
     // when `joinImplToCouples` stamped `coupleDefer` — a carrier that is OPEN-AND-HELD, unnameable, degraded, or
@@ -6065,6 +6069,7 @@ async function runCli() {
   const preparedPass = planDrainPass({
     verdicts,
     openPrContext,
+    strictAbsentHashDependencies: onlyPr != null,
     escalationRelief,
     label,
     isLocalRepo,
@@ -6092,7 +6097,7 @@ async function runCli() {
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
-    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
+    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
     return p;
   };

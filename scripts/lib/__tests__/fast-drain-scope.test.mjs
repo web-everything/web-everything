@@ -374,15 +374,30 @@ output({});
     ]));
   }, 30_000);
 
+  // Production proof sets: `provenOnMain` holds hash ids only (`isHash(id) && landedNumberFor(...)`), never numerics.
+  const incomplete = { contextComplete: false, truncated: true, openItems: new Set() };
+  const absentDep = (edge, item) => ({ num: 7, repo, item: 'xbbbbbb', hasManifest: true, decision: 'merge', [edge]: [item] });
+
   it.each([
-    ['blockedBy', 'xaaaaaa'], ['blockedBy', 123], ['stackParents', 'xaaaaaa'], ['stackParents', 123],
-  ])('requires complete context or positive proof for an absent %s dependency %s', (edge, item) => {
-    const verdict = { num: 7, repo, item: 'xbbbbbb', hasManifest: true, decision: 'merge', [edge]: [item] };
-    const openPrContext = { contextComplete: false, truncated: true, openItems: new Set() };
-    const { plan } = planDrainPass({ openPrContext, verdicts: [verdict] });
+    [false, 'blockedBy'], [false, 'stackParents'], [true, 'blockedBy'], [true, 'stackParents'],
+  ])('fast drain %s: an absent numeric %s clears on incomplete context with no numeric proof', (fastDrain, edge) => {
+    const { plan } = planDrainPass({ openPrContext: incomplete, verdicts: [absentDep(edge, 123)],
+      provenOnMain: new Set(), strictAbsentHashDependencies: fastDrain });
+    expect(plan.deferred).toEqual([]);
+    expect(plan.ready).toHaveLength(1);
+  });
+
+  it('full pass: an absent hash blockedBy keeps its pre-existing clear on incomplete context', () => {
+    const { plan } = planDrainPass({ openPrContext: incomplete, verdicts: [absentDep('blockedBy', 'xaaaaaa')] });
+    expect(plan.ready).toHaveLength(1);
+  });
+
+  it.each(['blockedBy', 'stackParents'])('fast drain: an absent hash %s needs positive proof on incomplete context', (edge) => {
+    const opts = { openPrContext: incomplete, verdicts: [absentDep(edge, 'xaaaaaa')], strictAbsentHashDependencies: true };
+    const { plan } = planDrainPass(opts);
     expect(plan.ready).toEqual([]);
-    expect(plan.deferred[0].waitOn).toContain(item);
-    const proven = planDrainPass({ openPrContext, verdicts: [verdict], provenOnMain: new Set([item]) });
+    expect(plan.deferred[0].waitOn).toContain('xaaaaaa');
+    const proven = planDrainPass({ ...opts, provenOnMain: new Set(['xaaaaaa']) });
     expect(proven.plan.ready).toHaveLength(1);
   });
 
