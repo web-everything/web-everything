@@ -366,7 +366,8 @@ describe('ci-red-recovery-watch — reconcileAcceptanceAfterRebase (#2811)', () 
     const out = reconcileAcceptanceAfterRebase({
       prNumber: 2826, newHead: 'a19e50b56', repo: null, root: '/repo',
       readLabels: readLabels([{ name: REVIEW_LABELS.accepted }]),
-      restamp: (a) => restampAcceptance({ ...a, spawn: fakeSpawn }),
+      // `/repo` is not a git checkout, so the local slug is injected (a null repo now resolves the local repo).
+      restamp: (a) => restampAcceptance({ ...a, spawn: fakeSpawn, localRepo: () => 'owner/local' }),
       rearm: (a) => spawnCiHealRearm({ ...a, spawn: fakeSpawn }),
     });
     expect(out.attempted).toBe(true);
