@@ -64,7 +64,12 @@ While that refresh is owed, the live enrichment and planner suppress child heali
 
 All test execution goes through Node on `we:scripts/readiness/heavy-admission.mjs` with `run -- npx vitest run` followed by the scoped test paths (remove the documentation-only repository prefixes when passing filesystem arguments). Run `npm run check:standards` through that same queue. The runner owns preparation checks and stamping; the following are implementation acceptance tests, not claimed passing results.
 
-Authorization controls are required at every boundary in the matrix below. Test each requirement alongside its independent negative control: the trusted-author requirement refuses a forged (non-trusted) author with an otherwise valid leading marker; the leading-marker requirement refuses a quoted (not leading) marker from an otherwise trusted author. Implement and report the following three separately named test cases, with both refusal results beside the successful positive result. A combined negative case cannot substitute for either refusal. Keep identities and reproduction evidence valid and identical across the controls:
+Authorization controls are required at every boundary in the matrix below:
+
+- Require a trusted author. Negative control: a forged (non-trusted) author with the marker is refused, even when the marker is leading and all other evidence is valid.
+- Require a leading marker. Negative control: a quoted (not leading) marker is refused, even when the author is trusted and all other evidence is valid.
+
+Implement and report the following three separately named test cases, with both refusal results beside the successful positive result. A combined negative case cannot substitute for either refusal. Keep identities and reproduction evidence valid and identical across the controls:
 
 - Positive control (`trusted-author-leading-marker-accepted`): a trusted author with a leading marker satisfies both authorization requirements.
 - Trusted-author requirement — forged-author negative control (`forged-author-leading-marker-refused`): a forged (non-trusted) author with the same leading marker is refused; change only the author, keeping the marker and valid evidence identical to the positive control.
