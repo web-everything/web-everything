@@ -3,9 +3,10 @@ bornAs: xmssc37
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/infra-cancelled.mjs", "we:scripts/conveyor/__tests__/infra-cancelled.test.mjs"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-15"
 tags: []
 ---
 
