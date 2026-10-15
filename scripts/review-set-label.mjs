@@ -223,16 +223,28 @@ export function withdrawParkOnLiveClearance({ provider, repo, pr, headSha, warn 
     const fresh = provider.readPrState(repo, pr);
     const comments = Array.isArray(thread) ? thread : fresh?.comments;
     if (!Array.isArray(comments) || !Array.isArray(fresh?.labels)) throw new Error('thread or labels unreadable');
-    const head = String(headSha).toLowerCase();
-    if (String(fresh.headRefOid).toLowerCase() !== head || parseLatestHumanClearedSha(comments)?.toLowerCase() !== head) return false;
-    if (!hasReviewLabel(fresh.labels, REVIEW_LABELS.human) || hasReviewLabel(fresh.labels, REVIEW_LABELS.changes)
-      || hasReviewLabel(fresh.labels, REVIEW_LABELS.heldMechanical)) return false;
-    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
-    return true;
+    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) return false;
+    return restoreClearanceOverRacedPark({ provider, repo, pr, headSha, comments, labels: fresh.labels });
   } catch (e) {
     warn(`review-set-label: post-park clearance re-check failed (${String(e?.message ?? e).split('\n')[0]}); the hold stays\n`);
     return false;
   }
+}
+
+/**
+ * PR #5273 — THE single-home write that undoes a park which lost a race with `clear-human`: remove `review:human` and
+ * restore the `review:accepted` the ceremony stamped. Callers outside this file (the human-surface sweep) read the
+ * live state and pass it in; this re-checks it before writing. Writes only when the latest trusted clearance in
+ * `comments` names `headSha`, `review:human` is present, and no bounce or mechanical hold stands. Returns whether it
+ * wrote. Read errors are the caller's; a write error throws.
+ */
+export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, comments, labels }) {
+  if (!Array.isArray(comments) || !Array.isArray(labels)) return false;
+  if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
+  if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
+    || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
+  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+  return true;
 }
 
 /**

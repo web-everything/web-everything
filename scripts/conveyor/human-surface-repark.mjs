@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
 import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman } from '../lib/review-escalation.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { restoreClearanceOverRacedPark } from '../review-set-label.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
@@ -171,8 +172,8 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, require
   // Neither label: something else took the acceptance away. Never create one.
   if (!hasReviewLabel(live.labels, REVIEW_LABELS.human)) return hasReviewLabel(live.labels, REVIEW_LABELS.accepted);
   if (dryRun) return true;
-  provider.setLabels(repo, num, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
-  return true;
+  // The acceptance write has one home (the single-home rule); it re-checks this state before writing.
+  return restoreClearanceOverRacedPark({ provider, repo, pr: num, headSha: head, comments: after, labels: live.labels });
 }
 
 /**
