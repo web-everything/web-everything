@@ -95,9 +95,18 @@ export function decideStaleGateRerun({ setting, labels, record, row, verdict, ro
   return no('clearance is not newer than the failed job');
 }
 
-export function decideRearmGuard({ setting, labels, record, prHead, refHead } = {}) {
-  const refuse = enabled(setting) && names(labels).includes('review:accepted') && sameHead(record, prHead, refHead);
-  return { refuse, why: refuse ? `same-head clearance at ${record.sha}; no push since acceptance` : 'same-head clearance unproven or guard off' };
+/**
+ * PR #5237 operator ruling (2026-10-14 ~22:05 ET): does a formal GitHub change request stand against `record`? A
+ * reviewer's latest decisive review being CHANGES_REQUESTED (not dismissed, not superseded by that reviewer's approval),
+ * or any objection after the record. Unreadable reviews count as standing. No approval is restored, kept or protected
+ * over one.
+ */
+const changeRequestStands = (reviews, record) => !Array.isArray(reviews) || laterReviewHold(reviews, record?.at);
+
+export function decideRearmGuard({ setting, labels, record, reviews, prHead, refHead } = {}) {
+  const refuse = enabled(setting) && names(labels).includes('review:accepted') && sameHead(record, prHead, refHead)
+    && !changeRequestStands(reviews, record);
+  return { refuse, why: refuse ? `same-head clearance at ${record.sha}; no push since acceptance` : 'same-head clearance unproven, a formal change request stands, or guard off' };
 }
 
 export function decideClearanceRestore({ setting, labels, comments, reviews, events, prHead, refHead } = {}) {
@@ -107,7 +116,7 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
   if (!ls.includes('review:pending') || ['review:accepted', ...holds.filter(l => l !== 'review:pending')].some(l => ls.includes(l))) return no('labels do not permit restoration');
   const record = latestAcceptance(comments);
   if (!sameHead(record, prHead, refHead) || !Number.isFinite(Date.parse(record?.at))) return no('same head clearance unproven');
-  if (!Array.isArray(reviews) || laterReviewHold(reviews, record.at)) return no('formal reviews unreadable or hold clearance');
+  if (changeRequestStands(reviews, record)) return no('formal reviews unreadable or hold clearance');
   if (!Array.isArray(events)) return no('issue events unreadable');
   const later = comments.slice(record.index + 1);
   const rearms = later.filter(c => starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c) && Date.parse(at(c)) > Date.parse(record.at));
@@ -170,12 +179,14 @@ export function readPrComments({ repo, pr, runGh = runGhSync }) {
  * and the rollback must leave it. It must be the latest acceptance record, trusted, name both live heads, be newer
  * than the record we restored from, and have no comment after it that could hold it. A label decision leaves no
  * comment, so no `review:accepted` removal and no hold label may follow it either, and no hold label may stand now
- * (`labels`: the live labels after our write). Anything unreadable is false.
+ * (`labels`: the live labels after our write). No formal change request may stand either (`reviews`: the live formal
+ * reviews; operator ruling 2026-10-14 ~22:05 ET). Anything unreadable is false.
  */
-export function newerAcceptanceOnHead({ comments, events, labels, record, prHead, refHead } = {}) {
+export function newerAcceptanceOnHead({ comments, events, labels, reviews, record, prHead, refHead } = {}) {
   if (!Array.isArray(comments) || !Array.isArray(events) || !Array.isArray(labels)) return false;
   const latest = latestAcceptance(comments);
   if (!latest || !sameHead(latest, prHead, refHead) || !(Date.parse(latest.at) > Date.parse(record?.at))) return false;
+  if (changeRequestStands(reviews, latest)) return false;
   if (comments.slice(latest.index + 1).some(holdsClearance)) return false;
   if (names(labels).some(l => holds.includes(l))) return false;
   return !events.some(e => ((e.event === 'unlabeled' && e.label?.name === 'review:accepted')

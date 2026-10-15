@@ -9,7 +9,7 @@ import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import {
   REVIEW_CLEARANCE_SETTINGS, REARM_MARKER, resolveReviewClearanceSetting, loadReviewClearanceSetting,
   classifyGateFailure, failingCiChecks, decideStaleGateRerun, decideRearmGuard, mayNeedRestore,
-  decideClearanceRestore, buildRestoreComment, createReviewClearanceGuard, readPrClearanceFacts,
+  decideClearanceRestore, buildRestoreComment, createReviewClearanceGuard, readPrClearanceFacts, newerAcceptanceOnHead,
 } from '../review-clearance-guard.mjs';
 
 const head = '9c72024172156f0f8b1b1c0c3f94b44d1031bdd3';
@@ -33,6 +33,9 @@ const verdict = { num: 5193, ok: false, head_sha: head, completed_at: '2026-10-1
 const row = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: verdict.completed_at, detailsUrl: `https://github.com/${repo}/actions/runs/1/job/115424411010` };
 const rows = [row, { name: 'review-gate', conclusion: 'SUCCESS' }, { name: 'test', conclusion: 'SUCCESS' }];
 const restoreFacts = { setting: on, labels: ['review:pending', 'review-round:1', 'status:ready-to-merge'], comments, reviews: [], events, prHead: head, refHead: head };
+/** A formal GitHub change request submitted BEFORE the acceptance and never dismissed: it still stands. */
+const review = (state, time, login = 'plateau-reviewer[bot]') => ({ id: `${state}-${time}`, state, submitted_at: `2026-10-13T${time}Z`, user: { login } });
+const standingChanges = review('CHANGES_REQUESTED', '18:00:00');
 
 describe('#5193 review clearance', () => {
   it('classifies only review holds as review work', () => {
@@ -70,9 +73,11 @@ describe('#5193 review clearance', () => {
     expect(decideStaleGateRerun({ setting: on, labels: ['review:accepted'], record, row: latest, verdict, rows: [{ name: 'merge-gate', status: 'IN_PROGRESS', id: 115424411009 }, latest] }).rerun).toBe(false);
   });
   it('protects acceptance only with two agreeing head reads', () => {
-    const facts = { setting: on, labels: ['review:accepted'], record, prHead: head, refHead: head };
+    const facts = { setting: on, labels: ['review:accepted'], record, reviews: [], prHead: head, refHead: head };
     expect(decideRearmGuard(facts).refuse).toBe(true);
-    for (const patch of [{ refHead: null }, { refHead: 'a'.repeat(40) }, { prHead: 'a'.repeat(40) }, { record: { ...record, sha: 'a'.repeat(40) } }, { setting: off }]) {
+    for (const patch of [{ refHead: null }, { refHead: 'a'.repeat(40) }, { prHead: 'a'.repeat(40) }, { record: { ...record, sha: 'a'.repeat(40) } }, { setting: off },
+      // PR #5237 operator ruling (2026-10-14 ~22:05 ET): an approval is never kept over a standing formal change request.
+      { reviews: null }, { reviews: [standingChanges] }]) {
       expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(false);
     }
   });
@@ -95,6 +100,42 @@ describe('#5193 review clearance', () => {
     { events: null }, { events: [] }, { setting: off },
   ])('does not restore with unproven or intervening evidence: %j', patch => {
     expect(decideClearanceRestore({ ...restoreFacts, ...patch }).restore).toBe(false);
+  });
+  // PR #5237 operator ruling (2026-10-14 ~22:05 ET, red-team break): an approval was restorable over a formal change
+  // request that still stood. Any restore, and the newer-head exception, refuse while a non-dismissed one stands.
+  const standing = [
+    ['submitted before the acceptance', [standingChanges]],
+    ['followed only by a comment review from the same reviewer', [standingChanges, review('COMMENTED', '18:10:00')]],
+    ['by another reviewer than a later approver', [standingChanges, review('APPROVED', '18:10:00', 'chalbert')]],
+    ['with no submission time', [{ ...standingChanges, submitted_at: undefined }]],
+  ];
+  const lifted = [
+    ['dismissed', [{ ...standingChanges, state: 'DISMISSED' }]],
+    ['superseded by the same reviewer\'s approval', [standingChanges, review('APPROVED', '18:10:00')]],
+  ];
+  it.each(standing)('does not restore over a standing formal change request (%s)', (_kind, reviews) => {
+    expect(decideClearanceRestore({ ...restoreFacts, reviews }).restore).toBe(false);
+  });
+  it.each(lifted)('restores once the formal change request no longer stands (%s)', (_kind, reviews) => {
+    expect(decideClearanceRestore({ ...restoreFacts, reviews }).restore).toBe(true);
+  });
+  describe('newerAcceptanceOnHead (the post-write newer-head exception)', () => {
+    const Y = 'b'.repeat(40);
+    const clearY = comment(`✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${Y} -->\n<!-- cleared-human: chalbert -->`, '19:10:00');
+    const live = { comments: [...comments, clearY], events, labels: ['review:accepted'], reviews: [], record, prHead: Y, refHead: Y };
+    it('owns review:accepted with no standing change request', () => expect(newerAcceptanceOnHead(live)).toBe(true));
+    it.each(standing)('refuses over a standing formal change request (%s)', (_kind, reviews) => {
+      expect(newerAcceptanceOnHead({ ...live, reviews })).toBe(false);
+    });
+    it('refuses over a change request submitted after the newer acceptance', () => {
+      expect(newerAcceptanceOnHead({ ...live, reviews: [review('CHANGES_REQUESTED', '19:11:00')] })).toBe(false);
+    });
+    it.each([['missing', undefined], ['unreadable', null]])('refuses when the formal reviews are %s', (_kind, reviews) => {
+      expect(newerAcceptanceOnHead({ ...live, reviews })).toBe(false);
+    });
+    it.each(lifted)('keeps the exception once the change request no longer stands (%s)', (_kind, reviews) => {
+      expect(newerAcceptanceOnHead({ ...live, reviews })).toBe(true);
+    });
   });
   // PR #5237 round 5 (red team): a revocation quoting the reviewed-sha marker was picked as the "latest accept
   // record", so the intervening-comment check never looked at it and restoration cited it as the clearance.
@@ -389,6 +430,11 @@ describe('I/O shell', () => {
       ['unreadable comments', { added: null }, true],
       ['unreadable events', { added: [clearY], events: null }, true],
       ['unreadable labels', { added: [clearY], labels: null }, true],
+      // PR #5237 operator ruling (2026-10-14 ~22:05 ET): the exception must not keep an approval over a standing change request.
+      ['newer clearance, a standing formal change request', { added: [clearY], reviews: [standingChanges] }, true],
+      ['newer clearance, a change request after it', { added: [clearY], reviews: [review('CHANGES_REQUESTED', '19:11:00')] }, true],
+      ['newer clearance, unreadable formal reviews', { added: [clearY], reviews: null }, true],
+      ['newer clearance, a dismissed change request', { added: [clearY], reviews: [{ ...standingChanges, state: 'DISMISSED' }] }, false],
     ])('after a post-write head move, rollback honours %s', (_kind, live, rolledBack) => {
       const fake = fakeGh(restoreFacts.labels);
       let written = false;
@@ -408,6 +454,10 @@ describe('I/O shell', () => {
           if (path.includes('/events')) {
             if (live.events === null) throw new Error('read failed');
             return JSON.stringify([[...events, ...(live.events ?? [])]]);
+          }
+          if (path.includes('/reviews') && live.reviews !== undefined) {
+            if (live.reviews === null) throw new Error('read failed');
+            return JSON.stringify([live.reviews]);
           }
         }
         return result;
