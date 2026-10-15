@@ -1527,7 +1527,7 @@ export function runReviewLabelCli({
   // hold and removes only the drain's own label; it never removes `review:human`. Re-read live first: a PR whose labels
   // moved since this run read them is left alone. Any write miss marks the refusal retryable, so the sweep comes back.
   let handOffRetryable = false;
-  const handMechanicalHoldToOperator = (why) => {
+  const handMechanicalHoldToOperator = (why, { overridesLiveClearance = false } = {}) => {
     try {
       const live = provider.readLabels(repo, pr);
       if (!hasReviewLabel(live, REVIEW_LABELS.heldMechanical) || hasReviewLabel(live, REVIEW_LABELS.human)) return;
@@ -1538,14 +1538,15 @@ export function runReviewLabelCli({
         '',
         `The drain's \`${REVIEW_LABELS.heldMechanical}\` park could not be lifted by carrying the operator's clearance: ${String(why || 'the carry was refused')}.`,
         `A review of this head is owed, so the hold is now \`${REVIEW_LABELS.human}\` (card xu7kxtt, PR #4631 ruling a).`,
-        '',
-        buildMechanicalHandoffMarker(headSha),
+        // The marker lets clear-human and the sweep's heal undo this park if it lost a race; a deliberate override
+        // of a live-head clearance carries none, so nothing undoes it.
+        ...(overridesLiveClearance ? [] : ['', buildMechanicalHandoffMarker(headSha)]),
       ].join('\n'));
       if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
       provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
       // PR #5273: the same read-then-write race as the human-surface park. Read for a concurrent clear-human of this
       // head after the write; clear-human recognises this park by its marker for the mirror-image case.
-      withdrawParkOnLiveClearance({ provider, repo, pr, headSha });
+      if (!overridesLiveClearance) withdrawParkOnLiveClearance({ provider, repo, pr, headSha });
     } catch (e) {
       handOffRetryable = true;
       process.stderr.write(`review-set-label: mechanical-hold hand-off failed (retryable) — ${String((e && e.message) || e).split('\n')[0]}\n`);
@@ -1560,7 +1561,13 @@ export function runReviewLabelCli({
     decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
     if (!decision.allowed) {
       // `retryable`: the refusal is a read miss (unreadable diff / reviews / thread), not a decision about the PR.
-      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason);
+      // PR #5273: a refusal that overrides a clearance already naming the live head (a later verdict or hold) is a
+      // deliberate park, not a race; it must not be withdrawn on that clearance.
+      // `from` is the latest accept record in the complete thread; the first page is checked too.
+      const liveHead = String(headSha).toLowerCase();
+      const overridesLiveClearance = String(humanCarry.from ?? '').toLowerCase() === liveHead
+        || String(parseLatestHumanClearedSha(prComments) ?? '').toLowerCase() === liveHead;
+      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason, { overridesLiveClearance });
       if (humanCarry.retryable || handOffRetryable) decision = { ...decision, retryable: true };
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
