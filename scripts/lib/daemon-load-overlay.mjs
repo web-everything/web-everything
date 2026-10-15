@@ -384,7 +384,7 @@ export async function runRealDispatchSmoke({
   const slug = `${kind}-${pr}`;
   const sessionId = randomUUID();
   const prompt = dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr });
-  const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off' };
+  const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off', WE_SMOKE_ALLOW_REAL_WORKER: '1' }; // Deliberate real-worker sentinel smoke.
   const base = { sessionId, scratch };
   log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker from ${tree} (scratch store ${store})`);
   const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt], {
