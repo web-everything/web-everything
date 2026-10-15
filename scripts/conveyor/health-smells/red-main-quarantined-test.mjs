@@ -1,5 +1,5 @@
 /** One repair card per live quarantine episode. */
-import { defaultQuarantineSafetyNet } from './main-ci-red.mjs';
+import { quarantineSafetyNetForTick } from './main-ci-red.mjs';
 
 export default {
   id: 'red-main-quarantined-test',
@@ -11,9 +11,9 @@ export default {
   severity: 'medium',
   action: 'file',
   recommendationHint: 'Fix or delete the quarantined flaky test before it expires.',
-  evaluate({ mainCiRuns }, { now, quarantineSafetyNet = defaultQuarantineSafetyNet }) {
-    let out;
-    try { out = quarantineSafetyNet?.(mainCiRuns, { now }); } catch { return []; }
+  evaluate({ mainCiRuns }, ctx) {
+    const { now } = ctx;
+    const out = quarantineSafetyNetForTick(mainCiRuns, ctx);
     if (!out || out.shadow) return [];
     return (out.liveEntries ?? []).filter((entry) => now < entry.expiresAt).map((entry) => ({
       subject: `quarantine:${entry.test}`,

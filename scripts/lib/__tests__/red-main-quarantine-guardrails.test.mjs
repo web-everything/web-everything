@@ -145,6 +145,29 @@ describe('audit and shadow visibility', () => {
     const result = net({ live: true, mode: { value: 'quarantine', source: 'env' }, write: ({ change }) => change({ version: 1, entries: [entry()] }) });
     expect(result.events.filter((e) => e.type === 'card-owed')).toEqual([]);
   });
+  it('rejects additions when the transport tip concurrently reaches maxTests, without publishing or owing a card', () => {
+    const dir = temp();
+    const fresh = { version: 1, mode: 'quarantine', entries: [entry({ tests: ['scripts/other.test.mjs'] })] };
+    const published = [];
+    const changes = [];
+    const result = net({ dir, live: true, mode: { value: 'quarantine', source: 'env' },
+      settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, maxTests: 1 }, sources: {} },
+      // Planning sees an empty list; publication sees the other writer's different live file.
+      write: ({ change }) => {
+        const changed = change(fresh);
+        changes.push(changed);
+        if (!changed.ok) throw new Error(changed.error);
+        published.push(changed);
+        return changed;
+      } });
+    expect(result.plan.action).toBe('add');
+    expect(changes).toEqual([{ ok: false, error: 'quarantine cap 1 reached' }]);
+    expect(result).toMatchObject({ applied: false, error: 'quarantine cap 1 reached' });
+    expect(result.events ?? []).toEqual([]);
+    expect(published).toEqual([]);
+    expect(fresh.entries.map((e) => e.test)).toEqual(['scripts/other.test.mjs']);
+    expect(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds['62da75ed3'].added).toEqual([]);
+  });
   it('logs none once per changed reason in a red window and persists shadowWhy', () => {
     const dir = temp();
     const mainCiRuns = structuredClone(fixture.mainCiRuns);

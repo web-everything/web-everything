@@ -16,6 +16,8 @@ const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, v
 import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, skipForList, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER, STAMP_RECHECK_MS } from '../../lib/red-main-quarantine-io.mjs';
 import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
 import { healthDir } from '../health-watch-section.mjs';
+import quarantineTickBreak from '../soak/breaks/quarantine-safety-net-twice-per-tick.mjs';
+import quarantinedSmell from '../health-smells/red-main-quarantined-test.mjs';
 
 const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs';
 const TEST_NAME = '#4979 the sanctioned writer > the reader hands the ruled PR and its head to the card resolver';
@@ -481,6 +483,21 @@ describe('settings cascade — standard → platform → tool → env, with sour
 });
 
 describe('main-ci-red smell hook', () => {
+  it('invokes runSafetyNet once per tick in either smell order, with a fresh result on the next tick', async () => {
+    expect(quarantineTickBreak.judge(await quarantineTickBreak.run())).toEqual([]);
+  });
+  it.each([null, 'throw'])('shares a failed or absent safety-net result (%s) without retrying in the other smell', (failure) => {
+    let calls = 0;
+    const ctx = { now: T('2026-10-10T19:20:00Z'), config: {}, quarantineSafetyNet: () => {
+      calls++;
+      if (failure === 'throw') throw new Error('unreadable');
+      return null;
+    } };
+    const probes = { mainCiRuns: { runs: RED_RUNS, failing: FAILING } };
+    expect(smell.evaluate(probes, ctx)[0].measure.quarantine).toBeNull();
+    expect(quarantinedSmell.evaluate(probes, ctx)).toEqual([]);
+    expect(calls).toBe(1);
+  });
   it('runs the safety net every tick and reports its plan in the measure, red or green', () => {
     const seen = [];
     const ctx = { now: T('2026-10-10T19:20:00Z'), config: {}, quarantineSafetyNet: (m) => { seen.push(m); return { mode: 'stop', shadow: true, plan: { action: 'add', tests: [TEST_FILE], why: 'w' } }; } };

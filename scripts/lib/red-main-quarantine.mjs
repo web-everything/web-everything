@@ -269,7 +269,8 @@ export function ciJobContext({ eventName, ref, event = null }) {
  * The CI skip decision for one job. Skips nothing when: the mode is not `quarantine`, the list is unreadable, the job
  * context is unknown, it is main, or the PR is a recorded main-fix PR. A PR that CHANGES a quarantined test file
  * also runs that file (it may be the real fix, or it may be hiding a further break in it). Changed files unknown ⇒
- * every quarantined file runs. PURE.
+ * every quarantined file runs. Omitting `job` selects legacy and tagged unit-shard entries, matching CI's
+ * default unit-suite invocation. An explicit job selects only that job (plus legacy entries for unit shards). PURE.
  * @returns {{skip:string[], why:string, unsupported?:string[]}}
  */
 export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = null }) {
@@ -277,7 +278,10 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   if (!read?.ok) return { skip: [], why: `quarantine list unreadable (${read?.error ?? 'unknown'}) — running everything` };
   if (!ctx?.known) return { skip: [], why: 'job context unknown — running everything' };
   const fixPrs = read.list.fixPrs ?? [];
-  const list = { ...read.list, entries: read.list.entries.filter((e) => e.job === undefined ? job === null || /^test-shard \(\d+\)$/.test(job) : e.job === job) };
+  const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
+  const list = { ...read.list, entries: read.list.entries.filter((e) => job === null
+    ? e.job === undefined || isUnitShard(e.job)
+    : e.job === undefined ? isUnitShard(job) : e.job === job) };
   const tests = testsToSkip({ list, now, prNumber: ctx.prNumber, fixPrs, onMain: ctx.onMain });
   if (!tests.length) return { skip: [], why: ctx.onMain ? 'main runs every test' : fixPrs.includes(ctx.prNumber) ? `PR #${ctx.prNumber} is the main-fix PR — it runs the quarantined tests` : 'no live quarantine entry' };
   if (!Array.isArray(changedFiles)) return { skip: [], why: 'this PR\'s changed files are unknown — running everything' };

@@ -20,6 +20,7 @@
  *   (run everything — the safe direction). The decision and its reason go to stderr (the CI log).
  *
  * Usage (repo root as cwd, inside a GitHub Actions job):  node scripts/ci/quarantine-skip.mjs
+ *   Without --job, selects legacy and tagged test-shard entries (the unit-suite default).
  *   --job=<ci job name> selects entries for that job; --nonblocking prints their files.
  *   Test/replay overrides: --event=<name> --ref=<ref> --event-path=<file> --base=<branch> --changed=<a,b> --now=<ms>
  */

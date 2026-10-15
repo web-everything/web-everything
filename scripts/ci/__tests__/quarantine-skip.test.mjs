@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 
 import { quarantineSkip } from '../quarantine-skip.mjs';
-import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList, testsToSkip } from '../../lib/red-main-quarantine.mjs';
+import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList, testsToSkip, planSafetyNet } from '../../lib/red-main-quarantine.mjs';
 import { skipForList } from '../../lib/red-main-quarantine-io.mjs';
 
 const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs';
@@ -167,6 +167,21 @@ describe('quarantine-skip — the mode is the one the daemon published on the li
 
 describe('ci.yml wiring', () => {
   const steps = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8')).jobs['test-shard'].steps;
+  it.each(['Unit suite shard', 'Unit suite no-coverage group'])('%s selects automatically added unit-shard entries with its default flags', (prefix) => {
+    const step = steps.find((x) => String(x.name).startsWith(prefix));
+    expect(step.run).toContain('$(node scripts/ci/quarantine-skip.mjs)');
+    const job = 'test-shard (3)';
+    const proof = { kind: 'rerun-passed', runId: 7, attempt: 2 };
+    const plan = planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, now: NOW,
+      failedJobs: [job], jobFailures: { [job]: { files: [TEST_FILE], tests: [], complete: true } }, flakeProof: { [job]: proof } });
+    expect(plan.action).toBe('add');
+    let list = null;
+    for (const entry of plan.entries) list = addEntries(list, { tests: [entry.test], job: entry.job, proof: entry.proof,
+      brokenSha: FIRST_RED, owner: 'red-main-safety-net', reason: plan.why, actor: 'red-main-safety-net', now: NOW }).list;
+    const read = { ok: true, list: { ...list, mode: 'quarantine' } };
+    expect(run({ pr: 4990, event: prEvent(4990), mode: undefined, read }).line).toBe(`--exclude=${TEST_FILE}`);
+    expect(run({ pr: 4990, event: prEvent(4990), read, changed: [TEST_FILE] }).line).toBe('');
+  });
   it.each(['Unit suite shard', 'Unit suite no-coverage group'])('%s appends the skip args to its vitest run', (prefix) => {
     const s = steps.find((x) => String(x.name).startsWith(prefix));
     const line = s.run.split('\n').find((l) => l.includes('npm run test:'));
@@ -186,11 +201,12 @@ describe('job-specific and nonblocking output', () => {
     expect(selected('test-shard (2)').skip).toEqual([TEST_FILE, 'scripts/shard.test.mjs']);
     expect(selected('test-shard (1)').skip).toEqual([TEST_FILE]);
     expect(selected('test').line).toBe('');
-    expect(selected(undefined).skip).toEqual([TEST_FILE]);
+    expect(selected(undefined).skip).toEqual([TEST_FILE, 'scripts/shard.test.mjs']);
   });
   it('nonblocking prints the same selected files, space-separated', () => {
     expect(selected('integration', { nonblocking: true }).line).toBe('scripts/integration.test.mjs');
     expect(selected('test-shard (2)', { nonblocking: true }).line).toBe(`${TEST_FILE} scripts/shard.test.mjs`);
+    expect(selected(undefined, { nonblocking: true }).line).toBe(`${TEST_FILE} scripts/shard.test.mjs`);
   });
   it('nonblocking preserves the fail-safe decisions', () => {
     const flags = { event: 'pull_request', ref: 'refs/pull/4990/merge', job: 'integration', nonblocking: true };
