@@ -1,14 +1,15 @@
 ---
+bornAs: xpwakvl
 kind: task
 status: open
-scope: ["we:scripts/lib/drain-ledger-facts.mjs"]
+scope: ["we:scripts/operations/operator-controls.mjs", "we:scripts/operations/operator-controls-io.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# drain ledger: deduplicate exemptions against the latest exemption, not any historical head
+# operator controls: tie --actor to the authenticated identity
 
-Ruling card from PR #5195 (operator, 2026-10-15). we:scripts/lib/drain-ledger-facts.mjs (~40) dedupes a review-exempt fact against any historical matching head, so a later exemption after a non-exempt interval is dropped. Compare with the latest exemption only. Shadow ledger rows only; do before the ledger-promotion decision (with xu7ove8).
+Ruling card from PR #5169 (operator, 2026-10-15). we:scripts/operations/operator-controls.mjs checks --actor only as a string against OPERATOR_LOGINS, so an automation shell can write an operator-attributed audit record for unpark, retry-prepare, rearm, refresh and clear-claim. Bind the actor to the authenticated gh/role-App identity; do with the role-App work (card 346).
 
 ## Acceptance
 

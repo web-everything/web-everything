@@ -1,14 +1,15 @@
 ---
+bornAs: xyja26g
 kind: task
 status: open
-scope: ["we:scripts/operations/why.mjs", "we:scripts/conveyor/health-investigate-dispatch.mjs"]
+scope: ["we:scripts/lib/drain-ledger-facts.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# why: strip control characters from echoed log and comment text
+# drain ledger: deduplicate exemptions against the latest exemption, not any historical head
 
-Ruling card from PR #5169 (operator, 2026-10-15). The why command echoes raw daemon-log lines and comment-derived stand-down reasons; compact strips only CR/LF, so ANSI escapes and injected text reach the health investigator and the terminal. Strip control characters and fence untrusted text, with a test.
+Ruling card from PR #5195 (operator, 2026-10-15). we:scripts/lib/drain-ledger-facts.mjs (~40) dedupes a review-exempt fact against any historical matching head, so a later exemption after a non-exempt interval is dropped. Compare with the latest exemption only. Shadow ledger rows only; do before the ledger-promotion decision (with xu7ove8).
 
 ## Acceptance
 

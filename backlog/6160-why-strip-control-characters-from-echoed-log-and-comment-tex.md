@@ -1,14 +1,15 @@
 ---
+bornAs: xn4ut25
 kind: task
 status: open
-scope: ["we:scripts/operations/operator-controls.mjs", "we:scripts/operations/operator-controls-io.mjs"]
+scope: ["we:scripts/operations/why.mjs", "we:scripts/conveyor/health-investigate-dispatch.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# operator controls: tie --actor to the authenticated identity
+# why: strip control characters from echoed log and comment text
 
-Ruling card from PR #5169 (operator, 2026-10-15). we:scripts/operations/operator-controls.mjs checks --actor only as a string against OPERATOR_LOGINS, so an automation shell can write an operator-attributed audit record for unpark, retry-prepare, rearm, refresh and clear-claim. Bind the actor to the authenticated gh/role-App identity; do with the role-App work (card 346).
+Ruling card from PR #5169 (operator, 2026-10-15). The why command echoes raw daemon-log lines and comment-derived stand-down reasons; compact strips only CR/LF, so ANSI escapes and injected text reach the health investigator and the terminal. Strip control characters and fence untrusted text, with a test.
 
 ## Acceptance
 
