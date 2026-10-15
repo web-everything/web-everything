@@ -2,9 +2,10 @@
 bornAs: x0dcjec
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs"]
 dateOpened: "2026-10-14"
+dateResolved: "2026-10-14"
 preparedDate: "2026-10-14"
 preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
 tags: []
