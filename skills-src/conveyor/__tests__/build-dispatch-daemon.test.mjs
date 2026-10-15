@@ -1907,6 +1907,31 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('5028');
     } finally { log.mockRestore(); }
   });
+  // Self-review: after the probe started recovery, later reads must stay on that PR. The default read takes the newest
+  // attempt's PR (here a newer CLOSED duplicate) and would file a false `prepare-unstamped` failure.
+  it('keeps follow-up reads of a probe-started stamp recovery on the probed PR', async () => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.readPrepareStatus = vi.fn(({ prNumber }) => ({ preparedDate: null, pr: prNumber === 91
+      ? { number: 91, state: 'OPEN', preparedDate: null, hasSections: true }
+      : { number: 95, state: 'CLOSED', preparedDate: null } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    effects.recordPrepareFailure = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      const second = await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(1);
+      effects.listHolds = () => [{ num: '5028', reason: 'prepare-stamp-pending' }];
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: second.nextBookkeeping });
+      const followUps = effects.readPrepareStatus.mock.calls.map(([a]) => a).slice(1);
+      expect(followUps.length).toBeGreaterThan(0);
+      expect(followUps.every(a => a.prNumber === 91 && a.claimedAt === undefined)).toBe(true);
+      expect(effects.recordPrepareFailure).not.toHaveBeenCalled();
+      expect(effects.placePrepareHold).not.toHaveBeenCalledWith(expect.objectContaining({ reason: 'prepare-unstamped' }));
+    } finally { log.mockRestore(); }
+  });
   it('never probes a refusal whose PR is not a lane prepare branch (a title-only match)', async () => {
     const effects = fixture();
     effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });

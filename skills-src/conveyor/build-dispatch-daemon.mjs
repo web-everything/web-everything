@@ -390,11 +390,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...holds.filter(isPrepareHold).map(h => normNum(h.num))]);
   try { await effects.primePrepareStatus?.({ nums: [...trackedPrepares], claims: prepareClaims }); }
   catch { /* Individual reads retain their own failure handling and can load lazily. */ }
+  // A stamp recovery the refusal probe started (no claim, no worker) is pinned to the PR it read, for as long as its
+  // `prepare-stamp-pending` hold stands: the default "newest attempt's PR" read could see a newer closed duplicate,
+  // or date-filter the PR out, and file a false `prepare-unstamped` failure.
+  const recoveryPins = new Map((Array.isArray(bookkeeping.prepareRecoveryPins) ? bookkeeping.prepareRecoveryPins : [])
+    .filter(p => p?.num != null && Number.isInteger(p.pr)
+      && holds.some(h => normNum(h.num) === normNum(p.num) && h.reason === 'prepare-stamp-pending'))
+    .map(p => [normNum(p.num), p]));
+  const pinnedRead = (num, claimedAt) => {
+    const pin = recoveryPins.get(normNum(num));
+    return pin ? { prNumber: pin.pr, ...(pin.bornAs ? { bornAs: pin.bornAs } : {}) } : { claimedAt };
+  };
   for (const num of trackedPrepares) {
     if (prepareRows.some(r => normNum(r.num) === num && prepareIsLive(r))) continue;
     try {
       const claim = prepareClaims.find(c => normNum(c.meta.num) === num);
-      let status = await effects.readPrepareStatus?.({ num, claimedAt: claim?.meta?.claimedAt, replacesStamp: claimReplacesStamp(num) });
+      let status = await effects.readPrepareStatus?.({ num, ...pinnedRead(num, claim?.meta?.claimedAt), replacesStamp: claimReplacesStamp(num) });
       // Apply the stamp identity contract even to injected readers: the old stamp is not completion.
       if (status?.preparedDate && claimReplacesStamp(num) !== undefined
         && !stampCoversClaim(status.preparedDate, claim?.meta?.claimedAt,
@@ -1025,14 +1036,17 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const openWithWork = samePr && pr.state === 'OPEN' && !pr.preparedDate && pr.hasSections === true;
       const mainWithWork = samePr && pr.state === 'MERGED' && status.hasSections === true && !status.replacedPreparedDate;
       const priorFailure = failureRecords.some(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
-      if (!status?.preparedDate && (openWithWork || mainWithWork) && !priorFailure) await startStampRecovery(num, status);
+      if (!status?.preparedDate && (openWithWork || mainWithWork) && !priorFailure) {
+        recoveryPins.set(num, { num, pr: probe.pr, ...(probe.bornAs ? { bornAs: probe.bornAs } : {}) });
+        await startStampRecovery(num, status);
+      }
       continue;
     }
     if (!tracked && !wasHeld && !currentSettled && !guarded) continue;
     try {
       if (prepareReadErrors.has(num)) throw prepareReadErrors.get(num);
       const status = prepareStatus.has(num) ? prepareStatus.get(num)
-        : await effects.readPrepareStatus?.({ num, claimedAt: claim?.meta?.claimedAt ?? settled?.startedAt, replacesStamp: claimReplacesStamp(num) });
+        : await effects.readPrepareStatus?.({ num, ...pinnedRead(num, claim?.meta?.claimedAt ?? settled?.startedAt), replacesStamp: claimReplacesStamp(num) });
       if (prepareRows.some(r => normNum(r.num) === num && prepareIsLive(r))) continue;
       // builder-starved-2 (2026-10-07) — a BARE spawn candidate (no claim, no hold, no guard: only an older settled
       // run row) whose card carries a stamp on main is a `prepare-stale` card the tick core asks to RE-prepare. That
@@ -1397,6 +1411,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString(),
           ...refusalDetail.get(normNum(r.num)) })),
       ].slice(-200),
+      prepareRecoveryPins: [...recoveryPins.values()].filter(p => !completedPrepares.has(normNum(p.num))).slice(-200),
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),
     }, dispatched.map((x) => x.num), prepare.launched.map((x) => x.num)),
   };
