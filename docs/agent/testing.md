@@ -66,6 +66,7 @@ a deferred response is not an empty PR list. Discovery CLI passes can use `defer
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
 The gh holder policy lives in `scripts/settings/gh-throttle.json` and resolves once per process/env object. Holder tests use a temporary lock root and injected clock/sleep; watch calls must remain unslotted. Verify timeout fidelity against a real local child, preserving native timeout errors and releasing its slot without signalling the holder process.
+Holder diagnostics persist only allowlisted command labels, omitting endpoints and all argument values. Sanitize old metadata and process-table commands at the output boundary as well as new lock writes. Cover admission with a decision table over caller-capped, pool-full and over-age states. Reaping waits for the greater of policy and the recorded effective timeout plus grace; an explicit zero timeout prevents age-based reaping of that holder. Metric operation labels use the same bounded vocabulary as default call logs.
 Daemon simulator worlds with independent clocks must each override `WE_GH_THROTTLE_LOCK_ROOT`
 and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A previous world's
 future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.

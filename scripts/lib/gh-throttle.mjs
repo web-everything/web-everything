@@ -1117,7 +1117,7 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 
 // Card 338: slot holder record, hold reaping and per-caller cap live in their own module (imported here, not
 // in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
-import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary } from './gh-throttle-holders.mjs';
+import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, sanitizeGhHolder } from './gh-throttle-holders.mjs';
 
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
@@ -1139,7 +1139,7 @@ export function acquireGhSlotSync({
     onReap: (holder) => {
       recordGhCallLogEntry(logPath || ghThrottleLogPath(lockRoot), { outcome: 'slot_reaped', ...holder });
       try { (warn || ((m) => process.stderr.write(m + '\n')))(`gh-throttle: reaped slot ${holder.slot} — holders: ${ghHoldersSummary([holder])}`); } catch { /* best-effort */ }
-      recordGhThrottleMetric('gh.throttle.slot_reaped', 1, { op: holder.op, source: holder.caller });
+      recordGhThrottleMetric('gh.throttle.slot_reaped', 1, { op: holder.op, source: 'max-hold' });
     },
   });
 }
@@ -1587,7 +1587,7 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  */
 export function noteSlotTimeout(logPath, acq, entry, warn) {
   if (!acq || !acq.timedOut) return false;
-  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null, holders: acq.holders ?? [] });
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null, holders: (acq.holders ?? []).map(sanitizeGhHolder) });
   const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated; holders: ${ghHoldersSummary(acq.holders)}`;
   try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
   return true;
@@ -1776,7 +1776,7 @@ export function runGhSync(args, opts = {}) {
       const result = encoding ? bytes.toString(encoding) : bytes;
       const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
       recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
-        outcome: 'memo_hit', op: throttle.op || args.slice(0, 2).join(' '), caller: deriveGhCaller(throttle, env), points: 0,
+        outcome: 'memo_hit', op: throttle.op || ghOpLabel(args), caller: deriveGhCaller(throttle, env), points: 0,
       });
       return result;
     }
@@ -1840,7 +1840,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
   // (`throttle.op`), else it derives from the gh subcommand itself (e.g. "pr create", "pr view").
   const calibrateHeaders = !!throttle.calibrateHeaders;
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
-  const opLabel = throttle.op || (Array.isArray(args) ? args.slice(0, 2).join(' ') : 'unknown');
+  const opLabel = throttle.op || ghOpLabel(args);
   const gateOpts = { warn: throttle.warn, logPath, op: opLabel };
   // #gh-write-burst — a THIRD, independent gate over MUTATIONS only (see DEFAULT_GH_WRITE_BUDGET_PER_MIN's own
   // doc comment), plus best-effort caller attribution recorded on every log line below.
@@ -1904,7 +1904,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: args, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) {
@@ -2065,7 +2065,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
-  const opLabel = throttle.op || (Array.isArray(argv) ? argv.slice(0, 2).join(' ') : 'unknown');
+  const opLabel = throttle.op || ghOpLabel(argv);
   const gateOpts = { warn: throttle.warn, logPath, op: opLabel };
   // #gh-write-burst — see runGhSync's identical wiring for the full rationale.
   const isWrite = classifyGhWrite(argv);
@@ -2138,7 +2138,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };

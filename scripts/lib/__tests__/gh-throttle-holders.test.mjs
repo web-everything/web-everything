@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough } from '../gh-throttle.mjs';
-import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, acquireGhHolderSlot } from '../gh-throttle-holders.mjs';
+import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
 import { readLockEntry, reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
 import { slotPath } from '../../readiness/heavy-admission.mjs';
 
@@ -19,14 +19,68 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gh-holders-')); logPath = 
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('gh holders', () => {
+  it.each([
+    ['-fapi_key=hidden-value'], ['-Fprivate_key=hidden-value'], ['--field', 'credential=hidden-value'],
+    ['--raw-field=body=hidden-value'], ['-HCookie: hidden-value'], ['--header', 'X-App-Key: hidden-value'],
+    ['--body', 'hidden-value\n`quoted`\r\u2028invisible\u200b'], ['--token', 'hidden-value'],
+  ])('omits attached, separate and free-text values: %j', (...tail) => {
+    const meta = ghHolderMeta({ caller: 'worker', args: ['api', 'user', ...tail] });
+    expect(JSON.stringify(meta)).not.toContain('hidden-value');
+  });
+  it('sanitizes every holder field supplied directly to timeout reporting', () => {
+    const warn = vi.fn();
+    const holders = [{ caller: 'worker --token hidden-value', op: 'pr view hidden-value', parent: 'node -e 0 --token hidden-value.mjs', ppid: 'hidden-value', slot: 'hidden-value', pid: 'hidden-value', alive: 'hidden-value', heldMs: 'hidden-value', args: 'hidden-value' }];
+    noteSlotTimeout(logPath, { timedOut: true, holders }, {}, warn);
+    expect(readFileSync(logPath, 'utf8') + JSON.stringify(warn.mock.calls)).not.toContain('hidden-value');
+  });
+  it.each(['api_key', 'private_key', 'credential', 'body', 'cookie', 'x-service-key'])('never persists %s payloads or headers', (key) => {
+    const args = ['api', 'user', '-f', `${key}=sensitive-value`, '-H', 'Cookie: sensitive-value', '--header=X-Service-Key: sensitive-value'];
+    acquire('one', 'worker', { cap: 1, meta: ghHolderMeta({ caller: 'worker', args, nowMs: clock }) });
+    expect(JSON.stringify(readLockEntry(root, slotPath(0)))).not.toContain('sensitive-value');
+    const warn = vi.fn();
+    noteSlotTimeout(logPath, acquire('two', 'other', { cap: 1 }), {}, warn);
+    expect(readFileSync(logPath, 'utf8') + JSON.stringify(warn.mock.calls)).not.toContain('sensitive-value');
+  });
+  it('sanitizes stored legacy metadata before reaping, logging and warning', () => {
+    reserve(root, slotPath(0), 'one', clock, new Date(clock).toISOString(), process.pid, 'unknown', 60, { caller: 'worker --token hidden-value', op: "api user -H 'Cookie: hidden-value'", parent: 'node parent.mjs --credential hidden-value', acquiredAt: new Date(clock).toISOString() });
+    const holders = readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: clock });
+    expect(JSON.stringify(holders) + ghHoldersSummary(holders)).not.toContain('hidden-value');
+    const warn = vi.fn();
+    acquire('next', 'other', { cap: 1, now: () => clock + 106000, warn });
+    expect(readFileSync(logPath, 'utf8') + JSON.stringify(warn.mock.calls)).not.toContain('hidden-value');
+    expect(rows()[0].op).toBe('api');
+  });
+  it.each([false, true].flatMap(capped => [false, true].flatMap(full => [false, true].map(aged => [capped, full, aged]))))('admission decision table: capped=%s full=%s aged=%s', (capped, full, aged) => {
+    for (let i = 0; i < (full ? 6 : 4); i++) acquire(`old-${i}`, i < 4 ? 'worker' : `other-${i}`);
+    const r = acquire('next', capped ? 'worker' : 'new-worker', { now: () => clock + (aged ? 106000 : 104000) });
+    expect(r.ok).toBe(aged || (!capped && !full));
+    if (aged && (capped || full)) expect(rows().some(row => row.outcome === 'slot_reaped')).toBe(true);
+  });
+  it.each([[300000, 106000, false], [300000, 315001, true], [0, 400000, false]])('respects effective timeout %s when reaping at %s', (timeoutMs, age, reaped) => {
+    acquire('one', 'worker', { cap: 1, meta: ghHolderMeta({ caller: 'worker', args: ['pr', 'view', '123'], timeoutMs, nowMs: clock }) });
+    expect(acquire('next', 'other', { cap: 1, now: () => clock + age }).ok).toBe(reaped);
+  });
+  it('reap logs and metrics use bounded operations', async () => {
+    const telemetry = await import('../../operations/telemetry-store.mjs');
+    const recordMetric = vi.fn();
+    const spy = vi.spyOn(telemetry, 'createTelemetryRecorder').mockReturnValue({ recordMetric });
+    try {
+      acquire('one', 'worker', { cap: 1, meta: ghHolderMeta({ caller: 'worker', args: ['pr', 'view', '123', '--body', 'private-body'], nowMs: clock }) });
+      acquire('next', 'other', { cap: 1, now: () => clock + 106000 });
+      expect(rows()[0]).toMatchObject({ outcome: 'slot_reaped', op: 'pr view' });
+      expect(rows()[0].args).not.toMatch(/123|private-body/);
+      expect(recordMetric).toHaveBeenCalledWith('gh.throttle.slot_reaped', 1, { unit: 'count', attributes: { op: 'pr view', source: 'max-hold', attempt: undefined } });
+    } finally { spy.mockRestore(); }
+  });
   it('writes redacted metadata and reads live holder attribution', () => {
     const args = ['api', 'user', '-H', 'Authorization: Bearer abc', '-f', 'client_secret=hidden', '-F', 'password=hidden', 'ghp_abcdef', 'github_pat_abcdef', 'token=hidden', '--field=client_secret=hidden', '--raw-field=password=hidden', 'Bearer', 'hidden', 'token="hidden words"', "Bearer 'hidden words'"];
     acquire('one', 'worker', { meta: ghHolderMeta({ caller: 'worker', args, nowMs: clock }) });
     const entry = readLockEntry(root, slotPath(0));
     expect(entry.meta).toMatchObject({ caller: 'worker', pid: process.pid, ppid: process.ppid, acquiredAt: new Date(clock).toISOString() });
     expect(entry.meta.op).not.toMatch(/hidden|abcdef|Bearer|abc/);
-    expect(entry.meta.op).toContain('<redacted>');
-    expect(redactGhArgs(['x'.repeat(500)])).toHaveLength(300);
+    expect(entry.meta.op).toBe('api');
+    expect(entry.meta.args).toBe('api <redacted>');
+    expect(redactGhArgs(['x'.repeat(500)])).toBe('unknown');
     expect(readGhSlotHolders({ lockRoot: root, cap: 6, nowMs: clock + 95000 })[0]).toMatchObject({ slot: 0, alive: true, heldMs: 95000, caller: 'worker' });
   });
   it('logs holders and warns on slot timeout', () => {
@@ -35,7 +89,7 @@ describe('gh holders', () => {
     const warn = vi.fn();
     noteSlotTimeout(logPath, acq, { caller: 'other' }, warn);
     expect(rows()[0]).toMatchObject({ outcome: 'slot_timeout', holders: [{ caller: 'worker', slot: 0 }] });
-    expect(warn.mock.calls[0][0]).toContain('holders: worker(api user, 0s)');
+    expect(warn.mock.calls[0][0]).toContain('holders: worker(api, 0s)');
   });
   it.each([[106000, 90, true], [104000, 90, false], [106000, 0, false]])('reaps only over-age enabled holds (%s, %s)', (age, maxHoldSeconds, reaped) => {
     acquire('one', 'worker', { cap: 1 });
@@ -80,6 +134,41 @@ describe('gh holders', () => {
 });
 
 describe('hold policy and execution', () => {
+  it('uses the same safe operation on call and memo-hit logs', () => {
+    const memo = join(root, 'memo');
+    mkdirSync(memo);
+    const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok'), stderr: Buffer.alloc(0) }));
+    const throttle = { lockRoot: root, logPath, spawn, budgetPerMin: 100, personalRoute: false,
+      env: { WE_GH_READ_MEMO_DIR: memo, WE_GH_THROTTLE_COST_HEADERS: '1', WE_GH_PERSONAL_READS: '0' } };
+    const args = ['api', 'repos/o/r?api_key=hidden-value', '--method', 'GET'];
+    runGhSync(args, { throttle });
+    runGhSync(args, { throttle });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(rows()).toMatchObject([{ outcome: 'call', op: 'api' }, { outcome: 'memo_hit', op: 'api' }]);
+    expect(readFileSync(logPath, 'utf8')).not.toContain('hidden-value');
+  });
+  it('preserves an explicit kill signal when adding the default timeout', () => {
+    expect(ghExecOptions({ killSignal: 'SIGKILL' }, ['api'], policy)).toEqual({ timeout: 90000, killSignal: 'SIGKILL' });
+  });
+  it.each([300000, 0])('records the effective explicit timeout %s in the executing holder', (timeout) => {
+    const spawn = vi.fn(() => {
+      expect(readGhSlotHolders({ lockRoot: root, cap: 6 })[0].timeoutMs).toBe(timeout);
+      return { status: 0, stdout: Buffer.from('ok'), stderr: Buffer.alloc(0) };
+    });
+    runGhSync(['api', 'user'], { timeout, throttle: { lockRoot: root, logPath, env: {}, spawn, budgetPerMin: 100 } });
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+  it.each([['sync', 90], ['sync', 0], ['passthrough', 90], ['passthrough', 0]])('records the default effective timeout and safe operation in %s execution (policy %s)', (mode, maxHoldSeconds) => {
+    const spawn = vi.fn(() => {
+      expect(readGhSlotHolders({ lockRoot: root, cap: 6 })[0]).toMatchObject({ timeoutMs: maxHoldSeconds * 1000, op: 'api' });
+      return { status: 0, stdout: Buffer.from('ok'), stderr: Buffer.alloc(0) };
+    });
+    const throttle = { lockRoot: root, logPath, env: { WE_GH_THROTTLE_MAX_HOLD_SECONDS: String(maxHoldSeconds) }, spawn, budgetPerMin: 100 };
+    if (mode === 'sync') runGhSync(['api', 'user'], { throttle });
+    else runGhCliPassthrough(['api', 'user'], { throttle, spawn });
+    expect(rows().find(row => row.outcome === 'call').op).toBe('api');
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
   it('resolves tool JSON and env provenance', () => {
     expect(loadGhThrottleSettings({ env: {} })).toMatchObject({ value: policy, sources: { maxHoldSeconds: 'tool', reapGraceSeconds: 'tool', perCallerMax: 'tool' } });
     expect(loadGhThrottleSettings({ env: { WE_GH_THROTTLE_MAX_HOLD_SECONDS: '0', WE_GH_THROTTLE_PER_CALLER_MAX: '2' } })).toMatchObject({ value: { maxHoldSeconds: 0, perCallerMax: 2 }, sources: { maxHoldSeconds: 'env', perCallerMax: 'env' } });
@@ -135,11 +224,21 @@ describe('hold policy and execution', () => {
 });
 
 describe('legacy holders without meta', () => {
+  it.each(['node -e 0 --token hidden-value.mjs', 'bash -c true --password hidden-value.js'])('does not infer parent scripts from arbitrary arguments: %s', (parent) => {
+    const out = describeLegacyHolders([{ pid: 10, alive: true, caller: 'unknown', op: '' }], pid => pid === 10 ? '20 gh pr list' : `1 ${parent}`);
+    expect(JSON.stringify(out)).not.toContain('hidden-value');
+  });
+  it.each(["-H 'Authorization: token ghp_hidden'", "--token hidden-value", "-H 'Cookie: hidden-value'", '-f private_key=hidden-value', '--field=body=hidden-value', '--header="X-App-Key: hidden-value"'])('drops legacy command payloads: %s', (payload) => {
+    const ps = pid => pid === 10 ? `20 gh api user ${payload}` : `1 node drain-daemon.mjs ${payload}`;
+    const out = describeLegacyHolders([{ slot: 0, pid: 10, alive: true, caller: 'unknown', op: '', parent: '', heldMs: 5 }], ps);
+    expect(JSON.stringify(out) + ghHoldersSummary(out)).not.toMatch(/ghp_hidden|hidden-value/);
+    expect(out[0].parent).toContain('drain-daemon.mjs');
+  });
   it('are named from the process table on timeout only', async () => {
     const { describeLegacyHolders } = await import('../gh-throttle-holders.mjs');
     const ps = (pid) => (pid === 10 ? ' 20 node gh-throttle.mjs api x' : ' 1 node drain-daemon.mjs');
     const out = describeLegacyHolders([{ slot: 0, pid: 10, alive: true, caller: 'unknown', op: '', parent: '', ppid: null, heldMs: 5 }, { slot: 1, pid: 11, alive: true, caller: 'w', op: 'pr list', parent: 'p', ppid: 2, heldMs: 1 }], ps);
-    expect(out[0]).toMatchObject({ ppid: 20, op: 'node gh-throttle.mjs api x', parent: 'node drain-daemon.mjs' });
+    expect(out[0]).toMatchObject({ ppid: 20, op: 'api', parent: 'drain-daemon.mjs' });
     expect(out[1]).toMatchObject({ caller: 'w', op: 'pr list' });
   });
 });
