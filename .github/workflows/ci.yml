@@ -110,7 +110,10 @@ jobs:
     # this; a HUNG one now gets killed by GitHub itself within the hour instead of waiting 6h, and the
     # new `scripts/conveyor/ci-red-recovery-watch.mjs` hung-run sweep (see its own header) no longer has
     # to out-wait this job to reclaim the PR.
-    timeout-minutes: 15
+    # 2026-10-14 RE-SIZED 15 -> 25: the 2026-09-25 sample above is stale (shards then ran ~4 min; they now take ~9-11 min
+    # on a normal runner). Main went red at 8cd0b3d12 with no code cause: shard 2 needed ~14 min on a slow runner and the
+    # 15-min cap cancelled it. 25 min = ~1.8x the slowest observed; a HUNG shard is still killed within the half hour.
+    timeout-minutes: 25
     strategy:
       # Don't cancel sibling shards when one fails — the `test` aggregator reports the combined red, and
       # cancelling would hide which other shards also failed.
@@ -494,9 +497,11 @@ jobs:
     # No measured per-shard p95 yet (this split is new) — sized generously pending a first-run sample, same
     # ~3x-p95 method `test-shard` used once IT had data (see that job's own timeout comment above).
     # Shard 1 is the baseline alone, so the ~133 break scenarios split across the remaining shards: with only
-    # 3 of them (shards 2-4, ~44 files each) a shard ran 13-15 min and hit this cap; 4 (shards 2-5, ~33 files
+    # 3 of them (shards 2-4, ~44 files each) a shard ran 13-15 min and hit the old 15-minute cap; 4 (shards 2-5, ~33 files
     # each, ~10-11 min) leaves headroom.
-    timeout-minutes: 15
+    # 2026-10-14 RE-SIZED 15 -> 25: shard 1's 50-tick baseline took 550s on the last green run and 615s (vitest's 10-min
+    # cap) on the run that turned main red at 8cd0b3d12. The vitest timeout (`vitest.soak.config.ts`) must stay below this.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
