@@ -160,16 +160,24 @@ describe('checkNumberingCommit', () => {
 
 // Exercise the actual IO shell without writing git state: exec observes the same raw
 // bytes cat-file returns, including bytes a permissive UTF-8 decoder would discard.
-function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '' } = {}) {
+function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '', modes = {} } = {}) {
   const from = 'a'.repeat(40), numbered = 'b'.repeat(40);
   const heads = [numbered, 'e'.repeat(40)];
   const head = heads[subjects.length - 1];
   const calls = [];
+  // Blobs are keyed by object id, as the proof reads them (never by `<rev>:<path>`).
   const blobs = new Map();
+  const oids = new Map();
+  const oidFor = (key, bytes) => {
+    const oid = (blobs.size + 1).toString(16).padStart(40, '0');
+    blobs.set(oid, Buffer.from(bytes));
+    oids.set(key, oid);
+  };
   for (const c of changes) {
-    if (c.before !== undefined) blobs.set(`${from}:${c.path}`, Buffer.from(c.before));
-    if (c.after !== undefined) blobs.set(`${numbered}:${c.path}`, Buffer.from(c.after));
+    if (c.before !== undefined) oidFor(`before:${c.path}`, c.before);
+    if (c.after !== undefined) oidFor(`after:${c.path}`, c.after);
   }
+  const zero = '0'.repeat(40);
   const exec = (_cmd, args, opts) => {
     calls.push(args);
     let output = '';
@@ -181,12 +189,17 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
       if (args.includes(failTree)) throw Error('inventory unreadable');
       const ref = args.find((a) => a === from || a === 'origin/main');
       output = (trees[ref] ?? []).map((p) => `${p}\0`).join('');
-    } else if (args[0] === 'diff') {
-      output = changes.map((c) => `:${c.status === 'A' ? '000000' : '100644'} ${c.status === 'D' ? '000000' : '100644'} ${'c'.repeat(40)} ${'d'.repeat(40)} ${c.status}\0${c.path}\0`).join('');
-    } else if (args[0] === 'cat-file' && ['blob', '-s'].includes(args[1])) {
+    } else if (args[0] === 'diff-tree') {
+      output = changes.map((c) => {
+        const m = modes[c.path] ?? {};
+        const beforeMode = c.status === 'A' ? '000000' : (m.beforeMode ?? '100644');
+        const afterMode = c.status === 'D' ? '000000' : (m.afterMode ?? '100644');
+        return `:${beforeMode} ${afterMode} ${oids.get(`before:${c.path}`) ?? zero} ${oids.get(`after:${c.path}`) ?? zero} ${c.status}\0${c.path}\0`;
+      }).join('');
+    } else if (args[0] === 'cat-file' && ['blob', '-s', '-t'].includes(args[1])) {
       const bytes = blobs.get(args[2]);
       if (!bytes) throw Error(`missing fixture blob ${args[2]}`);
-      output = args[1] === '-s' ? `${bytes.length}\n` : bytes;
+      output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${bytes.length}\n` : bytes;
     }
     return opts.encoding === null ? Buffer.from(output) : Buffer.isBuffer(output) ? output.toString('utf8') : output;
   };
@@ -255,7 +268,9 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     const changes = live().changes;
     changes[beforeIndex].before = before(changes[beforeIndex].before);
     changes[afterIndex].after = after(changes[afterIndex].after);
-    expect(Buffer.from(changes[afterIndex].after).equals(Buffer.from(changes[beforeIndex].before))).toBe(false);
+    // The appended text differs only in its bytes, never in what a reader sees.
+    expect(Buffer.from(after('')).equals(Buffer.from(before('')))).toBe(false);
+    expect(after('').normalize('NFC').replace(/\r\n/g, '\n')).toBe(before(''));
     refused(proofReader({ changes }).prove(), /rewrite/);
   });
   it('accepts the same character in the same encoding on both sides (the control for the case above)', () => {
@@ -265,23 +280,10 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     expect(proofReader({ changes }).prove().ok).toBe(true);
   });
   it.each([
-    ['a modification', [{ status: 'M', path: 'backlog/4815-a-not-real-ruling.md', beforeMode: '100644', afterMode: '100755' }]],
-    ['a rename', [{ status: 'D', path: 'backlog/xf74q20-hold-auto-land.md', beforeMode: '100644' },
-      { status: 'A', path: 'backlog/6053-hold-auto-land.md', afterMode: '100755' }]],
+    ['a modification', { 'backlog/4815-a-not-real-ruling.md': { afterMode: '100755' } }],
+    ['a rename', { 'backlog/6053-hold-auto-land.md': { afterMode: '100755' } }],
   ])('refuses an executable-bit change riding on %s', (_name, modes) => {
-    const changes = live().changes;
-    const r = proofReader({ changes });
-    const exec = (cmd, args, opts) => {
-      if (args[0] !== 'diff') return r.exec(cmd, args, opts);
-      const lines = changes.map((c) => {
-        const m = modes.find((x) => x.path === c.path) ?? {};
-        const before = c.status === 'A' ? '000000' : (m.beforeMode ?? '100644');
-        const after = c.status === 'D' ? '000000' : (m.afterMode ?? '100644');
-        return `:${before} ${after} ${'c'.repeat(40)} ${'d'.repeat(40)} ${c.status}\0${c.path}\0`;
-      });
-      return Buffer.from(lines.join(''));
-    };
-    refused(proveNumberingOnlyMove({ exec, fromSha: r.from, toSha: r.head }), /mode/);
+    refused(proofReader({ modes }).prove(), /mode/);
   });
   it('preserves a UTF-8 BOM when comparing valid blob content', () => {
     const changes = live().changes;
@@ -401,6 +403,39 @@ describe('proveNumberingOnlyMove (real git)', () => {
     r.git(['commit', '--amend', '--no-edit', '-q']);
     refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha: r.git(['rev-parse', 'HEAD']) }), /mode/);
   });
+  // Self-review (#5233): a blob read by `<rev>:<path>` goes through git's path handling, which on macOS
+  // (core.precomposeunicode) folds an NFD path onto its NFC twin — so the proof read the twin's valid rewrite and
+  // never saw the NFD card's real change. Blobs are read by the object ids the raw diff names.
+  it('refuses a change to an NFD card hidden behind its NFC twin when git precomposes paths', () => {
+    const r = repo();
+    const nfc = 'backlog/0003-café.md', nfd = 'backlog/0003-café.md';
+    const put = (path, text) => {
+      const oid = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: r.cwd, input: text, encoding: 'utf8' }).trim();
+      r.git(['-c', 'core.precomposeunicode=false', 'update-index', '--add', '--cacheinfo', `100644,${oid},${path}`]);
+    };
+    put(nfc, 'see #xabc123\n');
+    put(nfd, 'see #xabc123\n');
+    r.git(['commit', '-q', '-m', 'twin cards']);
+    const fromSha = r.git(['rev-parse', 'HEAD']);
+    r.number();
+    put(nfc, 'see #7001\n');
+    put(nfd, 'anything at all\n');
+    r.git(['commit', '--amend', '--no-edit', '-q']);
+    const toSha = r.git(['rev-parse', 'HEAD']);
+    expect(r.git(['-c', 'core.precomposeunicode=false', 'diff', '--name-only', fromSha, toSha])).toContain('0003-cafe');
+    const exec = (cmd, args, opts) => execFileSync(cmd, ['-c', 'core.precomposeunicode=true', ...args], opts);
+    refused(proveNumberingOnlyMove({ exec, cwd: r.cwd, fromSha, toSha }), /rewrite/);
+  });
+  // Self-review (#5233): porcelain `git diff` drops a gitlink when submodules are configured as ignored, so the mode
+  // allow-list never saw it. The raw diff is plumbing with --ignore-submodules=none.
+  it('refuses a gitlink added beside the numbering even when diff config ignores submodules', () => {
+    const r = repo();
+    r.number();
+    r.git(['update-index', '--add', '--cacheinfo', `160000,${r.base},backlog/sub`]);
+    r.git(['commit', '--amend', '--no-edit', '-q']);
+    const exec = (cmd, args, opts) => execFileSync(cmd, ['-c', 'diff.ignoreSubmodules=all', ...args], opts);
+    refused(r.prove(r.git(['rev-parse', 'HEAD']), exec), /mode/);
+  });
   it('refuses numbering combined with an NFC → NFD re-encoding of a card', () => {
     const r = repo();
     r.write('backlog/0001-parent.md', 'see #xabc123 café\n');
@@ -508,7 +543,7 @@ describe('proveNumberingOnlyMove (real git)', () => {
       ['cat-file', '-e', `${r.base}^{commit}`],
     ]);
   });
-  it.each(['rev-list', 'log', 'diff', 'cat-file'])('fails closed on a %s read error', (operation) => {
+  it.each(['rev-list', 'log', 'diff-tree', 'cat-file'])('fails closed on a %s read error', (operation) => {
     const r = repo();
     const head = r.number();
     const exec = (cmd, args, opts) => {

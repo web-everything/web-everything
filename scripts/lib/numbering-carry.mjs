@@ -216,7 +216,7 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
     const blobText = (object) => {
       const bytes = gitBytes(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
       const text = decoder.decode(bytes);
-      if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
+      if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
     ensureReadable(git, fromSha);
@@ -253,7 +253,9 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
     let totalBytes = 0;
     parent = fromSha;
     for (const { sha, parents, subject } of steps) {
-      const raw = git(['diff', '--no-renames', '--raw', '--no-abbrev', '-z', parent, sha]);
+      // Plumbing, not porcelain `git diff`: no diff config (diff.ignoreSubmodules, a .gitmodules ignore, diff.relative)
+      // may drop an entry — a hidden gitlink would never reach the mode allow-list below.
+      const raw = git(['diff-tree', '-r', '--no-renames', '--raw', '--no-abbrev', '-z', '--ignore-submodules=none', parent, sha]);
       if (raw && !raw.endsWith('\0')) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
       const fields = raw ? raw.slice(0, -1).split('\0') : [];
       if (fields.length % 2) return refuse(`malformed name-status diff at ${sha.slice(0, 9)}`);
@@ -261,19 +263,23 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
       const changes = [];
       for (let i = 0; i < fields.length; i += 2) {
         const [metadata, path] = fields.slice(i, i + 2);
-        const match = /^:([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([A-Z])$/.exec(metadata);
+        const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z])$/.exec(metadata);
         if (!match) return refuse(`malformed raw diff at ${sha.slice(0, 9)}`);
-        const [, beforeMode, afterMode, status] = match;
+        const [, beforeMode, afterMode, beforeOid, afterOid, status] = match;
         if (!['A', 'D', 'M'].includes(status)) return refuse(`unsupported change status ${status} at ${path}`);
         if ((status !== 'A' && !['100644', '100755'].includes(beforeMode))
           || (status !== 'D' && !['100644', '100755'].includes(afterMode))) return refuse(`unsupported file mode at ${path}`);
-        const change = { status, path, beforeMode, afterMode };
+        const change = { status, path, beforeMode, afterMode, beforeOid, afterOid };
         changes.push(change);
       }
       for (const change of changes) {
-        for (const [side, ref] of [['before', parent], ['after', sha]]) {
+        for (const side of ['before', 'after']) {
           if ((side === 'before' && change.status === 'A') || (side === 'after' && change.status === 'D')) continue;
-          const object = `${ref}:${change.path}`;
+          // By the object id the diff named, never `<rev>:<path>`: git's path lookup can fold a path onto a different
+          // entry (core.precomposeunicode maps an NFD name onto its NFC twin), so a path read may return another blob.
+          const object = change[`${side}Oid`];
+          if (/^0{40}$/.test(object)) return refuse(`missing blob id at ${change.path}`);
+          if (git(['cat-file', '-t', object]).trim() !== 'blob') return refuse(`object at ${change.path} is not a blob`);
           const sizeText = git(['cat-file', '-s', object]).trim();
           if (!/^\d+$/.test(sizeText)) return refuse(`invalid blob size at ${change.path}`);
           const size = Number(sizeText);
@@ -294,6 +300,7 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
       + `(${pairs.map(([hash, number]) => `${hash}→#${number}`).join(', ')}) — card renames and id rewrites only` };
   } catch (e) {
     if (e?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') return refuse('numbering proof contains invalid UTF-8');
+    if (e?.code === 'NUMBERING_BYTES_NOT_EXACT') return refuse('numbering proof blob text does not match its exact bytes');
     return { ...refuse(`numbering proof failed: ${String(e?.message ?? e).split('\n')[0]}`), retryable: true };
   }
 }
