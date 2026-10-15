@@ -1862,6 +1862,20 @@ describe('automatic item preparation', () => {
       expect(after.prepare.launched.map(r => r.num).sort()).toEqual(['5028', '5029']);
     } finally { log.mockRestore(); }
   });
+  // Same class: a card the daemon already knows it will skip after planning (a build backoff, a prepare group
+  // member in flight under its lead) is held out of tick-core's two picks before planning.
+  it('holds build-backoff cards and in-flight group members out of tick-core\'s prepare picks', async () => {
+    const effects = fixture();
+    acquireBuildDispatchClaim({ num: '4501', lockRoot, owner: 'host:10', pid: 10 });
+    acquireBuildDispatchClaim({ num: '4503', groupLead: '4501', lockRoot, owner: 'host:10', pid: 10 });
+    effects.listBuildBackoffs = () => [{ num: '4504', exhausted: true }];
+    const plan = effects.planTick;
+    const seen = [];
+    effects.planTick = (bk, opts) => { seen.push(bk.prepareHeldNums); return plan(bk, opts); };
+    await runBuildDispatchTick({ live: true, effects });
+    expect(seen[0]).toEqual(expect.arrayContaining(['4503', '4504']));
+    expect(seen[0]).not.toContain('4501'); // a lead keeps its tick-core guard; holding it would drop that guard
+  });
   it.each([
     ['listing unavailable', () => { throw new Error('network failed'); }, [], 'prepare PR listing unavailable'],
     ['listing effect absent', undefined, [], 'prepare PR listing unavailable'],
@@ -3832,6 +3846,19 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204'] })]);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
     expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #5366 review round 5 self-review: a card held out of tick-core for a fresh launch refusal (an open prepare
+  // PR) must not ride into a clean lead's group either — members are claimed under the lead, never refusal-checked.
+  it('keeps a refusal-held card out of a clean lead\'s prepare group', async () => {
+    const effects = fixture({ spawns: [rows[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    const bookkeeping = { prepareRefusals: [{ num: '7202', reason: 'open prepare PR #91 (lane/7202d-prepare-x)', at: '2026-10-15T11:50:00Z' }] };
+    const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+    expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7203', '7204', '7205'] })]);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7202');
+    expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7202']);
   });
 
   it('keeps agent and unknown prepare routes single-card before claiming members', async () => {

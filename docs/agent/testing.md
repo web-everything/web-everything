@@ -820,7 +820,8 @@ the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of
 the releases store. Cover each clearing path, and an older park under a newer record, so an operator's
 hand stamp never re-parks the card (the stale-reprepare livelock).
 tick-core offers at most two item prepares and cannot see these launch refusals. The daemon keeps a
-refused card out of the plan for `PREPARE_REFUSAL_HOLD_MS`, then checks it again. Test that capacity
+refused card out of the plan, and out of a clean lead's prepare group, for `PREPARE_REFUSAL_HOLD_MS`,
+then checks it again. Build-backoff cards and group members in flight are held out the same way. Test that capacity
 rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
 a clean third, across ticks.
 

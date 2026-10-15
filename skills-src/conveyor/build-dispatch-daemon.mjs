@@ -446,11 +446,20 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // decided here, after planning, so tick-core keeps offering the same refused cards in its two slots. Hold each one
   // out of the plan while its refusal is fresh, so the slots rotate to clean cards; it is re-checked once it ages out.
   const tickNowMs = effects.now?.() ?? Date.now();
+  // An operator release or a stamp lifts a cached refusal at once.
   const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
-    .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS && !completedPrepares.has(normNum(r.num)));
+    .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
+      && !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num)));
+  const refusalHeldNums = new Set(freshRefusals.map(r => normNum(r.num)));
+  // The same goes for cards the launch loop below is already known to skip: a build backoff (`heldNums`) and a group
+  // member in flight under its lead (a member has a claim but no tick-core guard). A lead keeps its own guard.
+  let prepareBackoffNums = [];
+  try { prepareBackoffNums = (effects.listBuildBackoffs?.() ?? []).map(b => normNum(b.num)); }
+  catch { /* the build pass below reads the backoffs again and owns that failure */ }
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: [...new Set([...holds.map((h) => normNum(h.num)),
-    ...freshRefusals.map(r => normNum(r.num))])] };
+    ...refusalHeldNums, ...prepareBackoffNums,
+    ...prepareClaims.filter(c => c.meta?.groupLead != null).map(c => normNum(c.meta.num))])] };
   const tickBookkeeping = bookkeeping;
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
   // row owns it from here); a failed one releases its claim and records the failure the same way a blocking launch did.
@@ -1136,6 +1145,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   prepare.freezeHeld = freezeHolds('prepare-item', plan.freeze, costSettings);
   const refusedPrepares = new Set();
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
+    && !refusalHeldNums.has(normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
