@@ -35,6 +35,7 @@ import {
 import { resolveReviewSeatSetting } from '../../lib/review-seat-settings.mjs';
 
 const NET_PATHS = ['scripts/operations/review-pr.mjs'];
+const HEAD = 'd'.repeat(40);
 
 function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n', diffScored = true) {
   return ({ pr, repo }) => ({
@@ -49,7 +50,7 @@ function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n
     },
     headRefName: 'lane/thing',
     body: 'the PR description',
-    net: { paths, base: 'abc123', rev: 'def456', scored: true },
+    net: { paths, base: 'abc123', rev: HEAD, scored: true },
     diff: { text: diffText, scored: diffScored },
   });
 }
@@ -109,6 +110,8 @@ async function loop({ parallel, judge, seatLanes = null, runId, store = createMe
   const out = await runReviewLoopOnce({
     declaration, registry, argv, store, sinks: recordingSinks(), makeJudge: judge.make, mintRunId: () => runId,
     appendLearning: () => ({ path: '/dev/null' }), fileItem: async () => ({ code: 0, lines: ['{}'] }),
+    // Keep the production acceptance gate enabled against this fixture's pinned head.
+    readAcceptancePr: () => ({ headRefOid: HEAD, body: 'the PR description', comments: [] }),
     parallelJudges: parallel, seatLanes,
   });
   return { out, run: store.read(out.run?.id ?? runId), store, declaration, registry };

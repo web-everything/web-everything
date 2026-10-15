@@ -7,8 +7,8 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
 /**
  * @file scripts/operations/probation-build-run.mjs
  * @description THE PROBATION BUILD RUN (agy-launcher-probation, #4291) — the detached per-dispatch
- *   process `dispatch-providers/probation-worker.mjs` starts for doc-fix builds. Also runs directly from
- *   the operator CLI for one non-critical doc-fix or bugfix item.
+ *   process `dispatch-providers/probation-worker.mjs` starts for supported probation builds. Also runs
+ *   directly from the operator CLI for one non-critical item.
  *   PR #2819 opened the model-probation gate and started RECORDING a doc-fix pick; this script is what actually
  *   LAUNCHES it, the doc-fix sibling of `we:scripts/operations/probation-heal-run.mjs` (`ci-heal`). It follows
  *   the same arc as a normal mechanical `build` dispatch (claim, build, gate, resolve, PR), with the SCRIPT
@@ -63,7 +63,7 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
  * every other conveyor delivery arc's own EXIT step) or on failure (matching `probation-heal-run.mjs`, which
  * never releases the lane either — the lease reaper reclaims it).
  *
- * Operator CLI: --num=<item> --taskType=doc-fix|bugfix|test-fix|prepare --worker=<roster id|JSON> [--model=<allowed id>].
+ * Operator CLI: --num=<item> --taskType=doc-fix|bugfix|test-fix|prepare|build-new-feature --worker=<roster id|JSON> [--model=<allowed id>].
  * Omitted taskType remains doc-fix; omitted session gets a random per-run identity. Worker names resolve
  * from PROBATION_WORKERS (agy Claude defaults to Sonnet). Flash is for simple mechanical work and requires
  * a read-only Codex APPROVE. No enclosing Claude session is started.
@@ -85,7 +85,8 @@ import { parseCard } from '../lib/priority-order.mjs';
 import { appendScorecard as appendScorecardRow } from '../conveyor/run-scorecard-store.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { hookSurfaceChanged, resetHookSurface, snapshotHookSurface, withHooksDisabled } from '../lib/git-hook-surface.mjs';
-import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, isStatuteTierPath } from '../lib/provider-routing.mjs';
+import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, probationWorkerForRoute, isStatuteTierPath } from '../lib/provider-routing.mjs';
+import { resolveBuildArgonModel } from '../lib/build-argon-settings.mjs';
 import { isDocScopePath } from '../lib/dispatch-task-type.mjs';
 import {
   buildCheckerArgv, parseCheckerVerdict, buildDocFixCommitMessage, buildDocFixTask, buildWorkerArgv, frontmatterTamperedBeyondClaim, PREPARE_OWNED_FRONTMATTER_KEYS,
@@ -220,12 +221,12 @@ export function parseArgs(argv) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   const taskType = flags.taskType ?? 'doc-fix';
-  if (!['doc-fix', 'bugfix', 'test-fix', 'prepare'].includes(taskType)) throw new Error('taskType must be doc-fix or bugfix or test-fix or prepare');
+  if (!['doc-fix', 'bugfix', 'test-fix', 'prepare', 'build-new-feature'].includes(taskType)) throw new Error('unsupported probation build taskType');
   const policy = readRoutingPolicy();
   const configured = flags.worker ? null : resolveOperationRoute({ operation: taskType === 'prepare' ? 'prepare-item' : 'build', taskType, policy, gateClosed: false, available: ['codex', 'antigravity', 'agy-claude', 'agy-gemini'] });
   const supplied = typeof flags.worker === 'string'
     ? (Object.hasOwn(PROBATION_WORKERS, flags.worker) ? { id: flags.worker } : JSON.parse(flags.worker))
-    : configured ? { id: configured.provider === 'codex' ? 'codex' : configured.model.startsWith('claude-') ? 'antigravity-claude' : 'antigravity-gemini', model: configured.model, effort: configured.effort } : null;
+    : configured ? probationWorkerForRoute(configured, taskType) : null;
   let worker = null;
   if (supplied) {
     const def = Object.hasOwn(PROBATION_WORKERS, supplied.id) ? PROBATION_WORKERS[supplied.id] : null;
@@ -238,15 +239,18 @@ export function parseArgs(argv) {
     let model;
     try { model = resolvePolicyModel(def.provider, flags.model ?? supplied.model ?? defaultModel); }
     catch (error) { throw new Error(`disallowed model for ${def.id}: ${error.message}`); }
+    if (def.id === 'antigravity-argon' && !resolveBuildArgonModel(model)) throw new Error(`disallowed model for ${def.id}: ${model}`);
+    if (taskType === 'build-new-feature' && !PROBATION_ROSTER[taskType].includes(def.id)) throw new Error('feature builds require a feature probation roster worker');
     if (explicit) {
       const allowed = def.provider === 'antigravity' ? [defaultModel, 'claude-sonnet-4-6', 'gemini-3.8-flash-high'] : [defaultModel];
       if (taskType === 'prepare' && (!['codex', 'antigravity-gemini'].includes(def.id) || model !== defaultModel)) throw new Error('prepare requires a Codex or Gemini roster model');
       if (!allowed.includes(model)) throw new Error(`disallowed model for ${def.id}: ${model}`);
     }
     // A Gemini override must never bypass the simple-only/checker constraints.
-    const flash = model.startsWith('gemini-');
+    const gemini = model.startsWith('gemini-');
+    const flash = gemini && !(def.id === 'antigravity-argon' && resolveBuildArgonModel(model));
     worker = { ...supplied, ...def, model, taskType,
-      simpleOnly: def.simpleOnly || flash, checker: flash ? 'codex' : def.checker };
+      simpleOnly: def.simpleOnly || flash, checker: gemini ? 'codex' : def.checker };
   }
   return {
     runId: flags['run-id'] ?? null,
@@ -285,7 +289,7 @@ function validateAndStampPrepare(num, card, lanePath, io, autoSize) {
 export async function runProbationBuild(args, io) {
   const { num, session, worker } = args;
   const taskType = args.taskType ?? 'doc-fix';
-  if (!['doc-fix', 'bugfix', 'test-fix', 'prepare'].includes(taskType)) throw new Error('taskType must be doc-fix or bugfix or test-fix or prepare');
+  if (!['doc-fix', 'bugfix', 'test-fix', 'prepare', 'build-new-feature'].includes(taskType)) throw new Error('unsupported probation build taskType');
   if (!num || !session || !worker?.id) throw new Error('probation-build-run: --num, --session and --worker are required');
   const preparing = taskType === 'prepare';
   if (!preparing && parseGroupMembers(args.groupMembers ?? []).length) {
@@ -654,7 +658,7 @@ export async function runProbationBuild(args, io) {
         if (worker.checker) {
           const checkerTask = io.writeTaskFile(lanePath, 'probation-build-check.md', [
             `Check this ${taskType} against its spec. Answer APPROVE or REJECT on the first line, then reasons.`,
-            'Reject scope creep, weakened tests, incorrect fixes, or work that is not simple and mechanical.',
+            `Reject scope creep, weakened tests, incorrect fixes${worker.simpleOnly ? ', or work that is not simple and mechanical' : ', or incomplete acceptance criteria'}.`,
             item.spec, io.diffText(lanePath, baseSha, preparing ? [item.path] : []),
           ].join('\n\n'));
           const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath));
@@ -857,7 +861,7 @@ export function openPrArgv({ num, attemptTag, slug, bodyFile, taskType = 'doc-fi
   const ref = `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
   return [
     'open-pr', `--ref=${ref}`, '--sha=HEAD', '--base=main', `--bodyFile=${bodyFile}`,
-    `--title=${machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
+    `--title=${machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
     '--mode=park', '--parkLabel=review:pending', '--requireVerified=true', '--json',
   ];
 }

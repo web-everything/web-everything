@@ -27,6 +27,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
+import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
+
+it('preserves the real rebuild finalize wait on first admission, late retries, and starvation', async () => {
+  const report = await finalizeWaitBreak.run();
+  expect(finalizeWaitBreak.judge(report)).toEqual([]);
+}, 60_000);
 
 describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunRebuildFn)', () => {
   it('requires --clone', async () => {
@@ -1032,14 +1038,20 @@ describe('the race: overlay registered AFTER the build being adopted was smoked 
       alerts: [{ kind: 'first' }, { kind: 'second' }],
     });
     expect(rebuild).toHaveBeenCalledTimes(2);
-    expect(rebuild.mock.calls[1][0]).toEqual(rebuild.mock.calls[0][0]);
+    expect(rebuild.mock.calls[1][0]).toEqual({
+      ...rebuild.mock.calls[0][0], admissionWaitMs: expect.any(Number),
+    });
+    expect(rebuild.mock.calls[1][0].admissionWaitMs).toBeLessThanOrEqual(rebuild.mock.calls[0][0].admissionWaitMs);
     expect(installed).toHaveBeenCalledTimes(2);
   });
 
-  it('stops when another rebuild owns the work and leaves a pending verdict', async () => {
+  it('waits within the shared budget when another rebuild owns the follow-up and leaves a pending verdict', async () => {
+    let time = 0;
     const rebuild = vi.fn().mockResolvedValueOnce(first)
-      .mockResolvedValueOnce({ moved: false, reason: 'rebuild-in-progress' });
-    const result = await runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale, followUpRebuilds: 3 });
+      .mockResolvedValue({ moved: false, reason: 'rebuild-in-progress' });
+    const result = await runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale, followUpRebuilds: 3,
+      env: { WE_DAEMON_REBUILD_LOCK_WAIT_MS: '250' }, clock: () => time, sleep: async (ms) => { time += ms; },
+    });
     expect(result).toMatchObject({
       adopted: false, reason: 'installed-build-lacks-overlay', rebuildReason: 'rebuild-in-progress',
       pending: true, followUps: 1, overlayInHead: false, installedCheck: stale,
@@ -1097,5 +1109,129 @@ describe('the race: overlay registered AFTER the build being adopted was smoked 
   it('propagates a follow-up rebuild error without a failed dispatch smoke', async () => {
     const rebuild = vi.fn().mockResolvedValueOnce(first).mockRejectedValueOnce(new Error('follow-up failed'));
     await expect(runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale })).rejects.toThrow('follow-up failed');
+  });
+});
+
+
+describe('legacy explicit load — bounded busy wait', () => {
+  const busy = { moved: false, adopted: false, reason: 'rebuild-in-progress' };
+  const present = { inHead: true, tip: 'tip', head: 'fresh', reason: 'in-head' };
+  function fixture(budget = 600) {
+    let time = 0;
+    const sleep = vi.fn(async (ms) => { time += ms; });
+    return {
+      options: {
+        clone: '/c', ref: 'lane/x', pr: 1, versions: null, addOverlayFn: vi.fn(),
+        env: { WE_DAEMON_REBUILD_LOCK_WAIT_MS: String(budget) }, log: quietLog,
+        settings: overlaySafetySettings({ WE_OVERLAY_DISPATCH_SMOKE: 'off' }, { readSettings: () => null }),
+        installed: () => present, clock: () => time, sleep,
+      },
+      sleep, advance: (ms) => { time += ms; },
+    };
+  }
+
+  it('retries busy → busy → adopted with decreasing lock budgets and installed evidence', async () => {
+    const { options, sleep } = fixture();
+    const log = { error: vi.fn() };
+    const rebuild = vi.fn().mockResolvedValueOnce(busy).mockResolvedValueOnce(busy)
+      .mockResolvedValueOnce({ moved: true, adopted: true, head: 'fresh' });
+    const result = await runDaemonLoadOverlay({ ...options, rebuild, log });
+    expect(result).toMatchObject({ adopted: true, overlayInHead: true, installedCheck: present, waitedMs: 500 });
+    expect(sleep.mock.calls).toEqual([[250], [250]]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
+    expect(log.error).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds perpetual busy attempts and clips the last sleep to the deadline', async () => {
+    const { options, sleep } = fixture();
+    const rebuild = vi.fn().mockResolvedValue(busy);
+    const result = await runDaemonLoadOverlay({ ...options, rebuild });
+    expect(result).toMatchObject({ adopted: false, reason: 'rebuild-in-progress', waitedMs: 600 });
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
+    expect(sleep.mock.calls).toEqual([[250], [250], [100]]);
+  });
+
+  it('shares the deadline with the stale-adoption follow-up', async () => {
+    const { options } = fixture();
+    const rebuild = vi.fn().mockResolvedValueOnce(busy)
+      .mockResolvedValueOnce({ adopted: true, head: 'old' }).mockResolvedValueOnce(busy)
+      .mockResolvedValueOnce({ adopted: true, head: 'fresh' });
+    const installed = vi.fn().mockReturnValueOnce({ ...present, inHead: false, head: 'old' }).mockReturnValue(present);
+    const result = await runDaemonLoadOverlay({ ...options, rebuild, installed });
+    expect(result).toMatchObject({ adopted: true, followUps: 1, waitedMs: 500 });
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 350, 100]);
+  });
+
+  it('does not admit a stale-adoption follow-up after the deadline', async () => {
+    const { options, advance } = fixture();
+    const rebuild = vi.fn(async () => { advance(700); return { adopted: true, head: 'old' }; });
+    const result = await runDaemonLoadOverlay({ ...options, rebuild, installed: () => ({ ...present, inHead: false }) });
+    expect(result).toMatchObject({ adopted: false, pending: true, followUps: 0 });
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets an admitted rebuild finish beyond the wait budget', async () => {
+    const { options, advance, sleep } = fixture();
+    const rebuild = vi.fn().mockResolvedValueOnce(busy).mockImplementationOnce(async () => {
+      advance(1_000);
+      return { adopted: true, head: 'fresh' };
+    });
+    expect(await runDaemonLoadOverlay({ ...options, rebuild })).toMatchObject({ adopted: true, waitedMs: 1_250 });
+    expect(sleep.mock.calls).toEqual([[250]]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350]);
+  });
+
+  it('still removes the overlay and recovers when candidate smoke fails after a busy wait', async () => {
+    const { options } = fixture();
+    const baseSmoke = vi.fn(async () => ({ verdict: 'pass' }));
+    const removeOverlayFn = vi.fn();
+    const rebuild = vi.fn().mockResolvedValueOnce(busy).mockImplementationOnce(async ({ runSmoke }) => {
+      await runSmoke({ root: '/candidate', env: {} });
+    }).mockResolvedValueOnce({ adopted: true, head: 'recovered' });
+    const log = { error: vi.fn() };
+    const result = await runDaemonLoadOverlay({
+      ...options, rebuild, baseSmoke, removeOverlayFn, appendEventFn: vi.fn(), log,
+      settings: overlaySafetySettings({}, { readSettings: () => null }),
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied' }),
+    });
+    expect(result).toMatchObject({ adopted: false, registered: false, rolledBack: true, reason: 'dispatch-smoke-failed', rollback: { adopted: true } });
+    expect(removeOverlayFn).toHaveBeenCalledTimes(1);
+    expect(rebuild).toHaveBeenCalledTimes(3);
+    expect(rebuild.mock.calls[2][0].runSmoke).toBe(baseSmoke);
+    expect(log.error.mock.calls.at(-1)[0]).toContain('not adopted (dispatch-smoke-failed)');
+  });
+
+  it.each(['Infinity', '-Infinity', 'NaN', 'invalid', '0', '-1'])('falls back to the default budget for %s', async (budget) => {
+    const { options } = fixture(budget);
+    const rebuild = vi.fn().mockResolvedValue({ adopted: true });
+    await runDaemonLoadOverlay({ ...options, rebuild });
+    expect(rebuild.mock.calls[0][0].admissionWaitMs).toBe(60_000);
+  });
+
+  it('does not retry another refusal or a thrown rebuild error', async () => {
+    const { options, sleep } = fixture();
+    const rebuild = vi.fn().mockResolvedValue({ adopted: false, reason: 'permission-denied' });
+    expect(await runDaemonLoadOverlay({ ...options, rebuild })).toMatchObject({ adopted: false, reason: 'permission-denied' });
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    rebuild.mockRejectedValueOnce(new Error('git failed'));
+    await expect(runDaemonLoadOverlay({ ...options, rebuild })).rejects.toThrow('git failed');
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each(['check-failed', 'not-in-head'])('never adopts without installed-tip proof (%s)', async (reason) => {
+    const { options } = fixture();
+    const rebuild = vi.fn().mockResolvedValueOnce(busy).mockResolvedValue({ adopted: true, head: 'old' });
+    const result = await runDaemonLoadOverlay({ ...options, rebuild, installed: () => ({ ...present, inHead: false, tip: 'advanced', reason }) });
+    expect(result).toMatchObject({ adopted: false, pending: true, installedCheck: { tip: 'advanced', reason } });
+  });
+
+  it('keeps dry-run and versioned waiting outside the legacy retry loop', async () => {
+    const { options, sleep } = fixture();
+    const rebuild = vi.fn();
+    await runDaemonLoadOverlay({ ...options, rebuild, dryRun: true, dryRunRebuildFn: async () => ({}) });
+    await runDaemonLoadOverlay({ ...options, rebuild, versions: {}, wait: true, submit: () => 'req', waitFor: async () => busy });
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

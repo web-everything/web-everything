@@ -52,8 +52,9 @@ export function shardFiles({ shard, total, breaksDir = BREAKS_DIR, baselineFile 
   if (total === 1) return all;
   const [baseline, ...breaks] = all;
   if (shard === 1) return [baseline];
-  // A new break gets the median cost; baseline isolation must not depend on a stale timing sample.
-  return assignByTime(breaks, timings, total - 1)[shard - 2];
+  // Keep the long soak out of both the worker pool and the fallback timing population for breaks.
+  const breakTimings = Object.fromEntries(Object.entries(timings).filter(([file]) => file !== baseline));
+  return assignByTime(breaks, breakTimings, total - 1)[shard - 2];
 }
 
 /** Parses `--shard=i/N` out of an argv array. Throws with a usage line if missing or malformed. */
