@@ -177,7 +177,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
@@ -1013,11 +1013,21 @@ export const GH_OUTER_INV_ENV = 'WE_GH_THROTTLE_OUTER_INV';
  *  (`0` = none). The nested passthrough applies it instead of its own default hold limit, so an explicit outer
  *  `timeout: 0` or `timeout: 300000` is not cut short by the nested 90s default (PR #5326 red team). */
 export const GH_OUTER_TIMEOUT_ENV = 'WE_GH_THROTTLE_OUTER_TIMEOUT_MS';
-/** The outer timeout a nested passthrough must honour, or null (un-nested, absent or unparseable → own default). */
-function outerTimeoutMs(outer, env) {
+/** Env var beside {@link GH_OUTER_TIMEOUT_ENV}: the outer exec's kill signal, so the nested child is stopped the
+ *  way the outer caller asked (e.g. `SIGKILL`), not with the nested default `SIGTERM`. */
+export const GH_OUTER_KILL_SIGNAL_ENV = 'WE_GH_THROTTLE_OUTER_KILL_SIGNAL';
+/** The outer timeout options a nested passthrough must honour, or null (un-nested, absent or unparseable → its own
+ *  default). An unknown signal is dropped (spawn would throw on it) and the node default applies. */
+function outerExecLimits(outer, env) {
   if (!outer) return null;
-  const raw = env[GH_OUTER_TIMEOUT_ENV] ?? process.env[GH_OUTER_TIMEOUT_ENV];
-  return typeof raw === 'string' && /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw)) ? Number(raw) : null;
+  const read = (name) => env[name] ?? process.env[name];
+  const rawTimeout = read(GH_OUTER_TIMEOUT_ENV);
+  if (typeof rawTimeout !== 'string' || !/^\d+$/.test(rawTimeout) || !Number.isSafeInteger(Number(rawTimeout))) return null;
+  const rawSignal = read(GH_OUTER_KILL_SIGNAL_ENV);
+  const signal = typeof rawSignal !== 'string' ? null
+    : /^\d+$/.test(rawSignal) ? (Object.values(osConstants.signals).includes(Number(rawSignal)) ? Number(rawSignal) : null)
+      : (Object.hasOwn(osConstants.signals, rawSignal) ? rawSignal : null);
+  return { timeout: Number(rawTimeout), ...(signal !== null ? { killSignal: signal } : {}) };
 }
 
 /**
@@ -1794,7 +1804,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
   let lastCapture = null;
   const exec = throttle.exec || ((a, o) => {
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
-    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0) } };
+    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
+      ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
     if (!capture) return execFileSync(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
@@ -2076,7 +2087,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const capture = resolveCostHeaderCapture(env) && !process.env.GH_DEBUG;
   const inv = randomUUID().slice(0, 12);
   const outer = env[GH_OUTER_INV_ENV] || process.env[GH_OUTER_INV_ENV] || null;
-  const outerTimeout = outerTimeoutMs(outer, env);
+  const outerLimits = outerExecLimits(outer, env);
   const jsonRetry = { ...resolveGhJsonParseRetry(env), used: 0 };
 
   let attempt = 0;
@@ -2116,8 +2127,8 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
-      // A nested call runs under the outer exec's timeout, never its own default over an explicit outer one.
-      r = spawn(bin, argv, ghExecOptions(outerTimeout === null ? spawnOpts : { ...spawnOpts, timeout: outerTimeout }, argv, ghHolderPolicy(env)));
+      // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
+      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
     }
