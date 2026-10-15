@@ -2,5 +2,7 @@
   "referralDefault": "auto-block",
   "scopedRereview": "shadow",
   "roundBudget": 3,
-  "takeoverReviewAttempts": 1
+  "takeoverReviewAttempts": 1,
+  "rulingResolvesStandDown": "on",
+  "standDownQueueSection": "needs-you"
 }
