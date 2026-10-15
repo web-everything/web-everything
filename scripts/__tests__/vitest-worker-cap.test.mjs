@@ -10,7 +10,6 @@ import { resolve } from 'node:path';
 import micromatch from 'micromatch';
 import integrationConfig from '../../vitest.integration.config';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
-import integrationConfig from '../../vitest.integration.config';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
 
 describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () => {
