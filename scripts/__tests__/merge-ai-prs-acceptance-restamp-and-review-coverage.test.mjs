@@ -90,11 +90,13 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
     return { calls, spawn };
   };
 
-  it('restampAcceptance omits --repo when repo is falsy', () => {
+  // A falsy repo means "the local repo" (merge-ai-prs keeps `repo:null` for local PRs). The child CLI requires
+  // --repo, so omitting it failed every local re-stamp ("invalid --repo", PR #5340, 2026-10-15): resolve it.
+  it('restampAcceptance resolves the local repo when repo is falsy', () => {
     for (const repo of [null, undefined, '']) {
       const { calls, spawn } = spy();
-      restampAcceptance({ pr: 42, repo, newHead: 'f5bc7940', spawn });
-      expect(calls[0].argv.some((a) => String(a).startsWith('--repo'))).toBe(false);
+      restampAcceptance({ pr: 42, repo, newHead: 'f5bc7940', spawn, localRepo: () => 'owner/local' });
+      expect(calls[0].argv).toContain('--repo=owner/local');
       expect(calls[0].argv).not.toContain('--repo=null');
     }
   });

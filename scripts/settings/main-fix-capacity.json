@@ -1,0 +1,4 @@
+{
+  "$comment": "card 302 — admit red-main fix PRs past the fixer cap without borrowing. Layers: standard -> platform -> this file -> env WE_MAIN_FIX_PAST_FIX_CAP (on|off|true|false|1|0). The source is logged; off = before card 302; host load still refuses.",
+  "mainFixCapacity": { "pastFixCap": true }
+}
