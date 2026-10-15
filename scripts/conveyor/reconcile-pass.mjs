@@ -83,7 +83,7 @@ import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync } from 'node:fs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds } from './reconcile-core.mjs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -208,6 +208,20 @@ function fixCapSettings(load, env, resolveBudget = resolveTakeoverBudget, log = 
 export function loadOperatorRulingExtraRounds({ env = process.env, read = (f) => readFileSync(f, 'utf8') } = {}) {
   const json = (f) => { try { return JSON.parse(read(f)); } catch { return null; } };
   return resolveOperatorRulingExtraRounds({ env, platform: json(PLATFORM_PREFERENCES_PATH), repo: json(REPO_FIX_SETTINGS_PATH) });
+}
+/** Same file cascade as the operator ruling allowance. */
+export function loadRoundExtensionAnchor({ env = process.env, read = (f) => readFileSync(f, 'utf8') } = {}) {
+  const json = (f) => { try { return JSON.parse(read(f)); } catch { return null; } };
+  return resolveRoundExtensionAnchor({ env, platform: json(PLATFORM_PREFERENCES_PATH), repo: json(REPO_FIX_SETTINGS_PATH) });
+}
+let loggedRoundExtensionAnchor = '';
+function roundExtensionAnchorSetting(load, env, log = (line) => console.error(line)) {
+  let r;
+  try { r = load({ env }); } catch { return {}; }
+  if (!['grant', 'off'].includes(r?.value)) return {};
+  const line = `round-extension-anchor: fix.roundExtensionAnchor=${r.value} (source: ${r.source})`;
+  if (line !== loggedRoundExtensionAnchor) { loggedRoundExtensionAnchor = line; log(line); }
+  return { roundExtensionAnchor: r };
 }
 /** The last logged `fix.operatorRulingExtraRounds` resolution, so a daemon logs the layer once per change. */
 let loggedOperatorRulingRounds = '';
@@ -1456,6 +1470,7 @@ export function runReconcilePass({
   loadTakeoverBudget = resolveTakeoverBudget,
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
   loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
+  loadRoundExtensionAnchorSetting = loadRoundExtensionAnchor,
   // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
@@ -1544,6 +1559,7 @@ export function runReconcilePass({
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
+    ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),
     ...takeoverReviewSetting(loadReviewSettings, env),
     ...mechanicalSetting,
     ...prOwnershipSettings(loadPrOwnership, env),

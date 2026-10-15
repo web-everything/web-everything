@@ -965,3 +965,16 @@ factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute
 The gate job records the same resolved budget its supervisor used; admission waits
 still consume only the separate queue ceiling. Reconcile probes bound PIDs each pass
 and must discard a previous `pidAlive` value if the new probe is unknown.
+
+### Operator repair round replay
+
+Replay round-extension grants after an already over-cap thread, then a completed repair and the
+review of its new head. Fix admission uses `< cap`; the owed review uses `<= cap`.
+`fix.roundExtensionAnchor` defaults to `grant` (env `WE_FIX_ROUND_EXTENSION_ANCHOR`); `off`
+retains additive caps. Each cap anchors to its own counter on the thread prefix before the grant;
+never use the current durable count map as historical evidence. Open send-back allowances use
+trusted fix-end comments after the latest open operator ceremony and `fix.operatorRulingExtraRounds`.
+Set that allowance to zero in tests isolating the older `operatorFixBudget` mechanism.
+An open send-back allowance must preserve the takeover gate predicate: a reviewed head with zero
+open defects and an own-gate hold still goes through cap handling for its advisory or operator note.
+Replay human, awaiting-base, stacked-base, review-gate and merge-gate holds alongside the allowance.
