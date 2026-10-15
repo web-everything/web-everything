@@ -64,7 +64,7 @@ While that refresh is owed, the live enrichment and planner suppress child heali
 
 All test execution goes through Node on `we:scripts/readiness/heavy-admission.mjs` with `run -- npx vitest run` followed by the scoped test paths (remove the documentation-only repository prefixes when passing filesystem arguments). Run `npm run check:standards` through that same queue. The runner owns preparation checks and stamping; the following are implementation acceptance tests, not claimed passing results.
 
-Authorization controls are required at every boundary in the matrix below. Keep identities and reproduction evidence valid and identical in these three required controls:
+Authorization controls are required at every boundary in the matrix below. Implement and report each of these three controls as a separately named test case so the trusted-author requirement and the leading-marker requirement each have an independently visible refusal result. Keep identities and reproduction evidence valid and identical across the controls:
 
 - Positive control: a trusted author with a leading marker satisfies both authorization requirements.
 - Forged-author negative control: a forged (non-trusted) author with the same leading marker is refused; change only the author.
