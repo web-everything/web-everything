@@ -120,7 +120,7 @@ export default {
             if (args[0] === 'merge-base') return BASE;
             if (args[0] === 'diff') return sha === NEXT && mode === 'whitespace' ? PATCH.replace('+new:', '+  new:')
               : sha === NEXT && mode === 'changed' ? PATCH.replace('+new:', '+changed:') : PATCH;
-            if (args[0] === 'patch-id') return execFileSync('git', args, { ...options, timeout: 5000 });
+            if (args[0] === 'patch-id') return execFileSync('git', args, { ...options, timeout: 5000, maxBuffer: 64 * 1024 * 1024 });
             throw Error(`unexpected git command: ${args}`);
           } }),
           restampVerdict: () => { calls.push('restamp'); return { ok: mode !== 'restamp-failed' }; },
