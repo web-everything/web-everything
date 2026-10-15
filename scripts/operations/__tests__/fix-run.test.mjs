@@ -11,7 +11,7 @@ import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcil
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
-import { parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
+import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -107,6 +107,34 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it.each([undefined, '42', '0'])('passes the acquire wait policy (%s)', async value => {
+    if (value === undefined) vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', '');
+    else vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', value);
+    try {
+      const m = mk(['aaa', 'aaa']);
+      const write = vi.fn();
+      await runFixCli(argv, { ...m.io, write });
+      const ms = value === undefined ? 120000 : Number(value);
+      expect(m.calls.find(c => c.includes('acquire'))).toContain(`--wait-ms=${ms}`);
+      expect(write).toHaveBeenCalledWith(`fix-run: lane acquire wait ${ms}ms (${value === undefined ? 'standard' : 'env'})\n`);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('records the child diagnostic while logging the complete acquire error', async () => {
+    const m = mk([]);
+    const recordOutcome = vi.fn(), writeErr = vi.fn();
+    const error = Object.assign(new Error('Command failed: node scripts/lane-pool.mjs acquire --session=long'), {
+      stderr: 'noise\n✗ lock contention: retry\n',
+    });
+    const run = (cmd, args, opts) => {
+      if (args.includes('acquire')) throw error;
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli(argv, { ...m.io, run, recordOutcome, writeErr })).code).toBe(1);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      reason: '✗ lock contention: retry (lane-pool.mjs acquire)',
+    }));
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining(error.message));
+  });
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
     const resolveProvider = vi.fn(m.io.resolveProvider);
@@ -1501,4 +1529,18 @@ it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports fa
   const provider = await resolveFixProvider('antigravity');
   await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({...failure,events:{agentMessages:['diagnosis']}})}))
     .rejects.toMatchObject({finalMessage:'diagnosis'});
+});
+
+describe('acquire launcher diagnostics', () => {
+  it('retains the last error line and short command', () => {
+    const err = Object.assign(new Error('Command failed: node scripts/lane-pool.mjs acquire --session=long'), {
+      stderr: Buffer.from('noise\n✗ first\n✗ lock contention: retry\ntrailing context\n'),
+    });
+    expect(childFailureReason(err)).toBe('✗ lock contention: retry (lane-pool.mjs acquire)');
+    expect(childFailureReason(Object.assign(err, { stderr: 'noise\nlast diagnostic\n' }))).toBe('last diagnostic (lane-pool.mjs acquire)');
+    expect(childFailureReason(new Error('plain refusal'))).toBe('plain refusal');
+  });
+  it.each(['-1', '1.5', 'garbage', ''])('rejects invalid env wait %s', value => {
+    expect(resolveAcquireWaitPolicy({ WE_FIX_RUN_ACQUIRE_WAIT_MS: value })).toEqual({ ms: 120000, source: 'standard' });
+  });
 });
