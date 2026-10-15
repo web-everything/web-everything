@@ -60,7 +60,10 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, numberingWithdrawalOwed, restampAfterNumbering, strandedNumberingRecords } from '../lib/numbering-carry.mjs';
+import {
+  NUMBERING_RESTAMP_MARKER, listedNumberingRecords, numberingRestampSettled, numberingWithdrawalOwed, restampAfterNumbering,
+  strandedNumberingRecords,
+} from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -167,18 +170,24 @@ export function sweepReviewHoldLabels({
       && ![REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l));
     // A re-stamp record written over a hold before it is withdrawn whatever the labels or the settled memo say (the
     // live read below re-checks it, with the formal reviews). A capped listing may hide one past its first page, so it
-    // is read live — once per head, until a pass on that head writes or fails (`strandedChecked`).
-    const checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`;
+    // is read live — once per head, until a pass on that head writes or fails (`strandedChecked`). The listing carries
+    // no formal reviews either, so a listed record the thread alone validates is read live too — once per head and
+    // set of listed records, since only a review submitted BEFORE a record can strand it.
+    let checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`;
     const listedState = () => {
       const listed = Array.isArray(pr.comments) ? pr.comments : null;
       const complete = Boolean(listed) && (pr.commentsComplete === true || listed.length < LIST_COMMENTS_CAP);
+      const records = listedNumberingRecords(listed);
+      if (records.length) checkKey += `|${records.map((c, i) => String(c?.id ?? c?.createdAt ?? c?.created_at ?? `#${i}`)).join(',')}`;
       // A withdrawal an earlier pass started and could not finish (a hold the thread cannot show) is owed whatever the
       // listing says.
       const owed = numberingWithdrawalOwed(repo ?? resolvedRepo, pr.number);
       const shown = complete && strandedNumberingRecords(listed).length > 0;
+      const unchecked = !strandedChecked.has(checkKey);
       // Off the carry path a PR listed with no comment field at all says nothing either way and is left alone.
       return { listed, complete, shown,
-        stranded: shown || owed || (!complete && (carryLabels || Boolean(listed)) && !strandedChecked.has(checkKey)) };
+        stranded: shown || owed || (records.length > 0 && unchecked)
+          || (!complete && (carryLabels || Boolean(listed)) && unchecked) };
     };
     let view;
     if (carryLabels) view = listedState();
@@ -227,8 +236,10 @@ export function sweepReviewHoldLabels({
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec,
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
-      // A clean pass (nothing withdrawn, posted or failed) settles the stranded check for this head.
-      if (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action))) strandedChecked.delete(checkKey);
+      // A clean pass (nothing withdrawn, posted or failed) settles the stranded check for this head — only when the
+      // formal reviews were read, since without them a record they strand looks like any other.
+      if (!Array.isArray(reviews)
+        || (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action)))) strandedChecked.delete(checkKey);
       else strandedChecked.add(checkKey);
       if (r) {
         results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });

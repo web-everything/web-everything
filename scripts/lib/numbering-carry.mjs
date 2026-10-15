@@ -391,6 +391,13 @@ export function isNumberingTolerableLaterBody(body) {
 export function strandedNumberingRecords(comments, reviews = undefined) {
   return strandedFrom(validatedThread(Array.isArray(comments) ? comments : []), reviews);
 }
+/**
+ * PURE: every numbering re-stamp record on the thread, kept or not. A comment listing has no formal reviews, so a
+ * record it validates may still be stranded by a review only a live read shows: each one is a reason to read live.
+ */
+export function listedNumberingRecords(comments) {
+  return (Array.isArray(comments) ? comments : []).filter((c) => restampRecord(c));
+}
 const commentAt = (c) => (typeof c?.createdAt === 'string' ? c.createdAt : (typeof c?.created_at === 'string' ? c.created_at : null));
 function strandedFrom({ carried, rootAt, dropped }, reviews) {
   const hidden = Array.isArray(reviews)

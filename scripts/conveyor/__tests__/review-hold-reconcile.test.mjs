@@ -404,8 +404,10 @@ describe('fresh complete review-hold decisions (#5955)', () => {
     expect(out).toEqual([]);
   });
   it.each([0, 12, 99, 100])('always reads a full thread with %i cached comments', (count) => {
+    _resetStrandedCheckMemo();
     const { p, readComments } = run({ snapshot: { number: 7, labels, comments: Array.from({ length: count }, filler) }, comments: [...Array.from({ length: 99 }, filler), clearance] });
-    expect(readComments).toHaveBeenCalledOnce();
+    // A capped listing may hide a numbering re-stamp record, so the withdrawal leg reads the thread live as well.
+    expect(readComments).toHaveBeenCalledTimes(count >= 100 ? 2 : 1);
     expect(p.calls.set).toEqual([]);
   });
   it.each([
@@ -596,11 +598,16 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
       expect(result).toContainEqual({ num: 5025, numberingRestamp: 'withdrawn', detail: 'withdrawn' });
     });
   it('leaves a label-held PR with no stranded record alone', () => {
-    const seen = [];
-    sweepFixture({ repo: 'o/n', provider: provider(),
+    // The listed record is read live once (formal reviews are not in the listing); with none, nothing is withdrawn.
+    const p = provider();
+    p.readPrReviews = () => [];
+    p.editComment = vi.fn();
+    const result = sweepFixture({ repo: 'o/n', provider: p,
       listPrs: () => [{ ...pr(5025, ['review:changes']), comments: [accept, record, objection] }],
-      numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
-    expect(seen).toEqual([]);
+      numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+    expect(p.editComment).not.toHaveBeenCalled();
+    expect(result).toEqual([]);
+    _resetStrandedCheckMemo();
   });
   // Operator send-back (#5233): a failed withdrawal behind a hold the thread cannot show stays owed across sweeps.
   it('keeps reaching a record whose withdrawal failed, though the thread shows no hold against it', () => {
@@ -619,6 +626,53 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
     expect(result).toContainEqual({ num: 5025, numberingRestamp: 'withdrawn', detail: 'withdrawn' });
     _resetNumberingRestampMemo();
   });
+  // Referral block (#5233, head c91661d6a): `gh pr list --json comments` carries no formal reviews, so a record the
+  // thread alone validates can still be stranded by a review submitted between its root acceptance and the record.
+  describe('a hold that exists only in formal reviews', () => {
+    afterEach(() => { _resetStrandedCheckMemo(); _resetNumberingRestampMemo(); });
+    const timedAccept = { ...accept, createdAt: '2026-10-12T10:00:00Z' };
+    const timedRecord = { ...record, createdAt: '2026-10-12T12:00:00Z' };
+    const between = [{ state: 'COMMENTED', submittedAt: '2026-10-12T11:00:00Z', user: { login: 'chalbert' }, body: 'Hold on.' }];
+    const sweepWith = (labels, reviews, p = provider({ readPrState: () => ({ labels: labels.map((name) => ({ name })),
+      comments: [timedAccept, timedRecord] }) })) => {
+      p.readPrReviews = () => reviews;
+      p.editComment = p.editComment ?? vi.fn();
+      const result = sweepFixture({ repo: 'o/n', provider: p,
+        listPrs: () => [{ ...pr(5025, labels), headRefOid: 'a'.repeat(40), comments: [timedAccept, timedRecord], commentsComplete: true }],
+        numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+      return { p, result };
+    };
+    it.each([[['review:changes']], [['review:human']], [['review:accepted']]])(
+      'reads a complete listing live and withdraws the record under %j', (labels) => {
+        const { p, result } = sweepWith(labels, between);
+        expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'withdrawn' }));
+        expect(p.editComment).toHaveBeenCalledWith('o/n', 'IC_stranded', expect.stringContaining('numbering-restamp-withdrawn:'), { pr: 5025 });
+      });
+    it('reads the same listed records once per head when the reviews show no hold, and again for a new record', () => {
+      const p = provider({ readPrState: () => ({ labels: [{ name: 'review:changes' }], comments: [timedAccept, timedRecord] }) });
+      sweepWith(['review:changes'], [], p);
+      sweepWith(['review:changes'], [], p);
+      expect(p.calls.readPrState).toHaveLength(1);
+      expect(p.editComment).not.toHaveBeenCalled();
+      const second = { ...timedRecord, id: 'IC_second', createdAt: '2026-10-12T13:00:00Z' };
+      sweepFixture({ repo: 'o/n', provider: p,
+        listPrs: () => [{ ...pr(5025, ['review:changes']), headRefOid: 'a'.repeat(40), comments: [timedAccept, timedRecord, second], commentsComplete: true }],
+        numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+      expect(p.calls.readPrState).toHaveLength(2);
+    });
+    it('reads again next pass when the formal reviews could not be read', () => {
+      const p = provider({ readPrState: () => ({ labels: [{ name: 'review:changes' }], comments: [timedAccept, timedRecord] }) });
+      p.readPrReviews = () => { throw Error('rate limited'); };
+      p.editComment = vi.fn();
+      const sweep = () => sweepFixture({ repo: 'o/n', provider: p,
+        listPrs: () => [{ ...pr(5025, ['review:changes']), headRefOid: 'a'.repeat(40), comments: [timedAccept, timedRecord], commentsComplete: true }],
+        numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+      sweep();
+      p.readPrReviews = () => between;
+      const result = sweep();
+      expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'withdrawn' }));
+    });
+  });
   // Self-review (#5233): `gh pr list --json comments` stops at the first page, so a record past it is invisible there.
   describe('a capped listing on a label-held PR', () => {
     afterEach(_resetStrandedCheckMemo);
@@ -635,6 +689,7 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
     });
     it('reads a capped head once, then not again until a pass on it writes or fails', () => {
       const p = provider();
+      p.readPrReviews = () => [];
       const seen = [];
       const sweep = (r) => sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [capped()],
         numberingRestamp: (opts) => { seen.push(opts.pr); return r; } });
