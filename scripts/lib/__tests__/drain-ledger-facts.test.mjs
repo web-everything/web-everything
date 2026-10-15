@@ -2,10 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
   recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord, resolveLedgerBoard, resolveLedgerBoardDetail,
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, probeOrigin, resolveLedgerBoard, resolveLedgerBoardDetail,
   verdictLedgerPath } from '../verdict-ledger.mjs';
 import { recordDrainHold } from '../../merge-ai-prs.mjs';
 const repo = 'o/r', head = 'a'.repeat(40), old = 'b'.repeat(40), now = '2026-10-13T12:00:00.000Z';
@@ -147,11 +148,22 @@ describe('drain ledger facts — the recorders read the store their writes land 
   it('a failed origin probe leaves the board unknown, never certainly absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-facts-board-'));
     try {
-      mkdirSync(join(dir, '.git'));
       expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => '' }, {})).toEqual({ board: null, certain: false });
       expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => 'x/y' }, {})).toEqual({ board: null, certain: true });
       expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => repo }, {})).toEqual({ board: dir, certain: true });
       expect(resolveLedgerBoard(repo, { boardRoot: dir, originRepo: () => '' }, {})).toBe(null);
+      // The real probe: a plain directory and a checkout with no origin are certainly not the board (a lasting
+      // answer, so they must not make every pass's read fail); only a timed-out or unstartable probe is unknown.
+      expect(resolveLedgerBoardDetail(repo, { boardRoot: dir }, {})).toEqual({ board: null, certain: true });
+      execFileSync('git', ['init', '-q', dir]);
+      expect(resolveLedgerBoardDetail(repo, { boardRoot: dir }, {})).toEqual({ board: null, certain: true });
+      expect(probeOrigin(dir)).toEqual({ slug: '', transient: false });
+      execFileSync('git', ['-C', dir, 'remote', 'add', 'origin', 'git@host:not-a-slug']);
+      expect(probeOrigin(dir)).toEqual({ slug: '', transient: false });
+      const timedOut = () => { throw Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGTERM', status: null }); };
+      expect(probeOrigin(dir, timedOut)).toEqual({ slug: '', transient: true });
+      const noGit = () => { throw Object.assign(new Error('spawnSync git ENOENT'), { code: 'ENOENT', status: null }); };
+      expect(probeOrigin(dir, noGit)).toEqual({ slug: '', transient: false });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('a hold that misses the shared store is reported and recorded again on the next pass', async () => {

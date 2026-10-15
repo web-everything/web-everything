@@ -1344,13 +1344,24 @@ function refuseClearingOnGitMiss({ g, store, loud, record }) {
 
 /** `owner/name` of a checkout's `origin` (canonical current slug), or '' when unreadable. Never throws. */
 function originRepoOf(cwd) {
+  return probeOrigin(cwd).slug;
+}
+
+/** {@link originRepoOf} plus whether an empty answer is TRANSIENT: the probe timed out, was killed, or could not
+ *  start (other than git missing). A git exit (no `origin` remote, not a repo, dubious ownership) and a URL that is
+ *  not `owner/name` are permanent answers: that checkout is certainly not a board. Never throws.
+ *  @returns {{slug: string, transient: boolean}} */
+export function probeOrigin(cwd, run = execFileSync) {
   try {
-    const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], {
+    const url = String(run('git', ['remote', 'get-url', 'origin'], {
       encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, maxBuffer: 64 * 1024,
     })).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
-    return m ? canonicalizeSlug(m[1]) : '';
-  } catch { return ''; }
+    return { slug: m ? canonicalizeSlug(m[1]) : '', transient: false };
+  } catch (e) {
+    const exited = typeof e?.status === 'number' && !e?.signal;
+    return { slug: '', transient: !exited && e?.code !== 'ENOENT' };
+  }
 }
 
 /** The checkout this module lives in (`scripts/lib/..` → repo root), or null where `import.meta.url` is not a file URL. */
@@ -1391,9 +1402,10 @@ export function resolveLedgerBoard(repo, opts = {}, env = process.env) {
   return resolveLedgerBoardDetail(repo, opts, env).board;
 }
 
-/** {@link resolveLedgerBoard} plus whether a null board is CERTAIN. A candidate checkout that exists but whose
- *  `origin` could not be read (a failed or timed-out probe, never cached) might be the board, so its null is not
- *  certain: a caller choosing a store from it must not treat "unknown" as "no board".
+/** {@link resolveLedgerBoard} plus whether a null board is CERTAIN. A candidate checkout whose `origin` probe failed
+ *  TRANSIENTLY (timed out or could not start; {@link probeOrigin}; never cached) might be the board, so its null is
+ *  not certain: a caller choosing a store from it must not treat "unknown" as "no board". A checkout with no origin,
+ *  or one that is not a git repo, is certainly not the board. An `opts.originRepo` seam's '' counts as unknown.
  *  @returns {{board: string|null, certain: boolean}} */
 export function resolveLedgerBoardDetail(repo, opts = {}, env = process.env) {
   const named = String(opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? '').trim();
@@ -1404,14 +1416,14 @@ export function resolveLedgerBoardDetail(repo, opts = {}, env = process.env) {
   const roots = opts.boardRoot !== undefined ? [opts.boardRoot].filter(Boolean) : candidateBoardRoots();
   let certain = true;
   for (const root of roots) {
-    let have = '';
-    if (opts.originRepo) have = opts.originRepo(root);
+    let have = '', transient = false;
+    if (opts.originRepo) { have = opts.originRepo(root); transient = !have; }
     else {
       have = originMemo.get(root) ?? '';
-      if (!have) { have = originRepoOf(root); if (have) originMemo.set(root, have); }
+      if (!have) { ({ slug: have, transient } = probeOrigin(root)); if (have) originMemo.set(root, have); }
     }
     if (have && String(have).toLowerCase() === want) return { board: root, certain: true };
-    if (!have && (opts.originRepo || existsSync(join(root, '.git')))) certain = false;
+    if (transient) certain = false;
   }
   return { board: null, certain };
 }
