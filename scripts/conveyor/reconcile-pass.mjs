@@ -27,7 +27,8 @@
  *      `main`'s current tip its head is (`gh api .../compare`'s own `ahead_by`, {@link enrichPrsWithMainRedFacts}).
  *      Read ONLY when at least one PR is failing, so a quiet pass pays nothing for it. Lets the core tell a
  *      required check that failed only because `main` itself was red apart from the PR's own defect
- *      (`reconcile-core.mjs#isPrCiFailureOwedRerun`), so it is never handed to a `ci-heal`.
+ *      (`reconcile-core.mjs#isPrCiFailureOwedRerun`). Once main is green, failed required jobs get a bounded
+ *      mechanical rerun through the existing timeout executor before any ordinary ci-heal.
  *
  * WHY THE ARGV IS PINNED BY A TEST AND NOT MERELY EXERCISED. The failure mode of a wrong discovery query is
  * SILENCE, not an error: an empty listing is indistinguishable from "no PR needs anything", so a query that
@@ -97,7 +98,7 @@ import {
   // landing-freeze fix (2026-09-27) — the one extra read `isPrCiFailureOwedRerun`'s new green-check path needs:
   // `main`'s own latest completed run's headSha, so the IO shell can fetch THAT commit's own per-check
   // conclusions. See `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header for the incident.
-  latestCompletedMainRun,
+  latestCompletedMainRun, currentMainGreen,
   // PR #2793 review — the per-PR evidence the green-check path now also requires (see `isMainGreenFixOwed`).
   mainLatestGreenShaForCheck,
 } from './main-red-recovery.mjs';
@@ -151,6 +152,38 @@ function prOwnershipSettings(load, env, log = line => console.error(line)) {
 /** `review.takeoverReviewAttempts` for `planReconcile`; an unreadable setting keeps the pure core's 0. */
 function takeoverReviewSetting(load, env) {
   try { const n = load({ env }).takeoverReviewAttempts; return Number.isInteger(n) ? { takeoverReviewAttempts: n } : {}; } catch { return {}; }
+}
+
+/** fix.* cascade: env > repository settings > standard; malformed action settings fail closed. */
+export function resolveOwedCiRerunSettings({ env = process.env, read = f => readFileSync(f, 'utf8') } = {}) {
+  let value = { rerun: 'on', maxRerunsPerHead: 1 }, source = 'standard';
+  try {
+    const setting = JSON.parse(read(REPO_FIX_SETTINGS_PATH))?.fix?.owedCiRerun;
+    if (setting !== undefined && setting !== null) {
+      value = ['on', 'off'].includes(setting.rerun) && Number.isInteger(setting.maxRerunsPerHead) && setting.maxRerunsPerHead >= 0
+        ? { rerun: setting.rerun, maxRerunsPerHead: setting.maxRerunsPerHead }
+        : { rerun: 'off', maxRerunsPerHead: 0 };
+      source = 'settings';
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') { value = { rerun: 'off', maxRerunsPerHead: 0 }; source = 'settings-invalid'; }
+  }
+  const override = env.WE_FIX_OWED_CI_RERUN?.trim().toLowerCase();
+  if (override) { value = { ...value, rerun: ['on', 'off'].includes(override) ? override : 'off' }; source = 'env'; }
+  return { value, source };
+}
+
+/** fix.staleCiRerun cascade: standard `once-per-head` -> scripts/settings/fix.json -> env WE_FIX_STALE_CI_RERUN; invalid fails closed to `off`. */
+export function resolveStaleCiRerunSetting({ env = process.env, read = f => readFileSync(f, 'utf8') } = {}) {
+  let value = 'once-per-head', source = 'standard';
+  const ok = v => ['off', 'once-per-head'].includes(v);
+  try {
+    const setting = JSON.parse(read(REPO_FIX_SETTINGS_PATH))?.fix?.staleCiRerun;
+    if (setting !== undefined && setting !== null) { value = ok(setting) ? setting : 'off'; source = ok(setting) ? 'settings' : 'settings-invalid'; }
+  } catch (error) { if (error?.code !== 'ENOENT') { value = 'off'; source = 'settings-invalid'; } }
+  const override = env.WE_FIX_STALE_CI_RERUN?.trim().toLowerCase();
+  if (override) { value = ok(override) ? override : 'off'; source = 'env'; }
+  return { value, source };
 }
 
 /** The last logged `fix.takeoverBudget` resolution, so a daemon logs the layer once per change. */
@@ -672,6 +705,40 @@ export function defaultReadMainFixedSignatureFacts({
   } catch { return null; }
 }
 
+/** One live job read per deduplicated run target; the executor revalidates it before dispatch. */
+export function defaultReadJobAttempt({ repo, job, exec = execFileSyncThrottled }) {
+  const out = exec('gh', ['api', `repos/${repo}/actions/jobs/${job}`], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  return JSON.parse(String(out)).run_attempt;
+}
+
+function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
+  try {
+    if (!repo || !pr.headRefOid || !pr.number) throw new Error('missing-repo-pr-head');
+    const targets = new Map();
+    for (const name of checks) {
+      if (!isRequiredCheckFailed(pr, name)) continue;
+      const url = latestRequiredCheck(pr, name)?.detailsUrl;
+      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url ?? '');
+      if (!match || match[1] !== repo) throw new Error(`unparseable-required-check-url:${name}`);
+      const run = Number(match[2]), job = Number(match[3]);
+      if (!Number.isSafeInteger(run) || run <= 0 || !Number.isSafeInteger(job) || job <= 0) throw new Error('invalid-run-job');
+      if (!targets.has(run)) targets.set(run, { repo, head: pr.headRefOid, run, job });
+    }
+    if (!targets.size) throw new Error('no-failed-required-jobs');
+    const jobs = [...targets.values()].map(target => {
+      const attempt = readJobAttempt({ repo, job: target.job });
+      if (!Number.isInteger(attempt) || attempt < 1) throw new Error('invalid-job-attempt');
+      return { ...target, attempt };
+    });
+    return { eligible: true, repo, pr: pr.number, head: pr.headRefOid,
+      signature: createHash('sha256').update(JSON.stringify(['owed-ci-rerun', pr.headRefOid, [...targets.keys()].sort()])).digest('hex'),
+      jobs, variant: 'owed-ci-rerun', infraCancelled: true };
+  } catch (error) { return { eligible: false, reason: error.message }; }
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithMainRedFacts — we:backlog/x5uqim1-*.md (#4075/#3383):
  * attach `requiredCheckCompletedAt` / `aheadByOnMain` to every PR whose required check is currently FAILING, and
@@ -702,6 +769,7 @@ export function defaultReadMainFixedSignatureFacts({
  * @returns {{prs:Array<object>, mainRedWindows:Array<object>, mainLatestCheckRuns:Array<object>}}
  */
 export function enrichPrsWithMainRedFacts(prs, {
+  readJobAttempt = defaultReadJobAttempt, readBudget = readTimeoutBudget,
   readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
@@ -714,6 +782,7 @@ export function enrichPrsWithMainRedFacts(prs, {
 
   const mainRuns = readMainRuns({ repo, branch: defaultBranch });
   const mainRedWindows = computeMainRedWindows(mainRuns);
+  const mainGreenNow = currentMainGreen(mainRuns);
   const mainLatestCheckRuns = readMainLatestCheckRuns({ repo, branch: defaultBranch, mainRuns });
   const failingSet = new Set(failing);
   const enriched = list.map((pr) => {
@@ -729,8 +798,15 @@ export function enrichPrsWithMainRedFacts(prs, {
       mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
     }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
       failureCompletedAt: check?.completedAt, defaultBranch }) : null;
+    const owedCiRerunRetry = mainGreenNow?.red === false ? owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) : undefined;
+    let timeoutRetryBudget = pr.timeoutRetryBudget;
+    if (owedCiRerunRetry && timeoutRetryBudget === undefined) {
+      try { timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid }); }
+      catch { /* Unknown budget never authorizes a dispatch. */ }
+    }
     return {
-      ...pr, mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
+      ...pr, mainGreenNow, ...(owedCiRerunRetry ? { owedCiRerunRetry, timeoutRetryBudget } : {}),
+      mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
       prContainsMainGreenSha: greenFix?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: greenFix?.mergeBaseCheckRuns ?? null,
       mergeBaseRunConclusion: greenFix?.mergeBaseRunConclusion ?? null,
     };
@@ -1289,7 +1365,10 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // scheduling recovery on this tick. A truncated snapshot that merely looks green is NOT kept — a later,
     // unread rerun could contradict it, so it stays `unchecked`.
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
-    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows });
+    // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
+    // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
+    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+      ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }
@@ -1370,6 +1449,8 @@ export function runReconcilePass({
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
   loadFixSettings = resolveFixSettings,
+  loadOwedCiRerunSettings = resolveOwedCiRerunSettings,
+  loadStaleCiRerunSetting = resolveStaleCiRerunSetting,
   // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
   loadTakeoverBudget = resolveTakeoverBudget,
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
@@ -1429,7 +1510,7 @@ export function runReconcilePass({
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
-  const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo, defaultBranch, requiredChecks });
+  const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
   // beyond the label scan `readPrs` already fetched every field for when no PR carries that label.
@@ -1450,7 +1531,13 @@ export function runReconcilePass({
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
+  const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
+  console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
+  const staleCiRerunSetting = loadStaleCiRerunSetting({ env });
+  console.error(`fix.staleCiRerun=${staleCiRerunSetting.value} (${staleCiRerunSetting.source})`);
   const plan = planReconcile({
+    owedCiRerun: owedCiRerunSetting.value,
+    staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,

@@ -117,6 +117,54 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expect(run2).not.toHaveBeenCalled();
   });
 
+  it.each(['dispatch dry-run ok', 'dispatch dry-run failed (1/9): fix failed'])(
+    'names slow passes in timings and alerts for %s', async (prefix) => {
+      const f = makeFixture();
+      addDispatchOverlay(f);
+      const log = { error: vi.fn() };
+      let clock = Date.now();
+      const detail = `${prefix} — review 1ms, fix 0ms, reconcile-fix-pass 81.3s, reconcile-ci-heal-pass 41.8s, reconcile-review-pass 36.3s, boundary 1000ms, short 999ms, bad NaNs, fifth 2s, sixth 3s, seventh 4s`;
+      const result = await rebuildClone({
+        root: f.cloneDir, env: f.env, prState: async () => null, lockOpts: LOCK_OPTS,
+        log, now: () => clock,
+        runSmoke: async () => {
+          clock += 65_000;
+          return { verdict: 'pass', smoke: { results: [
+            { name: 'dispatch-dry-run', ms: 495196, ok: true, detail },
+            { name: 'reconcile-dry-run', ms: 229798, ok: true },
+            { name: 'malformed', ms: 1, ok: true, detail: { timings: 'bad' } },
+          ] } };
+        },
+        dispatchSmoke: { settings: SETTINGS, run: async () => ({ ok: true, reason: 'passed', ms: 5 }) },
+      });
+      const line = log.error.mock.calls.map(([message]) => message)
+        .find(message => message.startsWith('daemon-rebuild: smoke-timings '));
+      const payload = JSON.parse(line.slice('daemon-rebuild: smoke-timings '.length));
+      const passes = { 'dispatch-dry-run': 'reconcile-fix-pass 81.3s, reconcile-ci-heal-pass 41.8s, reconcile-review-pass 36.3s, boundary 1000ms, fifth 2s, sixth 3s' };
+      expect(payload.checks).toBe('dispatch-dry-run:495196ms reconcile-dry-run:229798ms malformed:1ms dispatch-smoke:5ms');
+      expect(payload.passes).toEqual(passes);
+      expect(result.alerts.find(alert => alert.kind === 'smoke-slow').detail).toEqual(payload);
+    },
+  );
+
+  it('omits passes when no detail contains slow timing rows', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const log = { error: vi.fn() };
+    await rebuildClone({
+      root: f.cloneDir, env: f.env, prState: async () => null, lockOpts: LOCK_OPTS, log,
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [
+        { name: 'missing', ms: 1, ok: true },
+        { name: 'short', ms: 1, ok: true, detail: 'dispatch dry-run ok — review 1ms, fix 0ms' },
+        { name: 'bad', ms: 1, ok: true, detail: 'review 2s' },
+      ] } }),
+      dispatchSmoke: { settings: SETTINGS, run: async () => ({ ok: true, reason: 'passed' }) },
+    });
+    const line = log.error.mock.calls.map(([message]) => message)
+      .find(message => message.startsWith('daemon-rebuild: smoke-timings '));
+    expect(JSON.parse(line.slice('daemon-rebuild: smoke-timings '.length))).not.toHaveProperty('passes');
+  });
+
   it('a passing dispatch smoke adopts, and an unchanged overlay is not smoked again', async () => {
     const f = makeFixture();
     const sha = addDispatchOverlay(f);
