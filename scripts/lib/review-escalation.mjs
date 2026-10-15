@@ -1880,6 +1880,25 @@ export function parseOperatorClearance(comments) {
 }
 
 /**
+ * The prose clearance of ONE comment body, for a reader that needs more than the actor: the precedent capture
+ * (`we:scripts/lib/review-precedents.mjs#captureFromComment`) reads the quoted `--reason` that follows it. Pure.
+ * It uses `CLEARED_HUMAN_PROSE_RE` itself, so it matches exactly what `parseOperatorClearance` accepts: `null`
+ * unless the body OPENS with the `clear-human` heading and attribution `buildVerdictComment` renders.
+ * `end` is the offset just past the attribution match. `reviewedSha` is the body's last `reviewed-sha` MARKER, or
+ * '' — prose cannot forge one, because the render boundary escapes `<!--` in every caller field.
+ * @returns {{actor:string, end:number, reviewedSha:string}|null}
+ */
+export function parseClearedHumanProse(body) {
+  const text = typeof body === 'string' ? body : '';
+  const m = new RegExp(CLEARED_HUMAN_PROSE_RE.source).exec(text);
+  const actor = m ? m[1].trim() : '';
+  if (!actor) return null;
+  let reviewedSha = '';
+  for (const s of text.matchAll(new RegExp(REVIEWED_SHA_RE.source, 'g'))) reviewedSha = s[1].toLowerCase();
+  return { actor, end: m.index + m[0].length, reviewedSha };
+}
+
+/**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
  *

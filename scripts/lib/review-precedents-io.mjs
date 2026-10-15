@@ -22,6 +22,7 @@ import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 import { OPERATOR_LOGINS, AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { parseOperatorRulingComment } from './jury-core.mjs';
+import { parseClearedHumanProse } from './review-escalation.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const PRECEDENT_TRANSPORT_BRANCH = 'ops/review-requests';
@@ -193,7 +194,8 @@ export async function capturePrecedents({ repo, pr, info, existing = new Map(), 
   const drafts = [], skipped = [], invalid = [];
   const seen = new Set(existing.keys());
   for (const comment of info.comments ?? []) {
-    for (const raw of captureFromComment(comment, { operatorLogins: OPERATOR_LOGINS, automationLogins: AUTOMATION_LOGINS, parseRuling: parseOperatorRulingComment })) {
+    for (const raw of captureFromComment(comment, { operatorLogins: OPERATOR_LOGINS, automationLogins: AUTOMATION_LOGINS,
+      parseRuling: parseOperatorRulingComment, parseClearance: parseClearedHumanProse })) {
       const capture = { ...raw, head: raw.head || info.headRefOid,
         date: raw.date || (now instanceof Date ? now.toISOString() : String(now ?? '')).slice(0, 10) };
       const options = { repo, pr, scope: scopeHintsFromBody(capture.body), capturedBy };

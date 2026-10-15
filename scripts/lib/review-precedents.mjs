@@ -319,7 +319,23 @@ export function extractCitations(findings) {
   return [...ids].sort();
 }
 
-export function captureFromComment(comment, { operatorLogins = [], automationLogins = [], parseRuling } = {}) {
+// The notes after a `buildVerdictComment({ to: 'clear-human' })` attribution, in the order it renders them: the
+// rest of the attribution line, a blank line, `--reason` as `> ` lines, the fixed "What this record proves"
+// paragraph, an optional independence note, the `--body-file` text, then the marker block.
+const CLEAR_HUMAN_BOILERPLATE = [/^What this record proves: /, /^(🧑 Cleared by the HUMAN CEREMONY|⚠️ Independence NOT established)/];
+const MARKER_LINE = /^<!--[^\r\n]*-->$/;
+function clearHumanNotes(rest) {
+  const lines = rest.split(/\r?\n/).slice(1);
+  while (lines.length && !lines[0].trim()) lines.shift();
+  const quotes = [];
+  while (lines[0]?.startsWith('> ') || lines[0] === '>') quotes.push(lines.shift().slice(2));
+  const paragraphs = lines.join('\n').replace(/^\s+/, '').split(/\n(?:[ \t]*\n)+/).filter((p) => p.trim());
+  for (const re of CLEAR_HUMAN_BOILERPLATE) if (re.test(paragraphs[0] ?? '')) paragraphs.shift();
+  while (paragraphs.length && paragraphs.at(-1).trim().split('\n').every((l) => MARKER_LINE.test(l.trim()))) paragraphs.pop();
+  return { reason: quotes.join(' ').trim(), text: paragraphs.join('\n\n').trim() };
+}
+
+export function captureFromComment(comment, { operatorLogins = [], automationLogins = [], parseRuling, parseClearance } = {}) {
   const body = typeof comment?.body === 'string' ? comment.body : '';
   const trusted = (login, list) => typeof login === 'string' && list.some((l) => l.toLowerCase() === login.toLowerCase());
   const author = comment?.author?.login;
@@ -330,16 +346,14 @@ export function captureFromComment(comment, { operatorLogins = [], automationLog
       operatorWords: /Operator: ([^\r\n]+)/.exec(body)?.[1] ?? '',
       body: body.slice(recorded.index + recorded[0].length).trim(), actor: recorded[1], channel: recorded[2] }];
   }
-  const cleared = /^Cleared by (\S+) via `review-set-label\.mjs --to=clear-human`[^\r\n]*/.exec(body);
-  if (cleared && trusted(cleared[1], operatorLogins) && (trusted(author, operatorLogins) || trusted(author, automationLogins))) {
-    const lines = body.slice(cleared.index + cleared[0].length).split(/\r?\n/);
-    while (lines.length && !lines[0].trim()) lines.shift();
-    const quotes = [];
-    while (lines[0]?.startsWith('> ')) quotes.push(lines.shift().slice(2));
-    const reason = quotes.join(' ').trim();
+  // The clearance shape is the producer's own (`parseClearance` is injected, normally review-escalation's
+  // `parseClearedHumanProse`), so this reader cannot drift from what review-set-label.mjs writes.
+  const cleared = parseClearance?.(body);
+  if (cleared && trusted(cleared.actor, operatorLogins) && (trusted(author, operatorLogins) || trusted(author, automationLogins))) {
+    const { reason, text } = clearHumanNotes(body.slice(cleared.end));
     if (reason && reason.split(/\s+/).length >= 8) return [{ ...base, decision: 'accept-ok', kind: 'clear-human',
-      head: /reviewed-sha: ([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? '', operatorWords: reason, body,
-      actor: cleared[1], channel: 'review-set-label.mjs' }];
+      head: cleared.reviewedSha ?? '', operatorWords: reason, body: text,
+      actor: cleared.actor, channel: 'review-set-label.mjs' }];
   }
   const record = parseRuling?.(comment)?.record;
   if (!record || record.actor === 'auto-policy' || !trusted(record.actor, operatorLogins)) return [];

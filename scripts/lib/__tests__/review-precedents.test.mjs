@@ -2,6 +2,9 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as p from '../review-precedents.mjs';
+import * as escalation from '../review-escalation.mjs';
+import { INDEPENDENCE } from '../review-independence.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 
 const seeds = JSON.parse(readFileSync('scripts/review-precedents.seeds.json', 'utf8')).precedents;
 const REPO = 'web-everything/web-everything';
@@ -18,6 +21,8 @@ The post-accept red team confirmed two broken edge cases on this head. Both corr
 1. **\`scripts/operations/close-items.mjs:70\`: closing a duplicate's survivor invalidates the \`closedInto\` pointers already aimed at it.** Fix: refuse to close a card while any closed duplicate points to it.`;
 const options = { repo: REPO, pr: 5184, operatorLogins: ['chalbert'], automationLogins: ['review-bot'] };
 const comment = (body, login = 'chalbert') => ({ author: { login }, body, url: 'https://example.test/comment', createdAt: at });
+const SHA = 'abcdef1234567890abcdef1234567890abcdef12';
+const clearOptions = { ...options, parseClearance: escalation.parseClearedHumanProse };
 
 describe('records and events', () => {
   it('validates all eight real active seeds', () => {
@@ -144,10 +149,25 @@ describe('recorded operator capture', () => {
     expect(p.captureFromComment(comment('ordinary prose'), options)).toEqual([]);
   });
   it('captures meaningful quoted clear-human notes from a trusted tool identity', () => {
-    const clear = 'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (#2895).\n\n> These ten words explain why this finding needs no changes.\n\n<!-- reviewed-sha: abcdef123 -->';
-    expect(p.captureFromComment(comment(clear, 'review-bot'), options)).toMatchObject([{ decision: 'accept-ok', kind: 'clear-human', head: 'abcdef123', operatorWords: 'These ten words explain why this finding needs no changes.' }]);
-    expect(p.captureFromComment(comment(clear.replace('These ten words explain why this finding needs no changes.', 'ok')), options)).toEqual([]);
-    expect(p.captureFromComment(comment(clear, 'stranger'), options)).toEqual([]);
+    const reason = 'These ten words explain why this finding needs no changes.';
+    const clear = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA, reason });
+    expect(p.captureFromComment(comment(clear, 'review-bot'), clearOptions)).toMatchObject([{ decision: 'accept-ok', kind: 'clear-human', head: SHA, operatorWords: reason, body: '', actor: 'chalbert' }]);
+    expect(p.captureFromComment(comment(buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA, reason: 'ok' })), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(clear, 'stranger'), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(buildVerdictComment({ to: 'clear-human', actor: 'stranger', headSha: SHA, reason })), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(clear), options)).toEqual([]);
+  });
+  it('reads --reason and --body-file exactly as review-set-label renders them', () => {
+    const writeUp = 'The **`scripts/lib/foo.mjs` cache is pure and safe to reuse here**.\n\nreviewed-sha: 1111111 and <!-- reviewed-sha: 2222222 --> are prose, not markers.';
+    for (const independence of [null, { independent: false, status: INDEPENDENCE.SELF_CLEAR }, { independent: false, status: INDEPENDENCE.UNKNOWN_CLEARER, reason: 'no clearer id' }]) {
+      const clear = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA, clearerId: 'session-1', independence,
+        reason: 'The finding is a false positive:\nthe cache never crosses a process boundary.', body: writeUp });
+      const [capture] = p.captureFromComment(comment(clear), clearOptions);
+      expect(capture).toMatchObject({ kind: 'clear-human', head: SHA, operatorWords: 'The finding is a false positive: the cache never crosses a process boundary.' });
+      expect(capture.body).toBe(writeUp.replace('<!--', '&lt;!--').replace('-->', '--&gt;'));
+      expect(p.fallbackPattern(capture, { pr: 5184 })).toBe("'scripts/lib/foo.mjs' cache is pure and safe to reuse here");
+      expect(p.scopeHintsFromBody(capture.body).paths).toEqual(['scripts/lib/foo.mjs']);
+    }
   });
   it('groups distinct operator ruling results and excludes auto-policy', () => {
     const record = { actor: 'chalbert', head: 'abcdef123', reason: 'lesson', channel: 'console', rulings: [{ key: '["seat","first summary"]', result: 'block' }, { key: 'opaque', result: 'not-real' }, { key: '["seat","second summary"]', result: 'block' }] };
@@ -258,9 +278,12 @@ describe('measurement and settings', () => {
   });
   it('rejects non-operator promotion and quoted clearance provenance', () => {
     expect(() => p.statusEvent({ id: seeds[0].id, status: 'active', actor: 'stranger', at })).toThrow();
-    const phrase = 'Cleared by chalbert via `review-set-label.mjs --to=clear-human`\n> These are eight or more words about this review decision.';
-    expect(p.captureFromComment(comment(`Advisory quotes:\n${phrase}`, 'review-bot'), options)).toEqual([]);
-    expect(p.captureFromComment(comment(phrase.replace('chalbert', 'stranger'), 'review-bot'), options)).toEqual([]);
+    const phrase = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA, reason: 'These are eight or more words about this review decision.' });
+    expect(p.captureFromComment(comment(phrase, 'review-bot'), clearOptions)).toHaveLength(1);
+    expect(p.captureFromComment(comment(`Advisory quotes:\n${phrase}`, 'review-bot'), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(`> ${phrase.split('\n').join('\n> ')}`, 'review-bot'), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(buildVerdictComment({ to: 'accepted', actor: 'chalbert', headSha: SHA, body: phrase }), 'review-bot'), clearOptions)).toEqual([]);
+    expect(p.captureFromComment(comment(phrase.replace('chalbert', 'stranger'), 'review-bot'), clearOptions)).toEqual([]);
   });
   it('requires operator status events or exact reviewed seeds for active first writes', () => {
     const event = p.precedentEvent(row(), { at });

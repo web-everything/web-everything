@@ -6,6 +6,7 @@ import * as io from '../review-precedents-io.mjs';
 import { precedentEvent, fallbackPattern, captureFromComment, citationEvent, foldCitations } from '../review-precedents.mjs';
 import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
 import { FENCED_DATA_RULE } from '../mandate-fence.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -137,6 +138,15 @@ describe('settings and drafting', () => {
     expect(io.draftPatternWithModel({}, { route: () => { throw new Error('no route'); }, spawn })).toBeNull();
     for (const stdout of ['', 'x'.repeat(401)]) expect(io.draftPatternWithModel({}, { route, spawn: () => ({ status: 0, stdout }) })).toBeNull();
     expect(io.draftPatternWithModel({}, { route, spawn: () => ({ status: 0, stdout: '<rule> `literal`' }) })).toBe('<rule> \'literal\'');
+  });
+  it('captures a real review-set-label clear-human comment through the wired producer shape', async () => {
+    const reason = 'These ten words explain why this finding needs no changes.';
+    const body = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: 'abcdef1234567890abcdef1234567890abcdef12', reason, body: 'The **`scripts/lib/foo.mjs` cache is pure and safe** here.' });
+    const result = await io.capturePrecedents({ repo, pr: 5184, info: { headRefOid: 'fedcba987', comments: [comment(body)] }, now: at });
+    expect(result.drafts).toHaveLength(1);
+    expect(result.drafts[0]).toMatchObject({ decision: 'accept-ok', pattern: "'scripts/lib/foo.mjs' cache is pure and safe",
+      rationale: { operatorWords: reason }, scope: { paths: ['scripts/lib/foo.mjs'] },
+      source: { kind: 'clear-human', head: 'abcdef1234567890abcdef1234567890abcdef12' } });
   });
   it('captures only the operator draft, uses the fallback and skips existing ids', async () => {
     const args = { repo, pr: 5184, info, existing: new Map(), now: at };
