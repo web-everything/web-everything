@@ -19,13 +19,14 @@ import { withRealRepo } from './helpers/real-repo.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { dispatchPlan } from '../../readiness/dispatch-plan.mjs';
 import { hasOperatorRecord } from '../../backlog/operator-task.mjs';
+import { prepareCardStatus } from '../../conveyor/prepare-result.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { PREPARE_OWNED_FRONTMATTER_KEYS, frontmatterTamperedBeyondClaim } from '../../lib/probation-launcher.mjs';
 
 const brief = 'A bounded task.\n\n' + ['Design', 'MVP', 'Done when', 'Edge cases', 'Test plan', 'Proof plan']
   .map(h => `## ${h}\nConcrete handling in we:scripts/example.mjs.\n`).join('\n');
 const context = { existingIds: [], today: '2026-10-13', dir: '/repo/backlog',
-  originMainSha: 'a'.repeat(40), operatorTask: { enabled: true, maxPriority: 'P0' } };
+  originMainSha: 'a'.repeat(40), operatorTask: { enabled: true, maxPriority: 'P0' }, sessionRole: 'orchestrator' };
 const input = { title: 'Operator task', kind: 'story', size: '1', scope: 'we:scripts/example.mjs',
   digest: brief, operatorTask: true, priority: 'P0',
   operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'File this as P0.' };
@@ -147,7 +148,7 @@ describe('operator filing IO', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-10-14T02:00:00Z'));
       try {
-        const read = createFileItemReader({ root, listFiles: () => [], readPolicy: () => context.operatorTask })();
+        const read = createFileItemReader({ root, listFiles: () => [], readPolicy: () => context.operatorTask, env: {} })();
         expect(read.today).toBe('2026-10-13');
         expect(read.originMainSha).toBe(tip);
         expect(readField(planFileItem(read, input).content, 'preparedAgainstSha')).toBe(tip);
@@ -220,7 +221,7 @@ describe('operator task post-build', () => {
     expect(errors({ report: 'true' })).toContain('report must');
   });
   it('writes the flags through the existing scaffold renderer', () => {
-    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'Test', kind: 'investigation', operatorTask: true, operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'Report it.', edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
+    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '', sessionRole: 'orchestrator' }, { title: 'Test', kind: 'investigation', operatorTask: true, operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'Report it.', edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
     expect(result.content).toContain('operatorTask: true');
     expect(result.content).toContain('edgeClone: "review"');
     expect(result.content).toContain('liveProof: {"command":"printf \\"ready\\"","expect":"ready"}');
@@ -329,8 +330,11 @@ describe('operator authority record', () => {
   const fields = { operatorTask: true, report: true, liveProof: { command: 'printf ready', expect: 'ready' } };
   it('composes post-build steps only for a card carrying a valid operator record', () => {
     expect(composeOperatorTaskBrief(template, fields, { settings, policy: steps })).toBe(template);
-    // A record naming a non-operator is refused outright (like every malformed operator field), never composed.
-    expect(() => composeOperatorTaskBrief(template, { ...fields, operatorInstruction: forged }, { settings, policy: steps })).toThrow(/operatorInstruction\.actor/);
+    // A record naming a non-operator is no record: an ordinary card (the standards gate refuses it), never a
+    // failed dispatch read, since the operator list can differ per process.
+    expect(composeOperatorTaskBrief(template, { ...fields, operatorInstruction: forged }, { settings, policy: steps })).toBe(template);
+    // A non-build kind (the prepare that repairs a card) never fails on the card's operator fields.
+    expect(composeOperatorTaskBrief(template, { report: true }, { settings, policy: steps, kind: 'prepare' })).toBe(template);
     for (const bad of [{ ...record, channel: '' }, { ...record, channel: 'a\nb' }, { ...record, at: 'later' }, { ...record, words: ' ' }, 'chalbert', null]) {
       expect(hasOperatorRecord({ ...fields, operatorInstruction: bad })).toBe(false);
     }
@@ -357,6 +361,26 @@ describe('operator authority record', () => {
     expect(order([card('2', { priority: 'P1' })], { enabled: true, maxPriority: 'P2' })[0][1]).not.toBe('P1');
     expect(order([card('2', { priority: 'P2' })], { enabled: false, maxPriority: 'P0' })[0][1]).not.toBe('P2');
     expect(order([card('2', { priority: 'P2' })], { enabled: true, maxPriority: 'P0' })[0][1]).toBe('P2');
+    // `now` (P1) and `high` (P2) are card claims too, under the same switch and cap.
+    expect(order([card('2', { priority: 'now' })])[0][1]).toBe('P1');
+    expect(order([card('2', { priority: 'now' })], { enabled: true, maxPriority: 'P2' })[0][1]).not.toBe('P1');
+    expect(order([card('2', { priority: 'high' })], { enabled: false, maxPriority: 'P0' })[0][1]).not.toBe('P2');
+    const [row] = orderQueueDetailed([card('2', { priority: 'now' })], DEFAULT_CONFIG, Date.now(), { priority: { mode: 'enforce' }, operatorTask: { enabled: true, maxPriority: 'P2' } });
+    expect(row.priorityReasons).toContain('card priority: now ignored (above maxPriority P2)');
+  });
+  it('refuses an operator record from a dispatched worker or an unknown session role', () => {
+    for (const sessionRole of ['worker', 'unknown', undefined]) {
+      expect(() => planFileItem({ ...context, sessionRole }, input)).toThrow(/session role/);
+    }
+    expect(() => planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'T', kind: 'story', size: '1', ...input })).toThrow(/session role/);
+    const worker = createFileItemReader({ root: process.cwd(), listFiles: () => [], readPolicy: () => context.operatorTask, readTip: () => context.originMainSha, env: { WE_CONVEYOR_WORKER: '1' } })();
+    expect(worker.sessionRole).toBe('worker');
+    expect(() => planFileItem(worker, input)).toThrow(/session role "worker"/);
+  });
+  it('reports an operator filing stamp as unstamped, so prepare recovery runs prepare-stamp', () => {
+    const raw = fm => `---\nstatus: open\npreparedDate: "2026-10-01"${fm}\n---\n\n# t\n`;
+    expect(prepareCardStatus(raw('\npreparedBy: "operator-filing"')).preparedDate).toBeNull();
+    expect(prepareCardStatus(raw('')).preparedDate).toBe('2026-10-01');
   });
   it('file-item applies priority validation, maxPriority and enabled to every filing', () => {
     const plain = { title: 'Plain', kind: 'story', size: '1', scope: 'we:scripts/example.mjs' };

@@ -1289,7 +1289,9 @@ lists missing sections before any write or queue effect. A passing brief gets
 `--operatorChannel=<where the instruction came from>` and `--operatorWords=<the operator's words>`.
 Filing writes them as `operatorInstruction: {actor, channel, at, words}`; `actor` must be a
 registered operator login (`OPERATOR_LOGINS`, `we:scripts/lib/marker-authorship.mjs`). This is the
-clear-human pattern: an attributed record, not a signature. Every operator-task treatment (post-build
+clear-human pattern: an attributed record, not a signature. Like the pre-PR review bypass, only an
+interactive session may record it: a dispatched worker (`WE_CONVEYOR_WORKER=1`) or an unknown session role
+is refused, and a bare `scaffold` (which has no session role) cannot file an operator task. Every operator-task treatment (post-build
 steps, the filing prepare stamp, an explicit P0) requires `operatorTask: true` plus a valid record. A card
 without the record is an ordinary card: no post-build steps, its `preparedBy: "operator-filing"` stamp is
 void (held for prepare), and a `priority: P0` is ignored by the queue. The standards gate refuses a
@@ -1298,7 +1300,10 @@ malformed or non-operator record.
 `--priority=P0|P1|P2|P3|P4` writes the existing `priority` field, on any filing. Every filing is checked:
 the value must be P0..P4, `build.operatorTask.enabled` must be true, it may not exceed `maxPriority`,
 and P0 needs `--operatorTask`. The build queue re-applies the same rules to every card (a hand-edited
-`priority:` included) and names an ignored value in the row's reasons. An admitted P0 precedes
+`priority:` included) and names an ignored value in the row's reasons. The older `priority: now` (P1) and
+`priority: high` (P2) claims obey the same switch and cap. A bad operator record makes a card ordinary at
+dispatch rather than failing the read, and a card held for prepare because its filing stamp is void reads as
+unstamped, so prepare recovery runs `prepare-stamp` on it. An admitted P0 precedes
 `build.priority` in every queue mode and takes the next available slot; blockedBy,
 scope holds, sizing, clearance, and stamp staleness still apply.
 

@@ -29,6 +29,7 @@ import {
 import { FILE_ITEM_QUEUE_EFFECT } from './file-item.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
+import { classifySession } from './session-role.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
 export { REPO_ROOT };
@@ -38,6 +39,7 @@ export function createFileItemReader({ root = REPO_ROOT,
   today = () => localDateString(new Date(), 'America/Toronto'),
   readPolicy = readOperatorTaskSettings,
   now = () => new Date().toISOString(),
+  env = process.env,
   readTip = () => readGit(['rev-parse', 'origin/main'], { cwd: root }).trim(),
   ...opts } = {}) {
   const read = createScaffoldReader({ root, today, ...opts });
@@ -45,7 +47,8 @@ export function createFileItemReader({ root = REPO_ROOT,
     let originMainSha;
     let tipRead = false;
     return {
-      ...read(), operatorTask: readPolicy(), now: now(),
+      // The session role gates who may record an operator instruction (operatorTaskFields).
+      ...read(), operatorTask: readPolicy(), now: now(), sessionRole: classifySession(env).role,
       get originMainSha() {
         if (!tipRead) {
           tipRead = true;

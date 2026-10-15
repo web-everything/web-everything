@@ -33,10 +33,12 @@ export function hasOperatorRecord(item, options) {
   return item?.operatorTask === true && validateOperatorInstruction(item.operatorInstruction, options).length === 0;
 }
 
-export function validateOperatorTask(item) {
+/** Shape errors of the operator-card fields. `record: false` skips the operator record's own checks, for a
+ *  reader that treats a bad record as no record (an ordinary card) instead of failing the whole read. */
+export function validateOperatorTask(item, { record = true } = {}) {
   const errors = [];
   if (item.operatorTask !== undefined && typeof item.operatorTask !== 'boolean') errors.push('operatorTask must be a boolean');
-  if (item.operatorInstruction !== undefined) {
+  if (record && item.operatorInstruction !== undefined) {
     if (item.operatorTask !== true) errors.push('operatorInstruction requires operatorTask: true');
     errors.push(...validateOperatorInstruction(item.operatorInstruction));
   }
@@ -56,9 +58,14 @@ export function validateOperatorTask(item) {
   }
   return errors;
 }
-export function operatorTaskFields(input, { at } = {}) {
+export function operatorTaskFields(input, { at, role } = {}) {
   const fields = {};
   if (input.operatorTask === true) {
+    // Trust boundary (the pre-PR bypass rule, we:scripts/lib/pre-pr-review.mjs#authoriseBypass): a dispatched
+    // worker never records an operator instruction, and an unknown or absent session role fails closed.
+    if (role !== 'orchestrator') {
+      throw new Error(`operatorTask is refused for session role "${role ?? 'unknown'}": only an interactive operator session (no WE_CONVEYOR_WORKER marker) filing through file-item may record an operator instruction`);
+    }
     fields.operatorTask = true;
     if (!input.operatorActor || !input.operatorChannel || !input.operatorWords) {
       throw new Error('operatorTask requires --operatorActor (a registered operator login), --operatorChannel and --operatorWords: the operator instruction it records');

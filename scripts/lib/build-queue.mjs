@@ -297,17 +297,31 @@ const OPERATOR_PRIORITY_DEFAULTS = Object.freeze({ enabled: true, maxPriority: '
 export function explicitCardPriority(item, operatorTask = OPERATOR_PRIORITY_DEFAULTS) {
   const value = /^P[0-4]$/.test(item?.priority ?? '') ? item.priority : null;
   if (!value) return { explicit: null, ignored: null };
-  const policy = { ...OPERATOR_PRIORITY_DEFAULTS, ...operatorTask };
-  const why = policy.enabled === false ? 'build.operatorTask.enabled=false'
-    : Number(value[1]) < Number(String(policy.maxPriority).slice(1)) ? `above maxPriority ${policy.maxPriority}`
-      : value === 'P0' && !hasOperatorRecord(item) ? 'no operator record' : null;
+  const why = cardClaimRefusal(value, operatorTask) ?? (value === 'P0' && !hasOperatorRecord(item) ? 'no operator record' : null);
   return why ? { explicit: null, ignored: `card priority: ${value} ignored (${why})` } : { explicit: value, ignored: null };
+}
+
+/** Why a class a card's own `priority:` earns is refused by the enabled switch or the maxPriority cap, or null. PURE. */
+function cardClaimRefusal(priorityClass, operatorTask) {
+  const policy = { ...OPERATOR_PRIORITY_DEFAULTS, ...operatorTask };
+  if (policy.enabled === false) return 'build.operatorTask.enabled=false';
+  return Number(String(priorityClass).slice(1)) < Number(String(policy.maxPriority).slice(1)) ? `above maxPriority ${policy.maxPriority}` : null;
 }
 
 /** Class one card; the reasons name the card's own field instead of the rule's PR-shaped wording. PURE. */
 function cardPriority(item, unblocks, settings, now, operatorTask) {
-  const r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
-  const { explicit, ignored } = explicitCardPriority(item, operatorTask);
+  let r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
+  const card = explicitCardPriority(item, operatorTask);
+  const { explicit } = card;
+  let { ignored } = card;
+  // `now` and `high` are card claims too: the class they earn obeys the same switch and cap, or the card is
+  // classed as if it made no claim.
+  const claim = String(item?.priority ?? '').trim().toLowerCase();
+  const claimWhy = ['now', 'high'].includes(claim) && /^P[0-4]$/.test(r.class) ? cardClaimRefusal(r.class, operatorTask) : null;
+  if (claimWhy) {
+    ignored = `card priority: ${claim} ignored (${claimWhy})`;
+    r = deliveryPriority(buildQueuePriorityFacts({ ...item, priority: undefined }, { unblocks }), settings, now);
+  }
   const reasons = r.reasons.map((why) => (why === CARD_PRIORITY_REASON.operatorRequested ? 'card priority: high'
     : why === CARD_PRIORITY_REASON.low ? 'card priority: low'
     : why === CARD_PRIORITY_REASON.now ? 'card priority: now (operator request)' : why));

@@ -6,7 +6,7 @@ Read {{ITEM_SPEC_PATH}}, we:docs/agent/conventions.md, and the code the card nam
 Every code-path reference you author must carry its repository prefix (e.g.
 `we:scripts/example.mjs`), including references in backticks and section prose. Check the premise and author concrete
 ## Design, ## MVP, ## Test plan, ## Proof plan, and ## Follow-ups sections in that card.
-Only edit that card's body, scope:, size:, estimatedLoc:, and preparedDate/preparedAgainstSha; preserve all other frontmatter.
+Only edit that card's body, scope:, size:, estimatedLoc:, and preparedDate/preparedAgainstSha/preparedBy (prepare-stamp writes the stamps and removes preparedBy); preserve all other frontmatter.
 Correct factual drift in the card itself: moved code, stale file:line citations, missing test paths,
 and narrower or wider scope supported by the current code. Keep the original goal; a factual
 scope correction is preparation, not a reason to stop. Record the old premise/scope, corrected

@@ -1156,7 +1156,9 @@ function buildQueue() {
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
       // set it too: key on the merged value itself, not only on the one file's mtime.
-      JSON.stringify(readSettings().buildQueuePriority ?? null)]);
+      JSON.stringify(readSettings().buildQueuePriority ?? null),
+      // The card-priority switch and cap (build.operatorTask) and the operator logins a P0 record is checked against.
+      JSON.stringify(readSettings().build?.operatorTask ?? null), process.env.WE_OPERATOR_LOGINS]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;

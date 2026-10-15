@@ -150,8 +150,9 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const name = `${num}-${slug}.md`;
   const content = renderItem({
-    // The operator record's time: the file-item reader's clock when it has one, else the filing day.
-    ...operatorTaskFields(input, { at: read.now || read.today }),
+    // The operator record's time: the file-item reader's clock when it has one, else the filing day. Only the
+    // file-item reader supplies a session role, so a bare scaffold cannot record an operator instruction.
+    ...operatorTaskFields(input, { at: read.now || read.today, role: read.sessionRole }),
     kind,
     size: Number.isFinite(size) ? size : undefined,
     slug,

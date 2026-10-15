@@ -19,11 +19,15 @@ export function resolveOperatorPostBuild(settings = readSettings().build, option
  * dispatch's `operatorPostBuild` route flag, so the two cannot disagree and neither reads prompt text.
  */
 export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, workspace = '.', kind = 'build' } = {}) {
-  const errors = validateOperatorTask(item);
+  // Only a build composes steps; any other kind (a prepare that would repair the card) never fails on its fields.
+  if (kind !== 'build') return [];
+  // A bad operator record is no record (an ordinary card, refused by the standards gate), never a failed read:
+  // the operator login list can differ per process (WE_OPERATOR_LOGINS).
+  const errors = validateOperatorTask(item, { record: false });
   if (errors.length) throw new Error(errors.join('; '));
   // Card frontmatter alone never adds a step: the card must be an operator task carrying a valid operator
   // record (an attributed operator instruction), and operator tasks must be enabled.
-  if (kind !== 'build' || !hasOperatorRecord(item) || enabled !== true) return [];
+  if (!hasOperatorRecord(item) || enabled !== true) return [];
   const steps = [];
   if (item.edgeClone && policy.edgeLoad) {
     const path = settings?.operatorTask?.edgeClones?.[item.edgeClone];

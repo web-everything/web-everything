@@ -190,7 +190,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       reads: ['input.operatorTask'],
       fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, now: raw.now,
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, now: raw.now, sessionRole: raw.sessionRole,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),
