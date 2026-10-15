@@ -900,9 +900,13 @@ export function createReviewPrSinks({
         if (labelNames(state.labels).includes('review:changes')) out(plan.reason);
       };
       const persist = (record) => {
-        const body = renderReferralRecord(record);
-        if (body.length > commentBudget) throw new Error(`mandatory referral record exceeds ${commentBudget} characters`);
         const before = fresh();
+        // #5942 — the posted note names a legacy block carry's real ruler (operator vs automatic policy) from the
+        // recorded backing rulings; display only, so an unreadable ruling list falls back to the neutral wording.
+        let operatorRulings = [];
+        try { operatorRulings = readOperatorRulings(before.comments, context(before)).rulings; } catch { /* neutral wording */ }
+        const body = renderReferralRecord(record, { operatorRulings });
+        if (body.length > commentBudget) throw new Error(`mandatory referral record exceeds ${commentBudget} characters`);
         // xuxcsw6: never repost a record the thread already carries byte-for-byte (trusted-author read).
         const same = r => JSON.stringify(r) === JSON.stringify(record);
         if (!readReferralRecords(before.comments, context(before)).records.some(same)) {
