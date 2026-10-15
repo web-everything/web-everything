@@ -318,19 +318,49 @@ function validatedThread(comments) {
   const view = [];
   const carried = new Map();
   const rootAt = new Map();
+  // Records dropped here still read as acceptances to every other reader, so they are owed a withdrawal.
+  const dropped = [];
   for (const c of comments) {
     const r = restampRecord(c);
     if (r) {
       const prior = latestAcceptRecord(view);
       if (!prior || prior.sha !== r.from || prior.laterBodyDerivedHold || !sameClearance(prior, r.rec)
-        || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body))) continue;
+        || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body))) { dropped.push(c); continue; }
       carried.set(c, { comment: view[prior.index], at: prior.at });
       // `has`, not `??`: an unknown (null) root time must stay unknown, which counts every formal review.
       rootAt.set(c, rootAt.has(view[prior.index]) ? rootAt.get(view[prior.index]) : prior.at);
     }
     view.push(c);
   }
-  return { view, carried, rootAt };
+  return { view, carried, rootAt, dropped };
+}
+
+export const NUMBERING_WITHDRAWN_MARKER = 'numbering-restamp-withdrawn';
+const WITHDRAWN_HEADLINE = '🚫 review — numbering re-stamp withdrawn (no acceptance)';
+const WITHDRAWN_MARKER_LINE_RE = /^<!-- numbering-restamp-withdrawn: from=([0-9a-f]{40}) to=([0-9a-f]{40}) -->$/;
+const WITHDRAWN_WRITER_RE = /^Recorded by ([A-Za-z0-9._-]{1,64}) via numbering-carry\. /;
+
+/**
+ * PURE: the inert body a withdrawn re-stamp record is edited into. It carries none of the acceptance markers
+ * (`reviewed-sha`, `reviewed-diff`, `reviewed-contribution`, `cleared-human`, the re-stamp marker), so every
+ * acceptance reader — `latestAcceptRecord`, `readDrainAcceptance` and the drain reconcile — finds no acceptance in it.
+ */
+export function buildNumberingWithdrawnBody({ fromSha, toSha, writer }) {
+  return [
+    WITHDRAWN_HEADLINE, '',
+    `Recorded by ${writer} via numbering-carry. A hold or a newer acceptance reached this PR while the numbering `
+      + `re-stamp of \`${fromSha.slice(0, 12)}\` → \`${toSha.slice(0, 12)}\` was being written, so that re-stamp is `
+      + 'withdrawn: it carries no acceptance. A fresh review of the head is owed.', '',
+    `<!-- ${NUMBERING_WITHDRAWN_MARKER}: from=${fromSha} to=${toSha} -->`,
+  ].join('\n');
+}
+
+/** PURE: only the exact body the writer emits counts as a withdrawal notice, so it can never carry an objection. */
+function isWithdrawnNotice(body) {
+  const lines = typeof body === 'string' ? body.trimEnd().split('\n') : [];
+  const m = lines[0] === WITHDRAWN_HEADLINE ? WITHDRAWN_MARKER_LINE_RE.exec(lines[lines.length - 1]) : null;
+  const writer = m ? WITHDRAWN_WRITER_RE.exec(lines[2] ?? '') : null;
+  return Boolean(writer) && body.trimEnd() === buildNumberingWithdrawnBody({ fromSha: m[1], toSha: m[2], writer: writer[1] });
 }
 const staleHealHeadline = buildStaleAcceptHealComment({}).split('\n')[0];
 const stalePark = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for review by the drain\*\*\s*\n\s*review:accepted /;
@@ -340,6 +370,8 @@ const staleReason = /^(?:is STALE|could NOT be re-verified this pass) —/;
 export function isNumberingTolerableLaterBody(body) {
   if (isKnownMachineBody(body)) return true;
   if (typeof body !== 'string') return false;
+  // A withdrawal is not itself a hold: whatever caused it still stands on the thread and is judged on its own.
+  if (isWithdrawnNotice(body)) return true;
   const park = stalePark.exec(body);
   return (park !== null && staleReason.test(body.slice(park[0].length))) || body.trimStart().startsWith(staleHealHeadline);
 }
@@ -349,34 +381,42 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
   const names = new Set((Array.isArray(labels) ? labels : []).map((l) => typeof l === 'string' ? l : l?.name));
   if (!names.has(REVIEW_LABELS.pending)
     || [REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.has(l))) {
-    return { candidate: false, reason: 'labels do not permit numbering carry' };
+    return { candidate: false, reason: 'labels do not permit numbering carry',
+      ...(names.has(REVIEW_LABELS.pending) ? { hold: true } : {}) };
   }
   if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return { candidate: false, reason: 'live head unknown' };
   const list = Array.isArray(comments) ? comments : [];
   const head = headSha.toLowerCase();
   // A re-stamp record is judged against the acceptance it carried, never trusted as an acceptance on its own.
-  const { view, carried, rootAt } = validatedThread(list);
+  const { view, carried, rootAt, dropped } = validatedThread(list);
+  // `stranded`: re-stamp records the other acceptance readers would still honour although this plan does not.
+  const out = (plan, held = []) => {
+    const stranded = [...dropped, ...held];
+    return stranded.length ? { ...plan, stranded } : plan;
+  };
   const rec = latestAcceptRecord(view);
-  if (!rec) return { candidate: false, reason: 'no recorded acceptance' };
+  if (!rec) return out({ candidate: false, reason: 'no recorded acceptance' });
   const src = view[rec.index];
   // A numbering re-stamp whose label write failed after its record was posted: finish the labels only. The record was
   // validated against the acceptance it carried, so no proof or second comment is owed.
   const labelsOnly = rec.sha === head && carried.has(src);
-  if (rec.sha === head && !labelsOnly) return { candidate: false, reason: 'already bound' };
-  if (rec.laterBodyDerivedHold) return { candidate: false, reason: 'later body-derived hold' };
+  if (rec.sha === head && !labelsOnly) return out({ candidate: false, reason: 'already bound' });
+  // A hold standing after our own record: the record is withdrawn too, since readers bound to its sha ignore the hold.
+  const held = (reason) => out({ candidate: false, reason, hold: true }, carried.has(src) ? [src] : []);
+  if (rec.laterBodyDerivedHold) return held('later body-derived hold');
   if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
-    return { candidate: false, reason: 'later verdict or unknown comment stands' };
+    return held('later verdict or unknown comment stands');
   }
-  if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
+  if (!Array.isArray(reviews)) return out({ candidate: false, reason: 'formal reviews unreadable', retryable: true });
   // From the review that started the chain: a re-stamp re-dates the record without being a review.
-  if (laterReviewHold(reviews, rootAt.has(src) ? rootAt.get(src) : rec.at)) return { candidate: false, reason: 'formal review hold stands' };
+  if (laterReviewHold(reviews, rootAt.has(src) ? rootAt.get(src) : rec.at)) return held('formal review hold stands');
   // The acceptance comment this plan carries: a newer record on the same sha is a different acceptance.
   if (labelsOnly) {
     const { comment, at } = carried.get(src);
-    return { candidate: true, labelsOnly: true, from: restampRecord(src).from, to: head, human: rec.humanCleared,
-      actor: rec.actor, source: sourceKey(list, comment, at) };
+    return out({ candidate: true, labelsOnly: true, from: restampRecord(src).from, to: head, human: rec.humanCleared,
+      actor: rec.actor, source: sourceKey(list, comment, at) });
   }
-  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source: sourceKey(list, src, rec.at) };
+  return out({ candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source: sourceKey(list, src, rec.at) });
 }
 
 // Same allow-list as human-clearance-carry; local to avoid a circular dependency between the two carry tiers.
@@ -424,19 +464,36 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
     return { result: { action: 'retry', reason: 'live re-read returned no complete thread' } };
   }
   const plan = planNumberingRestamp({ labels: state.labels, headSha: state.headRefOid, comments: state.comments, reviews: live.reviews });
+  // `comments`, `stranded` and `hold` let a caller that already posted withdraw what the fresh plan does not honour.
+  const seen = { comments: state.comments, stranded: plan.stranded ?? [] };
   if (!plan.candidate) {
-    return { result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
+    return { ...seen, hold: Boolean(plan.hold), result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
   }
   // The write uses the first plan's clearance, so the fresh one must match it: the same human flag, the same actor (as
   // written into the record) and the same source acceptance comment. Any change aborts unsettled.
   const clearedBy = (p) => (p.human ? sanitizeActor(p.actor) : null);
   if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)
     || Boolean(plan.human) !== Boolean(expected.human) || clearedBy(plan) !== clearedBy(expected) || plan.source !== expected.source) {
-    return { result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
+    return { ...seen, hold: true, result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
   }
+  // A referral hold, or an unreadable referral record, is never proof the acceptance still stands.
   try { guardReferrals(state, { repo, pr }); }
-  catch (e) { return { result: { action: 'retry', reason: errorReason(e) } }; }
+  catch (e) { return { ...seen, hold: true, result: { action: 'retry', reason: errorReason(e) } }; }
   return { state };
+}
+
+/** IO: edit each stranded re-stamp record into the inert withdrawal notice. Throws on the first failed edit. */
+function withdrawRecords({ provider, repo, pr, records, writer }) {
+  const done = new Set();
+  for (const c of records) {
+    const r = restampRecord(c);
+    if (!r || done.has(c.id)) continue;
+    if (typeof c.id !== 'string' || !c.id) throw Error('re-stamp record has no comment id');
+    if (typeof provider?.editComment !== 'function') throw Error('provider cannot edit a comment');
+    provider.editComment(repo, c.id, buildNumberingWithdrawnBody({ fromSha: r.from, toSha: r.to, writer }), { pr });
+    done.add(c.id);
+  }
+  return done.size;
 }
 
 /** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
@@ -448,6 +505,15 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   const key = `${repo}#${pr}@${state?.headRefOid}`;
   if (settledRestamps.has(key)) return null;
   const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
+  // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
+  // withdrawn first; the next pass plans from the thread as it then stands.
+  if (plan.stranded?.length) {
+    if (dryRun) return { action: 'would-withdraw', withdrawn: plan.stranded.length, reason: plan.reason ?? 'stranded re-stamp record' };
+    let withdrawn;
+    try { withdrawn = withdrawRecords({ provider, repo, pr, records: plan.stranded, writer }); }
+    catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}` }; }
+    return { action: 'withdrawn', withdrawn, reason: 're-stamp record(s) that carry no standing acceptance withdrawn' };
+  }
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
   // A guard read failure is retryable and never settles the head or grants an acceptance.
@@ -455,10 +521,19 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
   const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
     expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor, source: plan.source } });
+  // Once our record is on the thread, a check that does not confirm it withdraws what the fresh plan does not honour:
+  // every stranded record and, on a hold, our own record (a hold before it reads as superseded to other readers).
+  const withdrawAfter = (check, own) => {
+    const records = [...check.stranded ?? [], ...(check.hold && Array.isArray(check.comments) ? check.comments.filter(own) : [])];
+    if (!records.length) return { ...check.result, commentPosted: true };
+    try { return { ...check.result, commentPosted: true, withdrawn: withdrawRecords({ provider, repo, pr, records, writer }) }; }
+    catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}`, commentPosted: true }; }
+  };
+  const isRecordOf = (from, to) => (c) => { const r = restampRecord(c); return Boolean(r) && r.from === from && r.to === to; };
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
     const live = recheck(true);
-    if (!live.state) return live.result;
+    if (!live.state) return withdrawAfter(live, isRecordOf(plan.from, plan.to));
     try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: live.state.labels }); }
     catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
     settledRestamps.add(key);
@@ -481,9 +556,10 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (!before.state) return before.result;
   try { provider.postComment(repo, pr, body); }
   catch (e) { return { action: 'error', reason: errorReason(e) }; }
-  // The record is now on the thread; a hold posted after it still keeps review:pending.
+  // The record is now on the thread; a hold posted after it still keeps review:pending, and any hold found now
+  // (including one that landed between the check above and the post) withdraws the record.
   const after = recheck(true);
-  if (!after.state) return { ...after.result, commentPosted: true };
+  if (!after.state) return withdrawAfter(after, (c) => typeof c?.body === 'string' && c.body.trimEnd() === body.trimEnd());
   try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: after.state.labels }); }
   catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
   settledRestamps.add(key);

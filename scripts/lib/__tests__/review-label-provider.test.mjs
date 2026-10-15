@@ -152,6 +152,31 @@ describe('the gh adapter', () => {
     expect(removed).toEqual([wrote[0].path]);
   });
 
+  it('edits a comment by node id with the body from a file, and removes the file after', () => {
+    const wrote = [];
+    const removed = [];
+    let seenArgv = null;
+    const p = createGhProvider({
+      exec: (argv) => { seenArgv = argv; return ''; },
+      writeFile: (path, body) => wrote.push({ path, body }),
+      removeFile: (path) => removed.push(path),
+      tmpDir: '/tmpdir',
+    });
+    p.editComment('o/n', 'IC_kwDO-c8_x', '🚫 withdrawn\n\nbody', { pr: 7 });
+    expect(seenArgv).toEqual(GH_ARGV.editComment('IC_kwDO-c8_x', wrote[0].path));
+    expect(seenArgv.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(seenArgv).toContain('id=IC_kwDO-c8_x');
+    expect(seenArgv).toContain(`body=@${wrote[0].path}`);
+    expect(wrote[0].body).toBe('🚫 withdrawn\n\nbody');
+    expect(removed).toEqual([wrote[0].path]);
+    expect(seenArgv.join(' ')).toContain('updateIssueComment');
+  });
+
+  it.each([undefined, '', '12345', '-f', 'IC_x y', 'IC_x\nquery=…'])('refuses an edit without a comment node id: %j', (id) => {
+    const p = createGhProvider({ exec: () => { throw new Error('unexpected exec'); } });
+    expect(() => p.editComment('o/n', id, 'x')).toThrow(/invalid comment node id/);
+  });
+
   // A failed post must not leave the body behind — it can be large, and it is the adapter's litter.
   it('still removes the temp file when the post THROWS', () => {
     const removed = [];

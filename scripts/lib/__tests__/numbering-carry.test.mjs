@@ -10,7 +10,7 @@ import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
   MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
-  planNumberingRestamp, buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo,
+  planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering, _resetNumberingRestampMemo,
 } from '../numbering-carry.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -518,6 +518,22 @@ describe('numbering acceptance restamp', () => {
     return { calls, provider: { postComment: (_r, _n, body) => calls.push(body), setLabels: (_r, _n, spec) => calls.push(spec) } };
   };
   describe('a hold that arrives while the proof runs (red team #5233)', () => {
+    const ok = () => ({ ok: true, reason: 'verified' });
+    // A live thread with comment node ids: every post and edit lands on it, and every re-read copies it.
+    const liveThread = (base = liveComments()) => {
+      const thread = base.map((c, i) => ({ ...c, id: `IC_live${i}` }));
+      const calls = [];
+      let n = 0;
+      const provider = {
+        postComment: (_r, _n, body) => { calls.push(body); thread.push({ author: { login: 'chalbert' }, body, id: `IC_posted${n++}` }); },
+        editComment: (_r, id, body) => { calls.push({ edit: id, body }); thread.find((c) => c.id === id).body = body; },
+        setLabels: (_r, _n, spec) => calls.push(spec),
+      };
+      const readLiveState = () => ({ state: { labels: ['review:pending'], headRefOid: TO, comments: thread.map((c) => ({ ...c })) }, reviews: [] });
+      const step = (over = {}) => restampAfterNumbering({ repo: 'o/n', pr: 5025, state: readLiveState().state, reviews: [],
+        provider, readLiveState, prove: ok, ...over });
+      return { thread, calls, provider, readLiveState, step };
+    };
     const liveRead = (patch) => () => {
       const read = { state: { labels: ['review:pending'], headRefOid: TO, comments: liveComments() }, reviews: [] };
       patch(read);
@@ -572,25 +588,23 @@ describe('numbering acceptance restamp', () => {
       if (human) expect(calls[0]).toContain(`cleared-human: ${/cleared-human: (\S+)/.exec(record.body)[1]}`);
       else expect(calls[0]).not.toContain('cleared-human:');
     });
-    it('a plain acceptance landing just before our record keeps pending, and the next pass supersedes our record', async () => {
+    it('a plain acceptance landing just before our record keeps pending, withdraws our record, and the next pass carries the plain one', async () => {
       const { parseLatestHumanClearedSha } = await import('../review-escalation.mjs');
-      const { calls, provider } = recording();
-      const comments = liveComments();
+      const { thread, calls, provider, step } = liveThread();
       // The acceptance lands after the pre-write re-read but before our comment is posted.
-      const racing = { postComment: (r, n, body) => { if (!calls.length) comments.push(newer(null)); provider.postComment(r, n, body); },
-        setLabels: provider.setLabels };
-      const state = { labels: ['review:pending'], headRefOid: TO, comments };
-      expect(run({ provider: racing, state, prove: () => ({ ok: true, reason: 'verified' }) }))
-        .toMatchObject({ action: 'retry', commentPosted: true });
-      expect(calls).toHaveLength(1);
+      const post = provider.postComment;
+      provider.postComment = (r, n, body) => { if (!calls.length) thread.push(newer(null)); post(r, n, body); };
+      expect(step()).toMatchObject({ action: 'retry', commentPosted: true, withdrawn: 1 });
+      expect(calls).toHaveLength(2);
       expect(calls[0]).toContain('cleared-human:');
-      const thread = [...comments, { author: { login: 'chalbert' }, body: calls[0] }];
-      const next = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments: thread },
-        prove: () => ({ ok: true, reason: 'verified' }) });
-      expect(next).toMatchObject({ action: 'restamped', human: false });
-      expect(calls).toHaveLength(3);
-      expect(calls[1]).not.toContain('cleared-human:');
-      expect(parseLatestHumanClearedSha([...thread, { author: { login: 'chalbert' }, body: calls[1] }])).toBeNull();
+      expect(calls[1]).toMatchObject({ edit: 'IC_posted0' });
+      // The withdrawn record no longer clears the head; the newer plain acceptance stands.
+      expect(parseLatestHumanClearedSha(thread)).toBeNull();
+      provider.postComment = post;
+      expect(step()).toMatchObject({ action: 'restamped', human: false });
+      expect(calls).toHaveLength(4);
+      expect(calls[2]).not.toContain('cleared-human:');
+      expect(parseLatestHumanClearedSha(thread)).toBeNull();
     });
     it('a labels-only recovery refuses a record whose carried acceptance was superseded before it', () => {
       const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
@@ -658,28 +672,107 @@ describe('numbering acceptance restamp', () => {
         .toMatchObject({ action: 'retry', reason: 'mandatory referral hold: unresolved' });
       expect(calls).toEqual([]);
     });
-    it('keeps pending when the objection lands between the record and the label write', () => {
-      const { calls, provider } = recording();
-      let reads = 0;
-      const readLiveState = () => {
-        const comments = [...liveComments(), ...calls.filter((c) => typeof c === 'string').map((body) => ({ author: { login: 'chalbert' }, body }))];
-        if (++reads > 1) comments.push(objection);
-        return { state: { labels: ['review:pending'], headRefOid: TO, comments }, reviews: [] };
-      };
-      expect(run({ provider, readLiveState, prove: () => ({ ok: true, reason: 'verified' }) }))
-        .toMatchObject({ action: 'held', commentPosted: true });
-      expect(calls).toHaveLength(1);
+    it('keeps pending and withdraws our record when the objection lands between the record and the label write', () => {
+      const { thread, calls, provider, step } = liveThread();
+      const post = provider.postComment;
+      provider.postComment = (r, n, body) => { post(r, n, body); thread.push({ ...objection, id: 'IC_objection' }); };
+      expect(step()).toMatchObject({ action: 'held', commentPosted: true, withdrawn: 1 });
+      expect(calls).toHaveLength(2);
       expect(typeof calls[0]).toBe('string');
+      expect(calls[1]).toMatchObject({ edit: 'IC_posted0' });
     });
-    it('a labels-only recovery re-reads before removing pending', () => {
+    it('a labels-only recovery re-reads before removing pending, and withdraws the record a hold now stands on', () => {
       const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
-      const comments = [...liveComments(), { author: { login: 'chalbert' }, body }];
-      const { calls, provider } = recording();
-      const r = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments },
-        readLiveState: () => ({ state: { labels: ['review:pending'], headRefOid: TO, comments: [...comments, objection] }, reviews: [] }),
-        prove: () => { throw Error('no proof is owed for a recorded re-stamp'); } });
-      expect(r).toMatchObject({ action: 'held' });
-      expect(calls).toEqual([]);
+      const { thread, calls, readLiveState, step } = liveThread([...liveComments(), { author: { login: 'chalbert' }, body }]);
+      const { state } = readLiveState();
+      thread.push({ ...objection, id: 'IC_objection' });
+      const r = step({ state, prove: () => { throw Error('no proof is owed for a recorded re-stamp'); } });
+      expect(r).toMatchObject({ action: 'held', withdrawn: 1 });
+      expect(calls).toEqual([{ edit: 'IC_live5', body: thread[5].body }]);
+      expect(thread[5].body).toContain('numbering-restamp-withdrawn:');
+    });
+    // Operator block (#5233, head 8265716f7): a hold in the window between the pre-write check and the post sits BEFORE
+    // our record, so every reader but the numbering planner would read the record as an acceptance on the head.
+    describe('a hold landing between the pre-write check and the post (operator block #5233)', () => {
+      const readers = async (thread) => {
+        const { latestAcceptRecord } = await import('../accept-carry-forward.mjs');
+        const { latestHumanClearance } = await import('../human-clearance-carry.mjs');
+        const { readDrainAcceptance, reconcileDrainReviewPending } = await import('../../merge-ai-prs.mjs');
+        const exec = () => JSON.stringify({ headRefOid: TO, headRefName: 'lane/numbering', comments: thread });
+        const spawned = [];
+        const reconcile = reconcileDrainReviewPending({ currentLabels: ['review:pending', 'review:accepted'], pr: 5025, repo: 'o/n',
+          exec, readReviews: () => [] }, { spawn: (o) => { spawned.push(o); return { ok: true }; } });
+        return { record: latestAcceptRecord(thread), clearance: latestHumanClearance(thread),
+          drain: readDrainAcceptance({ pr: 5025, repo: 'o/n', exec, readReviews: () => [] }), reconcile, spawned };
+      };
+      it.each([
+        ['an operator objection', (thread) => thread.push({ ...objection, id: 'IC_objection' })],
+        ['a newer plain acceptance', (thread) => thread.push({ author: { login: 'chalbert' }, createdAt: '2026-10-13T10:00:00Z', id: 'IC_newer',
+          body: `✅ review — accepted\n<!-- reviewed-sha: ${FROM} -->` })],
+      ])('withdraws our record so no acceptance reader honours it: %s', async (_name, land) => {
+        const { thread, calls, provider, step } = liveThread();
+        const post = provider.postComment;
+        provider.postComment = (r, n, body) => { if (!calls.length) land(thread); post(r, n, body); };
+        const r = step();
+        expect(r).toMatchObject({ commentPosted: true, withdrawn: 1 });
+        expect(['held', 'retry']).toContain(r.action);
+        expect(calls.filter((c) => c?.remove)).toEqual([]);
+        const withdrawn = thread.find((c) => c.id === 'IC_posted0');
+        expect(calls[1]).toEqual({ edit: 'IC_posted0', body: withdrawn.body });
+        expect(withdrawn.body).toContain('<!-- numbering-restamp-withdrawn:');
+        expect(withdrawn.body).not.toMatch(/reviewed-sha:|reviewed-diff:|reviewed-contribution:|cleared-human:/);
+        const seen = await readers(thread);
+        expect(seen.record.sha).toBe(FROM);
+        expect(seen.clearance?.sha ?? null).not.toBe(TO);
+        expect(seen.drain.acceptedSha).toBe(FROM);
+        expect(seen.drain.humanClearedSha ?? null).not.toBe(TO);
+        expect(seen.reconcile).toMatchObject({ ok: false });
+        expect(seen.spawned).toEqual([]);
+      });
+      it('the objection case stays held on the next pass, with nothing more to write', () => {
+        const { thread, calls, provider, step } = liveThread();
+        const post = provider.postComment;
+        provider.postComment = (r, n, body) => { if (!calls.length) thread.push({ ...objection, id: 'IC_objection' }); post(r, n, body); };
+        step();
+        _resetNumberingRestampMemo();
+        expect(step()).toBeNull();
+        expect(calls).toHaveLength(2);
+      });
+      it('a record stranded by an earlier pass (its withdrawal never landed) is withdrawn by the next pass', async () => {
+        const { thread, calls, step } = liveThread();
+        thread.push({ ...objection, id: 'IC_objection' });
+        const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
+        thread.push({ author: { login: 'chalbert' }, body, id: 'IC_stranded' });
+        expect((await readers(thread)).drain.acceptedSha).toBe(TO);
+        expect(step({ dryRun: true })).toMatchObject({ action: 'would-withdraw' });
+        expect(calls).toEqual([]);
+        expect(step({ prove: () => { throw Error('no proof is owed for a withdrawal'); } })).toMatchObject({ action: 'withdrawn', withdrawn: 1 });
+        expect(calls).toEqual([{ edit: 'IC_stranded', body: thread[thread.length - 1].body }]);
+        const seen = await readers(thread);
+        expect(seen.drain.acceptedSha).toBe(FROM);
+        expect(seen.spawned).toEqual([]);
+        expect(step()).toBeNull();
+      });
+      it('a failed withdrawal is an error the next pass retries, never a settled head', () => {
+        const { thread, calls, provider, step } = liveThread();
+        thread.push({ ...objection, id: 'IC_objection' });
+        thread.push({ author: { login: 'chalbert' }, id: 'IC_stranded',
+          body: buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' }) });
+        const edit = provider.editComment;
+        provider.editComment = () => { throw Error('offline'); };
+        expect(step()).toMatchObject({ action: 'error', reason: 'withdrawal failed: offline' });
+        provider.editComment = edit;
+        expect(step()).toMatchObject({ action: 'withdrawn', withdrawn: 1 });
+        expect(calls).toHaveLength(1);
+      });
+      it('a forged withdrawal notice carrying an objection still holds', () => {
+        const { thread } = liveThread();
+        const notice = buildNumberingWithdrawnBody({ fromSha: FROM, toSha: TO, writer: 'review-daemon' });
+        expect(planAt(TO, [...thread, { author: { login: 'chalbert' }, body: notice }]).candidate).toBe(true);
+        const forged = notice.replace('\n\n', '\n\nDo not land this.\n\n');
+        expect(planAt(TO, [...thread, { author: { login: 'chalbert' }, body: forged }]))
+          .toMatchObject({ candidate: false, reason: 'later verdict or unknown comment stands' });
+      });
     });
   });
   it('retries a transient proof read failure on the same head', () => {
