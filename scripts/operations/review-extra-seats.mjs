@@ -1665,9 +1665,12 @@ if (IS_CLI) {
       return r.stdout;
     };
     const pr = Number(flag('pr'));
-    const view = JSON.parse(ghRead(['pr', 'view', String(pr), `--repo=${flag('repo')}`, '--json', 'title,body,headRefOid,files,comments']));
+    const view = JSON.parse(ghRead(['pr', 'view', String(pr), `--repo=${flag('repo')}`, '--json', 'title,body,headRefOid,files']));
     const diffText = ghRead(['pr', 'diff', String(pr), `--repo=${flag('repo')}`]);
-    runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view, diffText }), post: false, record: false })
+    // Card 341: the open operator send-backs come from the COMPLETE thread (the shared reader), never a truncated view.
+    import('../conveyor/pr-comments-complete.mjs')
+      .then(({ readCompletePrComments }) => readCompletePrComments(pr, { repo: flag('repo') }))
+      .then((comments) => runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view: { ...view, comments }, diffText }), post: false, record: false }))
       .then((result) => emit(result, renderRedTeamSummary));
   } else {
     process.stderr.write('usage: review-extra-seats.mjs run|red-team --pr=<n> --repo=<owner/repo> --lane=<path> --loop-json=<file> [--no-post]\n'
