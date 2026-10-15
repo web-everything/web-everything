@@ -1,6 +1,7 @@
 import { it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { URL } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scanUnauthenticatedCommentMarkerParsers } from '../check-standards-rules.mjs';
 
 it('requires shared authorship for inline comment-marker parsers, accepting aliased gates', () => {
@@ -61,6 +62,6 @@ it.each([
 
 it('accepts the live review ceremony parser with its compound author and body guard', () => {
   const file = 'scripts/review-set-label.mjs';
-  const content = readFileSync(new URL('../review-set-label.mjs', import.meta.url), 'utf8');
+  const content = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../review-set-label.mjs'), 'utf8');
   expect(scanUnauthenticatedCommentMarkerParsers([{ file, content }])).toEqual([]);
 });
