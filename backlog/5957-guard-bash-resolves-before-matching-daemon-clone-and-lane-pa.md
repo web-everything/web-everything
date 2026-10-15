@@ -2,9 +2,11 @@
 bornAs: xj0teal
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
@@ -19,6 +21,8 @@ Held finding 248: a leading cd written with home shorthand must identify the sam
 - Rechecked at 37d55ee65. Original scope named only `we:scripts/guard-bash.mjs` and asked to expand tilde and HOME before matching paths. The defect remains: `we:scripts/guard-bash.mjs:2469` strips quotes, recognizes only whole-variable targets backed by command-local assignments, then resolves a tilde literally against the reported cwd. HOME with a suffix falls back to reported cwd. The CLI uses this result before both daemon-root and lane-lease classification at `we:scripts/guard-bash.mjs:4348`.
 - Corrected scope includes `we:scripts/__tests__/guard-bash.test.mjs`. Its daemon CLI harness at `we:scripts/__tests__/guard-bash.test.mjs:3421` already provides temporary registry roots and subprocess hook invocation. Keep this task on leading-cd resolution and downstream classification; direct git -C and arbitrary file operands are separate parser surfaces (`we:scripts/guard-bash.mjs:1863`, `we:scripts/guard-bash.mjs:1938`).
 - Increase size 1 to size 2: approximately 55 source lines for quote-aware, injectable home expansion and 100 test lines for resolver plus hook cases. Evidence: quote removal currently precedes expansion at `we:scripts/guard-bash.mjs:2470`, so blind string replacement would incorrectly expand quoted tilde and single-quoted HOME. The existing hook harness keeps proof within the same test file.
+
+- Built 2026-10-15: `resolveEffectiveCwd` now expands the leading-cd target quote-aware (`expandCdTarget`), takes an injectable `home` (default `process.env.HOME`, `null` = unset), walks assignments in command order (an assignment after the cd no longer applies) and treats a `HOME=` it cannot evaluate as unknown. Pure resolver cases plus real-hook daemon-clone cases (deny `git checkout --detach`, allow `git status`, quoted/single-quoted/unset controls) added to the guard test file.
 
 ## Design
 

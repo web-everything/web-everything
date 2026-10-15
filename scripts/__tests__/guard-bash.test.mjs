@@ -501,6 +501,119 @@ describe('guard-bash — resolveEffectiveCwd honours a leading `cd` (#2335)', ()
   });
 });
 
+describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading `cd` (#5957)', () => {
+  const REPORTED = '/ws/webeverything';
+  const HOME = '/home/dev';
+  const SPACED = '/home/dev with space';
+  const at = (cmd, home = HOME) => resolveEffectiveCwd(cmd, REPORTED, undefined, home);
+
+  it('bare tilde, tilde-slash, $HOME and ${HOME} reach the same path as the absolute spelling', () => {
+    expect(at('cd ~ && ls')).toBe(HOME);
+    expect(at('cd ~/clone && ls')).toBe(at(`cd ${HOME}/clone && ls`));
+    expect(at('cd $HOME/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd ${HOME}/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "${HOME}/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME" && ls')).toBe(HOME);
+  });
+  it('keeps a trailing slash and dot segments exactly as the absolute spelling would', () => {
+    expect(at('cd ~/clone/ && ls')).toBe(at(`cd ${HOME}/clone/ && ls`));
+    expect(at('cd ~/a/../clone && ls')).toBe(at(`cd ${HOME}/a/../clone && ls`));
+    expect(at('cd "$HOME/./clone" && ls')).toBe(at(`cd ${HOME}/./clone && ls`));
+  });
+  it('a home path containing spaces survives double quotes, and is unresolved when left unquoted', () => {
+    expect(at('cd "$HOME/clone" && ls', SPACED)).toBe(`${SPACED}/clone`);
+    expect(at('cd "${HOME}" && ls', SPACED)).toBe(SPACED);
+    expect(at('cd ~/clone && ls', SPACED)).toBe(`${SPACED}/clone`);
+    // unquoted $HOME word-splits in a real shell, so `cd` would fail — never a fabricated target
+    expect(at('cd $HOME/clone && ls', SPACED)).toBe(REPORTED);
+  });
+  it('cd options (`-P`, `-L`, `-e`, `--`) are skipped, so an option never becomes the target', () => {
+    expect(at('cd -P ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -- ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -L -- "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -e ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -@ ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -P /abs/clone && ls')).toBe('/abs/clone');
+    expect(at('cd - && ls')).toBe(REPORTED);
+    expect(at('cd -P && ls')).toBe(REPORTED);
+  });
+  it('quoted tilde and single-quoted HOME are literal shell text, not home aliases', () => {
+    expect(at('cd "~/clone" && ls')).toBe(`${REPORTED}/~/clone`);
+    expect(at("cd '~' && ls")).toBe(`${REPORTED}/~`);
+    expect(at("cd '$HOME/clone' && ls")).toBe(`${REPORTED}/$HOME/clone`);
+    expect(at('cd \\~/clone && ls')).toBe(`${REPORTED}/~/clone`);
+  });
+  it('unsupported spellings keep the reported cwd and never become a home target', () => {
+    expect(at('cd ~someone/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$UNKNOWN/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "$(echo ~)/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "`echo $HOME`" && ls')).toBe(REPORTED);
+    expect(at('cd ${HOME:-/x}/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$HOME/*" && ls')).toBe(`${HOME}/*`);
+    expect(at('cd $HOME/* && ls')).toBe(REPORTED);
+  });
+  it('a missing or non-absolute HOME fabricates nothing', () => {
+    expect(at('cd ~/clone && ls', null)).toBe(REPORTED);
+    expect(at('cd "$HOME" && ls', null)).toBe(REPORTED);
+    expect(at('cd ~ && ls', '')).toBe(REPORTED);
+    expect(at('cd ~ && ls', 'relative/home')).toBe(REPORTED);
+  });
+  it('honours a literal command-local HOME assignment, in command order only', () => {
+    expect(at('HOME=/other; cd ~/clone && ls')).toBe('/other/clone');
+    expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
+    expect(at('HOME="/other dir"; cd "$HOME" && ls')).toBe('/other dir');
+    // an assignment AFTER the cd must not retroactively change it
+    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
+    // an assignment we cannot evaluate makes HOME unknown rather than silently keeping the old one
+    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME=~/x; cd ~/clone')).toBe(REPORTED);
+    expect(at('unset HOME; cd ~/clone')).toBe(REPORTED);
+  });
+  it('NEW in #5957: any variable assigned after the cd no longer resolves it (assignments apply in command order)', () => {
+    const LANE = '/ws/.lanes/web-everything/lane-5';
+    expect(at(`cd "$LANE"; LANE=${LANE}`)).toBe(REPORTED);
+  });
+  it('an unevaluable reassignment or unset of any variable makes it unknown, never its earlier value', () => {
+    expect(at('LANE=/a; LANE=$(foo); cd "$LANE/x"')).toBe(REPORTED);
+    expect(at('LANE=/a; unset LANE; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE=/a; LANE=/b; cd "$LANE/x"')).toBe('/b/x');
+    // statements that rebind a variable in ways the walk does not model make every name they mention unknown
+    expect(at('LANE=/a; unset A LANE; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE=/a; read LANE; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE=/a; declare LANE=/b; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE=/a; LANE+=/b; cd "$LANE"')).toBe(REPORTED);
+    for (const stmt of ['readonly LANE', 'let LANE=2', 'typeset LANE=/b', 'printf -v LANE %s /b', 'mapfile LANE', 'readarray LANE', 'getopts ab LANE']) {
+      expect(at(`LANE=/a; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    expect(at('unset -v HOME; cd ~/x')).toBe(REPORTED);
+    expect(at('local HOME=/x; cd ~/x')).toBe(REPORTED);
+    // an unquoted `~` in ANY assignment is expanded by the shell, so it is unknown here; a quoted one is literal
+    expect(at('LANE=~/clone; cd "$LANE"')).toBe(REPORTED);
+    expect(at('LANE="~/clone"; cd "$LANE"')).toBe(`${REPORTED}/~/clone`);
+  });
+  it('heredoc body text never steers the resolution', () => {
+    const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
+    expect(at(cmd)).toBe(REPORTED);
+  });
+  it('pins the existing literal lane-variable behaviour', () => {
+    const LANE = '/ws/.lanes/web-everything/lane-5';
+    expect(at(`LANE=${LANE}; cd "$LANE" && ls`)).toBe(LANE);
+    expect(at(`LANE=${LANE}; cd \${LANE} && ls`)).toBe(LANE);
+    expect(at('cd relative/dir && ls')).toBe(`${REPORTED}/relative/dir`);
+    expect(at('cd "/abs with space/x" && ls')).toBe('/abs with space/x');
+  });
+  it('a home-spelled cd lands in the same lane root and ownership classification as the absolute spelling', () => {
+    const LANE_HOME = '/home/dev/.lanes/web-everything/lane-9';
+    const viaHome = at('cd ~/.lanes/web-everything/lane-9/scripts && ls');
+    const viaAbs = at(`cd ${LANE_HOME}/scripts && ls`);
+    expect(viaHome).toBe(viaAbs);
+    expect(isLaneCwd(viaHome)).toBe(true);
+    expect(laneRootFromCwd(viaHome)).toBe(laneRootFromCwd(viaAbs));
+    expect(laneRootFromCwd(viaHome)).toBe(LANE_HOME);
+  });
+});
+
 describe('guard-bash — foreign-live-lease destructive-op block (#2367)', () => {
   it('laneRootFromCwd: extracts the lane ROOT from cwd at or under it; null off a lane', () => {
     expect(laneRootFromCwd('/ws/.lanes/web-everything/lane-8')).toBe('/ws/.lanes/web-everything/lane-8');
@@ -3432,10 +3545,10 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   // The house idiom (see the #3311 CLI-boundary block above): vitest rewrites `import.meta.url` to a
   // non-file base, so `new URL(…, import.meta.url)` + `fileURLToPath` is NOT used here.
   const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
-  const runHook = (command, cwd) => {
+  const runHook = (command, cwd, home) => {
     const res = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir },
+      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home ? { HOME: home } : {}) },
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
@@ -3460,6 +3573,45 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+
+  // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
+  // HOME is the temp `root` here, so `~/some-new-daemon-clone` IS the registered clone. The command strings
+  // are inert: the hook only inspects them, it never runs the proposed checkout.
+  describe('home-spelled leading cd (#5957)', () => {
+    const denies = (cmd) => {
+      const out = runHook(cmd, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    };
+    it('the absolute spelling is denied (baseline)', () => {
+      denies(`cd ${fakeClone} && git checkout --detach`);
+    });
+    it.each([
+      ['tilde', 'cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['$HOME', 'cd $HOME/some-new-daemon-clone && git checkout --detach'],
+      ['${HOME}', 'cd ${HOME}/some-new-daemon-clone && git checkout --detach'],
+      ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
+      ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
+      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
+    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+    it('keeps the read-only control allowed', () => {
+      expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
+    });
+    it('does not treat a quoted tilde or single-quoted HOME as the home path', () => {
+      expect(runHook('cd "~/some-new-daemon-clone" && git checkout --detach', lane, root)).toBeNull();
+      expect(runHook("cd '$HOME/some-new-daemon-clone' && git checkout --detach", lane, root)).toBeNull();
+    });
+    it('fabricates no home target when HOME is unset', () => {
+      const res = execFileSync(process.execPath, [GUARD], {
+        input: JSON.stringify({ tool_input: { command: 'cd ~/some-new-daemon-clone && git checkout --detach' }, cwd: lane }),
+        env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, HOME: '' },
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'ignore'],
+      }).trim();
+      // unresolved target → reported cwd (the lane) → the clone is never reached → nothing to deny
+      expect(res).toBe('');
+    });
   });
 });
 

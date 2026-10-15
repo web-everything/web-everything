@@ -2432,6 +2432,74 @@ export function hasDestructiveLaneOp(command) {
   return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
 }
 
+// #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
+// double-quoted forms) lands on the SAME path as its absolute spelling and so reaches the same daemon-clone /
+// lane-lease guards. Quoting is kept until expansion is done: a quoted `~` and a single-quoted `$HOME` are
+// literal text, exactly as in a shell. The home source is the hook process's own HOME (`home`; `null` = unset),
+// overridden in command order by a literal `HOME=/abs` assignment. Nothing is ever executed or looked up: an
+// unset/relative HOME, `~user`, an unknown variable, a substitution or an unquoted glob stays unresolved.
+function expandCdTarget(rest, vars, home) {
+  const s = String(rest);
+  const variable = (at) => {
+    const m = s.slice(at).match(/^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/);
+    if (!m) return null;
+    const name = m[1] ?? m[2];
+    const value = name === 'HOME' ? home : vars[name];
+    return typeof value === 'string' && value ? { value, end: at + m[0].length - 1 } : null;
+  };
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
+    if (ch === "'") {                                                      // single quotes: all literal
+      const close = s.indexOf("'", i + 1);
+      if (close < 0) return null;
+      out += s.slice(i + 1, close);
+      i = close;
+    } else if (ch === '"') {                                               // double quotes: only $VAR and \ escapes
+      for (i += 1; s[i] !== '"'; i++) {
+        if (i >= s.length || s[i] === '`') return null;
+        if (s[i] === '\\' && '$`"\\'.includes(s[i + 1] ?? '')) { out += s[++i]; continue; }
+        if (s[i] !== '$') { out += s[i]; continue; }
+        const v = variable(i);
+        if (!v) return null;
+        out += v.value;
+        i = v.end;
+      }
+    } else if (ch === '\\') {
+      if (i + 1 >= s.length) return null;
+      out += s[++i];
+    } else if (ch === '$') {                                               // unquoted: must not word-split or glob
+      const v = variable(i);
+      if (!v || /[\s*?]/.test(v.value)) return null;
+      out += v.value;
+      i = v.end;
+    } else if (ch === '~' && i === 0) {                                    // only `~` / `~/…` — never `~user`, `~+`
+      if (!/^(?:\/|$|\s|[<>])/.test(s.slice(1)) || !home) return null;
+      out += home;
+    } else if (ch === '`' || ch === '*' || ch === '?') {
+      return null;
+    } else {
+      out += ch;
+    }
+  }
+  return out || null;
+}
+
+// A literal command-local assignment value we can evaluate without a shell: bare (no whitespace, no leading
+// `~` the shell would expand) or wrapped in ONE matching pair of quotes, with no substitution, escape or inner
+// quote. null = unevaluable: the variable becomes unknown rather than silently keeping its previous value.
+function literalValue(raw) {
+  const quoted = /^(['"])(.*)\1$/.exec(raw);
+  const val = quoted ? quoted[2] : raw;
+  if (!val || /[`$(\\'"]/.test(val)) return null;
+  return quoted || !/^~|\s/.test(val) ? val : null;
+}
+
+// Statements that (re)bind or unbind variables in ways this walk does not model: every name they mention
+// becomes unknown instead of keeping a stale literal.
+const BINDING_STATEMENT = /^(?:unset|read|declare|local|typeset|readonly|let|printf|mapfile|readarray|getopts)\s/;
+
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
 // standard lane invocation `cd <lane> && node …/backlog.mjs claim` reports cwd=primary and gets misclassified
 // as a primary mutation (denied) AND makes the #2323 git call run in the primary (a false "behind" count).
@@ -2443,7 +2511,8 @@ export function hasDestructiveLaneOp(command) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve) {
+// #5957 — `home` is the shell's home source (see `expandCdTarget`); `null` means unset.
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -2452,25 +2521,30 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve)
   if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
-  // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
+  // Walk the statements in command order: simple literal `VAR=value` / `export VAR=value` assignments (no
+  // command-subst/globs) feed the variable table, and the FIRST `cd <target>` statement wins (that is where the
+  // command lands before the mutation runs). An assignment after the cd never changes it (#5957).
   const vars = Object.create(null);
+  let homeCtx = typeof home === 'string' && home.startsWith('/') ? home : null; // unset/relative → no home
   for (const stmt of parsed.segments) {
-    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
-    if (!m) continue;
-    let val = m[2].trim();
-    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
-    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
-    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
-  }
-  // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
-  for (const stmt of parsed.segments) {
-    const cd = stmt.trim().match(/^cd\s+(.+)$/);
+    const t = stmt.trim();
+    const forget = (name) => { if (name === 'HOME') homeCtx = null; else delete vars[name]; };
+    if (BINDING_STATEMENT.test(t)) { for (const n of t.matchAll(/(?<![\w$])([A-Za-z_]\w*)(?=\+?=|\s|$)/g)) forget(n[1]); continue; }
+    const m = t.match(/^(?:export\s+)?([A-Za-z_]\w*)(\+?)=(.*)$/);
+    if (m) {
+      const [, name, append, raw] = m;
+      const val = append ? null : literalValue(raw.trim());
+      if (name === 'HOME') homeCtx = val?.startsWith('/') ? val : null;
+      else if (val !== null && !/\s/.test(val)) vars[name] = val; // single-token literal only
+      else forget(name);
+      continue;
+    }
+    const cd = t.match(/^cd\s+(.+)$/);
     if (!cd) continue;
-    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
-    target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
-    const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-    if (v) target = vars[v[1]] ?? '';
-    if (!target || /[`$(*?]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
+    let rest = cd[1].trim();
+    for (let opt; (opt = rest.match(/^(?:--|-[PLe@]+)(?:\s+|$)/));) rest = rest.slice(opt[0].length); // `cd -P -- <dir>`
+    const target = expandCdTarget(rest, vars, homeCtx);
+    if (!target || target === '-') return reportedCwd;        // unresolved / globby / `cd -` / unsupported → fail safe
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
   return reportedCwd;
