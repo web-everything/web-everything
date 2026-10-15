@@ -9,6 +9,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd, resolveCdLandings,
+  guardCwdCandidates, decideAcrossCwds, MAX_GUARD_CWDS,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
   isVerificationRun, isBackgrounded, backgroundedVerificationReason, dispatchedAgentVerificationReason,
@@ -568,6 +569,33 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(lands('cd "$UNKNOWN" && cd clone')).toEqual([`${REPORTED}/clone`]);
     expect(lands('cd && cd clone', null)).toEqual([`${REPORTED}/clone`]);
     expect(lands('cd - && cd /abs/clone')).toEqual(['/abs/clone']);
+    // a cd in a subshell, a condition or a function body lands too, without moving or deciding the cwd
+    for (const cmd of [
+      '(cd /abs/clone && git reset --hard)', '( cd /abs/clone )', '(cd /abs/clone)', 'if cd /abs/clone; then ls; fi',
+      'while cd /abs/clone; do ls; done', 'f() { cd /abs/clone; }; f', 'function f { cd /abs/clone; }', 'if ! cd /abs/clone; then :; fi',
+    ]) {
+      expect(lands(cmd), cmd).toEqual(['/abs/clone']);
+      expect(at(cmd), cmd).toBe(REPORTED);
+    }
+    expect(lands('cd /tmp && (cd clone && ls)')).toEqual(['/tmp', '/tmp/clone']);
+    expect(at('cd /tmp && (cd clone && ls)')).toBe('/tmp');
+    expect(lands('(cd "$UNKNOWN") && ls')).toEqual([]);
+  });
+  it('the CLI judges a command in each protected landing: one deny is enough', () => {
+    const PRIMARY = '/ws/webeverything';
+    const cmd = `X=1 cd /tmp && cd ${PRIMARY} && node scripts/backlog.mjs claim 1`;
+    expect(resolveEffectiveCwd(cmd, REPORTED, undefined, HOME)).toBe('/tmp');
+    const isProtected = (d) => d === PRIMARY;
+    const dirs = guardCwdCandidates('/tmp', resolveCdLandings(cmd, REPORTED, undefined, HOME), isProtected);
+    expect(dirs).toEqual(['/tmp', PRIMARY]);
+    const hit = decideAcrossCwds(cmd, dirs.map((d) => ({ cwd: d, primaryCwd: isProtected(d) })));
+    expect(hit?.ctx.cwd).toBe(PRIMARY);
+    expect(decideAcrossCwds(cmd, [{ cwd: '/tmp', primaryCwd: false }])).toBeNull();
+    // unprotected landings are never judged, and past the cap the command is refused instead
+    expect(guardCwdCandidates('/a', ['/tmp', HOME, '/a'], () => false)).toEqual(['/a']);
+    const many = Array.from({ length: MAX_GUARD_CWDS }, (_, i) => `/p/${i}`);
+    expect(guardCwdCandidates('/a', many.slice(1), () => true)).toHaveLength(MAX_GUARD_CWDS);
+    expect(guardCwdCandidates('/a', many, () => true)).toBeNull();
   });
   it('cd options are recognised after quote removal and expansion, as bash sees them', () => {
     for (const cmd of [
@@ -3982,6 +4010,9 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['bare cd into a HOME set to the clone', `HOME=${fakeClone}; cd && git checkout --detach; cd /tmp`],
       ['prefixed cd into the clone', `FOO=1 cd ${fakeClone} && git checkout --detach; cd /bin`],
       ['relative cd after an unknown one', 'cd "$UNKNOWN_DIR" && cd ../some-new-daemon-clone && rm f'],
+      ['subshell cd', `(cd ${fakeClone} && git reset --hard)`],
+      ['subshell cd after a plain cd', `cd /tmp && (cd ${fakeClone} && git reset --hard)`],
+      ['condition cd', `if cd ${fakeClone}; then echo in; fi; git reset --hard`],
     ])('DENIES a write when an earlier cd lands in the clone: %s', (_n, cmd) => denies(cmd));
     it('keeps a read in the clone followed by a lane listing allowed', () => {
       expect(runHook(`cd ${fakeClone} && git status; cd ${lane} && ls`, lane, root)).toBeNull();
