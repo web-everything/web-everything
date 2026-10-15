@@ -1,0 +1,65 @@
+
+import { afterEach, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS } from '../lane-git-hardening.mjs';
+
+const dirs = [];
+afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
+function repo() {
+  const dir = mkdtempSync(join(tmpdir(), 'lane-scrub-'));
+  dirs.push(dir);
+  const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+  git(['init', '--quiet']);
+  return { dir, git };
+}
+it('removes unsafe remotes and aliases while preserving safe origin', () => {
+  const { dir, git } = repo();
+  git(['remote', 'add', 'origin', 'https://github.com/x/y.git']);
+  git(['remote', 'add', 'primary', join(tmpdir(), 'primary-checkout')]);
+  git(['config', 'alias.x', '!false']);
+  const log = vi.fn();
+  expect(scrubRiskyLaneConfig(dir, { log })).toEqual({ removed: ['remote.primary.url', 'alias.x'], kept: [] });
+  expect(git(['remote'])).toBe('origin\n');
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
+  expect(log).toHaveBeenCalledTimes(1);
+});
+it('keeps unsafe origin so the guard continues refusing it', () => {
+  const { dir, git } = repo();
+  git(['remote', 'add', 'origin', join(tmpdir(), 'origin-checkout')]);
+  expect(scrubRiskyLaneConfig(dir)).toEqual({ removed: [], kept: ['remote.origin.url'] });
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual(['remote.origin.url']);
+});
+it('unsets worktree keys in worktree scope', () => {
+  const { dir, git } = repo();
+  git(['config', 'extensions.worktreeConfig', 'true']);
+  git(['config', '--worktree', 'alias.x', '!false']);
+  expect(scrubRiskyLaneConfig(dir).removed).toEqual(['alias.x']);
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
+});
+it('reports runner errors without throwing', () => {
+  expect(scrubRiskyLaneConfig('unused', { run: () => { throw new Error('read failed'); } }).kept.join()).toContain('read failed');
+});
+
+it('falls back to removing the local remote section if remote remove fails', () => {
+  const { dir, git } = repo();
+  git(['remote', 'add', 'primary', join(tmpdir(), 'primary-checkout')]);
+  const run = vi.fn(args => {
+    if (args[0] === 'remote') throw new Error('remote removal failed');
+    return git(args);
+  });
+  expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: ['remote.primary.url'], kept: [] });
+  expect(run).toHaveBeenCalledWith(['config', '--local', '--remove-section', 'remote.primary'], expect.anything());
+  expect(git(['remote'])).toBe('');
+});
+it('reports failed unsets as kept', () => {
+  const { dir, git } = repo();
+  git(['config', 'alias.x', '!false']);
+  const run = args => {
+    if (args.includes('--unset-all')) throw new Error('write failed');
+    return git(args);
+  };
+  expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: [], kept: ['alias.x (write failed)'] });
+});
