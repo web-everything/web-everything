@@ -1947,8 +1947,8 @@ export function planReconcile({
   const ciHealCapSource = ciHealCap === ciHealCapArg ? 'caller' : ciHealBudget.capSource;
   // The heal budget a PR is charged against right now: heals since its last non-mechanical head (when the setting is
   // on), with the sources named so the log says where the cap and the reset rule came from.
-  // The shared calculation (`ciHealBudgetEvidence`, #5968) is the only place a heal is refunded; `onlyReason` is the
-  // CodeQL branch's own narrowing.
+  // Refunds come from the shared calculation (`ciHealBudgetEvidence`, #5968); `onlyReason` is the CodeQL branch's own
+  // narrowing.
   const healBudgetFor = (pr, { onlyReason = null } = {}) => {
     const evidence = ciHealBudgetEvidence(pr?.comments, { resetOnFixHead: ciHealBudget.resetOnFixHead, restore: ciHealBudgetRestore, onlyReason });
     return {

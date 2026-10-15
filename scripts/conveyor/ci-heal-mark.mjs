@@ -163,9 +163,9 @@ export function countChargeableCiHealComments(comments, { restore = true, onlyRe
 
 /**
  * we:scripts/conveyor/ci-heal-mark.mjs#CI_HEAL_ROUND_CAP — the durable CI-heal attempt cap `ci-red` binds on
- * (multi-repo slice 7). Mirrors `we:scripts/conveyor/tick-core.mjs#DEFAULT_CI_HEAL_RETRY_CAP` (3);
- * `reconcile-core.test.mjs` and `tick-core.test.mjs` each pin their own copy so a drift fails loud in CI.
- * Owned here (and re-exported by `reconcile-core.mjs`) so every budget reader shares one policy source (#5968).
+ * (multi-repo slice 7). Mirrors `we:scripts/conveyor/tick-core.mjs#DEFAULT_CI_HEAL_RETRY_CAP` (3), which stays its own
+ * copy; `tick-core.test.mjs` pins that copy so a drift fails loud in CI. Owned here (and re-exported by
+ * `reconcile-core.mjs`, which no longer holds a copy) so reconcile, tick and landing read one policy source (#5968).
  */
 export const CI_HEAL_ROUND_CAP = 3;
 
@@ -257,8 +257,8 @@ function healCommentsSince(comments, resetAt) {
 }
 
 /**
- * we:scripts/conveyor/ci-heal-mark.mjs#ciHealBudgetEvidence — the ONE budget calculation every reader shares
- * (reconcile, tick, landing; #5968). Stages, each counted with attempt-id dedupe: the heals (optionally narrowed to
+ * we:scripts/conveyor/ci-heal-mark.mjs#ciHealBudgetEvidence — the budget calculation reconcile, tick and landing
+ * share (#5968). `exhausted-retry.mjs` still carries its own reset filter until card x3o0ohn lands. Stages, each counted with attempt-id dedupe: the heals (optionally narrowed to
  * `onlyReason`; an unreadable reason stays charged) → minus those proven before the fix-head reset → minus those
  * inside an attributed-main window. Refunds are the DIFFERENCES between successive counts, so an attempt covered by
  * both the reset and a window is refunded once.
