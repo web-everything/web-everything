@@ -325,7 +325,8 @@ function validatedThread(comments) {
       if (!prior || prior.sha !== r.from || prior.laterBodyDerivedHold || !sameClearance(prior, r.rec)
         || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body))) continue;
       carried.set(c, { comment: view[prior.index], at: prior.at });
-      rootAt.set(c, rootAt.get(view[prior.index]) ?? prior.at);
+      // `has`, not `??`: an unknown (null) root time must stay unknown, which counts every formal review.
+      rootAt.set(c, rootAt.has(view[prior.index]) ? rootAt.get(view[prior.index]) : prior.at);
     }
     view.push(c);
   }
@@ -368,7 +369,7 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
   }
   if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
   // From the review that started the chain: a re-stamp re-dates the record without being a review.
-  if (laterReviewHold(reviews, rootAt.get(src) ?? rec.at)) return { candidate: false, reason: 'formal review hold stands' };
+  if (laterReviewHold(reviews, rootAt.has(src) ? rootAt.get(src) : rec.at)) return { candidate: false, reason: 'formal review hold stands' };
   // The acceptance comment this plan carries: a newer record on the same sha is a different acceptance.
   if (labelsOnly) {
     const { comment, at } = carried.get(src);

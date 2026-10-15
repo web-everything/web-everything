@@ -613,6 +613,12 @@ describe('numbering acceptance restamp', () => {
       expect(planAt(H2, comments)).toMatchObject({ candidate: true, from: TO, to: H2, human: true, actor: 'chalbert' });
       expect(planAt(H2, [...comments, record(TO, H2)])).toMatchObject({ candidate: true, labelsOnly: true, from: TO, to: H2 });
     });
+    it('a root acceptance with no time keeps every formal review counting through its records', () => {
+      const comments = [{ ...accept(), createdAt: undefined }, { ...record(), createdAt: '2026-10-14T00:00:00Z' }];
+      const reviews = [{ state: 'COMMENTED', submittedAt: '2026-10-13T00:00:00Z' }];
+      expect(planNumberingRestamp({ labels: ['review:pending'], headSha: TO, comments, reviews }))
+        .toMatchObject({ candidate: false, reason: 'formal review hold stands' });
+    });
     it.each([
       ['a quoted record', (b) => `🧭 advisory note — changes\n\n${b.split('\n').map((l) => `> ${l}`).join('\n')}`],
       ['markers under another headline', (b) => `🧭 advisory note — changes\n${b.split('\n').slice(1).join('\n')}`],
