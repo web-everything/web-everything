@@ -129,7 +129,7 @@ export const GH_ARGV = Object.freeze({
   // caller (`review-set-label.mjs`) already goes out of its way NOT to pull in transitively (per that same
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
-  readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[].filename'],
+  readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[] | .filename, (.previous_filename // empty)'],
   // The PR's formal reviews (PR #4631 round 3): `gh pr view --json comments` never returns them, so a "Request changes"
   // review was invisible to the carry rule. A dedicated paginated read (not a `readPrState` field, which would change
   // that argv for every caller and cannot be shown to page); one JSON object per line so `--paginate` pages
@@ -216,7 +216,7 @@ export function createGhProvider({
       return exec(GH_ARGV.currentRepo(), { maxBuffer: 4 * 1024 * 1024 }).trim();
     },
 
-    /** The PR's changed files, net versus its base — real pagination applied, no cap. Read-only; see
+    /** The PR's changed files, including both rename paths — real pagination up to GitHub's API cap. Read-only; see
      *  {@link GH_ARGV.readPrFiles} for why `--method GET` cannot be dropped. */
     readPrFiles(repo, pr) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
