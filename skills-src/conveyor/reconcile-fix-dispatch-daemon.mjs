@@ -69,6 +69,8 @@ import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
+import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
@@ -786,9 +788,11 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
+  const chain = resolveFixExecutorChain();
   const fixSettings = resolveFixSettings();
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
-    setting: executorSetting, fixSettings, launcherAvailable: fixLauncherAvailable('codex'),
+    setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
+    criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
   });
   const routedCiHealTick = (options) => {
     let entries = [];

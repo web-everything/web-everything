@@ -1,0 +1,441 @@
+{
+ "$comment": "card 303: main red and green merge-group evidence on 2026-10-14 at 06:25Z",
+ "source": "gh run list / actions API, recorded 2026-10-14 ~08:30 ET; main runs as of 06:30Z (tip run 38517780758 = its attempt 1)",
+ "mainRuns": [
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T05:39:12Z",
+   "databaseId": 38517780758,
+   "event": "push",
+   "headSha": "28a7885f13a2b484c774da401bacb1883a020c89",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:08:57Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "failure",
+   "createdAt": "2026-10-14T05:38:01Z",
+   "databaseId": 38517676708,
+   "event": "push",
+   "headSha": "62da75ed373e53e83bd5874ab0307a6a0c1c3f30",
+   "status": "completed",
+   "updatedAt": "2026-10-14T05:53:16Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T03:42:57Z",
+   "databaseId": 38507675165,
+   "event": "push",
+   "headSha": "2ae04c1aab954faf9e1bdddc193a877bbb28ad91",
+   "status": "completed",
+   "updatedAt": "2026-10-14T04:06:39Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "failure",
+   "createdAt": "2026-10-14T03:38:00Z",
+   "databaseId": 38507252459,
+   "event": "push",
+   "headSha": "f7803c8864060bd26e2ccd993ddf7dc189b2eec3",
+   "status": "completed",
+   "updatedAt": "2026-10-14T03:52:22Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T03:16:03Z",
+   "databaseId": 38505356640,
+   "event": "push",
+   "headSha": "d26c73186ac856884d2faa4595707103f9e39b05",
+   "status": "completed",
+   "updatedAt": "2026-10-14T03:29:32Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T02:31:47Z",
+   "databaseId": 38501505279,
+   "event": "push",
+   "headSha": "9a06b7c3cc60135cae188de7755ee0c730d9c93a",
+   "status": "completed",
+   "updatedAt": "2026-10-14T02:47:06Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T02:07:21Z",
+   "databaseId": 38499370714,
+   "event": "push",
+   "headSha": "f72880d2ba6c909c08a2d55f67e866a6eff16540",
+   "status": "completed",
+   "updatedAt": "2026-10-14T02:21:36Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T01:34:22Z",
+   "databaseId": 38496457455,
+   "event": "push",
+   "headSha": "f39763d39724d2980a075a23e2725c478505f136",
+   "status": "completed",
+   "updatedAt": "2026-10-14T01:56:45Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T01:16:31Z",
+   "databaseId": 38494821237,
+   "event": "push",
+   "headSha": "cc7155ea63bfd8d2faea59e8f0f9307d199fbe82",
+   "status": "completed",
+   "updatedAt": "2026-10-14T01:41:29Z"
+  }
+ ],
+ "mergeGroupRuns": [
+  {
+   "attempt": 1,
+   "conclusion": "success",
+   "createdAt": "2026-10-14T06:10:03Z",
+   "databaseId": 38520623968,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5257-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "838cf3b505926fc86b4ba87a67782f632fb0ce5d",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:25:44Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T06:04:19Z",
+   "databaseId": 38520080776,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5251-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "5ee97cf80b2b855e9c4bb7394a20b322e9fea3dd",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:10:19Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T06:00:17Z",
+   "databaseId": 38519695952,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5234-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "7dbb2d5a8ac0442669c1fefc944a9934c1f98c7e",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:05:00Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T05:54:44Z",
+   "databaseId": 38519194005,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5228-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "10456fe6b7f8a76a0f0c755068346b5364e41253",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:00:33Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T05:53:47Z",
+   "databaseId": 38519106999,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5228-06efefd1cdb7932efd62ab8fdc75fb6e98ee043f",
+   "headSha": "e664dd1cc25666c29b0396dfa99af78e8d6399ed",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:01:00Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "cancelled",
+   "createdAt": "2026-10-14T05:53:46Z",
+   "databaseId": 38519105668,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5250-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "06efefd1cdb7932efd62ab8fdc75fb6e98ee043f",
+   "status": "completed",
+   "updatedAt": "2026-10-14T06:00:59Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "failure",
+   "createdAt": "2026-10-14T05:42:11Z",
+   "databaseId": 38518047959,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5228-02bf54b36d70e90dbb3260ba1b3158932e68b920",
+   "headSha": "99204c4d4c866ba5ae45d4cb2a69316f70c76503",
+   "status": "completed",
+   "updatedAt": "2026-10-14T05:55:00Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "failure",
+   "createdAt": "2026-10-14T05:39:13Z",
+   "databaseId": 38517783856,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5250-d71c9e380533b7d8a2f72491b3e82ed43ff5b785",
+   "headSha": "02bf54b36d70e90dbb3260ba1b3158932e68b920",
+   "status": "completed",
+   "updatedAt": "2026-10-14T05:51:59Z"
+  },
+  {
+   "attempt": 1,
+   "conclusion": "failure",
+   "createdAt": "2026-10-14T05:39:13Z",
+   "databaseId": 38517782878,
+   "event": "merge_group",
+   "headBranch": "gh-readonly-queue/main/pr-5249-28a7885f13a2b484c774da401bacb1883a020c89",
+   "headSha": "d71c9e380533b7d8a2f72491b3e82ed43ff5b785",
+   "status": "completed",
+   "updatedAt": "2026-10-14T05:53:16Z"
+  }
+ ],
+ "jobs": {
+  "38520623968": [
+   {
+    "conclusion": "success",
+    "id": 115709244103,
+    "name": "daemon-soak-scope",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709244338,
+    "name": "changes",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "id": 115709245316,
+    "name": "test-selection-measure",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "id": 115709287369,
+    "name": "visual",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709429696,
+    "name": "soak-shard (3)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709429737,
+    "name": "soak-shard (4)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709429840,
+    "name": "soak-shard (1)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709429920,
+    "name": "soak-shard (2)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709443859,
+    "name": "smoke",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709443876,
+    "name": "integration",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709444011,
+    "name": "test-shard (3)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709444017,
+    "name": "test-shard (2)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709444037,
+    "name": "test-shard (1)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709444045,
+    "name": "test-shard (5)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115709444185,
+    "name": "test-shard (4)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115712867503,
+    "name": "test",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115714023145,
+    "name": "daemon-soak",
+    "run_attempt": 1,
+    "status": "completed"
+   }
+  ],
+  "38517676708": [
+   {
+    "conclusion": "success",
+    "id": 115700038817,
+    "name": "daemon-soak-scope",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700039082,
+    "name": "changes",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "id": 115700040056,
+    "name": "visual",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "id": 115700069036,
+    "name": "test-selection-measure",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198123,
+    "name": "test-shard (4)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198125,
+    "name": "test-shard (1)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198140,
+    "name": "smoke",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198173,
+    "name": "test-shard (5)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "failure",
+    "id": 115700198178,
+    "name": "integration",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198197,
+    "name": "test-shard (3)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700198218,
+    "name": "test-shard (2)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700211471,
+    "name": "soak-shard (1)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700211528,
+    "name": "soak-shard (3)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700211565,
+    "name": "soak-shard (4)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115700211615,
+    "name": "soak-shard (2)",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "failure",
+    "id": 115702988350,
+    "name": "test",
+    "run_attempt": 1,
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "id": 115704300008,
+    "name": "daemon-soak",
+    "run_attempt": 1,
+    "status": "completed"
+   }
+  ]
+ }
+}
