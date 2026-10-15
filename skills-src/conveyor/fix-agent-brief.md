@@ -167,8 +167,16 @@ If the finding is ambiguous or needs a
 judgment you cannot safely make, do **NOT** guess. **Record the stand-down on the PR first**, then leave the PR
 `review:changes` (do **not** re-arm) and RETURN `#{{ITEM_NUM}} → fix escalated (finding needs human judgment)`:
 
+For a referral-finding question, write a JSON array of the exact `{runId, key}` subjects from the
+review's mandatory-referrals record to a temporary file and set `FINDING_REFS_FILE` to its path.
+Include every finding you need ruled on, preserving the record's values; do not derive keys from
+locations or prose. The flag below binds the question so a later operator ruling can resolve it.
+For a question unrelated to referral findings, omit `--finding-refs` and require an explicit operator
+answer. Legacy stand-downs without these subjects also require an explicit answer.
+
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
+  --finding-refs="$(cat -- "$FINDING_REFS_FILE")" \
   --detail="<one line — what you could not decide>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
