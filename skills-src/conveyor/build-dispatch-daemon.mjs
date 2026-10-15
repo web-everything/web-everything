@@ -31,7 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
-import { isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
@@ -1153,8 +1153,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           prepare.retired.push({ num, why, released: live });
         }
         finishedPrepares.add(num);
-        if (awaitingPr && !status.preparedDate) prepareBusy.add(num);
-        else prepareBusy.delete(num);
+        // An ended attempt never keeps a worker slot, even while its PR is OPEN (PR #5366 round 7): that PR already
+        // refuses a re-launch (`refusePrepareLaunch`), and two such cards would otherwise block every prepare.
+        prepareBusy.delete(num);
       } else if (claim || awaitingPr) prepareBusy.add(num);
     } catch (e) {
       // Failed observations never mean unprepared/dead. Keep a tracked item out of dispatch until a good read;
@@ -2208,8 +2209,9 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         { replaces: replacesStamp, preparedAgainstSha: stamped.preparedAgainstSha })) return { ...stamped, path };
       const main = stamped.preparedDate ? { ...stamped, preparedDate: null, replacedPreparedDate: stamped.preparedDate } : stamped;
       // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
-      // `prNumber` (the refusal probe) reads that one PR, not the newest attempt's.
-      const pr = prsFor(num, claimedAt, bornAs).filter(p => isPreparePrFor(p, { num, bornAs })
+      // `prNumber` (the refusal probe) reads that one PR, not the newest attempt's. Write grade (PR #5366 round 7):
+      // this read drives retirement, holds and the stamp worker, so a title-only PR on any other branch is not one.
+      const pr = prsFor(num, claimedAt, bornAs).filter(p => isLanePreparePrFor(p, { num, bornAs })
         && (prNumber == null || p.number === prNumber)
         && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (!pr) return { ...main, path, pr: null };

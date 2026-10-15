@@ -25,7 +25,8 @@ export default {
     const p = join(root, DAEMON);
     if (!existsSync(p)) return false;
     const source = readFileSync(p, 'utf8');
-    return source.includes('isPreparePrFor(p, { num, bornAs })') && source.includes('prepareLaunchRefusal({');
+    // The status reader's filter became the write-grade `isLanePreparePrFor` in PR #5366 round 7.
+    return source.includes('PreparePrFor(p, { num, bornAs })') && source.includes('prepareLaunchRefusal({');
   },
   async run({ log } = {}) {
     const { createPrepareStatusReader, runBuildDispatchTick } = await import(resolve(REPO_ROOT, DAEMON));

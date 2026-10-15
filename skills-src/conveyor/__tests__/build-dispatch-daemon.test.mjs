@@ -167,7 +167,11 @@ describe('prepare status batched', () => {
         ...(mode === 'prefetched' ? { execAsync: async (...args) => answer(...args) } : {}) });
       const claimedAt = mode === 'date fallback' ? '2026-10-14' : '2026-10-01';
       await reader.prime([{ num: 5028, bornAs: identity, claimedAt }]);
-      expect(reader.read({ num: 5028, bornAs: identity, claimedAt: '2026-10-01' }).pr).toMatchObject({ number: pr.number, state: 'OPEN' });
+      const read = reader.read({ num: 5028, bornAs: identity, claimedAt: '2026-10-01' }).pr;
+      // Write grade (PR #5366 round 7): the status reader drives stamps and holds, so a title-only PR is not its PR;
+      // the launch guard below still refuses on it.
+      if (headRefName.startsWith('lane/')) expect(read).toMatchObject({ number: pr.number, state: 'OPEN' });
+      else expect(read).toBeNull();
       const dispatch = vi.fn();
       const tick = await runBuildDispatchTick({ live: true, effects: {
         planTick: () => ({ decisions: { itemPrepareSpawns: [{ num: '5028', bornAs: identity }] }, nextState: {} }),
@@ -1954,16 +1958,59 @@ describe('automatic item preparation', () => {
   it('never probes a refusal whose PR is not a lane prepare branch (a title-only match)', async () => {
     const effects = fixture();
     effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
-    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'someone/manual-prepare' }];
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'someone/manual-prepare',
+      title: 'WE #5028: prepare — manual', isCrossRepository: false }];
     effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, pr: { number: 91, state: 'OPEN', hasSections: true } }));
     effects.stampPrepare = vi.fn();
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const first = await runBuildDispatchTick({ live: true, effects });
+      // The title still refuses the launch, so the exclusion below is exercised, not vacuous.
+      expect(first.prepare.refused).toEqual([{ num: '5028', reason: 'open prepare PR #91 (someone/manual-prepare)' }]);
       await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
       expect(effects.readPrepareStatus.mock.calls.filter(([a]) => a.num === '5028' && a.prNumber != null)).toEqual([]);
       expect(effects.stampPrepare).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
+  });
+  // PR #5366 review round 7: a title-only match may refuse a launch, never drive a write. The retirement pass reads a
+  // TRACKED card's PR through the status reader; a non-lane PR titled `WE #<num>: prepare` must not be stamped from.
+  it.each(['OPEN', 'CLOSED'])('never stamp-recovers or retires a tracked prepare from a title-only %s non-lane PR', async state => {
+    const sectioned = '---\nstatus: open\n---\n' + ['Design', 'MVP', 'Test plan', 'Proof plan']
+      .map(h => `## ${h}\nCompleted substantive work.\n`).join('\n');
+    const pr = { number: 91, state, headRefName: 'someone/manual', title: 'WE #5028: prepare — manual',
+      headRefOid: '9'.repeat(40), createdAt: '2026-10-14T12:00:00Z', isCrossRepository: false };
+    const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\nunprepared on main' }, [pr]);
+    const exec = vi.fn((cmd, args, opts) => cmd === 'gh' && args[0] === 'api'
+      ? JSON.stringify({ content: Buffer.from(sectioned).toString('base64') }) : git(cmd, args, opts));
+    const reader = createPrepareStatusReader({ exec });
+    const effects = fixture({ inFlight: [{ num: '5028', row: { runId: 'dead', entry: {
+      key: 'dead', live: false, expectedBy: '2020-01-01' } } }] });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [] }, nextState: {} });
+    effects.readPrepareStatus = args => reader.read(args);
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.stampPrepare).not.toHaveBeenCalled();
+    expect(effects.placePrepareHold).not.toHaveBeenCalledWith(expect.objectContaining({ reason: 'prepare-stamp-pending' }));
+    expect(tick.prepare.retired.map(r => r.why)).not.toContain('prepare PR closed');
+    // The same PR still refuses a launch (refusal grade).
+    expect(reader.listPrs({ num: '5028' }).map(p => p.number)).toEqual([91]);
+  });
+  // PR #5366 review round 7: an ended attempt whose PR is still OPEN is settled (claim released, row retired). Its
+  // OPEN PR already refuses a re-launch, so it must not keep a prepare slot: two of them would block every prepare.
+  it.each(['retry failure', 'held ledger record'])('an ended prepare with a still-OPEN PR frees its slot (%s): a clean third launches', async kind => {
+    const effects = fixture({ inFlight: ['5028', '5029'].map(num => ({ num, row: { runId: `dead-${num}`, entry: {
+      key: `dead-${num}`, live: false, expectedBy: '2020-01-01' } } })) });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: ['5028', '5029', '5030'].map(num => ({ num })) }, nextState: {} });
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: null,
+      pr: { number: Number(num), state: 'OPEN', preparedDate: null, hasSections: false } });
+    effects.listPreparePrs = ({ num }) => num === '5030' ? []
+      : [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}-prepare-x` }];
+    if (kind === 'retry failure') effects.recordPrepareFailure = input => ({ ...input, cause: 'infra-transient', retry: true, held: false });
+    else effects.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, attempt: `a-${num}`, held: true, recordedAt: '2026-10-14' }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.inFlight).not.toEqual(expect.arrayContaining(['5028']));
+    expect(tick.prepare.inFlight).not.toEqual(expect.arrayContaining(['5029']));
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5030']);
   });
   it('holds build-backoff cards and in-flight group members out of tick-core\'s prepare picks', async () => {
     const effects = fixture();

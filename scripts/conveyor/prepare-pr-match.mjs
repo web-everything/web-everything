@@ -5,13 +5,24 @@ import { releasedAttempt } from './prepare-failure-policy.mjs';
 const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const newestFirst = (a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? ''));
 
-export function isPreparePrFor(pr, { num, bornAs }) {
+/**
+ * Write grade: a same-repo PR from the card's own lane prepare branch. Only this may drive a stamp, a hold or a
+ * claim retirement (PR #5366 round 7): a title is free text any collaborator can type on any branch.
+ */
+export function isLanePreparePrFor(pr, { num, bornAs }) {
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
   if (!key) return false;
   const ids = [key, normNum(bornAs)].filter(Boolean).map(escapeRegex).join('|');
-  return new RegExp(`^lane/(?:${ids})[a-z]?-prepare-`).test(pr.headRefName ?? '')
-    || new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
+  return new RegExp(`^lane/(?:${ids})[a-z]?-prepare-`).test(pr.headRefName ?? '');
+}
+
+/** Refusal grade: the lane branch OR a `WE #<num>: prepare` title. Enough to refuse a duplicate launch, never to write. */
+export function isPreparePrFor(pr, { num, bornAs }) {
+  if (isLanePreparePrFor(pr, { num, bornAs })) return true;
+  if (!pr || pr.isCrossRepository) return false;
+  const key = normNum(num);
+  return Boolean(key) && new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
 }
 
 export function preparePrGuard({ num, bornAs, prs = [], lastDispatchAt }) {

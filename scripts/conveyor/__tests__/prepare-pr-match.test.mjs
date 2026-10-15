@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isPreparePrFor, preparePrGuard, prepareLaunchRefusal } from '../prepare-pr-match.mjs';
+import { isLanePreparePrFor, isPreparePrFor, preparePrGuard, prepareLaunchRefusal } from '../prepare-pr-match.mjs';
 
 const pr = (extra = {}) => ({ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x',
   createdAt: '2026-10-14T12:00:00Z', isCrossRepository: false, ...extra });
@@ -22,6 +22,16 @@ describe('prepare PR matching', () => {
     'rejects %s', headRefName => expect(isPreparePrFor(pr({ headRefName }), args)).toBe(false));
   it('rejects cross-repository PRs even with matching titles', () => {
     expect(isPreparePrFor(pr({ isCrossRepository: true, title: 'WE #5028: prepare' }), args)).toBe(false);
+  });
+  // PR #5366 review round 7: a title may refuse a launch; only a lane prepare branch may drive a stamp or a hold.
+  it('the write-grade match requires a lane prepare branch; a title alone is refusal-grade only', () => {
+    const titled = pr({ headRefName: 'someone/manual', title: 'WE #5028: prepare — work' });
+    expect(isPreparePrFor(titled, args)).toBe(true);
+    expect(isLanePreparePrFor(titled, args)).toBe(false);
+    expect(isLanePreparePrFor(pr({ headRefName: 'lane/5028d-prepare-x' }), args)).toBe(true);
+    expect(isLanePreparePrFor(pr({ headRefName: 'lane/abc.12b-prepare-x' }), { ...args, bornAs: 'abc.12' })).toBe(true);
+    expect(isLanePreparePrFor(pr({ headRefName: 'lane/5028-prepare-x', isCrossRepository: true }), args)).toBe(false);
+    expect(isLanePreparePrFor(pr({ headRefName: 'xlane/5028-prepare-x' }), args)).toBe(false);
   });
 });
 

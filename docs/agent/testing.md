@@ -810,7 +810,13 @@ claim retirement: dead-session cleanup frees capacity but does not prove why aut
 
 Prepare PR identity is shared in `we:scripts/conveyor/prepare-pr-match.mjs`: same-repo branches
 accept one uniqueness letter after the card number (or `bornAs`), with the `WE #<num>: prepare`
-title as a fallback. Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
+title as a fallback. That fallback is refusal grade only (`isPreparePrFor`): it may refuse a launch,
+never drive a write. The status reader, whose result drives retirement, holds and the stamp worker,
+uses the write-grade `isLanePreparePrFor` (lane branch required). Test every write path with a
+title-only PR outside `lane/` and assert no stamp, hold or retirement comes from it.
+An ended attempt frees its prepare slot even while its PR is OPEN (that PR refuses the re-launch):
+test cap-many ended OPEN-PR cards and assert a clean card still launches.
+Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
 The launch guard must also run without a surviving claim, and refuse when PR listing throws.
 Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
 0 disables only the merged refusal); probe the time boundary with an injected clock.
