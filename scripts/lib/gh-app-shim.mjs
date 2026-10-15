@@ -92,7 +92,8 @@ import {
 import { primaryCheckout } from '../bootstrap-session.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
 import { controlClonePath } from './automation-home.mjs';
-import { stripGhDebug, rateLimitRecords, ghAuthIdentity, classifyGhResource } from './gh-throttle.mjs';
+import { stripGhDebug, rateLimitRecords, ghAuthIdentity } from './gh-throttle.mjs';
+import { renderGhResourceClassifier } from './gh-argv.mjs';
 
 /**
  * #4200-ish (gh-shim-stable-path) — the absolute path to `we:scripts/lib/gh-throttle.mjs`, resolved through
@@ -350,7 +351,7 @@ const GH_DEBUG_GIT_LINE = /^\\[(\\S*\\/)?git( [^\\n]*)?\\]$/;
 ${stripGhDebug.toString()}
 ${rateLimitRecords.toString()}
 ${ghAuthIdentity.toString()}
-${classifyGhResource.toString()}
+${renderGhResourceClassifier()}
 function runDirect(argv, env, fallbackReason) {
   const capture = !env.GH_DEBUG && env.WE_GH_THROTTLE_COST_HEADERS !== '0';
   const result = spawnSync(REAL_GH, argv, {

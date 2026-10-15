@@ -352,6 +352,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'extend-rounds': 'extend-rounds.mjs',
     ...Object.fromEntries(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim'].map(name => [name, 'operator-controls.mjs'])),
     [RECORD_REFERRAL_RULING_OP]: 'record-referral-ruling.mjs',
+    // Card 334 — `land-human-only`'s `write` step labels, enqueues and comments, so it is NOT read-only; listed for map
+    // coverage. Every gh call lives in `land-human-only-io.mjs`.
+    'land-human-only': 'land-human-only.mjs',
     // #xp240uk — `verify` is two `compute` steps with no sink, so it IS read-only and appears in the pinned
     // list below. Its io (the spawn of the single home) lives entirely in `verify-io.mjs` and arrives only
     // through the `runChecks` its builder is handed in `../run.mjs`, which is what keeps this module pure.

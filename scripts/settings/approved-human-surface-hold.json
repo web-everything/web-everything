@@ -1,0 +1,4 @@
+{
+  "$comment": "Keep an approved human-only surface PR on its cleared live head while the merge queue tests freshness. Real conflicts and tracked root lane manifests still use the existing rebuild path. Override with WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE.",
+  "mergeQueue": { "skipRebaseApprovedHumanSurface": "on" }
+}

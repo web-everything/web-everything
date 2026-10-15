@@ -104,7 +104,8 @@ import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
-import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
+import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
+import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -1558,13 +1559,22 @@ function dispatchReviewRow({
       });
       return;
     }
-    refuse('already-reviewed-head', {
-      ...withPhase, headSha, reviewedSha, ...extra,
-      why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
-        ' review — dispatching another review for a commit nobody has touched since risks a second,' +
-        ' contradicting verdict landing on it (#2588)',
-    });
-    return;
+    // live #5323 — the drain re-stamped acceptance after a content-preserving rebase, but the
+    // advisory still covers the old head. A `needs-human` PR is owed one advisory on the live head:
+    // review-pr INVARIANT 2 never accepts a `review:human` PR, so the #2588 contradicting-verdict
+    // risk does not apply. Fall through to the ordinary review gates; needs-review keeps the refusal.
+    const { advisoryIsCurrent, unpinnedAdvisory } = advisoryHeadState(pr);
+    if (withPhase?.phase === 'needs-human' && !advisoryIsCurrent && !unpinnedAdvisory) {
+      extra = { ...extra, advisoryOwed: true };
+    } else {
+      refuse('already-reviewed-head', {
+        ...withPhase, headSha, reviewedSha, ...extra,
+        why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
+          ' review — dispatching another review for a commit nobody has touched since risks a second,' +
+          ' contradicting verdict landing on it (#2588)',
+      });
+      return;
+    }
   }
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
@@ -1765,7 +1775,8 @@ function operatorFixBudget(comments, roundCap) {
  */
 function operatorSendBackBody(commentBody) {
   const parts = String(commentBody ?? '').split(/\n\n/);
-  return parts.slice(2).join('\n\n').replace(/<!--[\s\S]*?-->/g, '').trim();
+  // Preserve a separator so removing metadata cannot assemble a new HTML comment.
+  return parts.slice(2).join('\n\n').replace(/<!--[\s\S]*?-->/g, ' ').trim();
 }
 
 /**
@@ -2023,7 +2034,9 @@ export function planReconcile({
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
     const realFixRounds = countRealFixRounds(pr);
+    const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
@@ -2514,6 +2527,22 @@ export function planReconcile({
           : 'draft PR — every required check is green; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
       });
+      continue;
+    }
+
+    // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
+    // stand-down, liveness and already-landed guards above; an unaddressed request belongs to a fixer.
+    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid));
+    if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: 'operator send-back remains unaddressed; automatic fix rounds exhausted' }, { allowTakeover: false });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed',
+          findings: operatorRuling.items.length, rulingNotAddressed: operatorRuling,
+          why: 'operator send-back not yet addressed after a fixer had its chance' });
+      }
       continue;
     }
 
