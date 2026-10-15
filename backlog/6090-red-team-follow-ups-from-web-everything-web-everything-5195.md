@@ -39,3 +39,8 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5195 (finding 2: `we:scripts/lib/ledger-promotion-readiness.mjs:95` — failing-input, degraded Replay projects agreement for PRs whose unruled referrals still block clearance.)
+- Also raised by web-everything/web-everything#5195 (finding 1: `we:scripts/lib/ledger-promotion-readiness.mjs:95` — failing-input, degraded Replay projects agreement for disagreements the new drain facts cannot resolve)

@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   CONTEXT_PACK_DEFAULTS, TRIM_SECTIONS, resolveContextPackSettings, settingsLogLine, extractFindings, extractFileRefs,
-  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs,
+  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, localTestsSection,
 } from '../fix-context-pack.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -91,6 +91,19 @@ describe('finding + reference extraction', () => {
   });
 });
 
+describe('already-fixed red proof', () => {
+  it('routes fix proof through revert-red-check without changing ci-heal instructions', () => {
+    expect(localTestsSection('proof-only', 'fix')).toContain('revert-red-check');
+    expect(localTestsSection('proof-only', 'fix')).toContain('--base=');
+    expect(localTestsSection('proof-only', 'ci-heal')).not.toContain('revert-red-check');
+  });
+
+  it('keeps the sanctioned revert and first-denial attribution in the fix brief', () => {
+    expect(FIX_BRIEF).toContain('revert-red-check');
+    expect(FIX_BRIEF).toContain('A `[Security Weaken]` classifier denial is caused by the attempted action (e.g. removing a guard), not by the later command it refuses — report that first denied action in `--denied`, not the later benign one.');
+  });
+});
+
 describe('the brief with a context pack', () => {
   it('both settings off = the old brief, byte for byte', () => {
     expect(applyContextPack(FIX_BRIEF, { settings: OFF, inputs: sampleInputs() })).toBe(FIX_BRIEF);
@@ -116,6 +129,11 @@ describe('the brief with a context pack', () => {
   it('the size cap holds and the packed brief is SMALLER than the plain one (redundant sections trimmed)', () => {
     for (const maxBytes of [8000, 3000, 1200]) {
       const out = applyContextPack(FIX_BRIEF, { settings: { ...ON, contextMaxBytes: maxBytes }, inputs: sampleInputs() });
+      if (maxBytes === 1200) {
+        // The mandatory proof rule exhausts this budget; preserve the full brief via the existing fallback.
+        expect(out).toBe(`${localTestsSection('proof-only', 'fix')}\n\n${FIX_BRIEF}`);
+        continue;
+      }
       const pack = out.slice(0, out.indexOf('\n---\n'));
       expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(maxBytes);
       expect(Buffer.byteLength(out)).toBeLessThan(Buffer.byteLength(FIX_BRIEF));

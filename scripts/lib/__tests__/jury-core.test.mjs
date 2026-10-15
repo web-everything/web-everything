@@ -2,7 +2,7 @@ import { sameAsLinkAllowed, findCarriedReviewerRuling, reviewerCarryBacking, REF
 import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
 import { validateOperatorRuling } from '../jury-core.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
-import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds, carriedActor, carriedReasonText, AUTO_POLICY_ACTOR } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
@@ -1599,10 +1599,97 @@ describe('#4315 mandatory referral protocol', () => {
       expect(validateReferralRecord({ ...r, carried: [{ ...r.carried[0], reason: 'wrong' }] })).toBe(false);
       expect(referralRecordState(r).pending).toEqual([key]);
       const state = referralRecordState(r, { operatorRulings: [{ ...from, repo: r.repo, pr: r.pr, result }] });
-      expect(state.pending).toEqual([]);
-      expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      // #5942 — a legacy block carry is not a verdict on this head: held pending even with its backing intact.
+      expect(state.pending).toEqual(result === 'block' ? [key] : []);
+      expect(state.blocked).toEqual([]);
       expect(liveReferrals(r)).toEqual([]);
     }
+  });
+
+  describe('#5942 a carried earlier-head block is re-checked, not copied', () => {
+    const reason = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
+    const oldHead = 'b'.repeat(40);
+    const legacy = () => {
+      const r = record(), key = r.referrals[0].key;
+      const from = { head: oldHead, runId: 'old', key };
+      r.carried = [{ key, from, reason, result: 'block' }];
+      const backing = (x = {}) => ({ repo: r.repo, pr: r.pr, ...from, result: 'block', actor: 'nic', ...x });
+      return { r, key, from, backing };
+    };
+
+    it('a legacy operator block carry stays pending and is re-askable (withdrawn), never blocked', () => {
+      const { r, key, backing } = legacy();
+      const state = referralRecordState(r, { operatorRulings: [backing()] });
+      expect(state).toMatchObject({ pending: [key], blocked: [], rulings: [] });
+      expect(liveReferrals(r, { withdrawn: new Set([key]) })).toHaveLength(1);
+    });
+
+    it('a counted current-head reviewer ruling decides over the legacy block carry: fresh block blocks, fresh clearance clears', () => {
+      for (const result of ['block', 'not-real']) {
+        const { r, key, backing } = legacy();
+        r.rulings = [rule(r, result)];
+        const state = referralRecordState(r, { operatorRulings: [backing()] });
+        expect(state.pending).toEqual([]);
+        expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      }
+    });
+
+    it('an untrusted (non-independent) current-head ruling cannot clear the held legacy block carry', () => {
+      const { r, key, backing } = legacy();
+      r.authorBody = `<!-- authored-by-actor: ${r.reviewer.id} -->`;
+      r.rulings = [rule(r, 'not-real')];
+      const state = referralRecordState(r, { operatorRulings: [backing()], stampPolicy: 'refuse' });
+      expect(state.pending).toContain(key);
+      expect(state.blocked).toEqual([]);
+    });
+
+    it('a same-head operator ruling keeps its precedence over the legacy carry', () => {
+      const { r, key, backing } = legacy();
+      const same = backing({ head: r.head, runId: r.runId, key, result: 'not-real' });
+      expect(referralRecordState(r, { operatorRulings: [backing(), same] })).toMatchObject({ pending: [], blocked: [] });
+    });
+
+    it('a legacy NOT-REAL / card carry keeps its existing backing rules', () => {
+      const { r, key, from } = legacy();
+      r.carried[0].result = 'not-real';
+      expect(referralRecordState(r, { operatorRulings: [{ repo: r.repo, pr: r.pr, ...from, result: 'not-real' }] }).pending).toEqual([]);
+      expect(referralRecordState(r).pending).toEqual([key]);
+    });
+
+    it('findCarriedOperatorRuling never creates a block carry, and a block ends the search over an older clearance', () => {
+      const r = record();
+      r.head = oldHead;
+      const key = r.referrals[0].key;
+      const op = (result) => ({ repo: r.repo, pr: r.pr, head: oldHead, runId: r.runId, key, result });
+      const ctx = { records: [r], head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      const target = { finding: r.referrals[0].finding };
+      expect(findCarriedOperatorRuling(target, { ...ctx, operatorRulings: [op('block')] })).toBeNull();
+      expect(findCarriedOperatorRuling(target, { ...ctx, operatorRulings: [op('not-real')] })?.result).toBe('not-real');
+      expect(findCarriedOperatorRuling(target, { ...ctx, operatorRulings: [op('not-real'), op('block')] })).toBeNull();
+    });
+
+    it('names the real ruler, and the stored legacy reason still validates', () => {
+      const { r, key, from } = legacy();
+      const [carriedBlock] = r.carried;
+      const auto = [{ ...from, actor: AUTO_POLICY_ACTOR, result: 'block' }];
+      const human = [{ ...from, actor: 'nic', result: 'block' }];
+      expect(validateReferralRecord(r)).toBe(true);
+      expect(carriedActor(carriedBlock, { operatorRulings: auto })).toBe('automatic policy');
+      expect(carriedActor(carriedBlock, { operatorRulings: human })).toBe('operator');
+      expect(carriedActor(carriedBlock)).toBe('earlier');
+      expect(carriedActor({ ...carriedBlock, result: 'not-real' })).toBe('operator');
+      expect(carriedActor({ ...carriedBlock, result: 'not-real', from: { ...from, rulingId: 'run:0' } })).toBe('reviewer');
+      const text = (operatorRulings) => renderReferralRecord(r, { operatorRulings }).split('\n').find(l => l.startsWith(`- ${key}: carried`));
+      expect(text(auto)).toBe(`- ${key}: carried: the automatic policy ruled this finding on an earlier head; its cited lines are unchanged (automatic policy block, from ${oldHead}, run old)`);
+      expect(text(human)).toContain('the operator ruled');
+      expect(text(undefined)).toContain('an earlier head ruled');
+      expect(text(undefined)).not.toContain('the operator ruled');
+      const reviewerBacked = { ...r, carried: [{ ...carriedBlock, result: 'not-real', from: { ...from, rulingId: 'run:0' } }] };
+      expect(carriedReasonText(reviewerBacked.carried[0])).toBe('carried: the reviewer ruled this finding on an earlier head; its cited lines are unchanged');
+      expect(renderReferralRecord(reviewerBacked)).toContain('(reviewer not-real, from');
+      expect(renderReferralRecord(reviewerBacked)).not.toContain('the operator ruled');
+      expect(validateReferralRecord(reviewerBacked)).toBe(true);
+    });
   });
 
   describe('findCarriedOperatorRuling matches strictly (clearing a mandatory referral)', () => {

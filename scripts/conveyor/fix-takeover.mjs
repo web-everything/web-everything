@@ -24,6 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const FIX_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'fix.json');
 export const FIX_SETTINGS_DEFAULTS = Object.freeze({
@@ -66,7 +67,7 @@ function readFileLayer(file, read) {
  * next layer, except `roundCapAction`, which fails closed to `person` (see below) — for a bad leaf and for a
  * malformed file or `fix` container alike. Never throws.
  */
-export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
+export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8'), platform } = {}) {
   const layer = readFileLayer(file, read);
   const fromFile = layer === INVALID_LAYER
     ? { roundCapAction: INVALID_LAYER, roundHistory: undefined }
@@ -104,12 +105,20 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
   const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
   const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
+  // Standard → platform → tool → env. Opus is reachable only through the critical-work verdict.
+  const model = cascadePolicy('fix', { claudeEscalationModel: fromFile.claudeEscalationModel }, {
+    standard: { claudeEscalationModel: 'sonnet' }, platform, env,
+    envValues: { claudeEscalationModel: env.WE_FIX_CLAUDE_ESCALATION_MODEL },
+    valid: { claudeEscalationModel: value => ['haiku', 'sonnet'].includes(value) },
+  });
   return {
     roundCapAction: action.value, roundHistory: history.value,
     resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    claudeEscalationModel: model.value.claudeEscalationModel,
     sources: {
       roundCapAction: action.source, roundHistory: history.source,
       resumeAcrossRounds: resume.source, strongerModelFromRound: from.source,
+      claudeEscalationModel: model.sources.claudeEscalationModel,
     },
   };
 }

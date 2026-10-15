@@ -124,6 +124,13 @@ describe('workerNeeded — the script goes first, a model only when there is som
 });
 
 describe('attribution', () => {
+  it.each(['codex', 'antigravity-argon'])('publishes feature build commit titles for %s', id => {
+    const worker = { id, provider: id === 'codex' ? 'codex' : 'antigravity', executor: id === 'codex' ? 'codex' : 'antigravity', model: id === 'codex' ? 'gpt-6-astra' : 'gemini-4-argon-high' };
+    const message = buildDocFixCommitMessage({ num: 4291, worker, taskType: 'build-new-feature', title: 'Implement scoped feature' });
+    expect(message.split('\n')[0]).toBe('WE #4291: build — Implement scoped feature');
+    expect(message).toContain(`Probation-Worker: ${id}`);
+    expect(message).toContain(`Model: ${worker.model}`);
+  });
   it('trailers name the real author family', () => {
     expect(coAuthorTrailerForWorker(codex)).toBe('Co-Authored-By: Codex <noreply@openai.com>');
     expect(coAuthorTrailerForWorker(agyClaude)).toContain('claude-sonnet-4-6, via Antigravity');

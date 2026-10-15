@@ -1,0 +1,3 @@
+{
+  "$comment": "build.argon.enabled defaults true; build.argon.model defaults gemini-4-argon-high. Both resolve standard → platform build preferences → tool settings, with cascade source logging. Argon builds stay on full probation review with a Codex checker; quota holds and critical-work vetoes still apply. Set enabled=false to disable the candidate."
+}

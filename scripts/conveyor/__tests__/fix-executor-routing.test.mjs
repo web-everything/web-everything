@@ -70,7 +70,7 @@ describe('fix executor decision', () => {
         expect(spawnBorrowed).not.toHaveBeenCalled();
         expect(spawnAgent).toHaveBeenCalledTimes(1);
         expect(spawnAgent.mock.calls[0][0]).toEqual(expect.arrayContaining(['--model']));
-        expect(spawnAgent.mock.calls[0][0].join(' ')).toContain('opus');
+        expect(spawnAgent.mock.calls[0][0].join(' ')).toContain('sonnet');
       } finally { log.mockRestore(); }
     });
   });

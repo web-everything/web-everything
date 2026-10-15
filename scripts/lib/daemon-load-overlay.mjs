@@ -51,15 +51,19 @@ import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { homedir, tmpdir } from 'node:os';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
+import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 import { switchCurrent as switchCurrentVersion, status as versionStatus } from './daemon-version-switch.mjs';
@@ -372,6 +376,7 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
  */
 export async function runRealDispatchSmoke({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
+  routingPolicy = readRoutingPolicy(),
 }) {
   const t0 = Date.now();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
@@ -386,8 +391,9 @@ export async function runRealDispatchSmoke({
   const prompt = dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr });
   const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off', WE_SMOKE_ALLOW_REAL_WORKER: '1' }; // Deliberate real-worker sentinel smoke.
   const base = { sessionId, scratch };
-  log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker from ${tree} (scratch store ${store})`);
-  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt], {
+  const model = resolvePolicyModel('claude', routingPolicy.aliases.claude.haiku ? 'haiku' : 'sonnet', routingPolicy);
+  log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker model=${model} (source routing-policy cheapest Claude alias) from ${tree} (scratch store ${store})`);
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model], {
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
@@ -505,7 +511,7 @@ export function withDispatchSmoke({
  * @param {{clone:string, ref:string, pr?:number|null, base?:string, dryRun?:boolean, env?:NodeJS.ProcessEnv,
  *   log?:Console, addedBy?:string|null, reason?:string|null, now?:string,
  *   addOverlayFn?:typeof addOverlay, rebuild?:typeof rebuildClone, dryRunRebuildFn?:typeof dryRunRebuild,
- *   installed?:typeof overlayInstalled, followUpRebuilds?:number}} o
+ *   installed?:typeof overlayInstalled, followUpRebuilds?:number, clock?:()=>number, sleep?:(ms:number)=>Promise<void>}} o
  * @returns {Promise<object>}
  */
 export async function runDaemonLoadOverlay({
@@ -515,7 +521,7 @@ export async function runDaemonLoadOverlay({
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
-  installed = overlayInstalled, followUpRebuilds = 1,
+  installed = overlayInstalled, followUpRebuilds = 1, clock = () => performance.now(), sleep = sleepAsync,
 }) {
   if (!clone || typeof clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
@@ -637,15 +643,47 @@ export async function runDaemonLoadOverlay({
   const runSmoke = smokeOn ? withDispatchSmoke({
     baseSmoke, ref, settings: safety, dispatchSmoke, inspect, ctl, log,
   }) : baseSmoke;
+  // One monotonic deadline bounds retry admission, including stale-adoption follow-ups.
+  // An admitted rebuild still completes its own smoke/finalization safety protocol.
+  const configuredBudget = Number(env?.[REBUILD_LOCK_WAIT_ENV]);
+  const budgetMs = Number.isFinite(configuredBudget) && configuredBudget > 0
+    ? configuredBudget : DEFAULT_REBUILD_LOCK_WAIT_MS;
+  const started = clock();
+  const deadline = started + budgetMs;
+  const remaining = () => Math.max(0, deadline - clock());
+  let waited = false;
+  const finishWait = (out) => {
+    if (waited) log.error?.(`daemon-load-overlay: wait finished after ${Math.max(0, clock() - started)}ms — ${out.adopted ? 'adopted' : 'not adopted'} (${out.reason ?? 'completed'})`);
+    return out;
+  };
+  const attemptRebuild = async () => {
+    let result = { moved: false, adopted: false, reason: 'rebuild-in-progress' };
+    while (remaining() > 0) {
+      const remainingMs = remaining();
+      if (remainingMs <= 0) break;
+      result = await rebuild({ root, env, log, mainOnly: false, runSmoke, admissionWaitMs: remainingMs });
+      if (result.reason !== 'rebuild-in-progress') return result;
+      if (!waited) {
+        waited = true;
+        log.error?.(`daemon-load-overlay: waiting for a running rebuild before loading ${ref} (budget ${budgetMs}ms)`);
+      }
+      const delay = Math.min(250, remaining());
+      if (delay <= 0) break;
+      // rebuild has returned and released its locks/lease before we sleep.
+      await sleep(delay);
+    }
+    return { ...result, adopted: false };
+  };
   let rebuildResult;
   try {
-    rebuildResult = await rebuild({
-      root, env, log, mainOnly: false, runSmoke,
-    });
+    rebuildResult = await attemptRebuild();
   } catch (e) {
     // The candidate smoke already failed (`ctl` holds it) and the rebuild then died on something else (a lock, a git
     // error): the overlay must still come off. With no failed smoke on record the error is not ours to swallow.
-    if (!(ctl.ran && ctl.result && !ctl.result.ok)) throw e;
+    if (!(ctl.ran && ctl.result && !ctl.result.ok)) {
+      finishWait({ adopted: false, reason: 'rebuild-threw' });
+      throw e;
+    }
     rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
   }
 
@@ -656,12 +694,15 @@ export async function runDaemonLoadOverlay({
   if (rebuildResult.adopted && !check.inHead) {
     staleAdopt = { head: rebuildResult.head, tip: check.tip, reason: check.reason };
     log.error?.(`daemon-load-overlay: the rebuild adopted ${staleAdopt.head} but ${ref} (${check.tip}) is NOT in it (${check.reason}) — that build predates the registration; NOT adopted, rebuilding to include it`);
-    while (followUps < followUpRebuilds) {
+    while (followUps < followUpRebuilds && remaining() > 0) {
       followUps += 1;
       try {
-        rebuildResult = await rebuild({ root, env, log, mainOnly: false, runSmoke });
+        rebuildResult = await attemptRebuild();
       } catch (e) {
-        if (!(ctl.ran && ctl.result && !ctl.result.ok)) throw e;
+        if (!(ctl.ran && ctl.result && !ctl.result.ok)) {
+          finishWait({ adopted: false, reason: 'rebuild-threw' });
+          throw e;
+        }
         rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
       }
       alerts = [...(alerts || []), ...(rebuildResult.alerts || [])];
@@ -687,6 +728,7 @@ export async function runDaemonLoadOverlay({
     root, ref, homeBranch: base, registered: true, mergedAnything: !!rebuildResult.moved,
     adopted: !!rebuildResult.adopted && check.inHead, reason: rebuildResult.reason, alerts, head: rebuildResult.head,
     overlayInHead: check.inHead, installedCheck: check, followUps,
+    ...(waited ? { waitedMs: Math.max(0, clock() - started) } : {}),
     ...(staleAdopt ? { staleAdopt } : {}),
     ...((staleAdopt || rebuildResult.adopted) && !check.inHead ? {
       reason: 'installed-build-lacks-overlay', rebuildReason: rebuildResult.reason, pending: true,
@@ -694,11 +736,11 @@ export async function runDaemonLoadOverlay({
     } : {}),
     warnings, ...(ctl.ran ? { dispatchSmoke: { ...ctl } } : {}),
   };
-  if (!ctl.ran || ctl.result?.ok) return out;
+  if (!ctl.ran || ctl.result?.ok) return finishWait(out);
 
-  return rollBack(out, ctl, () => rebuild({
+  return finishWait(await rollBack(out, ctl, () => rebuild({
     root, env, log, mainOnly: false, runSmoke: baseSmoke,
-  }));
+  })));
 }
 
 function parseFlags(argv) {

@@ -116,7 +116,7 @@ import { assertMainNotStale, behindFiles, gitRun, isCodePath } from '../lib/main
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
-import { workerTierFor, PROBATION_WORKERS } from '../lib/provider-routing.mjs';
+import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
 import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
@@ -1802,6 +1802,10 @@ export function routeDispatchProvider(request, {
   if (kind === 'build' && request.operatorPostBuild) {
     return launchAgent({ ...request, probationWorker: null, policyRoute: null });
   }
+  // A probation worker's checker runs inside the same detached arc, so its executable is owed before launch too.
+  const checkerAvailable = worker => !worker?.checker || providerAvailable(worker.checker, { provider: worker.checker });
+  // An operator's reasoned `--model` pin is a Claude pin on every route, policy or inherited.
+  const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
     let candidates = [request.policyRoute, ...request.policyRoute.fallback];
@@ -1817,11 +1821,9 @@ export function routeDispatchProvider(request, {
       veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider)));
     const workerFor = route => {
       if (!request.probationWorker || route.provider === 'claude') return null;
-      const id = route.provider === 'codex' ? 'codex' : route.model.startsWith('claude-') ? 'antigravity-claude' : 'antigravity-gemini';
-      return { ...PROBATION_WORKERS[id], taskType: request.probationWorker.taskType, model: route.model, effort: route.effort };
+      return probationWorkerForRoute(route, request.probationWorker.taskType);
     };
-    const pinnedModel = Boolean(String(request.modelReason ?? '').trim()) && extractModelFlag(request.extraArgs ?? []).found;
-    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && (route.provider === 'claude'
+    const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && checkerAvailable(workerFor(route)) && (route.provider === 'claude'
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
         && scriptExists(PROBATION_LAUNCHABLE_KINDS[kind].runScript))
       || (route.provider === 'codex' && registry[kind]?.runScript && scriptExists(registry[kind].runScript))));
@@ -1859,6 +1861,21 @@ export function routeDispatchProvider(request, {
   }
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
   // worker (see `dispatch-providers/probation-worker.mjs#probationLaunchDecision` for every condition).
+  // An inherited pick has no policy fallback chain, so the same pre-launch checks apply here: a pinned model goes
+  // to Claude, and a pick whose executable (or checker's) is missing yields to the router's next eligible worker
+  // (`alternates`, rotation order), then to the unchanged path below — never a doomed detached run.
+  if (request.probationWorker && probationLaunchDecision(request, probationLaunch).launch) {
+    const { alternates = [], ...primary } = request.probationWorker;
+    const ready = w => probationLaunchDecision({ ...request, probationWorker: w }, probationLaunch).launch
+      && providerAvailable(w.provider, { provider: w.provider, model: w.model, effort: w.effort }) && checkerAvailable(w);
+    const chosenWorker = pinnedModel ? null : [primary, ...alternates].find(ready) ?? null;
+    if (chosenWorker?.id !== primary.id) {
+      const why = pinnedModel ? 'pinned model' : `${primary.id} executable or checker unavailable`;
+      console.error(chosenWorker ? `routing-fallback: ${kind} → probation worker ${chosenWorker.id} (${why})`
+        : `routing-fallback: ${kind} → unchanged path (${why})`);
+    }
+    request = { ...request, probationWorker: chosenWorker };
+  }
   if (probationLaunchDecision(request, probationLaunch).launch) {
     if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
     const runScript = PROBATION_LAUNCHABLE_KINDS[kind].runScript;
