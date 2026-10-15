@@ -1559,13 +1559,22 @@ function dispatchReviewRow({
       });
       return;
     }
-    refuse('already-reviewed-head', {
-      ...withPhase, headSha, reviewedSha, ...extra,
-      why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
-        ' review — dispatching another review for a commit nobody has touched since risks a second,' +
-        ' contradicting verdict landing on it (#2588)',
-    });
-    return;
+    // live #5323 — the drain re-stamped acceptance after a content-preserving rebase, but the
+    // advisory still covers the old head. A `needs-human` PR is owed one advisory on the live head:
+    // review-pr INVARIANT 2 never accepts a `review:human` PR, so the #2588 contradicting-verdict
+    // risk does not apply. Fall through to the ordinary review gates; needs-review keeps the refusal.
+    const { advisoryIsCurrent, unpinnedAdvisory } = advisoryHeadState(pr);
+    if (withPhase?.phase === 'needs-human' && !advisoryIsCurrent && !unpinnedAdvisory) {
+      extra = { ...extra, advisoryOwed: true };
+    } else {
+      refuse('already-reviewed-head', {
+        ...withPhase, headSha, reviewedSha, ...extra,
+        why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
+          ' review — dispatching another review for a commit nobody has touched since risks a second,' +
+          ' contradicting verdict landing on it (#2588)',
+      });
+      return;
+    }
   }
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and

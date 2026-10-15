@@ -80,6 +80,7 @@ describe('runner freshness policy', () => {
         "heavy-queue",
         "item-activity",
         "land-advance",
+        "land-human-only",
         "live-state",
         "live-work",
         "maintenance",

@@ -5,8 +5,8 @@ size: 1
 status: open
 scope: ["we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-14"
-preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "24d9ebca8ca0b935093575ddbcac52f217c0a6d2"
 tags: []
 ---
 
@@ -15,6 +15,8 @@ tags: []
 Held finding 237 reported an immediate rebuild-in-progress result despite an explicit wait budget. Preserve that goal for an explicit overlay load: wait within the configured budget, retry through the existing rebuild machinery, and report adoption only after verifying the requested overlay is installed.
 
 ## Progress
+
+- Rechecked at 24d9ebca8: original premise was an explicit wait yielding immediately; corrected scope remains the legacy explicit loader plus its existing matching test, not ordinary daemon ticks or the versioned waiter. The initial call at `we:scripts/lib/daemon-load-overlay.mjs:642` still has no busy retry; the follow-up at `we:scripts/lib/daemon-load-overlay.mjs:662` requires an adopted result first. The live-lease refusal is at `we:scripts/lib/daemon-rebuild/prepare.mjs:484`, and the remaining-budget injection is supported by `we:scripts/lib/daemon-rebuild/rebuild.mjs:86`. Retain size 1 (approximately 70 source + 110 test lines). All five preparation sections below remain applicable; no implementation or live adoption was performed. Runner-owned stamps are unchanged.
 
 - Current-checkout recheck at 6d77e9169: retain the corrected loader-plus-test scope and size 1. The explicit loader still makes a single initial rebuild call at `we:scripts/lib/daemon-load-overlay.mjs:642`; the live-lease refusal remains at `we:scripts/lib/daemon-rebuild/prepare.mjs:482`. The concrete existing budget override is `lockOpts.waitMs`, merged last at `we:scripts/lib/daemon-rebuild/rebuild.mjs:86`; use that seam rather than inventing a top-level wait option. Existing prepared dates and hashes are left unchanged for the runner.
 

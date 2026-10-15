@@ -217,7 +217,7 @@ describe('the lane comes from the tick core or nowhere', () => {
   it('does not declare a `lane` input — a caller cannot ask for one', () => {
     const { declaration } = registryFor();
     // `modelReason` records a model override; `tickFile` reuses the caller's bookkeeping-bound tick.
-    expect(Object.keys(declaration.input).sort()).toEqual(['bookkeepingFile', 'expectedWithinMinutes', 'modelReason', 'num', 'tickFile']);
+    expect(Object.keys(declaration.input).sort()).toEqual(['bookkeepingFile', 'expectedWithinMinutes', 'groupMembers', 'modelReason', 'num', 'tickFile']);
     expect(declaration.input.num.type).toBe('string'); // an id may be a `xNNNNNN` hash, never only a number
     expect(declaration.input.expectedWithinMinutes.default).toBe(DEFAULT_EXPECTED_WITHIN_MINUTES);
   });
@@ -3252,7 +3252,7 @@ describe('#3110 — fillBrief tolerates a blank OPTIONAL placeholder (ATTEMPT_TA
   });
 
   it('OPTIONAL_BRIEF_PLACEHOLDERS names exactly ATTEMPT_TAG, and only the build kind carries it', () => {
-    expect(OPTIONAL_BRIEF_PLACEHOLDERS).toEqual(['ATTEMPT_TAG']);
+    expect(OPTIONAL_BRIEF_PLACEHOLDERS).toEqual(['ATTEMPT_TAG', 'GROUP_MEMBERS']);
     expect(BRIEF_PLACEHOLDERS).toContain('ATTEMPT_TAG');
     expect(BRIEF_REQUIRED_BY_KIND.build).toContain('ATTEMPT_TAG');
     expect(BRIEF_REQUIRED_BY_KIND.prepare).not.toContain('ATTEMPT_TAG');
@@ -3610,5 +3610,46 @@ describe('#4649 locus admission', () => {
   });
   it.each([undefined, { multiRepo: false, keys: ['we'] }, { multiRepo: false, keys: ['plateau-app'] }])('preserves supported/legacy reads: %j', (locus) => {
     expect(runTo(tickRead({ locus })).run.verdict.dispatching).toBe(true);
+  });
+});
+
+describe('grouped dispatch payload and prepare brief', () => {
+  it('leases every grouped prepare card through dispatch shaping and probation argv', async () => {
+    const { probationWorkerDetachedProvider } = await import('../dispatch-providers/probation-worker.mjs');
+    const raw = tickRead({ launchKind: 'prepare-item', groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md' },
+      { num: '3039', specPath: 'backlog/3039-other.md' },
+    ] });
+    const grouped = shapeDispatchRead(raw, { num: '3037', groupMembers: '3038,3039' });
+    expect(grouped.scope).toEqual(['we:backlog/3037-declare-dispatch.md', 'we:backlog/3038-member.md', 'we:backlog/3039-other.md']);
+    let argv;
+    probationWorkerDetachedProvider({ ...grouped, probationWorker: { id: 'codex', provider: 'codex', model: 'model', taskType: 'prepare' } }, {
+      spawnDetached: a => { argv = a; return { pid: 1 }; }, logPathFor: () => '/tmp/unused',
+    });
+    expect(argv).toContain(`--scope=${grouped.scope.join(',')}`);
+    expect(argv).toContain('--group-members=3038,3039');
+  });
+  it('refuses grouped preparation when a member card cannot be resolved', () => {
+    expect(() => shapeDispatchRead(tickRead({ launchKind: 'prepare-item' }), { num: '3037', groupMembers: '3038' })).toThrow(/group.*member/i);
+  });
+  it('carries validated members from operation input into the effect payload', () => {
+    const { run } = runTo(tickRead({ groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md', scope: ['we:docs/member.md'] },
+      { num: 'xabc123', specPath: 'backlog/xabc123-member.md', scope: ['we:docs/other.md'] },
+    ] }), { num: '3037', groupMembers: '3038,xabc123' });
+    expect(run.effects[0].payload.groupMembers).toEqual(['3038', 'xabc123']);
+    expect(run.effects[0].payload.scope).toEqual(['we:scripts/operations/', 'we:docs/member.md', 'we:docs/other.md']);
+  });
+  it('refuses malformed group member ids', () => {
+    expect(() => shapeDispatchRead(tickRead(), { num: '3037', groupMembers: '3038,../bad' })).toThrow(/group.*member/i);
+  });
+  it('fills grouped prepares and removes the optional token for a single prepare', () => {
+    const raw = tickRead({ launchKind: 'prepare-item', briefTemplate: 'Prepare {{ITEM_NUM}}. {{GROUP_MEMBERS}}',
+      groupItems: [{ num: '3038', specPath: 'backlog/3038-member.md' }, { num: '3039', specPath: 'backlog/3039-other.md' }] });
+    const grouped = shapeDispatchRead(raw, { num: '3037', groupMembers: '3038,3039' });
+    expect(grouped.prompt).toContain('GROUPED PREPARE');
+    expect(grouped.prompt).toContain('cards #3038, #3039 in addition to #3037');
+    expect(grouped.prompt).toContain("'Not prepared'");
+    expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe('Prepare 3037. ');
   });
 });

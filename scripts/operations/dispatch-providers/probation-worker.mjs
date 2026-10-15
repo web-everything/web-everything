@@ -122,6 +122,9 @@ export function probationWorkerDetachedProvider(request, {
   const kind = String(request?.launchKind ?? '');
   const sessionSlug = String(request?.sessionSlug ?? '').trim();
   const num = normNum(request?.num);
+  if (request?.groupMembers?.length && (kind !== 'prepare-item' || worker?.taskType !== 'prepare')) {
+    throw notApplied('dispatch-lane: grouped probation requests require prepare-item in prepare mode');
+  }
   if (!worker?.id || !worker?.provider || !worker?.model) throw notApplied('dispatch-lane: refusing a probation launch with no probation worker');
   if (!sessionSlug) throw notApplied(`dispatch-lane: refusing a probation '${kind}' launch with no session slug`);
 
@@ -139,6 +142,7 @@ export function probationWorkerDetachedProvider(request, {
     argv = [String(script), `--num=${num}`, `--session=${sessionSlug}`, `--worker=${JSON.stringify(worker)}`];
     const attemptTag = typeof request?.attemptTag === 'string' ? request.attemptTag : '';
     if (attemptTag) argv.push(`--attempt=${attemptTag}`);
+    if (request.groupMembers?.length) argv.push(`--group-members=${request.groupMembers.join(',')}`);
   } else if (kind === 'ci-heal') {
     const pr = normNum(request?.pr);
     const reason = String(request?.reason ?? '').trim() || 'red-ci';
