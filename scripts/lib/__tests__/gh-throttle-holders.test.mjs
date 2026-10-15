@@ -3,8 +3,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough } from '../gh-throttle.mjs';
-import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
+import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough, classifyGhWrite, ghCallerPriority, classifyGhResource } from '../gh-throttle.mjs';
+import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, isGhWatch, ghOpLabel, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
 import { readLockEntry, reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
 import { slotPath } from '../../readiness/heavy-admission.mjs';
 
@@ -179,6 +179,51 @@ describe('hold policy and execution', () => {
     expect(ghExecOptions({}, ['api'], { ...policy, maxHoldSeconds: 0 })).toEqual({});
     for (const a of [['run', 'watch'], ['pr', 'checks', '--watch']]) expect(ghExecOptions({ timeout: 7 }, a, policy)).toEqual({});
   });
+  // gh parses with cobra/pflag: global flags may precede the command, bool flags take `--flag=value`,
+  // and a value flag consumes the next argument even when it starts with `--`.
+  it.each([
+    ['run', 'watch'], ['run', 'watch', '123'], ['--repo', 'o/r', 'run', 'watch', '123'], ['-R', 'o/r', 'run', 'watch'],
+    ['run', '-R', 'o/r', 'watch', '123'], ['-Ro/r', 'run', 'watch'], ['--repo=o/r', 'run', 'watch'],
+    ['pr', 'checks', '--watch'], ['pr', 'checks', '123', '--watch=true'], ['pr', 'checks', '123', '--watch=1'], ['pr', 'checks', '--watch=T'],
+    ['--repo', 'o/r', 'pr', 'checks', '123', '--watch'], ['pr', '-R', 'o/r', 'checks', '--watch'], ['pr', 'checks', '--required', '--watch'],
+    ['pr', 'checks', '--fail-fast', '-w', '--watch'], ['pr', 'checks', '-i', '5', '--watch'], ['pr', 'checks', '-wRo/r', '--watch'],
+    ['pr', 'checks', '--watch=false', '--watch'],
+  ].map(a => [a]))('treats a valid watch invocation as watch: %j', (args) => {
+    expect(isGhWatch(args)).toBe(true);
+    expect(ghExecOptions({ timeout: 7 }, args, policy)).toEqual({});
+  });
+  it.each([
+    ['pr', 'comment', '123', '--body', '--watch'], ['pr', 'checks', '123', '--jq', '--watch'], ['pr', 'checks', '-q', '--watch'],
+    ['pr', 'checks', '-t', '--watch'], ['pr', 'checks', '-wq', '--watch'], ['pr', 'checks', '--watch=false'], ['pr', 'checks', '--watch', '--watch=0'],
+    ['pr', 'checks', '--watch=maybe'], ['pr', 'checks', '--', '--watch'], ['pr', '--', 'checks', '--watch'], ['api', '-f', '--watch'],
+    ['api', 'repos/o/r', '--watch'], ['run', 'view', 'watch'], ['--repo', 'run', 'watch'], ['issue', 'list', '--search', 'run watch'],
+    ['pr', 'view', 'checks', '--watch'], ['pr', '--watch', 'checks'], [],
+  ].map(a => [a]))('does not treat an argument value or other command as watch: %j', (args) => {
+    expect(isGhWatch(args)).toBe(false);
+    expect(ghExecOptions({ timeout: 7 }, args, policy)).toEqual({ timeout: 7 });
+    expect(ghExecOptions({}, args, policy)).toEqual({ timeout: 90000, killSignal: 'SIGTERM' });
+  });
+  it.each([
+    [['--repo', 'o/r', 'run', 'watch', '123'], 'run watch'], [['pr', '-R', 'o/r', 'checks', '1'], 'pr checks'],
+    [['--repo=o/r', 'pr', 'view'], 'pr view'], [['-R', 'pr', 'issue', 'list'], 'issue list'], [['api', '-X', 'GET', 'user'], 'api'],
+  ])('labels the operation from command positions, not fixed indices: %j', (args, label) => {
+    expect(ghOpLabel(args)).toBe(label);
+  });
+  it.each([
+    [['-R', 'o/r', 'pr', 'comment', '1', '--body', 'x'], true], [['--repo=o/r', 'issue', 'close', '1'], true], [['run', '-R', 'o/r', 'cancel', '1'], true],
+    [['api', '-X', 'DELETE', 'repos/o/r/labels/x'], true], [['api', '--method=POST', 'repos/o/r'], true], [['api', '-XPATCH', 'repos/o/r'], true],
+    [['api', '--method', 'POST', '--method', 'GET', 'repos/o/r'], false], [['api', '-X', 'GET', 'repos/o/r', '-f', 'per_page=1'], false],
+    [['api', 'repos/o/r/labels', '-fname=x'], true], [['api', 'repos/o/r/labels', '--field=name=x'], true], [['api', 'repos/o/r', '--raw-field=a=b'], true],
+    [['-R', 'o/r', 'pr', 'view', '1'], false], [['pr', 'view', 'comment'], false],
+  ])('classifies a write from gh command positions and every method spelling: %j', (args, write) => {
+    expect(classifyGhWrite(args)).toBe(write);
+  });
+  it('resolves land priority and the rate-limit bucket past leading global flags', () => {
+    expect(ghCallerPriority('pr-land', ['-R', 'o/r', 'pr', 'merge', '1'])).toBe('critical');
+    expect(ghCallerPriority('pr-land', ['-R', 'o/r', 'pr', 'view', '1'])).toBe('normal');
+    expect(classifyGhResource(['-R', 'o/r', 'pr', 'list'])).toBe('graphql');
+    expect(classifyGhResource(['--repo', 'o/r', 'run', 'list'])).toBe('core');
+  });
   it.each([90, 0])('applies the timeout to both real execution paths (%s)', (maxHoldSeconds) => {
     const env = { WE_GH_THROTTLE_MAX_HOLD_SECONDS: String(maxHoldSeconds), WE_GH_THROTTLE_COST_HEADERS: '1' };
     const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok'), stderr: Buffer.alloc(0) }));
@@ -196,8 +241,22 @@ describe('hold policy and execution', () => {
     const throttle = { lockRoot: root, logPath, env: {}, spawn, budgetPerMin: 100 };
     runGhSync(['run', 'watch'], { timeout: 1, throttle });
     runGhCliPassthrough(['pr', 'checks', '--watch'], { throttle, spawn });
+    runGhSync(['--repo', 'o/r', 'run', 'watch', '123'], { throttle });
+    runGhCliPassthrough(['pr', 'checks', '123', '--watch=true'], { throttle, spawn });
     expect(spawn.mock.calls.every((c) => c[2].timeout === undefined)).toBe(true);
+    expect(rows().filter((r) => r.outcome === 'call')).toHaveLength(4);
     expect(rows().filter((r) => r.outcome === 'call').every((r) => r.unslotted === 'watch')).toBe(true);
+  });
+  it('a literal --watch argument value still takes a slot and keeps its timeout in both paths', () => {
+    const spawn = vi.fn(() => {
+      expect(readGhSlotHolders({ lockRoot: root, cap: 6 })).toHaveLength(1);
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    });
+    const throttle = { lockRoot: root, logPath, env: {}, spawn, budgetPerMin: 100 };
+    runGhSync(['pr', 'comment', '123', '--body', '--watch'], { timeout: 7, throttle });
+    runGhCliPassthrough(['pr', 'comment', '123', '--body', '--watch'], { throttle, spawn });
+    expect(spawn.mock.calls.map((c) => c[2].timeout)).toEqual([7, 90000]);
+    expect(rows().filter((r) => r.outcome === 'call').some((r) => r.unslotted)).toBe(false);
   });
   it('preserves native subprocess timeout fields and logs both execution paths', () => {
     const args = ['-e', 'setInterval(() => {}, 1000)'];

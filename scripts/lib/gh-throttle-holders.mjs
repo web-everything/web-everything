@@ -26,9 +26,28 @@ export function ghHolderPolicy(env = process.env) {
 // payloads are deliberately omitted: a credential denylist cannot make arbitrary argv safe.
 const commands = new Set('api auth browse cache codespace completion config extension gist gpg-key issue label org pr project release repo ruleset run search secret ssh-key status variable workflow'.split(' '));
 const verbs = new Set('add archive cancel checks clone close comment create delete diff download edit export fork get import inspect list lock login logout merge pin ready rename reopen rerun restore review set setup-git show status sync unlock unpin upload view watch'.split(' '));
+// gh parses argv with cobra/pflag, so command words are not at fixed indices: flags may precede them
+// (`gh --repo o/r run watch`). Cobra's walk (stripFlags) skips a flag without `=` together with the
+// next argument unless the flag is a known boolean, and `--` ends it. Above the leaf only help/version
+// are boolean (`-R/--repo` takes a value).
+const groupBools = { long: new Set(['help', 'version']), short: new Set(['h']) };
+function ghCommandWords(args) {
+  const words = [];
+  for (let i = 0; Array.isArray(args) && i < args.length && words.length < 2; i++) {
+    const s = typeof args[i] === 'string' ? args[i] : '';
+    if (s === '--') break;
+    const long = s.startsWith('--') && !groupBools.long.has(s.slice(2));
+    if (!s.includes('=') && (long || (s.length === 2 && s[0] === '-' && !groupBools.short.has(s[1])))) i++;
+    else if (s !== '' && !s.startsWith('-')) words.push({ word: s, at: i });
+  }
+  return words;
+}
+/** The first two command words (`['pr', 'merge']`) as gh itself finds them. */
+export function ghCommandPath(args) { return ghCommandWords(args).map(w => w.word); }
 export function ghOpLabel(args = []) {
-  if (!Array.isArray(args) || !commands.has(args[0])) return 'unknown';
-  return args[0] !== 'api' && verbs.has(args[1]) ? `${args[0]} ${args[1]}` : args[0];
+  const [cmd, verb] = ghCommandPath(args);
+  if (!commands.has(cmd)) return 'unknown';
+  return cmd !== 'api' && verbs.has(verb) ? `${cmd} ${verb}` : cmd;
 }
 export function redactGhArgs(args = []) { return `${ghOpLabel(args)}${args.length > 1 ? ' <redacted>' : ''}`; }
 
@@ -62,7 +81,39 @@ export function ghHolderMeta({ caller, args, pid = process.pid, ppid = process.p
     parent: sanitizeHolderField(basename(process.argv[1] || ''), 'parent'), acquiredAt: new Date(nowMs).toISOString(),
     ...(Number.isFinite(timeoutMs) && timeoutMs >= 0 ? { timeoutMs } : {}) };
 }
-export function isGhWatch(args) { return args?.includes('--watch') || (args?.[0] === 'run' && args?.[1] === 'watch'); }
+// The leaf's own flags are parsed by pflag over the args minus the command words: a value flag consumes
+// the next argument even when it starts with `--` (`pr comment --body --watch`), a boolean also takes
+// `--flag=<bool>`, the last occurrence wins, and a short group `-wR` ends at its first value flag.
+const watchLeaves = { 'pr checks': { long: new Set(['help', 'watch', 'fail-fast', 'required', 'web']), short: new Set(['h', 'w']) } };
+const pflagTrue = new Set(['1', 't', 'T', 'TRUE', 'true', 'True']);
+function pflagLongValue(args, bools, name) {
+  let value;
+  for (let i = 0; i < args.length; i++) {
+    const s = typeof args[i] === 'string' ? args[i] : '';
+    if (s === '--') break;
+    if (s.startsWith('--')) {
+      const eq = s.indexOf('='), key = eq < 0 ? s.slice(2) : s.slice(2, eq);
+      if (eq >= 0) { if (key === name) value = s.slice(eq + 1); } else if (bools.long.has(key)) { if (key === name) value = 'true'; } else i++;
+    } else if (s.length > 1 && s[0] === '-') {
+      for (let j = 1; j < s.length; j++) {
+        if (s[j + 1] === '=') break; // `-x=value`: the rest of the group is its value
+        if (bools.short.has(s[j])) continue;
+        if (j === s.length - 1) i++; // a value flag ending the group takes the next argument
+        break; // otherwise the rest of the group is its value
+      }
+    }
+  }
+  return value;
+}
+export function isGhWatch(args) {
+  const words = ghCommandWords(args);
+  const path = words.map(w => w.word).join(' ');
+  if (path === 'run watch') return true;
+  const leaf = watchLeaves[path];
+  if (!leaf) return false;
+  const rest = args.filter((_, i) => !words.some(w => w.at === i));
+  return pflagTrue.has(pflagLongValue(rest, leaf, 'watch'));
+}
 export function ghExecOptions(opts, args, policy) {
   if (isGhWatch(args)) { const { timeout, ...rest } = opts; return rest; }
   return policy.maxHoldSeconds > 0 && opts.timeout === undefined ? { ...opts, timeout: policy.maxHoldSeconds * 1000, killSignal: opts.killSignal ?? 'SIGTERM' } : opts;

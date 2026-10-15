@@ -308,15 +308,22 @@ export function resolveGhWriteBudgetPerMin(env = process.env) {
  */
 export function classifyGhWrite(args) {
   const a = Array.isArray(args) ? args : [];
-  const cmd = a[0];
-  const sub = a[1];
+  // Command words by gh's own parse, so a leading `-R o/r` cannot hide a mutation from the write budget.
+  const [cmd, sub] = ghCommandPath(a);
   if (cmd === 'pr') return ['edit', 'comment', 'close', 'merge', 'reopen', 'ready', 'create', 'review'].includes(sub);
   if (cmd === 'issue') return ['edit', 'comment', 'close', 'reopen', 'create'].includes(sub);
   if (cmd === 'label') return ['create', 'delete', 'edit'].includes(sub);
   if (cmd === 'run') return ['cancel', 'rerun'].includes(sub);
   if (cmd === 'api') {
-    const methodIdx = a.indexOf('--method');
-    const method = methodIdx >= 0 ? String(a[methodIdx + 1] || '').toUpperCase() : null;
+    // Every pflag spelling of the method (`--method X`, `--method=X`, `-X X`, `-XX`, `-X=X`); the last one wins.
+    let method = null;
+    a.forEach((t, i) => {
+      if (typeof t !== 'string') return;
+      if (t === '--method' || t === '-X') method = String(a[i + 1] || '');
+      else if (t.startsWith('--method=')) method = t.slice(9);
+      else if (/^-X./.test(t)) method = t.slice(2).replace(/^=/, '');
+    });
+    method = method ? method.toUpperCase() : null;
     if (method) return method !== 'GET' && method !== 'HEAD';
     // `gh api graphql -f query=…` is POST only because of the flag. Read exemption is an ALLOWLIST: only an
     // inline `-f/--raw-field query=<text with no mutation>` and no `--input`/`@file` value anywhere. A `query=@file`
@@ -325,7 +332,7 @@ export function classifyGhWrite(args) {
       const qi = a.findIndex((t, i) => (t === '-f' || t === '--raw-field') && typeof a[i + 1] === 'string' && a[i + 1].startsWith('query=') && !a[i + 1].startsWith('query=@'));
       if (qi >= 0 && !/\bmutation\b/i.test(a[qi + 1])) return false;
     }
-    return a.some((t) => t === '-f' || t === '-F' || t === '--field' || t === '--raw-field' || t === '--input');
+    return a.some((t) => typeof t === 'string' && /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(t));
   }
   return false;
 }
@@ -568,7 +575,7 @@ function normalizeGhCaller(caller) {
 export function ghCallerPriority(caller, args = []) {
   const name = normalizeGhCaller(caller);
   if (/^(review-daemon|review-set-label|review-pr|merge-ai-prs)(:|$)/.test(name)) return 'critical';
-  if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || args[0] === 'pr' && args[1] === 'merge')) return 'critical';
+  if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || ghCommandPath(args).join(' ') === 'pr merge')) return 'critical';
   if (/^ci-heal(?:-run|-pr-dispatch)?(:|$)/.test(name) && (name.includes(':push') || classifyGhWrite(args))) return 'critical';
   if (/^(dispatch-plan|parked-pr-conflict-watch|parked-pr-progress-watch|active-progress-watch|progress-board|lane-whois|reconcile-pass|reconcile-fix-dispatch|reconcile-snapshot)(:|$)/.test(name)) return 'background';
   return 'normal';
@@ -1117,7 +1124,7 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 
 // Card 338: slot holder record, hold reaping and per-caller cap live in their own module (imported here, not
 // in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
-import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, sanitizeGhHolder } from './gh-throttle-holders.mjs';
+import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, sanitizeGhHolder } from './gh-throttle-holders.mjs';
 
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
@@ -1313,8 +1320,9 @@ export const MAX_BUDGET_BLOCK_MS = 65 * 60_000;
 export function classifyGhResource(args) {
   const a = Array.isArray(args) ? args.map(String) : [];
   // Not led by 'pr': multi-repo-scan reads any `['pr', …]` literal as gh argv and would flag it as repo-less.
-  if (['issue', 'pr', 'repo', 'project', 'search'].includes(a[0])) return 'graphql';
-  if (a[0] === 'api') {
+  const [cmd] = ghCommandPath(a);
+  if (['issue', 'pr', 'repo', 'project', 'search'].includes(cmd)) return 'graphql';
+  if (cmd === 'api') {
     const positional = a.slice(1).filter((t, i, arr) => !t.startsWith('-') && !(i > 0 && /^-(X|H|f|F|q|t|p)$|^--(method|header|field|raw-field|jq|template|input|preview|hostname|cache)$/.test(arr[i - 1])));
     return positional[0] === 'graphql' ? 'graphql' : 'core';
   }
