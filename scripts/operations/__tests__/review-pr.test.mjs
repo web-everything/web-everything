@@ -266,6 +266,16 @@ async function driveToRecordDeclared({
 }
 
 const BASE_INPUT = { pr: 1234, repo: 'web-everything/web-everything' };
+
+it('cannot reduce clean juror answers to accept while an operator send-back remains open', () => {
+  const comments = [{ id: 'SB1', author: { login: 'chalbert' }, createdAt: '2026-10-14T20:07:00Z',
+    body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nOperator send-back at head e5ed9cb74.\nMUST FIX the original guard.' }];
+  const { registry } = registryFor({ comments, netRev: '245c40542' + 'b'.repeat(31) });
+  const { run, requests } = atConfirm({ registry, input: BASE_INPUT, id: 'operator-send-back-reduction' });
+  expect(run.findings.read.openOperatorSendBacks.map(item => item.id)).toEqual(['SB1']);
+  expect(run.findings.reduce.verdict).toBe('changes');
+  for (const request of Object.values(requests)) expect(request.input).toContain('MUST FIX the original guard.');
+});
 /** Card 84 — both mandatory seats shadowed by agy, plus the advisory agy seat. */
 const AGY_SEAT_SETTINGS = Object.freeze({
   seatProvider: { correctness: 'shadow', security: 'shadow' }, agyModel: 'claude-opus-5-5-high', agyCorrectnessAdvisory: true,

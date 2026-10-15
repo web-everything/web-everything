@@ -661,6 +661,19 @@ pinned to `CONSTELLATION_REPOS` by `scripts/lib/__tests__/review-core.test.mjs`.
 
 ### Operator notification probes
 
+Operator send-back regressions replay the whole PR thread, including a newer mechanical conflict bounce,
+fix-end and advisory accept. `scripts/lib/operator-send-backs.mjs` owns resolution: trusted fix evidence must
+explicitly name the request and a different head (short/full SHA spellings of the same commit do not count).
+Acceptance labels alone never clear it. Evidence comments begin with a standalone `## Fix evidence` heading
+or a standalone addresses marker (optionally preceded by `Head:`). Reviewer prose, blockquotes, fenced and
+indented examples of those formats must never resolve a request, even from a trusted author. Keep evidence
+markers in fixer prompts and replay quoted instructions through queue holds and verdict reduction. Verify the
+complete comment reader retains URLs, and exercise planning, resumed prompts, review reduction, red-team
+input fingerprints and both operator-queue entry paths. Unknown send-back heads remain open conservatively.
+Partial operator-queue CLI copies load the send-back reader optionally, report import errors, and withhold
+all readiness when it is unavailable. Notice retry receipts stay separate from thread-derived `noticedRungs`
+and are scoped to the dispatch target, head and rung; a failed post must remain retryable.
+
 `operator-notify` consumes only `operator-queue`'s `ready` rows. Tests inject the notifier,
 including child CLI probes; never exercise real desktop delivery in this suite. Persisted
 successes deduplicate until an item leaves NEEDS YOU; queue errors preserve all prior keys.
@@ -871,6 +884,19 @@ or failed seal is archived before the active slot is replaced with its sequence 
 existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage alongside transport
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
+
+### Grouped build recovery
+
+Grouped members have no worker run row of their own. Restart adoption must use the lead's
+PID, session liveness or bound resume marker, using the single-card liveness classifier.
+Only the lead resumes or settles that worker; the daemon's grouped retirement path owns
+member cleanup. Probe real member claim files with a dead daemon PID and a live lead,
+including session and resumed-worker evidence. Recovery carries the durable dispatch's
+full member list through resumability, resume argv and wrapper publication; a missing
+original dispatch record refuses publication. Member claim edits are wrapper-owned,
+while unrelated card edits still refuse recovery. Test generated mixed numeric/hash
+`Resolves` lines through the real resolution reader, retaining diff corroboration and
+bornAs alias checks for hashes.
 
 ### Enqueue catch-up ordering
 

@@ -494,11 +494,14 @@ jobs:
     needs: daemon-soak-scope
     if: needs.daemon-soak-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # Measured 2026-10-14 (PR #5260 run): balanced shards run ~10-13 min wall; stale stored timings had left
-    # shard 3 at ~16 min (cancelled at the old 15-min cap, on main too). Keep main's 25-min cap for runner headroom:
-    # the 50-tick baseline took 550s on the last green run and hit the old 10-min vitest cap at 615s on main.
-    # The vitest timeout (`vitest.soak.config.ts`, now 17 min) must stay below this job cap.
-    timeout-minutes: 25
+    # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
+    # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
+    # 15m15s mid-`scorecard-dirt` with no assertion failing, which reddened the required `daemon-soak` aggregate.
+    # Shard 1's 50-tick baseline also took 550s on the last green run and hit the old 10-min Vitest cap at 615s
+    # on main at 8cd0b3d12. Its new 17-min timeout (`vitest.soak.config.ts`) must stay below this job cap.
+    # 30 min leaves real headroom for a slow runner while still killing a HUNG shard long before GitHub's 360-min
+    # default would.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
