@@ -992,7 +992,8 @@ export function defaultReadAttributedRequiredChecks({
  * a `declared`/`fallback`/`unavailable` result, or a stale entry that was declared — never a substituted default:
  * a guessed set like `['test']` would classify a PR that has already reported a DIFFERENT required context
  * (`smoke`) as "missing every run" and trigger CI it does not need (PR #2740 review). A classic set that was read
- * and is empty is preserved as `[]` (no required context → nothing can be missing). On `null`,
+ * and is empty is preserved as `[]` only when the full required set is also empty. An empty classic subset
+ * beside ruleset requirements returns `null`, keeping ruleset-only missing-run recovery enabled. On `null`,
  * {@link buildMissingRunCandidates} falls back to its narrower name-free "no CI-workflow check at all" test.
  * @param {{repo?:string|null, branch?:string, readRequiredChecks?:Function}} [o]
  * @returns {string[]|null}
@@ -1004,7 +1005,11 @@ export function defaultReadRequiredContexts({
   try {
     const result = readRequiredChecks({ repo, branch });
     if (result?.source === 'declared' || result?.source === 'fallback' || result?.source === 'unavailable') return null;
-    return Array.isArray(result?.classic) ? result.classic.filter((n) => typeof n === 'string' && n) : null;
+    if (!Array.isArray(result?.classic)) return null;
+    const classic = result.classic.filter((n) => typeof n === 'string' && n);
+    // Ruleset-only protection is not an empty required set: allow the attributed partial-rollup test.
+    if (!classic.length && result.checks?.length) return null;
+    return classic;
   } catch {
     return null;
   }

@@ -826,10 +826,28 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', readRequiredChecks })).toBeNull();
   });
 
-  it('returns null (unknown) with no repo, and preserves a classic set that was read and is EMPTY as []', () => {
+  it('returns null (unknown) with no repo, and preserves a truly empty required set as []', () => {
     expect(defaultReadRequiredContexts({ repo: null, readRequiredChecks: vi.fn() })).toBeNull();
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
-      readRequiredChecks: () => ({ checks: ['merge-gate'], classic: [], source: 'live' }) })).toEqual([]);
+      readRequiredChecks: () => ({ checks: [], classic: [], source: 'live' }) })).toEqual([]);
+  });
+
+  it.each(['live', 'cache', 'stale-cache'])('keeps ruleset-only missing-run recovery enabled for a %s result', source => {
+    const shared = { checks: ['test', 'merge-gate'], classic: [], source };
+    const readRequiredContexts = options => defaultReadRequiredContexts({
+      ...options, readRequiredChecks: () => shared,
+    });
+    expect(readRequiredContexts({ repo: 'web-everything/web-everything' })).toBeNull();
+    const result = sweepMissingRunRecoveryWithIo({
+      repo: 'web-everything/web-everything', mainRuns: [], now: Date.parse('2026-10-15T19:00:00Z'),
+      readOpenPrs: () => [{ number: 5404, headRefName: 'lane/ruleset-only', headRefOid: 'ruleset-head',
+        baseRefName: 'main', mergeable: 'MERGEABLE',
+        statusCheckRollup: [{ ...greenCheck, workflowName: 'CI' }] }],
+      readRequiredContexts, readAttributedRequiredChecks: () => shared.checks,
+      readDeclaredContexts: () => null,
+      readHeadCommittedAt: () => '2026-10-14T00:00:00Z', readComments: () => [],
+    });
+    expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 5404 })]);
   });
 
   it.each(['declared', 'fallback', 'unavailable'])('maps a %s result to null even when it carries checks', (source) => {
