@@ -1267,15 +1267,21 @@ describe('#4315 durable referral effects', () => {
       netChangedFiles: ['x.mjs'], diffText: '+ change' },
       referrals: [{ seat: 'judgeCorrectnessAdvisory', original: { summary: 'broken', file: 'x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' } }] };
     const provider = {
-      readPrState: () => { trace.push('read'); return structuredClone(state); },
+      readPrState: () => { trace.push('read'); state.comments.forEach((c, i) => { c.id ??= `fixture-${i}`; }); return structuredClone(state); },
       postComment: (repo, pr, body) => {
         trace.push('post');
         if (!body.includes('<!-- mandatory-referrals-v1:')) { state.comments.push({ body, author: { login: 'web-everything' } }); return; }
         posts++;
         if (failure === 'post' || (failure === 'attempt' && posts === 2)
           || (['completion', 'failure-snapshot'].includes(failure) && posts === 3)) throw new Error('post unavailable');
-        if (failure !== 'read-back') state.comments.push({ body, author: { login: 'web-everything' } });
+        if (failure !== 'read-back') state.comments.push({ id: `comment-${posts}`, body, author: { login: 'web-everything' } });
         if (failure === 'changed-head') state.headRefOid = 'b'.repeat(40);
+      },
+      editComment: (id, body) => {
+        const index = state.comments.findIndex(c => c.id === id);
+        provider.postComment('o/n', 7, body);
+        const updated = state.comments.pop();
+        state.comments[index] = { ...updated, id };
       },
       setLabels: (repo, pr, plan) => { trace.push(`label:${plan.add}`); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; },
     };
@@ -1898,7 +1904,7 @@ describe('#4315 durable referral effects', () => {
     expect(renderReferralRecord(oldRecord(0, referrals)).length).toBeGreaterThan(60_000);
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     const posted = h.state.comments.slice(42);
-    expect(posted.length).toBeGreaterThan(3);
+    expect(posted.length).toBeGreaterThanOrEqual(3);
     for (const { body } of posted) expect(body.length).toBeLessThanOrEqual(60_000);
     const parsed = readReferralRecords(h.state.comments);
     expect(parsed.malformed).toBe(false);
@@ -2106,7 +2112,7 @@ describe('#4315 durable referral effects', () => {
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'next' });
     expect(result.pending).toEqual([]);
     expect(h.judge).toHaveBeenCalledTimes(2);
-    expect(h.state.comments).toHaveLength(6);
+    expect(h.state.comments).toHaveLength(2);
   });
   it('keeps referrals tool-free without a checkout', async () => {
     const h = harness();
@@ -2622,7 +2628,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     const state = { headRefOid: H1, body: '<!-- authored-by-actor: author -->', labels: ['review:pending'], comments: [], createdAt: '' };
     const trace = [];
     const provider = { readPrState: () => structuredClone(state), ensureLabel: () => {},
-      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ body, author: { login: 'web-everything' } }); },
+      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+      editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter((l) => !plan.remove.includes(l)), plan.add]; } };
     const referralJudge = vi.fn(async (request) => ({ sessionId: request.sessionId, value: { rulings: [] } }));
     const lines = [];
@@ -2677,8 +2684,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     const referralPosts = () => w.trace.filter((t) => t === 'referral').length;
     const advisoryPosts = () => w.trace.filter((t) => t === 'advisory').length;
     const [referralBefore, advisoryBefore] = [referralPosts(), advisoryPosts()];
-    // initial record, attempted snapshot; the empty ruling answer leaves the completed snapshot byte-identical to the attempted one, so it is never reposted (xuxcsw6)
-    expect(referralBefore).toBe(2);
+    // The attempt updates the original comment; an empty ruling answer posts nothing else.
+    expect(referralBefore).toBe(1);
     expect(advisoryBefore).toBe(0); // this fixture has no advisory humanRequired input
 
     // The same tool-less seat re-raises the same claim on the same head: the REPRODUCED answer proves the verifier is never consulted.

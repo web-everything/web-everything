@@ -4192,6 +4192,20 @@ generic `changes` answer, bouncing and retrying a PR whose code has nothing wron
 (reusing the file-then-notify shape `buildAcceptQueueEntry` already established), THEN treat the PR as
 accept-worthy — never re-enter the bounce loop over a documentation debt the code itself doesn't have.
 
+**Unattended acceptance boundary (operator, 2026-10-15; live PR #5366):** this refines the
+file-then-accept path above: `prevention-outstanding` still files the named prevention(s), then accepts,
+provided the live head has no open mandatory referrals and no finding in that verdict has impact `broken`
+without a `card` or `not-real` ruling. Open referrals with no operator ruling, including automatic-policy
+blocks, hold acceptance; a later review comment on that head never retires them. `needs-human` and `changes`
+still never auto-accept. Read referrals with
+`we:scripts/operations/record-referral-ruling.mjs#openReferralFindings`, preserving their run and finding keys
+until a ruling or head change. Cumulative referral snapshots update the original comment, retaining prior
+rulings, instead of repeating the operator ask. The boundary lives in
+`we:scripts/operations/review-loop-cli.mjs` with the pure gate in `we:scripts/lib/unattended-review-accept.mjs`.
+`review.unattendedAcceptRequiresCleanReferrals` defaults to `true` and resolves through the shared
+standard → platform → tool → env cascade with source logging (tool: `we:scripts/settings/review.json`;
+env: `WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS`).
+
 **A distinct mechanism from the enforce-flip above — not a loosening of it.**
 [#enforce-flip-triple-gated](#enforce-flip-triple-gated) (#2838) gates a *different* code path — the
 **scheduled shadow review runner**'s `landMode` (`we:scripts/lib/auto-land-seam.mjs` /
