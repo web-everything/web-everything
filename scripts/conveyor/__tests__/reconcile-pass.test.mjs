@@ -25,6 +25,55 @@ vi.mock('../../lib/required-status-checks.mjs', async (importOriginal) => {
 
 import { prFileContract } from './pr-file-test-helpers.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
+import { enrichPrsWithMechanicalRound } from '../mechanical-round-cap.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+
+describe('mechanical round enrichment port (#5948)', () => {
+  const head = 'b'.repeat(40), priorHead = 'a'.repeat(40);
+  const comment = (body, hour) => ({ author: { login: 'web-everything' }, body,
+    createdAt: `2026-10-10T${String(hour).padStart(2, '0')}:00:00Z` });
+  const snapshot = (ordinary = false) => ({ number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
+    baseRefName: 'main', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
+    comments: [...[1, 2, 3, 4, 5].map(h => comment(REARM_COMMENT_MARKER, h)),
+      comment(`🔁 review — changes requested\n\nRecorded by agent via unattended review-loop.\n\n### Findings\n- bad\n\n<!-- reviewed-sha: ${priorHead} -->`, 6),
+      comment(REARM_COMMENT_MARKER, 7), comment(CONFLICT_FIX_COMMENT_MARKER, 8),
+      ...(ordinary ? [comment(REARM_COMMENT_MARKER, 9)] : [])] });
+  const options = (p) => ({ readPrs: () => [p], readAgents: () => [], enrich: p => p,
+    readRequiredChecks: () => ({ checks: ['test'] }), resolveMainSha: () => null,
+    enrichMainRed: prs => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: p => p,
+    enrichBaseRef: p => p, enrichSystemFix: p => p, enrichEscalationBase: p => p,
+    enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p,
+    enrichLedgerHolds: p => p, enrichRulings: p => p, enrichScopeBloat: p => p,
+    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, env: { WE_REVIEW_ROUND_CAP: '5' },
+    now: Date.parse('2026-10-10T12:00:00Z') });
+
+  it.each([['we', false, true], ['we', true, false], ['frontierui', false, false],
+    ['plateau-app', false, false]])('gates IO for repo=%s countTowardCap=%s', async (repo, value, called) => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const enrichMechanicalRound = vi.fn(prs => {
+      if (!called) throw new Error('mechanical IO must be skipped');
+      return prs;
+    });
+    runReconcilePass({ ...options(snapshot()), repo, loadMechanicalRoundsSetting: () => ({ value, source: 'env' }),
+      enrichMechanicalRound });
+    expect(enrichMechanicalRound).toHaveBeenCalledTimes(called ? 1 : 0);
+    if (called) expect(enrichMechanicalRound).toHaveBeenCalledWith([snapshot()], { defaultBranch: 'main' });
+  });
+
+  it.each([false, true])('replays mechanical evidence through planning; newer ordinary=%s', async ordinary => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readFacts = vi.fn(() => ({ head, priorHead, proven: true, netDiffIdentical: false }));
+    const plan = runReconcilePass({ ...options(snapshot(ordinary)), repo: 'we',
+      loadMechanicalRoundsSetting: () => ({ value: false, source: 'env' }),
+      enrichMechanicalRound: prs => enrichPrsWithMechanicalRound(prs, { readFacts,
+        readRoundCommits: () => ({ head, ok: false, reason: 'fixture' }) }) });
+    expect(readFacts).toHaveBeenCalledTimes(ordinary ? 0 : 1);
+    expect(plan.dispatch.some(row => row.prNumber === 5948 && row.mechanicalRound), JSON.stringify(plan)).toBe(!ordinary);
+  });
+});
+
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
