@@ -36,6 +36,20 @@ const standDown = { id: 'SD1', body: `${STAND_DOWN_MARKER}\nNeed a ruling`, auth
 const answer = { id: 'A1', body: buildOperatorAnswer({ standDownId: 'SD1', reason: 'Proceed', actor: 'chalbert', channel: 'console' }), author: { login: 'web-everything' }, createdAt: '2026-10-11T11:00:00Z' };
 const pr = (number, comments) => ({ number, title: `PR ${number}`, labels: [], comments, mergeable: 'MERGEABLE' });
 
+it.each(['review:human', 'review:accepted'])('holds an unresolved operator send-back out of NEEDS YOU with %s', label => {
+  const oldHead = 'e5ed9cb74', head = '245c40542' + 'b'.repeat(31);
+  const comments = [{ id: 'SB1', author: { login: 'chalbert' }, createdAt: '2026-10-14T20:07:00Z',
+    body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nOperator send-back at head ${oldHead}.\nRepair the original guard.` },
+  { author: { login: 'web-everything' }, body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${'a'.repeat(40)}..${head}\`` }];
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(5243, comments), headRefOid: head,
+    labels: [{ name: label }, { name: 'advisory:accepted' }] }]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.ready).toEqual([]);
+  expect(report.notReady).toContainEqual(expect.objectContaining({ number: 5243,
+    reasons: expect.arrayContaining(['operator send-back of 2026-10-14T20:07:00.000Z not yet addressed']) }));
+});
+
 it('does not surface an answered hold that lapsed on a new head', () => {
   vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');
   const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', head: 'a'.repeat(40) }) };
@@ -177,7 +191,7 @@ describe('operator queue read safety', () => {
     expect(execFileSync).toHaveBeenCalledTimes(4);
     expect(execFileSync).toHaveBeenLastCalledWith('gh', [
       'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/1/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv',
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv',
     ], expect.objectContaining({ encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
     expect(process.exitCode).toBeUndefined();
   });

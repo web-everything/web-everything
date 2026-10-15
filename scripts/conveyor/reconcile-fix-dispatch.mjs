@@ -70,6 +70,7 @@ import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } 
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
+import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
@@ -357,9 +358,9 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         isConflict: isConflictItemless, body: entry.body ?? null, headRefOid: entry.headRefOid ?? null,
         ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
         ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
+        ...(entry.openOperatorSendBacks?.length ? { openOperatorSendBacks: entry.openOperatorSendBacks } : {}),
         ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
         ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
-      ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
         ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
@@ -480,6 +481,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       // fix procedure — the saved alt branch of a concurrent-author pause this PR re-armed from, if any.
       ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
       ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
+      ...(entry.openOperatorSendBacks?.length ? { openOperatorSendBacks: entry.openOperatorSendBacks } : {}),
       ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
@@ -843,6 +845,7 @@ export function freeLaneNumbers({ exec = execFileSync, root = REPO_ROOT, lanePoo
 export function tryResumeFix(planned, {
   repo = 'we',
   root = REPO_ROOT,
+  postNotice = postRulingNotice,
   spawnAgent = defaultSpawnAgent,
   listAgentsAll = () => defaultListAgents({ all: true }),
   stop = stopSession,
@@ -913,9 +916,10 @@ export function tryResumeFix(planned, {
     };
   }
 
+  postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
   return resumeBgSession(planned, {
     candidate,
-    prompt: withOperatorAnswer(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned.operatorAnswer),
+    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1099,6 +1103,7 @@ export function tryResumeRoundFix(planned, {
  * alone. The same text is the durable PR comment {@link postRulingNotice} writes.
  */
 export function withRulingNotAddressed(prompt, ruling) {
+  if (ruling?.source === 'operator-send-back') return prompt; // the complete ledger leads withPlannedContext
   return ruling?.matches?.length ? `${fixerRulingBrief(ruling)}${prompt}` : prompt;
 }
 
@@ -1151,7 +1156,7 @@ export function fixerTableFor(ruling) {
 
 /** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
 export function withPlannedContext(prompt, planned) {
-  return withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
+  return renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
 }
 
 /**
@@ -1251,6 +1256,8 @@ export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottle
   const slug = ghRepoSlug(repo);
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', renderRulingNotAddressed(ruling)],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+  // A failed resume may cold-start from this same snapshot before the thread is read again.
+  ruling.noticedRungs = [...(ruling.noticedRungs ?? []), ruling.rung?.id ?? '*'];
   return true;
 }
 

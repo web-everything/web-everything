@@ -59,7 +59,7 @@ export function unescapeTsvField(s) {
  */
 export function defaultListPrComments({ number, repo, exec = execFileSyncThrottled }) {
   const path = repo ? `repos/${repo}/issues/${number}/comments` : `repos/{owner}/{repo}/issues/${number}/comments`;
-  const argv = ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', path, '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv'];
+  const argv = ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', path, '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv'];
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   return String(out || '').split('\n').filter((l) => l !== '').map((line) => {
@@ -73,7 +73,7 @@ export function defaultListPrComments({ number, repo, exec = execFileSyncThrottl
     const loginRaw = tab3 === -1 ? afterCreated : afterCreated.slice(0, tab3);
     // The GraphQL node id (`IC_kwDO…`) — the id an operator stand-down answer names in `Supersedes stand-down
     // comment \`<id>\``. Without it the answer can never be matched to the stand-down it resolves.
-    const idRaw = tab3 === -1 ? '' : afterCreated.slice(tab3 + 1);
+    const [idRaw = '', urlRaw = ''] = tab3 === -1 ? [] : afterCreated.slice(tab3 + 1).split('\t');
     const login = unescapeTsvField(loginRaw) || null;
     const id = unescapeTsvField(idRaw) || null;
     return {
@@ -81,6 +81,7 @@ export function defaultListPrComments({ number, repo, exec = execFileSyncThrottl
       createdAt: unescapeTsvField(createdAtRaw) || null,
       author: login ? { login } : null,
       ...(id ? { id } : {}),
+      ...(urlRaw ? { url: unescapeTsvField(urlRaw) } : {}),
     };
   });
 }

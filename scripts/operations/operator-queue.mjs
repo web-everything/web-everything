@@ -1,3 +1,4 @@
+import { operatorSendBackHoldReasons } from '../lib/operator-send-backs.mjs';
 import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
 /**
  * @file Read-only operator queue: the SOLE authority on which human-gated PRs are worth the operator's time.
@@ -136,7 +137,7 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
 export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
-  const reasons = [];
+  const reasons = operatorSendBackHoldReasons(pr);
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
   const advisory = latestAdvisory(pr.comments);
@@ -231,7 +232,7 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
 
 /** A non-review:human PR owes clear-human only when the live job proves a human-only acceptance hold. Pure. */
 export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
-  const reasons = [];
+  const reasons = operatorSendBackHoldReasons(pr);
   if (pr.isDraft) reasons.push('draft PR');
   for (const label of ['review:human', 'review:changes', 'review:pending', 'status:sent-back-red-team', 'ci:failed', 'merge-status:conflicting']) {
     if (hasLabel(pr, label)) reasons.push(`${label} label`);
@@ -608,6 +609,11 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         else report.notReady.push({ ...row, reasons: result.reasons });
       }
       for (const pr of prs.filter((candidate) => !hasLabel(candidate, 'review:human'))) {
+        const sendBackReasons = operatorSendBackHoldReasons(pr);
+        if (sendBackReasons.length) {
+          report.notReady.push({ repo, number: pr.number, title: pr.title, reasons: sendBackReasons });
+          continue;
+        }
         let result = evaluateCeremonyOwed(pr, { redTeamSetting });
         if (result.needsMergeGateVerdict) {
           const mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });

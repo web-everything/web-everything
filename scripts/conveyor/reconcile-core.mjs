@@ -104,7 +104,8 @@ import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
-import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
+import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
+import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -2023,7 +2024,9 @@ export function planReconcile({
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
     const realFixRounds = countRealFixRounds(pr);
+    const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
@@ -2514,6 +2517,22 @@ export function planReconcile({
           : 'draft PR — every required check is green; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
       });
+      continue;
+    }
+
+    // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
+    // stand-down, liveness and already-landed guards above; an unaddressed request belongs to a fixer.
+    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid));
+    if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: 'operator send-back remains unaddressed; automatic fix rounds exhausted' }, { allowTakeover: false });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed',
+          findings: operatorRuling.items.length, rulingNotAddressed: operatorRuling,
+          why: 'operator send-back not yet addressed after a fixer had its chance' });
+      }
       continue;
     }
 
