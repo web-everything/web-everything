@@ -457,6 +457,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-extra-seats, jury-core, write-all-sync) are covered above.
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
+  // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
+  'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);

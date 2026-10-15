@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
  *
@@ -4524,6 +4525,7 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
@@ -4539,10 +4541,6 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
-  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
-    read: () => fetchFreshPrForRevalidation(repo, num), opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
-  });
-
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -5216,6 +5214,48 @@ async function runCli() {
     }
   }
 
+  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
+  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
+    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
+    // still need the drain's rebase/refresh path, regardless of the head's human approval.
+    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
+    try {
+      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo,
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
+      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
+      return decision.hold;
+    } catch (e) {
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy rebase/refresh path\n`);
+      return false;
+    }
+  };
+  // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
+  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    read: async () => {
+      const pr = await fetchFreshPrForRevalidation(repo, num);
+      return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
+        hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
+    }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
+  });
+  const refreshApprovedHead = async (v, options) => {
+    let hold = approvedHeadHold(v, options.expectedHead);
+    try {
+      if (hold && !options.runId) {
+        const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
+          defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+        if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
+        options = { ...options, runId: facts.pr.requiredCheck?.runId ?? null };
+      }
+    }
+    catch (e) {
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy refresh path\n`);
+      hold = false;
+    }
+    return refreshHeldHead({ hold, options, refresh: refreshStalePr });
+  };
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure
@@ -5239,6 +5279,15 @@ async function runCli() {
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
       if (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v)) continue;
+      if (approvedHeadHold(v)) {
+        const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
+        if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
+          && classifyPr(retainApprovedHumanQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo) }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
+          v.decision = 'merge'; v.reason = 'approved human head retained for merge queue';
+        }
+        continue;
+      }
+
       // #2684 — is this a cross-locus couple's WE half that was overlap-stacked on its impl tip? For such a half
       // the rebase-drop OUTCOME below already IS the couple CI-concurrency guard realized in git state — no
       // separate override needed, and any override would be WRONG: reaching `current` is itself proof the tip is
@@ -6175,7 +6224,6 @@ async function runCli() {
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -6219,7 +6267,7 @@ async function runCli() {
     let out;
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
     else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
-    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
+    else out = await refreshApprovedHead(cand, { laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
     // Once per pass on a head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git
     // error, no clone) is retried next pass rather than parking the head as `wait` forever. The record names the pass
     // it was requested against, so a re-run that finished (a new pass on the SAME head) lapses it — see liveRefreshed.
@@ -6590,7 +6638,7 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
-          if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo)) {
+          if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo) && !approvedHeadHold(c, traceHeadSha)) {
             const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
@@ -6699,7 +6747,7 @@ async function runCli() {
         const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
         const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
           setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
-          refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+          refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
         if (recovery.handled) {
           revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
           if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
@@ -6725,7 +6773,7 @@ async function runCli() {
           allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (escalationRelief.passWide && !!label) },
         setting: staleMergeGateRefresh, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
         tag: repoTag(c.repo), readAcceptance: readDrainAcceptance,
-        refreshStalePr, needsAcceptanceRestamp, restampAcceptance,
+        refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance,
         warn: line => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
       if (recovery.handled) {
         revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
