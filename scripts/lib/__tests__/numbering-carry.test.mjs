@@ -475,7 +475,8 @@ const facts = () => ({ labels: ['review:pending'], headSha: TO, comments: liveCo
 afterEach(_resetNumberingRestampMemo);
 describe('numbering acceptance restamp', () => {
   it('recovers the exact #5025 thread without losing its actor', () => {
-    expect(planNumberingRestamp(facts())).toEqual({ candidate: true, from: FROM, to: TO, human: true, actor: 'chalbert' });
+    expect(planNumberingRestamp(facts())).toEqual({ candidate: true, from: FROM, to: TO, human: true, actor: 'chalbert',
+      source: 'at:2026-10-12T10:00:00Z#0' });
   });
   it.each(['🔁 review — changes requested', 'Please wait for me'])('refuses a later objection: %s', (body) => {
     const f = facts(); f.comments.push({ body });
@@ -545,6 +546,39 @@ describe('numbering acceptance restamp', () => {
       const { calls, provider } = recording();
       expect(run({ provider, readLiveState, prove: () => ({ ok: true, reason: 'verified' }) })).toMatchObject({ action: 'retry' });
       expect(calls).toEqual([]);
+    });
+    // Operator block (#5233, head f3b08989d): the write must carry the FRESH acceptance, never the first plan's clearance.
+    const newer = (actor) => ({ author: { login: 'chalbert' }, createdAt: '2026-10-13T10:00:00Z',
+      body: `✅ review — accepted\n<!-- reviewed-sha: ${FROM} -->${actor ? `\n<!-- cleared-human: ${actor} -->` : ''}` });
+    const plainBase = () => [{ ...accept(), body: accept().body.replace(/\n<!-- cleared-human: chalbert -->/, '') }];
+    it.each([
+      ['a newer plain acceptance', liveComments, newer(null), false],
+      ['a newer clearance by another actor', liveComments, newer('someone-else'), true],
+      ['a newer clearance on a plain acceptance', plainBase, newer('chalbert'), true],
+      ['a newer record by the same actor', liveComments, newer('chalbert'), true],
+    ])('writes nothing when the acceptance changes during the proof: %s', (_name, base, record, human) => {
+      const { calls, provider } = recording();
+      const thread = [...base(), record];
+      const r = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments: base() },
+        readLiveState: () => ({ state: { labels: ['review:pending'], headRefOid: TO, comments: thread }, reviews: [] }),
+        prove: () => ({ ok: true, reason: 'verified' }) });
+      expect(r).toMatchObject({ action: 'retry', reason: 'live re-read: the acceptance plan changed' });
+      expect(calls).toEqual([]);
+      // The next pass plans from the fresh thread and writes that acceptance, not the superseded one.
+      const next = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments: thread },
+        prove: () => ({ ok: true, reason: 'verified' }) });
+      expect(next).toMatchObject({ action: 'restamped', human });
+      expect(calls).toHaveLength(2);
+      if (human) expect(calls[0]).toContain(`cleared-human: ${/cleared-human: (\S+)/.exec(record.body)[1]}`);
+      else expect(calls[0]).not.toContain('cleared-human:');
+    });
+    it('compares the actor as the record writes it, so a sanitized name still finishes the labels', () => {
+      const { calls, provider } = recording();
+      const comments = [{ ...accept(), body: accept().body.replace('cleared-human: chalbert', 'cleared-human: @chal bert') }];
+      expect(run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments },
+        prove: () => ({ ok: true, reason: 'verified' }) })).toMatchObject({ action: 'restamped', human: true });
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toContain('cleared-human: chal bert');
     });
     it('writes nothing without a live re-read', () => {
       const { calls, provider } = recording();

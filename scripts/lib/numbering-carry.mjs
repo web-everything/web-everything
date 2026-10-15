@@ -329,8 +329,10 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
   }
   if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
   if (laterReviewHold(reviews, rec.at)) return { candidate: false, reason: 'formal review hold stands' };
-  if (own) return { candidate: true, labelsOnly: true, from: own, to: head, human: rec.humanCleared, actor: rec.actor };
-  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor };
+  // The acceptance comment this plan carries: a newer record on the same sha is a different acceptance.
+  const source = comments[rec.index]?.id != null ? `id:${comments[rec.index].id}` : `at:${rec.at ?? ''}#${rec.index}`;
+  if (own) return { candidate: true, labelsOnly: true, from: own, to: head, human: rec.humanCleared, actor: rec.actor, source };
+  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source };
 }
 
 // Same allow-list as human-clearance-carry; local to avoid a circular dependency between the two carry tiers.
@@ -379,7 +381,12 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
   if (!plan.candidate) {
     return { result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
   }
-  if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)) {
+  // The write uses the first plan's clearance, so the fresh one must match it: the same human flag, the same actor (as
+  // written into the record) and, before our own record exists, the same source comment. Any change aborts unsettled.
+  const clearedBy = (p) => (p.human ? sanitizeActor(p.actor) : null);
+  if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)
+    || Boolean(plan.human) !== Boolean(expected.human) || clearedBy(plan) !== clearedBy(expected)
+    || (expected.source != null && plan.source !== expected.source)) {
     return { result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
   }
   try { guardReferrals(state, { repo, pr }); }
@@ -401,8 +408,10 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // A guard read failure is retryable and never settles the head or grants an acceptance.
   try { guardReferrals(state, { repo, pr }); }
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
+  // After our record is posted it is the source, so only the pre-write checks can compare the source comment.
   const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
-    expected: { from: plan.from, to: plan.to, labelsOnly } });
+    expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor,
+      source: Boolean(labelsOnly) === Boolean(plan.labelsOnly) ? plan.source : null } });
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
     const live = recheck(true);
