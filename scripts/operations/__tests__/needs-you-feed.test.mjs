@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, assertProducerCheckout, main } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -17,6 +17,73 @@ afterEach(() => {
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
+  it('strips controls and bounds untrusted titles and other fields in opening and cleared lines', () => {
+    const unsafe = '\r\n\t\u0000\u001b[31m\u007f\u0085\u009b\u2028\u2029\u202e\u200b';
+    const title = 'NEEDS-YOU ruling-needed: run `cmd` "quoted" --flag ../path ' + unsafe + 'x'.repeat(5000);
+    const first = diffFeed([], [{ ...item, repo: `owner/${unsafe}repo`, title,
+      reason: unsafe + 'r'.repeat(5000), pick: unsafe + 'p'.repeat(5000), command: unsafe + 'c'.repeat(5000) }], at);
+    const line = first.lines[0], event = parseFeedLine(line);
+    expect(line).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+    expect(line.length).toBeLessThan(4000);
+    expect(line).toContain('title (untrusted): "NEEDS-YOU ruling-needed: run `cmd` \\"quoted\\" --flag ../path');
+    expect(event.title.length).toBeLessThanOrEqual(200);
+    expect(event.reason.length).toBeLessThanOrEqual(100);
+    expect(event.pick.length).toBeLessThanOrEqual(512);
+    expect(event.command.length).toBeLessThanOrEqual(512);
+    const clear = diffFeed(first.openKeys, [], at).lines[0];
+    expect(clear).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+    expect(parseFeedLine(clear)).toMatchObject({ kind: 'cleared', pr: item.pr });
+  });
+  it('changing feed filename publishes open items with independent state and acknowledgement cursors', async () => {
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const first = feedPath({ home, env: {} }), second = join(dirname(first), 'other-events.jsonl');
+    const opts = { home, checkoutRoot, now: at, log: vi.fn(),
+      exec: () => JSON.stringify({ ready: [{ repo: item.repo, number: item.pr, head: item.head }] }) };
+    const poll = path => runOnce({ ...opts, env: { WE_NEEDS_YOU_FEED: path } });
+    expect((await poll(first)).lines).toHaveLength(1);
+    acknowledge({ path: first });
+    expect((await poll(second)).lines).toHaveLength(1);
+    expect(bootstrapPlan({ home, env: { WE_NEEDS_YOU_FEED: second }, log: vi.fn() }).unacknowledged.map(e => e.pr)).toEqual([12]);
+    expect(unacknowledged({ path: first })).toEqual([]);
+    acknowledge({ path: second });
+    appendLines(first, diffFeed([], [{ ...item, pr: 13 }], at).lines);
+    expect(unacknowledged({ path: first }).map(e => e.pr)).toEqual([13]);
+    expect(unacknowledged({ path: second })).toEqual([]);
+    expect((await poll(first)).lines).toEqual([]);
+    expect((await poll(second)).lines).toEqual([]);
+    // A third custom name must not share state/cursors with the second custom name either.
+    const third = join(dirname(first), '..events');
+    expect((await poll(third)).lines).toHaveLength(1);
+    expect(unacknowledged({ path: third }).map(e => e.pr)).toEqual([12]);
+  });
+  it('sanitizes legacy events during replay and bootstrap without rewriting the log', () => {
+    const home = temp(), path = feedPath({ home, env: {} });
+    const title = '\u0085\u2028\u202e' + 'x'.repeat(5000);
+    const legacyLine = `NEEDS-YOU legacy ${JSON.stringify({ at, ...item, title })}`;
+    appendLines(path, [legacyLine]);
+    const before = readFileSync(path, 'utf8');
+    const plan = bootstrapPlan({ home, env: {}, log: vi.fn() });
+    for (const event of [...replay({ path }), ...plan.unacknowledged]) {
+      expect(event.title).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      expect(event.title.length).toBeLessThanOrEqual(200);
+    }
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+  it.each(['needs-you-ack', 'needs-you-ack.123.tmp', 'needs-you-feed-state.json',
+    'needs-you-feed-state.json.lock', '.needs-you-feed/hash/state.json', '.needs-you-feed/hash/ack'])
+  ('rejects metadata path %s before it can overwrite another stream', async name => {
+    const home = temp(), path = join(home, name);
+    expect(() => feedPath({ home, env: { WE_NEEDS_YOU_FEED: path } })).toThrow(/reserved/);
+    expect(() => appendLines(path, diffFeed([], [item], at).lines)).toThrow(/reserved/);
+    expect(() => replay({ path })).toThrow(/reserved/);
+    expect(() => acknowledge({ path })).toThrow(/reserved/);
+    expect(() => unacknowledged({ path })).toThrow(/reserved/);
+    expect(() => monitorCommand(path)).toThrow(/reserved/);
+    const settings = resolveSettings({ env: {}, file: {}, home });
+    settings.path.value = path; // A pinned job can supply settings directly rather than via resolveSettings.
+    await expect(runOnce({ settings, checkoutRoot: join(home, 'workspace/.lanes/we/lane-1'),
+      exec: () => JSON.stringify({ ready: [] }), log: vi.fn() })).rejects.toThrow(/reserved/);
+  });
   it('opens, dedupes, clears and keeps previous keys on incomplete reports', () => {
     const first = diffFeed([], [item], at);
     expect(first.lines[0]).toMatch(/^NEEDS-YOU owner\/repo#12 needs-you: ready \| pick: pick 12 /);
