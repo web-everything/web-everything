@@ -335,19 +335,22 @@ function clearHumanNotes(rest) {
   return { reason: quotes.join(' ').trim(), text: paragraphs.join('\n\n').trim() };
 }
 
-export function captureFromComment(comment, { operatorLogins = [], automationLogins = [], parseRuling, parseClearance } = {}) {
+export function captureFromComment(comment, { operatorLogins = [], automationLogins = [], parseRuling, parseChangesVerdict, parseClearance } = {}) {
   const body = typeof comment?.body === 'string' ? comment.body : '';
   const trusted = (login, list) => typeof login === 'string' && list.some((l) => l.toLowerCase() === login.toLowerCase());
   const author = comment?.author?.login;
   const base = { url: comment?.url, date: (comment?.createdAt ?? '').slice(0, 10) };
-  const recorded = /^Recorded by (\S+) via ([^\r\n]+)\.\s*$/m.exec(body);
-  if (body.startsWith('🔁 review — changes requested') && recorded && trusted(author, operatorLogins)) {
-    return [{ ...base, decision: 'changes', kind: 'changes', head: /on head ([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? '',
-      operatorWords: /Operator: ([^\r\n]+)/.exec(body)?.[1] ?? '',
-      body: body.slice(recorded.index + recorded[0].length).trim(), actor: recorded[1], channel: recorded[2] }];
+  // Both verdict shapes are the producer's own (`parseChangesVerdict` / `parseClearance` are injected, normally
+  // review-escalation's `parseChangesVerdictProse` / `parseClearedHumanProse`), so this reader cannot drift from
+  // what review-set-label.mjs writes.
+  const recorded = parseChangesVerdict?.(body);
+  if (recorded && trusted(author, operatorLogins)) {
+    const text = body.slice(recorded.end).trim();
+    // The head and the operator's words come from the write-up's lead paragraph only, never from later text.
+    const lead = text.split(/\n(?:[ \t]*\n)+/)[0];
+    return [{ ...base, decision: 'changes', kind: 'changes', head: /\bon head ([0-9a-f]{7,40})\b/i.exec(lead)?.[1] ?? '',
+      operatorWords: /\bOperator: ([^\r\n]+)/.exec(lead)?.[1] ?? '', body: text, actor: recorded.actor, channel: recorded.channel }];
   }
-  // The clearance shape is the producer's own (`parseClearance` is injected, normally review-escalation's
-  // `parseClearedHumanProse`), so this reader cannot drift from what review-set-label.mjs writes.
   const cleared = parseClearance?.(body);
   if (cleared && trusted(cleared.actor, operatorLogins) && (trusted(author, operatorLogins) || trusted(author, automationLogins))) {
     const { reason, text } = clearHumanNotes(body.slice(cleared.end));

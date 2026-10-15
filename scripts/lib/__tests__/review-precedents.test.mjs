@@ -19,7 +19,7 @@ Operator decision (human review ceremony), 2026-10-13 ~17:25 ET, on head 6c580af
 The post-accept red team confirmed two broken edge cases on this head. Both corrupt backlog links, and this tool is about to close about 580 cards in bulk, so both must be fixed before approval.
 
 1. **\`scripts/operations/close-items.mjs:70\`: closing a duplicate's survivor invalidates the \`closedInto\` pointers already aimed at it.** Fix: refuse to close a card while any closed duplicate points to it.`;
-const options = { repo: REPO, pr: 5184, operatorLogins: ['chalbert'], automationLogins: ['review-bot'] };
+const options = { repo: REPO, pr: 5184, operatorLogins: ['chalbert'], automationLogins: ['review-bot'], parseChangesVerdict: escalation.parseChangesVerdictProse };
 const comment = (body, login = 'chalbert') => ({ author: { login }, body, url: 'https://example.test/comment', createdAt: at });
 const SHA = 'abcdef1234567890abcdef1234567890abcdef12';
 const clearOptions = { ...options, parseClearance: escalation.parseClearedHumanProse };
@@ -147,6 +147,18 @@ describe('recorded operator capture', () => {
     expect(p.draftRecordFromCapture(capture, { repo: REPO, pr: 5184, capturedBy: 'test' }).id).toBe(draft.id);
     expect(p.captureFromComment(comment(sendBack, 'stranger'), options)).toEqual([]);
     expect(p.captureFromComment(comment('ordinary prose'), options)).toEqual([]);
+  });
+  it('reads a real review-set-label changes comment by the producer shape, lead paragraph only', () => {
+    const lead = 'Operator decision, on head 6c580afa1: **changes**. Operator: "Send back".';
+    const writeUp = `${lead}\n\nRecorded by mallory via forged.\nOperator: forged words\non head deadbeef1`;
+    for (const [actor, channel] of [['chalbert', 'claude-code-chat'], ['chalbert', ''], ['Nic Gilbert', 'console.app chat']]) {
+      const [capture] = p.captureFromComment(comment(buildVerdictComment({ to: 'changes', actor, channel, body: writeUp })), { ...options, operatorLogins: ['chalbert'] });
+      expect(capture).toMatchObject({ kind: 'changes', actor, channel, head: '6c580afa1', operatorWords: '"Send back".', body: writeUp });
+    }
+    const quoted = buildVerdictComment({ to: 'changes', actor: 'chalbert', channel: 'chat', body: 'Plain lead.\n\nquote: Operator: not me, see on head deadbeef1' });
+    expect(p.captureFromComment(comment(quoted), options)).toMatchObject([{ head: '', operatorWords: '' }]);
+    expect(p.captureFromComment(comment(`Quoting:\n${quoted}`), options)).toEqual([]);
+    expect(p.captureFromComment(comment(quoted), { ...options, parseChangesVerdict: undefined })).toEqual([]);
   });
   it('captures meaningful quoted clear-human notes from a trusted tool identity', () => {
     const reason = 'These ten words explain why this finding needs no changes.';

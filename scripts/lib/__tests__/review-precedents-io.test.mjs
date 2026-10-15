@@ -7,6 +7,7 @@ import { precedentEvent, fallbackPattern, captureFromComment, citationEvent, fol
 import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
 import { FENCED_DATA_RULE } from '../mandate-fence.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
+import { parseChangesVerdictProse } from '../review-escalation.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -154,7 +155,7 @@ describe('settings and drafting', () => {
     expect(result.drafts).toHaveLength(1);
     expect(result.drafts[0]).toMatchObject({ status: 'draft', pattern: 'Keep survivor links valid.', source: { head: '6c580afa1' } });
     const fallback = await io.capturePrecedents({ ...args, draft: async () => null });
-    expect(fallback.drafts[0].pattern).toBe(fallbackPattern(captureFromComment(info.comments[0], { operatorLogins: ['chalbert'] })[0], { pr: 5184 }));
+    expect(fallback.drafts[0].pattern).toBe(fallbackPattern(captureFromComment(info.comments[0], { operatorLogins: ['chalbert'], parseChangesVerdict: parseChangesVerdictProse })[0], { pr: 5184 }));
     expect(await io.capturePrecedents({ ...args, existing: new Map([[result.drafts[0].id, result.drafts[0]]]), draft: async () => null })).toMatchObject({ drafts: [], skipped: [result.drafts[0].id] });
     const invalid = await io.capturePrecedents({ ...args, draft: async () => 'two\nlines' });
     expect(invalid.invalid[0].errors).toContain('pattern');

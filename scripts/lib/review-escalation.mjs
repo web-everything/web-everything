@@ -1898,6 +1898,23 @@ export function parseClearedHumanProse(body) {
   return { actor, end: m.index + m[0].length, reviewedSha };
 }
 
+// The `--to=changes` sibling of `CLEARED_HUMAN_PROSE_RE`: the heading and attribution `buildVerdictComment` renders
+// (`Recorded by <actor>[ via <channel>].`), anchored at byte 0 so a caller field, always appended later, cannot
+// satisfy it. The actor may contain spaces and the channel is optional, exactly as the producer allows.
+const CHANGES_VERDICT_PROSE_RE = /^🔁 review — changes requested\n\nRecorded by (.+?)(?: via (.+?))?\.(?=\n\n|$)/;
+
+/**
+ * The attribution of ONE `--to=changes` verdict comment, for the precedent capture. Pure. `null` unless the body
+ * opens with the exact heading and attribution. `end` is the offset just past the attribution sentence; the
+ * `--body-file` write-up follows it.
+ * @returns {{actor:string, channel:string, end:number}|null}
+ */
+export function parseChangesVerdictProse(body) {
+  const m = CHANGES_VERDICT_PROSE_RE.exec(typeof body === 'string' ? body : '');
+  const actor = m ? m[1].trim() : '';
+  return actor ? { actor, channel: (m[2] ?? '').trim(), end: m.index + m[0].length } : null;
+}
+
 /**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
