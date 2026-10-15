@@ -227,20 +227,22 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
 
 /**
  * One fix PR's CI for the combine rule: its latest FINISHED ci.yml run on the PR head, with a complete job list.
- * `{status:'green'|'red'|'pending'|'unknown', failedJobs}` — anything not provable is `pending`/`unknown`.
+ * `{status:'green'|'red'|'inconclusive'|'pending'|'unknown', failedJobs}` — completed runs without a verdict
+ * are inconclusive, not in flight. They prove no job fixes to the combine rule.
  */
 export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
   try {
     const runs = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', String(pr.headRefName),
       '--limit', '5', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha']);
-    const done = (Array.isArray(runs) ? runs : []).filter((r) => classifyRun(r) !== 'ignore')
+    const headRuns = (Array.isArray(runs) ? runs : []).filter((r) => !pr.headRefOid || r.headSha === pr.headRefOid);
+    const done = headRuns.filter((r) => r.status === 'completed')
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     // card 302: a newer in-flight run supersedes the finished verdict for progress.
-    const pending = (runs || []).some((r) => r.status !== 'completed'
+    const pending = headRuns.some((r) => r.status !== 'completed'
       && (!done || Date.parse(r.createdAt) >= Date.parse(done.createdAt)));
     const progress = { completedAt: done?.updatedAt ?? null, ...(pending ? { pending: true } : {}) };
     if (!done || pending) return { status: 'pending', failedJobs: [], ...progress };
-    if (pr.headRefOid && done.headSha !== pr.headRefOid) return { status: 'pending', failedJobs: [], pending: true, ...progress };
+    if (classifyRun(done) === 'ignore') return { status: 'inconclusive', failedJobs: [], ...progress };
     if (classifyRun(done) === 'green') {
       // A green run can still have skipped jobs, so read the jobs: only the ones that SUCCEEDED prove a fix (F5). An
       // unreadable job list leaves the PR green with no proof — it can then fix nothing, but it is not "unknown".

@@ -121,6 +121,58 @@ describe('card 302 stalled red-main owner replay', () => {
   });
 });
 
+describe('completed inconclusive owner CI', () => {
+  const pr = { ...facts.pr, headRefOid: 'new-head' };
+  const old = { ...facts.ownerRun, headSha: 'old-head', updatedAt: '2026-10-14T06:30:00Z' };
+  const finished = { ...facts.ownerRun, databaseId: 2, headSha: pr.headRefOid,
+    createdAt: '2026-10-14T07:00:00Z', updatedAt: '2026-10-14T07:10:00Z', conclusion: 'cancelled' };
+  const read = (runs) => readFixPrCi(pr, { exec: (bin, args) => {
+    if (args[0] === 'run') return JSON.stringify(runs);
+    return JSON.stringify({ total_count: 1, jobs: [{ name: 'integration', conclusion: 'success' }] });
+  } });
+  const outcomes = [
+    { conclusion: 'cancelled' }, { conclusion: 'skipped' }, { conclusion: 'neutral' },
+    { conclusion: 'failure', infraOnly: true },
+  ];
+
+  it.each(outcomes)('escalates and recovers after completed $conclusion owner CI stops moving', async (outcome) => {
+    const ownerCi = read([{ ...finished, ...outcome }, old]);
+    expect(ownerCi).toMatchObject({ status: 'inconclusive', completedAt: finished.updatedAt, failedJobs: [] });
+    expect(ownerCi.pending).not.toBe(true);
+    const recent = (await replay('07:39:59', { pr, ci: ownerCi })).result;
+    expect(recent.ownerStall).toMatchObject({ moving: true, reason: 'owner-ci-recent' });
+    expect(recent.escalation).toBeNull();
+    const stalled = (await replay('07:40:00', { pr, ci: ownerCi })).result;
+    expect(stalled.ownerStall).toMatchObject({ stalled: true, reason: 'owner-ci-inconclusive', since: at('07:10:00') });
+    expect(stalled.escalation).not.toBeNull();
+    const later = (await replay('12:00:00', { pr, ci: ownerCi })).result;
+    expect(later.escalation).not.toBeNull();
+    expect(later.recovery).toMatchObject({ kind: 'rerun', reason: 'owner-stalled', status: 'dry-run' });
+    const retried = (await replay('12:00:00', { pr, ci: ownerCi, reruns: { 38517676708: { kind: 'owner-stalled' } } })).result;
+    expect(retried.recovery).toMatchObject({ kind: 'revert-proposal' });
+  });
+
+  it('uses the completed current head with no history, older green CI, or unrelated active CI', () => {
+    for (const history of [[], [{ ...old, conclusion: 'success' }], [{ ...old, status: 'in_progress', createdAt: '2026-10-14T08:00:00Z' }]]) {
+      expect(read([finished, ...history])).toMatchObject({ status: 'inconclusive', completedAt: finished.updatedAt });
+    }
+    expect(read([{ ...finished, updatedAt: null }])).toMatchObject({ status: 'inconclusive', completedAt: null });
+    expect(assess({ ownerPrs: [{ ci: read([{ ...finished, updatedAt: null }]) }] }).moving).toBe(true);
+  });
+
+  it('honors newer active and successful runs on the current head', async () => {
+    const next = { ...finished, databaseId: 3, createdAt: '2026-10-14T07:20:00Z', updatedAt: '2026-10-14T07:30:00Z' };
+    for (const status of ['queued', 'in_progress']) {
+      const ownerCi = read([{ ...next, status, conclusion: null }, finished, old]);
+      expect(ownerCi).toMatchObject({ status: 'pending', pending: true });
+      expect((await replay('12:00:00', { pr, ci: ownerCi })).result.escalation).toBeNull();
+    }
+    const green = read([{ ...next, conclusion: 'success' }, finished, old]);
+    expect(green.status).toBe('green');
+    expect((await replay('12:00:00', { pr, ci: green })).result.escalation).toBeNull();
+  });
+});
+
 describe('inconclusive main rerun recovery', () => {
   const outcomes = [
     { name: 'cancelled', conclusion: 'cancelled' },

@@ -654,7 +654,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
  * take in the others' branches, so one PR carries every fix.
  *
  * @param {{mainFailingJobs:string[], fixPrs:Array<{number:number, createdAt?:string, headRefName?:string,
- *   ci:{status:'green'|'red'|'pending'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
+ *   ci:{status:'green'|'red'|'inconclusive'|'pending'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
  *   `ci` is the PR's latest FINISHED CI run with a complete job list; anything else is `unknown` (never acted on).
  *   `passedJobs` = the jobs whose conclusion was `success` (skipped / cancelled / absent are NOT in it): the only
  *   evidence that this PR fixes a main cause.
@@ -783,9 +783,9 @@ export function assessOwnerProgress({ state, owner, ownerPrs = [], ledgerEntry, 
   let reason, since;
   if (ownerPrs.length) {
     // Unknown or green CI is not proof of a stalled red owner.
-    if (ownerPrs.some((pr) => pr.ci?.status !== 'red' || ts(pr.ci?.completedAt) === null)) return moving('owner-ci-not-red');
+    if (ownerPrs.some((pr) => !['red', 'inconclusive'].includes(pr.ci?.status) || ts(pr.ci?.completedAt) === null)) return moving('owner-ci-not-red');
     since = Math.max(...ownerPrs.map((pr) => ts(pr.ci.completedAt)));
-    reason = 'owner-ci-red';
+    reason = ownerPrs.some((pr) => pr.ci.status === 'inconclusive') ? 'owner-ci-inconclusive' : 'owner-ci-red';
   } else {
     if (owner.kind !== 'dispatched' || !(settings.mainCiRedOwnerPrDeadlineMin > 0)
       || !Number.isFinite(ledgerEntry?.at)) return moving('dispatch-unknown');
