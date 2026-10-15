@@ -16,7 +16,7 @@ export default {
   fixPresent(root) {
     const daemon = readFileSync(resolve(root, DAEMON), 'utf8');
     return daemon.includes('const stampedOpenPr =') && daemon.includes('PREPARE_REFUSAL_HOLD_MS')
-      && daemon.includes('refusePrepareLaunch(member') && daemon.includes('orphanWithWork');
+      && daemon.includes('refusePrepareLaunch(member') && daemon.includes('refusalProbes');
   },
   async run() {
     const { runBuildDispatchTick, createPrepareStatusReader } = await import(resolve(ROOT, DAEMON));

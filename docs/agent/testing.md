@@ -823,8 +823,10 @@ tick-core offers at most two item prepares and cannot see these launch refusals.
 refused card out of the plan, and out of a clean lead's prepare group, for `PREPARE_REFUSAL_HOLD_MS`,
 then checks it again. Build-backoff cards and group members in flight are held out the same way.
 Every group member passes the same launch admission as its lead (`refusePrepareLaunch`); test a member
-that was never refused before and has its own open PR. A card refused for an OPEN prepare PR is still
-inspected when nothing else tracks it, so a sectioned, unstamped PR reaches stamp recovery. Test that capacity
+that was never refused before and has its own open PR. When nothing else tracks a card refused for its
+own lane prepare PR, the daemon reads THAT PR once per refusal (`prNumber`). A finished but unstamped
+result (open with sections, or merged with sections on main) goes to stamp recovery; anything else
+stays a refusal that takes no prepare slot and places no hold. Test that capacity
 rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
 a clean third, across ticks.
 

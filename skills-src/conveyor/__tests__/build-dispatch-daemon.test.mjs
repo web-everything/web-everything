@@ -1867,28 +1867,58 @@ describe('automatic item preparation', () => {
   // PR #5366 operator send-back (item 2): a card with NO surviving claim, run row, hold or guard whose OPEN prepare
   // PR has sections but no stamp was refused at launch forever and never reached the stamp-recovery arm.
   it.each([
-    [{ hasSections: true, preparedDate: null }, true],
-    [{ hasSections: false, preparedDate: null }, false],
-    [{ hasSections: true, preparedDate: '2026-10-15' }, false],
-  ])('routes an untracked refused card whose open prepare PR is %j to stamp recovery (%s)', async (pr, recovers) => {
+    ['open, sections, unstamped', { state: 'OPEN', hasSections: true, preparedDate: null }, {}, true],
+    ['open, no sections', { state: 'OPEN', hasSections: false, preparedDate: null }, {}, false],
+    ['open, stamped on the PR branch (awaiting landing)', { state: 'OPEN', hasSections: true, preparedDate: '2026-10-15' }, {}, false],
+    ['merged, sections on main, unstamped', { state: 'MERGED', preparedDate: null, createdAt: '2026-10-15T11:00:00Z' }, { hasSections: true }, true],
+    ['merged, no sections on main', { state: 'MERGED', preparedDate: null, createdAt: '2026-10-15T11:00:00Z' }, { hasSections: false }, false],
+    ['a different PR read back', { state: 'OPEN', hasSections: true, preparedDate: null, number: 92 }, {}, false],
+  ])('probes an untracked refused card\'s own prepare PR once: %s', async (_name, pr, main, recovers) => {
     const effects = fixture();
     effects.now = () => Date.parse('2026-10-15T12:00:00Z');
-    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
-    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
-    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, pr: { state: 'OPEN', number: 91, ...pr } }));
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }, { num: '5029' }] }, nextState: {} });
+    effects.listPrepareFailures = () => pr.state === 'MERGED' ? [{ num: '5028', recordedAt: '2026-10-15T10:00:00Z' }] : [];
+    effects.listPreparePrs = ({ num }) => num === '5028'
+      ? [{ number: 91, state: pr.state, headRefName: 'lane/5028d-prepare-x', createdAt: pr.createdAt }] : [];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, ...main, pr: { number: 91, ...pr } }));
     effects.stampPrepare = vi.fn(() => ({ spawned: true }));
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      const first = await runBuildDispatchTick({ live: true, effects });
-      expect(first.prepare.refused.map(r => r.num)).toEqual(['5028']);
-      expect(effects.stampPrepare).not.toHaveBeenCalled();
-      const second = await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      let bookkeeping = {};
+      const ticks = [];
+      for (let i = 0; i < 3; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        ticks.push(tick);
+        bookkeeping = tick.nextBookkeeping;
+        effects.releasePrepareClaim({ num: '5029' });
+      }
+      expect(ticks[0].prepare.refused.map(r => r.num)).toEqual(['5028']);
+      // Exactly one read, of the refused PR itself — never a per-tick search, never the newest attempt's PR.
+      const reads = effects.readPrepareStatus.mock.calls.map(([a]) => a).filter(a => a.num === '5028');
+      expect(reads).toEqual([expect.objectContaining({ num: '5028', prNumber: 91 })]);
       expect(effects.stampPrepare).toHaveBeenCalledTimes(recovers ? 1 : 0);
-      if (recovers) {
-        expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending' });
-        expect(second.prepare.retired).toEqual([]); // nothing to release: no claim, no worker
-      } else expect(effects.placePrepareHold).not.toHaveBeenCalled();
-      expect(effects.dispatch).not.toHaveBeenCalled();
+      if (recovers) expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending' });
+      else expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      // A refusal-held card never takes a prepare slot: the clean card launches every tick.
+      for (const tick of ticks) {
+        expect(tick.prepare.inFlight).not.toContain('5028');
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(['5029']);
+      }
+      expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('5028');
+    } finally { log.mockRestore(); }
+  });
+  it('never probes a refusal whose PR is not a lane prepare branch (a title-only match)', async () => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'someone/manual-prepare' }];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, pr: { number: 91, state: 'OPEN', hasSections: true } }));
+    effects.stampPrepare = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.readPrepareStatus.mock.calls.filter(([a]) => a.num === '5028' && a.prNumber != null)).toEqual([]);
+      expect(effects.stampPrepare).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });
   it('holds build-backoff cards and in-flight group members out of tick-core\'s prepare picks', async () => {
