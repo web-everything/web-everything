@@ -5,7 +5,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireStoreLock, releaseStoreLock, LOCK_STALE_MS } from './helpers/fake-gh.mjs';
+import { acquireStoreLock, releaseStoreLock, withStore, LOCK_STALE_MS } from './helpers/fake-gh.mjs';
 
 const helper = new URL('./helpers/fake-gh.mjs', import.meta.url).href;
 const realNowMs = () => performance.timeOrigin + performance.now();
@@ -22,6 +22,10 @@ function backdate(path) {
 }
 function holderPath(lock) { return join(lock, readdirSync(lock)[0]); }
 function holder(lock) { return JSON.parse(readFileSync(holderPath(lock), 'utf8')); }
+// Use a reaped process's PID when modelling a crashed holder; an aged live PID still owns its lock.
+function deadPid() {
+  return Number(execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }));
+}
 
 // Signal readiness before entering the synchronous acquire, so assertions never depend on child boot time.
 async function waiter(store, futureClock = false) {
@@ -50,6 +54,37 @@ async function waiter(store, futureClock = false) {
 }
 
 describe('fake-gh store lock recovery', () => {
+  it('keeps an expired live writer exclusive until its store update finishes', () => {
+    const store = fixture();
+    writeFileSync(store, JSON.stringify({ count: 0 }));
+    let contender;
+    let preserved;
+    withStore(store, (state) => {
+      const lock = `${store}.lock`;
+      const original = { ...holder(lock), at: realNowMs() - 60_000 };
+      writeFileSync(holderPath(lock), JSON.stringify(original));
+      contender = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import { withStore } from ${JSON.stringify(helper)};
+        // Stop at the first contention backoff instead of waiting for the 20 s deadline.
+        Atomics.wait = () => { throw new Error('live holder'); };
+        try {
+          withStore(${JSON.stringify(store)}, (state) => { state.count += 10; });
+          process.stdout.write('acquired');
+        } catch (err) {
+          if (err.message !== 'live holder') throw err;
+          process.stdout.write('blocked');
+        }
+      `], { encoding: 'utf8', timeout: 5_000 });
+      preserved = existsSync(lock) && holder(lock).token === original.token;
+      // This paused writer would clobber the contender's update if its lease were stolen.
+      state.count += 1;
+    });
+    expect(contender).toBe('blocked');
+    expect(preserved).toBe(true);
+    expect(JSON.parse(readFileSync(store, 'utf8')).count).toBe(1);
+    expect(existsSync(`${store}.lock`)).toBe(false);
+  });
+
   const races = ['release', 'takeover', 'empty', 'malformed'].flatMap((operation) =>
     ['entry', 'directory'].map((boundary) => [operation, boundary]));
   races.push(['missing', 'directory']);
@@ -68,7 +103,8 @@ describe('fake-gh store lock recovery', () => {
       const entry = fs.readdirSync(lock)[0];
       const original = JSON.parse(fs.readFileSync(join(lock, entry), 'utf8'));
       if (${JSON.stringify(operation)} === 'takeover') {
-        fs.writeFileSync(join(lock, entry), JSON.stringify({ ...original, at: 0 }));
+        const pid = Number(execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']));
+        fs.writeFileSync(join(lock, entry), JSON.stringify({ ...original, pid, at: 0 }));
       }
       if (['missing', 'empty', 'malformed'].includes(${JSON.stringify(operation)})) {
         fs.unlinkSync(join(lock, entry));
@@ -156,7 +192,7 @@ describe('fake-gh store lock recovery', () => {
     const store = fixture();
     const lock = acquireStoreLock(store);
     const original = holder(lock);
-    writeFileSync(holderPath(lock), JSON.stringify({ ...original, at: realNowMs() - 60_000 }));
+    writeFileSync(holderPath(lock), JSON.stringify({ ...original, pid: deadPid(), at: realNowMs() - 60_000 }));
     execFileSync(process.execPath, ['--input-type=module', '-e', `
       import { acquireStoreLock } from ${JSON.stringify(helper)};
       acquireStoreLock(${JSON.stringify(store)});

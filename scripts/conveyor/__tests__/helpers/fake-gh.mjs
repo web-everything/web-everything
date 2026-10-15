@@ -168,9 +168,8 @@ const SHIM_PATH = join(HERE, 'fake-gh-shim.mjs');
 // (which imports these exact functions rather than re-implementing them).
 // ---------------------------------------------------------------------------------------------------------
 
-/** A stale lock (its holder died mid-call) is taken over after this long — long enough that no real call in
- *  this fixture (including a `pr merge` that shells a few `git` subprocesses) should ever legitimately hold
- *  the lock this long, short enough that a genuinely wedged test does not hang the whole suite. */
+/** A dead or incomplete holder can be recovered after this long. A live holder may exceed this age
+ *  under load; its lock must remain exclusive until release or process death. */
 export const LOCK_STALE_MS = 10_000;
 /** How long a caller will retry the acquire before giving up and throwing — comfortably above the stale window
  *  so a legitimate stale-takeover always gets a chance to happen before a caller gives up on it. */
@@ -262,6 +261,7 @@ export function acquireStoreLock(storePath) {
       continue;
     }
     let at = lockStat.mtimeMs;
+    let holderPid;
     let entry;
     try {
       const entries = readdirSync(lockPath);
@@ -277,13 +277,18 @@ export function acquireStoreLock(storePath) {
         try {
           const holder = JSON.parse(raw);
           if (Number.isFinite(holder?.at)) at = holder.at;
+          if (Number.isSafeInteger(holder?.pid) && holder.pid > 0) holderPid = holder.pid;
         } catch { /* empty or torn holder: age the directory itself */ }
       }
     } catch (err) {
       if (err.code === 'ENOENT') continue; // the observed generation has already retired
       throw err;
     }
-    if (realNowMs() - at > LOCK_STALE_MS) {
+    // Age is not permission to evict a live writer: it can resume and commit its old snapshot
+    // after a successor has updated the store. This also protects a publisher paused between
+    // stamping its candidate and renaming it into place. Death is monotonic for this owner;
+    // a replacement's unique entry is still protected by retireStoreLock below.
+    if (realNowMs() - at > LOCK_STALE_MS && !(holderPid && processIsAlive(holderPid))) {
       try {
         retireStoreLock(lockPath, entry);
         continue;
