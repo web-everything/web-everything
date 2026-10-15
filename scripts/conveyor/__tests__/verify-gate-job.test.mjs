@@ -1123,3 +1123,27 @@ describe('findLaneGatePidsDefault (real processes)', () => {
     } finally { child.kill('SIGKILL'); decoy.kill('SIGKILL'); }
   }, 60_000);
 });
+
+it('load-scaled gate ceiling: settlement records the exact budget given to supervision', async () => {
+  const prior = process.env.VERIFY_DISPATCH_TIMEOUT_MS;
+  process.env.VERIFY_DISPATCH_TIMEOUT_MS = '7200000';
+  let budget;
+  try {
+    const out = await runGateStep({ jobId: 'budget', input: INPUT, jobsDir: dir, log: () => {},
+      supervisorHandle: () => 'h:77:s', scanLane: () => [], probe: () => 'dead',
+      pidExists: () => false, groupExists: () => false, readStart: () => 'fixture-start',
+      laneState: () => ({ headSha: INPUT.headSha, marker: { status: 'running', sha: INPUT.headSha, startedAt: INPUT.requestStartedAt } }),
+      runGate: async o => {
+        budget = o.gateCeiling;
+        o.onSpawn(4242);
+        // A host/setting change at settlement cannot rewrite the budget actually used.
+        process.env.VERIFY_DISPATCH_TIMEOUT_MS = '25';
+      } });
+    expect(out.outcome).toBe('green');
+    expect(budget).toMatchObject({ ms: 7200000, source: 'env' });
+    expect(JSON.parse(readFileSync(resultPath(dir, 'budget'), 'utf8')).gateCeilingMs).toBe(budget.ms);
+  } finally {
+    if (prior === undefined) delete process.env.VERIFY_DISPATCH_TIMEOUT_MS;
+    else process.env.VERIFY_DISPATCH_TIMEOUT_MS = prior;
+  }
+});
