@@ -1685,11 +1685,31 @@ export function recordGhCallLogEntry(logPath, entry) {
 
 export const WE_GH_READ_MEMO_DIR = 'WE_GH_READ_MEMO_DIR';
 
-function ghReadMemoArgs(args) {
-  return args.map((arg, i) => {
-    if (args[i - 1] === '-H' || args[i - 1] === '--header') return arg.replace(/^(If-None-Match:).*$/i, '$1 <memo>');
-    return arg.replace(/^(-H|--header=)(If-None-Match:).*$/i, '$1$2 <memo>');
-  });
+function ghReadMemoContext(execOpts, throttle, env) {
+  // The executor inherits process.env unless opts.env is explicit; throttle.env configures gates only.
+  const childEnv = execOpts.env || process.env;
+  const cwd = resolve(execOpts.cwd || process.cwd());
+  const bin = throttle.bin || 'gh';
+  const probeBin = bin.includes('/') ? resolve(cwd, bin) : bin;
+  const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(cwd, path)).join(delimiter) };
+  // The App shim can choose a credential from its caller map even when a token was supplied.
+  const callerSelectsAuth = (!bin.includes('/') && !childEnv.PATH) || ghBinIsWeShim(probeBin, probeEnv);
+  const contextEnv = bag => Object.fromEntries(Object.keys(bag).sort()
+    .filter(key => (key !== 'GH_CALLER' || callerSelectsAuth) && key !== WE_GH_READ_MEMO_DIR
+      && (/^(?:GH_|GITHUB_|GIT_|WE_GH_|WE_GITHUB_)/.test(key) || ['HOME', 'XDG_CONFIG_HOME', 'PATH'].includes(key)))
+    .map(key => [key, bag[key]]));
+  // Hash all credential material: ghAuthIdentity deliberately groups unknown App tokens into one bucket.
+  return createHash('sha256').update(JSON.stringify({
+    identity: ghAuthIdentity(childEnv), cwd,
+    bin: throttle.bin || 'gh', childEnv: contextEnv(childEnv), configEnv: contextEnv(env),
+    personalRoute: throttle.personalRoute, personalToken: throttle.personalToken,
+  })).digest('hex');
+}
+
+function ghReadMemoHasFileInput(args) {
+  return args.some((arg, i) => arg === '--input' || arg.startsWith('--input=')
+    || ((args[i - 1] === '-F' || args[i - 1] === '--field' || arg.startsWith('-F') || arg.startsWith('--field='))
+      && /=@/.test(arg)));
 }
 
 function finishedCiContext(throttle) {
@@ -1772,16 +1792,23 @@ function runGhSyncReadMemo(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   const env = throttle.env || process.env;
   const dir = env[WE_GH_READ_MEMO_DIR];
-  if (!dir || throttle.exec || execOpts.input !== undefined || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))) {
+  if (!dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
+      || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))
+      // Personal routing can fall back to another identity as budget/access state changes.
+      || (classifyGhRead(args) && (throttle.personalRoute ?? resolvePersonalRouteEnabled(env)))) {
     return runGhSyncUnmemoized(args, opts);
   }
-  const memoArgs = ghReadMemoArgs(args);
-  const key = JSON.stringify({ args: memoArgs });
-  const path = join(dir, `${createHash('sha256').update(key).digest('hex')}.json`);
+  let key, path;
+  try {
+    const context = ghReadMemoContext(execOpts, throttle, env);
+    // Exact argv preserves conditional validators: 304 for one ETag is not a 200 body for another.
+    key = createHash('sha256').update(JSON.stringify({ args, context })).digest('hex');
+    path = join(dir, `${key}.json`);
+  } catch { return runGhSyncUnmemoized(args, opts); } // Unsupported context disables optional memoization.
   const encoding = execOpts.encoding && execOpts.encoding !== 'buffer' ? execOpts.encoding : null;
   try {
     const entry = JSON.parse(readFileSync(path, 'utf8'));
-    if (JSON.stringify({ args: ghReadMemoArgs(entry.args) }) === key && typeof entry.stdout === 'string'
+    if (entry.key === key && JSON.stringify(entry.args) === JSON.stringify(args) && typeof entry.stdout === 'string'
         && Buffer.isEncoding(entry.encoding)
         && (entry.encoding !== 'base64' || Buffer.from(entry.stdout, 'base64').toString('base64') === entry.stdout)) {
       const bytes = Buffer.from(entry.stdout, entry.encoding);
@@ -1798,9 +1825,9 @@ function runGhSyncReadMemo(args, opts = {}) {
   if (isGhDeferred(result) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
   const tmp = `${path}.${randomUUID()}.tmp`;
   try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(tmp, JSON.stringify({ args, stdout: Buffer.isBuffer(result) ? result.toString('base64') : result,
-      encoding: Buffer.isBuffer(result) ? 'base64' : encoding || 'utf8' }));
+    // The smoke owns directory creation/removal. A late reader must never resurrect it.
+    writeFileSync(tmp, JSON.stringify({ key, args, stdout: Buffer.isBuffer(result) ? result.toString('base64') : result,
+      encoding: Buffer.isBuffer(result) ? 'base64' : encoding || 'utf8' }), { mode: 0o600, flag: 'wx' });
     renameSync(tmp, path);
   } catch { /* Memo storage must not fail a successful read. */ }
   finally {

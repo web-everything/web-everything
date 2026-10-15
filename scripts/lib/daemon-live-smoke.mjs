@@ -81,6 +81,8 @@ import { admit as admitResource, shadowAdmission } from './resource-admission.mj
 import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
+export { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
 import { WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
 import { WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS } from './pr-snapshot.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
@@ -251,26 +253,6 @@ export function resolveSmokeReadMemo(env = process.env) {
   } catch { return { enabled: true, source: 'standard' }; }
 }
 
-/** Smoke-only read bounds: standard → platform → declared tool settings → env. Never throws. */
-export function resolveSmokeDryRun(env = process.env) {
-  const standard = { prSample: 12, snapshotStaleOkMs: 900000, lanePoolListCache: true };
-  try {
-    let tool;
-    try { tool = readDeclaredSettings().settings?.rebuildSmokeDryRun; } catch { /* use lower layers */ }
-    const integer = value => /^\d+$/.test(String(value ?? '')) ? Number(value) : undefined;
-    const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
-    const cache = env?.WE_SMOKE_LANE_POOL_LIST_CACHE;
-    const r = cascadePolicy('rebuildSmokeDryRun', tool, {
-      env, standard,
-      envValues: { prSample: integer(env?.WE_SMOKE_PR_SAMPLE), snapshotStaleOkMs: integer(env?.WE_SMOKE_SNAPSHOT_STALE_OK_MS),
-        lanePoolListCache: cache === 'on' ? true : cache === 'off' ? false : undefined },
-      valid: { prSample: nonnegative, snapshotStaleOkMs: nonnegative, lanePoolListCache: value => typeof value === 'boolean' },
-    });
-    return { ...r.value, sources: r.sources };
-  } catch {
-    return { ...standard, sources: { prSample: 'standard', snapshotStaleOkMs: 'standard', lanePoolListCache: 'standard' } };
-  }
-}
 
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // #4044: a crashed node child's first stderr line is only the stack LOCATION (`node:internal/modules/cjs/
@@ -831,6 +813,7 @@ export async function runLiveSmoke({
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
+  makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -857,7 +840,10 @@ export async function runLiveSmoke({
       console.error(`daemon-live-smoke: smoke-dry-run ${JSON.stringify(dryRun)}`);
     }
   } catch { /* logging never changes the smoke */ }
-  const memoDir = readMemo.enabled ? mkdtempSync(join(tmpdir(), 'smoke-read-memo-')) : null;
+  let memoDir = null;
+  try {
+    if (readMemo.enabled) memoDir = makeReadMemoDir();
+  } catch { /* Optional acceleration: run every check without a memo if tmp storage is unavailable. */ }
   try {
     const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
     if ([WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS].some(key => key in env)) {

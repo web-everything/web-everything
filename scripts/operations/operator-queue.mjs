@@ -229,6 +229,42 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
   };
 }
 
+/** A non-review:human PR owes clear-human only when the live job proves a human-only acceptance hold. Pure. */
+export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
+  const reasons = [];
+  if (pr.isDraft) reasons.push('draft PR');
+  for (const label of ['review:human', 'review:changes', 'review:pending', 'status:sent-back-red-team', 'ci:failed', 'merge-status:conflicting']) {
+    if (hasLabel(pr, label)) reasons.push(`${label} label`);
+  }
+  const redTeam = redTeamQueueReason(pr, redTeamSetting);
+  if (redTeam) reasons.push(redTeam);
+  const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  if (checks.some((check) => check.status !== 'COMPLETED')) reasons.push('CI pending');
+  const failing = checks.filter((check) => check.status === 'COMPLETED'
+    && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
+  if (failing.length !== 1 || failing[0].name !== 'merge-gate') reasons.push('CI must fail only merge-gate');
+  if (pr.mergeable !== 'MERGEABLE') reasons.push('not MERGEABLE');
+  if (reasons.length) return { owed: false, reasons };
+  if (mergeGateVerdict === undefined) {
+    return { owed: false, reasons, needsMergeGateVerdict: true, mergeGateCheck: failing[0] };
+  }
+  if (mergeGateVerdictImportError || !mergeGateVerdict || mergeGateVerdict.error || !Array.isArray(mergeGateVerdict.results)) {
+    return { owed: false, reasons: ['merge-gate verdict unreadable'] };
+  }
+  const head = String(pr.headRefOid ?? '').toLowerCase();
+  if (!head || String(mergeGateVerdict.headSha ?? '').toLowerCase() !== head) {
+    return { owed: false, reasons: ['merge-gate verdict is not for the live head'] };
+  }
+  const { only, holds } = humanReviewOnlyHold(mergeGateVerdict.results);
+  const acceptance = mergeGateVerdict.results.find((row) => row.id === 'review-acceptance'
+    && row.status === 'hold' && /human-only/i.test(row.reason));
+  if (!only || !acceptance) return { owed: false, reasons: ['merge-gate does not hold only for human-only review-acceptance'] };
+  const detail = String(acceptance.reason).trim().slice(0, 160);
+  const reason = `clear-human owed at live head ${head.slice(0, 9)}: merge-gate holds review-acceptance as human-only (${detail})`
+    + (hasLabel(pr, 'review:accepted') ? ' — review:accepted is stale (from an older head)' : '');
+  return { owed: true, reasons, reason, holds };
+}
+
 /** Bind a job's own verdict to its head; missing or unreadable evidence never excuses CI. */
 export function readMergeGateVerdict({ repo, check, number, exec = execFileSync }) {
   try {
@@ -519,7 +555,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   for (const repo of repoSlugs) {
     try {
-      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup';
+      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft';
       const listing = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json'];
       const completePr = (pr) => {
         try {
@@ -571,6 +607,18 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         } else if (result.transient) report.pending.push(row);
         else report.notReady.push({ ...row, reasons: result.reasons });
       }
+      for (const pr of prs.filter((candidate) => !hasLabel(candidate, 'review:human'))) {
+        let result = evaluateCeremonyOwed(pr, { redTeamSetting });
+        if (result.needsMergeGateVerdict) {
+          const mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });
+          result = evaluateCeremonyOwed(pr, { redTeamSetting, mergeGateVerdict });
+        }
+        if (result.owed) {
+          report.ready.push({ repo, number: pr.number, title: pr.title, ceremonyOwed: true,
+            reason: result.reason, humanHolds: result.holds });
+          readyNumbersThisRepo.add(pr.number);
+        }
+      }
       for (const pr of prs) {
         report.rulingNeeded.push(...mergeRulingRows(
           rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
@@ -620,9 +668,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       console.log(report.errors.join('\n'));
     }
     if (health) console.log(health.join('\n'));
-    console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
+    console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):');
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
-      + (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : '')).join('\n'));
+      + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
+        : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')

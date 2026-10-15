@@ -1,5 +1,5 @@
 {
-  "$comment": "Codex per-task launch defaults. Cascade: standard CODEX_MODEL_BY_TASK_DEFAULT \u2192 platform codexModelByTask \u2192 this file \u2192 env WE_CODEX_MODEL_BY_TASK (JSON). Every kind names model AND effort; effort must be one the model catalogue entry lists.",
+  "$comment": "Codex per-task launch defaults. Cascade: standard CODEX_MODEL_BY_TASK_DEFAULT \u2192 platform codexModelByTask \u2192 this file \u2192 env WE_CODEX_MODEL_BY_TASK (JSON). Every kind names model AND effort; effort must be one the model catalogue entry lists. Optional retry arrays name model/effort pairs, tried in order on definite pre-launch refusal before Claude fallback; [] disables these retries.",
   "codex": {
     "modelByTask": {
       "prepare": {
@@ -20,11 +20,23 @@
       },
       "fix": {
         "model": "gpt-6.1-sol",
-        "effort": "medium"
+        "effort": "high",
+        "retry": [
+          {
+            "model": "gpt-6-astra",
+            "effort": "high"
+          }
+        ]
       },
       "ci-heal": {
         "model": "gpt-6.1-sol",
-        "effort": "medium"
+        "effort": "high",
+        "retry": [
+          {
+            "model": "gpt-6-astra",
+            "effort": "high"
+          }
+        ]
       },
       "build": {
         "model": "gpt-6.1-sol",
@@ -45,6 +57,18 @@
       "review-mandatory": {
         "model": "gpt-6-astra",
         "effort": "high"
+      },
+      "doc-fix": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "prevention-card": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "prepare-card": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
       }
     }
   }

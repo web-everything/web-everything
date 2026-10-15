@@ -506,6 +506,27 @@ describe('classifySmokeFailure — pure, transient vs. code', () => {
 });
 
 describe('smoke read memo', () => {
+  it.each(['ENOSPC', 'EACCES'])('runs all checks without memo when temporary directory creation fails: %s', async code => {
+    const calls = [];
+    const defaults = withNewCheckDefaults(async () => '');
+    const runChild = async (cmd, args, opts) => {
+      calls.push(opts);
+      return defaults(cmd, args, opts);
+    };
+    const baseline = await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '0' }, runChild });
+    calls.length = 0;
+    // Fail only optional memo setup; the dispatch check still needs its mandatory isolated ledger.
+    const makeReadMemoDir = vi.fn(() => { throw Object.assign(Error('temporary storage unavailable'), { code }); });
+    const result = await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '1', WE_GH_READ_MEMO_DIR: '/inherited' },
+      runChild, makeReadMemoDir });
+    expect(makeReadMemoDir).toHaveBeenCalledOnce();
+    expect(result.results.map(({ name, ok }) => ({ name, ok })))
+      .toEqual(baseline.results.map(({ name, ok }) => ({ name, ok })));
+    expect(result.pass).toBe(baseline.pass);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(opts => opts.env?.WE_GH_READ_MEMO_DIR === undefined)).toBe(true);
+  });
+
   it('defaults to standard on without a tool setting and falls back on reader failure', () => {
     readDeclaredSettings.mockReturnValueOnce({ settings: {} });
     expect(resolveSmokeReadMemo({})).toEqual({ enabled: true, source: 'standard' });

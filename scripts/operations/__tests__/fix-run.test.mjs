@@ -10,6 +10,7 @@ import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-ha
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
+import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
 import { parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
@@ -173,6 +174,44 @@ describe('runFixCli', () => {
     await runFixCli([...argv, ...flags], m.io);
     expect(m.spawn.mock.calls[0][0]).toMatchObject(flags.length
       ? { taskKind: 'takeover', model: 'x', effort: 'high' } : { taskKind: 'fix' });
+  });
+  it.each([[[]], [['--task-kind=takeover', '--model=x', '--effort=high']]])('keeps ci-heal accounting separate from task routing %j', async flags => {
+    const m = mk(['aaa', 'aaa']);
+    await runFixCli([...argv, '--repair-kind=ci-heal', ...flags], {
+      ...m.io, readCiHeal: () => ({ checks: [{ name: 'unit' }], jobs: [] }),
+    });
+    expect(m.spawn.mock.calls[0][0]).toMatchObject({
+      taskKind: flags.length ? 'takeover' : 'fix', usageTaskKind: 'ci-heal',
+      ...(flags.length ? { model: 'x', effort: 'high' } : {}),
+    });
+  });
+  it('routes ci-heal through the real Codex provider using fix overrides while recording ci-heal', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fix-accounting-'));
+    try {
+      vi.stubEnv('WE_CODEX_USAGE_LEDGER', join(root, 'ledger'));
+      vi.stubEnv('CODEX_HOME', join(root, 'missing'));
+      vi.stubEnv('WE_CODEX_MODEL_BY_TASK', JSON.stringify({
+        fix: { model: 'gpt-6-astra', effort: 'high' },
+        'ci-heal': { model: 'gpt-6.1-sol', effort: 'medium' },
+      }));
+      const m = mk(['aaa', 'aaa']);
+      const spawnCodex = vi.fn(async () => ({ stdout: '', code: 0 }));
+      const provider = resolveDeliveryAgentProvider('codex');
+      const result = await runFixCli([...argv, '--repair-kind=ci-heal'], {
+        ...m.io, spawnCodex, readCiHeal: () => ({ checks: [{ name: 'unit' }], jobs: [] }),
+        resolveProvider: () => ({ spawn: (request, io) => provider.spawn(request, {
+          ...io, resolveReportsDir: () => join(root, 'reports'), denyPaths: [join(root, 'primary', '**')],
+          recordCpu: () => {}, recordScorecard: () => {}, writeThreadId: () => {},
+        }) }),
+      });
+      expect(result.code).toBe(0);
+      const [args] = spawnCodex.mock.calls[0];
+      expect(args[args.indexOf('-m') + 1]).toBe('gpt-6-astra');
+      expect(args).toContain('model_reasoning_effort=high');
+      expect(JSON.parse(readFileSync(join(root, 'ledger'), 'utf8'))).toMatchObject({
+        taskKind: 'ci-heal', model: 'gpt-6-astra', effort: 'high', caller: 'fix-run.mjs',
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('captures JSONL through the real provider spawn seam even when the provider returns nothing', async () => {
     const m = mk(['aaa', 'aaa']);
@@ -1236,6 +1275,26 @@ describe('runFixCli', () => {
     expect(m2.calls.some((c) => c.join(' ').includes('rearm-review.mjs 7 --repo=o/r'))).toBe(true);
     expect(m2.calls.some((c) => c.includes('push'))).toBe(false);
     expect(m2.owed.sha).toBe(null);
+  });
+  it('clears a pending re-arm refusal as pushed without running another agent', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
+    const m = mk(['bbb']);
+    m.owed.sha = 'bbb';
+    const base = m.run.getMockImplementation();
+    const run = vi.fn((cmd, args, opts) => {
+      if (args.some((a) => String(a).includes('rearm-review'))) {
+        throw Object.assign(new Error('Command failed'), { stderr: 'neither review:changes nor review:accepted is live — nothing to re-arm' });
+      }
+      return base(cmd, args, opts);
+    });
+    const write = vi.fn(), appendLoopRow = vi.fn();
+    const out = await runFixCli(argv, { ...m.io, run, write, appendLoopRow });
+    expect(out.code).toBe(0);
+    expect(m.owed.sha).toBe(null);
+    expect(m.pendingRearm.clear).toHaveBeenCalledOnce();
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', outcome: 'pushed' }));
+    expect(write).toHaveBeenCalledWith('fix-run: PR #7 re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source env)\n');
   });
   it('an unrelated stale marker (a different tip) does not re-arm a no-change run', async () => {
     const m = mk(['aaa', 'aaa']);
