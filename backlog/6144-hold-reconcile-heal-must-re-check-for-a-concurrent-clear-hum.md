@@ -1,17 +1,18 @@
 ---
+bornAs: xtwqa3k
 kind: story
 size: 3
 status: active
 scaffoldedBy: "fix-5273"
 dateScaffolded: "2026-10-14"
-scope: ["we:scripts/lib/review-escalation.mjs"]
+scope: ["we:scripts/conveyor/review-hold-reconcile.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention: route every trusted-comment builder's non-constant text through one marker neutralizer
+# Hold-reconcile heal must re-check for a concurrent clear-human after its label write
 
-PR #5273 security finding: we:scripts/conveyor/human-surface-repark.mjs interpolated raw PR file names into a comment posted by the trusted account, so a file name could forge reviewed-sha and cleared-human markers that the trusted-author parsers count. Fixed there with a percent-encoding neutralizer. Owed prevention: move that neutralizer to a shared lib, add a check:standards rule that every builder posting through the trusted account routes non-constant text through it, and a property test that parseLatestHumanClearedSha and the park marker regexes find only markers the builder itself emitted. Also add a soak scenario for a foreign review:human hold added after a clearance (the PR #5273 heal now proves label ownership from label events).
+PR #5273 red team (self-review): the we:scripts/conveyor/review-hold-reconcile.mjs heal reads labels, then removes review:accepted, with no re-check after the write. If it reads the brief accepted+human state before a clear-human comment lands and writes after it, the PR ends with neither label plus a valid clearance. Apply the same write-then-read re-check PR #5273 added to the human-surface park and the mechanical-hold hand-off (withdraw when a trusted clearance names the unchanged head), with a soak scenario.
 
 ## Acceptance
 
