@@ -372,6 +372,32 @@ describe('gatherPrFacts (injected exec)', () => {
   });
 });
 
+describe('ledger gate fails closed on unverifiable head/coverage (#5303)', () => {
+  const clearing = (coverage) => ({ folded: { clears: true, current: { coverage } }, derived: { clears: true, holds: [] } });
+  it('otherwise-clearing facts with absent coverage head fail closed for both/ledger, and labels is unchanged', () => {
+    for (const authority of ['both', 'ledger']) {
+      for (const coverage of [undefined, {}, { headSha: '' }, { headSha: 7 }]) {
+        const f = facts({ ledger: { authority, ...clearing(coverage) } });
+        expect(evaluated(f, 'ledger'), authority + JSON.stringify(coverage)).toMatchObject({ status: 'fail-closed' });
+        expect(evaluatePrGates(f).ok).toBe(false);
+      }
+      expect(evaluated(facts({ ledger: { authority, ...clearing({ headSha: HEAD }) } }), 'ledger').status).toBe('pass');
+    }
+    const labelsMode = facts({ ledger: { authority: 'labels', ...clearing(undefined) } });
+    expect(evaluated(labelsMode, 'ledger').status).toBe('pass');
+  });
+  it('an unavailable live head fails closed for both/ledger', () => {
+    const f = facts({ ledger: { authority: 'ledger', ...clearing({ headSha: HEAD }) } });
+    f.pr = { ...f.pr, headRefOid: '' };
+    expect(evaluated(f, 'ledger')).toMatchObject({ status: 'fail-closed' });
+  });
+  it('malformed holds fail closed instead of throwing out of the evaluator', () => {
+    const f = facts({ ledger: { authority: 'both', folded: { clears: true, current: { coverage: { headSha: HEAD } } }, derived: { clears: true, holds: 'ledger-unreadable' } } });
+    expect(() => evaluatePrGates(f)).not.toThrow();
+    expect(evaluated(f, 'ledger')).toMatchObject({ status: 'fail-closed' });
+  });
+});
+
 describe('ledger authority (mergeGate.reviewAuthority) reaches the evaluator', () => {
   const rules = [GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [])];
   it('honors configured ledger authority and refuses unreadable ledger evidence', () => {

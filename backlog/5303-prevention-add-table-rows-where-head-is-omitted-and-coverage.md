@@ -3,10 +3,12 @@ bornAs: xwc42kb
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs", "we:scripts/lib/__tests__/drain-ledger-shadow.test.mjs"]
 scopeRationale: "The ledger table suite covers the gate changes; we:scripts/__tests__/pr-merge-gate.test.mjs and we:scripts/lib/__tests__/pr-state-review-exempt.test.mjs run unchanged as regression checks, so neither belongs in the predicted write-set."
 dateOpened: "2026-10-07"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "4e7914456dc4199144b7e050f86d27fa7d0f1186"
 tags: []
@@ -25,6 +27,8 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 - Old scope included the generic merge wrapper suite and left caller tests unnamed. Corrected touch set: the gate source, its ledger table suite, and explicit CI/shadow regression suites in scope. `we:scripts/__tests__/pr-merge-gate.test.mjs:8` tests other exports rather than the ledger decision; retain it as regression-only. Caller behavior is observed at `we:scripts/lib/merge-gate-ci.mjs:268-269` and `we:scripts/lib/drain-ledger-shadow.mjs:117-132`; neither caller needs a source edit.
 - The earlier claim that missing coverage makes the shadow transient branch wholly unreachable was too broad. `we:scripts/lib/pr-merge-gate.mjs:376` returns existing holds before checking coverage, so held inputs can still reach `we:scripts/lib/drain-ledger-shadow.mjs:128-130`. Preserve that branch unchanged.
 - Size remains 3: approximately 20 changed lines in `we:scripts/lib/pr-merge-gate.mjs:343-382`, 90 in `we:scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs:10-74`, and 25 each in `we:scripts/lib/__tests__/merge-gate-ci.test.mjs` and `we:scripts/lib/__tests__/drain-ledger-shadow.test.mjs` (about 160 total). This is a story; no estimatedLoc field is added.
+
+- Built 2026-10-15: `ledgerVerdict` in `we:scripts/lib/pr-merge-gate.mjs` now defers (`ledger-head-unverifiable`) on a missing/empty/non-string live head or verdict coverage head, and defers as `ledger-unreadable` on non-array `holds` (undefined keeps the empty default). Shadow finding: with a missing head the real `derivePrState` already holds (`stale-acceptance`), so the shadow row is a hold, never agreement; the shadow suite asserts that and the exemption/transient preservation rows, not an `unreadable` row.
 
 ## Design
 
