@@ -42,6 +42,8 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     ['clearance revoked by re-score', say('**Your `review:human` clearance was revoked by an automated re-score.** …')],
     ['operator free text', say('Hold this one, I need to look again.', 'chalbert')],
     ['re-stamp heading, then a revocation', say('📌 review — acceptance re-stamped after a rebase (no new review)\n\nREVOKED', 'chalbert')],
+    // PR #5237 round 10 (block, same class): the trusted prevention notice is a note only in its producer's shape.
+    ['prevention-notice marker, then a revocation', say(`<!-- approval-prevention-filed:${X} -->\nI revoke my approval; do not restore.`, 'chalbert')],
   ])('does not carry clearance across a marker-free revocation: %s', (_kind, revocation) => {
     expect(parseLatestHumanClearedSha([clear(X), revocation, accept(X)], { sameShaCarries: true })).toBeNull();
   });

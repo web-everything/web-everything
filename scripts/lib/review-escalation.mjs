@@ -1919,8 +1919,7 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
     if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
       while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
     }
-    const machineNote = isMachineNoteBody(body)
-      || (isTrustedMarkerAuthor(c) && body.trimStart().startsWith('<!-- approval-prevention-filed:'));
+    const machineNote = isMachineNoteBody(body) || (isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(body));
     if (bodySha === null) {
       // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
       // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
@@ -2024,6 +2023,19 @@ const RESTAMP_LEAD_RE = /^\s*📌 review — /;
 export function isMachineNoteBody(body) {
   if (!isKnownMachineBody(body)) return false;
   return !RESTAMP_LEAD_RE.test(typeof body === 'string' ? body : '') || isSanctionedAcceptRecordBody(body);
+}
+
+/**
+ * Pure: is this the approval-time prevention notice exactly as `review-set-label.mjs` posts it after a clearance (its
+ * marker line, then the one "Filed the prevention guard(s)…" line, nothing else)? PR #5237 round 10 (block): matching
+ * the marker on the first line alone let a trusted comment open with it and revoke the clearance underneath, read as a
+ * note. A producer change makes the notice a possible hold: the fail-closed side.
+ */
+const PREVENTION_NOTE_MARKER_LINE_RE = /^<!-- approval-prevention-filed:[0-9a-f]{7,40} -->(?: <!-- approval-prevention-job:[A-Za-z0-9._-]{1,120} -->)?$/;
+const PREVENTION_NOTE_TEXT_LINE_RE = /^Filed the prevention guard\(s\) owed by [\w.-]+\/[\w.-]+#\d+'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[\w.-]+ \(#[\w?-]+\)|queued for landing via a lane \(tracking (?:pid:\d+|an untracked job)\))\.$/;
+export function isApprovalPreventionNoteBody(body) {
+  const lines = bodyLines(typeof body === 'string' ? body.trim() : '');
+  return lines.length === 2 && PREVENTION_NOTE_MARKER_LINE_RE.test(lines[0]) && PREVENTION_NOTE_TEXT_LINE_RE.test(lines[1]);
 }
 
 /**

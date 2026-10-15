@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
-import { parseLatestHumanClearedSha } from '../review-escalation.mjs';
+import { REARM_COMMENT_MARKER, buildRearmComment } from '../../conveyor/rearm-review.mjs';
+import { parseLatestHumanClearedSha, isApprovalPreventionNoteBody } from '../review-escalation.mjs';
+import { runApprovalPreventionFiling } from '../../review-set-label.mjs';
 import {
   REVIEW_CLEARANCE_SETTINGS, REARM_MARKER, resolveReviewClearanceSetting, loadReviewClearanceSetting,
   classifyGateFailure, failingCiChecks, decideStaleGateRerun, decideRearmGuard, mayNeedRestore,
   decideClearanceRestore, buildRestoreComment, createReviewClearanceGuard, readPrClearanceFacts, newerAcceptanceOnHead,
+  isRearmNote,
 } from '../review-clearance-guard.mjs';
 
 const head = '9c72024172156f0f8b1b1c0c3f94b44d1031bdd3';
@@ -18,8 +20,13 @@ const on = { value: 'on', source: 'standard' };
 const off = { value: 'off', source: 'env' };
 const comment = (body, time, login = 'chalbert') => ({ body, createdAt: `2026-10-13T${time}Z`, author: { login }, url: `https://github.com/${repo}/pull/5193#${time}` });
 const acceptance = comment(`✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${head} -->\n<!-- cleared-human: chalbert -->`, '18:30:07');
-const rearm = comment(REARM_COMMENT_MARKER, '19:02:59', 'web-everything[bot]');
-const comments = [acceptance, comment(`<!-- approval-prevention-filed:${head} -->`, '18:30:14'), rearm];
+// The real producers' shapes: `rearm-review.mjs#buildRearmComment` and the approval-time prevention notice
+// (`review-set-label.mjs`, after a human clearance).
+const rearmBody = buildRearmComment({ actor: 'conveyor fix agent', decision: { rearmFrom: 'review:accepted', keepsHuman: false } });
+const rearm = comment(rearmBody, '19:02:59', 'web-everything[bot]');
+const preventionNote = `<!-- approval-prevention-filed:${head} --> <!-- approval-prevention-job:land-prevention-5193-a1 -->\n`
+  + `Filed the prevention guard(s) owed by ${repo}#5193's independent review, mechanically, on approval (operator rule, 2026-09-27) — queued for landing via a lane (tracking pid:4242).`;
+const comments = [acceptance, comment(preventionNote, '18:30:14'), rearm];
 const event = (type, label, time, login = 'web-everything[bot]') => ({ event: type, label: { name: label }, created_at: `2026-10-13T${time}Z`, actor: { login } });
 const events = [event('unlabeled', 'review:human', '18:30:11', 'chalbert'), event('labeled', 'review:accepted', '18:30:11', 'chalbert'), event('unlabeled', 'review:accepted', '19:02:57'), event('labeled', 'review:pending', '19:02:57')];
 const record = { sha: head, at: acceptance.createdAt, url: acceptance.url };
@@ -109,6 +116,9 @@ describe('#5193 review clearance', () => {
       ['an automation restoration note with text after it', { comments: [...comments, comment(`${restoreBody}\n\nREVOKED`, '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
       ['a restoration of another record', { comments: [...comments, comment(restoreBody.replace(acceptance.url, `${acceptance.url}x`), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
       ['a revocation between the re-arm and the restoration', { comments: [...comments, comment('Hold this PR; I revoke my approval.', '19:03:10'), restoredThread.at(-1)], events: restoredEvents }],
+      // PR #5237 round 10 (block): a trusted comment opening with the re-arm heading is a re-arm only in its exact shape.
+      ['a pasted re-arm with a revocation before the restoration', { comments: [...comments, comment(`${REARM_COMMENT_MARKER}\n\nI revoke approval; do not restore.`, '19:03:10'), restoredThread.at(-1)], events: restoredEvents }],
+      ['a pasted prevention notice with a revocation', { comments: [...facts.comments, comment(`<!-- approval-prevention-filed:${head} -->\nI revoke approval; do not restore.`, '18:45:00')] }],
     ])('lets a re-arm through after %s', (_kind, patch) => {
       expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(false);
     });
@@ -224,6 +234,50 @@ describe('#5193 review clearance', () => {
     `📌 review — acceptance re-stamped — REVOKED, do not restore`,
   ])('does not restore over a re-stamp-headed revocation after the re-arm: %j', body => {
     expect(decideClearanceRestore({ ...restoreFacts, comments: [...comments, comment(body, '19:03:00')] }).restore).toBe(false);
+  });
+  // PR #5237 round 10 (block ruling): `rearms` was every trusted comment whose first line starts with the re-arm heading,
+  // and the hold scan skipped them, so an operator revocation pasted under that heading was restored over. A re-arm (and
+  // the prevention notice the hold scan also skips) counts only in its producer's exact shape.
+  const rearmPastes = [
+    ['heading then revocation', `${REARM_COMMENT_MARKER}\n\nI revoke approval; do not restore.`],
+    ['revocation on the heading line', `${REARM_COMMENT_MARKER} — I revoke approval; do not restore.`],
+    ['a whole re-arm with a revocation after it', `${rearmBody}\n\nI revoke approval; do not restore.`],
+    ['a whole re-arm with an edited line', rearmBody.replace('re-verdicts.', 'REVOKED — do not restore.')],
+    ['a whole re-arm with a revocation in the blank line', rearmBody.replace('\n\n', '\nREVOKED\n')],
+    ['a prevention notice marker then revocation', `<!-- approval-prevention-filed:${head} -->\nI revoke approval; do not restore.`],
+    ['a whole prevention notice with a revocation after it', `${preventionNote}\n\nI revoke approval; do not restore.`],
+  ];
+  it.each(rearmPastes)('does not restore over a pasted re-arm followed by an operator revocation (%s)', (_kind, body) => {
+    for (const login of ['chalbert', 'web-everything[bot]']) {
+      expect(decideClearanceRestore({ ...restoreFacts, comments: [...comments, comment(body, '19:03:00', login)] }).restore).toBe(false);
+    }
+  });
+  it('recognises every re-arm its producer renders, and only from a trusted author', () => {
+    for (const rearmFrom of ['review:accepted', 'review:changes', 'missing']) {
+      for (const keepsHuman of [false, true]) {
+        const body = buildRearmComment({ actor: 'conveyor fix agent', decision: { rearmFrom, keepsHuman } });
+        expect(isRearmNote(comment(body, '19:02:59', 'web-everything[bot]')), body).toBe(true);
+        expect(isRearmNote(comment(body, '19:02:59', 'mallory')), body).toBe(false);
+      }
+    }
+    for (const [, body] of rearmPastes) expect(isRearmNote(comment(body, '19:02:59', 'web-everything[bot]')), body).toBe(false);
+  });
+  it('recognises every prevention notice its producer posts', () => {
+    const owed = '**Verdict:** ✅ pass — no blocking findings\n- `scripts/a.mjs:1` — an issue\n  - _Prevention (OWED — file it):_ add a guard';
+    for (const filed of [{ ok: true, num: 5001, rel: 'backlog/5001-x.md' }, { ok: true, num: 'xab12cd', rel: 'backlog/xab12cd-y.md' },
+      { ok: true, num: null, rel: null, error: null, handle: 'pid:4242', session: 'land-prevention-5193-a1' }]) {
+      const posted = [];
+      runApprovalPreventionFiling({ to: 'clear-human', repo, pr: 5193, headSha: head, commentBody: owed, prComments: [],
+        provider: { postComment: (_r, _p, body) => posted.push(body) }, fileApprovalPrevention: () => filed, findFiledApprovalPrevention: () => null });
+      expect(posted).toHaveLength(1);
+      expect(isApprovalPreventionNoteBody(posted[0]), posted[0]).toBe(true);
+      expect(isApprovalPreventionNoteBody(`${posted[0]}\n\nI revoke approval.`)).toBe(false);
+    }
+    expect(isApprovalPreventionNoteBody(preventionNote)).toBe(true);
+  });
+  it('a pasted re-arm after a restoration does not make a restore look owed again', () => {
+    const restored = [...comments, comment(buildRestoreComment({ head, record, rearm, setting: on }), '19:03:31', 'web-everything[bot]')];
+    expect(mayNeedRestore({ comments: [...restored, comment(`${REARM_COMMENT_MARKER}\n\nI revoke approval.`, '19:05:00')], prHead: head })).toBe(false);
   });
   it.each(pastes)('lets a re-arm through after a pasted acceptance followed by a revocation (%s)', (_kind, body) => {
     const { runGh } = fakeGh(['review:accepted'], [acceptance, comment(body, '18:45:00')]);

@@ -5,7 +5,7 @@ import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewCle
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor, isAutomationAuthored } from './marker-authorship.mjs';
-import { parseLatestHumanClearedSha, isSanctionedAcceptRecordBody, isMachineNoteBody } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, isSanctionedAcceptRecordBody, isMachineNoteBody, isApprovalPreventionNoteBody } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -30,7 +30,27 @@ const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? ro
  * revocation after it holds (PR #5237 round 9, self-review).
  */
 const holdsClearance = c => (starts(c, RESTORE_MARKER) ? !restoreNote(c) : !isMachineNoteBody(c?.body))
-  && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.trimStart().startsWith('<!-- approval-prevention-filed:'));
+  && !(isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(c?.body));
+/**
+ * Is `c` a re-arm comment exactly as `rearm-review.mjs#buildRearmComment` writes it, from a trusted author? Every line
+ * is matched whole. PR #5237 round 10 (block): a first-line match let a trusted comment open with the re-arm heading
+ * and revoke under it, and the revocation was skipped as "the re-arm" (restored over). The actor is the one free part,
+ * one line with no `;`. A producer change makes a real re-arm unrecognised: no restoration, a re-review owed.
+ */
+const REARM_LINE_RE = new RegExp(`^(?:${['The healed PR had no review label; independent review is being requested',
+  'The previously accepted PR was re-pushed and its acceptance is being re-armed for review',
+  'The `review:changes` bounce was repaired and re-pushed'].map(escapeRe).join('|')}) by [^;\\n]+; (?:${[
+  '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).',
+  '`review:pending` is requested. This comment records the request; the completion result reports whether the label write was verified.',
+  'the PR is re-armed `review:pending` (an independent re-review is owed).'].map(escapeRe).join('|')})$`);
+const REARM_LAST_LINE = 'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts.';
+export function isRearmNote(c) {
+  if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
+  const lines = c.body.trimEnd().split(/\r?\n/);
+  return lines.length === 5 && lines[0] === REARM_MARKER && lines[1] === '' && REARM_LINE_RE.test(lines[2])
+    && lines[3] === '' && lines[4] === REARM_LAST_LINE;
+}
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 /**
  * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation
  * that quotes the marker is the latest record too, and it is not a clearance: null, so nothing is restored or
@@ -118,7 +138,7 @@ const revokedSinceRecord = ({ comments, events, record, prHead }) => {
   if (!Array.isArray(comments) || !Array.isArray(events) || !Number.isInteger(record?.index)) return true;
   const later = comments.slice(record.index + 1);
   const restoredAt = later.reduce((last, c, i) => (isRestoreOf(c, record, comments[record.index]?.url, prHead) ? i : last), -1);
-  if (later.some((c, i) => holdsClearance(c) && !(i < restoredAt && starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c)))) return true;
+  if (later.some((c, i) => holdsClearance(c) && !(i < restoredAt && isRearmNote(c)))) return true;
   const since = Date.parse(restoredAt >= 0 ? at(later[restoredAt]) : record.at);
   if (!Number.isFinite(since)) return true;
   return events.some(e => ((e.event === 'unlabeled' && e.label?.name === 'review:accepted')
@@ -144,7 +164,7 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
   if (changeRequestStands(reviews, record)) return no('formal reviews unreadable or hold clearance');
   if (!Array.isArray(events)) return no('issue events unreadable');
   const later = comments.slice(record.index + 1);
-  const rearms = later.filter(c => starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c) && Date.parse(at(c)) > Date.parse(record.at));
+  const rearms = later.filter(c => isRearmNote(c) && Date.parse(at(c)) > Date.parse(record.at));
   const rearmComment = rearms.at(-1);
   if (!rearmComment) return no('no later trusted re-arm');
   if (later.some(c => starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c)
@@ -203,7 +223,7 @@ export function mayNeedRestore({ comments, prHead } = {}) {
   const record = latestAcceptance(comments);
   if (!record || record.sha !== prHead) return false;
   const later = comments.slice(record.index + 1);
-  const last = later.map((c, i) => [c, i]).filter(([c]) => starts(c, REARM_MARKER) && isTrustedMarkerAuthor(c)).at(-1);
+  const last = later.map((c, i) => [c, i]).filter(([c]) => isRearmNote(c)).at(-1);
   return !!last && !later.slice(last[1] + 1).some(c => starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c));
 }
 
