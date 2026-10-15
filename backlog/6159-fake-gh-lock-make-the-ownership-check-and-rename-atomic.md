@@ -11,6 +11,8 @@ tags: []
 
 Ruling card from PR #5270 (operator, 2026-10-15). In we:scripts/conveyor/__tests__/helpers/fake-gh.mjs the stale-lock takeover checks ownership and then renames; a replacement lock acquired between the check and the rename can be renamed away. Test-only race; make check-and-rename atomic (or re-verify after rename) with a test that forces the interleaving.
 
+Also (operator, 2026-10-15, on #5270's final head acaf9f7, we:scripts/conveyor/__tests__/helpers/fake-gh.mjs ~298): stale takeover now requires the holder PID to be dead, so a lock whose recorded PID was reused (or whose holder is a zombie) is never recovered and every waiter spins 20 s then throws. Pair the PID with a start-time or nonce so a reused PID reads as stale, with a test.
+
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
