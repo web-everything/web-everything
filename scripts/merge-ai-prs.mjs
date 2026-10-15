@@ -4565,8 +4565,8 @@ async function runCli() {
   // The same argv class, third instance. NOTE: no repo-wide lint exists for it — guarded by hand inside
   // `readLegacyLocalManifestAt` (every ref argument sits behind --end-of-options). It reads the PR's head sha
   // directly, so only an answer from that exact commit is cached under it.
-  const readLegacyLocalManifest = (headRef, headSha) => legacyGitManifestMutex.run(() => readLegacyLocalManifestAt({
-    headRef, headSha,
+  const readLegacyLocalManifest = (headRef, headSha, prNumber) => legacyGitManifestMutex.run(() => readLegacyLocalManifestAt({
+    headRef, headSha, prNumber,
     git: (args) => readGit(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }),
   }));
   // #2417 review — returns `{ manifest, degraded }`. `degraded:true` marks a null that came from a swallowed gh
@@ -4590,14 +4590,16 @@ async function runCli() {
       return await readRemoteManifestViaApi({ exec: execFileP, repo, headRef });
     }
     const legacy = await readLegacyManifestCached({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha,
-      readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef, headSha) });
+      readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef, headSha, num) });
     // A non-definitive git answer (not read from the head sha itself) is used for this pass only: `transient`
     // keeps `fetchPrReadsCached` from latching it, without the `degraded` fail-closed (the R2 livelock).
     const transient = !legacy.definitive;
     if (legacy.manifest) return { manifest: legacy.manifest, degraded: false, transient };
     // Local git fallback found nothing. Post-cutover lanes carry the manifest in the PR BODY (not the tree), so a
     // null here after the PR-body gh read THREW is a spurious degrade — surface `fromPr.degraded` so it re-fetches.
-    return { manifest: null, degraded: fromPr.degraded, transient };
+    // A head commit git could not read (`unreadable`) is NOT "no manifest": degrade so the couple gate fails
+    // closed this pass. Its fetch uses refs/pull/<n>/head, which exists for every open PR, so this clears itself.
+    return { manifest: null, degraded: fromPr.degraded || legacy.unreadable, transient };
   };
   // #2417 — a PR's HEAD SHA cache key. `gh pr list --json headRefOid` supplies it in the SAME list call (no
   // extra round-trip); a PR whose SHA is unchanged since the previous `--watch` pass reuses its cached reads.

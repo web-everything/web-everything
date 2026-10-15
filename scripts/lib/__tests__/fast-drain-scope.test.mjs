@@ -43,10 +43,10 @@ describe('fast drain scope', () => {
 });
 
 describe('legacy manifest persistence', () => {
-  const key = { repo: 'web-everything/web-everything', num: 7, sha: 'abc', kind: 'legacy-manifest' };
+  const key = { repo: 'web-everything/web-everything', num: 7, sha: 'abc', kind: 'legacy-manifest-v2' };
   it.each([null, { item: 7 }])('reuses a cached answer %s without a git read', async (manifest) => {
     const readCache = vi.fn(() => manifest), writeCache = vi.fn(), readLegacy = vi.fn();
-    expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toEqual({ manifest, definitive: true });
+    expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toEqual({ manifest, definitive: true, unreadable: false });
     expect(readCache).toHaveBeenCalledWith(key);
     expect(readLegacy).not.toHaveBeenCalled();
     expect(writeCache).not.toHaveBeenCalled();
@@ -58,15 +58,21 @@ describe('legacy manifest persistence', () => {
     const readCache = vi.fn(() => undefined), writeCache = vi.fn();
     const readLegacy = vi.fn(async () => ({ manifest, definitive }));
     // `definitive` rides back so the in-memory per-pass caches can skip a non-head answer too.
-    expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toEqual({ manifest, definitive });
+    expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toEqual({ manifest, definitive, unreadable: false });
     if (persists) expect(writeCache).toHaveBeenCalledWith({ ...key, value: manifest });
     else expect(writeCache).not.toHaveBeenCalled();
   });
   it('never reads or writes the cache without a head sha', async () => {
     const readCache = vi.fn(() => ({ item: 9 })), writeCache = vi.fn();
     const readLegacy = vi.fn(async () => ({ manifest: { item: 7 }, definitive: true }));
-    expect(await readLegacyManifestCached({ ...key, sha: null, readCache, writeCache, readLegacy })).toEqual({ manifest: { item: 7 }, definitive: false });
+    expect(await readLegacyManifestCached({ ...key, sha: null, readCache, writeCache, readLegacy })).toEqual({ manifest: { item: 7 }, definitive: false, unreadable: false });
     expect(readCache).not.toHaveBeenCalled();
+    expect(writeCache).not.toHaveBeenCalled();
+  });
+  it('passes an unreadable head through uncached so the caller fails closed', async () => {
+    const readCache = vi.fn(() => undefined), writeCache = vi.fn();
+    const readLegacy = vi.fn(async () => ({ manifest: null, definitive: false, unreadable: true }));
+    expect(await readLegacyManifestCached({ ...key, readCache, writeCache, readLegacy })).toEqual({ manifest: null, definitive: false, unreadable: true });
     expect(writeCache).not.toHaveBeenCalled();
   });
 });
@@ -104,44 +110,59 @@ describe('legacy manifest revision identity', () => {
   };
   const failFetch = () => { throw new Error('network'); };
 
-  // With a full head sha, a fallback ref can only name ANOTHER commit, so its manifest is neither used nor cached.
+  // With a full head sha, a fallback ref can only name ANOTHER commit, so its manifest is neither used nor cached;
+  // the unreadable head fails closed (`unreadable` → degraded) rather than reading as "not a carrier".
+  const UNREADABLE = { manifest: null, definitive: false, unreadable: true };
   it('does not use or cache a stale origin ref after a failed fetch', () => {
     const { git } = fakeGit({ commits: { [STALE]: { item: 3 } }, refs: { 'origin/lane/x': STALE }, fetch: failFetch });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: null, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual(UNREADABLE);
   });
   it('does not use or cache a manifest from stale FETCH_HEAD after fetch failure', () => {
     const { git } = fakeGit({ commits: { [OTHER]: { item: 99 } }, refs: { FETCH_HEAD: OTHER }, fetch: failFetch });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: null, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual(UNREADABLE);
   });
   it('does not use FETCH_HEAD when another drain process moved it and the head object is still missing', () => {
     const { git } = fakeGit({ commits: { [OTHER]: { item: 99 } }, refs: { FETCH_HEAD: OTHER } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: null, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual(UNREADABLE);
   });
   it('reads the head sha, not FETCH_HEAD, when a concurrent drain moved FETCH_HEAD to another PR', () => {
     const { git } = fakeGit({ commits: { [HEAD]: { item: 7 }, [OTHER]: { item: 99 } }, refs: { FETCH_HEAD: OTHER } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: { item: 7 }, definitive: true });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual({ manifest: { item: 7 }, definitive: true, unreadable: false });
   });
   it('does not use or cache a fork branch named main as the PR head', () => {
     const { git } = fakeGit({ commits: { [OTHER]: { item: 1 } }, refs: { main: OTHER, 'origin/main': OTHER }, fetch: failFetch });
-    expect(readLegacyLocalManifestAt({ headRef: 'main', headSha: HEAD, git })).toEqual({ manifest: null, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'main', headSha: HEAD, prNumber: 7, git })).toEqual(UNREADABLE);
+  });
+  it('fetches a fork head through refs/pull/<n>/head, never needing a same-named origin branch', () => {
+    const commits = { [OTHER]: { item: 1 } };
+    const { git, calls } = fakeGit({ commits, refs: { 'origin/main': OTHER }, fetch: (args) => {
+      if (args.at(-1) === 'refs/pull/7/head') commits[HEAD] = { item: 7 }; else throw new Error('no such ref');
+    } });
+    expect(readLegacyLocalManifestAt({ headRef: 'main', headSha: HEAD, prNumber: 7, git })).toEqual({ manifest: { item: 7 }, definitive: true, unreadable: false });
+    expect(calls.filter(a => a[0] === 'fetch').map(a => a.at(-1))).toEqual(['refs/pull/7/head']);
+  });
+  it.each([undefined, 0, -1, 1.5, '7', NaN])('never builds a pull ref from an invalid PR number %s', (prNumber) => {
+    const { git, calls } = fakeGit({ fetch: failFetch });
+    readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber, git });
+    expect(calls.filter(a => a[0] === 'fetch').map(a => a.at(-1))).toEqual(['lane/x']);
   });
   it.each(['ls-tree', 'show'])('does not turn a failed %s of the head into a definitive absence', (op) => {
     const { git } = fakeGit({ commits: { [HEAD]: { item: 7 } }, fail: { [op]: true } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: null, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual(UNREADABLE);
   });
   it('answers definitively from a local head object even when the fetch fails, without fetching', () => {
     const { git, calls } = fakeGit({ commits: { [HEAD]: undefined, [STALE]: { item: 3 } }, refs: { 'origin/lane/x': STALE }, fetch: failFetch });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: null, definitive: true });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual({ manifest: null, definitive: true, unreadable: false });
     expect(calls.some(a => a[0] === 'fetch')).toBe(false);
   });
   it('fetches a missing head object, then reads it definitively', () => {
     const commits = {};
     const { git } = fakeGit({ commits, fetch: () => { commits[HEAD] = { item: 7 }; } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, git })).toEqual({ manifest: { item: 7 }, definitive: true });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual({ manifest: { item: 7 }, definitive: true, unreadable: false });
   });
   it.each([null, '', 'HEAD', `--output=/tmp/x`, 'A'.repeat(40), 'a'.repeat(39)])('never trusts or passes an invalid head sha %s', (headSha) => {
     const { git, calls } = fakeGit({ commits: { [OTHER]: { item: 1 } }, refs: { FETCH_HEAD: OTHER } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha, git })).toEqual({ manifest: { item: 1 }, definitive: false });
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha, prNumber: 7, git })).toEqual({ manifest: { item: 1 }, definitive: false, unreadable: false });
     expect(calls.some(a => a[0] === 'cat-file')).toBe(false);
   });
   it('keeps a dash-leading head ref behind --end-of-options', () => {

@@ -36,13 +36,14 @@ export function filterToFastDrainTarget(prs, { onlyPr, scope, isTarget }) {
  * (stale origin ref, same-named local branch, FETCH_HEAD another drain moved) is returned but stays retryable.
  */
 export async function readLegacyManifestCached({ repo, num, sha, readCache, writeCache, readLegacy }) {
-  if (!sha) return { manifest: (await readLegacy()).manifest, definitive: false };
-  const key = { repo, num, sha, kind: 'legacy-manifest' };
+  if (!sha) { const r = await readLegacy(); return { manifest: r.manifest, definitive: false, unreadable: !!r.unreadable }; }
+  // v2: entries written under the earlier fetchSucceeded rule could hold a fallback ref's manifest.
+  const key = { repo, num, sha, kind: 'legacy-manifest-v2' };
   const cached = readCache(key);
-  if (cached !== undefined) return { manifest: cached, definitive: true };
-  const { manifest, definitive } = await readLegacy();
+  if (cached !== undefined) return { manifest: cached, definitive: true, unreadable: false };
+  const { manifest, definitive, unreadable } = await readLegacy();
   if (definitive) writeCache({ ...key, value: manifest });
-  return { manifest, definitive: !!definitive };
+  return { manifest, definitive: !!definitive, unreadable: !!unreadable };
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -50,38 +51,44 @@ const MANIFEST_PATH = '.lane-manifest.json';
 
 /**
  * Read the tree-committed `.lane-manifest.json` for one PR head. `git(args)` returns stdout or throws.
- * With a full head sha, only that commit answers (fetching it when missing): FETCH_HEAD, origin/<ref> and a
- * same-named local branch can only name ANOTHER commit there, and FETCH_HEAD is shared by every drain process
- * in the clone. "No manifest" is definitive only when ls-tree lists the head tree without the file; a failed
- * git read is non-definitive. Without a usable sha, the ref fallbacks are used but never definitive.
+ * With a full head sha, only that commit answers (fetching it when missing — the PR's own
+ * `refs/pull/<n>/head` first, which origin keeps for every open PR, forks included, then `headRef`):
+ * FETCH_HEAD, origin/<ref> and a same-named local branch can only name ANOTHER commit there, and FETCH_HEAD is
+ * shared by every drain process in the clone. "No manifest" is definitive only when ls-tree lists the head
+ * tree without the file. A head that stays unreadable (missing after both fetches, or an ls-tree/show error)
+ * returns `unreadable` so the caller fails closed for this pass instead of reading it as "not a carrier".
+ * Without a usable sha, the ref fallbacks are used but never definitive.
  * `headRef` is a gh-supplied refname and may lead with a dash, so every ref argument sits behind --end-of-options.
- * @returns {{manifest: object|null, definitive: boolean}}
+ * @returns {{manifest: object|null, definitive: boolean, unreadable: boolean}}
  */
-export function readLegacyLocalManifestAt({ headRef, headSha, git }) {
+export function readLegacyLocalManifestAt({ headRef, headSha, prNumber, git }) {
   const sha = typeof headSha === 'string' && FULL_SHA.test(headSha) ? headSha : null;
   const parse = (raw) => { try { const m = JSON.parse(raw); return m && m.item != null ? m : null; } catch { return null; } };
-  const fetch = () => {
-    try { git(['fetch', '--quiet', '--end-of-options', 'origin', headRef]); } catch { /* ref may be local */ }
+  const fetch = (ref) => {
+    try { git(['fetch', '--quiet', '--end-of-options', 'origin', ref]); } catch { /* ref may be local */ }
   };
+  const unreadable = { manifest: null, definitive: false, unreadable: true };
   if (sha) {
     const hasHead = () => {
       try { git(['cat-file', '-e', '--end-of-options', `${sha}^{commit}`]); return true; } catch { return false; }
     };
-    if (!hasHead()) fetch();
-    if (!hasHead()) return { manifest: null, definitive: false };
+    if (!hasHead() && Number.isSafeInteger(prNumber) && prNumber > 0) fetch(`refs/pull/${prNumber}/head`);
+    if (!hasHead() && headRef) fetch(headRef);
+    if (!hasHead()) return unreadable;
     let listed;
-    try { listed = git(['ls-tree', '--end-of-options', sha, '--', MANIFEST_PATH]); } catch { return { manifest: null, definitive: false }; }
-    if (!String(listed ?? '').trim()) return { manifest: null, definitive: true };
+    try { listed = git(['ls-tree', '--end-of-options', sha, '--', MANIFEST_PATH]); } catch { return unreadable; }
+    if (!String(listed ?? '').trim()) return { manifest: null, definitive: true, unreadable: false };
     let raw;
-    try { raw = git(['show', '--end-of-options', `${sha}:${MANIFEST_PATH}`]); } catch { return { manifest: null, definitive: false }; }
-    return { manifest: parse(raw), definitive: true }; // a commit's bytes never change, so even unparseable is final
+    try { raw = git(['show', '--end-of-options', `${sha}:${MANIFEST_PATH}`]); } catch { return unreadable; }
+    // A commit's bytes never change, so even an unparseable manifest is a final answer.
+    return { manifest: parse(raw), definitive: true, unreadable: false };
   }
-  fetch();
+  fetch(headRef);
   for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
     let raw;
     try { raw = git(['show', '--end-of-options', `${rev}:${MANIFEST_PATH}`]); } catch { continue; }
     const manifest = parse(raw);
-    if (manifest) return { manifest, definitive: false };
+    if (manifest) return { manifest, definitive: false, unreadable: false };
   }
-  return { manifest: null, definitive: false };
+  return { manifest: null, definitive: false, unreadable: false };
 }
