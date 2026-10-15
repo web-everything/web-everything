@@ -166,7 +166,7 @@ describe('human surface re-park sweep', () => {
     expect(f.calls).toEqual([]);
   });
   // PR #5273 red team: the ceremony completes while the sweep's own write is in flight (after its final read).
-  function racing({ during = 'comment', readCommentsFails = false } = {}) {
+  function racing({ during = 'comment', readCommentsFails = false, bounce = false } = {}) {
     const live = { state: 'OPEN', headRefOid: head, labels: [...labels], comments: [] };
     const effects = [];
     let reads = 0;
@@ -174,11 +174,17 @@ describe('human surface re-park sweep', () => {
       // The label-less clear-human ceremony: swap (accepted already live) then the trusted clearance comment.
       live.labels = [...new Set([...live.labels.filter(l => l !== 'review:human'), 'review:accepted'])];
       live.comments.push({ id: 'C_clear', ...clearance(head) });
+      // A changes bounce after the ceremony carries no reviewed-sha marker, so the clearance stays "latest".
+      if (bounce) live.labels = [...live.labels.filter(l => l !== 'review:accepted'), 'review:changes'];
     };
     const provider = {
       readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),
       readPrFiles: () => ['.github/workflows/ci.yml'],
-      postComment: () => { effects.push('comment'); if (during === 'comment') clear(); },
+      postComment: (_r, _n, body) => {
+        effects.push('comment');
+        live.comments.push({ id: 'C_park', author: { login: 'web-everything' }, body });
+        if (during === 'comment') clear();
+      },
       setLabels: (_r, _n, { add, remove = [] }) => {
         effects.push(`labels:+${add}-${remove.join(',')}`);
         live.labels = [...new Set([...live.labels.filter(l => !remove.includes(l)), add])];
@@ -199,10 +205,58 @@ describe('human surface re-park sweep', () => {
     expect(r.live.labels).not.toContain('review:human');
     expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, files: ['.github/workflows/ci.yml'], reason: 'human clearance at the live head landed during the write' }]);
   });
+  it('does not add review:accepted beside a review:changes bounce that followed the ceremony', () => {
+    const r = racing({ during: 'comment', bounce: true });
+    expect(r.live.labels).not.toContain('review:accepted');
+    expect(r.live.labels).toContain('review:changes');
+    expect(r.results[0].repark).toBe('reparked');
+  });
+  it('withdraws without a failed remove when the ceremony already removed review:human', () => {
+    const r = racing({ during: 'labels' });
+    expect(r.effects.at(-1)).toBe('labels:+review:human-review:accepted');
+    expect(r.results[0]).not.toHaveProperty('error');
+  });
   it('leaves the hold (fail closed) and reports when the post-write read fails', () => {
     const r = racing({ during: 'none', readCommentsFails: true });
     expect(r.live.labels).toContain('review:human');
     expect(r.results[0]).toMatchObject({ num: 7, repark: 'reparked', error: 'post-write clearance check failed: offline' });
+  });
+  describe('heal of a park that lost the race and was never re-checked', () => {
+    const park = { id: 'C_park', author: { login: 'web-everything' }, body: buildHumanSurfaceReparkComment({ headSha: head, hits: [] }) };
+    function heal({ labels: l = ['review:human', 'ready-to-merge'], comments = [park, { id: 'C_clear', ...clearance(head) }], dryRun = false, headRefOid = head } = {}) {
+      const live = { state: 'OPEN', headRefOid, labels: [...l], comments };
+      const effects = [];
+      const provider = {
+        readPrState: () => ({ ...live, labels: [...live.labels] }), readPrFiles: () => ['.github/workflows/ci.yml'],
+        postComment: () => effects.push('comment'),
+        setLabels: (_r, _n, { add, remove = [] }) => { effects.push({ add, remove }); live.labels = [...new Set([...live.labels.filter(x => !remove.includes(x)), add])]; },
+      };
+      const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels: l }], provider, readComments: () => [...comments], resolveSurfaces: () => 'narrow', dryRun });
+      return { live, effects, results };
+    }
+    it('withdraws its own marked park beside a clearance of the live head', () => {
+      const r = heal();
+      expect(r.live.labels).toEqual(['ready-to-merge', 'review:accepted']);
+      expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, reason: 'healed a park that lost a race with a human clearance' }]);
+    });
+    it('reports only, in dry-run', () => {
+      const r = heal({ dryRun: true });
+      expect(r.effects).toEqual([]);
+      expect(r.results).toEqual([{ num: 7, repark: 'would-withdraw', head }]);
+    });
+    it.each([
+      ['no marker (another park)', { comments: [{ id: 'C_clear', ...clearance(head) }] }],
+      ['a marker for an older head', { comments: [{ ...park, body: buildHumanSurfaceReparkComment({ headSha: 'b'.repeat(40), hits: [] }) }, { id: 'C_clear', ...clearance(head) }] }],
+      ['an untrusted marker', { comments: [{ ...park, author: { login: 'outsider' } }, { id: 'C_clear', ...clearance(head) }] }],
+      ['no clearance of the live head', { comments: [park, { id: 'C_clear', ...clearance('b'.repeat(40)) }] }],
+      ['review:accepted kept beside the hold', { labels: ['review:human', 'review:accepted'] }],
+      ['a review:changes bounce', { labels: ['review:human', 'review:changes'] }],
+      ['a mechanical hold', { labels: ['review:human', 'review:held-mechanical'] }],
+    ])('leaves the hold with %s', (_name, extra) => {
+      const r = heal(extra);
+      expect(r.live.labels).toContain('review:human');
+      expect(r.effects).toEqual([]);
+    });
   });
   it('re-parks when no clearance lands during the write', () => {
     const r = racing({ during: 'none' });

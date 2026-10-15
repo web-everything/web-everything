@@ -601,7 +601,8 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the carry (no accept)', () => {
     const page = [clearComment(), ...filler(99)];
     const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
-    expect(r.reads.comments).toBe(1);
+    // One complete read for the carry decision, one after the hand-off's write (PR #5273 clearance re-check).
+    expect(r.reads.comments).toBe(2);
     expectHandedOff(r);
   });
 

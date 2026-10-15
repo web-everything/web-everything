@@ -5,13 +5,30 @@ import { fileURLToPath } from 'node:url';
 import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
 import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman } from '../lib/review-escalation.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
+// This sweep's own park shape: accepted removed, human added, no bounce or mechanical hold.
+const healCandidate = labels => hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.accepted)
+  && !hasReviewLabel(labels, REVIEW_LABELS.changes) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
 const errorText = e => String(e?.message ?? e).split('\n')[0];
+const sameSha = (a, b) => !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
+
+/**
+ * PR #5273 — the machine-readable marker in this sweep's park comment, so a later reader can tell this park from
+ * another. The SAME pattern is duplicated in review-set-label.mjs#HUMAN_SURFACE_REPARK_RE (clear-human must not
+ * import this module's daemon graph); the tests pin the two together.
+ */
+export const buildHumanSurfaceReparkMarker = headSha => `<!-- human-surface-repark: ${String(headSha).toLowerCase()} -->`;
+export function hasHumanSurfaceReparkMarker(comments, headSha) {
+  const want = buildHumanSurfaceReparkMarker(headSha);
+  return (Array.isArray(comments) ? comments : [])
+    .some(c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.toLowerCase().includes(want));
+}
 const commentKey = c => c?.id ?? JSON.stringify([c?.body, c?.createdAt, c?.author?.login]);
 
 /** Pure decision over a live head and its complete comment thread. */
@@ -31,7 +48,8 @@ export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha
 export function buildHumanSurfaceReparkComment({ headSha, hits }) {
   return `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`
     + hits.map(hit => `- \`${hit.file}\` (${hit.category})`).join('\n')
-    + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n';
+    + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n'
+    + `\n${buildHumanSurfaceReparkMarker(headSha)}\n`;
 }
 
 export function sweepHumanSurfaceRepark({
@@ -40,7 +58,16 @@ export function sweepHumanSurfaceRepark({
 } = {}) {
   const results = [];
   let resolvedRepo = repo;
-  for (const pr of listPrs({ repo }) ?? []) {
+  const prs = listPrs({ repo }) ?? [];
+  if (prs.some(pr => healCandidate(pr.labels))) {
+    try {
+      resolvedRepo ??= provider.currentRepo();
+      if (resolvedRepo) healRaceLostParks({ prs, provider, repo: resolvedRepo, readComments, dryRun, results });
+    } catch (e) {
+      results.push({ num: 0, skipped: `heal failed: ${errorText(e)}` });
+    }
+  }
+  for (const pr of prs) {
     if (!candidate(pr.labels)) continue;
     const num = pr.number;
     let state, files, comments, surfaces;
@@ -90,15 +117,11 @@ export function sweepHumanSurfaceRepark({
       // and this write. Write first, then read for the other writer's effect (clear-human does the mirror image).
       if (!entry.error) {
         try {
-          const after = readComments(num, { repo: resolvedRepo });
-          if (!Array.isArray(after)) throw new Error('comments read returned no array');
-          const cleared = parseLatestHumanClearedSha(after);
-          if (cleared && cleared.toLowerCase() === String(state.headRefOid).toLowerCase()) {
-            provider.setLabels(resolvedRepo, num, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+          if (withdrawRaceLostPark({ provider, repo: resolvedRepo, num, head: state.headRefOid, readComments })) {
             Object.assign(entry, { repark: 'withdrawn', reason: 'human clearance at the live head landed during the write' });
           }
         } catch (e) {
-          // Fail closed: the hold stays and the operator can clear it again.
+          // The hold stays for now. The heal pass below withdraws it on a later sweep.
           entry.error = `post-write clearance check failed: ${errorText(e)}`;
         }
       }
@@ -106,6 +129,53 @@ export function sweepHumanSurfaceRepark({
     results.push(entry);
   }
   return results;
+}
+
+/**
+ * PR #5273: withdraw this sweep's own park when a trusted clearance names the live head. The sweep never parks over
+ * such a clearance, so the pair can only come from a race. Reads the complete thread, then the labels and head.
+ * Leaves a moved head, a `review:changes` bounce or a mechanical hold alone. Returns whether it withdrew.
+ */
+function withdrawRaceLostPark({ provider, repo, num, head, readComments, requireMarker = false }) {
+  const after = readComments(num, { repo });
+  if (!Array.isArray(after)) throw new Error('comments read returned no array');
+  const live = provider.readPrState(repo, num);
+  if (!Array.isArray(live?.labels)) throw new Error('labels read returned no array');
+  if (!sameSha(live.headRefOid, head) || !sameSha(parseLatestHumanClearedSha(after), head)) return false;
+  if (hasReviewLabel(live.labels, REVIEW_LABELS.changes) || hasReviewLabel(live.labels, REVIEW_LABELS.heldMechanical)) return false;
+  // Right after its own write the sweep knows the park is its own; a later heal must prove it from the thread.
+  if (requireMarker && !hasHumanSurfaceReparkMarker(after, head)) return false;
+  const remove = hasReviewLabel(live.labels, REVIEW_LABELS.human) ? [REVIEW_LABELS.human] : [];
+  if (!remove.length && hasReviewLabel(live.labels, REVIEW_LABELS.accepted)) return true;
+  provider.setLabels(repo, num, { add: REVIEW_LABELS.accepted, remove });
+  return true;
+}
+
+/**
+ * Heal a park left behind when the post-write check (or clear-human's own re-check) never ran: a crash, or a failed
+ * read. Only this sweep's own park shape: `review:human` without `review:accepted`, this sweep's marker at the live
+ * head, and a trusted clearance of that head.
+ */
+function healRaceLostParks({ prs, provider, repo, readComments, dryRun, results }) {
+  for (const pr of prs) {
+    if (!healCandidate(pr.labels)) continue;
+    const num = pr.number;
+    try {
+      const state = provider.readPrState(repo, num);
+      if (state?.state !== 'OPEN' || !state.headRefOid || !healCandidate(state.labels)) continue;
+      if (dryRun) {
+        const comments = readComments(num, { repo });
+        if (Array.isArray(comments) && hasHumanSurfaceReparkMarker(comments, state.headRefOid)
+          && sameSha(parseLatestHumanClearedSha(comments), state.headRefOid)) results.push({ num, repark: 'would-withdraw', head: state.headRefOid });
+        continue;
+      }
+      if (withdrawRaceLostPark({ provider, repo, num, head: state.headRefOid, readComments, requireMarker: true })) {
+        results.push({ num, repark: 'withdrawn', head: state.headRefOid, reason: 'healed a park that lost a race with a human clearance' });
+      }
+    } catch (e) {
+      results.push({ num, skipped: `heal read failed: ${errorText(e)}` });
+    }
+  }
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

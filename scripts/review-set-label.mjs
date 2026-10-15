@@ -203,16 +203,70 @@ export function defaultReadHumanOnlyHold({ headSha, baseRefName, comments, exec 
 }
 
 /**
- * PR #5273 — after a `clear-human` swap and comment, re-read the PR and remove a `review:human` that a concurrent
- * re-park added at the same head, re-adding the `review:accepted` it took. Only that label: a concurrent bounce or
- * other hold is left alone. A failed read is reported, not fatal: the clearance is already durable.
+ * PR #5273 — the markers stamped by the two automatic parks that read labels, then write `review:human` (no
+ * conditional write exists): `human-surface-repark.mjs#buildHumanSurfaceReparkMarker` (duplicated, not imported, so
+ * this CLI does not load that daemon module's graph; the tests pin the two together) and the mechanical-hold
+ * hand-off below. A concurrent `clear-human` of the marked head undoes only these parks.
+ */
+export const HUMAN_SURFACE_REPARK_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
+export const buildMechanicalHandoffMarker = headSha => `<!-- mechanical-hold-handoff: ${String(headSha).toLowerCase()} -->`;
+
+/**
+ * PR #5273 — after a marked park's own label write, read the complete thread and the live labels. When a trusted
+ * clearance names this unchanged head, the park lost a race with `clear-human`: remove its `review:human` and restore
+ * `review:accepted`. A bounce or mechanical hold is left alone. A failed read keeps the hold (fail closed) and is
+ * reported on stderr. Returns whether it withdrew.
+ */
+export function withdrawParkOnLiveClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+  try {
+    const thread = typeof provider.readComments === 'function' ? provider.readComments(repo, pr) : null;
+    const fresh = provider.readPrState(repo, pr);
+    const comments = Array.isArray(thread) ? thread : fresh?.comments;
+    if (!Array.isArray(comments) || !Array.isArray(fresh?.labels)) throw new Error('thread or labels unreadable');
+    const head = String(headSha).toLowerCase();
+    if (String(fresh.headRefOid).toLowerCase() !== head || parseLatestHumanClearedSha(comments)?.toLowerCase() !== head) return false;
+    if (!hasReviewLabel(fresh.labels, REVIEW_LABELS.human) || hasReviewLabel(fresh.labels, REVIEW_LABELS.changes)
+      || hasReviewLabel(fresh.labels, REVIEW_LABELS.heldMechanical)) return false;
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    return true;
+  } catch (e) {
+    warn(`review-set-label: post-park clearance re-check failed (${String(e?.message ?? e).split('\n')[0]}); the hold stays\n`);
+    return false;
+  }
+}
+
+/**
+ * PR #5273 — is `review:human` on `labels` the human-surface sweep's park of `headSha`? That park stamps its marker
+ * BEFORE its label write, so the marker is already readable. `review:accepted` may sit beside it: this ceremony's own
+ * swap can re-add it after the park removed it. A PR the sweep never parked at this head, a bounce or a mechanical
+ * hold is not. Reads the complete thread when the provider can; an unreadable thread is `false` (the hold stays).
+ * Called only inside a clear-human run of this head, so another hold landing on a swept PR in those seconds is the
+ * one residual it can remove.
+ */
+export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, comments = null }) {
+  if (!hasReviewLabel(labels, REVIEW_LABELS.human)
+    || hasReviewLabel(labels, REVIEW_LABELS.changes) || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
+  let thread = comments;
+  try {
+    if (typeof provider.readComments === 'function') thread = provider.readComments(repo, pr);
+  } catch { return false; }
+  const want = String(headSha).toLowerCase();
+  return (Array.isArray(thread) ? thread : []).some(c => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
+    return [...c.body.matchAll(HUMAN_SURFACE_REPARK_RE)].some(m => m[1].toLowerCase() === want);
+  });
+}
+
+/**
+ * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
+ * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
+ * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
  */
 export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
   try {
     const fresh = provider.readPrState(repo, pr);
-    if (fresh.headRefOid !== headSha || !Array.isArray(fresh.labels)) return { reapplied: false };
-    // A concurrent `review:changes` bounce is a newer verdict, not a re-park: leave it to the operator.
-    if (!hasReviewLabel(fresh.labels, REVIEW_LABELS.human) || hasReviewLabel(fresh.labels, REVIEW_LABELS.changes)) return { reapplied: false };
+    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
+    if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
     return { reapplied: true };
   } catch (e) {
@@ -1484,9 +1538,14 @@ export function runReviewLabelCli({
         '',
         `The drain's \`${REVIEW_LABELS.heldMechanical}\` park could not be lifted by carrying the operator's clearance: ${String(why || 'the carry was refused')}.`,
         `A review of this head is owed, so the hold is now \`${REVIEW_LABELS.human}\` (card xu7kxtt, PR #4631 ruling a).`,
+        '',
+        buildMechanicalHandoffMarker(headSha),
       ].join('\n'));
       if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
       provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
+      // PR #5273: the same read-then-write race as the human-surface park. Read for a concurrent clear-human of this
+      // head after the write; clear-human recognises this park by its marker for the mirror-image case.
+      withdrawParkOnLiveClearance({ provider, repo, pr, headSha });
     } catch (e) {
       handOffRetryable = true;
       process.stderr.write(`review-set-label: mechanical-hold hand-off failed (retryable) — ${String((e && e.message) || e).split('\n')[0]}\n`);
@@ -1729,9 +1788,10 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
-        // PR #5273: a re-park (e.g. human-surface-repark) can add `review:human` after the first read; the
-        // clearance supersedes it at this head, so remove it too. Other concurrent labels keep the first read's view.
-        if (to === 'clear-human' && hasReviewLabel(fresh.labels, REVIEW_LABELS.human) && !removals.includes(REVIEW_LABELS.human)) {
+        // PR #5273: the human-surface sweep can park `review:human` after the first read; this clearance supersedes
+        // that park at this head, so remove it too. Any other concurrent hold keeps the first read's view.
+        if (to === 'clear-human' && !removals.includes(REVIEW_LABELS.human)
+          && isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) {
           removals = [...removals, REVIEW_LABELS.human];
         }
       }
@@ -1803,9 +1863,10 @@ export function runReviewLabelCli({
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
-  // `review:human` after the swap. Read once more after the clearance comment and re-apply only that part.
+  // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
+  // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
-  if (to === 'clear-human') reassertHumanClearance({ provider, repo, pr, headSha });
+  if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and
