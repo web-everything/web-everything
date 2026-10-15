@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs", "we:scripts/conveyor/__tests__/main-ci-red-rerun.test.mjs", "we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs", "we:scripts/lib/__tests__/red-main-hold.test.mjs"]
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "17242a56dfd230c00de33e1c4db3bfd76049d455"
+preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
 tags: []
 ---
 
@@ -16,9 +16,11 @@ Held finding 213 reports that on 2026-10-10 at 19:58Z the drain exempted #4814, 
 
 ## Progress
 
+- Current-checkout recheck at 6d77e9169: the permissive matcher remains in `we:scripts/conveyor/main-ci-red-core.mjs:405`, including label/supersession admission at line 437; priority still has a generic reason at line 471. The publisher consumes it at `we:scripts/conveyor/main-ci-red-io.mjs:399`. Retain the existing five-file scope and size 1; refreshed citations supersede the earlier preparation. No implementation or historical live-incident replay was performed.
+
 - Rechecked at 17242a56d. Original scope covered the core matcher and its core, health-tick and hold-consumer tests. Add the existing rerun test file, whose ownership tests now depend on label/supersession recognition; the goal is not delivered.
-- The prior preparation cited the matcher at line 284 and publisher at line 281. Current sources are `we:scripts/conveyor/main-ci-red-core.mjs:367` and `we:scripts/conveyor/main-ci-red-io.mjs:378`. In addition to title/body/prefix/alternate-regex recognition, the matcher now admits configured labels and body supersession declarations (`we:scripts/conveyor/main-ci-red-core.mjs:398`). Corrected scope includes removing those identity bypasses too, as required by the original exact-branch goal. A repair label or supersession claim alone must not confer exemption.
-- The hold consumer still consumes the published identities (`we:scripts/lib/red-main-hold.mjs:73`); no production change there is needed. The publisher writes the planner result (`we:scripts/conveyor/main-ci-red-io.mjs:387`), so no publisher change is needed either.
+- The prior preparation cited the matcher at line 284 and publisher at line 281. Current sources are `we:scripts/conveyor/main-ci-red-core.mjs:407` and `we:scripts/conveyor/main-ci-red-io.mjs:399`. In addition to title/body/prefix/alternate-regex recognition, the matcher now admits configured labels and body supersession declarations (`we:scripts/conveyor/main-ci-red-core.mjs:438`). Corrected scope includes removing those identity bypasses too, as required by the original exact-branch goal. A repair label or supersession claim alone must not confer exemption.
+- The hold consumer still consumes the published identities (`we:scripts/lib/red-main-hold.mjs:73`); no production change there is needed. The publisher writes the planner result (`we:scripts/conveyor/main-ci-red-io.mjs:408`), so no publisher change is needed either.
 - Retain size 1: approximately 60 changed lines in the matcher, 90 in its core tests, 70 in health-tick tests and 40 in hold-chain tests. Add approximately 40 lines in `we:scripts/conveyor/__tests__/main-ci-red-rerun.test.mjs:224` to convert label/supersession positives to exact-identity negatives while preserving its unrelated rerun cases. All five files are in scope; no new ownership protocol or dispatch path is introduced.
 
 ## Design
@@ -27,7 +29,7 @@ In `we:scripts/conveyor/main-ci-red-core.mjs`, make `findOwnerPrs` compare the c
 
 Preserve existing open-state, trusted-author setting and creation-window behavior. Disabling the trusted-author check must not disable exact branch matching. Preserve the array result and ordering, singular owner wrapper, and downstream priority/combine interfaces. Update comments on the matching rules without removing legacy settings still used by other callers such as `we:scripts/pr-land.mjs`.
 
-Return a stable match-rule field with each recognized PR (for example `exact-owner-branch`) and include that rule and the incident SHA9 in `planPriority`'s reason. The existing publisher in `we:scripts/conveyor/main-ci-red-io.mjs:387` records this diagnostic through `we:scripts/lib/main-red-priority.mjs:35`; no new log writer is needed. Keep support for caller-supplied priority inputs without match metadata, but do not falsely label those as exact matches.
+Return a stable match-rule field with each recognized PR (for example `exact-owner-branch`) and include that rule and the incident SHA9 in `planPriority`'s reason. The existing publisher in `we:scripts/conveyor/main-ci-red-io.mjs:408` records this diagnostic through `we:scripts/lib/main-red-priority.mjs:35`; no new log writer is needed. Keep support for caller-supplied priority inputs without match metadata, but do not falsely label those as exact matches.
 
 ## MVP
 

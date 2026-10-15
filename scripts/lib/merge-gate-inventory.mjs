@@ -68,6 +68,7 @@ export const DRAIN_GATES = Object.freeze([
 export const NON_GATE_CALLS = Object.freeze({
   shouldApplyReviewLabel: 'label-write idempotence',
   shouldRepollForLabelLag: 'listing re-poll',
+  shouldReadContextCommits: 'fast-drain context read scope (target selection, not merge eligibility)',
   shouldPostParkReasonComment: 'comment routing',
   shouldLabelOnGreen: 'ci-lifecycle labelling',
   isRequiredCheckFailed: 'ci-lifecycle labelling',

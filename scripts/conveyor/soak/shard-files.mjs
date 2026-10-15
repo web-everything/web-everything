@@ -2,9 +2,9 @@
  * @file shard-files.mjs — #4200-ish CI speed-up (card x0zg44l's own harness). Deterministic file-level sharding
  * for `npm run test:soak`, used by `.github/workflows/ci.yml`'s `soak-shard` matrix.
  *
- * The 50-tick baseline runs alone in shard 1: concurrent break worlds increased its tick durations until
- * it exceeded the unchanged 10-minute test budget. Breaks are assigned to the remaining shards by MEASURED
- * time (`scripts/ci/test-timings.json`, greedy longest-first, `scripts/ci/shard-assign.mjs`). A file with no stored
+ * Shard 1 runs the 50-tick baseline alone: sibling scenarios fork enough daemon/git children to slow it past
+ * its test timeout when they share a runner. Breaks are assigned to the remaining shards by MEASURED time
+ * (`scripts/ci/test-timings.json`, greedy longest-first, `scripts/ci/shard-assign.mjs`). A file with no stored
  * timing gets the median, so a new break (one file, discovered from disk — never from `breaks/index.mjs`'s registry)
  * lands in a shard automatically with no shard-list edit.
  */
@@ -36,7 +36,7 @@ function toRepoRelative(absPath, repoRoot) {
  *
  * `shard` is 1-based. `total === 1` runs everything (baseline + all breaks) — the single-shard fallback used by
  * `npm run test:soak` (no sharding) and by a local "does the split still work" smoke check. Otherwise the
- * baseline runs alone in shard 1 and breaks are balanced across the remaining shards by measured time.
+ * baseline is isolated in shard 1 and breaks are balanced across shards 2..N by measured time.
  */
 export function listAllSoakFiles({ breaksDir = BREAKS_DIR, baselineFile = BASELINE_FILE, repoRoot = REPO_ROOT } = {}) {
   return [baselineFile, ...listBreakTestFiles(breaksDir)].map((f) => toRepoRelative(f, repoRoot));
@@ -46,13 +46,12 @@ export function shardFiles({ shard, total, breaksDir = BREAKS_DIR, baselineFile 
   if (!Number.isInteger(total) || total < 1) throw new Error(`soak shard-files: --shard total must be a positive integer, got "${total}"`);
   if (!Number.isInteger(shard) || shard < 1 || shard > total) throw new Error(`soak shard-files: --shard index must be 1..${total}, got "${shard}"`);
 
-  const all = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
-  if (total === 1) return all;
-  if (shard === 1) return [all[0]];
+  const [baseline, ...breaks] = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
+  if (total === 1) return [baseline, ...breaks];
+  if (shard === 1) return [baseline];
   // Keep the long soak out of both the worker pool and the fallback timing population for breaks.
-  const breakTimings = Object.fromEntries(Object.entries(timings).filter(([file]) => file !== all[0]));
-  return assignByTime(all.slice(1), breakTimings, total - 1)[shard - 2];
-
+  const breakTimings = Object.fromEntries(Object.entries(timings).filter(([file]) => file !== baseline));
+  return assignByTime(breaks, breakTimings, total - 1)[shard - 2];
 }
 
 /** Parses `--shard=i/N` out of an argv array. Throws with a usage line if missing or malformed. */

@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE } from '../shard-files.mjs';
 import { loadTimings } from '../../../ci/shard-assign.mjs';
 
-describe('soak shard-files — time-balanced split (card 11)', () => {
+describe('soak shard-files — isolated baseline and time-balanced breaks', () => {
   it('every file (baseline + breaks) is assigned to exactly one shard', () => {
     const total = 4;
     const seen = [];
@@ -48,7 +48,27 @@ describe('soak shard-files — time-balanced split (card 11)', () => {
     expect(output.trim().split('\n')).toEqual(shardFiles({ shard: 1, total: 4 }));
   });
 
-  it('balances breaks by stored timings across the remaining shards', () => {
+  it('reserves shard 1 for the baseline even when timings make it the cheapest file', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
+        timings: { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 100, 'b.soak.test.mjs': 100 } };
+      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
+      const breaks = [2, 3].flatMap((shard) => shardFiles({ ...opts, shard }));
+      expect(breaks.sort()).toEqual(['a.soak.test.mjs', 'b.soak.test.mjs']);
+    });
+  });
+
+  it('balances breaks by measured time across the remaining shards', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
+        timings: { 'base.soak.test.mjs': 1000, 'a.soak.test.mjs': 20, 'b.soak.test.mjs': 10, 'c.soak.test.mjs': 10 } };
+      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
+      expect(shardFiles({ ...opts, shard: 2 })).toEqual(['a.soak.test.mjs']);
+      expect(shardFiles({ ...opts, shard: 3 })).toEqual(['b.soak.test.mjs', 'c.soak.test.mjs']);
+    });
+  });
+
+  it('balances by the stored timings: the heavy file sits alone, light files fill the rest', () => {
     const names = ['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'];
     withBreaks(names, (dir) => {
       const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };

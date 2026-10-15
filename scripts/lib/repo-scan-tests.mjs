@@ -117,6 +117,7 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/review-corpus/__tests__/gates.test.mjs': 'reads one named backlog card as a fixture; not a rule scan',
   'scripts/conveyor/__tests__/fix-procedure.test.mjs': 'walks skills-src markdown for `--repo` on fix-* commands; markdown-only reach, large file, follow-up',
   'scripts/lib/__tests__/daemon-rebuild.test.mjs': 'walks a throwaway git dir it created, not the repo',
+  'scripts/lib/__tests__/collect-run-closure.test.mjs': 'walks an in-memory source map with injected readFile/exists callbacks, not the repo; imports skip-unrelated.mjs, so vitest related already selects it when that implementation changes',
   'scripts/operations/__tests__/unsized-kind-callers.test.mjs': 'greps scripts/ for a never-sized kind paired with a size (#x0h3pe4); cheap to run in CI, and every caller it guards also has its own wiring test',
   'scripts/lib/__tests__/settings-files.test.mjs': 'one test walks scripts/ to pin the direct readers of the legacy dispatch-settings.json to LEGACY_ONLY_READERS; it is a small walk, and it is also selected by `vitest related` whenever settings-files.mjs changes; a brand-new direct reader is caught by CI',
   'scripts/lib/__tests__/merge-queue-enqueue.test.mjs': 'one test greps scripts/ for any sender of the enqueue mutation other than merge-queue-enqueue.mjs (PR 4708); a small walk that is also selected by `vitest related` whenever merge-queue-enqueue.mjs changes, and a new sender elsewhere is caught by CI',

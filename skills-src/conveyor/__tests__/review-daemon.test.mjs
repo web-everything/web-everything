@@ -32,12 +32,19 @@ vi.mock('../../../scripts/conveyor/review-hold-reconcile.mjs', async (importOrig
   const actual = await importOriginal();
   return { ...actual, sweepReviewHoldLabels: (...args) => sweepReviewHoldLabelsMock(...args) };
 });
+// Same reasoning for the human-surface re-park sweep (live #5193): its default shells real `gh` reads. Its behavior is
+// proven in scripts/conveyor/__tests__/human-surface-repark.test.mjs; the wiring test below injects its own fake.
+const sweepHumanSurfaceReparkMock = vi.fn(() => []);
+vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepHumanSurfaceRepark: (...args) => sweepHumanSurfaceReparkMock(...args) };
+});
 
 import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
-  resolveConvertAdvisoryEnabled,
+  resolveConvertAdvisoryEnabled, sweepReviewHolds,
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { tagReviewStatus } from '../../../scripts/conveyor/review-status-tag.mjs';
@@ -812,6 +819,24 @@ describe('runReviewTick — real dispatchReview contract (regression, #3876 live
 // sweep's OWN decision logic is proven in scripts/conveyor/__tests__/review-hold-reconcile.test.mjs.
 describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
   const noop = () => ({ dispatch: [], refusals: [] });
+
+  it('the default hold sweep runs the human-surface re-park first, then the reconcile (live #5193)', () => {
+    sweepHumanSurfaceReparkMock.mockReturnValueOnce([{ num: 5193, repark: 'reparked', head: 'a'.repeat(40), files: ['.github/workflows/ci.yml'] }]);
+    sweepReviewHoldLabelsMock.mockReturnValueOnce([{ num: 7, remove: ['review:pending'] }]);
+    const r = runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      repo: 'web-everything/web-everything',
+    });
+    expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
+    expect(r.holdReconcile.map((h) => h.num)).toEqual([5193, 7]);
+    expect(r.holdReconcile[0].repark).toBe('reparked');
+  });
+
+  it('a re-park failure is its own entry and never stops the reconcile', () => {
+    sweepHumanSurfaceReparkMock.mockImplementationOnce(() => { throw new Error('gh down'); });
+    sweepReviewHoldLabelsMock.mockReturnValueOnce([{ num: 7, remove: ['review:pending'] }]);
+    expect(sweepReviewHolds({ repo: 'o/n' })).toEqual([{ num: 0, repark: 'sweep-failed', error: 'gh down' }, { num: 7, remove: ['review:pending'] }]);
+  });
 
   it('runs holdReconcile with THIS tick\'s own repo, independent of reconcile\'s plan', () => {
     const holdReconcile = vi.fn(() => []);

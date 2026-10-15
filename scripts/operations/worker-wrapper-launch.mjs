@@ -30,6 +30,7 @@ import { mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { isUnderTest } from '../lib/under-test.mjs';
+import { isSmokeSentinelPr, resolveSmokeRealWorker } from '../lib/smoke-real-worker.mjs';
 import { COMPLETION_RECORD_V2, listCompletionSessions, resolveCompletionsDir, tryReadCompletion } from './completion-store.mjs';
 import { STRUCTURED_OUTPUT_SUFFIX, WORKER_WRAPPER_ENV, launchDetached, withStructuredOutput, resumeRequestPath } from './worker-wrapper.mjs';
 import { isValidSessionSlug } from './completion-record.mjs';
@@ -128,7 +129,18 @@ export function requestWrappedResume({ session, prompt, specDir = defaultWorkerS
 export function launchWrappedClaudeWorker({
   role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null,
   sessionId = randomUUID(), specDir = defaultWorkerSpecDir(), launch = launchDetached,
+  allowRealSentinel = resolveSmokeRealWorker({ env }).allowSentinel,
 } = {}) {
+  const slugPr = String(session ?? '').match(/-(9\d{5})$/)?.[1];
+  const sentinelPr = isSmokeSentinelPr(pr) ? pr : slugPr;
+  if (sentinelPr != null && allowRealSentinel !== true) {
+    // Refuse WITHOUT throwing: a rebuild smokes the new tree with the running daemon's OLD smoke runner, which
+    // still wraps the dry-run launch. A throw there rejects the very build that fixes the runner (x0dcjec
+    // rollout); a refused launch starts nothing, and the new runner's empty-prompt check still fails the smoke.
+    const refused = `operations: refusing to launch a real claude worker for smoke sentinel PR #${sentinelPr} (set smokeRealWorker.allowSentinel or WE_SMOKE_ALLOW_REAL_WORKER=1 to allow)`;
+    console.error(refused);
+    return { handle: `refused:smoke-sentinel-${sentinelPr}`, wrapperPid: null, sessionId, argv: [], refused };
+  }
   const argv = wrappedArgvFromBg(bgArgv, { sessionId });
   const { wrapperPid } = launch({
     role, launcher: 'claude-p', session, command: 'claude', argv, cwd, env, timeoutMs: wrappedTimeoutMs(role, env),

@@ -9,7 +9,7 @@ import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
-import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
+import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
 import { parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
@@ -107,6 +107,29 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it('records a no-change Argon outcome and resolves its provider', async () => {
+    const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
+    const resolveProvider = vi.fn(m.io.resolveProvider);
+    expect((await runFixCli(argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), {...m.io,resolveProvider,recordRouted})).code).toBe(0);
+    expect(resolveProvider).toHaveBeenCalledWith('antigravity');
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({head:'aaa',outcome:'no-change'}));
+  });
+  it.each(['codex', 'antigravity'])('retains the failed %s worker diagnosis in its ledger and escalation', async provider => {
+    const m = mk(['aaa']);
+    const diagnosis = `${provider}: worker diagnosis`;
+    m.spawn.mockRejectedValue(Object.assign(new Error('worker failed'), { finalMessage: diagnosis }));
+    const comments = [];
+    const run = (cmd, args, opts) => {
+      if (args.includes('comment')) { comments.push(readFileSync(args.at(-1), 'utf8')); return ''; }
+      return m.run(cmd, args, opts);
+    };
+    const recordRouted = vi.fn(entry => ({ 'we#7': [entry, entry] }));
+    const out = await runFixCli(argv.map(a => a === '--provider=codex' ? `--provider=${provider}` : a), { ...m.io, run, recordRouted });
+    expect(out.code).toBe(1);
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', note: diagnosis, reason: expect.stringContaining(diagnosis) }));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain(diagnosis);
+  });
   // card 5947 (live #5045, 2026-10-13): CI context and durable outcomes precede lane acquisition.
   it('launches a ci-heal without a finding and records no-change as real repair evidence', async () => {
     const m = mk(['aaa', 'aaa']);
@@ -1441,4 +1464,41 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
     expect(renderCiHealContext(inputs)).not.toContain('b'.repeat(4001));
     expect(renderCiHealContext({ ...inputs, jobs: [{ name: 'unit', log: 'line'.repeat(10000) }] }).length).toBeLessThanOrEqual(16020);
   });
+});
+
+it('fix provider runs an injected Antigravity worker in the existing lane', async () => {
+  const {resolveFixProvider} = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  const runTask = vi.fn(async ()=>({events:{agentMessages:['earlier response'],finalResponse:'done'}}));
+  expect(await provider.spawn({prompt:'edit',model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toMatchObject({finalMessage:'done'});
+  expect(runTask).toHaveBeenCalledWith(expect.objectContaining({task:'edit',dir:'/lane',gate:'none',model:'gemini-4-argon-high',effort:'high'}));
+});
+
+it('every fix executor declares confinement or is unavailable for dispatch', () => {
+  for (const executor of FIX_RUN_EXECUTORS) {
+    const contract = FIX_RUN_CONFINEMENT[executor];
+    expect(contract).toBeDefined();
+    if (contract.mode === 'sandboxed') expect(contract.boundary).toBe('workspace');
+    else {
+      expect(contract.mode).toBe('unavailable');
+      expect(contract.reason).toBeTruthy();
+      expect(fixLauncherAvailable(executor)).toBe(false);
+    }
+  }
+  expect(fixLauncherAvailable('codex')).toBe(true);
+  expect(fixLauncherAvailable('antigravity')).toBe(false);
+});
+
+it('refuses the production Antigravity worker before running untrusted review input', async () => {
+  const { resolveFixProvider } = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  await expect(provider.spawn({ prompt: 'untrusted PR review', sessionSlug: 'fix-7' }, { resolveLane: () => '/missing/lane' }))
+    .rejects.toThrow('confined Antigravity fix adapter is unavailable');
+});
+
+it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports failed Gemini task %j with its final message', async failure => {
+  const {resolveFixProvider} = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({...failure,events:{agentMessages:['diagnosis']}})}))
+    .rejects.toMatchObject({finalMessage:'diagnosis'});
 });
