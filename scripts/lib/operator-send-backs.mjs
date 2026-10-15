@@ -49,7 +49,11 @@ function isFixEvidence(text) {
     || /^(?: {0,3}Head:[ \t]*`[a-f0-9]{7,40}`[ \t]*\n(?:[ \t]*\n)*)? {0,3}<!--[ \t]*addresses-operator-send-back:[ \t]*[^\s<>]+[ \t]*-->[ \t]*(?:\n|$)/i.test(start);
 }
 
-/** Only later trusted fix evidence on a different head resolves a request. Labels carry no resolution evidence. */
+/**
+ * Only later trusted fix evidence resolves a request; when the request names its head, the evidence must be on a
+ * different one. review-set-label renders no head, so a headless request is released by naming evidence alone.
+ * Labels carry no resolution evidence.
+ */
 export function openOperatorSendBacks(pr) {
   const comments = commentsOf(pr), items = operatorSendBacks(comments);
   const resolved = new Set();
@@ -58,6 +62,7 @@ export function openOperatorSendBacks(pr) {
       if (index <= item.index || !isTrustedMarkerAuthor(c)) return false;
       const text = String(c?.body ?? '');
       if (!isFixEvidence(text) || !namesSendBack(text, item)) return false;
+      if (!item.head) return true;
       const namedHead = /\bHead:\s*`([a-f0-9]{7,40})`/i.exec(stripComments(text));
       return differentHead(item.head, namedHead ? namedHead[1] : pr?.headRefOid);
     })) resolved.add(item.index);

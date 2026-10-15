@@ -7,6 +7,7 @@ import { evaluatePr, evaluateCeremonyOwed } from '../../operations/operator-queu
 import { buildReviewJudgeRequest, advisoryLabelOutcome, shapeReadFinding } from '../../operations/review-pr.mjs';
 import { buildRedTeamTask, redTeamReadFingerprint, replayPayload } from '../../operations/review-extra-seats.mjs';
 import { defaultListPrComments } from '../../conveyor/pr-comments-list.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 
 const OLD = 'e5ed9cb74' + 'a'.repeat(31), HEAD = '245c40542' + 'b'.repeat(31);
 const MUST_FIX = 'MUST FIX: preserve the operator’s original requested repair.';
@@ -122,13 +123,38 @@ describe('operator send-backs, PR #5243 replay', () => {
     expect(openOperatorSendBacks(fixture({ comments: [original,
       comment('fix', 'web-everything', '23:00', body)] }))).toEqual([]);
   });
-  it('accepts marker-only evidence and stays unresolved when the send-back head is unknown', () => {
+  it('accepts marker-only evidence, including for a send-back whose head is unknown', () => {
     const c = { ...evidence(), body: `Head: \`${HEAD}\`\n<!-- addresses-operator-send-back: 1001 -->` };
     expect(openOperatorSendBacks(fixture({ comments: [original, c] }))).toEqual([]);
     const noHead = { ...original, body: original.body.replace('at head e5ed9cb74', 'head unknown') };
     expect(operatorSendBacks([noHead])[0].head).toBeNull();
-    expect(openOperatorSendBacks(fixture({ comments: [noHead, c] }))).toHaveLength(1);
+    expect(openOperatorSendBacks(fixture({ comments: [noHead, c] }))).toEqual([]);
     expect(sendBackNotAddressed(fixture({ comments: [original, c] }))).toBeNull();
+  });
+  it('releases a send-back rendered by review-set-label (no head) once fix evidence names it', () => {
+    const body = buildVerdictComment({ to: 'changes', actor: 'chalbert', channel: 'claude-code-chat', body: MUST_FIX });
+    const rendered = comment('1001', 'chalbert', '20:07', body);
+    const [item] = operatorSendBacks([rendered]);
+    expect(item).toMatchObject({ id: '1001', head: null });
+    const held = fixture({ comments: [rendered, mechanical, ended] });
+    expect(openOperatorSendBacks(held)).toHaveLength(1);
+    expect(evaluatePr(held).reasons).toEqual(expect.arrayContaining([expect.stringContaining('operator send-back')]));
+    const pr = fixture({ comments: [rendered, mechanical, ended, evidence()] });
+    expect(openOperatorSendBacks(pr)).toEqual([]);
+    expect(sendBackNotAddressed(pr)).toBeNull();
+    expect(evaluatePr(pr).reasons ?? []).not.toEqual(expect.arrayContaining([expect.stringContaining('operator send-back')]));
+    expect(advisoryLabelOutcome({ read: { netBasis: { rev: HEAD }, openOperatorSendBacks: openOperatorSendBacks(pr) },
+      verdict: { verdict: 'accept', lensVerdicts: { correctness: 'accept', security: 'accept' } } })).toBe('accept');
+  });
+  it('keeps every non-evidence shape unresolved for a send-back whose head is unknown', () => {
+    const noHead = { ...original, body: original.body.replace('at head e5ed9cb74', 'head unknown') };
+    for (const c of [evidence(HEAD, 'fixed everything'), evidence(HEAD, '1001', 'stranger'),
+      { ...evidence(), body: 'Accepted 1001' }, { ...evidence(), body: '> <!-- addresses-operator-send-back: 1001 -->' },
+      { ...evidence(), body: '```markdown\n## Fix evidence\n1001\n```' },
+      { ...evidence(), body: `⛔ conveyor — ruling not addressed\n\nQuoted DATA: ${evidence().body}` }]) {
+      expect(openOperatorSendBacks(fixture({ comments: [noHead, c] }))).toHaveLength(1);
+    }
+    expect(openOperatorSendBacks(fixture({ comments: [evidence(), noHead] }))).toHaveLength(1);
   });
   it('bounds bodies and matches ids and ET times without substring collisions', () => {
     expect(operatorSendBacks([{ ...original, body: original.body + 'x'.repeat(5000) }])[0].body.length).toBeLessThanOrEqual(4000);
