@@ -4244,11 +4244,13 @@ export function basisTouchesEngineTier(score) {
 /**
  * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS gh's own last stderr line.
  * Also used by the per-PR merge catch to preserve the merge failure's stderr cause.
+ * Enqueue errors carry `githubMessage`: preserve that diagnostic verbatim, including multiple lines.
  * `execFile`'s message is only "Command failed: gh pr list …" — the actual cause (secondary rate limit, 401,
  * a crashing wrapper) lives in stderr and was being dropped (live 2026-09-27 ~04:04Z: every drain pass logged a
  * bare gh-error for 20 minutes and nobody could tell it was a GitHub rate-limit storm).
  */
 export function ghListErrText(e) {
+  if (e?.githubMessage != null) return e.githubMessage;
   const head = String((e && e.message) || e).split('\n')[0];
   const lines = String((e && e.stderr) || '').split('\n').map((l) => l.trim()).filter(Boolean);
   const cause = lines.length ? lines[lines.length - 1].slice(0, 300) : '';
@@ -6690,7 +6692,7 @@ async function runCli() {
           for (const id of landedIdsForCandidate(c, { isLocalRepo, openPrNums: otherOpenPrNums(c.repo, c.num) })) landedThisPass.add(id);
           if (!AS_JSON) process.stderr.write(`  ✓ merged ${repoTag(c.repo)}${c.num}${c.item ? ` (#${c.item})` : ''}\n`);
         } catch (e) {
-          const detail = e.githubMessage ?? ghListErrText(e);
+          const detail = ghListErrText(e);
           if (e.enqueueFailure) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure });
           // #2683 — CONTENDED-FALLBACK idempotency recovery. If the merge write raced past the mutex (the
           // never-hang fallback ran `fn` un-locked) and LOST to a concurrent lander, `gh pr merge` throws here on
