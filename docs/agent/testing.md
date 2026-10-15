@@ -33,6 +33,16 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Human-only re-park net basis
+
+The human-surface sweep uses `readHumanSurfaceNetFiles` over the shared `readNetFileSets` reader.
+Unlike the scope reader, this gate requires a successful fetch of current `origin/main`; cached refs
+following a failed fetch cannot prove the absence of a sensitive change. Test inherited-main identity
+files separately from the PR's own identity edits (#5381), and assert that an unavailable basis parks
+with its reason even when GitHub lists no sensitive paths. Inject net reads into sweep and soak
+fixtures so synthetic heads never cause real network fetches. `review.humanSurfaceUsesNetDiff`
+(default true) resolves through the policy cascade; false explicitly restores the legacy list decision.
+
 ## Model routing retry verification
 
 Codex `modelByTask` resolves model, effort and the optional `retry` array as independent cascade

@@ -27,6 +27,7 @@ export default {
     const results = sweepHumanSurfaceRepark({
       repo: 'o/n', listPrs: () => [{ number: 5273, labels: state.labels }],
       resolveSurfaces: () => 'narrow',
+      readNetFiles: () => ({ ok: true, files: ['.github/workflows/ci.yml'] }),
       readComments() {
         // Snapshot the old comments, then let the operator complete the ceremony.
         const old = [...state.comments];
@@ -53,6 +54,7 @@ export default {
     sweepHumanSurfaceRepark({
       repo: 'o/n', listPrs: () => [{ number: 5273, labels: live.labels }],
       resolveSurfaces: () => 'narrow',
+      readNetFiles: () => ({ ok: true, files: ['.github/workflows/ci.yml'] }),
       readComments: () => [...live.comments],
       provider: {
         readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),

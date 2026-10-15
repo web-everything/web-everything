@@ -11,6 +11,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
+import { readHumanSurfaceNetFiles, resolveHumanSurfaceNetSetting } from '../lib/human-surface-net-diff.mjs';
 
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
@@ -53,10 +54,10 @@ export function raceLostParkProven(comments, head) {
 const commentKey = c => c?.id ?? JSON.stringify([c?.body, c?.createdAt, c?.author?.login]);
 
 /** Pure decision over a live head and its complete comment thread. */
-export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha, comments = [], surfaces = 'narrow' } = {}) {
+export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha, comments = [], surfaces = 'narrow', netFailure } = {}) {
   if (!candidate(currentLabels)) return { repark: false, reason: 'not an accepted PR without a hold' };
   const hits = sensitiveSurfaceHits(files, () => undefined, surfaces).filter(hit => hit.category !== 'permission');
-  if (!hits.length) return { repark: false, reason: 'no human-only surface' };
+  if (!hits.length && !netFailure) return { repark: false, reason: 'no human-only surface' };
   const cleared = parseLatestHumanClearedSha(comments);
   if (cleared) {
     return { repark: false, reason: cleared.toLowerCase() === String(headSha).toLowerCase()
@@ -75,18 +76,21 @@ export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha
 export const neutralizeCommentText = text => String(text ?? '').replace(/[^A-Za-z0-9._/+=,~@-]/g,
   ch => [...new TextEncoder().encode(ch)].map(b => `%${b.toString(16).toUpperCase().padStart(2, '0')}`).join(''));
 
-export function buildHumanSurfaceReparkComment({ headSha, hits }) {
-  if (!/^[0-9a-f]{40}$/i.test(String(headSha))) throw new Error('re-park comment needs a 40-hex head sha');
-  return `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`
+export function buildHumanSurfaceReparkComment({ headSha, hits, netFailure }) {
+  const missingHead = !headSha && !!netFailure;
+  if (!missingHead && !/^[0-9a-f]{40}$/i.test(String(headSha))) throw new Error('re-park comment needs a 40-hex head sha');
+  return (missingHead ? 'Human-only surface check with missing head:\n\n' : `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`)
     + hits.map(hit => `- \`${neutralizeCommentText(hit.file)}\` (${neutralizeCommentText(hit.category)})`).join('\n')
+    + (netFailure ? `\n\nNet file set unavailable: ${String(netFailure).split(' ').map(neutralizeCommentText).join(' ')}. Failing closed; the absence of human-only changes could not be verified against current origin/main.` : '')
     + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n'
-    + `\n${buildHumanSurfaceReparkMarker(headSha)}\n`;
+    + (missingHead ? '' : `\n${buildHumanSurfaceReparkMarker(headSha)}\n`);
 }
 
 export function sweepHumanSurfaceRepark({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(),
   readComments = readCompletePrComments, resolveSurfaces = resolveHumanReviewSurfaces, dryRun = false,
   readLabelEvents = defaultReadLabelEvents,
+  readNetFiles = readHumanSurfaceNetFiles, resolveNetSetting = resolveHumanSurfaceNetSetting,
 } = {}) {
   const results = [];
   let resolvedRepo = repo;
@@ -102,14 +106,27 @@ export function sweepHumanSurfaceRepark({
   for (const pr of prs) {
     if (!candidate(pr.labels)) continue;
     const num = pr.number;
-    let state, files, comments, surfaces;
+    let state, files, comments, surfaces, netFailure;
     try {
       resolvedRepo ??= provider.currentRepo();
       if (!resolvedRepo) throw new Error('missing repository');
       state = provider.readPrState(resolvedRepo, num);
       if (state.state !== 'OPEN') throw new Error('PR is not open');
-      if (!state.headRefOid) throw new Error('missing head');
-      files = provider.readPrFiles(resolvedRepo, num);
+      if (resolveNetSetting().value) {
+        let net;
+        try { net = readNetFiles({ repo: resolvedRepo, number: num, headRefOid: state.headRefOid }); }
+        catch (e) { net = { ok: false, reason: errorText(e) }; }
+        if (net?.ok && Array.isArray(net.files) && net.files.every(file => typeof file === 'string')) files = net.files;
+        else {
+          netFailure = net?.reason || 'net file set returned no usable array';
+          // GitHub can supply diagnostic hits, but cannot clear a PR when the net basis is unknown.
+          try { files = provider.readPrFiles(resolvedRepo, num); } catch { files = []; }
+          if (!Array.isArray(files)) files = [];
+        }
+      } else {
+        if (!state.headRefOid) throw new Error('missing head');
+        files = provider.readPrFiles(resolvedRepo, num);
+      }
       if (!Array.isArray(files)) throw new Error('files read returned no array');
       comments = readComments(num, { repo: resolvedRepo });
       if (!Array.isArray(comments)) throw new Error('comments read returned no array');
@@ -136,18 +153,18 @@ export function sweepHumanSurfaceRepark({
       results.push({ num, skipped: `live re-read failed: ${errorText(e)}` });
       continue;
     }
-    const plan = planHumanSurfaceRepark({ currentLabels: state.labels, files, headSha: state.headRefOid, comments, surfaces });
+    const plan = planHumanSurfaceRepark({ currentLabels: state.labels, files, headSha: state.headRefOid, comments, surfaces, netFailure });
     if (!plan.repark) continue;
     const entry = { num, repark: dryRun ? 'would-repark' : 'reparked', head: state.headRefOid, files: [...new Set(plan.hits.map(hit => hit.file))] };
     if (!dryRun) {
       try {
-        provider.postComment(resolvedRepo, num, buildHumanSurfaceReparkComment({ headSha: state.headRefOid, hits: plan.hits }));
+        provider.postComment(resolvedRepo, num, buildHumanSurfaceReparkComment({ headSha: state.headRefOid, hits: plan.hits, netFailure }));
         provider.setLabels(resolvedRepo, num, { add: plan.decision.addLabel,
           remove: plan.decision.removeLabels.filter(label => hasReviewLabel(state.labels, label)) });
       } catch (e) { entry.error = errorText(e); }
       // PR #5273: GitHub has no conditional label write, so a clear-human ceremony can land between the final read
       // and this write. Write first, then read for the other writer's effect (clear-human does the mirror image).
-      if (!entry.error) {
+      if (!entry.error && state.headRefOid) {
         try {
           if (withdrawRaceLostPark({ provider, repo: resolvedRepo, num, head: state.headRefOid, readComments })) {
             Object.assign(entry, { repark: 'withdrawn', reason: 'human clearance at the live head landed during the write' });
