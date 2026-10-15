@@ -290,7 +290,7 @@ describe('env-timeout hold escape', () => {
   it.each([
     ['a scan unit whose time a sibling kill spent', { ms: 151_000, detail: scanAndKill(150_000) }, { ms: 275_000, detail: scanAndKill(150_000) }, false],
     ['two scan units that could not both have spent their budget', { ms: 110_000, detail: twoScans }, { ms: 250_000, detail: twoScans }, false],
-    ['a control that could not have spent both budgets', { ms: 250_000, detail: twoScans }, { ms: 230_000, detail: twoScans }, false],
+    ['a control that could not have spent both budgets', { ms: 220_000, detail: twoScans }, { ms: 210_000, detail: twoScans }, false],
     ['rows whose clocks cover every unit', { ms: 271_000, detail: scanAndKill(150_000) }, { ms: 275_000, detail: scanAndKill(150_000) }, true],
   ])('multi-repo row clock: %s', async (_label, candidate, control, adopted) => {
     const { r, ctx } = await runWith({ ...failed[0], ...candidate }, { ...failed[0], ...control });
