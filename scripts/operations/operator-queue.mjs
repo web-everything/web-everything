@@ -78,6 +78,9 @@ try { reviewSettings = await import('../lib/review-settings.mjs'); } catch { /* 
 let remainingStandDownFindings;
 try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolved-stand-down.mjs')); }
 catch { /* Staged copies still surface the question without remaining findings. */ }
+let needsPersonRow;
+try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
+
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
 let rulingLedgerError = null;
@@ -624,7 +627,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   const repoSlugs = requested.length ? requested : Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug);
   const reconcileNotes = args.includes('--with-reconcile-notes') ? reconcileNotesFor(repoSlugs) : [];
   const report = {
-    ready: [], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
+    ready: [], rulingNeeded: [], needsPerson: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
@@ -734,6 +737,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
         ));
       }
+      for (const pr of prs) {
+        if (readyNumbersThisRepo.has(pr.number)) continue;
+        const row = needsPersonRow?.(repo, pr);
+        if (!row) continue;
+        const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
+        report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
+      }
       // STOOD DOWN — every OPEN PR (any labels) carrying a stand-down comment, minus anything already in NEEDS
       // YOU above. `standDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
       for (const pr of prs) {
@@ -802,7 +812,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
-      + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).join('\n'));
+      + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).concat(report.needsPerson.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [conveyor asks since ${pr.noteAt}] ${pr.headline}${pr.detail ? ` — ${pr.detail}` : ''}`
+      + `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`)).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')
