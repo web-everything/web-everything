@@ -106,10 +106,23 @@ describe('readPrFacts required-check probe goes through the shared reader (xqd4v
     expect(gh.some(c => /protection/.test(c))).toBe(false);
     expect(facts.requiredChecks.map(c => c.name)).toEqual(['test']);
   });
-  it.each(['declared', 'fallback'])('uses the shared reader\'s %s result as-is', (source) => {
-    const facts = readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: ['test', 'e2e'], source }) });
+  it('uses the shared reader\'s declared result as-is: the intended policy after a protection denial, not a failed read', () => {
+    const facts = readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: ['test', 'e2e'], source: 'declared' }) });
     expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'e2e']);
     expect(facts.probeErrors).toEqual([]);
+  });
+  it.each([
+    ['fallback', 'required-check policy (using declared fallback) unavailable'],
+    ['unavailable', 'required-check policy (using declared fallback) unavailable'],
+    ['stale-cache', 'required-check policy (stale cache) unavailable'],
+  ])('a %s result keeps its checks but stays visible as a failed live read (never a silent substitute)', (source, message) => {
+    const facts = readPrFacts(PR, { ...io({ labels: ['ready-to-merge'] }), readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'], source }) });
+    expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
+    expect(facts.probeErrors).toContain(message);
+    expect(derivePrState(facts).phase).toBe('NEEDS-OPERATOR');
+  });
+  it.each(['live', 'cache'])('a %s result is silent', (source) => {
+    expect(readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: ['test'], source }) }).probeErrors).toEqual([]);
   });
   it('an empty shared result reports "required-check set empty" (readiness unknown)', () => {
     const facts = readPrFacts(PR, { ...io(), readRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });

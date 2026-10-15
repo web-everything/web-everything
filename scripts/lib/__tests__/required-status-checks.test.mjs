@@ -18,6 +18,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 import { execFileSync, spawnSync } from 'node:child_process';
 import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, readRequiredStatusChecksDetailed, requiredChecksFromRules, FALLBACK_REQUIRED_STATUS_CHECKS, defaultCachePath, resolveCacheTtlMs, cacheTtlMsFromSettings } from '../required-status-checks.mjs';
 import { ghRestGetJson } from '../gh-rest-read.mjs';
+import { readSettings } from '../settings-files.mjs';
 
 describe('getRequiredStatusChecks', () => {
   let dir;
@@ -753,8 +754,23 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
       }
       expect(resolveCacheTtlMs({ settings: { requiredChecksCache: { ttlMinutes: 1 } } })).toBe(60_000);
     });
-    it('the shipped settings file declares 15 minutes', () => {
-      expect(resolveCacheTtlMs({ now: Date.now() + 10 * 60_000 })).toBe(15 * 60_000);
+    it('with no explicit ttlMs, the default TTL decides whether an entry is served or revalidated', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readChecks = vi.fn(() => ['test']);
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1_000_000, readChecks });
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1_000_000 + 14 * 60_000, readChecks }).source).toBe('cache');
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1_000_000 + 16 * 60_000, readChecks }).source).toBe('live');
+      expect(readChecks).toHaveBeenCalledTimes(2);
+    });
+    it('the shipped settings file is read by the real settings loader and drives the TTL', () => {
+      // Not asserted against the 15 min default alone (a missing file would also pass): the key itself must be present.
+      expect(readSettings().requiredChecksCache).toEqual({ ttlMinutes: 15 });
+      expect(cacheTtlMsFromSettings(readSettings())).toBe(15 * 60_000);
+      const dir2 = mkdtempSync(join(tmpdir(), 'we-ttl-settings-'));
+      try {
+        writeFileSync(join(dir2, 'required-checks-cache.json'), JSON.stringify({ requiredChecksCache: { ttlMinutes: 7 } }));
+        expect(cacheTtlMsFromSettings(readSettings({ dir: dir2, legacyPath: null }))).toBe(7 * 60_000);
+      } finally { rmSync(dir2, { recursive: true, force: true }); }
     });
   });
 

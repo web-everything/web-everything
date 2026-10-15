@@ -849,6 +849,17 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
       readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'stale-cache' }) })).toEqual(['test']);
   });
 
+  it('with NO injected seam, the default reader resolves the real shared cache file and answers from it (zero gh calls)', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    const { defaultCachePath } = await import('../../lib/required-status-checks.mjs');
+    const path = defaultCachePath(); // the per-test throwaway coordination root (vitest.setup.ts)
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ entries: { 'web-everything/web-everything@main': {
+      checks: ['test', 'merge-gate'], classic: ['test'], source: 'live', fetchedAtMs: Date.now() } } }));
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything' })).toEqual(['test']);
+  });
+
   it('wires through the REAL shared cache: a fresh entry on disk answers with zero gh calls', async () => {
     const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

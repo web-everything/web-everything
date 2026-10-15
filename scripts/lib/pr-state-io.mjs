@@ -108,8 +108,15 @@ export function readPrFacts(pr, io = {}) {
   // `…/protection` read per probe. An empty result is "unknown" below, not "nothing required".
   const readRequiredChecks = io.readRequiredChecks ?? getRequiredStatusChecks;
   const required = probe('required-check policy (using declared fallback)', () => {
-    const checks = readRequiredChecks({ repo, branch: 'main' })?.checks;
+    const result = readRequiredChecks({ repo, branch: 'main' });
+    const checks = result?.checks;
     if (!Array.isArray(checks)) throw new Error('required-check policy unreadable');
+    // The shared reader degrades instead of throwing. A live read that FAILED (fallback, unavailable, or a stale entry
+    // kept past its TTL) must stay as visible as the old direct probe's failure, never a silent substitute; `declared`
+    // is the repo's intended policy after a protection denial, not a failed read.
+    if (['fallback', 'unavailable', 'stale-cache'].includes(result?.source)) {
+      errors.push(`required-check policy (${result.source === 'stale-cache' ? 'stale cache' : 'using declared fallback'}) unavailable`);
+    }
     return checks.filter(name => typeof name === 'string' && name);
   }, [...(DECLARED_REQUIRED_STATUS_CHECKS[repo] ?? FALLBACK_REQUIRED_STATUS_CHECKS)]); // each repo's own declared policy
   if (!required.length) errors.push('required-check set empty; readiness unknown');
