@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseLatestHumanClearedSha, isAcceptRecordBody } from '../review-escalation.mjs';
+import { parseLatestHumanClearedSha, isAcceptRecordBody, isSanctionedAcceptRecordBody } from '../review-escalation.mjs';
 
 // Live #5193 (2026-10-13): the operator cleared 9c7202417 (clear-human); a false no-push re-arm then triggered an AI
 // re-review whose plain accept named the SAME sha, so merge-gate read "no human clearance" for the cleared tree.
@@ -68,9 +68,13 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
     const { buildCarryRecordBody } = await import('../human-clearance-carry.mjs');
     const verdict = to => buildVerdictComment({ to, actor: 'chalbert', headSha: X, reason: 'looked at it',
       humanClearance: to === 'restamp' ? { actor: 'chalbert', sha: X } : null });
-    for (const to of ['accepted', 'clear-human', 'restamp']) expect(isAcceptRecordBody(verdict(to)), to).toBe(true);
-    expect(isAcceptRecordBody(buildVerdictComment({ to: 'restamp', actor: 'drain', headSha: X }))).toBe(true);
-    expect(isAcceptRecordBody(buildCarryRecordBody({ fromSha: Y, toSha: X, fingerprint: 'd'.repeat(64), actor: 'chalbert', headDiffText: 'diff' }))).toBe(true);
+    const plainRestamp = buildVerdictComment({ to: 'restamp', actor: 'drain', headSha: X });
+    const carry = buildCarryRecordBody({ fromSha: Y, toSha: X, fingerprint: 'd'.repeat(64), actor: 'chalbert', headDiffText: 'diff' });
+    for (const body of [...['accepted', 'clear-human', 'restamp'].map(verdict), plainRestamp, carry]) {
+      expect(isAcceptRecordBody(body), body).toBe(true);
+      expect(isSanctionedAcceptRecordBody(body), body).toBe(true);
+    }
+    expect(isSanctionedAcceptRecordBody(verdict('changes'))).toBe(false);
     // Renamed 2026-10-11; records under the old heading are still on open PRs.
     expect(isAcceptRecordBody('📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)\n')).toBe(true);
     expect(isAcceptRecordBody(verdict('changes'))).toBe(false);
@@ -100,6 +104,17 @@ describe('parseLatestHumanClearedSha — same-sha carry (reviewClearance.humanCl
       expect(parseLatestHumanClearedSha([clear(X), revoked, quote, accept(X)], { sameShaCarries })).toBeNull();
       expect(parseLatestHumanClearedSha([clear(X), revoked, quote], { sameShaCarries })).toBeNull();
     }
+  });
+  // PR #5237 operator ruling (2026-10-14, red-team break #1): a raw paste of an acceptance keeps its heading at the top,
+  // so it read as an acceptance and continued the same-sha run although a revocation follows its marker block.
+  it.each([
+    ['plain accept paste', `✅ review — accepted\n<!-- reviewed-sha: ${X} -->\n\nThe clearance above is REVOKED.`],
+    ['re-stamp paste', `📌 review — acceptance re-stamped after a rebase (no new review)\n${quote}\nREVOKED`],
+  ])('a pasted acceptance followed by a revocation ends the same-sha run (%s)', (_kind, body) => {
+    const paste = say(body, 'chalbert');
+    expect(parseLatestHumanClearedSha([clear(X), paste], { sameShaCarries: true })).toBeNull();
+    expect(parseLatestHumanClearedSha([clear(X), paste, accept(X)], { sameShaCarries: true })).toBeNull();
+    expect(isSanctionedAcceptRecordBody(body)).toBe(false);
   });
   it('a NEW clear-human ceremony after the revocation does clear again', () => {
     const revoked = say('🔁 review — changes requested\n\n1. not yet');

@@ -5,7 +5,7 @@ import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewCle
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
 import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor, isAutomationAuthored } from './marker-authorship.mjs';
-import { parseLatestHumanClearedSha, isAcceptRecordBody } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, isSanctionedAcceptRecordBody } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -31,10 +31,12 @@ const holdsClearance = c => !isKnownMachineBody(c?.body)
  * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation
  * that quotes the marker is the latest record too, and it is not a clearance: null, so nothing is restored or
  * protected from it, and a newer marker-bearing comment of any other kind never lets an older acceptance through.
+ * The comment must be authored in the sanctioned shape (PR #5237 operator ruling, 2026-10-14): a pasted acceptance
+ * keeps its heading, and a revocation after its marker block makes it a quote, never a clearance to restore.
  */
 const latestAcceptance = comments => {
   const record = latestAcceptRecord(comments);
-  return record && isAcceptRecordBody(comments[record.index]?.body) ? record : null;
+  return record && isSanctionedAcceptRecordBody(comments[record.index]?.body) ? record : null;
 };
 
 export function classifyGateFailure({ name, verdict } = {}) {

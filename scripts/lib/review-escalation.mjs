@@ -1933,8 +1933,9 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
     const bodyHumanCleared = isSanctionedClearanceBody(body);
     // PR #5237 round 5: carrying the marker does not make a comment an acceptance. A revocation can QUOTE it (in a
     // fence, a blockquote, a whole line or inline). The run continues only through a recognised acceptance
-    // (`isAcceptRecordBody`) or a machine note; any other marker-bearing comment ends it, like a marker-free one.
-    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && (isAcceptRecordBody(body) || machineNote)
+    // (`isSanctionedAcceptRecordBody`: the heading AND the marker block at the end, so a pasted acceptance followed by a
+    // revocation does not count) or a machine note; any other marker-bearing comment ends it, like a marker-free one.
+    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && (isSanctionedAcceptRecordBody(body) || machineNote)
       && !isLaterVerdictBody(body)) || bodyHumanCleared;
     latestSha = bodySha;
     latestWasHumanCleared = bodyHumanCleared;
@@ -1989,6 +1990,29 @@ function fencedLines(lines) {
   });
 }
 
+/** The marker block a body ENDS with: consecutive whole-line markers, one comment per line, outside any fence. */
+function markerBlockAtEnd(lines) {
+  const fenced = fencedLines(lines);
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === '') end--;
+  let start = end;
+  while (start > 0 && !fenced[start - 1] && MARKER_LINE_RE.test(lines[start - 1])) start--;
+  return lines.slice(start, end);
+}
+
+/**
+ * Pure: is this comment an acceptance record AUTHORED in the sanctioned shape (PR #5237 operator ruling, 2026-10-14,
+ * red-team break #1)? Its first non-blank line is an acceptance heading at column 0 ({@link isAcceptRecordBody}) AND
+ * the body ENDS with its marker block holding the `reviewed-sha` marker, as every producer writes it
+ * (`buildVerdictComment` accepted / clear-human / restamp, `buildCarryRecordBody`). A raw paste of an old acceptance
+ * keeps the heading, so the heading alone is not enough: text after the marker block ("The clearance above is
+ * REVOKED.") makes it a quote, not an acceptance. A sanctioned clearance ({@link isSanctionedClearanceBody}) counts too.
+ */
+export function isSanctionedAcceptRecordBody(body) {
+  if (!isAcceptRecordBody(body)) return false;
+  return markerBlockAtEnd(bodyLines(body)).some((l) => REVIEWED_SHA_LINE_RE.test(l)) || isSanctionedClearanceBody(body);
+}
+
 /**
  * Pure: is this comment a human clearance AUTHORED in the sanctioned shape, not one quoted inside other prose (PR #5237
  * operator send-back, 2026-10-14)? Exactly as its producers write it (`buildVerdictComment` clear-human / a restamp
@@ -2004,12 +2028,7 @@ export function isSanctionedClearanceBody(body) {
   const lines = bodyLines(body);
   const first = lines.find((l) => l.trim() !== '');
   if (first === undefined || !CLEARANCE_HEADINGS.includes(first.trimEnd())) return false;
-  const fenced = fencedLines(lines);
-  let end = lines.length;
-  while (end > 0 && lines[end - 1].trim() === '') end--;
-  let start = end;
-  while (start > 0 && !fenced[start - 1] && MARKER_LINE_RE.test(lines[start - 1])) start--;
-  const tail = lines.slice(start, end);
+  const tail = markerBlockAtEnd(lines);
   if (tail.some((l) => CLEARED_HUMAN_LINE_RE.test(l))) return true;
   CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
   return CLEARED_HUMAN_PROSE_RE.exec(String(body)) !== null && tail.some((l) => REVIEWED_SHA_LINE_RE.test(l));

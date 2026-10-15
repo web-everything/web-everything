@@ -112,6 +112,23 @@ describe('#5193 review clearance', () => {
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
     expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
   });
+  // PR #5237 operator ruling (2026-10-14, red-team break #1): a trusted raw paste of an old acceptance (its heading and
+  // reviewed-sha marker) followed by a revocation was taken as the latest acceptance and restored as review:accepted.
+  const pastes = [
+    ['clearance paste', `${acceptance.body}\n\nThe clearance above is REVOKED.`],
+    ['plain accept paste', `✅ review — accepted\n<!-- reviewed-sha: ${head} -->\n\nThe clearance above is REVOKED.`],
+    ['re-stamp paste', `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\nREVOKED`],
+  ];
+  it.each(pastes)('does not restore from a pasted acceptance followed by a revocation (%s)', (_kind, body) => {
+    const thread = [acceptance, comments[1], comment(body, '18:45:00'), rearm];
+    expect(decideClearanceRestore({ ...restoreFacts, comments: thread }).restore).toBe(false);
+    expect(mayNeedRestore({ comments: thread, prHead: head })).toBe(false);
+  });
+  it.each(pastes)('lets a re-arm through after a pasted acceptance followed by a revocation (%s)', (_kind, body) => {
+    const { runGh } = fakeGh(['review:accepted'], [acceptance, comment(body, '18:45:00')]);
+    const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+    expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
+  });
   it('pins the local marker', () => expect(REARM_MARKER).toBe(REARM_COMMENT_MARKER));
   it.each(['chalbert', 'mallory'])('never restores an acceptance removed by %s', login => {
     const revoked = events.map(e => e.label.name === 'review:accepted' && e.event === 'unlabeled'
