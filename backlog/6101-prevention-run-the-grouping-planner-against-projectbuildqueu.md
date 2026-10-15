@@ -42,3 +42,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5187 (finding 1: `we:skills-src/conveyor/build-dispatch-daemon.mjs:700` — Give planBuildGroups the queue's rawScope or the card's repo-qualified scope for repo and overlap checks. Add a daemon tick fixture built from projectBuildQueueRow output rather than hand-written rows, so tests exercise the real shape. A contract test asserting that grouping inputs are repo-qualifi…)
