@@ -25,13 +25,22 @@ export function isRunningSession(a) {
 /**
  * 'yes' when running, alive and active within the window (a recent start counts);
  * 'unknown' when running and alive but its activity could not be read; else 'no'.
- * Future timestamps are not evidence.
+ * Future timestamps are not evidence. Unknown lasts only `unknownForMinutes` after the start.
  */
-export function sessionActivity(a, now, activeWithinMinutes = 30) {
+export function sessionActivity(a, now, activeWithinMinutes = 30, unknownForMinutes = 90) {
   if (!isRunningSession(a)) return 'no';
-  const seen = Math.max(...[a.lastActivityAt, a.startedAt].map(ms).filter((t) => Number.isFinite(t) && t <= now + 60000));
+  const valid = (v) => { const t = ms(v); return Number.isFinite(t) && t <= now + 60000 ? t : NaN; };
+  const seen = Math.max(...[a.lastActivityAt, a.startedAt].map(valid).filter(Number.isFinite));
   if (Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000) return 'yes';
-  return a.activityUnknown === true ? 'unknown' : 'no';
+  const started = valid(a.startedAt);
+  return a.activityUnknown === true && Number.isFinite(started) && now - started <= unknownForMinutes * 60000 ? 'unknown' : 'no';
+}
+// Only a PR-kind slug names its PR; item slugs (conveyor-N, prepare-N) and
+// unnamed rows must not make a PR unreadable.
+function namesPr(name, pr) {
+  const slug = parseSessionSlug(name);
+  if (slug) return !slug.itemKind && slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number);
+  return repoKeyForSlug(pr.repo) === 'we' && Boolean(findFixerSession([{ name }], pr.number));
 }
 export function resolveOwner(pr, signals = {}) {
   const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [], unreadSessions = [] } = signals;
@@ -43,9 +52,9 @@ export function resolveOwner(pr, signals = {}) {
       : (a.repo ? repoKeyForSlug(a.repo) === repoKeyForSlug(pr.repo) : repoKeyForSlug(pr.repo) === 'we');
   });
   const live = bound.filter((a) => sessionActivity(a, now, sessionActiveWithinMinutes) === 'yes');
-  // A bound session we could not read (activity or listing record) is unknown, not absent.
-  const unread = bound.some((a) => sessionActivity(a, now, sessionActiveWithinMinutes) === 'unknown')
-    || unreadSessions.some((name) => { const slug = parseSessionSlug(name); return slug?.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number); });
+  // A session naming this PR that we could not read (activity or listing record) is unknown, not absent.
+  const unread = bound.some((a) => namesPr(a.name, pr) && sessionActivity(a, now, sessionActiveWithinMinutes, stuckAfterMinutes) === 'unknown')
+    || unreadSessions.some((name) => namesPr(name, pr));
   const session = findFixerSession(live, pr.number) ?? live.find((a) => ['review', 'inspect'].includes(parseSessionSlug(a.name)?.kind));
   // Refusals and diagnostics never acquired ownership. Keep them out of the
   // progress clock, including legacy refusal signals carrying only `reason`.
@@ -67,12 +76,13 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
   const report = { idle: idle.map((p) => ({ ...p, ...owners[prKey(p)] })), needsYou: needsYou ?? null, needsYouAdded: [] };
   for (const p of idle) {
     const key = prKey(p); const owner = owners[key];
-    // An unreadable owner keeps its previous episode untouched, like a failed read.
-    if (owner?.state === 'unknown' && prevState.episodes?.[key]) episodes[key] = prevState.episodes[key];
-    if (!ownerReadsOk || !prsReadOk || !['none', 'stuck'].includes(owner?.state)) continue;
+    if (!ownerReadsOk || !prsReadOk || !['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
     const old = prevState.episodes?.[key];
     const episode = old?.head === p.headRefOid && old?.updatedAt === p.updatedAt ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, firstUnownedAt: now, alerted: false };
-    if (!episode.alerted && now - episode.firstUnownedAt > settings.stuckAlertMinutes * 60000) {
+    // An unreadable owner keeps the episode clock running but waits twice as long,
+    // so a brief unreadable tick never alerts and a permanent one still does.
+    const alertAfter = settings.stuckAlertMinutes * (owner.state === 'unknown' ? 2 : 1);
+    if (!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) {
       alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}`, key }); episode.alerted = true;
     }
     episodes[key] = episode;

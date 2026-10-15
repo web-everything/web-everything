@@ -17,7 +17,6 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
-import { parseSessionSlug } from './session-slug.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -90,9 +89,10 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
   sessions = await guarded('agents', async () => {
     const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array');
     // A session missing from a partial listing is unknown, not gone. A gap naming a
-    // session pauses only that session's PR; an unscoped gap fails the whole read.
+    // session affects only the PR that name binds to (if any); a gap with no name
+    // fails the whole read.
     const gaps = rows.incomplete ?? [];
-    const unscoped = gaps.filter((g) => !parseSessionSlug(g?.session));
+    const unscoped = gaps.filter((g) => typeof g?.session !== 'string' || !g.session);
     if (unscoped.length) throw new Error(`agent listing incomplete: ${unscoped.map((g) => g?.reason ?? g).join('; ')}`);
     unreadSessions = gaps.map((g) => g.session);
     // A transcript that cannot be read leaves activity unknown, not stale.

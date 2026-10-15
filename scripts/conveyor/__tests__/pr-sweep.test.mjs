@@ -272,9 +272,18 @@ describe('only an actively running session owns a PR', () => {
     expect(own.nextState.episodes).toEqual(first.nextState.episodes);
     const other = await sweepWith(gapped({ reason: 'wrapped record fix-13 unreadable', session: 'fix-13' }), first.nextState);
     expect(other.errors).toEqual([]); expect(other.alerts).toHaveLength(1);
-    const unscoped = await sweepWith(gapped({ reason: 'wrapped record ??? unreadable', session: 'not a slug' }), first.nextState);
+    for (const session of ['harvest-x', 'conveyor-12', 'fix-pa-12']) {
+      const unbound = await sweepWith(gapped({ reason: `wrapped record ${session} unreadable`, session }), first.nextState);
+      expect(unbound.errors).toEqual([]); expect(unbound.idle[0].state).toBe('none'); expect(unbound.alerts).toHaveLength(1);
+    }
+    expect((await sweepWith(gapped({ reason: 'x', session: 'conflict-12' }), first.nextState)).idle[0].state).toBe('unknown');
+    const unscoped = await sweepWith(gapped({ reason: 'completion store row unreadable' }), first.nextState);
     expect(unscoped.errors.join(' ')).toContain('agent listing incomplete'); expect(unscoped.alerts).toEqual([]);
     expect(unscoped.nextState.episodes).toEqual(first.nextState.episodes);
+    // A record that stays unreadable still alerts once the doubled wait passes.
+    const blind = await sweepWith(gapped({ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }), first.nextState, now + 181 * 60000);
+    expect(blind.idle[0].state).toBe('unknown'); expect(blind.alerts).toHaveLength(1);
+    expect(blind.alerts[0].body).toContain('Bound session could not be read');
   });
   it('a busy live job with no readable transcript is unknown, never a false stall or a forever owner', async () => {
     const first = plan();
@@ -285,6 +294,12 @@ describe('only an actively running session owns a PR', () => {
     const thrown = await sweepWith([job], first.nextState, now + 100 * 60000, () => { throw new Error('tail read failed'); });
     expect(thrown.idle[0].state).toBe('unknown'); expect(thrown.alerts).toEqual([]);
     expect((await sweepWith([{ ...job, pidAlive: false }], first.nextState)).alerts).toHaveLength(1);
+    // Unknown is bounded: a job started 4 h ago with no readable activity no longer holds the PR.
+    const wedged = await sweepWith([{ ...job, startedAt: now - 140 * 60000 }], first.nextState);
+    expect(wedged.idle[0].state).toBe('none'); expect(wedged.alerts).toHaveLength(1);
+    // An unnamed busy row binds to every web-everything PR but must not make them unreadable.
+    const unnamed = await sweepWith([{ ...job, name: 'Assistant' }], first.nextState);
+    expect(unnamed.idle[0].state).toBe('none'); expect(unnamed.alerts).toHaveLength(1);
     expect(resolveOwner(pr, { now, sessions: [running(now, { lastActivityAt: now + 10 * 60 * 60000 })] }).state).toBe('none');
     expect(resolveOwner(pr, { now, sessions: [running(now, { lastActivityAt: String(now - 60000) })] }).state).toBe('active');
   });
