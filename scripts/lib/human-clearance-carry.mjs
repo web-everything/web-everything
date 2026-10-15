@@ -107,8 +107,9 @@ export function latestHumanClearance(comments) {
  * code span or invisible/bidi character can reach the record.
  */
 export function sanitizeActor(actor) {
-  const name = String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim();
-  return name.slice(0, 64) || 'the operator';
+  // Cut by code point before trimming, so a sanitized name sanitizes to itself (numbering-carry compares the two).
+  const name = Array.from(String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ')).slice(0, 64).join('').trim();
+  return name || 'the operator';
 }
 
 /**

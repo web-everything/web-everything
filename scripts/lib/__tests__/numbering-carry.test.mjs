@@ -572,6 +572,41 @@ describe('numbering acceptance restamp', () => {
       if (human) expect(calls[0]).toContain(`cleared-human: ${/cleared-human: (\S+)/.exec(record.body)[1]}`);
       else expect(calls[0]).not.toContain('cleared-human:');
     });
+    it('a plain acceptance landing just before our record keeps pending, and the next pass supersedes our record', async () => {
+      const { parseLatestHumanClearedSha } = await import('../review-escalation.mjs');
+      const { calls, provider } = recording();
+      const comments = liveComments();
+      // The acceptance lands after the pre-write re-read but before our comment is posted.
+      const racing = { postComment: (r, n, body) => { if (!calls.length) comments.push(newer(null)); provider.postComment(r, n, body); },
+        setLabels: provider.setLabels };
+      const state = { labels: ['review:pending'], headRefOid: TO, comments };
+      expect(run({ provider: racing, state, prove: () => ({ ok: true, reason: 'verified' }) }))
+        .toMatchObject({ action: 'retry', commentPosted: true });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toContain('cleared-human:');
+      const thread = [...comments, { author: { login: 'chalbert' }, body: calls[0] }];
+      const next = run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments: thread },
+        prove: () => ({ ok: true, reason: 'verified' }) });
+      expect(next).toMatchObject({ action: 'restamped', human: false });
+      expect(calls).toHaveLength(3);
+      expect(calls[1]).not.toContain('cleared-human:');
+      expect(parseLatestHumanClearedSha([...thread, { author: { login: 'chalbert' }, body: calls[1] }])).toBeNull();
+    });
+    it('a labels-only recovery refuses a record whose carried acceptance was superseded before it', () => {
+      const body = buildNumberingRestampBody({ fromSha: FROM, toSha: TO, human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' });
+      const comments = [...liveComments(), newer(null), { author: { login: 'chalbert' }, body }];
+      const plan = planNumberingRestamp({ labels: ['review:pending'], headSha: TO, comments, reviews: [] });
+      expect(plan).toMatchObject({ candidate: true, from: FROM, to: TO, human: false });
+      expect(plan.labelsOnly).toBeUndefined();
+    });
+    it('a long actor cut at a separator still matches its own record', () => {
+      const { calls, provider } = recording();
+      const actor = `${'a'.repeat(63)} b`;
+      const comments = [{ ...accept(), body: accept().body.replace('cleared-human: chalbert', `cleared-human: ${actor}`) }];
+      expect(run({ provider, state: { labels: ['review:pending'], headRefOid: TO, comments },
+        prove: () => ({ ok: true, reason: 'verified' }) })).toMatchObject({ action: 'restamped', human: true });
+      expect(calls).toHaveLength(2);
+    });
     it('compares the actor as the record writes it, so a sanitized name still finishes the labels', () => {
       const { calls, provider } = recording();
       const comments = [{ ...accept(), body: accept().body.replace('cleared-human: chalbert', 'cleared-human: @chal bert') }];

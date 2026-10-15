@@ -316,27 +316,39 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
     return { candidate: false, reason: 'labels do not permit numbering carry' };
   }
   if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return { candidate: false, reason: 'live head unknown' };
-  const rec = latestAcceptRecord(comments);
-  if (!rec) return { candidate: false, reason: 'no recorded acceptance' };
+  const latest = latestAcceptRecord(comments);
+  if (!latest) return { candidate: false, reason: 'no recorded acceptance' };
   const head = headSha.toLowerCase();
   // A numbering re-stamp whose label write failed after its record was posted: finish the labels only. The record is
   // the trusted re-stamp itself (its own marker names this head), so no proof or second comment is owed.
-  const own = rec.sha === head ? restampMarkerFrom(comments[rec.index]?.body, head) : null;
-  if (rec.sha === head && !own) return { candidate: false, reason: 'already bound' };
+  const own = latest.sha === head ? restampMarkerFrom(comments[latest.index]?.body, head) : null;
+  if (latest.sha === head && !own) return { candidate: false, reason: 'already bound' };
+  // Our re-stamp records for this head are judged against the acceptance they carried, never as that acceptance: a
+  // newer acceptance posted just before our record (after the last re-read) supersedes it and is planned instead.
+  const ownRecord = (c) => restampMarkerFrom(c?.body, head) !== null && latestAcceptRecord([c])?.sha === head;
+  const view = comments.filter((c) => !ownRecord(c));
+  const rec = latestAcceptRecord(view);
+  if (!rec) return { candidate: false, reason: 'the re-stamp record names no carried acceptance' };
+  if (rec.sha === head) return { candidate: false, reason: 'already bound' };
   if (rec.laterBodyDerivedHold) return { candidate: false, reason: 'later body-derived hold' };
-  if (comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+  if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
     return { candidate: false, reason: 'later verdict or unknown comment stands' };
   }
   if (!Array.isArray(reviews)) return { candidate: false, reason: 'formal reviews unreadable', retryable: true };
   if (laterReviewHold(reviews, rec.at)) return { candidate: false, reason: 'formal review hold stands' };
   // The acceptance comment this plan carries: a newer record on the same sha is a different acceptance.
-  const source = comments[rec.index]?.id != null ? `id:${comments[rec.index].id}` : `at:${rec.at ?? ''}#${rec.index}`;
-  if (own) return { candidate: true, labelsOnly: true, from: own, to: head, human: rec.humanCleared, actor: rec.actor, source };
-  return { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source };
+  const src = view[rec.index];
+  const source = src?.id != null ? `id:${src.id}` : `at:${rec.at ?? ''}#${comments.indexOf(src)}`;
+  const plan = { candidate: true, from: rec.sha, to: head, human: rec.humanCleared, actor: rec.actor, source };
+  const carriesRec = own === rec.sha && Boolean(latest.humanCleared) === Boolean(rec.humanCleared)
+    && (!rec.humanCleared || sanitizeActor(latest.actor) === sanitizeActor(rec.actor));
+  return carriesRec ? { ...plan, labelsOnly: true } : plan;
 }
 
 // Same allow-list as human-clearance-carry; local to avoid a circular dependency between the two carry tiers.
-const sanitizeActor = (actor) => String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim().slice(0, 64) || 'the operator';
+// Cut by code point before trimming, so sanitizing an already-sanitized name returns it unchanged.
+const sanitizeActor = (actor) => Array.from(String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ')).slice(0, 64).join('').trim()
+  || 'the operator';
 
 /** PURE: the existing restamp headline and markers keep all acceptance readers in agreement. */
 export function buildNumberingRestampBody({ fromSha, toSha, human, actor, headDiffText, proofReason, writer }) {
@@ -382,11 +394,10 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
     return { result: { action: plan.retryable ? 'retry' : 'held', reason: `live re-read: ${plan.reason}` } };
   }
   // The write uses the first plan's clearance, so the fresh one must match it: the same human flag, the same actor (as
-  // written into the record) and, before our own record exists, the same source comment. Any change aborts unsettled.
+  // written into the record) and the same source acceptance comment. Any change aborts unsettled.
   const clearedBy = (p) => (p.human ? sanitizeActor(p.actor) : null);
   if (plan.from !== expected.from || plan.to !== expected.to || Boolean(plan.labelsOnly) !== Boolean(expected.labelsOnly)
-    || Boolean(plan.human) !== Boolean(expected.human) || clearedBy(plan) !== clearedBy(expected)
-    || (expected.source != null && plan.source !== expected.source)) {
+    || Boolean(plan.human) !== Boolean(expected.human) || clearedBy(plan) !== clearedBy(expected) || plan.source !== expected.source) {
     return { result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
   }
   try { guardReferrals(state, { repo, pr }); }
@@ -408,10 +419,8 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // A guard read failure is retryable and never settles the head or grants an acceptance.
   try { guardReferrals(state, { repo, pr }); }
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
-  // After our record is posted it is the source, so only the pre-write checks can compare the source comment.
   const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
-    expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor,
-      source: Boolean(labelsOnly) === Boolean(plan.labelsOnly) ? plan.source : null } });
+    expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor, source: plan.source } });
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
     const live = recheck(true);
