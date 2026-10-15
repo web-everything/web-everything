@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr } from './helpers/fake-gh.mjs';
 import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__tests__/helpers/real-repo.mjs';
+import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
 
 const execFileAsync = promisify(execFile);
 const cleanups = [];
@@ -285,6 +286,53 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
     } catch (err) {
       expect(String(err.stderr || err.message)).toMatch(/unsupported/);
     }
+  });
+
+  it('serves paged open PRs to the real snapshot reader, with live checks and heavy hydration', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-pages-');
+    const gh = makeGithub(originPath);
+    const numbers = [];
+    for (let i = 0; i < 5; i++) {
+      seedBranchAt(originPath, `lane/page-${i}`);
+      numbers.push(gh.openPr({ repo: SLUG, head: `lane/page-${i}`, title: `page ${i}`, body: `body ${i}`,
+        labels: ['ready-to-merge', 'review:accepted'] }));
+    }
+    gh.closePr(SLUG, numbers[1]);
+    gh.comment(SLUG, numbers[4], 'review evidence');
+    gh.setChecks(SLUG, numbers[4], [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }]);
+    const exec = (command, args, opts) => execFileSync(command, args, { ...opts, cwd: clonePath,
+      env: { ...opts.env, ...gh.env } });
+    const page = listOpenPrsPagedHydrated({ repo: SLUG, exec,
+      paging: { pageSize: 2, pageRetries: 0, heavyMaxAgeSeconds: 600 }, heavyFields: ['body', 'comments', 'files'] });
+    expect(page.pages).toBe(2);
+    expect(page.totalCount).toBe(4);
+    expect(page.rows.map(pr => pr.number)).toEqual([numbers[4], numbers[3], numbers[2], numbers[0]]);
+    const latest = page.rows[0];
+    expect(latest.body).toBe('body 4');
+    expect(latest.comments.map(c => c.body)).toEqual(['review evidence']);
+    expect(latest.labels.map(l => l.name)).toEqual(['ready-to-merge', 'review:accepted']);
+    expect(latest.statusCheckRollup).toEqual([expect.objectContaining({ name: 'test', conclusion: 'FAILURE' })]);
+    expect(latest.mergeStateStatus).toBe('UNSTABLE');
+    expect(page.rows[1].mergeStateStatus).toBe('CLEAN');
+    expect(latest.headRefOid).toBe(git(['rev-parse', DEFAULT_BRANCH], { cwd: originPath }).trim());
+    expect(latest.files).toEqual([]);
+    // A failed later page must not publish the earlier page as a complete snapshot.
+    let reads = 0;
+    expect(() => listOpenPrsLightPaged({ repo: SLUG, pageSize: 2, pageRetries: 0, exec: (command, args, opts) => {
+      if (++reads === 2) gh.fault({ verb: 'api', kind: '5xx', times: 1 });
+      return exec(command, args, opts);
+    } })).toThrow(/page 2 failed/);
+  });
+
+  it('rejects unsupported GraphQL queries and invalid pagination cursors', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-query-');
+    const gh = makeGithub(originPath);
+    expect(() => ghExec(gh, ['api', 'graphql', '-f', 'query=query{viewer{login}}'], clonePath)).toThrow(/unsupported graphql query/);
+    const query = buildOpenPrPageQuery({ repo: SLUG, pageSize: 2, after: 'unknown-cursor' });
+    expect(() => ghExec(gh, ['api', 'graphql', '-f', `query=${query}`], clonePath)).toThrow(/invalid graphql cursor/);
+    const empty = JSON.parse(ghExec(gh, ['api', 'graphql', '-f', `query=${buildOpenPrPageQuery({ repo: SLUG, pageSize: 2 })}`], clonePath));
+    expect(empty.data.repository.pullRequests).toEqual({ nodes: [], totalCount: 0,
+      pageInfo: { hasNextPage: false, endCursor: null } });
   });
 
   it('concurrency: 30 parallel `gh pr edit --add-label` processes on distinct PRs all land, no lost write', async () => {
