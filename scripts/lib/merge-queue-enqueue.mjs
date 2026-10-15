@@ -161,6 +161,17 @@ export function buildEnqueueArgs({ nodeId, headSha }) {
   return ['api', 'graphql', '-f', `query=${ENQUEUE_MUTATION}`, '-f', `id=${nodeId}`, '-f', `sha=${headSha}`];
 }
 
+/**
+ * Transport for the explicitly instructed operator operation. Keep mutation dispatch in this module;
+ * the caller owns its operator gates, credential environment, response handling and queue verification.
+ * This does not call the drain's `enqueuePr` or alter its workflow-edit refusal.
+ */
+export function requestOperatorQueueEntry({ nodeId, headSha, bin, env, exec = execFileSync }) {
+  return JSON.parse(String(exec(bin, buildEnqueueArgs({ nodeId, headSha }), {
+    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
+  }) || '{}'));
+}
+
 /** Is a gh error the "already in the merge queue" case (idempotent success)? Pure. */
 export function isAlreadyQueuedError(text) {
   return /already (?:in|queued in) the (?:merge )?queue|is already queued/i.test(String(text || '')); // GitHub also says "already in the queue" (card 257)

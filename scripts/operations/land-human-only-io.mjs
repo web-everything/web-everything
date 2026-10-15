@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { workflowEditHold, buildEnqueueArgs, isAlreadyQueuedError } from '../lib/merge-queue-enqueue.mjs';
+import { workflowEditHold, requestOperatorQueueEntry, isAlreadyQueuedError } from '../lib/merge-queue-enqueue.mjs';
 import { readQueueRequiredChecks } from '../lib/drain-merge-strategy.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { labelOnGreenVerdict } from '../merge-ai-prs.mjs';
@@ -190,8 +190,7 @@ export function createLandHumanOnlySinks({ exec = execFileSync, credential = () 
       if (!labelNames(live).includes(READY_LABEL)) { gh(['pr', 'edit', String(pr), '--repo', repo, '--add-label', READY_LABEL]); labelled = true; }
       let error = null;
       try {
-        const out = JSON.parse(String(exec(cred.bin, buildEnqueueArgs({ nodeId: live.id, headSha: head }), { env: operatorEnv(cred.token),
-          encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }) || '{}'));
+        const out = requestOperatorQueueEntry({ nodeId: live.id, headSha: head, bin: cred.bin, env: operatorEnv(cred.token), exec });
         const errs = Array.isArray(out?.errors) ? out.errors.map((x) => x?.message).join('; ') : '';
         if (errs && !isAlreadyQueuedError(errs)) error = errs;
       } catch (e) { if (!isAlreadyQueuedError(errLine(e))) error = errLine(e); }
