@@ -2525,11 +2525,17 @@ const OPAQUE_BLANK = String.fromCharCode(0xe000);
 // drops the top-level ones. A `#` comment (a word that begins with an unquoted `#`) is cut with everything after.
 function shellWords(stmt) {
   const tokens = shellTokens(String(stmt).replace(ODD_BLANK, OPAQUE_BLANK), { preserveQuotes: true });
-  const words = tokens.map((t, i) => ({
-    raw: t.text,
-    text: t.op ? t.text : shellTokens(t.text)[0]?.text ?? '',
-    redir: t.op || !!tokens[i - 1]?.op,
-  }));
+  const words = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    // `<(…)` / `>(…)` is a process substitution — a word (`/dev/fd/63`), not a redirect
+    if (t.op && (t.text === '<' || t.text === '>') && tokens[i + 1]?.text.startsWith('(')) {
+      const raw = t.text + tokens[++i].text;
+      words.push({ raw, text: raw, redir: false });
+      continue;
+    }
+    words.push({ raw: t.text, text: t.op ? t.text : shellTokens(t.text)[0]?.text ?? '', redir: t.op || !!tokens[i - 1]?.op });
+  }
   const comment = words.findIndex((w) => !w.redir && w.raw.startsWith('#'));
   return comment < 0 ? words : words.slice(0, comment);
 }
@@ -2579,6 +2585,7 @@ function expandableText(stmt) {
   const s = String(stmt);
   let out = '';
   let dq = false;
+  let arith = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === '\\') { i++; out += ' '; continue; }
@@ -2589,9 +2596,13 @@ function expandableText(stmt) {
       out += ' ';
       continue;
     }
-    if (c === '"') dq = !dq;
+    if (arith) {                                                // inside `$((…))`: parens are arithmetic
+      if (c === '(') arith++;
+      else if (c === ')') arith--;
+    } else if (c === '$' && s[i + 1] === '(' && s[i + 2] === '(') { out += '$(('; i += 2; arith = 2; continue; }
+    else if (c === '"') dq = !dq;
     else if (!dq && c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;
-    else if (dq && c === '(' && s[i + 1] === '(' && s[i - 1] !== '$') { out += '  '; i++; continue; } // only `$((` expands in quotes
+    else if (dq && c === '(' && s[i + 1] === '(') { out += '  '; i++; continue; } // a literal `((` in quotes
     out += c;
   }
   return out;
@@ -2636,27 +2647,30 @@ function expansionOps(stmt) {
 // (`"$(echo "a b")"`); inside `${…}` / `$[…]` a bare paren is literal (`${Y//(/a}`). false = a `)` that closes
 // nothing, or an unclosed `'`. Linear.
 const EXPANSION_CLOSER = { '(': ')', '{': '}', '[': ']' };
+// One step of that scan at raw[i]: returns the index of the last character it consumed, or -1 when broken.
+function scanChar(raw, i, stack) {
+  const c = raw[i];
+  const top = stack[stack.length - 1];
+  if (c === '\\') return i + 1;
+  if (c === '$' && raw[i + 1] === '$') return i + 1;            // `$$` is the shell's pid, not an opener
+  if (c === '$' && EXPANSION_CLOSER[raw[i + 1]]) { stack.push(EXPANSION_CLOSER[raw[i + 1]]); return i + 1; }
+  if (top === '"') {
+    if (c === '"') stack.pop();
+    else if (c === '`') stack.push('`');
+    return i;
+  }
+  if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); return i; }
+  if (c === "'") return raw.indexOf("'", i + 1);
+  if (c === '"') stack.push('"');
+  else if (top === '}' || top === ']') { if (c === top) stack.pop(); }
+  else if (c === '(') stack.push(')');
+  else if (c === ')') { if (top !== ')') return -1; stack.pop(); }
+  return i;
+}
 function scanSubstitutions(raw, stack) {
   for (let i = 0; i < raw.length; i++) {
-    const c = raw[i];
-    const top = stack[stack.length - 1];
-    if (c === '\\') { i++; continue; }
-    if (c === '$' && raw[i + 1] === '$') { i++; continue; }    // `$$` is the shell's pid, not an opener
-    if (c === '$' && EXPANSION_CLOSER[raw[i + 1]]) { stack.push(EXPANSION_CLOSER[raw[i + 1]]); i++; continue; }
-    if (top === '"') {
-      if (c === '"') stack.pop();
-      else if (c === '`') stack.push('`');
-      continue;
-    }
-    if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); continue; }
-    if (c === "'") {
-      const close = raw.indexOf("'", i + 1);
-      if (close < 0) return false;
-      i = close;
-    } else if (c === '"') stack.push('"');
-    else if (top === '}' || top === ']') { if (c === top) stack.pop(); }
-    else if (c === '(') stack.push(')');
-    else if (c === ')') { if (top !== ')') return false; stack.pop(); }
+    i = scanChar(raw, i, stack);
+    if (i < 0) return false;
   }
   return true;
 }
@@ -2672,23 +2686,17 @@ function scanSubstitutions(raw, stack) {
 // assumed to be able to vanish.
 function mayExpandToNothing(raw) {
   if (raw.length > LET_MAX_CHARS) return true;
-  for (let i = 0; i < raw.length;) {
-    if (raw[i] === '`') {
-      const close = raw.indexOf('`', i + 1);
-      if (close < 0) return true;
-      i = close + 1;
-    } else if (raw[i] !== '$') return false;
-    else if (/[A-Za-z_]/.test(raw[i + 1] ?? '')) { i += 2; while (/\w/.test(raw[i] ?? '')) i++; }
-    else if (/[0-9@*#?$!-]/.test(raw[i + 1] ?? '')) i += 2;
-    else if (raw[i + 1] === '{' || raw[i + 1] === '(') {
-      const stack = [];
-      const start = i;
-      for (; i < raw.length; i++) {
-        if (raw[i] === '{' || raw[i] === '(') stack.push(raw[i]);
-        else if ((raw[i] === '}' || raw[i] === ')') && stack.pop() && !stack.length) { i++; break; }
-      }
-      if (stack.length || i === start) return true;
-    } else return false;
+  const stack = [];
+  for (let i = 0; i < raw.length; i++) {
+    if (!stack.length) {                                        // between expansions: only another may start
+      const c = raw[i];
+      const n = raw[i + 1] ?? '';
+      if (c === '$' && /[A-Za-z_]/.test(n)) { i++; while (/\w/.test(raw[i + 1] ?? '')) i++; continue; }
+      if (c === '$' && /[0-9@*#?$!-]/.test(n)) { i++; continue; }
+      if (c !== '`' && !(c === '$' && EXPANSION_CLOSER[n])) return false;
+    }
+    i = scanChar(raw, i, stack);                                // inside one: bash's own nesting rules
+    if (i < 0) return true;
   }
   return true;
 }

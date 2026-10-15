@@ -776,6 +776,14 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     for (const c of ['$CMD', '${CMD}', '$(echo true)', '`echo true`', '$@', '$*', '$1', '$!', '$A$B', '$A${B}', '${A}$B', '$A$(true)', '$(true)$A', '`true`$A']) {
       expect(at(`X=/protected/clone; X=/etc ${c} f; cd "$X"`), c).toBe(REPORTED);
     }
+    // a literal `)` or `}` inside an expansion does not end it early
+    for (const c of ['${A#)}', '$(: ")")', '$(: })', '${A/\\}/}', '${A#"}"}']) {
+      expect(at(`X=/protected/clone; X=/etc ${c}; cd "$X"`), c).toBe(REPORTED);
+    }
+    // a process substitution is a word, never a dropped redirect
+    expect(at('cd <(true a) && ls')).toBe(REPORTED);
+    expect(at('cd <(true a) /protected/clone')).toBe(REPORTED);
+    expect(at('<(true a) cd /protected/clone')).toBe(REPORTED);
     // a redirect inside `${…}` / `$[…]` / `$(…)` is part of the expansion, and `$$` opens nothing
     for (const v of ['${Y:-<}', '${Y:-a<b}', '${Y:->}', '${Y:-<none>}', '${Y:-a >b}', '$[1>0]', '${A[i<2]}', '$(cat <f)', '$$', '$${']) {
       expect(at(`X=${v} cd /protected/clone; cd sub`), v).toBe('/protected/clone');
@@ -787,6 +795,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'let ${N:-LANE}=0', 'let "$(echo LANE)=0"', 'let "${!N}=0"', 'let ${N}LANE=0', '(( ${N}X = 0 ))', 'let "$N++"',
       ': $(( $N[0]++ ))', ': $(( $N[0]-- ))', ': $(( ${N}[0]++ ))', 'let "$N[0]++"', '(( "$N"++ ))',
       '! ((LANE=0))', 'time ((LANE=0))', '{ ((LANE=0))', 'if ((LANE=0))', 'while ((LANE=0))',
+      ': "$(((LANE=2)))"', ': "$((((LANE=2))))"', ': "$(( ((0)) + (LANE=2) ))"',
     ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
