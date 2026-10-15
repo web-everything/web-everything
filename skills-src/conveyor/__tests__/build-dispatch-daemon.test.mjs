@@ -250,7 +250,10 @@ describe('prepare status batched', () => {
       ? JSON.stringify({ content: Buffer.from('---\nstatus: open\n---\ncard').toString('base64') })
       : git(cmd, args, opts);
     const reader = createPrepareStatusReader({ exec });
-    expect(reader.read({ num: 5028 }).pr).toMatchObject({ number: 91, state: 'OPEN', preparedDate: null });
+    // Write grade (PR #5366 round 7): a title-only PR off the card's lane prepare branch never reaches the status
+    // reader, which drives stamps and holds; it still refuses a launch through `listPrs` (refusal grade).
+    if (title) expect(reader.read({ num: 5028 }).pr).toBeNull();
+    else expect(reader.read({ num: 5028 }).pr).toMatchObject({ number: 91, state: 'OPEN', preparedDate: null });
     expect(reader.listPrs({ num: 5028 })).toHaveLength(1);
   });
   it.each([false, true])('batches 50 tracked prepares (unstamped=%s)', unstamped => {
