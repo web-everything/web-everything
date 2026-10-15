@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -41,6 +42,151 @@ function fixture(output = '{"total_count":1,"jobs":[{"status":"completed"}]}') {
 }
 
 describe('finished CI cache (card 309)', () => {
+  it.each([false, true])('amortizes unfinished proof reads across repeated polls (CLI=%s)', cli => {
+    for (const args of [log, jobs]) {
+      const f = fixture();
+      f.spawn.mockImplementation((_bin, argv) => ({ status: 0, stderr: Buffer.alloc(0),
+        stdout: Buffer.from(argv[1] === args[1] ? args === log ? 'partial log'
+          : '{"total_count":1,"jobs":[{"status":"in_progress"}]}' : '{"status":"in_progress"}') }));
+      const call = () => cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }) : runGhSync(args, f.opts);
+      for (let i = 0; i < 5; i++) {
+        // The retry hint is shared on disk, including between runner entry points.
+        if (i === 1) {
+          if (cli) runGhSync(args, f.opts);
+          else runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn });
+        } else call();
+        f.advance(10000);
+      }
+      // Count ALL real requests: one initial proof, then one payload per poll.
+      expect(f.spawn).toHaveBeenCalledTimes(6);
+      expect(f.files()).toHaveLength(0);
+      f.advance(600000);
+      f.spawn.mockImplementation((_bin, argv) => ({ status: 0, stderr: Buffer.alloc(0),
+        stdout: Buffer.from(argv[1] === args[1] ? args === log ? 'final log'
+          : '{"total_count":1,"jobs":[{"status":"completed"}]}' : '{"status":"completed"}') }));
+      call(); call();
+      expect(f.spawn).toHaveBeenCalledTimes(8);
+      expect(f.files()).toHaveLength(1);
+    }
+  });
+  it.each([false, true])('amortizes proof reads for truncated completed collections (CLI=%s)', cli => {
+    const f = fixture('{"total_count":2,"jobs":[{"status":"completed"}]}');
+    for (let i = 0; i < 5; i++) {
+      if (cli) runGhCliPassthrough(jobs, { throttle: f.throttle, spawn: f.spawn });
+      else runGhSync(jobs, f.opts);
+    }
+    expect(f.spawn).toHaveBeenCalledTimes(6); expect(f.files()).toHaveLength(0);
+  });
+  it('removes the retired setting from platform policy and source reporting', () => {
+    const f = fixture(); const path = join(f.dir, 'platform.json');
+    writeFileSync(path, JSON.stringify({ finishedCiCache: { checkRunsRevalidateMs: 1, runJobsRevalidateMs: 123 } }));
+    const settings = resolveFinishedCiCacheSettings({ ...f.env, WE_PLATFORM_PREFERENCES_FILE: path });
+    expect(settings.runJobsRevalidateMs).toBe(123);
+    expect(settings.source.runJobsRevalidateMs).toBe('platform');
+    expect(settings).not.toHaveProperty('checkRunsRevalidateMs');
+    expect(settings.source).not.toHaveProperty('checkRunsRevalidateMs');
+  });
+  it('leaves check-runs and projections eligible for the smoke read memo', () => {
+    for (const args of [checks, [...jobs, '--jq', '.jobs']]) {
+      const f = fixture('[]');
+      f.env.WE_GH_READ_MEMO_DIR = join(f.dir, 'memo'); mkdirSync(f.env.WE_GH_READ_MEMO_DIR);
+      runGhSync(args, f.opts); runGhSync(args, f.opts);
+      expect(f.spawn).toHaveBeenCalledTimes(1);
+      expect(f.rows().at(-1).outcome).toBe('memo_hit');
+    }
+    expect(resolveFinishedCiCacheSettings({ WE_FINISHED_CI_CACHE_CHECK_RUNS_REVALIDATE_MS: '1' }))
+      .not.toHaveProperty('checkRunsRevalidateMs');
+  });
+  it.each([log, jobs].map(args => ({ args })))('deletes expired private payloads even with revalidation disabled: $args', ({ args }) => {
+    const f = fixture(); f.env.WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS = '0';
+    const cls = classifyFinishedCiRead(args);
+    storeFinishedCi(cls, Buffer.from('private bytes'), f.cacheOpts());
+    f.advance(23 * 3600000); expect(lookupFinishedCi(cls, f.cacheOpts())).toEqual(Buffer.from('private bytes'));
+    f.advance(3600000); expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
+    expect(f.files()).toHaveLength(0);
+  });
+  it('enforces the disk budget on every write in a burst', () => {
+    const f = fixture(); const settings = { ...resolveFinishedCiCacheSettings(f.env), maxBytes: 1600 };
+    for (let id = 1; id <= 8; id++) {
+      storeFinishedCi(classifyFinishedCiRead(['api', `repos/o/r/actions/jobs/${id}/logs`]), randomBytes(700), { ...f.cacheOpts(), settings });
+      const size = readdirSync(f.env.WE_FINISHED_CI_CACHE_DIR).reduce((n, name) => n + statSync(join(f.env.WE_FINISHED_CI_CACHE_DIR, name)).size, 0);
+      expect(size).toBeLessThanOrEqual(settings.maxBytes);
+    }
+  });
+  it('cleans abandoned temp payloads and accounts for recent temp files', () => {
+    const f = fixture(); const dir = f.env.WE_FINISHED_CI_CACHE_DIR; mkdirSync(dir);
+    const old = join(dir, 'job-log-1-abandoned.json.gz.writer.tmp');
+    writeFileSync(old, randomBytes(800)); utimesSync(old, new Date(f.now() - 86400000), new Date(f.now() - 86400000));
+    const recent = join(dir, 'job-log-2-recent.json.gz.writer.tmp'); writeFileSync(recent, randomBytes(800));
+    storeFinishedCi(classifyFinishedCiRead(log), randomBytes(700), { ...f.cacheOpts(), settings: { ...resolveFinishedCiCacheSettings(f.env), maxBytes: 1200 } });
+    expect(readdirSync(dir)).not.toContain(old.split('/').at(-1));
+    expect(readdirSync(dir).reduce((n, name) => n + statSync(join(dir, name)).size, 0)).toBeLessThanOrEqual(1200);
+  });
+  it('rejects oversized entries before encoding even when highly compressible', () => {
+    const f = fixture();
+    storeFinishedCi(classifyFinishedCiRead(log), Buffer.alloc(16 * 1024 ** 2 + 1), f.cacheOpts());
+    expect(f.files()).toHaveLength(0);
+  });
+  it('deletes oversized legacy gzip payloads on lookup', () => {
+    const f = fixture(); const cls = classifyFinishedCiRead(log);
+    storeFinishedCi(cls, Buffer.from('small log'), f.cacheOpts());
+    const path = join(f.env.WE_FINISHED_CI_CACHE_DIR, f.files()[0]);
+    const entry = JSON.parse(gunzipSync(readFileSync(path)));
+    entry.stdout = Buffer.alloc(18 * 1024 ** 2).toString('base64');
+    writeFileSync(path, gzipSync(JSON.stringify(entry)));
+    expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
+    expect(f.files()).toHaveLength(0);
+  });
+  it.each([false, true])('zero disk budget adds no proof requests (CLI=%s)', cli => {
+    const f = fixture(); f.env.WE_FINISHED_CI_CACHE_MAX_BYTES = '0';
+    for (let i = 0; i < 3; i++) {
+      if (cli) runGhCliPassthrough(jobs, { throttle: f.throttle, spawn: f.spawn });
+      else runGhSync(jobs, f.opts);
+    }
+    expect(f.spawn).toHaveBeenCalledTimes(3); expect(f.files()).toHaveLength(0);
+  });
+  it('bounds zero-byte retry metadata by file count', () => {
+    const f = fixture(); const dir = f.env.WE_FINISHED_CI_CACHE_DIR; mkdirSync(dir);
+    const hints = new Set(Array.from({ length: 4100 }, (_, i) => `job-log-${i}-test.json.gz.retry`));
+    const fs = { ...nodeFs,
+      readdirSync: path => path === dir ? [...readdirSync(path), ...hints] : readdirSync(path),
+      statSync: path => hints.has(path.split('/').at(-1)) ? { size: 0, mtimeMs: f.now(), isFile: () => true } : statSync(path),
+      unlinkSync: path => { if (!hints.delete(path.split('/').at(-1))) nodeFs.unlinkSync(path); },
+    };
+    storeFinishedCi(classifyFinishedCiRead(log), Buffer.from('log'), { ...f.cacheOpts(), fs });
+    expect(hints.size + readdirSync(dir).length).toBeLessThanOrEqual(4096);
+  });
+  it('accounts for another writer while a payload is still temporary', () => {
+    const f = fixture(); const settings = { ...resolveFinishedCiCacheSettings(f.env), maxBytes: 1600 };
+    let interleaved = false;
+    const fs = { ...nodeFs, writeFileSync: (path, data, options) => {
+      writeFileSync(path, data, options);
+      if (path.endsWith('.tmp') && !interleaved) {
+        interleaved = true;
+        storeFinishedCi(classifyFinishedCiRead(['api', 'repos/o/r/actions/jobs/789/logs']), randomBytes(700), { ...f.cacheOpts(), settings });
+      }
+    } };
+    storeFinishedCi(classifyFinishedCiRead(log), randomBytes(700), { ...f.cacheOpts(), settings, fs });
+    const names = readdirSync(f.env.WE_FINISHED_CI_CACHE_DIR);
+    expect(interleaved).toBe(true);
+    expect(names.some(n => n.endsWith('.tmp'))).toBe(false);
+    expect(names.reduce((n, name) => n + statSync(join(f.env.WE_FINISHED_CI_CACHE_DIR, name)).size, 0)).toBeLessThanOrEqual(1600);
+  });
+  it('deletes stale-generation payloads left by a crashed invalidator', () => {
+    const f = fixture(); const cls = classifyFinishedCiRead(jobs);
+    storeFinishedCi(cls, Buffer.from('old private jobs'), f.cacheOpts());
+    writeFileSync(join(f.env.WE_FINISHED_CI_CACHE_DIR, '.run-generation'), 'new-generation');
+    expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
+    expect(f.files()).toHaveLength(0);
+  });
+  it.each([false, true])('never serves expired logs after upstream access fails (CLI=%s)', cli => {
+    const f = fixture('secret log');
+    runGhSync(log, f.opts); f.advance(86400000);
+    f.spawn.mockReturnValue({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('access denied') });
+    if (cli) expect(runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).status).toBe(1);
+    else expect(() => runGhSync(log, f.opts)).toThrow();
+    expect(f.files()).toHaveLength(0);
+  });
   it('classifies only exact supported reads and jq projections', () => {
     for (const [args, kind, jq] of [[jobs, 'run-jobs', '.jobs'], [checks, 'check-runs', '.check_runs'], [log, 'job-log', null]]) {
       expect(classifyFinishedCiRead(args)).toMatchObject({ kind, repo: 'o/r', key: JSON.stringify(args) });
@@ -87,17 +233,17 @@ describe('finished CI cache (card 309)', () => {
       call(); call(); expect(f.reads()).toHaveLength(2); expect(f.files()).toHaveLength(0);
     }
   });
-  it('revalidates by fetch age even when hits refresh LRU; zero never expires', () => {
+  it('revalidates by fetch age even when hits refresh LRU; zero skips revalidation within retention', () => {
     const f = fixture(); runGhSync(jobs, f.opts); f.advance(500000); runGhSync(jobs, f.opts);
     f.advance(100001); runGhSync(jobs, f.opts); expect(f.reads()).toHaveLength(2);
-    f.env.WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS = '0'; f.advance(999999999);
+    f.env.WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS = '0'; f.advance(1000000);
     runGhSync(jobs, f.opts); expect(f.reads()).toHaveLength(2);
   });
-  it.each([false, true])('job logs require completed proof and never expire (CLI=%s)', cli => {
+  it.each([false, true])('job logs require completed proof and re-fetch after retention expires (CLI=%s)', cli => {
     const f = fixture('log bytes\n');
     const call = () => cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout.toString() : runGhSync(log, f.opts);
     expect(call()).toBe('log bytes\n'); f.advance(999999999); expect(call()).toBe('log bytes\n');
-    expect(f.spawn).toHaveBeenCalledTimes(2); expect(f.spawn.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/jobs/456']);
+    expect(f.spawn).toHaveBeenCalledTimes(4); expect(f.spawn.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/jobs/456']);
   });
   it.each([false, true])('never serves another credential its cached CI data (CLI=%s)', cli => {
     for (const args of [log, jobs]) {
@@ -223,6 +369,7 @@ describe('finished CI cache (card 309)', () => {
         stdout: Buffer.from(args[1].endsWith('/456') ? JSON.stringify({ status: failure }) : 'logs'), stderr: Buffer.alloc(0) }));
       const call = () => cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout.toString() : String(runGhSync(log, f.opts));
       expect(call()).toBe('logs'); expect(call()).toBe('logs'); expect(f.files()).toHaveLength(0);
+      expect(f.spawn).toHaveBeenCalledTimes(3);
     }
   });
   it.each([false, true])('does not freeze a partial log when completion follows its fetch (CLI=%s)', cli => {
@@ -351,7 +498,7 @@ describe('finished CI cache (card 309)', () => {
     expect(size).toBeLessThanOrEqual(960); expect(f.files().some(n => n.startsWith('job-log-1-'))).toBe(false);
   });
   it('resolves settings, expands dir and disables all IO under the off switch', () => {
-    expect(resolveFinishedCiCacheSettings({})).toMatchObject({ enabled: true, maxBytes: 2 * 1024 ** 3, runJobsRevalidateMs: 600000, checkRunsRevalidateMs: 300000 });
+    expect(resolveFinishedCiCacheSettings({})).toMatchObject({ enabled: true, maxBytes: 2 * 1024 ** 3, runJobsRevalidateMs: 600000 });
     expect(resolveFinishedCiCacheSettings({ WE_UNDER_TEST: '1' }).enabled).toBe(false);
     const f = fixture(); f.env.WE_FINISHED_CI_CACHE = '0';
     runGhSync(jobs, f.opts); runGhSync(jobs, f.opts);
