@@ -3,9 +3,9 @@ import { isCandidacyHold, readMergeGateVerdict } from './merge-gate-hold-class.m
 import { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting } from './review-clearance-settings.mjs';
 
 export { REVIEW_CLEARANCE_SETTINGS, resolveReviewClearanceSetting, loadReviewClearanceSetting };
-import { latestAcceptRecord, isKnownMachineBody, laterReviewHold } from './accept-carry-forward.mjs';
+import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor, isAutomationAuthored } from './marker-authorship.mjs';
-import { parseLatestHumanClearedSha, isSanctionedAcceptRecordBody } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, isSanctionedAcceptRecordBody, isMachineNoteBody } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -25,7 +25,7 @@ const sameHead = (record, prHead, refHead) => /^[0-9a-f]{40}$/.test(record?.sha 
 const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());
 /** Could this comment hold a clearance? Anything but a known machine note or the trusted approval-prevention notice. */
-const holdsClearance = c => !isKnownMachineBody(c?.body)
+const holdsClearance = c => !isMachineNoteBody(c?.body)
   && !(isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.trimStart().startsWith('<!-- approval-prevention-filed:'));
 /**
  * The latest trusted `reviewed-sha` record, only when that comment IS an acceptance (PR #5237 round 5). A revocation

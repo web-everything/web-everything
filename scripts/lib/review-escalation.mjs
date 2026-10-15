@@ -1919,7 +1919,7 @@ export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaC
     if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
       while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
     }
-    const machineNote = isKnownMachineBody(body)
+    const machineNote = isMachineNoteBody(body)
       || (isTrustedMarkerAuthor(c) && body.trimStart().startsWith('<!-- approval-prevention-filed:'));
     if (bodySha === null) {
       // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
@@ -2011,6 +2011,19 @@ function markerBlockAtEnd(lines) {
 export function isSanctionedAcceptRecordBody(body) {
   if (!isAcceptRecordBody(body)) return false;
   return markerBlockAtEnd(bodyLines(body)).some((l) => REVIEWED_SHA_LINE_RE.test(l)) || isSanctionedClearanceBody(body);
+}
+
+const RESTAMP_LEAD_RE = /^\s*📌 review — /;
+
+/**
+ * Pure: a machine note that says nothing about the clearance ({@link isKnownMachineBody}), except that a re-stamp's
+ * own comment counts only in its sanctioned shape ({@link isSanctionedAcceptRecordBody}). `isKnownMachineBody` reads
+ * the re-stamp heading off the first line alone, so a pasted re-stamp followed by "REVOKED" passed as a note (PR #5237
+ * operator ruling, self-review). Only narrows the machine shapes: anything failing here is a possible hold.
+ */
+export function isMachineNoteBody(body) {
+  if (!isKnownMachineBody(body)) return false;
+  return !RESTAMP_LEAD_RE.test(typeof body === 'string' ? body : '') || isSanctionedAcceptRecordBody(body);
 }
 
 /**

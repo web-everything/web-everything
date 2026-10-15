@@ -124,6 +124,13 @@ describe('#5193 review clearance', () => {
     expect(decideClearanceRestore({ ...restoreFacts, comments: thread }).restore).toBe(false);
     expect(mayNeedRestore({ comments: thread, prHead: head })).toBe(false);
   });
+  // Self-review: a re-stamp heading with a revocation after it (no marker) read as a machine note, not an intervening hold.
+  it.each([
+    `📌 review — acceptance re-stamped after a rebase (no new review)\n\nREVOKED — do not restore`,
+    `📌 review — acceptance re-stamped — REVOKED, do not restore`,
+  ])('does not restore over a re-stamp-headed revocation after the re-arm: %j', body => {
+    expect(decideClearanceRestore({ ...restoreFacts, comments: [...comments, comment(body, '19:03:00')] }).restore).toBe(false);
+  });
   it.each(pastes)('lets a re-arm through after a pasted acceptance followed by a revocation (%s)', (_kind, body) => {
     const { runGh } = fakeGh(['review:accepted'], [acceptance, comment(body, '18:45:00')]);
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
