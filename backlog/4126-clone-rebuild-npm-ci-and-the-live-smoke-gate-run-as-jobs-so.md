@@ -4,10 +4,12 @@ kind: story
 size: 3
 priority: high
 parent: "4075"
-status: open
+status: resolved
 blockedBy: []
 scope: ["we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "plateau-app:tools/drain-daemon/daemon.mjs"]
 dateOpened: "2026-09-24"
+dateResolved: "2026-10-15"
+graduatedTo: fa5b3e501194e89f1c66fa604f369c5a41df276d
 tags: []
 ---
 
