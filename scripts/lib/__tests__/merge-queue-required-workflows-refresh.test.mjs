@@ -36,7 +36,7 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     if (graphql) expect(out).toMatchObject({ type: 'UNPROCESSABLE', code: 'RULESET' });
   });
   it('strategy preserves its diagnostic, code and pinned head', () => {
-    const s = createDrainMergeStrategy({ localSlug: 'owner/repo', isLocalRepo: () => true, exec: execFor(), readFile: () => '{"pending":[],"followedUp":[]}', statePath: '/unused', log: { write() {} }, resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null } });
+    const s = createDrainMergeStrategy({ localSlug: 'owner/repo', isLocalRepo: () => true, exec: execFor(), readFile: () => '{"pending":[],"followedUp":[]}', statePath: '/unused', writeState: () => {}, log: { write() {} }, resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null } });
     try { s.enqueue({ num: 42 }, HEAD, { comments: [] }); expect.fail('must throw'); }
     catch (e) { expect(e.code).toBe('required-workflows-unsatisfied'); expect(e.headSha).toBe(HEAD); expect(e.message).toBe(`github-merge-queue enqueue FAILED (${LIVE}) — NOT merged directly; retried next pass`); }
   });

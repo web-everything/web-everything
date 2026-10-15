@@ -589,6 +589,8 @@ describe('batching IO shell and drain hook', () => {
         if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
         if (args[0] === 'pr' && args[1] === 'comment') return '';
         if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'pr-1', headRefOid: head, baseRefName: 'main' });
+        if (args.includes('--slurp')) return '[[]]';
+        if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: order.some(o => o[0] === 'enqueue'), headRefOid: head } } } });
         if (args.includes('graphql')) {
           order.push(['enqueue', 1]);
           return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'entry-1', position: 1, state: 'QUEUED' } } } });

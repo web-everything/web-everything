@@ -20,6 +20,7 @@ const execFor = ({ files, liveHead = HEAD, mutation = '{}', calls = [], filesErr
     }
     return '';
   }
+  if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)), headRefOid: HEAD } } } });
   return mutation;
 };
 const CWD = '/clone';
@@ -50,20 +51,29 @@ describe('merge queue enqueue', () => {
     const diff = calls.find(([c, a]) => c === 'git' && a[0] === 'diff');
     expect(diff[1]).toEqual(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/main...${HEAD}`]);
     expect(calls.some(([c, a]) => c === 'gh' && a.includes('--paginate'))).toBe(false);
-    const last = calls.at(-1);
+    const last = calls.find(([cmd, args]) => cmd === 'gh' && args.includes(`query=${ENQUEUE_MUTATION}`));
     expect(last[0]).toBe('gh');
     expect(last[1]).toEqual(buildEnqueueArgs({ nodeId: 'PR_1', headSha: HEAD }));
     expect(last[1]).toContain(`sha=${HEAD}`);
   });
 
   it.each([
-    ['already in the merge queue', { ok: true, already: true }],
+    ['already in the merge queue', { ok: false, error: 'already in the merge queue' }],
     ['permission denied', { ok: false, error: 'permission denied' }],
   ])('handles GraphQL errors: %s', (message, expected) => {
     const calls = [];
     const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], mutation: JSON.stringify({ errors: [{ message }] }), calls }) });
     expect(result).toEqual(expected);
-    expect(calls.filter(([c, a]) => c === 'gh' && a[1] === 'graphql')).toHaveLength(1);
+    expect(calls.filter(([c, a]) => c === 'gh' && a.includes(`query=${ENQUEUE_MUTATION}`))).toHaveLength(1);
+  });
+
+  it.each([
+    {}, { data: { enqueuePullRequest: null } },
+    { data: { enqueuePullRequest: {} } },
+    { data: { enqueuePullRequest: { mergeQueueEntry: {} } } },
+    { errors: [{ message: 'Pull request has merge conflicts and Pull request not in mergeable state' }], data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } },
+  ])('fails closed on a missing entry or errors even alongside an entry: %j', response => {
+    expect(enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: ['a.txt'], mutation: JSON.stringify(response) }) }).ok).toBe(false);
   });
 
   it('fails without enqueueing when the PR read throws', () => {
@@ -237,6 +247,7 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
   const realExec = (liveHead, calls) => (cmd, args, opts) => {
     calls.push([cmd, args]);
     if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
+    if (cmd === 'gh' && args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: calls.some(([, a]) => a.includes(`query=${ENQUEUE_MUTATION}`)), headRefOid: liveHead } } } });
     if (cmd === 'gh') return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } });
     return execFileSync(cmd, args, opts);
   };
@@ -259,7 +270,7 @@ describe('the workflow-edit refusal reads the change list of the exact enqueued 
       const calls = [];
       const result = enqueuePr({ repo: 'o/r', num: 7, headSha: safe, cwd: clone, exec: realExec(safe, calls) });
       expect(result).toMatchObject({ ok: true });
-      const mutation = calls.find(([c, a]) => c === 'gh' && a[1] === 'graphql');
+      const mutation = calls.find(([c, a]) => c === 'gh' && a.includes(`query=${ENQUEUE_MUTATION}`));
       expect(mutation[1]).toContain(`sha=${safe}`);
       expect(readPinnedChangedFiles({ headSha: safe, cwd: clone }).files).toEqual(['b.txt']);
     } finally { rmSync(root, { recursive: true, force: true }); }
