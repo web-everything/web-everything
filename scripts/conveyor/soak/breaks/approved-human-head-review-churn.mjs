@@ -37,6 +37,8 @@ export default {
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
     let restoreRecorder = () => {};
     try {
+      const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
+      const repo = CONSTELLATION_REPOS.we.slug;
       // The review job installs an ambient recorder; isolate and restore it even
       // when another scenario already has one active in this process.
       const { createMemoryTelemetryStore, createTelemetryRecorder, setActiveRecorder } = await load('scripts/operations/telemetry-store.mjs');
@@ -52,7 +54,7 @@ export default {
       const readHold = (overrides = {}) => {
         const facts = { setting: 'on', head: HEAD, mergeable: 'MERGEABLE', manifest: '',
           labels: ['review:accepted'], comments: [clearance], ...overrides };
-        return readApprovedHumanSurfaceHold({ setting: facts.setting, pr: 5354, repo: 'web-everything/web-everything', expectedHead: HEAD,
+        return readApprovedHumanSurfaceHold({ setting: facts.setting, pr: 5354, repo, expectedHead: HEAD,
           readComments: () => facts.comments,
           exec(tool, args) {
             if (facts.unreadable) throw Error('proof unavailable');
@@ -130,7 +132,7 @@ export default {
           runExtraSeats: () => { calls.push('seats'); return { status: 'skipped' }; },
           runRedTeam: () => { calls.push('red-team'); return { status: 'skipped' }; },
         };
-        const result = runReviewJob({ pr: 5354, repo: 'web-everything/web-everything' }, io);
+        const result = runReviewJob({ pr: 5354, repo }, io);
         if (mode === 'identical') {
           check(result.outcome === 'carried' && calls.join(',') === 'restamp,comment', 'identical rebase spent a lane, round or red-team pass, or posted before restamping');
           const marker = parseVerdictCarriedMarker(posted[0]?.body);
