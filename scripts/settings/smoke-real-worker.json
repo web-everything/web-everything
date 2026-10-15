@@ -1,0 +1,6 @@
+{
+  "$comment": "Real Claude workers for smoke sentinel PRs (9xxxxx) are refused by default. Cascade: standard → platform smokeRealWorker → this file → WE_SMOKE_ALLOW_REAL_WORKER (1/true or 0/false). Opt in only for a deliberate real-worker smoke.",
+  "smokeRealWorker": {
+    "allowSentinel": false
+  }
+}
