@@ -94,6 +94,16 @@ try { ({ readCompletePrComments, LIST_COMMENTS_PAGE_SIZE = 100 } = await import(
 catch (error) { completeCommentsImportError = error; }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
+/** Both GraphQL rollup variants, in the CheckRun shape used by every queue classifier. */
+function queueChecks(pr) {
+  return (pr?.statusCheckRollup ?? []).map((check) => {
+    if (check.status !== undefined || typeof check.state !== 'string') return check;
+    const state = check.state.toUpperCase();
+    return { ...check, name: check.context,
+      status: ['SUCCESS', 'FAILURE', 'ERROR'].includes(state) ? 'COMPLETED' : 'IN_PROGRESS', conclusion: state };
+  }).filter((check) => check.name !== 'review-gate');
+}
+
 /**
  * RULING NEEDED row (live 2026-10-04, PR #3794: parked about 8 h with confirmed findings awaiting a ruling and no
  * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
@@ -202,7 +212,7 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
   const redTeam = redTeamQueueReason(pr, redTeamSetting);
   if (redTeam) reasons.push(redTeam);
 
-  const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  const checks = queueChecks(pr);
   const pending = checks.filter((check) => check.status !== 'COMPLETED');
   let failing = checks.filter((check) => check.status === 'COMPLETED'
     && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
@@ -253,7 +263,7 @@ export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEF
   }
   const redTeam = redTeamQueueReason(pr, redTeamSetting);
   if (redTeam) reasons.push(redTeam);
-  const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
+  const checks = queueChecks(pr);
   if (checks.some((check) => check.status !== 'COMPLETED')) reasons.push('CI pending');
   const failing = checks.filter((check) => check.status === 'COMPLETED'
     && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion));
@@ -340,6 +350,59 @@ export function standDownRow(repo, pr) {
     reason: standDownReason(latest.body),
     alsoReviewHuman: hasLabel(pr, 'review:human'),
   };
+}
+
+// Card 334 — NEEDS YOUR MERGE. The drain never enqueues a PR whose diff touches a workflow or action file (only a
+// person may land it), so an approved, all-green one sat silent (#5193, #5253, #5298). Optional like the siblings
+// above: a staged CLI copy without the enqueue module simply shows no such rows.
+let workflowEditHold = null;
+let readMergeQueueState = null;
+try { ({ workflowEditHold, readMergeQueueState } = await import('../lib/merge-queue-enqueue.mjs')); } catch { /* no needs-your-merge rows */ }
+
+const NEEDS_YOUR_MERGE_BLOCKING_LABELS = ['review:human', 'review:changes', 'review:pending', 'ci:failed', 'merge-status:conflicting'];
+
+/**
+ * Card 334 — the cheap half of "needs your merge", from the listing alone: approved, not held, mergeable, and every
+ * check green. Only a PR passing this costs the extra changed-files read. Pure.
+ * @returns {string[]} reasons it is not a candidate (empty = candidate)
+ */
+export function needsYourMergePrecheck(pr) {
+  const reasons = [];
+  if (pr?.isDraft) reasons.push('draft PR');
+  if (pr?.isInMergeQueue === true) reasons.push('already in merge queue');
+  if (!hasLabel(pr, 'review:accepted')) reasons.push('no review:accepted label');
+  for (const label of NEEDS_YOUR_MERGE_BLOCKING_LABELS) if (hasLabel(pr, label)) reasons.push(`${label} label`);
+  if (pr?.mergeable !== 'MERGEABLE') reasons.push('not MERGEABLE');
+  const checks = queueChecks(pr);
+  if (!checks.length) reasons.push('no checks');
+  if (checks.some((check) => check.status !== 'COMPLETED' || !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion))) {
+    reasons.push('checks not all green');
+  }
+  return reasons;
+}
+
+/**
+ * Card 334 — is this an approved PR that passes every gate except the person-only enqueue? The precheck plus the
+ * drain's own human-only rule (`workflowEditHold`) on its full change list. Pure.
+ * @param {object} pr - a listing row
+ * @param {{files?: Array<string|{path:string}|{filename:string, previous_filename?:string}>, changedFiles?: number}} o
+ * @returns {{owed:boolean, paths:string[], reasons:string[]}}
+ */
+export function evaluateNeedsYourMerge(pr, { files, changedFiles } = {}) {
+  const reasons = needsYourMergePrecheck(pr);
+  if (reasons.length) return { owed: false, paths: [], reasons };
+  if (!workflowEditHold) return { owed: false, paths: [], reasons: ['workflow-edit rule unavailable'] };
+  // Strings, `gh pr view` rows (`{path}`) and REST rows (`{filename, previous_filename}`) are all accepted.
+  const list = Array.isArray(files) ? files.map((f) => (typeof f === 'string' || f?.filename ? f : f?.path)) : files;
+  const hold = workflowEditHold({ files: list, expectedCount: changedFiles });
+  if (hold.hold && hold.humanOnly) return { owed: true, paths: hold.paths, reasons: [] };
+  return { owed: false, paths: [], reasons: [hold.hold ? hold.error : 'touches no workflow or action file — the drain lands it'] };
+}
+
+/** Card 334 — the one command the operator runs for a needs-your-merge row. Pure. */
+export function needsYourMergeCommand({ repo, number }) {
+  return `node scripts/operations/run.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
+    + "--channel=<where you said it> --reason='<your words>'";
 }
 
 /**
@@ -642,6 +705,30 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           readyNumbersThisRepo.add(pr.number);
         }
       }
+      // Card 334 — NEEDS YOUR MERGE: approved human-only PRs that pass every gate except the person-only enqueue.
+      for (const pr of prs) {
+        if (readyNumbersThisRepo.has(pr.number) || !workflowEditHold || needsYourMergePrecheck(pr).length) continue;
+        // `gh pr view --json files` stops at 100 files, so the full list comes from the paginated REST read (renames
+        // carry `previous_filename`), checked against GitHub's own count.
+        let changed;
+        try {
+          const { changedFiles } = read(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'changedFiles'],
+            (value) => value && Number.isInteger(value.changedFiles));
+          const pages = read(['api', '--paginate', '--slurp', `repos/${repo}/pulls/${pr.number}/files?per_page=100`], Array.isArray);
+          changed = { files: pages.flat(), changedFiles };
+        } catch (error) { failedRead(`${repo}#${pr.number}`, error); continue; }
+        const result = evaluateNeedsYourMerge(pr, changed);
+        if (!result.owed) continue;
+        const queue = readMergeQueueState({ repo, pr: pr.number, readJson: (args) => read(args, (value) => value && typeof value === 'object') });
+        if (queue.error || queue.head !== pr.headRefOid) {
+          failedRead(`${repo}#${pr.number}`, new Error(queue.error || 'PR head moved since the listing; re-run'));
+          continue;
+        }
+        if (queue.inQueue) continue;
+        (report.needsYourMerge ??= []).push({ repo, number: pr.number, title: pr.title, paths: result.paths,
+          command: needsYourMergeCommand({ repo, number: pr.number }) });
+        readyNumbersThisRepo.add(pr.number);
+      }
       for (const pr of prs) {
         report.rulingNeeded.push(...mergeRulingRows(
           rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
@@ -692,10 +779,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   if (args.includes('--json')) {
     console.log(JSON.stringify(readFailures ? { ...report, incomplete: true } : report, null, 2));
   } else {
+    // Card 334 — rows a section printed ahead of its main rows (NEEDS YOUR MERGE) mean that section is not "(none)".
+    let shownAhead = false;
     const printRows = (rows) => {
       if (rows) console.log(rows);
       if (readFailures) console.log('UNKNOWN — reads failed, re-run');
-      else if (!rows) console.log('(none)');
+      else if (!rows && !shownAhead) console.log('(none)');
+      shownAhead = false;
     };
     for (const error of report.errors) console.error(`ERROR ${error}`);
     // #4722 — a repo whose listing failed shows NONE of its PRs below, so the failure must be on the same page as
@@ -706,6 +796,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     }
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):');
+    const mergeRows = (report.needsYourMerge ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title} — needs your merge: `
+      + `approved, all gates green, touches ${pr.paths.join(', ')} (only a person may enqueue)\n    merge: ${pr.command}`);
+    if (mergeRows.length) { console.log(mergeRows.join('\n')); shownAhead = true; }
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
