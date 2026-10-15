@@ -11,36 +11,25 @@ import { createRegistry } from '../registry.mjs';
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { readField } from '../../backlog/frontmatter.mjs';
-import { orderQueueDetailed, DEFAULT_CONFIG } from '../../lib/build-queue.mjs';
 import { resolveOperatorTaskSettings, readOperatorTaskSettings } from '../../lib/operator-task-settings.mjs';
-import { prepareAheadNums } from '../../conveyor/build-dispatch-policy.mjs';
 import { createFileItemReader } from '../file-item-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
-import { dispatchPlan } from '../../readiness/dispatch-plan.mjs';
-import { hasOperatorRecord } from '../../backlog/operator-task.mjs';
-import { prepareCardStatus } from '../../conveyor/prepare-result.mjs';
-import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
-import { PREPARE_OWNED_FRONTMATTER_KEYS, frontmatterTamperedBeyondClaim } from '../../lib/probation-launcher.mjs';
+import * as operatorTaskModule from '../../backlog/operator-task.mjs';
 
 const brief = 'A bounded task.\n\n' + ['Design', 'MVP', 'Done when', 'Edge cases', 'Test plan', 'Proof plan']
   .map(h => `## ${h}\nConcrete handling in we:scripts/example.mjs.\n`).join('\n');
 const context = { existingIds: [], today: '2026-10-13', dir: '/repo/backlog',
-  originMainSha: 'a'.repeat(40), operatorTask: { enabled: true, maxPriority: 'P0' }, sessionRole: 'orchestrator' };
+  originMainSha: 'a'.repeat(40), operatorTask: { enabled: true }, sessionRole: 'orchestrator' };
 const input = { title: 'Operator task', kind: 'story', size: '1', scope: 'we:scripts/example.mjs',
-  digest: brief, operatorTask: true, priority: 'P0',
-  operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'File this as P0.' };
-// An operator task with its attributed operator record (the only shape that gets operator-task treatment).
-const OP = { operatorTask: true, operatorInstruction: { actor: OPERATOR_LOGINS[0], channel: 'operator console', at: '2026-10-14T20:50:00-04:00', words: 'File this as P0.' } };
-const card = (num, extra = {}) => ({ num, id: `${num}-task`, status: 'open', scope: ['we:scripts/example.mjs'],
-  size: 1, kind: 'story', preparedDate: context.today, ...extra });
+  digest: brief, operatorTask: true };
+const OP = { operatorTask: true };
 
 describe('operator task filing', () => {
   it('carries CLI flags through the declaration and refuses before declaring effects', () => {
     const declaration = fileItemOperation({ readScaffoldContext: () => context });
     const parsed = parseOperationArgv(declaration, ['--title=Operator task', '--kind=story', '--size=1',
-      '--scope=we:scripts/example.mjs', `--digest=${brief}`, '--operatorTask', '--priority=P0',
-      `--operatorActor=${OPERATOR_LOGINS[0]}`, '--operatorChannel=operator console', '--operatorWords=File this as P0.']);
+      '--scope=we:scripts/example.mjs', `--digest=${brief}`, '--operatorTask']);
     expect(parsed.errors).toEqual([]);
     expect(parsed.input.operatorTask).toBe(true);
     const registry = createRegistry();
@@ -52,13 +41,11 @@ describe('operator task filing', () => {
     expect(() => advanceWhileRunning(incomplete, { registry })).toThrow(/missing or incomplete/);
     expect(incomplete.effects).toEqual([]);
   });
-  it('stamps a complete brief with the origin/main tip and existing priority field', () => {
+  it('stamps a complete brief with the origin/main tip', () => {
     const { content } = planFileItem(context, input);
     expect(readField(content, 'preparedDate')).toBe(context.today);
     expect(readField(content, 'preparedAgainstSha')).toBe(context.originMainSha);
     expect(readField(content, 'operatorTask')).toBe('true');
-    expect(readField(content, 'preparedBy')).toBe('operator-filing');
-    expect(readField(content, 'priority')).toBe('P0');
     expect(content).not.toContain('TODO');
   });
   it('refuses incomplete and placeholder briefs, naming missing sections', () => {
@@ -68,11 +55,9 @@ describe('operator task filing', () => {
     expect(() => planFileItem({ ...context, originMainSha: '' }, input)).toThrow(/origin\/main/);
   });
   it('disabled filing retains the brief and marker but leaves it unprepared', () => {
-    // Explicit priority is refused while disabled (below), so the disabled filing carries none.
-    const { content } = planFileItem({ ...context, operatorTask: { enabled: false, maxPriority: 'P0' } }, { ...input, priority: '' });
+    const { content } = planFileItem({ ...context, operatorTask: { enabled: false } }, input);
     expect(readField(content, 'operatorTask')).toBe('true');
     expect(readField(content, 'preparedDate')).toBeUndefined();
-    expect(readField(content, 'preparedBy')).toBeUndefined();
     expect(content).toContain('## Proof plan');
   });
   it('does not count section headings inside comments or fences', () => {
@@ -80,59 +65,59 @@ describe('operator task filing', () => {
       expect(() => planFileItem(context, { ...input, digest })).toThrow(/Design/);
     }
   });
-  it('validates priorities and caps an operator priority at the configured maximum', () => {
-    expect(() => planFileItem(context, { ...input, priority: 'urgent' })).toThrow(/priority/);
-    expect(() => planFileItem({ ...context, operatorTask: { enabled: true, maxPriority: 'P1' } }, input)).toThrow(/maxPriority/);
+  it('refuses a dispatched worker or an unknown session role', () => {
+    for (const sessionRole of ['worker', 'unknown', undefined]) {
+      expect(() => planFileItem({ ...context, sessionRole }, input)).toThrow(/session role/);
+    }
+    expect(() => planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, input)).toThrow(/session role/);
+    const worker = createFileItemReader({ root: process.cwd(), listFiles: () => [], readPolicy: () => context.operatorTask, readTip: () => context.originMainSha, env: { WE_CONVEYOR_WORKER: '1' } })();
+    expect(worker.sessionRole).toBe('worker');
+    expect(() => planFileItem(worker, input)).toThrow(/session role "worker"/);
   });
 });
 
-describe('operator task admission', () => {
-  const items = [card('1'), card('2', { ...OP, preparedBy: 'operator-filing', priority: 'P0' })];
-  const policy = { requirePreparedDate: true, operatorTask: { enabled: true, maxPriority: 'P0' } };
-  const plan = (queue, preparePolicy = policy, leases = []) => dispatchPlan({ queue, preparePolicy, leases, freeLanes: [18] });
-  it.each(['off', 'shadow', 'enforce'])('P0 precedes build.priority and takes the next slot in %s mode', mode => {
-    const rows = orderQueueDetailed(items, DEFAULT_CONFIG, Date.now(), { priority: { mode }, buildPriority: ['1'] });
-    expect(rows.map(r => r.item.num)).toEqual(['2', '1']);
-    expect([...prepareAheadNums({ queue: rows.map(r => ({ num: r.item.num, priorityClass: r.priorityClass, buildPriority: r.buildPriorityIndex })), launch: [{ num: '1' }, { num: '2' }], window: 1 })]).toEqual(['2']);
-    const result = plan(rows.map(r => r.item));
-    expect(result.launch.map(r => String(r.num))).toEqual(['2']);
+// Operator send-back on PR 5242, 2026-10-15 item 2: the operator authority work (the operatorInstruction record,
+// hasOperatorRecord gating, and the queue, dispatch-plan and probation changes) is card xqqmw6g, not this PR.
+describe('operator authority is not part of this feature (card xqqmw6g)', () => {
+  it('file-item declares no operator record or explicit priority flags', () => {
+    const declaration = fileItemOperation({ readScaffoldContext: () => context });
+    for (const flag of ['--operatorActor=chalbert', '--operatorChannel=console', '--operatorWords=go', '--priority=P0']) {
+      expect(parseOperationArgv(declaration, ['--title=T', flag]).errors.join('\n')).toMatch(/unknown flag/);
+    }
   });
-  it('does not bypass blockers or scope holds', () => {
-    expect(orderQueueDetailed([items[0], { ...items[1], blockedBy: ['1-task'] }], DEFAULT_CONFIG).map(r => r.item.num)).toEqual(['1']);
-    expect(plan([{ ...items[1], openBlockers: ['1'] }]).held[0].reason).toBe('blocked');
-    const held = plan([items[1]], policy, [{ lane: 19, scope: items[1].scope }]);
-    expect(held.launch).toEqual([]);
-    expect(held.held[0].reason).toMatch(/overlaps/);
+  it('filing writes no operator record, filing marker or priority', () => {
+    const { content } = planFileItem(context, input);
+    expect(content).not.toMatch(/^(operatorInstruction|preparedBy|priority):/m);
   });
-  it('disabled admission sends an already stamped operator card through prepare', () => {
-    expect(plan([items[1]], { ...policy, operatorTask: { enabled: false, maxPriority: 'P0' } }).held[0].reason).toBe('needs-prepare');
+  it('the operator-task module exports no operator record helpers', () => {
+    expect(Object.keys(operatorTaskModule)).not.toEqual(expect.arrayContaining(['hasOperatorRecord']));
+    expect(Object.keys(operatorTaskModule)).not.toEqual(expect.arrayContaining(['validateOperatorInstruction']));
   });
-  it('a really prepared operator card (no filing stamp) builds while disabled and keeps its post-build steps', () => {
-    const prepared = card('2', { ...OP, priority: 'P0', report: true });
-    expect(plan([prepared], { ...policy, operatorTask: { enabled: false, maxPriority: 'P0' } }).launch.map(r => String(r.num))).toEqual(['2']);
-    const brief = composeOperatorTaskBrief('open-pr\n### 9. Append\nEXIT', prepared, { settings: { operatorTask: { enabled: true } } });
-    expect(brief).toContain('<!-- operator-task-report -->');
+  it('the report step needs only operatorTask: true and the enabled switch', () => {
+    const settings = { operatorTask: { enabled: true } };
+    expect(composeOperatorTaskBrief(template, { operatorTask: true, report: true }, { settings })).toContain('<!-- operator-task-report -->');
+    expect(composeOperatorTaskBrief(template, { operatorTask: true, report: true }, { settings: { operatorTask: { enabled: false } } })).toBe(template);
   });
 });
 
 describe('operator task settings', () => {
   it('resolves admission and post-build leaves together, retaining defaults for invalid overrides', () => {
     expect(resolveOperatorTaskSettings({
-      platform: { operatorTask: { enabled: false, maxPriority: 'P2', postBuild: { edgeLoad: false, report: false } } },
+      platform: { operatorTask: { enabled: false, postBuild: { edgeLoad: false, report: false } } },
       tool: { operatorTask: { enabled: true, postBuild: { edgeLoad: 'yes', liveProof: false, report: true } } },
     })).toMatchObject({
-      value: { enabled: true, maxPriority: 'P2', postBuild: { edgeLoad: false, liveProof: false, report: true } },
-      sources: { enabled: 'tool', maxPriority: 'platform', 'postBuild.edgeLoad': 'platform',
+      value: { enabled: true, postBuild: { edgeLoad: false, liveProof: false, report: true } },
+      sources: { enabled: 'tool', 'postBuild.edgeLoad': 'platform',
         'postBuild.liveProof': 'tool', 'postBuild.report': 'tool' },
       invalid: ['tool.postBuild.edgeLoad="yes"'],
     });
-    expect(resolveOperatorTaskSettings().value).toEqual({ enabled: true, maxPriority: 'P0',
+    expect(resolveOperatorTaskSettings().value).toEqual({ enabled: true,
       postBuild: { edgeLoad: false, liveProof: false, report: true } });
   });
   it('cascades valid leaves and logs their source', () => {
-    expect(resolveOperatorTaskSettings({ platform: { operatorTask: { enabled: false, maxPriority: 'P1' } },
-      tool: { operatorTask: { enabled: true, maxPriority: 'typo' } } })).toMatchObject({
-      value: { enabled: true, maxPriority: 'P1' }, sources: { enabled: 'tool', maxPriority: 'platform' } });
+    expect(resolveOperatorTaskSettings({ platform: { operatorTask: { enabled: false } },
+      tool: { operatorTask: { enabled: 'typo' } } })).toMatchObject({
+      value: { enabled: false }, sources: { enabled: 'platform' } });
     expect(readOperatorTaskSettings({ env: {}, read: () => ({ build: { operatorTask: { enabled: false } } }) })).toMatchObject({ enabled: false });
   });
 });
@@ -160,8 +145,8 @@ describe('operator filing IO', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       readOperatorTaskSettings({ env: { WE_POLICY_CASCADE_LOG: '1' },
-        read: () => ({ build: { operatorTask: { enabled: false, maxPriority: 'P1' } } }) });
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('build.operatorTask: enabled=false (tool), maxPriority="P1" (tool)'));
+        read: () => ({ build: { operatorTask: { enabled: false } } }) });
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('build.operatorTask: enabled=false (tool)'));
     } finally { log.mockRestore(); resetCascadeLogForTest(); }
   });
 });
@@ -170,10 +155,18 @@ const ctx = { projectById: new Map(), graduatedKinds: new Set(), knownNums: new 
 const item = { id: '123-test', title: 'Test', kind: 'story', size: 1, status: 'open', summary: 'Test.', dateOpened: '2026-10-13' };
 const errors = fields => validateBacklogItem({ ...item, ...fields }, ctx).errors.map(e => e.message).join('\n');
 const template = 'open-pr\n### 9. Append a structured learnings entry\nEXIT';
+const tickFor = (items, { num = '123', groupMembers } = {}) => readTick({
+  root: process.cwd(), num, ...(groupMembers ? { groupMembers } : {}),
+  runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num, lane: 16 }] }, nextState: { tick: 1 } }),
+  readText: path => readFileSync(path, 'utf8'),
+  loadItems: () => items,
+  listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
+  readDeliveryAgentOverride: () => null,
+});
 describe('operator task post-build', () => {
   // Operator send-back 2026-10-15: edge-load and live-proof steps are off for every card until their authority is
   // verified (card xqqmw6g); only the report step can still be composed.
-  it('never emits an edge-load or live-proof step, even for a valid operator card with every leaf on', () => {
+  it('never emits an edge-load or live-proof step, even for an operator card with every leaf on', () => {
     const settings = { operatorTask: { enabled: true, edgeClones: { review: 'daemon/review' }, postBuild: { edgeLoad: true, liveProof: true, report: true } } };
     const requestedAll = { ...OP, edgeClone: 'review', liveProof: { command: 'printf ready', expect: 'ready' } };
     expect(planOperatorPostBuild(requestedAll, { settings, enabled: true, policy: { edgeLoad: true, liveProof: true, report: true } })).toEqual([]);
@@ -229,14 +222,12 @@ describe('operator task post-build', () => {
   });
   it('validates optional metadata and refuses paths, incomplete proof and nonboolean report', () => {
     expect(errors({ operatorTask: true, edgeClone: 'review', liveProof: { command: 'printf ready', expect: '/ready/i' }, report: true })).not.toMatch(/edgeClone|liveProof|report must/);
-    expect(errors({ operatorTask: true, preparedBy: 'operator-filing' })).not.toContain('preparedBy');
-    expect(errors({ preparedBy: 'someone-else' })).toContain('preparedBy');
     for (const edgeClone of ['/tmp/daemon', 'C:\\daemon', '../daemon', 'other']) expect(errors({ edgeClone })).toContain('edgeClone');
     for (const liveProof of [true, {}, { command: 'echo ok' }, { command: '', expect: 'ok' }, { command: 'echo ok', expect: '/[/' }]) expect(errors({ liveProof })).toContain('liveProof');
     expect(errors({ report: 'true' })).toContain('report must');
   });
   it('writes the flags through the existing scaffold renderer', () => {
-    const filing = { title: 'Test', kind: 'investigation', operatorTask: true, operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'Report it.', report: true };
+    const filing = { title: 'Test', kind: 'investigation', operatorTask: true, report: true };
     const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '', sessionRole: 'orchestrator' }, filing);
     expect(result.content).toContain('operatorTask: true');
     expect(result.content).toContain('report: true');
@@ -263,6 +254,8 @@ describe('operator task post-build', () => {
     expect(renderOperatorProofStep({ command: 'printf ready', expect: 'ready' })).toContain('after adoption');
     expect(composeOperatorTaskBrief(template, op({ report: false }), { settings })).toBe(template);
     expect(composeOperatorTaskBrief(template, op({ report: true }), { settings, policy: { edgeLoad: false, liveProof: false, report: false } })).toBe(template);
+    // A non-build kind (the prepare that repairs a card) never composes steps.
+    expect(composeOperatorTaskBrief(template, op({ report: true }), { settings, kind: 'prepare' })).toBe(template);
   });
   // Card frontmatter alone never adds a post-build step: the card must be an operator task and operator tasks
   // must be enabled (build.operatorTask.enabled), in addition to the per-step policy leaf.
@@ -292,35 +285,17 @@ describe('operator task post-build', () => {
     const registry = createRegistry();
     registry.register(declaration);
     const parsed = parseOperationArgv(declaration, ['--title=we: operator report', '--kind=investigation',
-      '--operatorTask', `--operatorActor=${OPERATOR_LOGINS[0]}`, '--operatorChannel=operator console', '--operatorWords=Report it.',
-      '--priority=P0', '--scope=we:scripts/example.mjs', `--digest=${brief}`,
-      '--report']);
+      '--operatorTask', '--scope=we:scripts/example.mjs', `--digest=${brief}`, '--report']);
     expect(parsed.errors).toEqual([]);
     const run = advanceWhileRunning(startRun({ op: 'file-item', id: 'operator-file', registry, input: parsed.input }), { registry });
-    expect(readField(run.verdict.content, 'priority')).toBe('P0');
     expect(readField(run.verdict.content, 'preparedDate')).toBe(context.today);
     expect(readField(run.verdict.content, 'preparedAgainstSha')).toBe(context.originMainSha);
     expect(run.verdict.content).toContain('operatorTask: true');
     expect(run.verdict.content).toContain('report: true');
     expect(run.verdict.content).not.toMatch(/edgeClone|liveProof/);
-    const root = process.cwd();
     // A card requesting a post-build step without operatorTask: true is refused, never silently composed.
-    expect(() => readTick({
-      root, num: '123',
-      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
-      readText: path => readFileSync(path, 'utf8'),
-      loadItems: () => [{ num: '123', slug: 'test', report: true, scope: ['we:scripts/worker-brief.mjs'] }],
-      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
-      readDeliveryAgentOverride: () => null,
-    })).toThrow(/require operatorTask: true/);
-    const operatorRaw = readTick({
-      root, num: '123',
-      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
-      readText: path => readFileSync(path, 'utf8'),
-      loadItems: () => [{ num: '123', slug: 'test', ...OP, report: true, scope: ['we:scripts/worker-brief.mjs'] }],
-      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
-      readDeliveryAgentOverride: () => null,
-    });
+    expect(() => tickFor([{ num: '123', slug: 'test', report: true, scope: ['we:scripts/worker-brief.mjs'] }])).toThrow(/require operatorTask: true/);
+    const operatorRaw = tickFor([{ num: '123', slug: 'test', ...OP, report: true, scope: ['we:scripts/worker-brief.mjs'] }]);
     expect(operatorRaw.item.report).toBe(true);
     const shaped = shapeDispatchRead(operatorRaw, { num: '123' });
     expect(shaped.prompt).toContain('<!-- operator-task-report -->');
@@ -332,133 +307,29 @@ describe('operator task post-build', () => {
     })).toBe('agent-handle');
     expect(seen.prompt).toBe(shaped.prompt);
   });
-});
-
-// Operator send-back 2026-10-14: operator-task treatment needs an attributed operator instruction (actor checked
-// against OPERATOR_LOGINS, plus channel, time and words), like clear-human. Frontmatter flags alone are an
-// ordinary card.
-describe('operator authority record', () => {
-  const record = { actor: OPERATOR_LOGINS[0], channel: 'operator console', at: '2026-10-14T20:50:00-04:00', words: 'File this as P0.' };
-  const forged = { ...record, actor: 'not-an-operator' };
-  const steps = { edgeLoad: true, liveProof: true, report: true };
-  const settings = { operatorTask: { enabled: true, edgeClones: { review: 'daemon/review' } } };
-  const fields = { operatorTask: true, report: true, liveProof: { command: 'printf ready', expect: 'ready' } };
-  it('composes post-build steps only for a card carrying a valid operator record', () => {
-    expect(composeOperatorTaskBrief(template, fields, { settings, policy: steps })).toBe(template);
-    // A record naming a non-operator is no record: an ordinary card (the standards gate refuses it), never a
-    // failed dispatch read, since the operator list can differ per process.
-    expect(composeOperatorTaskBrief(template, { ...fields, operatorInstruction: forged }, { settings, policy: steps })).toBe(template);
-    // A non-build kind (the prepare that repairs a card) never fails on the card's operator fields.
-    expect(composeOperatorTaskBrief(template, { report: true }, { settings, policy: steps, kind: 'prepare' })).toBe(template);
-    for (const bad of [{ ...record, channel: '' }, { ...record, channel: 'a\nb' }, { ...record, at: 'later' }, { ...record, words: ' ' }, 'chalbert', null]) {
-      expect(hasOperatorRecord({ ...fields, operatorInstruction: bad })).toBe(false);
-    }
-    expect(composeOperatorTaskBrief(template, { ...fields, operatorInstruction: record }, { settings, policy: steps })).toContain('<!-- operator-task-report -->');
-  });
-  it('the standards gate refuses a malformed or non-operator record, and a record without operatorTask', () => {
-    expect(errors({ ...fields, operatorInstruction: record })).not.toMatch(/operatorInstruction/);
-    expect(errors({ ...fields, operatorInstruction: forged })).toMatch(/operatorInstruction\.actor/);
-    expect(errors({ operatorInstruction: record })).toMatch(/operatorInstruction requires operatorTask: true/);
-  });
-  it('holds a filing-stamped card for prepare when it has no operator record', () => {
-    const policy = { requirePreparedDate: true, operatorTask: { enabled: true, maxPriority: 'P0' } };
-    const stamped = card('2', { operatorTask: true, preparedBy: 'operator-filing' });
-    expect(dispatchPlan({ queue: [stamped], preparePolicy: policy, leases: [], freeLanes: [18] }).held[0]?.reason).toBe('needs-prepare');
-    const proven = dispatchPlan({ queue: [{ ...stamped, operatorInstruction: record }], preparePolicy: policy, leases: [], freeLanes: [18] });
-    expect(proven.launch.map(r => String(r.num))).toEqual(['2']);
-  });
-  it('build-queue ignores P0 without an operator record and applies the cap and switch to every card', () => {
-    const order = (items, operatorTask) => orderQueueDetailed(items, DEFAULT_CONFIG, Date.now(), { priority: { mode: 'enforce' }, buildPriority: ['1'], operatorTask }).map(r => [r.item.num, r.priorityClass]);
-    expect(order([card('1'), card('2', { priority: 'P0' })])[0]).toEqual(['1', expect.anything()]);
-    expect(order([card('1'), card('2', { priority: 'P0', operatorTask: true })])[0][0]).toBe('1');
-    expect(order([card('1'), card('2', { priority: 'P0', operatorTask: true, operatorInstruction: forged })])[0][0]).toBe('1');
-    expect(order([card('1'), card('2', { priority: 'P0', operatorTask: true, operatorInstruction: record })])[0]).toEqual(['2', 'P0']);
-    expect(order([card('2', { priority: 'P1' })], { enabled: true, maxPriority: 'P2' })[0][1]).not.toBe('P1');
-    expect(order([card('2', { priority: 'P2' })], { enabled: false, maxPriority: 'P0' })[0][1]).not.toBe('P2');
-    expect(order([card('2', { priority: 'P2' })], { enabled: true, maxPriority: 'P0' })[0][1]).toBe('P2');
-    // `now` (P1) and `high` (P2) are card claims too, under the same switch and cap.
-    expect(order([card('2', { priority: 'now' })])[0][1]).toBe('P1');
-    expect(order([card('2', { priority: 'now' })], { enabled: true, maxPriority: 'P2' })[0][1]).not.toBe('P1');
-    expect(order([card('2', { priority: 'high' })], { enabled: false, maxPriority: 'P0' })[0][1]).not.toBe('P2');
-    const [row] = orderQueueDetailed([card('2', { priority: 'now' })], DEFAULT_CONFIG, Date.now(), { priority: { mode: 'enforce' }, operatorTask: { enabled: true, maxPriority: 'P2' } });
-    expect(row.priorityReasons).toContain('card priority: now ignored (above maxPriority P2)');
-  });
-  it('refuses an operator record from a dispatched worker or an unknown session role', () => {
-    for (const sessionRole of ['worker', 'unknown', undefined]) {
-      expect(() => planFileItem({ ...context, sessionRole }, input)).toThrow(/session role/);
-    }
-    expect(() => planScaffold({ existingIds: [], today: '2026-10-13', dir: '' }, { title: 'T', kind: 'story', size: '1', ...input })).toThrow(/session role/);
-    const worker = createFileItemReader({ root: process.cwd(), listFiles: () => [], readPolicy: () => context.operatorTask, readTip: () => context.originMainSha, env: { WE_CONVEYOR_WORKER: '1' } })();
-    expect(worker.sessionRole).toBe('worker');
-    expect(() => planFileItem(worker, input)).toThrow(/session role "worker"/);
-  });
-  it('reports an operator filing stamp as unstamped, so prepare recovery runs prepare-stamp', () => {
-    const raw = fm => `---\nstatus: open\npreparedDate: "2026-10-01"${fm}\n---\n\n# t\n`;
-    expect(prepareCardStatus(raw('\npreparedBy: "operator-filing"')).preparedDate).toBeNull();
-    expect(prepareCardStatus(raw('')).preparedDate).toBe('2026-10-01');
-  });
-  it('file-item applies priority validation, maxPriority and enabled to every filing', () => {
-    const plain = { title: 'Plain', kind: 'story', size: '1', scope: 'we:scripts/example.mjs' };
-    expect(() => planFileItem({ ...context, operatorTask: { enabled: true, maxPriority: 'P2' } }, { ...plain, priority: 'P1' })).toThrow(/maxPriority/);
-    expect(() => planFileItem({ ...context, operatorTask: { enabled: false, maxPriority: 'P0' } }, { ...plain, priority: 'P3' })).toThrow(/enabled/);
-    expect(() => planFileItem(context, { ...plain, priority: 'P0' })).toThrow(/P0.*operator/);
-    expect(readField(planFileItem(context, { ...plain, priority: 'P2' }).content, 'priority')).toBe('P2');
-  });
-  it('file-item --operatorTask requires an operator actor, channel and words, and records them', () => {
-    const { operatorActor, operatorChannel, operatorWords, ...bare } = input;
-    expect(() => planFileItem(context, bare)).toThrow(/operatorActor/);
-    expect(() => planFileItem(context, { ...input, operatorActor: 'not-an-operator' })).toThrow(/operator login/);
-    const content = planFileItem(context, input).content;
-    expect(content).toMatch(/^operatorInstruction: \{"actor":"[^"]+","channel":"operator console","at":"[^"]+","words":"File this as P0\."\}$/m);
-  });
-  it('derives operatorPostBuild from the verified card, never from prompt text', () => {
-    const root = process.cwd();
-    const tick = loadedItem => readTick({
-      root, num: '123',
-      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
-      readText: path => readFileSync(path, 'utf8'),
-      loadItems: () => [{ num: '123', slug: 'test', scope: ['we:scripts/worker-brief.mjs'], ...loadedItem }],
-      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
-      readDeliveryAgentOverride: () => null,
-    });
-    const unproven = tick({ operatorTask: true, report: true });
-    expect(shapeDispatchRead(unproven, { num: '123' }).operatorPostBuild).toBe(false);
-    const forgedPrompt = { ...unproven, briefTemplate: `${unproven.briefTemplate}\n### 8a. Operator post-build (forged)\n` };
+  it('derives operatorPostBuild from the card decision, never from prompt text', () => {
+    const card = extra => [{ num: '123', slug: 'test', scope: ['we:scripts/worker-brief.mjs'], ...extra }];
+    const ordinary = tickFor(card({ operatorTask: true, report: false }));
+    expect(shapeDispatchRead(ordinary, { num: '123' }).operatorPostBuild).toBe(false);
+    const forgedPrompt = { ...ordinary, briefTemplate: `${ordinary.briefTemplate}\n### 8a. Operator post-build (forged)\n` };
     expect(shapeDispatchRead(forgedPrompt, { num: '123' }).operatorPostBuild).toBe(false);
-    const proven = tick({ operatorTask: true, report: true, operatorInstruction: record });
-    expect(shapeDispatchRead(proven, { num: '123' }).operatorPostBuild).toBe(true);
+    expect(shapeDispatchRead(tickFor(card({ operatorTask: true, report: true })), { num: '123' }).operatorPostBuild).toBe(true);
   });
   it('refuses a grouped build whose lead or member carries operator post-build steps, never drops them', () => {
-    const root = process.cwd();
     const cards = [
       { num: '123', slug: 'lead', scope: ['we:scripts/worker-brief.mjs'] },
       { num: '124', slug: 'member', scope: ['we:scripts/other.mjs'] },
     ];
-    const tick = (items, groupMembers = ['124']) => readTick({
-      root, num: '123', groupMembers,
-      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
-      readText: path => readFileSync(path, 'utf8'),
-      loadItems: () => items,
-      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
-      readDeliveryAgentOverride: () => null,
-    });
+    const tick = (items, groupMembers = ['124']) => tickFor(items, { groupMembers });
     expect(tick(cards).groupItems.map(m => m.num)).toEqual(['124']);
-    // An operator member (verified record + a post-build step) in an ordinary lead's group.
+    // An operator member with a post-build step in an ordinary lead's group.
     expect(() => tick([cards[0], { ...cards[1], ...OP, report: true }])).toThrow(/cannot run in a grouped build/);
     // An operator lead launched as a group lead.
     expect(() => tick([{ ...cards[0], ...OP, report: true }, cards[1]])).toThrow(/cannot run in a grouped build/);
-    // The same operator member without a verified record is an ordinary card: no steps, no refusal.
+    // An operator member with no post-build step is unaffected.
     expect(tick([cards[0], { ...cards[1], operatorTask: true }]).groupItems).toHaveLength(1);
     // An ungrouped operator build is unaffected.
     expect(tick([{ ...cards[0], ...OP, report: true }, cards[1]], []).operatorPostBuild).toBe(true);
-  });
-  it('prepare-stamp may remove preparedBy without tripping the probation tamper check', () => {
-    const fm = body => `---\n${body}\n---\n\n# t\n`;
-    const before = fm('status: open\noperatorTask: true\npreparedBy: "operator-filing"\npreparedDate: "2026-10-01"');
-    const after = fm('status: open\noperatorTask: true\npreparedDate: "2026-10-14"');
-    expect(PREPARE_OWNED_FRONTMATTER_KEYS).toContain('preparedBy');
-    expect(frontmatterTamperedBeyondClaim(before, after, PREPARE_OWNED_FRONTMATTER_KEYS)).toBe(false);
-    expect(frontmatterTamperedBeyondClaim(before, fm('status: open\npreparedDate: "2026-10-14"'), PREPARE_OWNED_FRONTMATTER_KEYS)).toBe(true);
   });
 });
 

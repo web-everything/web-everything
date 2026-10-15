@@ -1,48 +1,14 @@
-/** Optional operator-card metadata; shared by filing and the standards gate. Pure. */
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+/** Optional operator-card metadata; shared by filing and the standards gate. Pure. Verified operator-task
+ *  authority (a recorded operator instruction, and what it gates) is card #xqqmw6g, not this module. */
 
 export const EDGE_CLONE_NAMES = Object.freeze(['review', 'fix', 'control', 'drain', 'health-watch']);
 // Same shape as dispatch-lane BRIEF_TOKEN_RE: the composed brief is filled again, which would rewrite or refuse it.
 export const BRIEF_TOKEN_SHAPE = /\{\{\s*[^{}\n]*?\s*\}\}/;
-// `preparedBy` value written by an operator filing stamp; a real prepare-stamp removes it.
-export const OPERATOR_FILING_STAMP = 'operator-filing';
 
-const oneLine = (value, max) => typeof value === 'string' && Boolean(value.trim()) && value.length <= max && !/[\r\n\p{Zl}\p{Zp}]/u.test(value);
-
-/**
- * The attributed operator instruction behind an operator task, the same pattern as the clear-human ceremony:
- * the actor must be a registered operator login (OPERATOR_LOGINS), with the channel the instruction came
- * through, when, and the operator's words. Like clear-human, the actor is a recorded assertion, not a
- * signature; the card still lands through a reviewed PR. Returns the shape errors (empty = valid). PURE.
- */
-export function validateOperatorInstruction(record, { operators = OPERATOR_LOGINS } = {}) {
-  if (!record || typeof record !== 'object' || Array.isArray(record)) return ['operatorInstruction must be an object with actor, channel, at and words'];
-  const errors = [];
-  if (!oneLine(record.actor, 100) || !/^[\w-]+$/.test(record.actor) || !operators.includes(record.actor.toLowerCase())) {
-    errors.push(`operatorInstruction.actor must be a registered operator login (${operators.join(', ')})`);
-  }
-  if (!oneLine(record.channel, 200)) errors.push('operatorInstruction.channel must be one nonempty line of at most 200 characters');
-  if (!oneLine(record.at, 40) || !/^\d{4}-\d{2}-\d{2}(?:T|$)/.test(record.at) || !Number.isFinite(Date.parse(record.at))) errors.push('operatorInstruction.at must be an ISO date or time');
-  if (!oneLine(record.words, 1000)) errors.push('operatorInstruction.words must be one nonempty line of at most 1000 characters');
-  return errors;
-}
-
-/** True only for a card that is an operator task AND carries a valid operator record. Every operator-task
- *  treatment (post-build steps, the filing prepare stamp, an explicit P0) reads this, never the bare flag. */
-export function hasOperatorRecord(item, options) {
-  return item?.operatorTask === true && validateOperatorInstruction(item.operatorInstruction, options).length === 0;
-}
-
-/** Shape errors of the operator-card fields. `record: false` skips the operator record's own checks, for a
- *  reader that treats a bad record as no record (an ordinary card) instead of failing the whole read. */
-export function validateOperatorTask(item, { record = true } = {}) {
+/** Shape errors of the operator-card fields. */
+export function validateOperatorTask(item) {
   const errors = [];
   if (item.operatorTask !== undefined && typeof item.operatorTask !== 'boolean') errors.push('operatorTask must be a boolean');
-  if (record && item.operatorInstruction !== undefined) {
-    if (item.operatorTask !== true) errors.push('operatorInstruction requires operatorTask: true');
-    errors.push(...validateOperatorInstruction(item.operatorInstruction));
-  }
-  if (item.preparedBy !== undefined && item.preparedBy !== OPERATOR_FILING_STAMP) errors.push(`preparedBy must be "${OPERATOR_FILING_STAMP}"`);
   // Post-build fields never take effect without the flag, so refuse them rather than ignore them silently.
   if (item.operatorTask !== true && (item.edgeClone !== undefined || item.liveProof !== undefined || item.report === true)) errors.push('edgeClone, liveProof and report require operatorTask: true');
   if (item.edgeClone !== undefined && !EDGE_CLONE_NAMES.includes(item.edgeClone)) errors.push('edgeClone must be a daemon name: ' + EDGE_CLONE_NAMES.join(', ') + '; paths are refused');
@@ -58,21 +24,15 @@ export function validateOperatorTask(item, { record = true } = {}) {
   }
   return errors;
 }
-export function operatorTaskFields(input, { at, role } = {}) {
+export function operatorTaskFields(input, { role } = {}) {
   const fields = {};
   if (input.operatorTask === true) {
     // Trust boundary (the pre-PR bypass rule, we:scripts/lib/pre-pr-review.mjs#authoriseBypass): a dispatched
-    // worker never records an operator instruction, and an unknown or absent session role fails closed.
+    // worker never files an operator task, and an unknown or absent session role fails closed.
     if (role !== 'orchestrator') {
-      throw new Error(`operatorTask is refused for session role "${role ?? 'unknown'}": only an interactive operator session (no WE_CONVEYOR_WORKER marker) filing through file-item may record an operator instruction`);
+      throw new Error(`operatorTask is refused for session role "${role ?? 'unknown'}": only an interactive operator session (no WE_CONVEYOR_WORKER marker) filing through file-item may file an operator task`);
     }
     fields.operatorTask = true;
-    if (!input.operatorActor || !input.operatorChannel || !input.operatorWords) {
-      throw new Error('operatorTask requires --operatorActor (a registered operator login), --operatorChannel and --operatorWords: the operator instruction it records');
-    }
-    fields.operatorInstruction = { actor: input.operatorActor, channel: input.operatorChannel, at, words: input.operatorWords };
-  } else if (input.operatorActor || input.operatorChannel || input.operatorWords) {
-    throw new Error('--operatorActor, --operatorChannel and --operatorWords require --operatorTask');
   }
   // Edge-load and live-proof steps are off for every card (we:scripts/operations/operator-task-brief.mjs
   // #planOperatorPostBuild), so filing them would record a step that never runs: refuse rather than ignore.
@@ -89,9 +49,6 @@ export function operatorTaskFields(input, { at, role } = {}) {
 }
 export const OPERATOR_TASK_INPUT = Object.freeze({
   operatorTask: { type: 'boolean', required: false, default: false },
-  operatorActor: { type: 'string', required: false, default: '' },
-  operatorChannel: { type: 'string', required: false, default: '' },
-  operatorWords: { type: 'string', required: false, default: '' },
   edgeClone: { type: 'string', required: false, default: '' },
   'liveProof-command': { type: 'string', required: false, default: '' },
   'liveProof-expect': { type: 'string', required: false, default: '' },

@@ -56,7 +56,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
-import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS, OPERATOR_FILING_STAMP } from '../backlog/operator-task.mjs';
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -65,26 +65,11 @@ import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from './scaffold.mjs
 import { setFrontmatterField } from '../backlog/frontmatter.mjs';
 import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
 
-/**
- * The explicit-priority rules for EVERY filing, not only operator ones (operator send-back 2026-10-14): the value
- * is P0..P4, `build.operatorTask.enabled` must be on, it may not exceed `maxPriority`, and P0 needs an operator
- * task (whose record operatorTaskFields requires). build-queue applies the same rules when it reads a card.
- */
-function checkFilingPriority(priority, policy, operatorTask) {
-  if (!priority) return;
-  if (!/^P[0-4]$/.test(priority)) throw new Error('file-item: priority must be P0..P4');
-  if (!policy) throw new Error('file-item: --priority requires the resolved build.operatorTask policy');
-  if (!policy.enabled) throw new Error('file-item: --priority is refused while build.operatorTask.enabled=false');
-  if (Number(priority[1]) < Number(policy.maxPriority[1])) throw new Error(`file-item: priority ${priority} exceeds build.operatorTask.maxPriority ${policy.maxPriority}`);
-  if (priority === 'P0' && !operatorTask) throw new Error('file-item: priority P0 is reserved for an operator task (--operatorTask with its operator record)');
-}
-
-/** Validate before either filing effect; ordinary scaffold output stays byte-identical. */
+/** Validate before either filing effect; ordinary scaffold output stays byte-identical. An explicit card
+ *  priority (P0..P4) for operator tasks is card #xqqmw6g, with the authority it needs. */
 export function planFileItem(read, input) {
   const verdict = planScaffold(read, input);
   const policy = read.operatorTask;
-  checkFilingPriority(input.priority, policy, input.operatorTask === true);
-  if (input.priority) verdict.content = setFrontmatterField(verdict.content, 'priority', input.priority);
   if (!input.operatorTask) return verdict;
   // The digest supplies the complete authored body, replacing the scaffold's unfinished agreement.
   verdict.content = verdict.content.slice(0, verdict.content.indexOf('\n# '))
@@ -96,8 +81,6 @@ export function planFileItem(read, input) {
   if (!/^[a-f0-9]{40,64}$/.test(read.originMainSha ?? '')) throw new Error('file-item: cannot stamp without origin/main tip');
   verdict.content = setFrontmatterField(verdict.content, 'preparedDate', JSON.stringify(read.today));
   verdict.content = setFrontmatterField(verdict.content, 'preparedAgainstSha', JSON.stringify(read.originMainSha));
-  // Marks the stamp as filing admission; a real prepare-stamp clears it and keeps operatorTask.
-  verdict.content = setFrontmatterField(verdict.content, 'preparedBy', JSON.stringify(OPERATOR_FILING_STAMP));
   return verdict;
 }
 
@@ -175,7 +158,6 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       blockedBy: { type: 'string', required: false, default: '' },
       scope: { type: 'string', required: false, default: '' },
       session: { type: 'string', required: false, default: '' },
-      priority: { type: 'string', required: false, default: '' },
       // Opt OUT of the auto-clear, not opt in — the default behaviour is the whole point of this operation
       // over bare `scaffold`; a caller who wants scaffold-only behaviour passes `--queue=false` (or calls
       // `scaffold` directly, which this operation intentionally leaves reachable).
@@ -190,7 +172,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       reads: ['input.operatorTask'],
       fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, now: raw.now, sessionRole: raw.sessionRole,
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),
@@ -201,7 +183,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'input.priority', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
       fn: (view) => planFileItem(view.findings.read, view.input),
     }),

@@ -1,7 +1,6 @@
 /** Mechanical shape check for a completed prepare, shared by observation and lane recovery. */
 import { readField } from '../backlog/frontmatter.mjs';
 import matter from 'gray-matter';
-import { OPERATOR_FILING_STAMP } from '../backlog/operator-task.mjs';
 
 const REQUIRED = ['design', 'mvp', 'test plan', 'proof plan'];
 
@@ -52,11 +51,8 @@ export function validatePrepareCard(raw, { operatorTask = false } = {}) {
 
 export function prepareCardStatus(raw) {
   const stamp = readField(raw, 'preparedDate');
-  // An operator FILING stamp is not a prepare: a card sent to prepare still carries it until prepare-stamp
-  // replaces it, so recovery must run prepare-stamp rather than report it already stamped.
-  const filingStamp = readField(raw, 'preparedBy') === OPERATOR_FILING_STAMP;
   return {
-    preparedDate: !filingStamp && /^\d{4}-\d{2}-\d{2}$/.test(stamp ?? '') ? stamp : null,
+    preparedDate: /^\d{4}-\d{2}-\d{2}$/.test(stamp ?? '') ? stamp : null,
     hasSections: validatePrepareCard(raw).ok,
   };
 }

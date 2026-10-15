@@ -2,7 +2,7 @@
 import { homedir } from 'node:os';
 import { resolve, isAbsolute } from 'node:path';
 import { renderEdgeStep, renderProofStep, renderReportStep } from '../worker-brief.mjs';
-import { validateOperatorTask, hasOperatorRecord, BRIEF_TOKEN_SHAPE } from '../backlog/operator-task.mjs';
+import { validateOperatorTask, BRIEF_TOKEN_SHAPE } from '../backlog/operator-task.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
@@ -36,20 +36,17 @@ export function renderOperatorProofStep(liveProof) {
  * dispatch's `operatorPostBuild` route flag, so the two cannot disagree and neither reads prompt text.
  *
  * Edge-load and live-proof steps are OFF for every card, whatever the card, settings or policy say (operator
- * send-back on PR 5242, 2026-10-15): they run commands named by card frontmatter, and the operator record that
- * would authorize them is still self-asserted. Re-enabling them waits on verified operator-task authority
- * (#xqqmw6g).
+ * send-back on PR 5242, 2026-10-15): they run commands named by card frontmatter, which any card author can
+ * write. Re-enabling them waits on verified operator-task authority (#xqqmw6g).
  */
 export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, kind = 'build' } = {}) {
   // Only a build composes steps; any other kind (a prepare that would repair the card) never fails on its fields.
   if (kind !== 'build') return [];
-  // A bad operator record is no record (an ordinary card, refused by the standards gate), never a failed read:
-  // the operator login list can differ per process (WE_OPERATOR_LOGINS).
-  const errors = validateOperatorTask(item, { record: false });
+  const errors = validateOperatorTask(item);
   if (errors.length) throw new Error(errors.join('; '));
-  // Card frontmatter alone never adds a step: the card must be an operator task carrying a valid operator
-  // record (an attributed operator instruction), and operator tasks must be enabled.
-  if (!hasOperatorRecord(item) || enabled !== true) return [];
+  // The card must be an operator task and operator tasks must be enabled. Only the report step can follow;
+  // verifying the operator authority behind the flag is #xqqmw6g.
+  if (item.operatorTask !== true || enabled !== true) return [];
   return item.report && policy.report ? [renderReportStep()] : [];
 }
 

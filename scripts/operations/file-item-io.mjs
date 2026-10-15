@@ -38,7 +38,6 @@ export { REPO_ROOT };
 export function createFileItemReader({ root = REPO_ROOT,
   today = () => localDateString(new Date(), 'America/Toronto'),
   readPolicy = readOperatorTaskSettings,
-  now = () => new Date().toISOString(),
   env = process.env,
   readTip = () => readGit(['rev-parse', 'origin/main'], { cwd: root }).trim(),
   ...opts } = {}) {
@@ -47,8 +46,8 @@ export function createFileItemReader({ root = REPO_ROOT,
     let originMainSha;
     let tipRead = false;
     return {
-      // The session role gates who may record an operator instruction (operatorTaskFields).
-      ...read(), operatorTask: readPolicy(), now: now(), sessionRole: classifySession(env).role,
+      // The session role gates who may file an operator task (operatorTaskFields).
+      ...read(), operatorTask: readPolicy(), sessionRole: classifySession(env).role,
       get originMainSha() {
         if (!tipRead) {
           tipRead = true;

@@ -22,7 +22,6 @@ import { isTerminalStatus } from './backlog-status.cjs';
 import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES, PRIORITY_SETTINGS_OFF } from './delivery-priority.mjs';
 import { platformPreference, logCascadeSources, resolveCascade, cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
-import { hasOperatorRecord } from '../backlog/operator-task.mjs';
 
 const BUILD_PRIORITY_ID = /^(\d+|x[0-9a-z]{6,})$/;
 function normalizeBuildPriority(value) {
@@ -271,7 +270,7 @@ export function effectiveScore(item, config, now, ctx = {}) {
 //   - card `priority: low`              → the operator's `low` override (P4);
 //   - `queuedAt` (the sidecar's clear stamp) → `waitingSince`: the time it has waited IN the build queue, which
 //     drives the in-class score and the +1-class aging after `agingHours` (never into P0 — the rule's own cap).
-// Explicit P0–P4 values select the class in `cardPriority` when `explicitCardPriority` admits them; medium/normal/absent add no fact.
+// Any other priority value (medium/normal/absent) adds no fact → the normal class.
 const CARD_PRIORITY_REASON = Object.freeze({ operatorRequested: 'an operator answer waits on it', low: 'operator override low', now: 'operator override now' });
 
 /** Plain delivery-priority facts for one backlog card. PURE. */
@@ -285,52 +284,16 @@ export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
   };
 }
 
-/** The operator-task admission defaults (we:scripts/lib/operator-task-settings.mjs), used when a caller passes none. */
-const OPERATOR_PRIORITY_DEFAULTS = Object.freeze({ enabled: true, maxPriority: 'P0' });
-
-/**
- * A card's explicit `priority: P0..P4`, or null when the card may not claim it. The same rules file-item applies
- * at filing, re-applied here because a card can be hand-edited: classes must be enabled
- * (`build.operatorTask.enabled`), within `maxPriority`, and P0 needs a valid operator record. PURE.
- * @returns {{explicit: string|null, ignored: string|null}}
- */
-export function explicitCardPriority(item, operatorTask = OPERATOR_PRIORITY_DEFAULTS) {
-  const value = /^P[0-4]$/.test(item?.priority ?? '') ? item.priority : null;
-  if (!value) return { explicit: null, ignored: null };
-  const why = cardClaimRefusal(value, operatorTask) ?? (value === 'P0' && !hasOperatorRecord(item) ? 'no operator record' : null);
-  return why ? { explicit: null, ignored: `card priority: ${value} ignored (${why})` } : { explicit: value, ignored: null };
-}
-
-/** Why a class a card's own `priority:` earns is refused by the enabled switch or the maxPriority cap, or null. PURE. */
-function cardClaimRefusal(priorityClass, operatorTask) {
-  const policy = { ...OPERATOR_PRIORITY_DEFAULTS, ...operatorTask };
-  if (policy.enabled === false) return 'build.operatorTask.enabled=false';
-  return Number(String(priorityClass).slice(1)) < Number(String(policy.maxPriority).slice(1)) ? `above maxPriority ${policy.maxPriority}` : null;
-}
-
 /** Class one card; the reasons name the card's own field instead of the rule's PR-shaped wording. PURE. */
-function cardPriority(item, unblocks, settings, now, operatorTask) {
-  let r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
-  const card = explicitCardPriority(item, operatorTask);
-  const { explicit } = card;
-  let { ignored } = card;
-  // `now` and `high` are card claims too: the class they earn obeys the same switch and cap, or the card is
-  // classed as if it made no claim.
-  const claim = String(item?.priority ?? '').trim().toLowerCase();
-  const claimWhy = ['now', 'high'].includes(claim) && /^P[0-4]$/.test(r.class) ? cardClaimRefusal(r.class, operatorTask) : null;
-  if (claimWhy) {
-    ignored = `card priority: ${claim} ignored (${claimWhy})`;
-    r = deliveryPriority(buildQueuePriorityFacts({ ...item, priority: undefined }, { unblocks }), settings, now);
-  }
+function cardPriority(item, unblocks, settings, now) {
+  const r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
   const reasons = r.reasons.map((why) => (why === CARD_PRIORITY_REASON.operatorRequested ? 'card priority: high'
     : why === CARD_PRIORITY_REASON.low ? 'card priority: low'
     : why === CARD_PRIORITY_REASON.now ? 'card priority: now (operator request)' : why));
   // Q2's in-class score is the fix-queue score: unblocks × weight + minutes waited. Mode `off` scores 0 so the
   // order stays exactly today's (tier → WSJF → rank → date → num).
   const score = settings.mode === 'off' ? 0 : unblocks * settings.unblockWeightMinutes + r.minutesWaited;
-  if (explicit) reasons.push(`card priority: ${explicit}`);
-  if (ignored) reasons.push(ignored);
-  return { priorityClass: explicit ?? r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged,
+  return { priorityClass: r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged,
     operatorRequest: String(item?.priority ?? '').trim().toLowerCase() === 'now' && r.override === 'now' };
 }
 
@@ -352,11 +315,11 @@ function tierRank(item) {
  * operator request first (unless requestsFirstInClass=false; Q2 amendment 2026-10-09) → tier (pinned
  * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
  * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
- * `opts.priority` omitted or mode `off` → derived rows P3, score 0, legacy order; explicit P0 still leads.
+ * `opts.priority` omitted or mode `off` → every row P3, priorityScore 0, legacy order.
  * Mode `shadow` computes real classes, scores and reasons but retains the legacy keys after buildPriority:
  * tier → effectiveScore → rank → dateOpened → num. Only `enforce` applies class-first ordering.
  */
-export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority, buildPriority = [], operatorTask } = {}) {
+export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority, buildPriority = [] } = {}) {
   const byId = indexItems(items);
   const prioritySettings = resolvePrioritySettings(priority);
   const priorityIds = new Map(buildPriority.map((id, i) => [id, i]).reverse());
@@ -369,7 +332,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
     .map((it) => {
       const unblocks = unblocksCount(it, items);
       const placement = buildPriorityPlacement(it, priorityIds, ancestors);
-      const delivery = cardPriority(it, unblocks, prioritySettings, now, operatorTask);
+      const delivery = cardPriority(it, unblocks, prioritySettings, now);
       if (placement.buildPriorityIndex !== null) delivery.priorityReasons.push(
         `build.priority #${placement.buildPriorityIndex + 1}${placement.buildPriorityVia === null ? '' : ` (via ${placement.buildPriorityVia})`}`);
       return {
@@ -390,7 +353,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         num: numOr(Number(it.num), Infinity),
       };
     });
-  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : (a, b) => Number(b.priorityClass === 'P0') - Number(a.priorityClass === 'P0') || compareBuildPriority(a, b) || compareLegacyOrder(a, b));
+  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : (a, b) => compareBuildPriority(a, b) || compareLegacyOrder(a, b));
   return ready;
 }
 

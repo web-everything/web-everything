@@ -61,7 +61,6 @@ import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
-import { readOperatorTaskSettings } from './lib/operator-task-settings.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
@@ -615,12 +614,9 @@ function prepareStamp() {
   const status = curStatus || 'open';
   let after = status === 'open' ? setFrontmatterField(before, 'status', 'open', { after: ['kind', 'size'] }) : before;
   if (after == null) die(`#${idFromName(file)} — could not splice frontmatter (no frontmatter block?)`);
-  // A real prepare replaces operator filing admission, including when its fast path is disabled. operatorTask
-  // stays: it still gates the post-build steps of the card.
-  after = removeFrontmatterField(after, 'preparedBy');
   const today = localToday();
   after = setFrontmatterField(after, 'preparedDate', `"${today}"`, { after: ['status', 'dateStarted', 'dateOpened'] });
-  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: DIR, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
+  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: DIR, encoding: 'utf8' }).trim();
   after = setFrontmatterField(after, 'preparedAgainstSha', `"${sha}"`, { after: ['preparedDate'] });
   writeBacklogMd(abs, rel, after);
   ok({ verb: 'prepare-stamp', num: idFromName(file), preparedDate: today, preparedAgainstSha: sha, status },
@@ -1156,9 +1152,7 @@ function buildQueue() {
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
       // set it too: key on the merged value itself, not only on the one file's mtime.
-      JSON.stringify(readSettings().buildQueuePriority ?? null),
-      // The card-priority switch and cap (build.operatorTask) and the operator logins a P0 record is checked against.
-      JSON.stringify(readSettings().build?.operatorTask ?? null), process.env.WE_OPERATOR_LOGINS]);
+      JSON.stringify(readSettings().buildQueuePriority ?? null)]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
@@ -1208,9 +1202,7 @@ function buildQueue() {
   });
   // Platform preference → tool → env through the shared policy cascade (logs each value's source once).
   const priority = readBuildQueuePrioritySettings({ env: process.env });
-  // build.operatorTask's enabled switch and maxPriority cap apply to every card's explicit priority (P0 also
-  // needs an operator record), so a hand-edited `priority:` cannot jump the queue.
-  const detailed = orderQueueDetailed(items, config, Date.now(), { priority, buildPriority: buildPriority.ids, operatorTask: readOperatorTaskSettings() });
+  const detailed = orderQueueDetailed(items, config, Date.now(), { priority, buildPriority: buildPriority.ids });
   const shadow = priority.mode === 'shadow'
     ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};
   if (priority.mode === 'shadow') console.error(formatBuildQueuePriorityShadowLine(detailed, priority.mode));

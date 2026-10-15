@@ -1276,7 +1276,7 @@ Two parallel lane sessions can allocate the **same** backlog `NNN` for a *new* i
 ## Complete operator task briefs
 
 File an authored task through `we:scripts/operations/run.mjs file-item` with
-`--operatorTask --priority=P0` and the complete body in `--digest`. The body replaces
+`--operatorTask` and the complete body in `--digest`. The body replaces
 scaffold placeholders and must contain nonempty Design, MVP, Done when (or Acceptance),
 Edge cases, Test plan, and Proof plan sections without TODO/TBD placeholders. Pass a
 nonempty `--scope` of `we:`-qualified paths. Filing uses the prepare pass's shared
@@ -1285,37 +1285,21 @@ lists missing sections before any write or queue effect. A passing brief gets
 `operatorTask: true`, an ET `preparedDate`, and the local `origin/main` tip as
 `preparedAgainstSha`. A missing origin/main reference refuses stamping.
 
-**Operator authority.** `--operatorTask` also requires `--operatorActor=<login>`,
-`--operatorChannel=<where the instruction came from>` and `--operatorWords=<the operator's words>`.
-Filing writes them as `operatorInstruction: {actor, channel, at, words}`; `actor` must be a
-registered operator login (`OPERATOR_LOGINS`, `we:scripts/lib/marker-authorship.mjs`). This is the
-clear-human pattern: an attributed record, not a signature. Like the pre-PR review bypass, only an
-interactive session may record it: a dispatched worker (`WE_CONVEYOR_WORKER=1`) or an unknown session role
-is refused, and a bare `scaffold` (which has no session role) cannot file an operator task. Every operator-task treatment (post-build
-steps, the filing prepare stamp, an explicit P0) requires `operatorTask: true` plus a valid record. A card
-without the record is an ordinary card: no post-build steps, its `preparedBy: "operator-filing"` stamp is
-void (held for prepare), and a `priority: P0` is ignored by the queue. The standards gate refuses a
-malformed or non-operator record.
+Like the pre-PR review bypass, only an interactive session may file an operator task: a dispatched worker
+(`WE_CONVEYOR_WORKER=1`) or an unknown session role is refused, and a bare `scaffold` (which has no session
+role) cannot file one. The filing stamp is an ordinary `preparedDate`/`preparedAgainstSha` stamp: blockedBy,
+scope holds, sizing, clearance, stamp staleness and the queue order all apply as for any card.
 
-`--priority=P0|P1|P2|P3|P4` writes the existing `priority` field, on any filing. Every filing is checked:
-the value must be P0..P4, `build.operatorTask.enabled` must be true, it may not exceed `maxPriority`,
-and P0 needs `--operatorTask`. The build queue re-applies the same rules to every card (a hand-edited
-`priority:` included) and names an ignored value in the row's reasons. The older `priority: now` (P1) and
-`priority: high` (P2) claims obey the same switch and cap. A bad operator record makes a card ordinary at
-dispatch rather than failing the read, and a card held for prepare because its filing stamp is void reads as
-unstamped, so prepare recovery runs `prepare-stamp` on it. An admitted P0 precedes
-`build.priority` in every queue mode and takes the next available slot; blockedBy,
-scope holds, sizing, clearance, and stamp staleness still apply.
+**Not in this feature: verified operator authority.** An attributed operator instruction record, gating
+operator-task treatment on it, an explicit `priority: P0..P4` that jumps the build queue, and operator-aware
+prepare/queue/probation admission are card #xqqmw6g. Until it lands, `operatorTask: true` is card
+frontmatter any card author can write, so it unlocks nothing beyond the report step below.
 
 `we:scripts/settings/operator-task.json` owns `build.operatorTask`:
-`{ enabled: true, maxPriority: "P0", postBuild: { edgeLoad: false, liveProof: false, report: true } }`. Valid leaves cascade independently from
+`{ enabled: true, postBuild: { edgeLoad: false, liveProof: false, report: true } }`. Valid leaves cascade independently from
 standard defaults to platform build preferences to tool settings; policy logs identify
-each leaf's source. `maxPriority` is the highest allowed class (P0 permits P0–P4;
-P1 permits P1–P4). Disabled filing retains the brief and operator marker but adds no
-prepare stamp. Disabled build admission holds previously stamped operator cards for
-prepare too: a filing stamp carries `preparedBy: "operator-filing"`. A real `prepare-stamp` clears that
-marker (and keeps `operatorTask: true`, which still gates post-build steps), replacing its
-fast-path admission so the card can build after preparation while disabled.
+each leaf's source. Disabled filing retains the brief and operator marker but adds no
+prepare stamp, and disables post-build steps.
 
 ### Operator card post-build steps
 
@@ -1324,8 +1308,8 @@ fast-path admission so the card can build after preparation while disabled.
 now, see above), and `--report`.
 **Edge-load and live-proof steps are off for every card.** Filing refuses `--edgeClone` and `--liveProof-*`
 (a step that never runs is not recorded), the standards gate still checks the fields on a hand-edited card,
-and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, and the operator
-record that would authorize them is still self-asserted. Turning them back on waits on verified operator-task
+and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, which any card
+author can write. Turning them back on waits on verified operator-task
 authority (#xqqmw6g). Only `--report`
 currently adds a step.
 
@@ -1339,9 +1323,8 @@ Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/op
 an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
 the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
 requests it. The fields alone never add a step: the card must also carry `operatorTask: true` (filing and
-the standards gate refuse these fields without it) with a valid `operatorInstruction` record, and
-`build.operatorTask.enabled` must be true. The dispatcher's route flag for these cards comes from the same
-card-record decision, never from searching the prompt text. Cards without enabled post-build steps retain their existing brief
+the standards gate refuse these fields without it), and `build.operatorTask.enabled` must be true. The
+dispatcher's route flag for these cards comes from the same card decision, never from searching the prompt text. Cards without enabled post-build steps retain their existing brief
 and provider route.
 
 The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent

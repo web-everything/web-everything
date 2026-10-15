@@ -564,7 +564,7 @@ export function readTick({
     });
   }
 
-  // One decision from the verified card (operator record + settings) feeds both the brief and the route flag.
+  // One decision from the card (operatorTask + settings) feeds both the brief and the route flag.
   const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
   const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
   const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
@@ -1059,7 +1059,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
   if (!it || !it.slug) return null;
   const rawTarget = typeof it.deliveryTarget === 'string' && it.deliveryTarget.trim() ? it.deliveryTarget.trim() : null;
   return {
-    ...Object.fromEntries(['operatorTask', 'operatorInstruction', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
+    ...Object.fromEntries(['operatorTask', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
     num: String(it.num),
     status: it.status ?? null,
     deliveryAgent: it.deliveryAgent ?? null,

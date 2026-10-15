@@ -216,9 +216,7 @@ export const CLAIM_OWNED_FRONTMATTER_KEYS = Object.freeze([
  * `## Proposed blockedBy changes` section ({@link parseProposedBlockedBy}); the frontmatter stays untouched
  * until an independent reviewer confirms (the parked PR's review), so a direct `blockedBy:` edit is still tamper.
  */
-export const PREPARE_OWNED_FRONTMATTER_KEYS = Object.freeze(['scope', 'size', 'estimatedLoc', 'preparedDate', 'preparedAgainstSha',
-  // prepare-stamp removes the operator filing marker (`preparedBy: "operator-filing"`): a real prepare replaces it.
-  'preparedBy']);
+export const PREPARE_OWNED_FRONTMATTER_KEYS = Object.freeze(['scope', 'size', 'estimatedLoc', 'preparedDate', 'preparedAgainstSha']);
 
 // Two-form backlog id; the contract test keeps this aligned with check-standards' ITEM_REF_RX.
 export const BACKLOG_ID_SOURCE = '\\d{1,5}|x[0-9a-z]{6}';
