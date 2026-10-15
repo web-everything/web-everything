@@ -592,6 +592,39 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('LANE=~/clone; cd "$LANE"')).toBe(REPORTED);
     expect(at('LANE="~/clone"; cd "$LANE"')).toBe(`${REPORTED}/~/clone`);
   });
+  it('preserves a literal cd target across ordinary printf output', () => {
+    for (const stmt of [
+      "printf '%s\\n' LANE", "printf '%s\\n' -v LANE", "printf -- '%s\\n' LANE", 'printf -- -v LANE',
+      'printf LANE', 'printf\tLANE', 'printf > /tmp/log LANE', 'printf "%s\\n" "LANE"',
+      "printf '%%n' LANE", 'printf -v OTHER %s LANE', "printf $'%s\\n' LANE",
+      "printf '$HOME' LANE", 'printf \\$HOME LANE', 'printf "\\$HOME" LANE', "printf '`date`' LANE",
+      "printf '\\x25n' LANE",
+      'printf -v LANE -v OTHER %s text',
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
+    }
+    expect(at("printf '%s\\n' HOME; cd ~/clone")).toBe(`${HOME}/clone`);
+  });
+  it('forgets a literal cd target when printf binds it with -v', () => {
+    for (const stmt of [
+      'printf -v LANE %s /other', 'printf\t-v\tLANE %s /other', 'printf "-v" LANE %s /other',
+      "printf '-v' LANE %s /other", 'printf -\\v LANE %s /other', 'printf -"v" LANE %s /other',
+      'printf -vLANE %s /other', 'printf > /tmp/log -v LANE %s /other', 'printf -v "LANE" %s /other',
+      'printf -v OTHER -v LANE %s /other',
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    expect(at('printf -v HOME %s /other; cd ~/clone')).toBe(REPORTED);
+  });
+  it('keeps printf %n and unknown formats conservative', () => {
+    for (const stmt of [
+      "printf '%n' LANE", "printf '%s%n' text LANE", 'printf "$FORMAT" LANE',
+      'printf -v OTHER -- %n LANE', "printf $'-\\x76' LANE %s /other", "printf $'\\x25n' LANE",
+    ]) {
+      expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
+    }
+    expect(at("printf '%n' HOME; cd ~/clone")).toBe(REPORTED);
+  });
   it('heredoc body text never steers the resolution', () => {
     const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
     expect(at(cmd)).toBe(REPORTED);
@@ -3573,6 +3606,12 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+
+  it('DENIES checkout after ordinary printf output preserves the protected cd target', () => {
+    const out = runHook(`LANE=${fakeClone}; printf '%s\\n' LANE; cd "$LANE" && git checkout --detach`, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
   });
 
   // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.

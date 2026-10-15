@@ -1053,9 +1053,10 @@ function scanRun(s, i, atWordStart) {
  *     safe, replacing the old end-of-segment anchor that only worked by accident);
  *   • redirect operators are split out as their own `op` tokens even when glued to their neighbours, with
  *     any fd prefix attached: `2>&1` → `2>&` + `1`, `>|file` → `>|` + `file`, `cmd>x` → `cmd` + `>` + `x`.
+ * `preserveQuotes` keeps each word's lexical spelling for callers that need expansion provenance.
  * Not a shell parser — no expansion, no command substitution; the #2367 accidental-collision threat model.
  */
-export function shellTokens(segment) {
+export function shellTokens(segment, { preserveQuotes = false } = {}) {
   const s = String(segment || '');
   const out = [];
   let cur = '';
@@ -1073,14 +1074,14 @@ export function shellTokens(segment) {
     if (run && run.kind === 'comment') { inComment = true; }
     else if (run && run.kind === 'continuation') { i = run.end; atWordStart = true; continue; }
     else if (run && run.kind !== 'escape') {                    // 'quote' | 'unterminated'
-      cur += run.body;                                          // body only — the quotes are resolved away
+      cur += preserveQuotes ? run.raw : run.body;
       started = true;
       quoted = true;
       atWordStart = false;
       i = run.end;
       continue;
     } else if (run) {                                           // 'escape'
-      cur += run.body; started = true; atWordStart = false; i = run.end; continue;
+      cur += preserveQuotes ? run.raw : run.body; started = true; atWordStart = false; i = run.end; continue;
     }
     if (ch === '>' || ch === '<') {
       let fd = '';
@@ -2498,7 +2499,44 @@ function literalValue(raw) {
 
 // Statements that (re)bind or unbind variables in ways this walk does not model: every name they mention
 // becomes unknown instead of keeping a stale literal.
-const BINDING_STATEMENT = /^(?:unset|read|declare|local|typeset|readonly|let|printf|mapfile|readarray|getopts)\s/;
+const BINDING_STATEMENT = /^(?:unset|read|declare|local|typeset|readonly|let|mapfile|readarray|getopts)\s/;
+
+function printfBindings(stmt) {
+  // Use shell words so quoted/escaped options agree, ignoring redirects and their operands.
+  const words = shellTokens(stmt, { preserveQuotes: true })
+    .filter((t, i, tokens) => !t.op && !tokens[i - 1]?.op)
+    .map((t) => ({ raw: t.text, text: shellTokens(t.text)[0]?.text ?? '' }));
+  if (words[0]?.text !== 'printf') return [];
+  const names = [];
+  let i = 1;
+  let target;
+  while (words[i]?.text.startsWith('-v')) {
+    target = words[i++].text.slice(2) || words[i++]?.text;
+  }
+  if (target) names.push(target); // repeated -v options bind only the last target
+  if (words[i]?.text === '--') i++;
+  const formatWord = words[i++];
+  const format = formatWord?.text ?? '';
+  let dynamic = false;
+  const raw = formatWord?.raw ?? '';
+  for (let j = 0; j < raw.length; j++) {
+    const run = scanRun(raw, j, j === 0);
+    if (run) {
+      if (run.kind === 'quote' && (run.raw[0] === '"' || run.raw.startsWith('$"'))) {
+        dynamic ||= /[`$]/.test(run.body.replace(/\\[$`"\\]/g, ''));
+      }
+      // ANSI-C encoded options/formats cannot be classified from shellTokens' undecoded body.
+      if (run.kind === 'quote' && run.raw.startsWith("$'")) dynamic ||= /\\(?:x[\da-fA-F]|[0-7]|u|U)/.test(run.body);
+      j = run.end;
+    } else if (raw[j] === '$' || raw[j] === '`') dynamic = true;
+  }
+  // %n also writes a variable. For that or a dynamic format, conservatively forget argument names.
+  // Consume %% first so an ordinary format such as '%%n' remains output only.
+  if (dynamic || /%[-+ #0-9.*hlLjzt]*n/.test(format.replace(/%%/g, ''))) {
+    names.push(...words.slice(i).map((t) => t.text));
+  }
+  return names.filter((n) => typeof n === 'string').map((n) => n.match(/^[A-Za-z_]\w*/)?.[0]).filter(Boolean);
+}
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
 // standard lane invocation `cd <lane> && node …/backlog.mjs claim` reports cwd=primary and gets misclassified
@@ -2530,6 +2568,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     const t = stmt.trim();
     const forget = (name) => { if (name === 'HOME') homeCtx = null; else delete vars[name]; };
     if (BINDING_STATEMENT.test(t)) { for (const n of t.matchAll(/(?<![\w$])([A-Za-z_]\w*)(?=\+?=|\s|$)/g)) forget(n[1]); continue; }
+    for (const name of printfBindings(t)) forget(name);
     const m = t.match(/^(?:export\s+)?([A-Za-z_]\w*)(\+?)=(.*)$/);
     if (m) {
       const [, name, append, raw] = m;
