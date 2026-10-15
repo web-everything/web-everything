@@ -150,7 +150,8 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const name = `${num}-${slug}.md`;
   const content = renderItem({
-    ...operatorTaskFields(input),
+    // The operator record's time: the file-item reader's clock when it has one, else the filing day.
+    ...operatorTaskFields(input, { at: read.now || read.today }),
     kind,
     size: Number.isFinite(size) ? size : undefined,
     slug,

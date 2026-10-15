@@ -2,7 +2,7 @@
 import { homedir } from 'node:os';
 import { resolve, isAbsolute } from 'node:path';
 import { renderEdgeStep, renderProofStep, renderReportStep } from '../worker-brief.mjs';
-import { validateOperatorTask, BRIEF_TOKEN_SHAPE } from '../backlog/operator-task.mjs';
+import { validateOperatorTask, hasOperatorRecord, BRIEF_TOKEN_SHAPE } from '../backlog/operator-task.mjs';
 import { readOperatorTaskSettings } from '../lib/operator-task-settings.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
@@ -14,11 +14,16 @@ export function resolveOperatorPostBuild(settings = readSettings().build, option
   return resolveOperatorTask(settings, options).postBuild;
 }
 
-export function composeOperatorTaskBrief(template, item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, workspace = '.', kind = 'build' } = {}) {
+/**
+ * The post-build steps this card gets, or [] for none. The ONE decision behind both the composed brief and the
+ * dispatch's `operatorPostBuild` route flag, so the two cannot disagree and neither reads prompt text.
+ */
+export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, workspace = '.', kind = 'build' } = {}) {
   const errors = validateOperatorTask(item);
   if (errors.length) throw new Error(errors.join('; '));
-  // Card frontmatter alone never adds a step: the card must be an operator task and operator tasks enabled.
-  if (kind !== 'build' || item.operatorTask !== true || enabled !== true) return template;
+  // Card frontmatter alone never adds a step: the card must be an operator task carrying a valid operator
+  // record (an attributed operator instruction), and operator tasks must be enabled.
+  if (kind !== 'build' || !hasOperatorRecord(item) || enabled !== true) return [];
   const steps = [];
   if (item.edgeClone && policy.edgeLoad) {
     const path = settings?.operatorTask?.edgeClones?.[item.edgeClone];
@@ -34,6 +39,11 @@ export function composeOperatorTaskBrief(template, item, { settings = readSettin
     steps.push(renderProofStep(`Run the following command after adoption (or after open-pr when no edge load was requested). Capture exit status and output; record PASS only on exit 0 and a match, FAIL on nonzero exit or mismatch, PENDING when adoption is unproven.\n\n${fence}sh\n${item.liveProof.command}\n${fence}\n\nMatch output against ${JSON.stringify(item.liveProof.expect)}: /pattern/flags means a JavaScript regex; otherwise use a literal substring.`));
   }
   if (item.report && policy.report) steps.push(renderReportStep());
+  return steps;
+}
+
+export function composeOperatorTaskBrief(template, item, options = {}) {
+  const steps = options.steps ?? planOperatorPostBuild(item, options);
   if (!steps.length) return template;
   if (item.deliveryBase && item.deliveryBase !== 'main') throw new Error('operator post-build requires a PR delivery target');
   const anchor = '### 9. Append';

@@ -134,7 +134,7 @@ export function renderItem(spec) {
   const { kind, size, title, today, blockedBy = [], parent, digest, scaffoldedBy, scope = [] } = spec;
   const scopeEntries = normalizeScope(scope);
   const fm = ['---', `kind: ${kind}`];
-  for (const key of ['operatorTask', 'edgeClone', 'liveProof', 'report']) {
+  for (const key of ['operatorTask', 'operatorInstruction', 'edgeClone', 'liveProof', 'report']) {
     if (spec[key] !== undefined) fm.push(`${key}: ${JSON.stringify(spec[key])}`);
   }
   // A story always carries its size; every other kind carries it exactly when one was passed. Kinds that can

@@ -65,20 +65,32 @@ import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from './scaffold.mjs
 import { setFrontmatterField } from '../backlog/frontmatter.mjs';
 import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
 
+/**
+ * The explicit-priority rules for EVERY filing, not only operator ones (operator send-back 2026-10-14): the value
+ * is P0..P4, `build.operatorTask.enabled` must be on, it may not exceed `maxPriority`, and P0 needs an operator
+ * task (whose record operatorTaskFields requires). build-queue applies the same rules when it reads a card.
+ */
+function checkFilingPriority(priority, policy, operatorTask) {
+  if (!priority) return;
+  if (!/^P[0-4]$/.test(priority)) throw new Error('file-item: priority must be P0..P4');
+  if (!policy) throw new Error('file-item: --priority requires the resolved build.operatorTask policy');
+  if (!policy.enabled) throw new Error('file-item: --priority is refused while build.operatorTask.enabled=false');
+  if (Number(priority[1]) < Number(policy.maxPriority[1])) throw new Error(`file-item: priority ${priority} exceeds build.operatorTask.maxPriority ${policy.maxPriority}`);
+  if (priority === 'P0' && !operatorTask) throw new Error('file-item: priority P0 is reserved for an operator task (--operatorTask with its operator record)');
+}
+
 /** Validate before either filing effect; ordinary scaffold output stays byte-identical. */
 export function planFileItem(read, input) {
   const verdict = planScaffold(read, input);
-  if (input.priority && !/^P[0-4]$/.test(input.priority)) throw new Error('file-item: priority must be P0..P4');
+  const policy = read.operatorTask;
+  checkFilingPriority(input.priority, policy, input.operatorTask === true);
   if (input.priority) verdict.content = setFrontmatterField(verdict.content, 'priority', input.priority);
   if (!input.operatorTask) return verdict;
   // The digest supplies the complete authored body, replacing the scaffold's unfinished agreement.
   verdict.content = verdict.content.slice(0, verdict.content.indexOf('\n# '))
     + `\n# ${input.title}\n\n${input.digest || ''}\n`;
-  verdict.content = setFrontmatterField(verdict.content, 'operatorTask', 'true');
-  const policy = read.operatorTask;
   if (!policy) throw new Error('file-item: operatorTask requires the resolved build policy');
   if (!policy.enabled) return verdict;
-  if (input.priority && Number(input.priority[1]) < Number(policy.maxPriority[1])) throw new Error('file-item: priority exceeds operatorTask.maxPriority');
   const ready = validatePrepareCard(verdict.content, { operatorTask: true });
   if (!ready.ok) throw new Error(`file-item: missing or incomplete sections: ${ready.missing.join(', ')}`);
   if (!/^[a-f0-9]{40,64}$/.test(read.originMainSha ?? '')) throw new Error('file-item: cannot stamp without origin/main tip');
@@ -178,7 +190,7 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       reads: ['input.operatorTask'],
       fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask,
+        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, now: raw.now,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),

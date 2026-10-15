@@ -1,7 +1,7 @@
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
-import { composeOperatorTaskBrief } from './operator-task-brief.mjs';
+import { composeOperatorTaskBrief, planOperatorPostBuild } from './operator-task-brief.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
 import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -560,6 +560,9 @@ export function readTick({
     });
   }
 
+  // One decision from the verified card (operator record + settings) feeds both the brief and the route flag.
+  const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
+  const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
   return {
     resolvedNum: key,
     admission: tick.decisions?.admission ? {
@@ -578,7 +581,9 @@ export function readTick({
     suppressed: match(decisions.suppressedBuilds),
     dispatchedGuard,
     item,
-    briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))), item ?? {}, { workspace: workspaceRootOf(root), kind: launchKind }),
+    briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+    // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
+    operatorPostBuild: operatorSteps.length > 0,
     nextState,
     statusLine: String(decisions.statusLine || ''),
     notes: Array.isArray(decisions.notes) ? decisions.notes : [],
@@ -1043,7 +1048,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
   if (!it || !it.slug) return null;
   const rawTarget = typeof it.deliveryTarget === 'string' && it.deliveryTarget.trim() ? it.deliveryTarget.trim() : null;
   return {
-    ...Object.fromEntries(['operatorTask', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
+    ...Object.fromEntries(['operatorTask', 'operatorInstruction', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
     num: String(it.num),
     status: it.status ?? null,
     deliveryAgent: it.deliveryAgent ?? null,

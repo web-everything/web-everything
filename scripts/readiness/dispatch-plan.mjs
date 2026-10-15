@@ -82,6 +82,7 @@ import { getCachedVerdict, readAlreadyDoneCacheState, resolveAlreadyDoneCacheSto
   ALREADY_DONE_NOT_DONE_COOLDOWN_MS, ALREADY_DONE_DONE_COOLDOWN_MS } from './already-done-cache.mjs';
 import { scopesOverlap, normScope } from './scope-lease.mjs';
 import { isGroupingKind } from '../check-standards-rules.mjs';
+import { hasOperatorRecord, OPERATOR_FILING_STAMP } from '../backlog/operator-task.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 // The kind-scoped pause's PURE half (epic #3383). `dispatch-pause.mjs`'s fs helpers stay out of this pure core
@@ -601,7 +602,11 @@ export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, drif
     //    (cross-checking `preparedAgainstSha`) is a possible future hardening, not this MVP's job.
     //    A prepare-item launch creates this stamp: exempt ONLY that kind from this gate,
     //    leaving size, overlap, pause and lane admission unchanged.
-    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && ((item.preparedBy === 'operator-filing' && preparePolicy.operatorTask?.enabled === false) || !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate)))) {
+    //    An operator FILING stamp (`preparedBy: operator-filing`) counts only while operator tasks are enabled
+    //    AND the card carries a valid operator record; otherwise it is no stamp at all and the card is prepared.
+    const filingStampVoid = item.preparedBy === OPERATOR_FILING_STAMP
+      && (preparePolicy?.operatorTask?.enabled === false || !hasOperatorRecord(item));
+    if (preparePolicy?.requirePreparedDate && item.kind !== 'prepare-item' && !sizeExempt && (filingStampVoid || !(typeof item.preparedDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.preparedDate)))) {
       held.push({ num, reason: 'needs-prepare' });
       continue;
     }
@@ -1006,6 +1011,9 @@ async function main(argv) {
       // a card nobody has actually prepared).
       preparedDate: it?.preparedDate,
       preparedBy: it?.preparedBy,
+      // The operator authority record a filing stamp needs (hasOperatorRecord above).
+      operatorTask: it?.operatorTask,
+      operatorInstruction: it?.operatorInstruction,
       // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
       preparedAgainstSha: it?.preparedAgainstSha,
       rawScope: Array.isArray(it?.scope) ? it.scope : undefined,

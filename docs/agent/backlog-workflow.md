@@ -1285,7 +1285,20 @@ lists missing sections before any write or queue effect. A passing brief gets
 `operatorTask: true`, an ET `preparedDate`, and the local `origin/main` tip as
 `preparedAgainstSha`. A missing origin/main reference refuses stamping.
 
-`--priority=P0|P1|P2|P3|P4` writes the existing `priority` field. P0 precedes
+**Operator authority.** `--operatorTask` also requires `--operatorActor=<login>`,
+`--operatorChannel=<where the instruction came from>` and `--operatorWords=<the operator's words>`.
+Filing writes them as `operatorInstruction: {actor, channel, at, words}`; `actor` must be a
+registered operator login (`OPERATOR_LOGINS`, `we:scripts/lib/marker-authorship.mjs`). This is the
+clear-human pattern: an attributed record, not a signature. Every operator-task treatment (post-build
+steps, the filing prepare stamp, an explicit P0) requires `operatorTask: true` plus a valid record. A card
+without the record is an ordinary card: no post-build steps, its `preparedBy: "operator-filing"` stamp is
+void (held for prepare), and a `priority: P0` is ignored by the queue. The standards gate refuses a
+malformed or non-operator record.
+
+`--priority=P0|P1|P2|P3|P4` writes the existing `priority` field, on any filing. Every filing is checked:
+the value must be P0..P4, `build.operatorTask.enabled` must be true, it may not exceed `maxPriority`,
+and P0 needs `--operatorTask`. The build queue re-applies the same rules to every card (a hand-edited
+`priority:` included) and names an ignored value in the row's reasons. An admitted P0 precedes
 `build.priority` in every queue mode and takes the next available slot; blockedBy,
 scope holds, sizing, clearance, and stamp staleness still apply.
 
@@ -1312,7 +1325,9 @@ Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/op
 an absolute clone path on a card. Each `build.operatorTask.postBuild` boolean resolves independently through
 the standard/platform/tool cascade and is source-logged. Disabling a step suppresses it even when the card
 requests it. The fields alone never add a step: the card must also carry `operatorTask: true` (filing and
-the standards gate refuse these fields without it), and `build.operatorTask.enabled` must be true. Cards without enabled post-build steps retain their existing brief
+the standards gate refuse these fields without it) with a valid `operatorInstruction` record, and
+`build.operatorTask.enabled` must be true. The dispatcher's route flag for these cards comes from the same
+card-record decision, never from searching the prompt text. Cards without enabled post-build steps retain their existing brief
 and provider route.
 
 The shared blocks live in `we:scripts/worker-brief.mjs`. Post-build cards use the existing full delivery-agent

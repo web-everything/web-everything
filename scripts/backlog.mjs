@@ -61,6 +61,7 @@ import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
+import { readOperatorTaskSettings } from './lib/operator-task-settings.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
@@ -1205,7 +1206,9 @@ function buildQueue() {
   });
   // Platform preference → tool → env through the shared policy cascade (logs each value's source once).
   const priority = readBuildQueuePrioritySettings({ env: process.env });
-  const detailed = orderQueueDetailed(items, config, Date.now(), { priority, buildPriority: buildPriority.ids });
+  // build.operatorTask's enabled switch and maxPriority cap apply to every card's explicit priority (P0 also
+  // needs an operator record), so a hand-edited `priority:` cannot jump the queue.
+  const detailed = orderQueueDetailed(items, config, Date.now(), { priority, buildPriority: buildPriority.ids, operatorTask: readOperatorTaskSettings() });
   const shadow = priority.mode === 'shadow'
     ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};
   if (priority.mode === 'shadow') console.error(formatBuildQueuePriorityShadowLine(detailed, priority.mode));

@@ -37,6 +37,7 @@ export { REPO_ROOT };
 export function createFileItemReader({ root = REPO_ROOT,
   today = () => localDateString(new Date(), 'America/Toronto'),
   readPolicy = readOperatorTaskSettings,
+  now = () => new Date().toISOString(),
   readTip = () => readGit(['rev-parse', 'origin/main'], { cwd: root }).trim(),
   ...opts } = {}) {
   const read = createScaffoldReader({ root, today, ...opts });
@@ -44,7 +45,7 @@ export function createFileItemReader({ root = REPO_ROOT,
     let originMainSha;
     let tipRead = false;
     return {
-      ...read(), operatorTask: readPolicy(),
+      ...read(), operatorTask: readPolicy(), now: now(),
       get originMainSha() {
         if (!tipRead) {
           tipRead = true;

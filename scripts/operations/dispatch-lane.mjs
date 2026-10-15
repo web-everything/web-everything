@@ -1216,7 +1216,9 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
     // The records this dispatch went PAST. They are still `in-flight` on disk and still need closing out; the
     // verdict says so rather than letting an aged-out guard disappear silently.
     agedOutRuns,
-    operatorPostBuild: brief.prompt.includes('### 8a. Operator post-build'),
+    // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
+    // card-influenced text can reach. A build only: no other kind composes post-build steps.
+    operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
     prompt: brief.prompt,
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
