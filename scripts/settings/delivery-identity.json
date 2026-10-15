@@ -13,6 +13,54 @@
           "name": "plateau-reviewer"
         },
         "botLogin": "plateau-reviewer[bot]"
+      },
+      "worker": {
+        "appId": "5267514",
+        "installations": {
+          "web-everything": "170085944",
+          "plateauapp": "170085924",
+          "frontier-ui": "170085905"
+        },
+        "key": {
+          "name": "plateau-worker"
+        },
+        "botLogin": "plateau-worker[bot]"
+      },
+      "ledger": {
+        "appId": "5267551",
+        "installations": {
+          "web-everything": "170085739",
+          "plateauapp": "170085724",
+          "frontier-ui": "170085702"
+        },
+        "key": {
+          "name": "plateau-ledger"
+        },
+        "botLogin": "plateau-ledger[bot]"
+      },
+      "observer": {
+        "appId": "5267580",
+        "installations": {
+          "web-everything": "170085659",
+          "plateauapp": "170085627",
+          "frontier-ui": "170085606"
+        },
+        "key": {
+          "name": "plateau-observer"
+        },
+        "botLogin": "plateau-observer[bot]"
+      },
+      "merger": {
+        "appId": "5267489",
+        "installations": {
+          "web-everything": "170085807",
+          "plateauapp": "170085790",
+          "frontier-ui": "170085775"
+        },
+        "key": {
+          "name": "plateau-merger"
+        },
+        "botLogin": "plateau-merger[bot]"
       }
     }
   }

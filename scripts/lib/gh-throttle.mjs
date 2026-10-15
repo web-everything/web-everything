@@ -176,10 +176,10 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs';
+import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { URL as NodeURL, fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 
 import { tryAcquireSlot, releaseOwnedSlot, admissionStatus, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
@@ -195,6 +195,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
@@ -308,24 +309,28 @@ export function resolveGhWriteBudgetPerMin(env = process.env) {
  */
 export function classifyGhWrite(args) {
   const a = Array.isArray(args) ? args : [];
-  const cmd = a[0];
-  const sub = a[1];
+  // Command words by gh's own parse, so a leading `-R o/r` cannot hide a mutation from the write budget.
+  const words = ghCommandWords(a);
+  const [cmd, sub] = words.map((w) => w.word);
   if (cmd === 'pr') return ['edit', 'comment', 'close', 'merge', 'reopen', 'ready', 'create', 'review'].includes(sub);
   if (cmd === 'issue') return ['edit', 'comment', 'close', 'reopen', 'create'].includes(sub);
   if (cmd === 'label') return ['create', 'delete', 'edit'].includes(sub);
   if (cmd === 'run') return ['cancel', 'rerun'].includes(sub);
   if (cmd === 'api') {
-    const methodIdx = a.indexOf('--method');
-    const method = methodIdx >= 0 ? String(a[methodIdx + 1] || '').toUpperCase() : null;
+    // One pflag parse of everything but the `api` word (see parseGhApiArgs): every method/payload spelling, and
+    // a flag value that looks like a flag (`-H -XPOST`) stays a value. pflag keeps the LAST method.
+    const p = parseGhApiArgs(a.filter((_, i) => i !== words[0].at));
+    const method = p.methods.length ? p.methods[p.methods.length - 1] || null : null;
     if (method) return method !== 'GET' && method !== 'HEAD';
-    // `gh api graphql -f query=…` is POST only because of the flag. Read exemption is an ALLOWLIST: only an
-    // inline `-f/--raw-field query=<text with no mutation>` and no `--input`/`@file` value anywhere. A `query=@file`
-    // token or `--input` hides the text, so it stays a write.
-    if (a[1] === 'graphql' && !a.includes('--input') && !a.some((t) => typeof t === 'string' && /^(query=)?@/.test(t) && t !== '@')) {
-      const qi = a.findIndex((t, i) => (t === '-f' || t === '--raw-field') && typeof a[i + 1] === 'string' && a[i + 1].startsWith('query=') && !a[i + 1].startsWith('query=@'));
-      if (qi >= 0 && !/\bmutation\b/i.test(a[qi + 1])) return false;
-    }
-    return a.some((t) => t === '-f' || t === '-F' || t === '--field' || t === '--raw-field' || t === '--input');
+    if (!p.payload) return false;
+    // `gh api graphql -f query=…` is POST only because of the flag. Read exemption is an ALLOWLIST: the endpoint
+    // is `graphql`, there is no `--input`, and EVERY `query` field (any spelling; gh sends the last) is inline
+    // text with no mutation. A `query=@file` value or `--input` hides the text, so it stays a write.
+    const queries = p.fields.filter((f) => f.startsWith('query=')).map((f) => f.slice(6));
+    // Leading global flag values are not endpoints; retain the full parse above for method/payload flags.
+    const endpoint = parseGhApiArgs(a.slice(words[0].at + 1)).positionals[0];
+    if (endpoint === 'graphql' && !p.input && queries.length && queries.every((q) => !q.startsWith('@') && !/\bmutation\b/i.test(q))) return false;
+    return true;
   }
   return false;
 }
@@ -360,11 +365,6 @@ export function stripLeadingGhGlobalFlags(args) {
   return out;
 }
 
-// `gh api`'s own short flags (pflag): the ones that take a value, and the one boolean. Any OTHER short letter
-// is unknown to this scanner and is treated as unsafe (see {@link scanGhApiFlags}).
-const GH_API_SHORT_VALUE_FLAGS = new Set(['X', 'f', 'F', 'H', 'p', 'q', 't']);
-const GH_API_SHORT_BOOL_FLAGS = new Set(['i']);
-
 /**
  * Scan a `gh api` argv the way pflag parses it, so no spelling of a method or payload flag slips past a read
  * allowlist (PR #2885 review: `--input=FILE`, attached `-fkey=v`/`-Fkey=v`, a clustered `-iXPOST`, and a
@@ -378,33 +378,8 @@ const GH_API_SHORT_BOOL_FLAGS = new Set(['i']);
  * @returns {{methods: string[], payload: boolean, unknown: boolean}}
  */
 export function scanGhApiFlags(args) {
-  const a = Array.isArray(args) ? args.map(String) : [];
-  const out = { methods: [], payload: false, unknown: false };
-  for (let i = 0; i < a.length; i++) {
-    const t = a[i];
-    // No early stop at `--`: pflag takes it as the VALUE of a preceding long flag (`--preview -- -XPOST` still
-    // sends a POST), and `gh api` takes one endpoint anyway — scanning to the end can only add false negatives.
-    if (t === '--') continue;
-    if (t.startsWith('--')) {
-      const name = t.slice(2).split('=')[0];
-      const hasInline = t.includes('=');
-      if (name === 'method') out.methods.push((hasInline ? t.slice(t.indexOf('=') + 1) : String(a[++i] ?? '')).toUpperCase());
-      else if (name === 'input' || name === 'field' || name === 'raw-field') out.payload = true;
-      continue;
-    }
-    if (!t.startsWith('-') || t.length < 2) continue; // a positional (or a bare `-`)
-    for (let j = 1; j < t.length; j++) {
-      const c = t[j];
-      if (GH_API_SHORT_BOOL_FLAGS.has(c)) continue;
-      if (!GH_API_SHORT_VALUE_FLAGS.has(c)) { out.unknown = true; break; }
-      const rest = t.slice(j + 1);
-      const value = rest.length ? rest : String(a[++i] ?? '');
-      if (c === 'X') out.methods.push(value.toUpperCase());
-      if (c === 'f' || c === 'F') out.payload = true;
-      break; // a value-taking flag consumes the rest of the token (or the next arg)
-    }
-  }
-  return out;
+  const { methods, payload, unknown } = parseGhApiArgs(args);
+  return { methods, payload, unknown };
 }
 
 /**
@@ -568,7 +543,7 @@ function normalizeGhCaller(caller) {
 export function ghCallerPriority(caller, args = []) {
   const name = normalizeGhCaller(caller);
   if (/^(review-daemon|review-set-label|review-pr|merge-ai-prs)(:|$)/.test(name)) return 'critical';
-  if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || args[0] === 'pr' && args[1] === 'merge')) return 'critical';
+  if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || ghCommandPath(args).join(' ') === 'pr merge')) return 'critical';
   if (/^ci-heal(?:-run|-pr-dispatch)?(:|$)/.test(name) && (name.includes(':push') || classifyGhWrite(args))) return 'critical';
   if (/^(dispatch-plan|parked-pr-conflict-watch|parked-pr-progress-watch|active-progress-watch|progress-board|lane-whois|reconcile-pass|reconcile-fix-dispatch|reconcile-snapshot)(:|$)/.test(name)) return 'background';
   return 'normal';
@@ -1035,6 +1010,26 @@ export function settleLikeExecFileSync(file, args, opts, ret) {
 /** Env var {@link runGhSync} sets on its real `gh` child so a nested passthrough (the gh App shim → this CLI)
  *  records `outer: <inv>` and the pair counts as ONE invocation, not two. */
 export const GH_OUTER_INV_ENV = 'WE_GH_THROTTLE_OUTER_INV';
+/** Env var {@link runGhSync} sets beside {@link GH_OUTER_INV_ENV}: the outer exec's EFFECTIVE timeout in ms
+ *  (`0` = none). The nested passthrough applies it instead of its own default hold limit, so an explicit outer
+ *  `timeout: 0` or `timeout: 300000` is not cut short by the nested 90s default (PR #5326 red team). */
+export const GH_OUTER_TIMEOUT_ENV = 'WE_GH_THROTTLE_OUTER_TIMEOUT_MS';
+/** Env var beside {@link GH_OUTER_TIMEOUT_ENV}: the outer exec's kill signal, so the nested child is stopped the
+ *  way the outer caller asked (e.g. `SIGKILL`), not with the nested default `SIGTERM`. */
+export const GH_OUTER_KILL_SIGNAL_ENV = 'WE_GH_THROTTLE_OUTER_KILL_SIGNAL';
+/** The outer timeout options a nested passthrough must honour, or null (un-nested, absent or unparseable → its own
+ *  default). An unknown signal is dropped (spawn would throw on it) and the node default applies. */
+function outerExecLimits(outer, env) {
+  if (!outer) return null;
+  const read = (name) => env[name] ?? process.env[name];
+  const rawTimeout = read(GH_OUTER_TIMEOUT_ENV);
+  if (typeof rawTimeout !== 'string' || !/^\d+$/.test(rawTimeout) || !Number.isSafeInteger(Number(rawTimeout))) return null;
+  const rawSignal = read(GH_OUTER_KILL_SIGNAL_ENV);
+  const signal = typeof rawSignal !== 'string' ? null
+    : /^\d+$/.test(rawSignal) ? (Object.values(osConstants.signals).includes(Number(rawSignal)) ? Number(rawSignal) : null)
+      : (Object.hasOwn(osConstants.signals, rawSignal) ? rawSignal : null);
+  return { timeout: Number(rawTimeout), ...(signal !== null ? { killSignal: signal } : {}) };
+}
 
 /**
  * Extract a GraphQL response body's IN-BAND `rateLimit` field — GitHub attaches it only when the query itself
@@ -1115,6 +1110,12 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
   }
 }
 
+// Card 338: slot holder record, hold reaping and per-caller cap live in their own module (imported here, not
+// in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
+import { classifyGhResource, parseGhApiArgs } from './gh-argv.mjs';
+export { classifyGhResource } from './gh-argv.mjs';
+import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
+
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
 /**
@@ -1128,17 +1129,16 @@ export function acquireGhSlotSync({
   lockRoot, cap, owner, pid = process.pid,
   pollMs = DEFAULT_ACQUIRE_POLL_MS, timeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS,
   now = () => Date.now(), sleep = sleepSyncMs,
+  meta = ghHolderMeta({ caller: 'unknown', args: [], pid }), policy = ghHolderPolicy(), logPath, warn,
 }) {
-  const startedAt = now();
-  for (;;) {
-    const nowMs = now();
-    const r = tryAcquireSlot({
-      lockRoot, cap, owner, nowMs, nowIso: new Date(nowMs).toISOString(), pid, leaseMinutes: ADMISSION_LEASE_MINUTES,
-    });
-    if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: nowMs - startedAt };
-    if (nowMs - startedAt >= timeoutMs) return { ok: false, slot: null, timedOut: true, waitedMs: nowMs - startedAt };
-    sleep(pollMs);
-  }
+  return acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy,
+    trySlot: (opts) => tryAcquireSlot({ ...opts, leaseMinutes: ADMISSION_LEASE_MINUTES }),
+    onReap: (holder) => {
+      recordGhCallLogEntry(logPath || ghThrottleLogPath(lockRoot), { outcome: 'slot_reaped', ...holder });
+      try { (warn || ((m) => process.stderr.write(m + '\n')))(`gh-throttle: reaped slot ${holder.slot} — holders: ${ghHoldersSummary([holder])}`); } catch { /* best-effort */ }
+      recordGhThrottleMetric('gh.throttle.slot_reaped', 1, { op: holder.op, source: 'max-hold' });
+    },
+  });
 }
 
 /** Release whichever `gh`-call slot `owner` holds (idempotent — a no-op if it holds none). */
@@ -1301,24 +1301,6 @@ export const DEFAULT_BUDGET_BLOCK_FALLBACK_MS = 5 * 60_000;
 export const MAX_BUDGET_BLOCK_MS = 65 * 60_000;
 
 /**
- * Which GitHub rate-limit RESOURCE a `gh` argv spends — `graphql` (every `gh pr …`/`gh issue …`/`gh repo …`/
- * `gh project …` subcommand and `gh api graphql`) or `core` (REST: `gh api <path>`, `gh run …`, `gh label …`,
- * `gh workflow …`, …). PURE. The two are separate buckets, so exhausting one must never block the other.
- * @param {string[]} args
- * @returns {'graphql'|'core'}
- */
-export function classifyGhResource(args) {
-  const a = Array.isArray(args) ? args.map(String) : [];
-  // Not led by 'pr': multi-repo-scan reads any `['pr', …]` literal as gh argv and would flag it as repo-less.
-  if (['issue', 'pr', 'repo', 'project', 'search'].includes(a[0])) return 'graphql';
-  if (a[0] === 'api') {
-    const positional = a.slice(1).filter((t, i, arr) => !t.startsWith('-') && !(i > 0 && /^-(X|H|f|F|q|t|p)$|^--(method|header|field|raw-field|jq|template|input|preview|hostname|cache)$/.test(arr[i - 1])));
-    return positional[0] === 'graphql' ? 'graphql' : 'core';
-  }
-  return 'core';
-}
-
-/**
  * Is `text` GitHub's PRIMARY (hourly budget) exhaustion — never the secondary/abuse limit, which clears in
  * seconds and keeps its own retry path — and for which resource? PURE.
  * @param {string|null|undefined} text
@@ -1356,26 +1338,34 @@ const shimProbeCache = new Map();
  * Does `bin` (a bare name resolved on `env.PATH`, or a path) run the WE App shim? The shim chooses the credential
  * per call, so a caller without its own token cannot label the bucket (see runGhSync's `shimRouted`). Reads at most
  * 512 bytes once per resolved file per process. Never throws: anything unreadable is "not a shim" (the old gate).
+ * `fresh` is the cache's stricter auth check: follow executable PATH candidates, re-read the marker, and treat
+ * an unknown/unreadable executable as a possible shim, so it cannot authorize a cache hit.
  */
-export function ghBinIsWeShim(bin = 'gh', env = process.env) {
+export function ghBinIsWeShim(bin = 'gh', env = process.env, { fresh = false } = {}) {
   try {
     let file = null;
     if (String(bin).includes('/')) file = String(bin);
     else {
       for (const dir of String((env && env.PATH) || '').split(delimiter)) {
-        if (dir && existsSync(join(dir, bin))) { file = join(dir, bin); break; }
+        if (!dir) continue;
+        const candidate = join(dir, bin);
+        if (fresh) {
+          try { if (!statSync(candidate).isFile()) continue; accessSync(candidate, constants.X_OK); }
+          catch { continue; }
+        } else if (!existsSync(candidate)) continue;
+        file = candidate; break;
       }
     }
-    if (!file) return false;
-    if (shimProbeCache.has(file)) return shimProbeCache.get(file);
+    if (!file) return fresh;
+    if (!fresh && shimProbeCache.has(file)) return shimProbeCache.get(file);
     const fd = openSync(file, 'r');
     let head = '';
     try { const buf = Buffer.alloc(512); head = buf.subarray(0, readSync(fd, buf, 0, 512, 0)).toString('utf8'); } finally { closeSync(fd); }
     const yes = head.includes(WE_GH_SHIM_MARKER);
-    shimProbeCache.set(file, yes);
+    if (!fresh) shimProbeCache.set(file, yes);
     return yes;
   } catch {
-    return false;
+    return fresh;
   }
 }
 
@@ -1584,8 +1574,8 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  */
 export function noteSlotTimeout(logPath, acq, entry, warn) {
   if (!acq || !acq.timedOut) return false;
-  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null });
-  const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated`;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null, holders: (acq.holders ?? []).map(sanitizeGhHolder) });
+  const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated; holders: ${ghHoldersSummary(acq.holders)}`;
   try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
   return true;
 }
@@ -1711,6 +1701,28 @@ function ghReadMemoHasFileInput(args) {
       && /=@/.test(arg)));
 }
 
+function finishedCiContext(throttle, childEnv, bin, cwd = process.cwd()) {
+  const env = throttle.finishedCiCacheDir
+    ? { ...(throttle.env || process.env), WE_FINISHED_CI_CACHE_DIR: throttle.finishedCiCacheDir }
+    : throttle.env || process.env;
+  const settings = resolveFinishedCiCacheSettings(env);
+  const nowMs = (throttle.now || Date.now)();
+  if (!settings.enabled) return { env, authScope: null, settings, nowMs };
+  const absCwd = resolve(cwd instanceof NodeURL ? fileURLToPath(cwd) : cwd || process.cwd());
+  const probeBin = bin.includes('/') ? resolve(absCwd, bin) : bin;
+  const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(absCwd, path)).join(delimiter) };
+  // A keychain login, routing fallback, or App shim can change credentials without changing the caller's env.
+  const dynamicAuth = (throttle.personalRoute ?? resolvePersonalRouteEnabled(env))
+    || throttle.shimRouted || (!bin.includes('/') && !childEnv.PATH) || ghBinIsWeShim(probeBin, probeEnv, { fresh: true });
+  return { env, authScope: dynamicAuth ? null : finishedCiAuthScope(childEnv), settings, nowMs };
+}
+function logFinishedCiHit(args, cls, throttle, env) {
+  const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
+  recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
+    outcome: 'ci_cache_hit', op: args.join(' '), caller: deriveGhCaller(throttle, env), kind: cls.kind, points: 0,
+  });
+}
+
 /**
  * Run `gh` with `args`, gated by the concurrency semaphore and retried with bounded backoff on a rate-limit-
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
@@ -1748,6 +1760,41 @@ function ghReadMemoHasFileInput(args) {
  */
 export function runGhSync(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
+  if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
+  const childEnv = execOpts.env || process.env;
+  const cache = finishedCiContext(throttle, childEnv, throttle.bin || 'gh', execOpts.cwd);
+  const candidate = cache.settings.enabled && cache.settings.maxBytes > 0 && cache.authScope && !throttle.exec && execOpts.input === undefined ? classifyFinishedCiRead(args) : null;
+  const cls = finishedCiCacheable(candidate) ? candidate : null;
+  if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
+  if (cls) {
+    const hit = lookupFinishedCi(cls, cache);
+    if (hit !== null) {
+      logFinishedCiHit(args, cls, throttle, cache.env);
+      return execOpts.encoding && execOpts.encoding !== 'buffer' ? hit.toString(execOpts.encoding) : hit;
+    }
+  }
+  let completedBeforeRead = false;
+  const proofArgs = finishedCiProofArgs(cls, cache);
+  if (proofArgs) {
+    try {
+      const proof = runGhSyncUnmemoized(proofArgs, { ...opts, encoding: 'utf8' });
+      completedBeforeRead = !isGhDeferred(proof) && JSON.parse(String(proof))?.status === 'completed';
+    } catch { /* Failed proof never fails the requested read. */ }
+    recordFinishedCiProof(cls, completedBeforeRead, { ...cache, nowMs: (throttle.now || Date.now)() });
+  }
+  // Eligible CI reads bypass the smoke memo: it must not defeat revalidation or cache running CI.
+  const result = cls ? runGhSyncUnmemoized(args, opts) : runGhSyncReadMemo(args, opts);
+  if (!isGhDeferred(result)) invalidateForWrite(args, cache);
+  if (cls && (typeof result === 'string' || Buffer.isBuffer(result)) && !isGhDeferred(result)) {
+    const storable = cls.kind === 'job-log' ? completedBeforeRead : finishedCiStorable(cls, result, { runCompleted: completedBeforeRead });
+    const stored = storable && storeFinishedCi(cls, Buffer.isBuffer(result) ? result : Buffer.from(result, execOpts.encoding || 'utf8'),
+      { ...cache, nowMs: (throttle.now || Date.now)() });
+    if (completedBeforeRead && !stored) recordFinishedCiProof(cls, false, { ...cache, nowMs: (throttle.now || Date.now)() });
+  }
+  return result;
+}
+function runGhSyncReadMemo(args, opts = {}) {
+  const { throttle = {}, ...execOpts } = opts;
   const env = throttle.env || process.env;
   const dir = env[WE_GH_READ_MEMO_DIR];
   if (!dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
@@ -1773,7 +1820,7 @@ export function runGhSync(args, opts = {}) {
       const result = encoding ? bytes.toString(encoding) : bytes;
       const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
       recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
-        outcome: 'memo_hit', op: throttle.op || args.slice(0, 2).join(' '), caller: deriveGhCaller(throttle, env), points: 0,
+        outcome: 'memo_hit', op: throttle.op || ghOpLabel(args), caller: deriveGhCaller(throttle, env), points: 0,
       });
       return result;
     }
@@ -1822,7 +1869,9 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const capture = !throttle.exec && resolveCostHeaderCapture(env) && !(execOpts.env || process.env).GH_DEBUG && stdioPipesStderr(execOpts.stdio);
   let lastCapture = null;
   const exec = throttle.exec || ((a, o) => {
-    const childOpts = { ...o, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv } };
+    const held = ghExecOptions(o, a, ghHolderPolicy(env));
+    const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
+      ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
     if (!capture) return execFileSync(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
@@ -1837,7 +1886,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
   // (`throttle.op`), else it derives from the gh subcommand itself (e.g. "pr create", "pr view").
   const calibrateHeaders = !!throttle.calibrateHeaders;
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
-  const opLabel = throttle.op || (Array.isArray(args) ? args.slice(0, 2).join(' ') : 'unknown');
+  const opLabel = throttle.op || ghOpLabel(args);
   const gateOpts = { warn: throttle.warn, logPath, op: opLabel };
   // #gh-write-burst — a THIRD, independent gate over MUTATIONS only (see DEFAULT_GH_WRITE_BUDGET_PER_MIN's own
   // doc comment), plus best-effort caller attribution recorded on every log line below.
@@ -1901,7 +1950,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep });
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) {
@@ -1932,7 +1981,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     if (captured) recordGhHeadroom(lockRoot, identity, rateLimitRecords(captured.responses));
     recordGhCallLogEntry(logPath, {
       op: opLabel, attempt, points, outcome: 'call', ok: !failure, caller, priority: ghCallerPriority(caller, args), w: isWrite, resource, id: identity, auth: ghAuthProvenance(callEnv), inv,
-      ...(shimRouted ? { via: 'shim' } : {}),
+      ...ghCallHoldFields(args, failure), ...(shimRouted ? { via: 'shim' } : {}),
       ...(captured ? { rl: rateLimitRecords(captured.responses) } : {}),
     });
     if (!failure) {
@@ -2044,6 +2093,40 @@ export function execFileSyncThrottled(file, args, opts = {}) {
  * @returns {{status:number, stdout:Buffer, stderr:Buffer}}
  */
 export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bin = 'gh' } = {}) {
+  // With routing inactive the passthrough inherits process.env, even when throttle.env configures gates.
+  const cache = finishedCiContext(throttle, process.env, bin);
+  const candidate = cache.settings.enabled && cache.settings.maxBytes > 0 && cache.authScope && !isGhLocalOnly(argv) ? classifyFinishedCiRead(argv) : null;
+  const cls = finishedCiCacheable(candidate) ? candidate : null;
+  if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
+  if (cls) {
+    const hit = lookupFinishedCi(cls, cache);
+    if (hit !== null) {
+      logFinishedCiHit(argv, cls, throttle, cache.env);
+      return { status: 0, stdout: hit, stderr: Buffer.alloc(0) };
+    }
+  }
+  let completedBeforeRead = false;
+  const proofArgs = finishedCiProofArgs(cls, cache);
+  if (proofArgs) {
+    try {
+      const proof = runGhCliPassthroughUncached(proofArgs, { throttle, spawn, bin });
+      completedBeforeRead = proof.status === 0 && !proof.deferred && !isGhDeferred(proof.stdout)
+        && JSON.parse(String(proof.stdout))?.status === 'completed';
+    } catch { /* Preserve the requested read even if proof fails. */ }
+    recordFinishedCiProof(cls, completedBeforeRead, { ...cache, nowMs: (throttle.now || Date.now)() });
+  }
+  const result = runGhCliPassthroughUncached(argv, { throttle, spawn, bin });
+  if (result.status === 0 && !result.deferred && !isGhDeferred(result.stdout)) {
+    invalidateForWrite(argv, cache);
+    if (cls) {
+      const storable = cls.kind === 'job-log' ? completedBeforeRead : finishedCiStorable(cls, result.stdout, { runCompleted: completedBeforeRead });
+      const stored = storable && storeFinishedCi(cls, result.stdout, { ...cache, nowMs: (throttle.now || Date.now)() });
+      if (completedBeforeRead && !stored) recordFinishedCiProof(cls, false, { ...cache, nowMs: (throttle.now || Date.now)() });
+    }
+  }
+  return result;
+}
+function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, bin = 'gh' } = {}) {
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
@@ -2062,7 +2145,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
-  const opLabel = throttle.op || (Array.isArray(argv) ? argv.slice(0, 2).join(' ') : 'unknown');
+  const opLabel = throttle.op || ghOpLabel(argv);
   const gateOpts = { warn: throttle.warn, logPath, op: opLabel };
   // #gh-write-burst — see runGhSync's identical wiring for the full rationale.
   const isWrite = classifyGhWrite(argv);
@@ -2104,6 +2187,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const capture = resolveCostHeaderCapture(env) && !process.env.GH_DEBUG;
   const inv = randomUUID().slice(0, 12);
   const outer = env[GH_OUTER_INV_ENV] || process.env[GH_OUTER_INV_ENV] || null;
+  const outerLimits = outerExecLimits(outer, env);
   const jsonRetry = { ...resolveGhJsonParseRetry(env), used: 0 };
 
   let attempt = 0;
@@ -2135,7 +2219,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
     const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
@@ -2143,11 +2227,12 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
-      r = spawn(bin, argv, spawnOpts);
+      // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
+      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? spawnOpts : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
     } finally {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap, owner }), gateOpts);
     }
-    if (r.error) throw r.error; // e.g. `gh` not on PATH — not a `gh`-level failure to retry
+    if (r.error) { recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'call', ok: false, caller, inv, ...ghCallHoldFields(argv, r.error), ...(outer ? { outer } : {}) }); throw r.error; } // e.g. `gh` not on PATH — not a `gh`-level failure to retry
     const stdoutOverflow = capture && r.stdout && r.stdout.length > maxBuffer;
     const rawStderrText = r.stderr ? r.stderr.toString('utf8') : '';
     // Classify on the STRIPPED text (what the caller would have seen without debug): the raw trace includes
@@ -2180,7 +2265,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
 
     recordGhCallLogEntry(logPath, {
       op: opLabel, attempt, points, outcome: 'call', ok: !failed && !stdoutOverflow, caller, priority: ghCallerPriority(caller, argv), w: isWrite, resource, id: identity, auth: ghAuthProvenance(callEnv), inv,
-      ...(outer ? { outer } : {}), ...(stripped ? { rl: rateLimitRecords(stripped.responses) } : {}),
+      ...ghCallHoldFields(argv), ...(outer ? { outer } : {}), ...(stripped ? { rl: rateLimitRecords(stripped.responses) } : {}),
     });
     // The call ran and spent points, so it is logged above before the overflow is raised.
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);

@@ -341,7 +341,7 @@ function scopeLeavesWe(scope) {
  * @returns {{resumable: boolean, reason: string, lanePath?: string}}
  */
 export function checkResumable({
-  lane, sessionSlug, num = null, rowStartedAt = null, scope = null, base = 'origin/main', resolveLane = resolveLanePath,
+  lane, sessionSlug, num = null, groupMembers = [], rowStartedAt = null, scope = null, base = 'origin/main', resolveLane = resolveLanePath,
   readReport = tryReadDeliveryReport, resolveReportsDir = resolveDeliveryReportsDir,
   isLaneCommitAhead = laneHasCommitAhead, listLaneChangedFiles = defaultListLaneChangedFiles,
   currentLaneSession = defaultCurrentLaneSession,
@@ -366,7 +366,7 @@ export function checkResumable({
   if (!Array.isArray(changed)) return { resumable: false, reason: 'lane-diff-unreadable', lanePath };
   const claimed = new Set((report.filesTouched || []).map(plainPath));
   if (claimed.size === 0) return { resumable: false, reason: 'report-lists-no-files', lanePath };
-  const foreign = changed.map(plainPath).filter((f) => !claimed.has(f) && !isWrapperOwnedPath(f, num));
+  const foreign = changed.map(plainPath).filter((f) => !claimed.has(f) && !isWrapperOwnedPath(f, num) && !groupMembers.some(member => isWrapperOwnedPath(f, member)));
   if (foreign.length > 0) return { resumable: false, reason: 'lane-commits-not-this-item', lanePath };
   return { resumable: true, lanePath };
 }
@@ -464,11 +464,12 @@ export function settleOrphanRow({ runId, key, outcome = 'orphan-released' }, sto
  *  minus a fresh attempt tag (a resume is not a new attempt at building; it continues the one that already
  *  finished). `runId`/`effectKey` name the ORIGINAL dispatch row, so the resumed wrapper settles that row on
  *  exit instead of leaving it in-flight forever (PR #2921 review). Returns the spawned pid. */
-export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath } = {}) {
+export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [] }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath } = {}) {
   const argv = [
     String(dispatchProviderEntry('build').runScript),
     `--num=${num}`, `--lane=${lane}`, `--session=${sessionSlug}`, `--scope=${String(scope ?? '')}`, '--resume',
     ...(runId && effectKey ? [`--run-id=${runId}`, `--effect-key=${effectKey}`] : []),
+    ...(groupMembers.length ? [`--group-members=${groupMembers.join(',')}`] : []),
   ];
   const child = spawnDetached(argv, { cwd: REPO_ROOT, logPath: logPathFor(sessionSlug) });
   const pid = Number(child?.pid);
@@ -533,17 +534,29 @@ export async function adoptOrphanedBuildClaims({
   const runs = () => (runsCache ??= listRuns());
   const clearMarker = (num) => { try { releaseResumeMarker({ num }); } catch { /* best-effort — see build-dispatch-claim.mjs's own posture */ } };
   const results = [];
-  for (const claim of listClaims()) {
+  const claims = listClaims();
+  for (const claim of claims) {
     if (claim.meta?.kind !== 'build') continue;
     const num = normNum(claim.meta?.num);
     try {
-      const foundRow = findRow(num, runs);
-      const resumeMarker = readResumeMarker(num);
-      const ownerPid = Number.isInteger(claim.pid) ? claim.pid : null;
+      // A member has no worker row of its own. Its lead's PID/session/resume marker is
+      // the same evidence used for a single-card worker; the daemon PID is only a fallback.
+      const lead = claim.meta?.groupLead == null ? null : normNum(claim.meta.groupLead);
+      const workerNum = lead ?? num;
+      const workerClaim = lead == null ? claim : claims.find(c => normNum(c.meta?.num) === lead && c.meta?.groupLead == null) ?? claim;
+      const foundRow = findRow(workerNum, runs);
+      const resumeMarker = readResumeMarker(workerNum);
+      const ownerPid = Number.isInteger(workerClaim.pid) ? workerClaim.pid : null;
       const handle = foundRow?.entry?.handle;
-      const sessionLive = foundRow && detachedHandlePid(handle) == null && handle ? sessionLivenessFor({ handle: String(handle), num }) : null;
-      const liveness = classifyClaimLiveness({ row: foundRow, resumeMarker, ownerPid, isPidAlive, nowMs: now(), claimedAt: claim.meta?.claimedAt ?? null, sessionLive });
+      const sessionLive = foundRow && detachedHandlePid(handle) == null && handle ? sessionLivenessFor({ handle: String(handle), num: workerNum }) : null;
+      const liveness = classifyClaimLiveness({ row: foundRow, resumeMarker, ownerPid, isPidAlive, nowMs: now(), claimedAt: workerClaim.meta?.claimedAt ?? null, sessionLive });
       const row = liveness.row; // null when the found row predates this claim
+      if (lead != null) {
+        // Only the lead may resume/settle its worker. The tick's grouped retirement path
+        // releases members after that lead finishes; never spawn a second worker per member.
+        results.push({ num, action: 'leave', reason: `group lead #${lead}: ${liveness.status}` });
+        continue;
+      }
       // A marker bound to some OLDER row (or to none at all) is stale — it must never answer for this claim
       // again.
       if (resumeMarker && !liveness.marker) clearMarker(num);
@@ -565,6 +578,7 @@ export async function adoptOrphanedBuildClaims({
       const attempts = Number(liveness.marker?.meta?.attempts) || 0;
       const resumability = resolveResumability({
         num, lane: payload.lane, sessionSlug: payload.sessionSlug, scope: payload.scope ?? null,
+        groupMembers: payload.groupMembers ?? [],
         rowStartedAt: row?.entry?.startedAt ?? null,
       });
       const decision = decideOrphanAction({ resumable: resumability.resumable, attempts, maxAttempts, allowResume, frozenReason });
@@ -577,7 +591,7 @@ export async function adoptOrphanedBuildClaims({
         try {
           pid = spawnResume({
             num, lane: payload.lane, scope: payload.scope, sessionSlug: payload.sessionSlug,
-            runId: row.runId, effectKey: row.entry?.key,
+            runId: row.runId, effectKey: row.entry?.key, groupMembers: payload.groupMembers ?? [],
           });
         } catch (e) {
           // Known NOT running — record it so the next pass counts this attempt dead at once, not after a TTL.

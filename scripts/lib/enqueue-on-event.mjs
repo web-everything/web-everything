@@ -437,19 +437,31 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = '
     later: candidates.slice(room).map((p) => p.num), skipped };
 }
 
+/** Last pass's phase timings, without the trailing verdict counts. PURE. */
+export function extractPassTimings(stderr) {
+  let timings = null;
+  for (const match of String(stderr ?? '').matchAll(/^merge-ai-prs · pass timings:[ \t]*([^\r\n(]+)/gm)) {
+    timings = match[1].trim() || null;
+  }
+  return timings;
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
-    let stdout = ''; let stderrTail = ''; let timedOut = false;
+    let stdout = ''; let stderr = ''; let timedOut = false;
+    const output = () => ({ stdout, stderrTail: stderr.slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
     onChild(child);
     child.stdout?.on('data', (d) => { stdout += d; });
-    child.stderr?.on('data', (d) => { stderrTail = (stderrTail + d).slice(-2000); });
+    // Keep the full stream: timing lines can span chunks and fall outside the diagnostic tail.
+    child.stderr?.setEncoding?.('utf8');
+    child.stderr?.on('data', (d) => { stderr += d; });
     const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
     killer.unref?.();
-    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, stdout, stderrTail, timedOut, error: String(e?.message || e) }); });
-    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, stdout, stderrTail, timedOut }); });
+    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, ...output(), error: String(e?.message || e) }); });
+    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, ...output() }); });
   });
 }
 
@@ -690,7 +702,7 @@ export function createEnqueueOnEvent({
           refillCatchUp();
         }
         const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
-        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]`);
+        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]${r.passTimings ? ` · phases: ${r.passTimings}` : ''}`);
         ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
       const task = finish().catch(e => {

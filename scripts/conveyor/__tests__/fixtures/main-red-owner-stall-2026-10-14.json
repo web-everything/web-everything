@@ -1,0 +1,64 @@
+{
+  "mainRuns": [
+    {
+      "databaseId": 38517780758,
+      "headSha": "28a7885f1",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "attempt": 1,
+      "createdAt": "2026-10-14T05:39:12Z",
+      "updatedAt": "2026-10-14T06:08:57Z"
+    },
+    {
+      "databaseId": 38517676708,
+      "headSha": "62da75ed3",
+      "status": "completed",
+      "conclusion": "failure",
+      "attempt": 1,
+      "createdAt": "2026-10-14T05:38:01Z",
+      "updatedAt": "2026-10-14T05:53:16Z"
+    },
+    {
+      "databaseId": 38507675165,
+      "headSha": "2ae04c1aa",
+      "status": "completed",
+      "conclusion": "success",
+      "attempt": 1,
+      "createdAt": "2026-10-14T03:42:57Z",
+      "updatedAt": "2026-10-14T04:06:39Z"
+    }
+  ],
+  "ledger": {
+    "62da75ed3": {
+      "at": 1791958196000,
+      "sessionSlug": "main-fix-62da75ed3",
+      "status": "dispatched"
+    }
+  },
+  "pr": {
+    "number": 5269,
+    "title": "fix red main",
+    "headRefName": "lane/main-fix-62da75ed3",
+    "headRefOid": "owner-head",
+    "createdAt": "2026-10-14T06:42:12Z",
+    "author": {
+      "login": "app/web-everything"
+    },
+    "state": "OPEN"
+  },
+  "ownerRun": {
+    "databaseId": 38523771925,
+    "headSha": "owner-head",
+    "status": "completed",
+    "conclusion": "failure",
+    "createdAt": "2026-10-14T06:42:16Z",
+    "updatedAt": "2026-10-14T06:57:52Z"
+  },
+  "manualRerun": {
+    "startedAt": "2026-10-14T10:28:00Z",
+    "completedAt": "2026-10-14T10:43:00Z",
+    "conclusion": "success"
+  },
+  "ownerNextHeadAt": "2026-10-14T10:48:00Z",
+  "$comment": "card 302: recorded stalled-owner episode; SHA prefixes identify the real commits."
+}

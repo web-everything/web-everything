@@ -33,7 +33,7 @@ import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
 import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
 import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
-import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -53,23 +53,7 @@ export { FIX_RUN_EXECUTORS };
  *  the pins also hold for anything git itself spawns). */
 export const HARDENED_GIT_ARGS = Object.freeze(laneGitConfigArgs());
 
-/** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
- *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
- *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
-const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
-export function riskyLaneConfig(listOutput) {
-  const parts = String(listOutput ?? '').split('\0');
-  const found = [];
-  for (let i = 0; i + 1 < parts.length; i += 2) {
-    const scope = parts[i];
-    if (scope !== 'local' && scope !== 'worktree') continue;
-    const [key, ...rest] = parts[i + 1].split('\n');
-    if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
-    else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
-  }
-  return found;
-}
+export { riskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 
 const PENDING_REARM_MAX_AGE_MS = 7 * 24 * 3_600_000;
 const pendingRearmDir = () => join(homedir(), '.claude', 'conveyor', 'fix-run-pending');
@@ -472,6 +456,33 @@ export function resolveRearmRefusalPolicy(env = process.env) {
   } catch { return { mode: 'noop', source: 'standard' }; }
 }
 
+export function resolveAcquireWaitPolicy(env = process.env) {
+  try {
+    const raw = env?.WE_FIX_RUN_ACQUIRE_WAIT_MS;
+    const r = cascadePolicy('fixRunAcquireWait', undefined, {
+      env, standard: { ms: 120000 },
+      envValues: { ms: raw === undefined || String(raw).trim() === '' ? undefined : Number(raw) },
+      valid: { ms: x => Number.isInteger(x) && x >= 0 },
+    });
+    return { ms: r.value.ms, source: r.sources?.ms ?? 'standard' };
+  } catch { return { ms: 120000, source: 'standard' }; }
+}
+
+/** Keep the actionable child diagnostic ahead of the ledger's length cap. */
+export function childFailureReason(err) {
+  const message = String(err?.message ?? err);
+  const lines = String(err?.stderr ?? '').split('\n').map(line => line.trim()).filter(Boolean);
+  if (!lines.length) return message;
+  const diagnostic = lines.filter(line => line.startsWith('✗')).at(-1) ?? lines.at(-1);
+  const command = message.split('\n')[0].replace(/^Command failed:\s*/, '');
+  const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const script = tokens.findIndex(token => /\.(?:mjs|cjs|js)["']?$/.test(token));
+  const short = script >= 0
+    ? [basename(tokens[script].replace(/^["']|["']$/g, '')), tokens[script + 1]?.startsWith('-') ? '' : tokens[script + 1]].filter(Boolean).join(' ')
+    : basename(tokens[0] ?? 'child');
+  return `${diagnostic} (${short})`;
+}
+
 /** Resolve the repair-only Gemini worker without changing delivery provider routing. */
 export async function resolveFixProvider(name) {
   if (name === 'antigravity') return (await import('./agy-fix-provider.mjs')).AGY_FIX_PROVIDER;
@@ -583,9 +594,11 @@ export async function runFixCli(argv = [], {
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, comments });
     }
+    const acquireWait = resolveAcquireWaitPolicy();
+    write(`fix-run: lane acquire wait ${acquireWait.ms}ms (${acquireWait.source})\n`);
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-      '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
+      `--wait-ms=${acquireWait.ms}`, '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
     ];
     const lanePath = parseAcquiredLanePath(run('node', poolArgs, { cwd: weRoot }));
     const laneNum = basename(lanePath).replace(/^lane-/, '');
@@ -831,7 +844,7 @@ export async function runFixCli(argv = [], {
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
-    outcome = 'failed'; reason = `${String(e?.message ?? e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    outcome = 'failed'; reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
     if (!finalMessage && e instanceof LauncherError) {
       finalMessage = e.message;
     }

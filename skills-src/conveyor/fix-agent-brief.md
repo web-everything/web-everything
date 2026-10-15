@@ -156,7 +156,12 @@ rulings. A finding marked "raised again" means the last fix did not hold: fix th
 same line again. Never re-argue a `not-real` ruling, and never work around a `block` ruling.
 
 **Reproduce it before you touch any code.** Run or write a test that FAILS for the exact reason the reviewer
-named, and show it red. Where the finding is observable on a real surface — a CLI dry-run, a read-only query, a
+named, and show it red. If an earlier commit already fixed the finding, run
+`node "{{WE_ROOT}}/scripts/operations/run.mjs" revert-red-check --checkout="$LANE" --base=<the commit before that fix>`
+and cite its output as the red proof. Never disable, comment out, or `if (false && …)` a guard, check, or test to
+produce a red run; a temporary revert is only done by `revert-red-check` (the auto-mode classifier denies hand
+removal as `[Security Weaken]` and then refuses the rest of the session, PR #5242).
+Where the finding is observable on a real surface — a CLI dry-run, a read-only query, a
 page render — probe that surface too and show the SAME failure there, not only in the test. Trim both outputs;
 you post them as evidence at step 6, alongside the after-fix run from step 4. **If you genuinely cannot
 reproduce the finding** — it does not repro on this HEAD, or the described behavior is not occurring — say so
@@ -247,6 +252,7 @@ one line>"` — never `stand-down.mjs`, which is terminal and reserved for a gen
 permission wall does not clear by waiting, so the reconciler surfaces it at once and holds retries for 60 minutes
 (`we:scripts/conveyor/reconcile-core.mjs#PERMISSION_BLOCKED_COOLOFF_MS`) until the product grows a sanctioned
 path. Keep `blocked-on-infra` (no `--denied`) for outages and rate limits.
+A `[Security Weaken]` classifier denial is caused by the attempted action (e.g. removing a guard), not by the later command it refuses — report that first denied action in `--denied`, not the later benign one.
 
 ```bash
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-permission --denied="<the exact denied command, one line>"

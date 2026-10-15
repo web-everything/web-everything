@@ -1,0 +1,12 @@
+{
+  "$comment": "One automatic retry after exhaustion when main moves or the wait expires; false restores the old behavior.",
+  "fixLoop": {
+    "exhaustedRetry": {
+      "enabled": true,
+      "onMainMove": true,
+      "maxRetries": 1,
+      "afterHours": 12,
+      "lookbackHours": 72
+    }
+  }
+}

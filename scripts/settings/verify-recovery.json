@@ -1,0 +1,7 @@
+{
+  "$comment": "Infra-only fix waits retry the same head without waking a fixer. After the cap, retain the wait and surface exhaustion for an operator. Gate budgets use the rebuild smoke load/core factor (max 4); fixed restores the former 30-minute ceiling. VERIFY_DISPATCH_TIMEOUT_MS remains an absolute override.",
+  "verify": {
+    "infraRetry": { "maxAttempts": 3, "backoffMinutes": 15 },
+    "gateCeiling": "load-scaled"
+  }
+}

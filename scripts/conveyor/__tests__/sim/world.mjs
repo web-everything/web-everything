@@ -21,7 +21,6 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
@@ -32,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
 import * as act from './agent-actions.mjs';
@@ -130,6 +130,11 @@ function buildWeTemplate() {
   configureRepo(work);
   git(work, ['add', '-A']);
   git(work, ['commit', '-q', '-m', 'sim template: scripts/ + skills-src/ + package.json snapshot']);
+
+  // Every world, lane and main-move scratch clone inherits this object database. Leave it packed rather than
+  // copying thousands of loose-object directory entries on every local clone. Repack synchronously BEFORE
+  // publishing the template; background auto-gc stays disabled so it cannot race a scenario's next clone.
+  git(work, ['repack', '-ad']);
 
   const bare = mkdtempSync(join(tmpdir(), 'sim-template-we-bare-'));
   rmSync(bare, { recursive: true, force: true }); // git clone --bare refuses an existing target dir
@@ -383,9 +388,8 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // is the flag that skips `npm ci`/`npm install` entirely (lane-pool.mjs's own `ensureDeps` call sites are
   // ALL gated on `!flags['no-install']`). Later live-smoke acquires do NOT pass that flag, so seed their
   // dependency readiness too: reuse this checkout's installed modules, just like the daemon clone above,
-  // and record the lane's lockfile hash in `.git/.lane-pool-deps` (the `depsReady` contract). Otherwise a
-  // rebuild tick runs a real `npm ci`, making these hermetic scenarios depend on the registry and exceed
-  // their timeout under CI load.
+  // and record the lane's lockfile hash in `.git/.lane-pool-deps` (the `depsReady` contract). The npm shim
+  // above covers later pool growth and fresh snapshots without downloading dependencies.
   // #4075 soak harness gap — `provision --acquirable` caps NEW clones per call at
   // `ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT` (4, `we:scripts/lane-pool.mjs`), so `createWorld({lanes: N})` for
   // N > 4 silently provisioned only 4 lanes (found building `breaks/lane-acquire-under-load.mjs`, which needs a
@@ -400,15 +404,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
       const poolDir = join(lanePoolRoot, pool.name);
       for (const lane of readdirSync(poolDir, { withFileTypes: true })) {
         if (!lane.isDirectory() || !/^lane-\d+$/.test(lane.name)) continue;
-        const laneRoot = join(poolDir, lane.name);
-        symlinkSync(nodeModulesSrc, join(laneRoot, 'node_modules'), 'dir');
-        // `node_modules/` in .gitignore excludes directories, not our symlink. Match the daemon clone's
-        // exclude above so list/acquire still sees clean lanes and git clean preserves the shared modules.
-        appendFileSync(join(laneRoot, '.git', 'info', 'exclude'), '\nnode_modules\n');
-        const lock = join(laneRoot, 'package-lock.json');
-        const manifest = existsSync(lock) ? lock : join(laneRoot, 'package.json');
-        const hash = createHash('sha256').update(readFileSync(manifest)).digest('hex');
-        writeFileSync(join(laneRoot, '.git', '.lane-pool-deps'), hash);
+        seedLaneDependencies(join(poolDir, lane.name), nodeModulesSrc);
       }
     }
   }
