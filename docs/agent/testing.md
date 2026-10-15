@@ -1,10 +1,46 @@
 # Testing — Three-Tier Strategy
 
+## Codex usage accounting
+
+Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
+seat appends through `scripts/lib/codex-usage-ledger.mjs`. The default ledger is
+`<daemonConveyorStateRoot>/codex-usage.jsonl`; `WE_CODEX_USAGE_LEDGER` overrides the file.
+Direct CLI attribution flags are `--caller`, `--repo`, `--pr`, `--card`, and
+`--usage-task-kind` (an accounting label that preserves model routing).
+Redirect the ledger to a temporary file in tests. Append/probe failures must preserve the launch's result
+or original error. Unknown tokens, quota, file changes, and exit codes stay null; quota resets have no delta.
+Persist repository identities as `owner/name`, stripping remote credentials, queries, and fragments.
+Worker-writable snapshots use the shared Git hardening, refuse lane-defined filters, and never read
+worktree contents or run Git diff/conversion commands. Fingerprints include HEAD, index entries,
+and nanosecond file metadata; touches can count as changes. Snapshot limits are 4096 untracked
+paths, 65536 tracked entries, 8 MiB per Git output, and a five-second budget. Lazy fetch is disabled;
+submodules, sparse directory entries, and unsafe or incomplete snapshots record unknown file changes.
+Delivery providers accept `usageTaskKind` separately from routing `taskKind`.
+Quota is sampled from the newest persisted Codex rollout observations, so ephemeral runs may
+have no fresh observation and concurrent runs can contribute to the observed bucket delta.
+`node scripts/codex-usage-report.mjs --since=24h` (or `--json`) reads without launching Codex.
+Cached input is a subset of input; reasoning is a subset of output when reported, not additive spend.
+
+
 > Tier-1 reference. Read when writing or changing tests.
 
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
+
+## Model routing retry verification
+
+Codex `modelByTask` resolves model, effort and the optional `retry` array as independent cascade
+leaves. Each retry pair must use a catalogue model and one of its supported efforts; `[]` disables
+same-provider retries. Cover standard, platform, tool and env provenance, invalid pair rejection,
+and the actual launch sequence before Claude fallback. Routing-policy model vetoes must survive
+settings expansion at the launch boundary. Only a definite pre-launch `notApplied` refusal advances
+the chain; an indeterminate or already-started launch must never start a second worker.
+Repair defaults (`operations.fix`, `operations.ci-heal`, `taskTypes.bugfix`) keep `inherit: true`
+at high effort so evidence routing, backend holds and fixer escalation remain effective. Assert the
+Codex retry order through `codex.modelByTask` settings; use an explicit route fixture for launch-boundary tests.
+Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
+per-lens design models still override the helper default.
 
 ## Wrapped worker verification waits
 
@@ -57,7 +93,10 @@ derive their roots from `import.meta.url`. Daemon clones remain read-only launch
 test snapshots every launch-checkout file, including `.git`, across success and pre-worker failure.
 Prepare edits only the target card body and preparation stamps, never claims/resolves it, and verifies
 the runner-authored stamp before opening a parked PR. Its implementation scope does not bound preparation;
-the card path does. Decision preparation remains a Claude judgment role.
+the card path does. `prepare.runner=codex` passes that card path to routing; `scope` retains implementation-scope
+gating, and `claude` forces the daemon fallback. Use a named critical gate file (for example,
+`scripts/lib/dispatch-contracts.mjs`) in scope-gating fixtures: arbitrary `scripts/lib/` files are not
+critical by directory alone. Decision preparation remains a Claude judgment role.
 Flash keeps the Codex read-only checker; a checker refusal undoes the attempt.
 `test-fix` uses Flash without a separate simple flag and refuses non-test worker diffs.
 The CI-heal decision currently has no structured failing-file list; do not infer one from check names.

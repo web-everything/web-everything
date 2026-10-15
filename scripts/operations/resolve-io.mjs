@@ -1,3 +1,4 @@
+import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/operations/resolve-io.mjs
  * @description THE IO SHELL of the `resolve` declaration (#xrrpfo7) — the reader its `read` step is injected
@@ -167,7 +168,7 @@ export function createResolveReader({
         // guard. This is the third finding on this operation with one root — re-deriving a predicate
         // instead of reading the home that owns it.
         const st = readField(body, 'status') || 'open';
-        if (st !== 'resolved') openChildren.push({ num: idFromName(f), status: st });
+        if (!isTerminalStatus(st)) openChildren.push({ num: idFromName(f), status: st });
       }
     }
 

@@ -26,3 +26,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 ## Also raised by
 
 - Also raised by web-everything/web-everything#5074 (finding 2: `we:backlog/4648-reconcile-dead-build-run-records-even-after-their-dispatch-c.md:24` — Add a check:standards rule that resolves we:path:line citations in backlog cards against preparedAgainstSha and flags a cited line that is blank or a bare closing brace.)
+- Also raised by web-everything/web-everything#5315 (finding 1: `we:backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md:56` — Add a lint to check:standards that resolves we:path:N-M citations in backlog cards and verifies the cited range contains the named symbol or title. Until then, cite by test name.)

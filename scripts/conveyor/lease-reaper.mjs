@@ -97,7 +97,8 @@ import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { liveAgentInLane } from '../lib/lane-salvage.mjs';
 // #3903 — a mechanical dispatch's detached wrapper holds its lease; its `pid:<n>` handle lives in the run store.
 import { detachedHandlePid } from '../operations/detached-dispatch.mjs';
-import { createFileRunStore } from '../operations/run-store.mjs';
+import { createFileRunStore, resolveRunsDir } from '../operations/run-store.mjs';
+import { readDetachedWrapperPidsIndexed, resolveRunScanSettings } from './lease-reaper-run-index.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../operations/dispatch-lane.mjs';
 // #4415 — live incident 2026-09-29: this file's own `gh pr list --state all` (below) was a bare `execFileSync`,
 // invisible to `gh-throttle.mjs`'s attribution log AND paid out of the small GraphQL bucket — one call per
@@ -1370,6 +1371,33 @@ export function readDetachedWrapperPids(store = createFileRunStore()) {
   return bySession;
 }
 
+/** Card 311: default to the incremental index; full opts out, and index failures fall back to full. */
+export function readWrapperPidsForPass({ env = process.env, log = (m) => console.error(m) } = {}) {
+  const settings = resolveRunScanSettings(env);
+  const started = Date.now();
+  let mode = settings.mode;
+  let result;
+  if (mode === 'index') {
+    try {
+      const dir = resolveRunsDir();
+      result = readDetachedWrapperPidsIndexed({ dir, maxAgeMs: settings.maxAgeMs });
+    } catch { mode = 'full'; }
+  }
+  if (!result) {
+    const store = createFileRunStore();
+    const stats = { listed: 0, parsed: 0, reused: 0, skippedOld: 0, ms: 0 };
+    const bySession = readDetachedWrapperPids({
+      list: () => { const ids = store.list(); stats.listed = ids.length; return ids; },
+      read: (id) => { stats.parsed++; return store.read(id); },
+    });
+    stats.ms = Date.now() - started;
+    result = { bySession, stats };
+  }
+  const { listed, parsed, reused, skippedOld, ms } = result.stats;
+  log(`lease-reaper: run scan mode=${mode} (source ${settings.source.mode}) listed=${listed} parsed=${parsed} reused=${reused} skippedOld=${skippedOld} in ${ms}ms`);
+  return result.bySession;
+}
+
 /** #4370 — the actor name the reaper stamps on the journal line its `release` child writes. */
 export const LEASE_REAPER_ACTOR = 'lease-reaper';
 
@@ -1454,7 +1482,7 @@ function main(argv) {
   const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
   // #3903 — ONE read of the run store for every in-flight detached-wrapper pid. Best-effort: an unreadable
   // store or record leaves the map empty/partial, which only means the old (listing-only) behaviour applies.
-  const wrapperPids = readDetachedWrapperPids();
+  const wrapperPids = readWrapperPidsForPass({ env: process.env, log });
 
   // Collect every held lease across the scanned pools into flat candidates, tagging each with the repo key ITS
   // POOL names (#xr4ygg7 — ground truth; see repoKeyForPool's own docblock for why this, never the session, is

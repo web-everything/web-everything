@@ -26,6 +26,12 @@
  * 5748 (2026-10-11): legacy `review-status:*` writes stay on (LEGACY_REVIEW_STATUS_DEFAULT) until their readers
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
+import { loadPrStatusSettings, prStatusSettingValues } from './pr-status-settings.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 import { readLiveFixClaim, FIX_DRAFT_REASONS } from './fix-procedure.mjs';
@@ -41,6 +47,14 @@ import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from '
 
 /** Compatibility default while dispatch and hold readers still use review-status labels. */
 export const LEGACY_REVIEW_STATUS_DEFAULT = true;
+
+// No network from the label writer; the planner owns the live required-check read.
+const readCachedRequiredChecks = ({ repo }) => getRequiredStatusChecks({
+  repo,
+  // The planner refreshes the cache. Preserve declared/unavailable provenance even after its TTL expires.
+  ttlMs: Infinity,
+  readChecks: () => { throw new Error('required-status-checks: cache-only read in the status tagger'); },
+});
 
 /** Matches this module's own label shape, and only this shape.
  *
@@ -222,7 +236,7 @@ export function describeReviewState({ labels = [], status = null } = {}) {
  * (`we:skills-src/conveyor/review-daemon.mjs#runReviewTick`, wired to reuse it) passes it straight through.
  * Omitting either (the default, and every pre-existing caller/test) reads fresh, byte-identical to before
  * these options existed.
- * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function, legacyReviewStatus?:boolean}} o
+ * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function, excuseMergeGate?:Function, legacyReviewStatus?:boolean}} o
  * @returns {{changed:boolean, label:string|null, removed:string[], reviewState:{code:string, text:string}|null}}
  */
 // x26lw6u — the default listing includes live review JOBS (`we:scripts/operations/review-job.mjs`): a review no
@@ -242,6 +256,11 @@ export function tagReviewStatus({
   // `null` (a standalone CLI call) leaves any `status:*` label untouched: without the plan it cannot be derived.
   planRows = null,
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
+  requiredChecks, prStatusSettings,
+  readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
+  excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
+    repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
+  })[0],
 } = {}) {
   const repoKey = repo === undefined ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`review-status-tag: --repo ${repo} is not a constellation repo`);
@@ -267,7 +286,26 @@ export function tagReviewStatus({
   let prStatus;
   const applyPrStatus = () => {
     if (!Array.isArray(planRows)) return;
-    const state = derivePrStatusLabel({ pr: { ...(subject ?? {}), labels: currentLabels }, labels: currentLabels, reviewStatus: status, rows: planRows, defaultBranch });
+    if (requiredChecks === undefined) {
+      requiredChecks = null; // Unknown requirements must never filter a CI refusal into a review signal.
+      try {
+        const result = readRequiredChecks({ repo });
+        if (['live', 'cache', 'stale-cache'].includes(result?.source)) requiredChecks = result.checks ?? null;
+      } catch { /* Keep requirements unknown; the pure core still recognises fallback failures. */ }
+    }
+    if (prStatusSettings === undefined) {
+      try { prStatusSettings = prStatusSettingValues(loadStatusSettings()); } catch { /* Pure core retains its defaults. */ }
+    }
+    let statusSubject = { ...(subject ?? {}), labels: currentLabels };
+    const mergeGate = collapseRollupToLatestPerName(statusSubject.statusCheckRollup).find(row => row.name === 'merge-gate');
+    const conclusion = String(mergeGate?.conclusion ?? '').toLowerCase();
+    if (FAILING_CONCLUSIONS.includes(conclusion) || conclusion === 'error') {
+      // Apply the planner's head-bound evidence to the raw daemon snapshot too.
+      // Unreadable evidence retains the original failing checks (fail closed).
+      try { statusSubject = excuseMergeGate(statusSubject, { repo }); } catch { /* Keep the raw subject. */ }
+    }
+    const state = derivePrStatusLabel({ pr: statusSubject, labels: currentLabels,
+      reviewStatus: status, rows: planRows, defaultBranch, requiredChecks, settings: prStatusSettings });
     const sp = planPrStatusLabel({ state, currentLabels });
     prStatus = state ? `status:${state}` : null;
     if (sp.add || sp.remove.length) {

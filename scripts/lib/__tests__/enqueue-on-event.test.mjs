@@ -11,6 +11,7 @@ import {
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
+import * as enqueueModule from '../enqueue-on-event.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -42,8 +43,9 @@ function setup(extra = {}) {
     child.kill = () => true;
     child.finish = () => queueMicrotask(() => {
       const num = Number(args.find(a => a.startsWith('--only=')).slice('--only='.length));
-      const result = extra.drainResult ? extra.drainResult(num) : { considered: 1, toMerge: [{ num }], failed: [], skipReasons: [] };
+      const result = extra.drainResult ? extra.drainResult(num) : extra.drainJson ?? { considered: 1, toMerge: [{ num }], failed: [], skipReasons: [] };
       child.stdout.emit('data', `${JSON.stringify(result)}\n`);
+      if (extra.drainStderr) child.stderr.emit('data', extra.drainStderr);
       queueMicrotask(() => child.emit('close', 0));
     });
     children.push(child);
@@ -55,6 +57,7 @@ function setup(extra = {}) {
     now: () => time, spawnImpl, log: (line) => lines.push(line),
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
     readPr: async () => READY_PR,
+    readMembership: async () => ({ ok: true, inQueue: true, entry: { position: 1, state: 'QUEUED' }, lastEvents: [] }),
     ...extra,
   });
   return { handle, calls, lines, children, advance: (ms) => { time += ms; } };
@@ -271,7 +274,7 @@ describe('createEnqueueOnEvent', () => {
     handle.notePoll({ ok: true, marked: [mark()] });
     advance(15_000);
     await expect(handle.tick()).resolves.toEqual([{
-      num: 42, code: null, what: 'could not run (fake spawn failure)',
+      num: 42, code: null, what: 'could not run (fake spawn failure)', verified: null,
     }]);
     expect(lines.some((line) => line.includes('#42') && line.includes('could not run'))).toBe(true);
     expect(handle.pending()).toEqual([]);
@@ -951,4 +954,262 @@ it('uses oldest-ready fallback when acceptance history cannot be read', async ()
   }) });
   await handle.catchUp();
   expect(calls.map(c => c.args[1])).toEqual(['--only=8', '--only=7']);
+});
+
+
+describe('actual enqueue outcomes and membership', () => {
+  const membershipSetup = (extra = {}) => catchUpSetup({ readCandidates: async () => ({ ok: true, prs: [candidate(42)], queued: 0 }), ...extra });
+  it('reports the live batching deferral instead of the pre-enqueue toMerge verdict', () => {
+    expect(summarizeFastDrain({ toMerge: [{ num: 5025 }], enqueueOutcomes: [{ num: 5025, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'queue holds 2 group(s) (max 2)' }] }, 5025))
+      .toBe('not enqueued: batching-deferred: queue holds 2 group(s) (max 2)');
+  });
+
+  it('uses recorded success, already queued, missing outcomes and legacy results', () => {
+    const enqueued = 'passed every drain gate — enqueued';
+    expect(summarizeFastDrain({ enqueueOutcomes: [{ num: 42, outcome: 'enqueued', already: false }] }, 42)).toBe(enqueued);
+    expect(summarizeFastDrain({ enqueueOutcomes: [{ num: 42, outcome: 'enqueued', already: true }] }, 42)).toBe(enqueued + ' (already queued)');
+    expect(summarizeFastDrain({ toMerge: [{ num: 42 }], enqueueOutcomes: [] }, 42)).toBe('not enqueued: no enqueue outcome recorded');
+    expect(summarizeFastDrain({ toMerge: [{ num: 42 }] }, 42)).toBe(enqueued);
+    expect(summarizeFastDrain({ enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: 'x'.repeat(300) }] }, 42).length).toBeLessThanOrEqual(200);
+  });
+
+  it.each([false, true])('verifies a legacy enqueue claim against GitHub (inQueue=%s)', async (inQueue) => {
+    const reads = [];
+    const { handle, lines } = membershipSetup({ readMembership: async (args) => {
+      reads.push(args); return { ok: true, inQueue, entry: { position: 2, state: 'QUEUED' }, lastEvents: [] };
+    } });
+    const ran = await handle.catchUp();
+    expect(reads).toEqual([{ repo: REPO, num: 42 }]);
+    expect(ran[0].verified).toBe(inQueue);
+    expect(ran[0].what).toContain(inQueue ? 'verified: isInMergeQueue=true, position 2, state QUEUED' : 'NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false');
+    expect(lines.some(line => line.includes(ran[0].what))).toBe(true);
+    expect(handle.misses().get(42)).toBe(inQueue ? undefined : 1);
+  });
+
+  it('counts consecutive misses, logs at each threshold, retries, and resets on verified success', async () => {
+    let inQueue = false;
+    const { handle, lines, advance } = membershipSetup({ readMembership: async () => ({ ok: true, inQueue, lastEvents: [] }) });
+    for (let i = 0; i < 3; i++) { await handle.catchUp(); advance(600_000); }
+    expect(handle.misses().get(42)).toBe(3);
+    expect(lines.filter(line => line.includes('SMELL enqueue-not-entering'))).toHaveLength(1);
+    for (let i = 0; i < 3; i++) { await handle.catchUp(); advance(600_000); }
+    expect(lines.filter(line => line.includes('SMELL enqueue-not-entering'))).toHaveLength(2);
+    const snapshot = handle.misses(); snapshot.clear();
+    expect(handle.misses().get(42)).toBe(6);
+    inQueue = true;
+    await handle.catchUp();
+    expect(handle.misses().has(42)).toBe(false);
+  });
+
+  it('includes queue timeline evidence and the collapsed last 300 stderr characters in a miss', async () => {
+    const { handle } = membershipSetup({ drainStderr: 'x'.repeat(400) + '\n batching   blocked',
+      readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-10-14', reason: 'checks failed' }] }),
+    });
+    const [ran] = await handle.catchUp();
+    expect(ran.what).toContain('RemovedFromMergeQueueEvent at 2026-10-14: checks failed');
+    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(400) + ' batching blocked').slice(-300));
+  });
+
+  it('does not count failed membership reads as misses', async () => {
+    const { handle } = membershipSetup({ readMembership: async () => ({ ok: false, error: 'HTTP 504' }) });
+    const ran = await handle.catchUp();
+    expect(ran[0]).toMatchObject({ verified: null, what: 'passed every drain gate — enqueued (unverified: HTTP 504)' });
+    expect(handle.misses().size).toBe(0);
+  });
+
+  it('stops remaining catch-up admissions on batching deferral but runs event-origin PRs', async () => {
+    const drains = [];
+    const { handle, lines, advance } = membershipSetup({
+      readCapacity: () => ({ capacity: 3, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 1), candidate(44, 2)] }),
+      spawnImpl: (_command, args) => {
+        const num = Number(args[1].split('=')[1]); drains.push(num);
+        if (drains.length === 1) { handle.notePoll({ ok: true, marked: [mark(99)] }); advance(15_000); }
+        const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => true;
+        queueMicrotask(() => {
+          child.stdout.emit('data', JSON.stringify({ toMerge: [{ num }], enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'queue holds 2 group(s) (max 2)' }] }));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+    await handle.tick();
+    expect(drains).toEqual([42, 99]);
+    expect(handle.pending()).toEqual([]);
+    expect(lines).toContain('enqueue-on-event: catch-up stopping this round — batching deferred #42 (queue holds 2 group(s) (max 2)); 2 PR(s) retried at the next catch-up');
+    expect(handle.misses().get(42)).toBe(1);
+    advance(600_000);
+    await handle.tick();
+    expect(drains).toEqual([42, 99, 42]);
+  });
+
+  it('resolves the miss threshold and falls back on invalid settings', () => {
+    const s = resolveSetting({ catchUp: { missSmellAfter: 5 } });
+    expect(s.catchUp.missSmellAfter).toBe(5);
+    expect(s.line).toContain('catchUp.missSmellAfter=5 (tool)');
+    for (const missSmellAfter of [0, -1, 'x']) {
+      const invalid = resolveSetting({ catchUp: { missSmellAfter } });
+      expect(invalid.catchUp.missSmellAfter).toBe(3);
+      expect(invalid.invalid.join(' ')).toContain('catchUp.missSmellAfter=');
+    }
+  });
+
+  it('reads queue entry and recent timeline through repo-scoped GraphQL', async () => {
+    const pr = { isInMergeQueue: false, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', reason: 'checks failed', createdAt: '2026-10-14' }] } };
+    const result = await enqueueModule.readMergeQueueMembership({ repo: REPO, num: 42, env: {}, execFileImpl: (cmd, args, opts, cb) => {
+      expect(cmd).toBe('gh'); expect(args).toContain('owner=web-everything'); expect(args).toContain('name=web-everything');
+      const query = args.find(a => a.startsWith('query='));
+      expect(query).toContain('pullRequest(number:42)'); expect(query).toContain('isInMergeQueue');
+      expect(query).toContain('ADDED_TO_MERGE_QUEUE_EVENT'); expect(query).toContain('REMOVED_FROM_MERGE_QUEUE_EVENT');
+      expect(opts.env).toEqual({}); cb(null, JSON.stringify({ data: { repository: { pullRequest: pr } } }));
+    } });
+    expect(result).toEqual({ ok: true, inQueue: false, entry: null, lastEvents: pr.timelineItems.nodes });
+  });
+
+  it.each(['throw', 'errors', 'missing', 'invalid'])('never throws on a membership read failure (%s)', async (mode) => {
+    const result = await enqueueModule.readMergeQueueMembership({ repo: REPO, num: 42, execFileImpl: (_cmd, _args, _opts, cb) => {
+      if (mode === 'throw') throw new Error('spawn failed');
+      cb(null, mode === 'errors' ? '{"errors":[{"message":"denied"}]}' : mode === 'missing' ? '{"data":{"repository":{}}}' : 'oops');
+    } });
+    expect(result).toMatchObject({ ok: false, error: expect.any(String) });
+  });
+});
+
+
+describe('BLOCKED catch-up back-off', () => {
+  const reason = 'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase; required-checks-not-successful: merge-gate (failure); merge-gate hold review-acceptance not cleared on this head';
+  const head = { ...READY_PR, headRefOid: 'abcdef123456789', statusCheckRollup: [...READY_PR.statusCheckRollup, { context: 'merge-gate', state: 'FAILURE' }] };
+  const blockedSetup = (extra = {}) => catchUpSetup({
+    resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 2 } }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(5193, 0), candidate(42, 1), candidate(43, 2), candidate(44, 3)] }),
+    readPr: async () => head,
+    drainResult: num => num === 5193 ? { considered: 1, skipReasons: [{ num, reason }] } : { toMerge: [{ num }] },
+    ...extra,
+  });
+  const nums = calls => calls.map(c => Number(c.args[1].split('=')[1]));
+
+  it('resolves the default, cascade overrides, zero, and invalid leaves', () => {
+    expect(ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds).toBe(6);
+    expect(resolveSetting().catchUp.blockedBackoffRounds).toBe(6);
+    expect(resolveSetting({}, { platform: { catchUp: { blockedBackoffRounds: 4 } } }).catchUp.blockedBackoffRounds).toBe(4);
+    for (const blockedBackoffRounds of [0, 2]) {
+      const s = resolveSetting({ catchUp: { blockedBackoffRounds } });
+      expect(s.catchUp.blockedBackoffRounds).toBe(blockedBackoffRounds);
+      expect(s.line).toContain(`catchUp.blockedBackoffRounds=${blockedBackoffRounds} (tool)`);
+    }
+    for (const blockedBackoffRounds of [-1, 1.5, 'x', true]) {
+      const s = resolveSetting({ catchUp: { blockedBackoffRounds } });
+      expect(s.catchUp.blockedBackoffRounds).toBe(6);
+      expect(s.invalid.join(' ')).toContain('catchUp.blockedBackoffRounds=');
+    }
+  });
+
+  it('signs the head and sorted check states, and returns null for unreadable heads', () => {
+    const signature = enqueueModule.prHeadSignature(head);
+    expect(signature).toEqual(enqueueModule.prHeadSignature({ ...head, statusCheckRollup: [...head.statusCheckRollup].reverse() }));
+    expect(signature).not.toEqual(enqueueModule.prHeadSignature({ ...head, headRefOid: 'different' }));
+    expect(signature).not.toEqual(enqueueModule.prHeadSignature({ ...head, statusCheckRollup: [{ ...head.statusCheckRollup[0], conclusion: 'FAILURE' }] }));
+    for (const pr of [null, undefined, {}, { headRefOid: '' }, { headRefOid: 42 }]) expect(enqueueModule.prHeadSignature(pr)).toBeNull();
+  });
+
+  it('reads the head SHA with the wake checks', async () => {
+    await enqueueModule.readPrForWake({ repo: REPO, num: 5193, execFileImpl: (_cmd, args, _opts, cb) => {
+      expect(args[args.indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRefOid', 'statusCheckRollup']));
+      cb(null, JSON.stringify(head));
+    } });
+  });
+
+  it('continues and refills every round, skips the next N listings, then retries and re-arms', async () => {
+    const { handle, calls, lines, advance } = blockedSetup();
+    await handle.catchUp();
+    expect(nums(calls)).toEqual([5193, 42, 43, 44]);
+    expect(handle.blocked().has(5193)).toBe(true);
+    handle.blocked().clear();
+    expect(handle.blocked().has(5193)).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      advance(600_000);
+      const ran = await handle.catchUp();
+      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: expect.stringMatching(/^backed off:/) });
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+      expect(nums(calls).slice(-3)).toEqual([42, 43, 44]);
+      expect(lines).toContain(`enqueue-on-event: catch-up #5193 — backed off: BLOCKED at head abcdef123 (${2 - i} of 2 catch-up(s) left; retried sooner if its head or checks change)`);
+      await handle.tick(); // another tick is not another listing
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+    }
+    advance(600_000);
+    await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(true);
+  });
+
+  it.each(['head', 'checks', 'unreadable'])('retries when the %s changes', async (change) => {
+    let pr = head;
+    const { handle, calls, advance } = blockedSetup({ readPr: async () => pr });
+    await handle.catchUp(); advance(600_000);
+    pr = change === 'head' ? { ...head, headRefOid: 'new-head' } : change === 'checks' ? { ...head, statusCheckRollup: [{ ...head.statusCheckRollup[0], conclusion: 'FAILURE' }] } : null;
+    await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    if (!pr) expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it('disables back-off at zero', async () => {
+    const { handle, calls, advance } = blockedSetup({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 0 } }) });
+    await handle.catchUp(); advance(600_000); await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().size).toBe(0);
+  });
+
+  it('runs an event wake despite back-off and clears it on enqueue', async () => {
+    let blocked = true;
+    const { handle, calls, advance } = blockedSetup({ drainResult: num => blocked && num === 5193 ? { skipReasons: [{ num, reason }] } : { toMerge: [{ num }] } });
+    await handle.catchUp();
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(true);
+    blocked = false;
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('only backs off the targeted gate skips (%s)', async (skip) => {
+    const { handle, calls, advance } = blockedSetup({ drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
+    await handle.catchUp(); advance(600_000); await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(skip.startsWith('merge-gate hold') ? 1 : 2);
+  });
+
+  it('bypasses back-off for an event folded into retained catch-up work', async () => {
+    let closeDuringRead = false;
+    let allowed = true;
+    const { handle, calls, advance } = blockedSetup({ allowed: () => allowed, readPr: async ({ num }) => {
+      if (num === 5193 && closeDuringRead) allowed = false;
+      return head;
+    } });
+    await handle.catchUp(); advance(600_000);
+    closeDuringRead = true;
+    await handle.catchUp();
+    expect(handle.pending().some(p => p.num === 5193 && p.catchUp)).toBe(true);
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    closeDuringRead = false; allowed = true;
+    await handle.tick();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+  });
+
+  it.each(['CLOSED', 'MERGED', 'unlabeled'])('clears back-off on a %s wake read', async (state) => {
+    let pr = head;
+    const { handle, advance } = blockedSetup({ readPr: async () => pr });
+    await handle.catchUp();
+    pr = state === 'unlabeled' ? { ...head, labels: [] } : { ...head, state };
+    handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
+    await handle.tick();
+    expect(handle.blocked().has(5193)).toBe(false);
+  });
+
+  it('clears entries for PRs absent from the next listing', async () => {
+    let prs = [candidate(5193)];
+    const { handle, advance } = blockedSetup({ readCandidates: async () => ({ ok: true, queued: 0, prs }) });
+    await handle.catchUp(); prs = []; advance(600_000); await handle.catchUp();
+    expect(handle.blocked().size).toBe(0);
+  });
 });
