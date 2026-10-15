@@ -328,10 +328,10 @@ export async function probeAndOwnMainCi({
     // unreadable) shows only as attempt > 1. A ledgered run of another kind (the cancelled tip) was never a settled red, so it stays out.
     const kind = reruns[run.databaseId]?.kind;
     if (kind != null ? !['flake', 'owner-stalled'].includes(kind) : !(Number(run.attempt) > 1)) continue;
-    // The rerun replaces the original verdict: while it runs the run stays red, and a flake rerun that finishes with no
+    // The rerun replaces the original verdict: while it runs the run stays red, and a rerun that finishes with no
     // verdict (cancelled / skipped / infra-only) must not erase the failure it was meant to settle.
     if (run.status !== 'completed') run.rerunPending = true;
-    else if (kind !== 'owner-stalled') run.rerunInconclusive = true;
+    else run.rerunInconclusive = true;
   }
   const state = mainRedState(probe.runs, { tip: probe.tip });
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };

@@ -121,6 +121,49 @@ describe('card 302 stalled red-main owner replay', () => {
   });
 });
 
+describe('inconclusive main rerun recovery', () => {
+  const outcomes = [
+    { name: 'cancelled', conclusion: 'cancelled' },
+    { name: 'skipped', conclusion: 'skipped' },
+    { name: 'infra-only', conclusion: 'failure', infraOnly: true },
+  ];
+  const cases = ['owner-stalled', 'flake', 'manual'].flatMap((kind) => outcomes.map((outcome) => ({ kind, ...outcome })));
+
+  it.each(cases)('preserves red main after a $kind rerun is $name and resumes escalation', async ({ kind, conclusion, infraOnly }) => {
+    const runs = facts.mainRuns.map((run) => run.databaseId === 38517676708
+      ? { ...run, status: 'completed', attempt: 2, conclusion, infraOnly } : run);
+    // Flake retries are exhausted; manual reruns have no ledger entry.
+    const reruns = kind === 'manual' ? {} : { 38517676708: { kind, rounds: kind === 'flake' ? core.FLAKE_RERUN_ROUNDS : 1 } };
+    const { result, rerun } = await replay('08:28:00', { runs, reruns, dryRun: false });
+    expect(core.mainRedState(result.runs)).toMatchObject({ status: 'red', firstRed: { runId: 38517676708 } });
+    expect(result.mainRed).toMatchObject({ red: true, firstRedSha: '62da75ed3' });
+    expect(result.ownerStall).toMatchObject({ stalled: true, reason: 'owner-ci-red' });
+    expect(result.escalation).toMatchObject({ n: 2 });
+    expect(result.recovery).toMatchObject({ kind: 'revert-proposal', sha: '62da75ed3' });
+    expect(rerun).not.toHaveBeenCalled();
+    const { default: smell } = await import('../health-smells/main-ci-red-owner-stalled.mjs');
+    expect(smell.evaluate({ mainCiRuns: result }, { now: at('08:28:00'), config: isolated })[0].breach).toBe(true);
+    expect(mainSmell.evaluate({ mainCiRuns: result }, { now: at('08:28:00'), config: isolated, quarantineSafetyNet: null })[0].breach).toBe(true);
+  });
+
+  it.each(outcomes)('does not invent a red verdict for a cancelled-tip rerun that is $name', async ({ conclusion, infraOnly }) => {
+    const runs = facts.mainRuns.filter((run) => run.databaseId !== 38517676708).map((run) => run.databaseId === 38517780758
+      ? { ...run, attempt: 2, conclusion, infraOnly } : run);
+    const { result } = await replay('08:28:00', { runs, reruns: { 38517780758: { kind: 'cancelled-tip' } } });
+    expect(core.mainRedState(result.runs).status).toBe('green');
+    expect(result.decision.reason).toBe('main-green');
+  });
+
+  it.each(['same run', 'newer run'])('clears red main when a %s succeeds after owner-stalled recovery', async (success) => {
+    const runs = facts.mainRuns.map((run) => run.databaseId === 38517676708
+      ? { ...run, attempt: 2, conclusion: success === 'same run' ? 'success' : 'cancelled' } : run);
+    if (success === 'newer run') runs.push({ ...facts.mainRuns[2], databaseId: 99, headSha: 'recovered', createdAt: '2026-10-14T08:20:00Z' });
+    const { result } = await replay('08:28:00', { runs, reruns: { 38517676708: { kind: 'owner-stalled' } } });
+    expect(core.mainRedState(result.runs).status).toBe('green');
+    expect(result.decision.reason).toBe('main-green');
+  });
+});
+
 describe('card 302 pure boundaries', () => {
   it('uses deadlines and finished-run timestamps, failing closed on unknown progress', () => {
     expect(assess().stalled).toBe(true);
