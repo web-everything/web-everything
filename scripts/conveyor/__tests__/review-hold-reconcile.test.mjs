@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
-import { restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
+import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
 // The REAL #4535 measurement (card xu7kxtt): a cleared-human accept on an older head, the merge queue moved the head, the drain re-parked.
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
@@ -575,4 +575,31 @@ it('re-reads the PR before posting, so an objection made during the numbering pr
   expect(p.calls.postComment).toEqual([]);
   expect(p.calls.set).toEqual([]);
   _resetNumberingRestampMemo();
+});
+
+// Operator block (#5233, head 8265716f7): a re-stamp record written over a hold before it is withdrawn on any PR,
+// whatever its labels — a changes verdict or a human park would otherwise keep the sweep away from it for good.
+describe('numbering re-stamp withdrawal on label-held PRs', () => {
+  const FROM = 'b'.repeat(40);
+  const accept = { author: { login: 'chalbert' }, createdAt: '2026-10-12T10:00:00Z',
+    body: `✅ review — human cleared\n<!-- reviewed-sha: ${FROM} -->\n<!-- cleared-human: chalbert -->` };
+  const objection = { author: { login: 'chalbert' }, body: 'Do not land this. I found a bug and am preparing findings.' };
+  const record = { author: { login: 'chalbert' }, id: 'IC_stranded', body: buildNumberingRestampBody({
+    fromSha: FROM, toSha: 'a'.repeat(40), human: true, actor: 'chalbert', proofReason: 'verified', writer: 'review-daemon' }) };
+  it.each([[['review:changes']], [['review:human']], [['review:pending', 'review:held-mechanical']]])(
+    'reaches a stranded record under %j', (labels) => {
+      const seen = [];
+      const result = sweepFixture({ repo: 'o/n', provider: provider(),
+        listPrs: () => [{ ...pr(5025, labels), comments: [accept, objection, record] }],
+        numberingRestamp: (opts) => { seen.push(opts.pr); return { action: 'withdrawn', reason: 'withdrawn' }; } });
+      expect(seen).toEqual([5025]);
+      expect(result).toContainEqual({ num: 5025, numberingRestamp: 'withdrawn', detail: 'withdrawn' });
+    });
+  it('leaves a label-held PR with no stranded record alone', () => {
+    const seen = [];
+    sweepFixture({ repo: 'o/n', provider: provider(),
+      listPrs: () => [{ ...pr(5025, ['review:changes']), comments: [accept, record, objection] }],
+      numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
+    expect(seen).toEqual([]);
+  });
 });

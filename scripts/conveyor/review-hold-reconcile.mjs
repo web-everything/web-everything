@@ -49,6 +49,8 @@
  *
  * The one label-add exception: a numbering-only head move proven by scripts/lib/numbering-carry.mjs carries
  * the existing acceptance, adding review:accepted and removing review:pending before the stale-accept heal.
+ * The one comment edit: a numbering re-stamp record written over a hold before it is edited into an inert withdrawal
+ * notice (on any PR, whatever its labels), so no acceptance reader honours it.
  * WHAT IT NEVER DOES: add any other label, or touch anything but the removals named above.
  * It never removes `review:human` itself (that is `clear-human`'s job, a deliberate
  * human/independent-agent act, never a sweep's), and it never adds `review:pending`/`review:changes` — a stray
@@ -58,7 +60,7 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, restampAfterNumbering } from '../lib/numbering-carry.mjs';
+import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, restampAfterNumbering, strandedNumberingRecords } from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -157,20 +159,35 @@ export function sweepReviewHoldLabels({
   const restamped = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
     const names = labelNames(pr.labels);
-    if (!names.includes(REVIEW_LABELS.pending)
-      || [REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l))) continue;
+    const carryLabels = names.includes(REVIEW_LABELS.pending)
+      && ![REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l));
+    // A re-stamp record written over a hold before it is withdrawn whatever the labels or the settled memo say (the
+    // live read below re-checks it, with the formal reviews). A capped listing may hide one, so it is read live.
+    const listedState = () => {
+      const listed = Array.isArray(pr.comments) ? pr.comments : null;
+      const complete = Boolean(listed) && listed.length < LIST_COMMENTS_CAP;
+      return { listed, complete, stranded: !complete || strandedNumberingRecords(listed).length > 0 };
+    };
+    let view;
+    if (carryLabels) view = listedState();
+    else {
+      // Off the carry path, only a listed re-stamp record earns the live read; an unreadable listing is left to the
+      // later legs, as before.
+      try { view = listedState(); } catch { continue; }
+      if (!view.stranded || !view.listed?.some((c) => String(c?.body ?? '').includes(`<!-- ${NUMBERING_RESTAMP_MARKER}:`))) continue;
+    }
+    const { listed, complete, stranded } = view;
     // Cheap pre-filter on the listing so the live re-read is spent only on a possible numbering carry: a complete listed
     // thread with no accept on another head (or an accept already bound here by something other than a numbering
     // re-stamp) cannot be one. A capped (possibly truncated) listing is re-read live.
-    const listed = Array.isArray(pr.comments) ? pr.comments : null;
-    if (listed && listed.length < LIST_COMMENTS_CAP) {
+    if (complete && !stranded) {
       const rec = latestAcceptRecord(listed);
       const head = String(pr.headRefOid || '').toLowerCase();
       if (!rec || (rec.sha === head && !String(listed[rec.index]?.body || '').includes(`<!-- ${NUMBERING_RESTAMP_MARKER}:`))) continue;
     }
     try {
       const slug = repoOf();
-      if (numberingRestampSettled(slug, pr.number, pr.headRefOid)) continue;
+      if (!stranded && numberingRestampSettled(slug, pr.number, pr.headRefOid)) continue;
       // One validated live read, used for the plan and again right before each write (a hold can arrive mid-proof).
       const readLiveState = () => {
         const metadata = provider.readPrState(slug, pr.number);

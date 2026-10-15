@@ -357,10 +357,12 @@ export function buildNumberingWithdrawnBody({ fromSha, toSha, writer }) {
 
 /** PURE: only the exact body the writer emits counts as a withdrawal notice, so it can never carry an objection. */
 function isWithdrawnNotice(body) {
-  const lines = typeof body === 'string' ? body.trimEnd().split('\n') : [];
+  // Line endings as `restampRecord` reads them: a notice read back with CRLF is still the same notice.
+  const text = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimEnd() : '';
+  const lines = text.split('\n');
   const m = lines[0] === WITHDRAWN_HEADLINE ? WITHDRAWN_MARKER_LINE_RE.exec(lines[lines.length - 1]) : null;
   const writer = m ? WITHDRAWN_WRITER_RE.exec(lines[2] ?? '') : null;
-  return Boolean(writer) && body.trimEnd() === buildNumberingWithdrawnBody({ fromSha: m[1], toSha: m[2], writer: writer[1] });
+  return Boolean(writer) && text === buildNumberingWithdrawnBody({ fromSha: m[1], toSha: m[2], writer: writer[1] });
 }
 const staleHealHeadline = buildStaleAcceptHealComment({}).split('\n')[0];
 const stalePark = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for review by the drain\*\*\s*\n\s*review:accepted /;
@@ -377,23 +379,42 @@ export function isNumberingTolerableLaterBody(body) {
 }
 
 /** PURE: nominate an existing acceptance, retaining every later human/formal hold. */
+/**
+ * PURE: the re-stamp records other acceptance readers still honour although the planner does not — each one written
+ * over a hold that stood BEFORE it (where the "what came after the record" readers cannot see it):
+ *   - a record the thread validation drops (a hold, or a newer acceptance, posted in the gap before it);
+ *   - a carried record a formal review hides from those readers: submitted after the review that started its chain
+ *     but before the record itself (the record re-dates the acceptance, so a reader timing from it misses the review).
+ * A hold posted AFTER a record is never a reason to withdraw it: any author can post one, and the readers see it.
+ * `reviews` unread (not an array) checks the thread only.
+ */
+export function strandedNumberingRecords(comments, reviews = undefined) {
+  return strandedFrom(validatedThread(Array.isArray(comments) ? comments : []), reviews);
+}
+const commentAt = (c) => (typeof c?.createdAt === 'string' ? c.createdAt : (typeof c?.created_at === 'string' ? c.created_at : null));
+function strandedFrom({ carried, rootAt, dropped }, reviews) {
+  const hidden = Array.isArray(reviews)
+    ? [...carried.keys()].filter((c) => laterReviewHold(reviews, rootAt.get(c)) && !laterReviewHold(reviews, commentAt(c))) : [];
+  return [...dropped, ...hidden];
+}
+
 export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}) {
+  const list = Array.isArray(comments) ? comments : [];
+  // A re-stamp record is judged against the acceptance it carried, never trusted as an acceptance on its own.
+  const thread = validatedThread(list);
+  const { view, carried, rootAt } = thread;
+  // `stranded` rides on every outcome, whatever the labels say: those records are owed a withdrawal regardless.
+  const stranded = strandedFrom(thread, reviews);
+  const out = (plan) => (stranded.length ? { ...plan, stranded } : plan);
   const names = new Set((Array.isArray(labels) ? labels : []).map((l) => typeof l === 'string' ? l : l?.name));
+  // `hold`: after our own post, any label state but pending-only (a verdict swap, a human park, another writer's
+  // labels) means the record must not stand on its own.
   if (!names.has(REVIEW_LABELS.pending)
     || [REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.has(l))) {
-    return { candidate: false, reason: 'labels do not permit numbering carry',
-      ...(names.has(REVIEW_LABELS.pending) ? { hold: true } : {}) };
+    return out({ candidate: false, reason: 'labels do not permit numbering carry', hold: true });
   }
-  if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return { candidate: false, reason: 'live head unknown' };
-  const list = Array.isArray(comments) ? comments : [];
+  if (!/^[0-9a-f]{40}$/i.test(headSha ?? '')) return out({ candidate: false, reason: 'live head unknown' });
   const head = headSha.toLowerCase();
-  // A re-stamp record is judged against the acceptance it carried, never trusted as an acceptance on its own.
-  const { view, carried, rootAt, dropped } = validatedThread(list);
-  // `stranded`: re-stamp records the other acceptance readers would still honour although this plan does not.
-  const out = (plan, held = []) => {
-    const stranded = [...dropped, ...held];
-    return stranded.length ? { ...plan, stranded } : plan;
-  };
   const rec = latestAcceptRecord(view);
   if (!rec) return out({ candidate: false, reason: 'no recorded acceptance' });
   const src = view[rec.index];
@@ -401,8 +422,7 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
   // validated against the acceptance it carried, so no proof or second comment is owed.
   const labelsOnly = rec.sha === head && carried.has(src);
   if (rec.sha === head && !labelsOnly) return out({ candidate: false, reason: 'already bound' });
-  // A hold standing after our own record: the record is withdrawn too, since readers bound to its sha ignore the hold.
-  const held = (reason) => out({ candidate: false, reason, hold: true }, carried.has(src) ? [src] : []);
+  const held = (reason) => out({ candidate: false, reason, hold: true });
   if (rec.laterBodyDerivedHold) return held('later body-derived hold');
   if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
     return held('later verdict or unknown comment stands');
@@ -483,11 +503,14 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
 }
 
 /** IO: edit each stranded re-stamp record into the inert withdrawal notice. Throws on the first failed edit. */
+export const MAX_WITHDRAWALS_PER_PASS = 10;
 function withdrawRecords({ provider, repo, pr, records, writer }) {
   const done = new Set();
   for (const c of records) {
     const r = restampRecord(c);
     if (!r || done.has(c.id)) continue;
+    // Bounded per pass: any remainder is still stranded, so the next pass withdraws it.
+    if (done.size >= MAX_WITHDRAWALS_PER_PASS) break;
     if (typeof c.id !== 'string' || !c.id) throw Error('re-stamp record has no comment id');
     if (typeof provider?.editComment !== 'function') throw Error('provider cannot edit a comment');
     provider.editComment(repo, c.id, buildNumberingWithdrawnBody({ fromSha: r.from, toSha: r.to, writer }), { pr });
@@ -501,12 +524,11 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
   guardReferrals = assertMandatoryReferralsCleared } = {}) {
-  if (!enabled || acceptCarry !== 'on') return null;
   const key = `${repo}#${pr}@${state?.headRefOid}`;
-  if (settledRestamps.has(key)) return null;
   const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
   // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
-  // withdrawn first; the next pass plans from the thread as it then stands.
+  // withdrawn first, whatever the labels, the carry switch or the settled memo say: switching the carry off must
+  // never leave its records standing. The next pass plans from the thread as it then stands.
   if (plan.stranded?.length) {
     if (dryRun) return { action: 'would-withdraw', withdrawn: plan.stranded.length, reason: plan.reason ?? 'stranded re-stamp record' };
     let withdrawn;
@@ -514,6 +536,8 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
     catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}` }; }
     return { action: 'withdrawn', withdrawn, reason: 're-stamp record(s) that carry no standing acceptance withdrawn' };
   }
+  if (!enabled || acceptCarry !== 'on') return null;
+  if (settledRestamps.has(key)) return null;
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
   // A guard read failure is retryable and never settles the head or grants an acceptance.
@@ -521,10 +545,12 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
   const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
     expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor, source: plan.source } });
-  // Once our record is on the thread, a check that does not confirm it withdraws what the fresh plan does not honour:
-  // every stranded record and, on a hold, our own record (a hold before it reads as superseded to other readers).
-  const withdrawAfter = (check, own) => {
-    const records = [...check.stranded ?? [], ...(check.hold && Array.isArray(check.comments) ? check.comments.filter(own) : [])];
+  // A check that does not confirm the write withdraws every record the fresh plan finds stranded and — only for the
+  // record THIS pass just posted (`own`) — any hold: one that landed between the pre-write check and the post sits
+  // before the record, where other readers read it as superseded. An older record is never withdrawn for a hold
+  // posted after it (any author can post one, and every reader sees it).
+  const withdrawAfter = (check, own = null) => {
+    const records = [...check.stranded ?? [], ...(own && check.hold && Array.isArray(check.comments) ? check.comments.filter(own) : [])];
     if (!records.length) return { ...check.result, commentPosted: true };
     try { return { ...check.result, commentPosted: true, withdrawn: withdrawRecords({ provider, repo, pr, records, writer }) }; }
     catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}`, commentPosted: true }; }
@@ -533,7 +559,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (plan.labelsOnly) {
     if (dryRun) return { action: 'would-restamp', from: plan.from, to: plan.to, human: plan.human, actor: plan.actor, labelsOnly: true };
     const live = recheck(true);
-    if (!live.state) return withdrawAfter(live, isRecordOf(plan.from, plan.to));
+    if (!live.state) return withdrawAfter(live);
     try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: live.state.labels }); }
     catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
     settledRestamps.add(key);
@@ -559,7 +585,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // The record is now on the thread; a hold posted after it still keeps review:pending, and any hold found now
   // (including one that landed between the check above and the post) withdraws the record.
   const after = recheck(true);
-  if (!after.state) return withdrawAfter(after, (c) => typeof c?.body === 'string' && c.body.trimEnd() === body.trimEnd());
+  if (!after.state) return withdrawAfter(after, isRecordOf(plan.from, plan.to));
   try { finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels: after.state.labels }); }
   catch (e) { return { action: 'error', reason: errorReason(e), commentPosted: true }; }
   settledRestamps.add(key);
