@@ -16,7 +16,8 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, spawnSync, execFileSync, default: { ...actual.default, spawnSync, execFileSync } };
 });
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, requiredChecksFromRules, FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
+import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, readRequiredStatusChecksDetailed, requiredChecksFromRules, FALLBACK_REQUIRED_STATUS_CHECKS, defaultCachePath, resolveCacheTtlMs, cacheTtlMsFromSettings } from '../required-status-checks.mjs';
+import { ghRestGetJson } from '../gh-rest-read.mjs';
 
 describe('getRequiredStatusChecks', () => {
   let dir;
@@ -597,13 +598,18 @@ describe('defaultReadRequiredStatusChecks', () => {
       .toEqual({ source: 'declared', checks: ['test', 'e2e'] });
   });
 
-  it('shells `gh api repos/<repo>/branches/<branch>` for the classic set', () => {
-    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test', 'smoke', 'daemon-soak'));
+  it('reads `repos/<repo>/branches/<branch>` for the classic set through the conditional REST reader', () => {
+    execFileSync.mockReturnValueOnce('[]').mockReturnValueOnce(classicBranch('test', 'smoke', 'daemon-soak'));
     const result = defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'main' });
     expect(result).toEqual(['test', 'smoke', 'daemon-soak']);
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/web-everything/web-everything/branches/main'],
+      ['api', '-i', 'repos/web-everything/web-everything/branches/main'],
+      expect.objectContaining({ encoding: 'utf8' }),
+    );
+    expect(execFileSync).toHaveBeenCalledWith(
+      'gh',
+      ['api', '-i', 'repos/web-everything/web-everything/rules/branches/main?per_page=100&page=1'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
@@ -613,11 +619,11 @@ describe('defaultReadRequiredStatusChecks', () => {
   // rather than this reader failing a caller (e.g. a local CLI run with no `--repo` flag) that never had a
   // slug to pass.
   it('falls back to gh\'s own {owner}/{repo} template placeholders when no repo slug is given', () => {
-    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test'));
+    execFileSync.mockReturnValueOnce('[]').mockReturnValueOnce(classicBranch('test'));
     defaultReadRequiredStatusChecks({});
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/{owner}/{repo}/branches/main'],
+      ['api', '-i', 'repos/{owner}/{repo}/branches/main'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
@@ -645,5 +651,185 @@ describe('adding a required check never stalls reviews (live 2026-10-07, `integr
     expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [ok('test')] }).allowed).toBe(true);
     expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [] }).allowed).toBe(false);
     expect(reduceCheckState([ok('test')], req).state).toBe('green');
+  });
+});
+
+// ── xqd4v1o — ONE shared per-repo cache instead of re-reading branch protection on every check ───────────────────
+describe('shared per-repo required-checks cache (xqd4v1o)', () => {
+  const WE = 'web-everything/web-everything';
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-required-shared-')); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it('defaultCachePath is identical from two different working directories and lives under the coordination root', () => {
+    vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coord'));
+    const cwd = vi.spyOn(process, 'cwd');
+    cwd.mockReturnValue('/lane/clone/one');
+    const first = defaultCachePath();
+    cwd.mockReturnValue('/lane/clone/two');
+    const second = defaultCachePath();
+    expect(first).toBe(second);
+    expect(first).toBe(join(dir, 'coord', 'required-status-checks-cache.json'));
+  });
+
+  it('a second reader in another cwd makes zero reads against the shared default file', () => {
+    vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coord'));
+    const cwd = vi.spyOn(process, 'cwd');
+    const readChecks = vi.fn(() => ['test', 'smoke']);
+    cwd.mockReturnValue('/lane/clone/one');
+    expect(getRequiredStatusChecks({ repo: WE, now: 1000, readChecks })).toMatchObject({ source: 'live' });
+    cwd.mockReturnValue('/lane/clone/two');
+    expect(getRequiredStatusChecks({ repo: WE, now: 2000, readChecks })).toEqual({ checks: ['test', 'smoke'], source: 'cache' });
+    expect(readChecks).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the classic subset on a live entry and serves it from cache and from a stale entry', () => {
+    const cachePath = join(dir, 'cache.json');
+    const readChecks = () => ({ checks: ['test', 'merge-gate'], classic: ['test'] });
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 1000, readChecks }))
+      .toEqual({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'live' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`].classic).toEqual(['test']);
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1500, ttlMs: 1000, readChecks }))
+      .toEqual({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'cache' });
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 9000, ttlMs: 1000, readChecks: () => { throw new Error('offline'); } }))
+      .toMatchObject({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'stale-cache' });
+  });
+
+  it('a declared entry carries no classic set', () => {
+    const cachePath = join(dir, 'cache.json');
+    const denied = () => { throw new Error('Resource not accessible by integration (HTTP 403)'); };
+    const result = getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000, readChecks: denied });
+    expect(result).toEqual({ checks: ['test', 'e2e'], source: 'declared' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries['plateauapp/plateau-app@main']).not.toHaveProperty('classic');
+  });
+
+  it('two interleaved writers for different repos keep both entries (read-merge-write under a lock)', () => {
+    const cachePath = join(dir, 'cache.json');
+    const other = 'frontier-ui/frontierui';
+    // Repo A's read is IN FLIGHT when repo B finishes and writes: A's save must merge, not clobber B.
+    const readA = () => {
+      getRequiredStatusChecks({ repo: other, cachePath, now: 1000, readChecks: () => ['test'] });
+      return ['test', 'smoke'];
+    };
+    getRequiredStatusChecks({ repo: WE, cachePath, now: 1001, readChecks: readA });
+    expect(Object.keys(JSON.parse(readFileSync(cachePath, 'utf8')).entries).sort()).toEqual([`${WE}@main`, `${other}@main`].sort());
+    expect(existsSync(`${cachePath}.lock`)).toBe(false);
+  });
+
+  it('a lock that cannot be taken skips the write but never fails the read', () => {
+    const cachePath = join(dir, 'cache.json');
+    writeFileSync(`${cachePath}.lock`, `${process.pid}\n`); // a live holder (this process) — never stale-stolen
+    const result = getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: () => ['test'] });
+    expect(result).toEqual({ checks: ['test'], source: 'live' });
+    expect(existsSync(cachePath)).toBe(false);
+  }, 15_000);
+
+  it.each([
+    ['not JSON', '{not json'],
+    ['an empty file', ''],
+    ['a JSON array', '[]'],
+    ['entries as an array', '{"entries":[]}'],
+  ])('a corrupt cache (%s) is no cache: a live read happens and the file is repaired — never an empty required set', (_l, body) => {
+    const cachePath = join(dir, 'cache.json');
+    writeFileSync(cachePath, body);
+    const readChecks = vi.fn(() => ['test']);
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks })).toEqual({ checks: ['test'], source: 'live' });
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`].checks).toEqual(['test']);
+  });
+
+  it('an anonymous (cwd-inferred) repo is never cached', () => {
+    const cachePath = join(dir, 'cache.json');
+    getRequiredStatusChecks({ cachePath, now: 1000, readChecks: () => ['test'] });
+    expect(existsSync(cachePath)).toBe(false);
+  });
+
+  describe('ttl setting', () => {
+    it('a settings value overrides the 15 minute default; junk values are ignored', () => {
+      expect(cacheTtlMsFromSettings({ requiredChecksCache: { ttlMinutes: 5 } })).toBe(5 * 60_000);
+      for (const junk of [undefined, {}, { requiredChecksCache: {} }, { requiredChecksCache: { ttlMinutes: 0 } },
+        { requiredChecksCache: { ttlMinutes: -3 } }, { requiredChecksCache: { ttlMinutes: '9' } }, { requiredChecksCache: { ttlMinutes: NaN } }]) {
+        expect(cacheTtlMsFromSettings(junk)).toBe(15 * 60_000);
+      }
+      expect(resolveCacheTtlMs({ settings: { requiredChecksCache: { ttlMinutes: 1 } } })).toBe(60_000);
+    });
+    it('the shipped settings file declares 15 minutes', () => {
+      expect(resolveCacheTtlMs({ now: Date.now() + 10 * 60_000 })).toBe(15 * 60_000);
+    });
+  });
+
+  describe('ETag revalidation', () => {
+    const rulesBody = JSON.stringify([requiredRule('test', 'merge-gate')]);
+    const okReply = (body, etag) => `HTTP/2.0 200 OK\r\netag: ${etag}\r\ncontent-type: application/json\r\n\r\n${body}`;
+    const NOT_MODIFIED = () => Object.assign(new Error('Command failed: gh api'), { stdout: 'HTTP/2.0 304 Not Modified\r\netag: "e"\r\n\r\n', stderr: 'gh: HTTP 304' });
+
+    it('after the TTL the revalidating read sends If-None-Match and a 304 keeps the set, refreshing fetchedAtMs', () => {
+      const etagDir = join(dir, 'etag');
+      const cachePath = join(dir, 'cache.json');
+      const branch = classicBranch('test');
+      let phase = 'first';
+      const calls = [];
+      const exec = vi.fn((_bin, argv) => {
+        calls.push(argv);
+        const path = argv[argv.length - 1];
+        if (phase === 'first') return okReply(path.includes('/rules/') ? rulesBody : branch, `"etag-${path.includes('/rules/') ? 'r' : 'b'}"`);
+        throw NOT_MODIFIED();
+      });
+      const restGet = (path, o) => ghRestGetJson(path, { ...o, exec, dir: etagDir, env: { HOME: dir } });
+      const readChecks = o => readRequiredStatusChecksDetailed({ ...o, restGet });
+      const first = getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 1000, readChecks });
+      expect(first).toEqual({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'live' });
+      expect(calls.every(a => !a.includes('-H'))).toBe(true);
+
+      phase = 'revalidate';
+      calls.length = 0;
+      const second = getRequiredStatusChecks({ repo: WE, cachePath, now: 9000, ttlMs: 1000, readChecks });
+      expect(second).toEqual({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'live' });
+      expect(calls).toHaveLength(2);
+      for (const argv of calls) expect(argv).toEqual(expect.arrayContaining(['-H', expect.stringMatching(/^If-None-Match: "etag-[rb]"$/)]));
+      expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`].fetchedAtMs).toBe(9000);
+    });
+
+    it('a 304 for an injected restGet keeps the checks and bumps the age', () => {
+      const cachePath = join(dir, 'cache.json');
+      const restGet = vi.fn(path => ({ status: 304, notModified: true,
+        json: path.includes('/rules/') ? [requiredRule('test')] : JSON.parse(classicBranch('test')) }));
+      const readChecks = o => readRequiredStatusChecksDetailed({ ...o, restGet });
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 1000, readChecks });
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 5000, ttlMs: 1000, readChecks });
+      expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`]).toMatchObject({ checks: ['test'], fetchedAtMs: 5000 });
+    });
+
+    it('a blank 200 body is a failed read, never "no checks": the stale entry is kept', () => {
+      const cachePath = join(dir, 'cache.json');
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: () => ['test', 'smoke'] });
+      // A blank 200 body parses to `null` in ghRestGetJson (`JSON.parse(body || 'null')`): both sources must refuse it.
+      const blank = () => ({ status: 200, json: null });
+      const result = getRequiredStatusChecks({ repo: WE, cachePath, now: 90_000_000, ttlMs: 1000,
+        readChecks: o => readRequiredStatusChecksDetailed({ ...o, restGet: blank }) });
+      expect(result).toMatchObject({ checks: ['test', 'smoke'], source: 'stale-cache' });
+    });
+
+    it('a rules page that is not an array is a failed read (never an empty rule list), and the page cap is an error', () => {
+      const notArray = vi.fn(path => ({ status: 200, json: path.includes('/rules/') ? null : JSON.parse(classicBranch('test')) }));
+      expect(() => readRequiredStatusChecksDetailed({ repo: WE, restGet: notArray })).toThrow(/rules/);
+      const endless = vi.fn(path => ({ status: 200, json: path.includes('/rules/') ? Array.from({ length: 100 }, () => ({ type: 'deletion' })) : JSON.parse(classicBranch('test')) }));
+      expect(() => readRequiredStatusChecksDetailed({ repo: WE, restGet: endless })).toThrow(/page cap/);
+    });
+
+    it('reads every rules page until a short page', () => {
+      const page1 = Array.from({ length: 99 }, () => ({ type: 'deletion' })).concat([requiredRule('p1')]);
+      const restGet = vi.fn(path => ({ status: 200, json: path.endsWith('&page=1') ? page1 : path.endsWith('&page=2') ? [requiredRule('p2')]
+        : JSON.parse(classicBranch('test')) }));
+      expect(readRequiredStatusChecksDetailed({ repo: WE, restGet })).toEqual({ checks: ['p1', 'p2', 'test'], classic: ['test'] });
+    });
+
+    it('a REST 403 on the rules read keeps the declared-policy classification (denial → declared)', () => {
+      const cachePath = join(dir, 'cache.json');
+      const denied = () => { throw Object.assign(new Error('Command failed: gh api'), { stderr: 'gh: Resource not accessible by integration (HTTP 403)' }); };
+      const result = getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000,
+        readChecks: o => readRequiredStatusChecksDetailed({ ...o, restGet: denied }) });
+      expect(result).toEqual({ checks: ['test', 'e2e'], source: 'declared' });
+    });
   });
 });

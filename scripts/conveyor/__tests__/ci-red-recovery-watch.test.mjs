@@ -814,22 +814,57 @@ describe('ci-red-recovery-watch — defaultReadAttributedRequiredChecks', () => 
 
 // ── MISSING-CI-RUN RECOVERY (xi4od2p, #4075/#3383) — fixture is PR web-everything/web-everything#2729's REAL state ──
 describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHeadCommittedAt', () => {
-  it('reads the live required contexts off branch protection', () => {
-    const exec = vi.fn(() => '["test","smoke","daemon-soak"]');
-    const contexts = defaultReadRequiredContexts({ repo: 'web-everything/web-everything', branch: 'main', exec });
-    expect(contexts).toEqual(['test', 'smoke', 'daemon-soak']);
-    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'], expect.anything());
+  it('reads the classic required contexts through the shared cache — zero direct protection gh calls', () => {
+    const readRequiredChecks = vi.fn(() => ({ checks: ['test', 'smoke', 'merge-gate'], classic: ['test', 'smoke'], source: 'cache' }));
+    const contexts = defaultReadRequiredContexts({ repo: 'web-everything/web-everything', branch: 'main', readRequiredChecks });
+    expect(contexts).toEqual(['test', 'smoke']); // classic-only: the ruleset-only `merge-gate` never appears (#5060)
+    expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'main' });
   });
 
   it('returns null (unknown) on a read failure — never substitutes an invented default set (PR #2740 review)', () => {
-    const exec = vi.fn(() => { throw new Error('403'); });
-    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec })).toBeNull();
+    const readRequiredChecks = vi.fn(() => { throw new Error('403'); });
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', readRequiredChecks })).toBeNull();
   });
 
-  it('returns null (unknown) when no repo is given, and preserves an explicitly EMPTY required set as []', () => {
-    expect(defaultReadRequiredContexts({ repo: null, exec: vi.fn() })).toBeNull();
-    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec: vi.fn(() => '[]') })).toEqual([]);
-    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec: vi.fn(() => 'null') })).toEqual([]);
+  it('returns null (unknown) with no repo, and preserves a classic set that was read and is EMPTY as []', () => {
+    expect(defaultReadRequiredContexts({ repo: null, readRequiredChecks: vi.fn() })).toBeNull();
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+      readRequiredChecks: () => ({ checks: ['merge-gate'], classic: [], source: 'live' }) })).toEqual([]);
+  });
+
+  it.each(['declared', 'fallback', 'unavailable'])('maps a %s result to null even when it carries checks', (source) => {
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+      readRequiredChecks: () => ({ checks: ['test'], classic: ['test'], source }) })).toBeNull();
+  });
+
+  it('maps a stale entry that was declared (no classic set) and a classic-unknown live result to null', () => {
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+      readRequiredChecks: () => ({ checks: ['test'], source: 'stale-cache', cacheAgeMs: 9e9 }) })).toBeNull();
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+      readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
+  });
+
+  it('passes a stale-cache entry that held a live classic set through', () => {
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+      readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], classic: ['test'], source: 'stale-cache' }) })).toEqual(['test']);
+  });
+
+  it('wires through the REAL shared cache: a fresh entry on disk answers with zero gh calls', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { getRequiredStatusChecks } = await import('../../lib/required-status-checks.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'ci-red-shared-cache-'));
+    try {
+      const cachePath = join(dir, 'cache.json');
+      writeFileSync(cachePath, JSON.stringify({ entries: { 'web-everything/web-everything@main': {
+        checks: ['test', 'merge-gate'], classic: ['test'], source: 'live', fetchedAtMs: Date.now() } } }));
+      const readChecks = vi.fn();
+      const contexts = defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
+        readRequiredChecks: (o) => getRequiredStatusChecks({ ...o, cachePath, readChecks }) });
+      expect(contexts).toEqual(['test']);
+      expect(readChecks).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('reads a head commit\'s own committed date', () => {
