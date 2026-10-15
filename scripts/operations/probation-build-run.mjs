@@ -861,7 +861,7 @@ export function openPrArgv({ num, attemptTag, slug, bodyFile, taskType = 'doc-fi
   const ref = `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
   return [
     'open-pr', `--ref=${ref}`, '--sha=HEAD', '--base=main', `--bodyFile=${bodyFile}`,
-    `--title=${machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
+    `--title=${machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
     '--mode=park', '--parkLabel=review:pending', '--requireVerified=true', '--json',
   ];
 }

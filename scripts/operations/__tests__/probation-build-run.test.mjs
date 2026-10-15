@@ -64,6 +64,11 @@ describe('realIo().findItem — the card\'s own scope is what the arc allowlists
 });
 
 describe('openPrArgv — every probation build PR is parked review:pending, never label-on-green (#4291 plan review round 3)', () => {
+  it('uses the supported build title kind for feature publication', () => {
+    const argv = openPrArgv({ num: '4291', attemptTag: '', slug: 'scoped-feature', bodyFile: '/lane/.pr-body.md', taskType: 'build-new-feature' });
+    expect(argv).toContain('--title=WE #4291: build — scoped feature');
+    expect(argv).toEqual(expect.arrayContaining(['--mode=park', '--parkLabel=review:pending', '--requireVerified=true']));
+  });
   it('carries --mode=park --parkLabel=review:pending --requireVerified=true, never label-on-green', () => {
     const argv = openPrArgv({ num: '4291', attemptTag: '', slug: 'probation-launcher', bodyFile: '/lane/.pr-body.md' });
     expect(argv).toEqual(expect.arrayContaining(['--mode=park', '--parkLabel=review:pending', '--requireVerified=true']));
@@ -150,7 +155,7 @@ describe('Argon feature build checker boundary', () => {
     const result = await runProbationBuild(parsed, io);
     expect(tasks.find(t => t.name === 'probation-build-task.md').text).toContain('Implement only the requested feature');
     expect(tasks.find(t => t.name === 'probation-build-check.md').text).not.toContain('work that is not simple and mechanical');
-    expect(result.outcome).toBe(verdict === 'APPROVE' ? 'opened-pr' : 'gate-red');
+    expect(result.outcome, result.detail).toBe(verdict === 'APPROVE' ? 'opened-pr' : 'gate-red');
     expect(calls.some(c => c[0] === 'commit')).toBe(verdict === 'APPROVE');
     expect(calls.some(c => c[0] === 'openPr')).toBe(verdict === 'APPROVE');
   });

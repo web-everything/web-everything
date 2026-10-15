@@ -91,10 +91,12 @@ describe('dispatch-eligibility agrees with the live admission path', () => {
     expect(report[1].gates.at(-1)).toEqual({ name: 'blockedBy', pass: false, observed: ['8999'] });
     expect(report[2].gates).toHaveLength(1); // no invented passes after a short-circuit
     expect(report[3].markers.deliveryAgent).toBeNull();
-    // The report names the policy-selected executor; native adapter prediction stays available separately.
+    // Feature builds inherit evidence routing: the report retains the native tier while the
+    // dispatch snapshot carries the selected probation worker separately.
     for (const row of report.filter((r) => r.eligible)) {
-      expect(row.route).toMatchObject({ outcome: 'routed', routed: 'codex', executed: 'codex', model: 'gpt-6.1-sol', tier: 'sonnet' });
-      expect(row.plannedWorkerModel).toBeNull(); // native-only tier prediction is absent for an explicit Codex route
+      expect(row.route).toMatchObject({ outcome: 'routed', routed: 'claude', executed: 'claude', model: 'claude-sonnet-5-5', tier: 'sonnet' });
+      expect(readTick({ num: row.num }).routing.probationWorker).toMatchObject({ id: 'codex', taskType: 'build-new-feature', supervision: 'full', review: 'full' });
+      expect(row.plannedWorkerModel).toMatchObject({ tier: 'sonnet', model: 'sonnet' });
     }
   });
 

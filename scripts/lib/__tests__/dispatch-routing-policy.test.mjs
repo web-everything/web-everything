@@ -274,6 +274,10 @@ it('inherits feature probation by default and preserves explicit operator pins a
   expect(policy.taskTypes['build-new-feature']).toEqual({ inherit: true });
   expect(policy.operations['build:build-new-feature']).toEqual({ inherit: true });
   expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toBeNull();
+  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, policy })).toMatchObject({
+    provider: 'claude', model: 'claude-sonnet-5-5', fallback: [],
+  });
+  expect(() => resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, availability: { claude: 'held' }, policy })).toThrow(/no available route/);
   policy.taskTypes['build-new-feature'] = {
     provider: 'codex', model: 'sol',
     effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },

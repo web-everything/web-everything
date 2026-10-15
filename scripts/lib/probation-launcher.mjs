@@ -172,11 +172,11 @@ export function buildDocFixTask({ num, title = '', spec, scope = [], taskType = 
  * The commit message for a probation doc-fix build (#4291). PURE. Mirrors {@link buildHealCommitMessage}: the
  * trailers name who did the work, so the review and the trial record can tell a probation build from a Claude
  * one.
- * @param {{num: string|number, worker: object, taskType?: 'doc-fix'|'bugfix'}} o
+ * @param {{num: string|number, worker: object, taskType?: 'doc-fix'|'bugfix'|'test-fix'|'prepare'|'build-new-feature'}} o
  */
 export function buildDocFixCommitMessage({ num, worker, taskType = 'doc-fix', title }) {
   return [
-    machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : `${taskType}-build`, subject: title }),
+    machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: title }),
     '',
     `Built by the ${worker.id} probation worker (agy-launcher-probation, #4291); the launcher claimed the item,`,
     'ran the gate, resolved it, and committed. Full review and a run rating are owed on this change.',
