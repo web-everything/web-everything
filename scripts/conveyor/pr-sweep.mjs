@@ -48,10 +48,17 @@ export function readLogTail(path) {
 const mentions = (text, pr, defaultRepo = 'we') => {
   const key = repoKeyForSlug(pr.repo);
   // Qualified references take precedence, so identical PR numbers in different repos do not cross-bind.
-  const refs = String(text).match(/(?:[\w.-]+\/[\w.-]+|we|plateau-app|frontierui)#\d+/g) ?? [];
-  if (refs.length) return refs.some((r) => { const [repo, n] = r.split('#'); return repoKeyForSlug(repo) === key && Number(n) === Number(pr.number); });
+  const refs = [...String(text).matchAll(/(?<![\w./-])(?:https?:\/\/github\.com\/)?([\w.-]+\/[\w.-]+|we|plateau-app|frontierui)(?:[ \t]*(?:PR[ \t]*)?#|\/pull\/)(\d+)(?!\d)/gi)];
+  if (refs.length) return refs.some(([, repo, n]) => repoKeyForSlug(repo.toLowerCase()) === key && Number(n) === Number(pr.number));
   return key === defaultRepo && new RegExp(`(?:fix(?:ing)?-|#)${pr.number}(?!\\d)`).test(text);
 };
+// Both dispatchers log failed attempts every tick; none proves that work began.
+const isDispatchRefusal = (line) => /\b(?:refus(?:ed|al|ing)|not dispatched|no review dispatched|failed)\b/i.test(line);
+// A reference alone may be a ranking, held item or repeated note. Require an
+// actual work event so new diagnostic wording cannot silently renew ownership.
+const isDaemonProgress = (line) => !isDispatchRefusal(line)
+  && !/\b(?:scope-rank|note(?:-comment)?|dry-run|would|skipp(?:ed|ing)|held|waiting)\b/i.test(line)
+  && /\b(?:start(?:ed|ing)|dispatched|promoted|merged|landed|applied|pushed|resumed|rebased|tagged)\b/i.test(line);
 export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
   readAgents = async () => {
     const { defaultReadAgents, enrichAgents } = await import('./reconcile-pass.mjs');
@@ -79,10 +86,11 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
     for (const log of logs) for (const line of log.text.split('\n')) {
       if (!mentions(line, pr, log.repo)) continue;
       const stamp = line.match(/^\[?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))/)?.[1];
-      if (stamp && Number.isFinite(Date.parse(stamp))) daemons.push({ name: log.name, at: stamp });
+      if (stamp && Number.isFinite(Date.parse(stamp))) daemons.push({ name: log.name, at: stamp,
+        ...(isDaemonProgress(line) ? { kind: 'progress' } : { kind: isDispatchRefusal(line) ? 'refusal' : 'diagnostic', reason: line }) });
     }
     for (const [name, data] of Object.entries(health.daemons ?? {})) for (const [ref, refusal] of Object.entries(data.prRefusals ?? {})) {
-      if (mentions(ref, pr)) daemons.push({ name, at: refusal.at, reason: refusal.reason });
+      if (mentions(ref, pr)) daemons.push({ name, at: refusal.at, kind: 'refusal', reason: refusal.reason });
     }
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));

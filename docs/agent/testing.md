@@ -921,6 +921,14 @@ remain unknown; healthy sessions and recent daemon evidence still count. Replay 
 with the `pr-sweep-unhealthy-owner-and-symlink-entry` soak break: successive dry sweeps must alert once
 after the delay, and both CLI entry points must execute when their directory is reached through a symlink.
 
+Dispatch refusals from health memory or daemon logs are diagnostic signals, never ownership or progress
+(including review-daemon's `not dispatched`, `no review dispatched` and failed-dispatch formats).
+Log ownership requires a recognized work event (start, dispatch, applied action, or completed movement);
+rankings, repeated notes, dry runs and unknown diagnostic wording cannot renew ownership.
+The same soak break refreshes refusals on every sweep through 24 hours and requires exactly one stalled
+alert. Qualified daemon references (`repo#number`, `repo PR #number`, and GitHub PR URLs) override the
+clone's default repository; replay colliding PR numbers to catch cross-repository ownership attribution.
+
 Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the heavy-admission queue.
 Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
 agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall

@@ -3,13 +3,86 @@
  */
 import { describe, it, expect } from 'vitest';
 import { classifyIdlePrs, resolveOwner, planSweep } from '../pr-sweep-core.mjs';
-import { runPrSweep } from '../pr-sweep.mjs';
+import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const now = Date.parse('2026-10-14T16:00:00Z');
 const pr = { repo: 'web-everything/web-everything', number: 12, title: 'test', updatedAt: new Date(now - 120 * 60000).toISOString(), headRefOid: 'abc', labels: ['review:changes'], isDraft: true };
 const settings = { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [pr.repo] };
 const plan = (o = {}) => planSweep({ idle: [pr], owners: { [`${pr.repo}#12`]: resolveOwner(pr, { now, ...settings }) }, now, settings, needsYou: [], ...o });
+it.each(['health', 'log', 'review-not-started', 'review-pending', 'review-failed', 'scope-rank', 'note', 'note-comment', 'unknown'])('recurring %s diagnostics do not suppress stalled PR alerts', async (source) => {
+  let previous = {}; const alerts = [];
+  for (const minutes of [0, 30, 60, 90, 120, 240, 1440]) {
+    const tick = now + minutes * 60000;
+    const line = {
+      log: `reconcile-fix-dispatch-daemon: refused no-lane ${pr.repo} PR #12 — no acquirable lane`,
+      'review-not-started': `review-daemon: ${pr.repo}#12 not dispatched — no acquirable lane`,
+      'review-pending': `review-daemon: ${pr.repo}#12 review:pending, no review dispatched — no acquirable lane`,
+      'review-failed': `review-daemon: ${pr.repo}#12 failed (non-fatal): no lane`,
+      'scope-rank': `reconcile-fix-dispatch-daemon: scope-rank ${pr.repo} PR #12 — rank 1, blocks 0, age 2h`,
+      note: `reconcile-fix-dispatch-daemon: note awaiting-permission ${pr.repo} PR #12 — no work started`,
+      'note-comment': `reconcile-fix-dispatch-daemon: note-comment awaiting-permission ${pr.repo} PR #12 — already posted, skipping`,
+      unknown: `reconcile-fix-dispatch-daemon: observed ${pr.repo} PR #12`,
+    }[source];
+    const out = await runPrSweep({ now: tick, dryRun: true, config: {}, settings: { value: settings, sources: {} },
+      readPrevious: () => previous, readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }),
+      readSignals: (args) => collectOwnerSignals({ ...args, readAgents: () => [],
+        cloneRoots: () => [join(tmpdir(), 'fix-clone')], listLogs: () => [source.startsWith('review-') ? 'review-daemon.log' : 'fix-dispatch-daemon.log'],
+        readTail: () => line ? `${new Date(tick).toISOString()} ${line}` : '',
+        readHealth: () => source === 'health' ? { daemons: { 'fix-dispatch-daemon': { prRefusals: {
+          'we#12': { at: tick, reason: 'refused no-lane: no acquirable lane' },
+        } } } } : {} }),
+    });
+    expect(out.errors).toEqual([]);
+    expect(out.idle[0].state).toBe('none');
+    expect(out.idle[0].ownerLastSeenAt).toBeNull();
+    previous = out.nextState; alerts.push(...out.alerts);
+  }
+  expect(alerts).toHaveLength(1);
+  expect(previous.episodes[`${pr.repo}#12`].alerted).toBe(true);
+});
+it.each(['plateauapp/plateau-app#12', 'plateauapp/plateau-app PR #12', 'https://github.com/plateauapp/plateau-app/pull/12'])('binds explicit repository reference %s across clones', async (ref) => {
+  const plateau = { ...pr, repo: 'plateauapp/plateau-app' }; const errors = [];
+  const signals = await collectOwnerSignals({ prs: [pr, plateau], dir: tmpdir(), env: {}, errors,
+    readAgents: () => [], cloneRoots: () => [join(tmpdir(), 'we-fix-clone')], listLogs: () => ['fix-dispatch-daemon.log'],
+    readTail: () => `${new Date(now - 1000).toISOString()} reconcile-fix-dispatch-daemon: refused no-lane ${ref} — no acquirable lane`,
+    readHealth: () => ({}) });
+  expect(errors).toEqual([]);
+  expect(signals[`${pr.repo}#12`].daemons).toEqual([]);
+  expect(signals[`${plateau.repo}#12`].daemons).toHaveLength(1);
+  expect(resolveOwner(plateau, { now, ...settings, ...signals[`${plateau.repo}#12`] }).state).toBe('none');
+});
+it('ignores refusal evidence without hiding real sessions, daemon progress or health smells', () => {
+  const refusal = { name: 'fix-dispatch-daemon', at: now, reason: 'no-lane' };
+  expect(resolveOwner(pr, { now, daemons: [refusal] }).state).toBe('none');
+  expect(resolveOwner(pr, { now, daemons: [{ ...refusal, kind: 'refusal', reason: undefined }] }).state).toBe('none');
+  expect(resolveOwner(pr, { now, daemons: [{ ...refusal, kind: 'diagnostic', reason: undefined }] }).state).toBe('none');
+  expect(resolveOwner(pr, { now, daemons: [refusal], sessions: [{ name: 'fix-12' }] }).owner).toBe('session:fix-12');
+  const progress = { name: 'review', at: now - 1000 };
+  expect(resolveOwner(pr, { now, daemons: [refusal, progress] }).owner).toBe('daemon:review');
+  expect(resolveOwner(pr, { now, daemons: [refusal, { ...progress, at: now - 100 * 60000 }] }).state).toBe('stuck');
+  expect(resolveOwner(pr, { now, daemons: [refusal], smell: 'fixer-stuck' }).state).toBe('stuck');
+});
+it.each([
+  ['PR #12 started', 'we'], ['fixing-12 started', 'we'],
+  ['plateau-app PR #12 started', 'plateau-app'], ['PLATEAUAPP/PLATEAU-APP PR #12 started', 'plateau-app'],
+  ['chalbert/plateau-app#12 started', 'plateau-app'], ['plateauapp/plateau-app #12 started', 'plateau-app'],
+  ['other/repo PR #12 started', null], ['other/plateau-app#12 started', null],
+  ['plateauapp/plateau-app PR #123 started', null],
+  ['plateauapp/plateau-app#12 dispatched as session', 'plateau-app'],
+  ['plateauapp/plateau-app PR #12 — applied rerun', 'plateau-app'],
+  ['we#12 tagged review-status:fixing at dispatch', 'we'],
+])('matches daemon reference %s only to %s', async (ref, repo) => {
+  const plateau = { ...pr, repo: 'plateauapp/plateau-app' }; const errors = [];
+  const signals = await collectOwnerSignals({ prs: [pr, plateau], dir: tmpdir(), env: {}, errors,
+    readAgents: () => [], cloneRoots: () => [join(tmpdir(), 'we-fix-clone')], listLogs: () => ['review-daemon.log'],
+    readTail: () => `${new Date(now - 1000).toISOString()} ${ref}`, readHealth: () => ({}) });
+  expect(errors).toEqual([]);
+  expect(signals[`${pr.repo}#12`].daemons).toHaveLength(repo === 'we' ? 1 : 0);
+  expect(signals[`${plateau.repo}#12`].daemons).toHaveLength(repo === 'plateau-app' ? 1 : 0);
+  expect(resolveOwner(pr, { now, ...settings, ...signals[`${pr.repo}#12`] }).state).toBe(repo === 'we' ? 'active' : 'none');
+  expect(resolveOwner(plateau, { now, ...settings, ...signals[`${plateau.repo}#12`] }).state).toBe(repo === 'plateau-app' ? 'active' : 'none');
+});
 describe('PR sweep', () => {
   it('includes idle drafts and preserves head, labels; excludes moved/closed/invalid dates', () => {
     expect(classifyIdlePrs({ prs: [pr, { ...pr, number: 2, updatedAt: new Date(now).toISOString() }, { ...pr, state: 'CLOSED' }, { ...pr, updatedAt: 'bad' }], now, idleMinutes: 45 })).toEqual([{ ...pr, ageMin: 120 }]);

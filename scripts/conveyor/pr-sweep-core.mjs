@@ -22,13 +22,16 @@ export function resolveOwner(pr, signals = {}) {
       : (a.repo ? repoKeyForSlug(a.repo) === repoKeyForSlug(pr.repo) : repoKeyForSlug(pr.repo) === 'we');
   });
   const session = findFixerSession(live, pr.number) ?? live.find((a) => ['review', 'inspect'].includes(parseSessionSlug(a.name)?.kind));
-  const daemon = [...daemons].filter((d) => Number.isFinite(ms(d.at))).sort((a, b) => ms(b.at) - ms(a.at))[0];
+  // Refusals and diagnostics never acquired ownership. Keep them out of the
+  // progress clock, including legacy refusal signals carrying only `reason`.
+  const daemon = [...daemons].filter((d) => d.kind !== 'refusal' && d.kind !== 'diagnostic' && d.reason === undefined && Number.isFinite(ms(d.at)))
+    .sort((a, b) => ms(b.at) - ms(a.at))[0];
   const owner = session ? `session:${session.name}` : daemon ? `daemon:${daemon.name}` : null;
   // A healthy live session is current evidence even when its creation timestamp is old.
   const at = session ? now : daemon ? ms(daemon.at) : null;
   const stuck = Boolean(smell) || (at !== null && now - at > stuckAfterMinutes * 60000);
   return { ...base, owner, ownerLastSeenAt: at === null ? null : new Date(at).toISOString(),
-    state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? `Live owner signal${daemon?.reason && !session ? ` (last refusal: ${daemon.reason})` : ''}` : base.why,
+    state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
 }
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
