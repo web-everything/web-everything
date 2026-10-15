@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { runPrSweep } from '../../pr-sweep.mjs';
 
 const CONVEYOR = fileURLToPath(new URL('../../', import.meta.url));
@@ -27,7 +28,7 @@ export default {
   async run({ log } = {}) {
     const violations = []; const owners = []; const entries = [];
     const now = Date.parse('2026-10-14T16:00:00Z');
-    const repo = 'web-everything/web-everything'; const key = `${repo}#12`;
+    const repo = CONSTELLATION_REPOS.we.slug; const key = `${repo}#12`;
     const pr = { repo, number: 12, title: 'idle PR', updatedAt: new Date(now - 120 * 60000).toISOString(), headRefOid: 'abc' };
     const value = { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [repo] };
     for (const health of [{ hung: true }, { pidAlive: false }, { hung: true, pidAlive: false }]) {
