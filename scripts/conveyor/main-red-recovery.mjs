@@ -546,6 +546,17 @@ export function isPrCiFailureOwedRerun({
   }).mainDefect;
 }
 
+// live PR #5195, 2026-10-14: aggregate daemon-soak hides the timeout in a failed sibling job.
+export const KNOWN_INFRA_SIGNATURES = Object.freeze([
+  Object.freeze({ id: 'test-timeout', re: /Test timed out in \d+\s*ms|timed out in \d+\s*ms/i }),
+  Object.freeze({ id: 'job-time-cap', re: /exceeded the maximum execution time|has exceeded the maximum execution time of/i }),
+  Object.freeze({ id: 'runner-lost', re: /The runner has received a shutdown signal|lost communication with the server/i }),
+]);
+
+export function extractInfraSignatures(logText) {
+  return KNOWN_INFRA_SIGNATURES.filter(({ re }) => re.test(String(logText ?? ''))).map(({ id }) => id);
+}
+
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#classifyMainDefect — THE ONE classifier of "is this PR's red MAIN's
  * own defect (owed a mechanical refresh onto main) or the PR's own (owed a ci-heal)?". PURE. Both the fix daemon
@@ -556,13 +567,13 @@ export function isPrCiFailureOwedRerun({
  * window; (green-fix) the check now passes on main's latest run with positive evidence — which includes a
  * head-scoped escalation that recorded "main's own defect" (`escalation: true`); (signature) its error
  * signatures were fixed on main.
- * @returns {{mainDefect:boolean, via:('red-window'|'green-fix'|'signature'|null), escalation:boolean,
+ * @returns {{mainDefect:boolean, via:('red-window'|'green-fix'|'signature'|'main-failure-signature'|null), escalation:boolean,
  *   attribution:('main-red'|'own-failure'|'unknown'|null)}}
  */
 export function classifyMainDefect({
   requiredCheckCompletedAt = null, mainRedWindows = [], failingCheckName = null, mainLatestCheckRuns = null,
   prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
-  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
+  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null, mainFailureSignature = null,
 } = {}) {
   const none = { mainDefect: false, via: null, escalation: false, attribution: null };
   // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
@@ -575,6 +586,7 @@ export function classifyMainDefect({
     comments, headSha, failureCompletedAt: requiredCheckCompletedAt,
   })) return { mainDefect: true, via: 'green-fix', escalation, attribution };
   if (isMainFixedSignatureOwed(mainFixedSignature)) return { mainDefect: true, via: 'signature', escalation, attribution };
+  if (mainFailureSignature?.matched === true) return { mainDefect: true, via: 'main-failure-signature', escalation, attribution };
   return { ...none, attribution };
 }
 
@@ -660,7 +672,7 @@ export function planMainRedRebases({
       requiredCheckCompletedAt: base.failureCompletedAt, mainRedWindows, failingCheckName: base.failingCheckName,
       mainLatestCheckRuns, prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null,
       mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null, mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
-      comments: c?.comments, headSha: base.headSha, prScopedChecks, mainFixedSignature: c?.mainFixedSignature,
+      comments: c?.comments, headSha: base.headSha, prScopedChecks, mainFixedSignature: c?.mainFixedSignature, mainFailureSignature: c?.mainFailureSignature,
     });
     const attribution = cls.attribution;
     const mainGreenForCheck = cls.via === 'green-fix';
@@ -674,10 +686,16 @@ export function planMainRedRebases({
       });
       continue;
     }
+    const signatureMatch = cls.via === 'main-failure-signature';
+    if (signatureMatch && !isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns, failureCompletedAt: base.failureCompletedAt })) {
+      refusals.push({ ...base, kind: 'main-failure-signature-wait',
+        why: `PR #${prNumber}'s failing check \`${base.failingCheckName}\` matches main's own failure (${c.mainFailureSignature.signature} on main run ${c.mainFailureSignature.mainRunId}) — infra, not the PR's own; waiting for main to recover that check` });
+      continue;
+    }
     // xd3dkzx — main's WORKFLOW may stay red on a different check (live 2026-10-08: `daemon-soak` only) while the
     // PR's own failing check is green on main again. Then the refresh is owed now: the merge gate still demands
     // every required check green on the PR itself, and the per-head cap below still bounds the attempts.
-    const recoveredCheck = mainStillRed && recoveryScope === 'check'
+    const recoveredCheck = mainStillRed && (recoveryScope === 'check' || signatureMatch)
       && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns, failureCompletedAt: base.failureCompletedAt }) ? base.failingCheckName : null;
     const isMainFix = (mainFixPrs || []).map(Number).includes(prNumber);
     if (mainStillRed && !recoveredCheck && !isMainFix) {
@@ -717,11 +735,14 @@ export function planMainRedRebases({
     }
     dispatch.push({
       ...base, attempts: rebaseAttempts, kind: 'rebase-onto-main',
+      ...(signatureMatch ? { via: 'main-failure-signature' } : {}),
       ...(recoveredCheck ? { recoveredCheck } : {}),
       ...(mainFixed ? { attribution: 'main-fixed-signature', attributedWindow: {
         from: c.mainFixedSignature.bugIntroducedAt, to: c.mainFixedSignature.fixedAt,
       } } : {}),
-      why: mainFixed
+      why: signatureMatch
+        ? `PR #${prNumber}'s failing check matches main's own failure: ${c.mainFailureSignature.signature}; main recovered — refreshing onto main`
+        : mainFixed
         ? `PR #${prNumber}'s error signatures were fixed on main by ${[...new Set(c.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — refreshing onto main`
         : mainGreenForCheck
         ? `PR #${prNumber}'s \`${base.failingCheckName}\` check failed at ${base.failureCompletedAt}, but is passing on main's own latest completed run and this head is ${base.aheadBy} commit(s) behind it — main has since fixed this, refreshing onto it`

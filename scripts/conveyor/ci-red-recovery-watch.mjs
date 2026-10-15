@@ -57,6 +57,14 @@
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
 import { resolve } from 'node:path';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
+import { resolveCiHealBudget } from './reconcile-core.mjs';
+import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
+  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, trustedRetryMarkerComments, EXHAUSTED_RETRY_SPENT_MARKER,
+  realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
+  buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
+import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -69,7 +77,7 @@ import { latestRequiredCheck, isRequiredCheckFailed, collapseRollupToLatestPerNa
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { spawnCiHealRearm } from './ci-heal-mark.mjs';
 import {
-  currentMainGreen, resolveRecoveryCaps, markerFreeText, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
+  extractInfraSignatures, runIdFromDetailsUrl, isMainRecoveredForCheck, currentMainGreen, resolveRecoveryCaps, markerFreeText, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
   buildHungCandidates, planHungCiRecoveries, DEFAULT_HUNG_THRESHOLD_MS, DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   classifyCiFailureAttribution, countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
@@ -84,6 +92,7 @@ import {
   defaultReadMainFixedSignatureFacts,
 } from './reconcile-pass.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { rebaseDropManifest } from '../lib/rebase-drop-manifest.mjs';
 import { gitRun } from '../lib/git-run.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
@@ -226,6 +235,8 @@ export function sweepCiRedRecovery({
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
+  readMainFailureSignature = defaultReadMainFailureSignature, exhaustedRetrySettings = null,
+  ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
   readIsCrossRepository = defaultReadIsCrossRepository,
   maxRebaseRetriesPerSha = resolveRecoveryCaps().rebaseRetriesPerSha, checkClaim = pushRefusal,
@@ -234,14 +245,16 @@ export function sweepCiRedRecovery({
   // Card xu1nixv — the published red-main priority record (WE only); hermetic (null) inside a test run.
   readPriority = () => readMainRedPriority(),
 } = {}) {
-  const prs = readOpenPrs({ repo });
+  const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
+  const prs = readOpenPrs({ repo, extraFields: ['labels'] });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
-  // The shared required-check read is paid only when some open PR has ANY failing check at all.
+  // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.
   const prList = Array.isArray(prs) ? prs : [];
   const anyRed = prList.some((pr) => collapseRollupToLatestPerName(pr?.statusCheckRollup).some((c) => isRequiredCheckFailed(pr, c?.name || c?.context)));
   const checks = requiredCheck ? [requiredCheck]
-    : ((anyRed ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : null) ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS);
+    : (((anyRed || (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0 && prList.length))
+      ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : null) ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS);
   // The `gh run list --branch main` read only matters when at least one PR has a failing required check to
   // judge against it — mirrors `reconcile-pass.mjs#enrichPrsWithMainRedFacts`'s own "pay for it only when needed".
   const needWindows = prList.some((pr) => isAnyRequiredCheckFailed(pr, checks));
@@ -265,10 +278,15 @@ export function sweepCiRedRecovery({
   // per-PR evidence `isMainGreenFixOwed` requires (lacks that green commit; check not already green at its merge
   // base), read only for a candidate this path could actually admit.
   const candidates = rawCandidates.map((c) => {
+    let exhaustionComments;
+    if (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0) {
+      exhaustionComments = readComments(c.prNumber, { repo });
+      c = { ...c, comments: exhaustionComments, exhaustion: exhaustionFacts({ comments: exhaustionComments, ciHealBudget, ciHealCap, headSha: c.headSha }) };
+    }
     if (!(c.aheadBy > 0)) return c;
     const attribution = classifyCiFailureAttribution({ failureCompletedAt: c.failureCompletedAt, mainRedWindows });
     let withFacts = c;
-    let comments;
+    let comments = exhaustionComments;
     if (attribution !== 'main-red') {
       const greenSha = mainLatestGreenShaForCheck({ failingCheckName: c.failingCheckName, mainLatestCheckRuns });
       if (greenSha) {
@@ -277,25 +295,33 @@ export function sweepCiRedRecovery({
         // The gate is the shared classifier's own (never a private label signal: this pass does not fetch labels, so
         // the old `needsHuman` gate never fired and #4368's recorded main-defect escalation went unseen).
         if (classifierNeedsComments({ failingCheckName: c.failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha: withFacts.prContainsMainGreenSha })) {
-          comments = readComments(c.prNumber, { repo });
+          comments ??= readComments(c.prNumber, { repo });
           withFacts.comments = comments;
         }
       }
       if (!classifyMainDefect({ requiredCheckCompletedAt: c.failureCompletedAt, mainRedWindows, mainLatestCheckRuns, ...withFacts }).mainDefect) {
         withFacts.mainFixedSignature = readMainFixedSignatureFacts({ repo, defaultBranch,
           detailsUrl: c.detailsUrl, failureCompletedAt: c.failureCompletedAt });
-        if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) return withFacts;
+        if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) {
+          if (!retrySettings.enabled || retrySettings.maxRetries === 0) return withFacts;
+          withFacts.mainFailureSignature = readMainFailureSignature({ repo, detailsUrl: c.detailsUrl,
+            failingCheckName: c.failingCheckName, mainRuns, lookbackHours: retrySettings.lookbackHours });
+          if (!withFacts.mainFailureSignature?.matched) return withFacts;
+        }
       }
     }
     comments ??= readComments(c.prNumber, { repo });
-    return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
+    return { ...withFacts, comments, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
   });
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
   const prio = readPriority();
   const isWe = repo == null || repo === 'we' || repo === CONSTELLATION_REPOS.we.slug;
   const mainFixPrs = prio && prio.repo === 'we' && isWe ? (Array.isArray(prio.prs) ? prio.prs : [prio.pr]) : [];
-  const plan = planMainRedRebases({ candidates, mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
+  for (const c of candidates) {
+    c.mainRecoveryOwned = existingMainRecoveryOwns(c, { mainRedWindows, mainLatestCheckRuns });
+  }
+  const plan = planMainRedRebases({ candidates: candidates.filter(c => !c.exhaustion?.exhausted || c.mainRecoveryOwned), mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
   // `rebaseDropManifest` needs a REAL LOCAL checkout of the repo it rebases (this file's own header). Left at
@@ -339,7 +365,187 @@ export function sweepCiRedRecovery({
       applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ...result, acceptance });
     }
   }
-  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns, mainRuns };
+  // Keep discovery rows too: a retry can have gone green (or be missing checks) since the last tick.
+  // The exhausted pass merges these with the attributed candidates instead of rebuilding ownership.
+  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns, mainRuns, candidates, prs: prList, requiredChecks: checks };
+}
+
+// live PR #5195, 2026-10-14: read FAILED sibling logs, not just the aggregate check's 3s log.
+export function defaultReadMainFailureSignature({ repo, detailsUrl, failingCheckName, mainRuns = [],
+  exec = execFileSyncThrottled, lookbackHours = 72, now = Date.now() } = {}) {
+  const runId = runIdFromDetailsUrl(detailsUrl);
+  if (!runId) return { matched: false };
+  const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+  const readSignatures = id => {
+    const jobs = JSON.parse(String(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/runs/${id}/jobs?per_page=100`], options))).jobs;
+    if (!Array.isArray(jobs)) throw new Error('unreadable jobs');
+    const found = new Set();
+    for (const job of jobs.filter(j => ['failure', 'timed_out'].includes(j.conclusion)).slice(0, 6)) {
+      for (const signature of extractInfraSignatures(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/jobs/${job.id}/logs`], options))) found.add(signature);
+    }
+    return [...found];
+  };
+  try {
+    const signatures = readSignatures(runId);
+    if (!signatures.length) return { matched: false };
+    const runs = (Array.isArray(mainRuns) ? mainRuns : []).filter(r => r.conclusion === 'failure'
+      && Date.parse(r.updatedAt) >= now - lookbackHours * 3600000 && Date.parse(r.updatedAt) <= now)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 4);
+    for (const run of runs) {
+      const shared = readSignatures(run.databaseId ?? run.id).find(id => signatures.includes(id));
+      if (shared) return { matched: true, signature: shared, mainRunId: run.databaseId ?? run.id, mainSha: run.headSha };
+    }
+    return { matched: false, signature: signatures[0] };
+  } catch { return null; }
+}
+
+function defaultCiHealBudget(env = process.env) {
+  return resolveCiHealBudget({ env, platform: readPlatformPreferences({ env }).prefs, repo: readSettings()?.ciHeal });
+}
+
+function existingMainRecoveryOwns(c, { mainRedWindows = [], mainLatestCheckRuns = [] } = {}) {
+  const cls = classifyMainDefect({ ...c, requiredCheckCompletedAt: c.failureCompletedAt, mainRedWindows, mainLatestCheckRuns });
+  return cls.mainDefect && cls.via !== 'main-failure-signature';
+}
+
+export function defaultReadMainTip({ repo, defaultBranch = 'main', exec = execFileSyncThrottled } = {}) {
+  const out = exec('gh', ['api', `repos/${repoSlug(repo)}/commits/${defaultBranch}`], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  const tip = JSON.parse(String(out));
+  return { sha: tip.sha, committedAt: tip.commit?.committer?.date ?? null };
+}
+
+export function defaultPostExhaustedRetryComment(prNumber, { body, repo, exec = execFileSyncThrottled } = {}) {
+  exec('gh', ['pr', 'comment', String(prNumber), '--repo', repoSlug(repo), '--body', body], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+}
+
+/** Edit our own erroneous stand-down using the node id returned by the complete comment reader. */
+export function defaultEditExhaustedRetryComment(commentId, { body, repo, exec = execFileSyncThrottled } = {}) {
+  const out = exec('gh', ['api', 'graphql', '-f',
+    'query=mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}',
+    '-f', `id=${commentId}`, '-f', `body=${body}`], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  const result = JSON.parse(String(out || '{}'));
+  if (result.errors?.length || result.data?.updateIssueComment?.issueComment?.id !== commentId) {
+    throw new Error('could not resolve exhausted-retry stand-down');
+  }
+}
+
+export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch = 'main', settings = resolveExhaustedRetry(),
+  ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap, now = Date.now(), candidates = null, mainRuns = null,
+  prs: sharedPrs = null, requiredChecks: sharedRequiredChecks = null,
+  excuseHolds = excusePrMergeGateHolds, editComment = defaultEditExhaustedRetryComment,
+  readOpenPrs = defaultReadOpenPrs, readAttributedRequiredChecks = defaultReadAttributedRequiredChecks,
+  readAheadBy = defaultReadAheadBy, readComments = defaultReadPrComments, readMainRuns = defaultReadMainRuns,
+  readMainTip = defaultReadMainTip, readMainFailureSignature = defaultReadMainFailureSignature,
+  refresh = refreshOntoMain, trigger = triggerCiForPr, postComment = defaultPostExhaustedRetryComment,
+  checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
+  reconcileAcceptance = reconcileAcceptanceAfterRebase,
+} = {}) {
+  const dispatch = [], refusals = [], applied = [];
+  if (!settings.enabled || settings.maxRetries === 0) return { dispatch, refusals, applied, settings };
+  if (candidates === null || sharedPrs !== null) {
+    // Listings nominate PRs only. Marker-dependent mutations require a complete live thread, even when
+    // discovery supplied fewer than 100 comments. Shared candidates carry the first pass's live reads.
+    const raw = sharedPrs ?? readOpenPrs({ repo, extraFields: ['labels'] });
+    const prs = excuseHolds(Array.isArray(raw) ? raw : [], { repo });
+    const checks = sharedRequiredChecks ?? (prs.length ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : []);
+    const requiredChecks = checks ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS;
+    const shared = new Map((candidates ?? []).map(c => [c.prNumber, c]));
+    candidates = prs.filter(pr => Number.isInteger(pr.number) && pr.number > 0).map(pr => {
+      const failures = realRequiredFailures(pr, requiredChecks);
+      const candidate = shared.get(pr.number) ?? (failures.length
+        ? buildCandidates([pr], { requiredChecks: failures, readAheadBy, repo, defaultBranch })[0] : null);
+      return { prNumber: pr.number, headRefName: pr.headRefName, headSha: pr.headRefOid,
+        ...candidate, pr, requiredChecks };
+    });
+  }
+  let mainTip;
+  for (const c of candidates) {
+    const comments = c.comments ?? readComments(c.prNumber, { repo });
+    const facts = c.exhaustion ?? exhaustionFacts({ comments, ciHealBudget, ciHealCap, headSha: c.headSha });
+    const outcome = c.pr ? retryOutcome({ comments, pr: c.pr, requiredChecks: c.requiredChecks }) : null;
+    const wrongSpent = c.pr ? wrongSpentStandDowns({ comments, pr: c.pr, requiredChecks: c.requiredChecks }) : [];
+    if (outcome?.state === 'recovered' || wrongSpent.length) {
+      const recovered = trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_RECOVERED_MARKER)
+        .some(comment => bodyHasExactLine(comment.body, `head: ${c.headSha}`));
+      if (apply) {
+        for (const comment of wrongSpent) {
+          editComment(comment.id, { repo, body: buildResolvedSpentComment(comment, c.headSha) });
+          applied.push({ prNumber: c.prNumber, kind: 'spent-stand-down-resolved', ok: true, commentId: comment.id });
+        }
+        if (!recovered) {
+          postComment(c.prNumber, { repo, body: buildExhaustedRetryRecoveredComment({ kind: facts.kind ?? c.exhaustion?.kind ?? 'exhaustion', headSha: c.headSha }) });
+          applied.push({ prNumber: c.prNumber, kind: 'exhausted-retry-recovered', ok: true });
+        }
+      }
+      continue;
+    }
+    if (!facts.exhausted) continue;
+    if (outcome?.state === 'pending') {
+      refusals.push({ ...c, action: 'wait', kind: 'wait', why: `the retried CI run has not finished on ${c.headSha?.slice(0, 7)}` });
+      continue;
+    }
+    if (c.pr && !realRequiredFailures(c.pr, c.requiredChecks).length) continue;
+    mainRuns ??= readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME });
+    // Existing main attribution keeps its recovery gates and per-head cap, even after heal exhaustion.
+    if (c.mainRecoveryOwned ?? existingMainRecoveryOwns({ ...c, comments }, { mainRedWindows: computeMainRedWindows(mainRuns) })) continue;
+    mainTip ??= readMainTip({ repo, defaultBranch });
+    // Shared candidates from the red sweep carry the already-read signature facts (including a failed read).
+    const signature = Object.hasOwn(c, 'mainFailureSignature') ? c.mainFailureSignature
+      : readMainFailureSignature({ repo, detailsUrl: c.detailsUrl, failingCheckName: c.failingCheckName, mainRuns, lookbackHours: settings.lookbackHours });
+    const decision = planExhaustedRetry({ facts, retriesUsed: countExhaustedRetries(comments), settings, mainTip,
+      aheadBy: c.aheadBy, now, mainFailureSignature: signature, outcome, headSha: c.headSha,
+      mainRecoveredForCheck: isMainRecoveredForCheck({ checkName: c.failingCheckName, mainRuns, failureCompletedAt: c.failureCompletedAt }) });
+    const d = { ...c, ...decision, kind: decision.action, exhaustionKind: facts.kind };
+    if (decision.action !== 'retry') {
+      if (decision.action === 'none') continue;
+      refusals.push(d);
+      const spent = trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_SPENT_MARKER)
+        .some(comment => bodyHasExactLine(comment.body, `head: ${c.headSha}`));
+      if (apply && decision.action === 'needs-you' && !spent) {
+        postComment(c.prNumber, { repo, body: buildExhaustedRetrySpentComment({ kind: facts.kind, check: c.failingCheckName, headSha: c.headSha }) });
+      }
+      continue;
+    }
+    dispatch.push(d);
+    if (!apply) continue;
+    const root = resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
+    let result;
+    try {
+      const held = checkClaim({ repo, branch: c.headRefName });
+      result = held ? { ok: false, deferred: true, error: held.message }
+        : decision.mode === 'rebase' ? refresh(c.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
+        : trigger(c, { repo: repoSlug(repo), defaultBranch });
+    } catch (e) { result = { ok: false, error: describeExecError(e) }; }
+    if (!result.ok && checkClaim({ repo, branch: c.headRefName })) result = { ...result, deferred: true };
+    if (!result.ok || result.deferred) {
+      refusals.push({ ...d, kind: 'exhausted-retry-failed', why: result.error ?? 'retry deferred' });
+    }
+    // Claim holds spend nothing; every actual attempt, including conflicts and thrown push errors, is bounded.
+    if (!result.deferred) {
+      postComment(c.prNumber, { repo, body: buildExhaustedRetryComment({ prNumber: c.prNumber, kind: facts.kind,
+        trigger: decision.trigger, mode: decision.mode, mainSha: mainTip.sha, headSha: c.headSha,
+        retryHeadSha: result.newCommit ?? result.newHeadSha ?? c.headSha, why: decision.why, ok: result.ok }) });
+      if (result.ok && result.action === 'rebased' && result.newCommit) reconcileAcceptance({ prNumber: c.prNumber, newHead: result.newCommit, repo, root });
+    }
+    applied.push({ prNumber: c.prNumber, ...result });
+  }
+  return { dispatch, refusals, applied, settings };
+}
+
+export function formatExhaustedRetryReport({ dispatch = [], refusals = [], applied = [], settings } = {}) {
+  const lines = [`exhausted-retry: ${Object.entries(settings?.sources ?? {}).map(([key, source]) => `${key}=${settings[key]} (${source})`).join(' ')}${settings?.invalid?.length ? ` ignored invalid: ${settings.invalid.join('; ')}` : ''}`,
+    `exhausted-retry — ${dispatch.length} retry(s), ${refusals.length} refusal(s), ${applied.length} applied`];
+  for (const d of dispatch) lines.push(`  → ${d.mode} PR #${d.prNumber} — ${d.why}`);
+  for (const r of refusals) lines.push(`  ✗ ${r.kind} PR #${r.prNumber} — ${r.why}`);
+  for (const a of applied) lines.push(`  ${a.ok ? '✓' : '✗'} PR #${a.prNumber} — ${a.action ?? a.error}`);
+  return lines.join('\n');
 }
 
 // ── HUNG-CI-RUN RECOVERY (we:backlog/xd1sfms-*.md, parent #4075/#3383) ─────────────────────────────────────────
@@ -460,22 +666,14 @@ export function countHungCiCommentsByJob(comments, jobName = null) {
 }
 
 /**
- * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadPrComments — read one PR's comment thread, the
- * narrow shape {@link countHungCiComments} needs. Called ONLY for a candidate this tick has already found
- * hung (see `sweepHungCiRecovery`'s own "pay for it only when needed" comment) — never for every open PR.
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadPrComments — read one candidate's complete live
+ * thread for recovery budgets, deduplication and stand-down edits. Preserve author, timestamp and node id.
  * @param {number} prNumber
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
 export function defaultReadPrComments(prNumber, { exec = execFileSyncThrottled, repo = null } = {}) {
-  const argv = ['pr', 'view', String(prNumber), '--json', 'comments'];
-  if (repo) argv.push('--repo', repo);
-  const out = exec('gh', argv, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024,
-    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-  });
-  const parsed = JSON.parse(String(out || '{}'));
-  return Array.isArray(parsed?.comments) ? parsed.comments : [];
+  return readCompletePrComments(prNumber, { repo: repoSlug(repo), exec });
 }
 
 /** we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadPrLabels — #2811. The one extra read the rebase
@@ -1151,40 +1349,61 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
   return lines.join('\n');
 }
 
-async function main(argv) {
+// Injectable CLI boundary: regression tests exercise the same orchestration that the daemon invokes.
+export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedRecovery,
+  sweepExhausted = sweepExhaustedRetry, sweepHung = sweepHungCiRecovery, sweepMissingRun = sweepMissingRunRecovery,
+  writeLine = writeLineSync, writeAll = writeAllSync } = {}) {
   const [verbRaw, ...rest] = argv;
   const verb = verbRaw && !verbRaw.startsWith('--') ? verbRaw : 'sweep';
   const flags = parseFlags(verbRaw && !verbRaw.startsWith('--') ? rest : argv);
   if (verb !== 'sweep') {
-    writeLineSync(2, 'usage: ci-red-recovery-watch.mjs sweep [--repo=<owner/name>] [--apply] [--json]');
+    writeLine(2, 'usage: ci-red-recovery-watch.mjs sweep [--repo=<owner/name>] [--apply] [--json]');
     process.exitCode = 2;
     return;
   }
   const repoFlag = typeof flags.repo === 'string' && flags.repo ? flags.repo : null;
   if (repoFlag && repoKeyForSlug(repoFlag) === null) {
-    writeLineSync(2, `✗ ci-red-recovery-watch: --repo ${repoFlag} is not a constellation repo`);
+    writeLine(2, `✗ ci-red-recovery-watch: --repo ${repoFlag} is not a constellation repo`);
     process.exitCode = 1;
     return;
   }
-  const result = sweepCiRedRecovery({ repo: repoFlag, apply: !!flags.apply });
+  const exhaustedRetrySettings = sweepOptions.exhaustedRetrySettings ?? resolveExhaustedRetry();
+  const options = { ...sweepOptions, repo: repoFlag, apply: !!flags.apply };
+  let failed = false;
+  const runPass = (name, sweep, args) => {
+    try { return sweep(args); }
+    catch (e) {
+      failed = true;
+      const error = describeExecError(e);
+      writeLine(2, `✗ ci-red-recovery-watch ${name}: ${error}`);
+      return { dispatch: [], refusals: [], applied: [], error };
+    }
+  };
+  const result = runPass('main-red', sweepMainRed, { ...options, exhaustedRetrySettings });
+  // Never rediscover exhausted candidates if the first pass failed: ownership facts may be incomplete.
+  const exhaustedResult = runPass('exhausted-retry', sweepExhausted, { ...options,
+    settings: exhaustedRetrySettings, mainRuns: result.mainRuns, candidates: result.candidates ?? [],
+    prs: result.prs ?? [], requiredChecks: result.requiredChecks });
   // xd1sfms (#4075/#3383) — the hung-run pass runs in the SAME `sweep` invocation, never a separate CLI verb:
   // both watch the same open-PR listing for the same reason (a PR wrongly stuck on `checking`), and a daemon
   // manifest entry that already schedules this script (see `we:skills-src/conveyor/daemon-manifest.mjs`'s own
   // `ci-red-recovery-watch` entries) gets the hung-run fix for free rather than needing a second entry.
-  const hungResult = sweepHungCiRecovery({ repo: repoFlag, apply: !!flags.apply });
+  const hungResult = runPass('hung-CI', sweepHung, options);
   // xi4od2p (#4075/#3383) — the missing-run pass runs in the SAME `sweep` invocation too, for the identical
   // reason the hung-run pass was folded in above rather than given a second CLI verb: both watch the same
   // open-PR listing for the same reason (a PR wrongly stuck on `checking`), and the daemon-manifest entry that
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
-  const missingRunResult = sweepMissingRunRecovery({ repo: repoFlag, apply: !!flags.apply, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
+  const missingRunResult = runPass('missing-run', sweepMissingRun, { ...options, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
   if (flags.json) {
-    writeAllSync(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult })}\n`);
+    writeLine(2, formatExhaustedRetryReport(exhaustedResult).split('\n')[0]);
+    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult })}\n`);
   } else {
-    writeLineSync(2, formatReport(result));
-    writeLineSync(2, formatHungReport(hungResult));
-    writeLineSync(2, formatMissingRunReport(missingRunResult));
+    writeLine(2, formatReport(result));
+    writeLine(2, formatExhaustedRetryReport(exhaustedResult));
+    writeLine(2, formatHungReport(hungResult));
+    writeLine(2, formatMissingRunReport(missingRunResult));
   }
-  process.exitCode = 0;
+  process.exitCode = failed ? 1 : 0;
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
