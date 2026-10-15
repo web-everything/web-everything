@@ -101,9 +101,29 @@ describe('simulator git and budget regressions', () => {
       play: [(w) => {
         const origin = w.repos.we.originPath;
         const show = (ref, path) => execFileSync('git', ['show', `${ref}:${path}`], { cwd: origin, encoding: 'utf8' });
+        const git = (args, input) => execFileSync('git', args, { cwd: origin, encoding: 'utf8', input });
+        const executable = 'executable script.sh';
+        const script = '#!/bin/sh\nexit 1\n';
+        const beforeSeed = w.git.headOf('we', 'main');
+        const blob = git(['hash-object', '-w', '--stdin'], '#!/bin/sh\nexit 0\n').trim();
+        const tree = git(['mktree', '-z'], git(['ls-tree', '-z', beforeSeed]) +
+          `100755 blob ${blob}\t${executable}\0`).trim();
+        const seed = git(['-c', 'user.name=Sim World', '-c', 'user.email=sim@example.com',
+          'commit-tree', tree, '-p', beforeSeed, '-m', 'seed executable']).trim();
+        git(['update-ref', 'refs/heads/main', seed, beforeSeed]);
+        const mode = (ref, path) => git(['ls-tree', ref, '--', path]).split(' ')[0];
+        expect(mode('main', executable)).toBe('100755');
         const base = w.git.headOf('we', 'main');
         const content = 'utf8: café\nno trailing newline';
-        const head = w.git.commitToMain('we', { 'backlog/9999-x.md': content, [IMPORTED]: content });
+        const head = w.git.commitToMain('we', { 'backlog/9999-x.md': content, [IMPORTED]: content, [executable]: script });
+        expect.soft(mode('main', executable)).toBe('100755');
+        expect(show('main', executable)).toBe(script);
+        expect(mode('main', IMPORTED)).toBe('100644');
+        expect(mode('main', 'backlog/9999-x.md')).toBe('100644');
+        // Start from the original executable too, so this caller is checked independently of commitToMain.
+        w.git.createBranch('we', 'executable-update', { from: base, files: { [executable]: script } });
+        expect.soft(mode('executable-update', executable)).toBe('100755');
+        expect(show('executable-update', executable)).toBe(script);
         expect(head).not.toBe(base);
         expect(show('main', 'backlog/9999-x.md')).toBe(content);
         expect(show('main', IMPORTED)).toBe(content);

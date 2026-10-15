@@ -426,11 +426,17 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     } };
     try {
       git(repo.originPath, ['read-tree', base], opts);
+      // Content writes preserve an existing regular file's executable bit, just like writeFileSync.
+      // Read the seeded index once; NUL records keep whitespace and quoted filenames literal.
+      const executables = new Set(git(repo.originPath, ['ls-files', '--stage', '-z'], opts)
+        .split('\0').filter((entry) => entry.startsWith('100755 '))
+        .map((entry) => entry.slice(entry.indexOf('\t') + 1)));
       for (const [name, content] of Object.entries(files)) {
         const blob = git(repo.originPath, ['hash-object', '-w', '--stdin'], {
           ...opts, input: content, stdio: ['pipe', 'pipe', 'pipe'],
         }).trim();
-        git(repo.originPath, ['update-index', '--add', '--cacheinfo', `100644,${blob},${name}`], opts);
+        const mode = executables.has(name) ? '100755' : '100644';
+        git(repo.originPath, ['update-index', '--add', '--cacheinfo', `${mode},${blob},${name}`], opts);
       }
       const tree = git(repo.originPath, ['write-tree'], opts).trim();
       // A normal `git commit` rejects both empty files and writes that change nothing.
