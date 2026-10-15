@@ -16,9 +16,13 @@ export default {
   async run() {
     const tree = process.env.SOAK_TREE_ROOT || resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
     const load = (file) => import(pathToFileURL(join(tree, 'scripts/lib', file)).href);
-    const [{ runDaemonLoadOverlay }, { rebuildClone }, lock, { writeRebuildStarvation }] = await Promise.all([
-      load('daemon-load-overlay.mjs'), load('daemon-rebuild.mjs'), load('daemon-clone-lock.mjs'), load('daemon-rebuild/lease.mjs'),
-    ]);
+    // These modules share cycles through self-sync and overlays. Let the loader's graph finish
+    // evaluating before importing its dependencies separately: concurrent roots can deadlock Vitest
+    // on a cold soak worker (the unit suite has already imported the loader before running this).
+    const { runDaemonLoadOverlay } = await load('daemon-load-overlay.mjs');
+    const { rebuildClone } = await load('daemon-rebuild.mjs');
+    const lock = await load('daemon-clone-lock.mjs');
+    const { writeRebuildStarvation } = await load('daemon-rebuild/lease.mjs');
     const violations = [];
     for (const variant of [
       { name: 'first attempt', busy: 0, finalize: 180_000 },
