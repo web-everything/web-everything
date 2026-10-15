@@ -14,11 +14,33 @@ export function resolveOperatorPostBuild(settings = readSettings().build, option
   return resolveOperatorTask(settings, options).postBuild;
 }
 
+/** The edge-load step for a card's allowlisted clone name. Not emitted by planOperatorPostBuild (see there). */
+export function renderOperatorEdgeStep(edgeClone, { settings = readSettings().build, workspace = '.' } = {}) {
+  const path = settings?.operatorTask?.edgeClones?.[edgeClone];
+  if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..') || BRIEF_TOKEN_SHAPE.test(path) || /[\r\n`\p{Zl}\p{Zp}]/u.test(path)) throw new Error(`edgeClone ${edgeClone} needs a relative or ~/ clone path in settings`);
+  const clone = path.startsWith('~/') ? resolve(homedir(), path.slice(2)) : resolve(workspace, path);
+  // Shell quote the runtime-only resolved path; never persist an absolute clone path on the card.
+  const quoted = `'${clone.replace(/'/g, `'\\''`)}'`;
+  return renderEdgeStep({ edgeClone: quoted, ref: 'lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug>', step: 'a' });
+}
+
+/** The live-proof step for a card's liveProof record. Not emitted by planOperatorPostBuild (see there). */
+export function renderOperatorProofStep(liveProof) {
+  // A fence longer than any tilde run in the command, so the command cannot close it early.
+  const fence = '~'.repeat(Math.max(3, ...(liveProof.command.match(/~+/g) ?? []).map(run => run.length + 1)));
+  return renderProofStep(`Run the following command after adoption (or after open-pr when no edge load was requested). Capture exit status and output; record PASS only on exit 0 and a match, FAIL on nonzero exit or mismatch, PENDING when adoption is unproven.\n\n${fence}sh\n${liveProof.command}\n${fence}\n\nMatch output against ${JSON.stringify(liveProof.expect)}: /pattern/flags means a JavaScript regex; otherwise use a literal substring.`);
+}
+
 /**
  * The post-build steps this card gets, or [] for none. The ONE decision behind both the composed brief and the
  * dispatch's `operatorPostBuild` route flag, so the two cannot disagree and neither reads prompt text.
+ *
+ * Edge-load and live-proof steps are OFF for every card, whatever the card, settings or policy say (operator
+ * send-back on PR 5242, 2026-10-15): they run commands named by card frontmatter, and the operator record that
+ * would authorize them is still self-asserted. Re-enabling them waits on verified operator-task authority
+ * (we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md).
  */
-export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, workspace = '.', kind = 'build' } = {}) {
+export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, kind = 'build' } = {}) {
   // Only a build composes steps; any other kind (a prepare that would repair the card) never fails on its fields.
   if (kind !== 'build') return [];
   // A bad operator record is no record (an ordinary card, refused by the standards gate), never a failed read:
@@ -28,22 +50,7 @@ export function planOperatorPostBuild(item, { settings = readSettings().build, o
   // Card frontmatter alone never adds a step: the card must be an operator task carrying a valid operator
   // record (an attributed operator instruction), and operator tasks must be enabled.
   if (!hasOperatorRecord(item) || enabled !== true) return [];
-  const steps = [];
-  if (item.edgeClone && policy.edgeLoad) {
-    const path = settings?.operatorTask?.edgeClones?.[item.edgeClone];
-    if (typeof path !== 'string' || !path || isAbsolute(path) || path.split(/[\\/]/).includes('..') || BRIEF_TOKEN_SHAPE.test(path) || /[\r\n`\p{Zl}\p{Zp}]/u.test(path)) throw new Error(`edgeClone ${item.edgeClone} needs a relative or ~/ clone path in settings`);
-    const clone = path.startsWith('~/') ? resolve(homedir(), path.slice(2)) : resolve(workspace, path);
-    // Shell quote the runtime-only resolved path; never persist an absolute clone path on the card.
-    const quoted = `'${clone.replace(/'/g, `'\\''`)}'`;
-    steps.push(renderEdgeStep({ edgeClone: quoted, ref: 'lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug>', step: 'a' }));
-  }
-  if (item.liveProof && policy.liveProof) {
-    // A fence longer than any tilde run in the command, so the command cannot close it early.
-    const fence = '~'.repeat(Math.max(3, ...(item.liveProof.command.match(/~+/g) ?? []).map(run => run.length + 1)));
-    steps.push(renderProofStep(`Run the following command after adoption (or after open-pr when no edge load was requested). Capture exit status and output; record PASS only on exit 0 and a match, FAIL on nonzero exit or mismatch, PENDING when adoption is unproven.\n\n${fence}sh\n${item.liveProof.command}\n${fence}\n\nMatch output against ${JSON.stringify(item.liveProof.expect)}: /pattern/flags means a JavaScript regex; otherwise use a literal substring.`));
-  }
-  if (item.report && policy.report) steps.push(renderReportStep());
-  return steps;
+  return item.report && policy.report ? [renderReportStep()] : [];
 }
 
 export function composeOperatorTaskBrief(template, item, options = {}) {
@@ -51,8 +58,8 @@ export function composeOperatorTaskBrief(template, item, options = {}) {
   if (!steps.length) return template;
   if (item.deliveryBase && item.deliveryBase !== 'main') throw new Error('operator post-build requires a PR delivery target');
   const anchor = '### 9. Append';
-  const at = template.indexOf(anchor);
-  if (at < 0) throw new Error('delivery brief has no post-open-pr insertion point');
-  // Splice by index, never String.replace: no `$` replacement pattern in operator text can be interpreted.
-  return `${template.slice(0, at)}### 8a. Operator post-build (generated by we:scripts/worker-brief.mjs)\n\nUse the exact ref and PR returned by open-pr above. Complete these steps before exiting, including on a parked PR.\n\n${steps.join('\n')}\n${template.slice(at)}`;
+  if (!template.includes(anchor)) throw new Error('delivery brief has no post-open-pr insertion point');
+  // A function replacement: its return value is inserted as is, so `$&`, `$'`, `` $` ``, `$$` (or any other
+  // replacement pattern) in step text stay literal. A string replacement would expand them.
+  return template.replace(anchor, () => `### 8a. Operator post-build (generated by we:scripts/worker-brief.mjs)\n\nUse the exact ref and PR returned by open-pr above. Complete these steps before exiting, including on a parked PR.\n\n${steps.join('\n')}\n${anchor}`);
 }

@@ -2,8 +2,9 @@
 import { platformPreference, logCascadeSources, resolveCascade } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 
+// edgeLoad and liveProof default off; planOperatorPostBuild never emits them in any case (PR 5242 send-back).
 const OPERATOR_TASK_DEFAULTS = Object.freeze({ enabled: true, maxPriority: 'P0',
-  postBuild: Object.freeze({ edgeLoad: true, liveProof: true, report: true }) });
+  postBuild: Object.freeze({ edgeLoad: false, liveProof: false, report: true }) });
 const valid = { enabled: v => typeof v === 'boolean', maxPriority: v => /^P[0-4]$/.test(v),
   postBuild: v => typeof v === 'boolean' };
 

@@ -1308,7 +1308,7 @@ unstamped, so prepare recovery runs `prepare-stamp` on it. An admitted P0 preced
 scope holds, sizing, clearance, and stamp staleness still apply.
 
 `we:scripts/settings/operator-task.json` owns `build.operatorTask`:
-`{ enabled: true, maxPriority: "P0", postBuild: { edgeLoad: true, liveProof: true, report: true } }`. Valid leaves cascade independently from
+`{ enabled: true, maxPriority: "P0", postBuild: { edgeLoad: false, liveProof: false, report: true } }`. Valid leaves cascade independently from
 standard defaults to platform build preferences to tool settings; policy logs identify
 each leaf's source. `maxPriority` is the highest allowed class (P0 permits P0–P4;
 P1 permits P1–P4). Disabled filing retains the brief and operator marker but adds no
@@ -1321,9 +1321,17 @@ fast-path admission so the card can build after preparation while disabled.
 
 `we:scripts/operations/run.mjs file-item` accepts `--edgeClone=review|fix|control|drain|health-watch`,
 `--liveProof-command='<shell command>'`, `--liveProof-expect='<substring or /regex/flags>'`, and `--report`.
+**Edge-load and live-proof steps are off for every card.** Filing still records `edgeClone` and `liveProof`,
+and the standards gate still checks them, but `planOperatorPostBuild` never turns them into brief steps,
+whatever the card, settings or policy leaves say. They run commands named by card frontmatter, and the operator
+record that would authorize them is still self-asserted. Turning them back on waits on verified operator-task
+authority (`we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md`). Only `--report`
+currently adds a step.
+
 These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge
-adoption, capture the command's exit status/output and expectation match, then post a report of at most eight
-lines with `<!-- operator-task-report -->`. A failed or pending adoption/proof is reported honestly.
+adoption (off, see above), capture the command's exit status/output and expectation match (off, see above),
+then post a report of at most eight lines with `<!-- operator-task-report -->`. A failed or pending
+adoption/proof is reported honestly.
 The command and expectation are copied verbatim into the brief, so `{{...}}` text is refused: the dispatch
 fill would otherwise rewrite it as a brief placeholder.
 Clone names map to workspace-relative (or `~/`) paths in `we:scripts/settings/operator-task.json`; never put
