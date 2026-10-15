@@ -15,7 +15,8 @@ function fullPool(caller = 'lane-pool-health-watch-we', env = {}) {
   let clock = Date.now();
   const start = clock;
   expect(acquireGhSlotSync({ lockRoot, cap: 1, owner: `${process.pid}:holder`, pid: process.pid, now: () => clock, timeoutMs: 0 }).ok).toBe(true);
-  const throttle = { lockRoot, cap: 1, caller, env: { WE_PLATFORM_PREFERENCES_FILE: join(lockRoot, 'absent.json'), WE_GH_THROTTLE_COST_HEADERS: '0', ...env }, logPath: join(lockRoot, 'calls.jsonl'), now: () => clock, sleep: vi.fn(ms => { clock += ms; }), pollMs: 1000, warn: vi.fn(), exec: vi.fn(() => '[]') };
+  // Keep the pool full for the entire wait budget; holder reaping is covered by gh-throttle-holders.test.mjs.
+  const throttle = { lockRoot, cap: 1, caller, env: { WE_PLATFORM_PREFERENCES_FILE: join(lockRoot, 'absent.json'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_MAX_HOLD_SECONDS: '0', ...env }, logPath: join(lockRoot, 'calls.jsonl'), now: () => clock, sleep: vi.fn(ms => { clock += ms; }), pollMs: 1000, warn: vi.fn(), exec: vi.fn(() => '[]') };
   return { throttle, elapsed: () => clock - start, rows: () => readFileSync(throttle.logPath, 'utf8').trim().split('\n').map(JSON.parse) };
 }
 
