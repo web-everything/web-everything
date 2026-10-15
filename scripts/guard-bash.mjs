@@ -2864,7 +2864,7 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
     if (dynamic(operands)) return [CLEAR_ALL];
     // An option bash 3.2 rejects assigns nothing there; one only a newer bash knows (`-A`, `-g`, `-l`, …)
     // leaves the operands version-dependent, so unknown.
-    const letters = opts.replace(/[-+]/g, '');
+    const letters = (opts.match(/[-+]./g) ?? []).map((p) => p[1]).join(''); // `-x-` keeps its stray `-`
     if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l))) {
       if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l) && !DECLARATION_OPTIONS_NEWER.includes(l))) return [];
       return operands.map((w) => declarationOperand(w)?.name).filter(Boolean).map(forget);
@@ -2877,6 +2877,8 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
       || (name !== 'local' && /-[xr]/.test(opts));
     const keepsAssigned = name === 'export' || name === 'readonly' || (name !== 'local' && /-[xra]/.test(opts));
     const freezes = name === 'readonly' || (name !== 'local' && opts.includes('-r'));
+    // with -a, bash 3.2 freezes the name BEFORE assigning, so the assignment is refused and the old value stays
+    const refusesAssign = freezes && opts.includes('-a');
     const prefixNames = new Set(prefix.map((w) => assignmentOp(w).name));
     const assigned = new Set();                                 // names an earlier operand already assigned
     for (const w of operands) {
@@ -2886,6 +2888,8 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
       if (op.bare) {
         if (name === 'local' || (transforms && opts.includes('n'))) { if (!temporary) out.push(forget(op.name)); }
         else if (keepsBare && temporary && !assigned.has(op.name)) out.push({ name: op.name, fromPrefix: true });
+      } else if (refusesAssign) {
+        assigned.add(op.name);
       } else if (!temporary || keepsAssigned) {
         // bash expands every operand before the builtin assigns any: `export A=/x L=$A` reads the old A
         out.push(name === 'local' || transforms ? forget(op.name) : { ...op, snapshot: true });

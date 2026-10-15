@@ -693,6 +693,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // an option bash 3.2 rejects assigns nothing; one only a newer bash knows leaves the operand unknown
     expect(at('LANE=/protected/clone; export -z LANE=/tmp; cd "$LANE"')).toBe('/protected/clone');
     expect(at('LANE=/protected/clone; declare -A LANE=/tmp; cd "$LANE"')).toBe(REPORTED);
+    for (const b of ['declare -x-', 'export -n-', 'readonly -a-', 'declare -x+']) {
+      expect(at(`LANE=/protected/clone; ${b} LANE=/tmp; cd "$LANE"`), b).toBe('/protected/clone');
+    }
+    // with -a, bash 3.2 freezes the name before assigning, so the old value stays
+    for (const b of ['readonly -a', 'declare -ra', 'declare -r -a', 'typeset -ar']) {
+      expect(at(`LANE=/protected/clone; ${b} LANE=/tmp; cd "$LANE"`), b).toBe('/protected/clone');
+    }
     // bare assignments (no command) still bind left to right
     expect(at('A=/x; A=/protected/clone LANE=$A; cd "$LANE"')).toBe('/protected/clone');
     // a prefix assignment to a declaration that does not export or freeze the name stays temporary
