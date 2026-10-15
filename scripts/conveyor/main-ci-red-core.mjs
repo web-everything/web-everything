@@ -20,6 +20,7 @@
  */
 
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
+import { isNonCodeFile } from '../lib/merge-queue-affected.mjs';
 import { parsePushBeforeGate } from '../lib/fix-push-policy.mjs';
 
 /**
@@ -40,6 +41,37 @@ export const MINUTE = 60_000;
 export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   /** Off = before this card: the smell never breaches. */
   mainCiRedEnabled: true,
+  /** card 302: minutes without owner CI progress; 0 = owners never stall. */
+  mainCiRedOwnerStallMin: 30,
+  /** card 302: minutes from dispatch to a PR; 0 = no PR deadline. */
+  mainCiRedOwnerPrDeadlineMin: 45,
+  /** card 302: minutes red before stalled-owner alerts; 0 = no escalation. */
+  mainCiRedEscalateAfterMin: 60,
+  /** card 302: minutes between stalled-owner alerts; 0 = no escalation. */
+  mainCiRedEscalateEveryMin: 60,
+  /** card 302: automatic safe recovery; false = alerts only. */
+  mainCiRedAutoRecover: true,
+  /** card 302: minutes stalled before safe recovery; 0 = alerts only. */
+  mainCiRedAutoRecoverAfterMin: 60,
+  /** Off = no automatic CI reruns. Each run is requested at most once. */
+  mainCiRedFlakeRerun: true,
+  /** card 303: off = before this card, green merge groups supply no flake evidence. */
+  mainCiRedMergeGroupFlakeEvidence: true,
+  /** card 303: maximum merge-group runs to read; 0 = no merge-group read. */
+  mainCiRedMergeGroupRunLimit: 30,
+  /** Case-insensitive error signature; empty = no signature rule. */
+  mainCiRedFlakeSignaturePattern: 'Test timed out in \\d+ ?ms|Hook timed out in \\d+ ?ms',
+  /** File or file > title substrings; empty = no known-flaky exceptions. */
+  mainCiRedKnownFlakyTests: Object.freeze([]),
+  /** Off = prose-only changes after a green run do not qualify. */
+  mainCiRedRerunUnrelatedChange: true,
+  mainCiRedNonCodePaths: Object.freeze(['backlog/', 'docs/']),
+  /** Off = leave a cancelled tip alone. */
+  mainCiRedRerunCancelledTip: true,
+  /** Empty = labels cannot declare repair ownership. */
+  mainCiRedOwnerLabels: Object.freeze(['red-main-repair']),
+  /** Off = body supersession markers cannot declare repair ownership. */
+  mainCiRedOwnerSupersedeMarker: true,
   /** How long main must stay red (measured from the first red run's push) before the smell opens and an owner is owed. */
   mainCiRedThresholdMs: 15 * MINUTE,
   /** The workflow file whose runs ARE main's CI (read by workflow, never across all workflows — card xfrjlsi). */
@@ -85,10 +117,45 @@ export function mainCiRedSettings(config = {}) {
   const out = {};
   for (const [k, d] of Object.entries(MAIN_CI_RED_DEFAULTS)) {
     const v = config?.[k];
-    out[k] = v !== undefined && v !== null && typeof v === typeof d ? v : d;
+    out[k] = mainCiRedSettingSource(config, k) === 'health' ? v : d;
   }
   if (config?.mainCiRedPushBeforeGate !== undefined && config?.mainCiRedPushBeforeGate !== null) out.mainCiRedPushBeforeGate = config.mainCiRedPushBeforeGate;
   return out;
+}
+
+/** card 303: attribute only well-typed health overrides. PURE. */
+export function mainCiRedSettingSource(config, key) {
+  const v = config?.[key];
+  return Object.hasOwn(MAIN_CI_RED_DEFAULTS, key) && v !== undefined && v !== null
+    && typeof v === typeof MAIN_CI_RED_DEFAULTS[key] ? 'health' : 'standard';
+}
+
+/** card 303: the queue branch names its base, not its synthetic head commit. PURE. */
+export function parseMergeGroupBase(headBranch, branch = 'main') {
+  const prefix = `gh-readonly-queue/${branch}/`;
+  if (typeof headBranch !== 'string' || !headBranch.startsWith(prefix)) return null;
+  return /^pr-\d+-([0-9a-f]{40})$/i.exec(headBranch.slice(prefix.length))?.[1] ?? null;
+}
+
+/** card 303: newest green group covering every failing cause on this tip. PURE. */
+export function findMergeGroupFlakeEvidence({ groupRuns, tipSha, failedJobs, jobsOf, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedMergeGroupFlakeEvidence || !Array.isArray(groupRuns)
+    || typeof tipSha !== 'string' || !/^[0-9a-f]{7,40}$/i.test(tipSha)) return null;
+  const coveredJobs = [...new Set((failedJobs ?? []).filter((name) => !settings.mainCiRedSummaryJobs.includes(name)))];
+  if (!coveredJobs.length) return null;
+  const candidates = groupRuns.filter((r) => r?.status === 'completed' && r.conclusion === 'success')
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  for (const run of candidates) {
+    const baseSha = parseMergeGroupBase(run.headBranch, settings.mainCiRedBranch);
+    if (!baseSha || !baseSha.toLowerCase().startsWith(tipSha.toLowerCase())) continue;
+    const jobs = jobsOf(run.databaseId);
+    // Accept a complete raw list or readRunJobs' complete success projection.
+    const passed = Array.isArray(jobs) ? jobs.filter((j) => j.conclusion === 'success').map((j) => j.name)
+      : jobs?.complete === true && Array.isArray(jobs.passed) ? jobs.passed : null;
+    if (!passed || !coveredJobs.every((name) => passed.includes(name))) continue;
+    return { runId: run.databaseId, headBranch: run.headBranch, baseSha, completedAt: run.updatedAt, coveredJobs };
+  }
+  return null;
 }
 
 /** The operator's one-off override of `mainCiRed.pushBeforeGate` (the top layer of the cascade below). */
@@ -135,18 +202,86 @@ export function formatMainFixPushPolicyLine(policy) {
   return `main-fix-push-policy: mainCiRed.pushBeforeGate=${policy?.pushBeforeGate ? 'on' : 'off'} (${policy?.source ?? 'standard'})${bad}`;
 }
 
+/** Parse Vitest failure blocks from timestamped, ANSI-coloured Actions logs. Junk yields no failures. PURE.
+ * @returns {Array<{file:string, title:string, error:string}>}
+ */
+export function parseVitestFailures(logText) {
+  if (typeof logText !== 'string') return [];
+  const lines = logText.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/)
+    .map((line) => line.replace(/^\d{4}-\d{2}-\d{2}T\S+\s/, '').trim());
+  const out = [], seen = new Set();
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^FAIL\s+(.+?) > (.+)$/.exec(lines[i]);
+    if (!match) continue;
+    const [, file, title] = match;
+    const key = JSON.stringify([file, title]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let error = '';
+    for (let j = i + 1; j <= i + 6 && j < lines.length; j += 1) {
+      if (/^FAIL\s/.test(lines[j])) break;
+      if (/^(?:Error\b|AssertionError\b|TypeError\b|[A-Za-z_$][\w.$]*Error:)|timed out/i.test(lines[j])) { error = lines[j]; break; }
+    }
+    out.push({ file, title, error });
+  }
+  return out;
+}
+
+/** Decide whether one first-attempt failure merits a flake rerun. Unreadable facts prove nothing. PURE.
+ * @returns {{eligible:boolean, reason:string}}
+ */
+export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, groupEvidence, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedFlakeRerun) return { eligible: false, reason: 'rerun-off' };
+  if (run?.attempt > 1) return { eligible: false, reason: 'already-rerun' };
+  // failedJobs names (including summaries) are not signature evidence: only parsed test failures count.
+  let signature = null;
+  try { if (settings.mainCiRedFlakeSignaturePattern) signature = new RegExp(settings.mainCiRedFlakeSignaturePattern, 'i'); } catch { /* invalid setting disables the signature */ }
+  if (Array.isArray(failures) && failures.length && failures.every((f) =>
+    (signature && signature.test(String(f?.error ?? ''))) || settings.mainCiRedKnownFlakyTests.some((entry) =>
+      entry && `${f?.file ?? ''} > ${f?.title ?? ''}`.includes(entry)))) return { eligible: true, reason: 'flaky-signature' };
+  if (settings.mainCiRedRerunUnrelatedChange && prevRunGreen === true && Array.isArray(changedFiles) && changedFiles.length
+    && changedFiles.every((f) => isNonCodeFile(f, settings.mainCiRedNonCodePaths))) return { eligible: true, reason: 'unrelated-change' };
+  if (groupEvidence) return { eligible: true, reason: 'merge-group-green-on-tip' };
+  return { eligible: false, reason: 'not-flaky' };
+}
+
+/** How many times one run may be flake-rerun when a rerun ends without a verdict (the first try plus one retry). */
+export const FLAKE_RERUN_ROUNDS = 2;
+
+/** Plan at most one rerun, preferring the cancelled tip and waiting for all active runs. PURE.
+ * @returns {null|{runId:number, sha:string, kind:string, reason:string}}
+ */
+export function planMainCiRerun({ runs, tipSha, reruns = {}, flake = null, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedFlakeRerun || !Array.isArray(runs) || runs.some((r) => r.status !== 'completed')) return null;
+  const newest = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+  const unseen = (id) => !Object.hasOwn(reruns, id);
+  if (settings.mainCiRedRerunCancelledTip && newest?.headSha === tipSha && newest?.conclusion === 'cancelled'
+    && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
+    return { runId: newest.databaseId, sha: newest.headSha, kind: 'cancelled-tip', reason: 'latest main run was cancelled' };
+  }
+  // A flake rerun that finished with no verdict (cancelled / skipped / infra-only) settled nothing: try it once more, then
+  // leave the hold to the owner. Only runs we ledgered as a flake rerun qualify, and only up to FLAKE_RERUN_ROUNDS tries.
+  const again = runs.find((r) => r.rerunInconclusive === true && Number(r.attempt) > 1 && reruns[r.databaseId]?.kind === 'flake' && (reruns[r.databaseId].rounds ?? 1) < FLAKE_RERUN_ROUNDS);
+  if (again) return { runId: again.databaseId, sha: again.headSha, kind: 'flake', reason: 'inconclusive-rerun', retry: true };
+  const run = flake?.eligible && runs.find((r) => r.databaseId === flake.runId);
+  if (run && unseen(run.databaseId)) return { runId: run.databaseId, sha: run.headSha, kind: 'flake', reason: flake.reason };
+  return null;
+}
+
 const RED = new Set(['failure', 'timed_out', 'startup_failure']);
 
 /**
  * One run's verdict about main's code: `green`, `red`, or `ignore` (still running, cancelled by a newer push,
- * skipped, or a failure whose only bad jobs were cancelled / never got a runner — `infraOnly`). PURE.
+ * skipped, or a failure whose only bad jobs were cancelled / never got a runner — `infraOnly`). A red run
+ * with `rerunPending` stays red until its rerun completes, and one whose rerun finished without a verdict
+ * (`rerunInconclusive`: cancelled, skipped, infra-only) stays red until a later run succeeds. PURE.
  */
 export function classifyRun(run) {
-  if (String(run?.status ?? '').toLowerCase() !== 'completed') return 'ignore';
+  if (String(run?.status ?? '').toLowerCase() !== 'completed') return run?.rerunPending === true ? 'red' : 'ignore';
   const c = String(run?.conclusion ?? '').toLowerCase();
   if (c === 'success') return 'green';
-  if (RED.has(c)) return run?.infraOnly === true ? 'ignore' : 'red';
-  return 'ignore';
+  if (RED.has(c) && run?.infraOnly !== true) return 'red';
+  return run?.rerunInconclusive === true ? 'red' : 'ignore';
 }
 
 const ts = (s) => { const t = Date.parse(s ?? ''); return Number.isFinite(t) ? t : null; };
@@ -289,7 +424,8 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
   const branchRe = rx(settings.mainCiRedOwnerBranchPattern);
   const since = ts(firstRed.createdAt);
   const short = sha.slice(0, 7);
-  const out = [];
+  const out = [], candidates = [];
+  const add = (pr) => { if (!out.some((p) => p.number === Number(pr.number))) out.push({ number: Number(pr.number), title: String(pr.title ?? '').slice(0, 100) }); };
   for (const pr of prs || []) {
     if (!pr || (pr.state && String(pr.state).toUpperCase() !== 'OPEN')) continue;
     // F4 (review round 1): a title or branch anyone can type is not provenance. Only the conveyor's own login or the
@@ -297,6 +433,7 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
     if (settings.mainCiRedOwnerRequireTrustedAuthor !== false && !isTrustedPrAuthor(pr)) continue;
     const created = ts(pr.createdAt);
     if (since !== null && created !== null && created < since) continue; // an older PR cannot be fixing a newer break
+    candidates.push(pr);
     const title = String(pr.title ?? '');
     // The commit named in the TITLE, or in the body right after a fix verb ("fixes 7c731a9"). A body that only
     // mentions the commit (live 2026-10-09: the card PR #4527 describing the incident) does not own the fix.
@@ -305,8 +442,30 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
     const branch = String(pr.headRefName ?? '');
     if ((short.length === 7 && title.includes(short)) || bodyNames || branch.startsWith(settings.mainCiRedOwnerBranchPrefix)
       || (branchRe && branchRe.test(branch)) || (re && re.test(title))) {
-      out.push({ number: Number(pr.number), title: title.slice(0, 100) });
+      add(pr);
     }
+  }
+  const existing = new Set(out.map((p) => p.number));
+  for (const pr of candidates) {
+    const labelled = (pr.labels || []).some((label) => settings.mainCiRedOwnerLabels?.some((name) => name.toLowerCase() === String(label?.name ?? '').toLowerCase()));
+    let supersedes = false;
+    if (settings.mainCiRedOwnerSupersedeMarker) {
+      for (const rawLine of String(pr.body ?? '').split(/\r?\n/)) {
+        let line = rawLine.trim();
+        // Parse a complete declaration as text, optionally inside a paired comment wrapper.
+        // Deleting delimiters throughout the body can splice malformed text into a valid marker.
+        if (line.startsWith('<!--')) {
+          const endLength = line.endsWith('--!>') ? 4 : line.endsWith('-->') ? 3 : 0;
+          if (!endLength) continue;
+          line = line.slice(4, -endLength).trim();
+        }
+        const match = /^red-main-repair:\s*supersedes\s+(?:lane\/main-fix-([a-f0-9]{7,64})|([a-f0-9]{7,64})|#(\d+))$/i.exec(line);
+        if (!match) continue;
+        const ref = match[1] || match[2];
+        if (ref ? sha.toLowerCase().startsWith(ref.toLowerCase()) : Number(match[3]) !== Number(pr.number) && existing.has(Number(match[3]))) supersedes = true;
+      }
+    }
+    if (labelled || supersedes) add(pr);
   }
   return out;
 }
@@ -388,13 +547,14 @@ export function findOwner({ firstRed, prs = [], agents = [], ledger = {}, settin
  * Is an owner owed for main's current break? PURE. `prs === null` means the open-PR read failed: ownership is then
  * unknown and nothing is dispatched (never risk a duplicate on a blind read).
  * @param {{state:object, now:number, settings:object, owner:object|null, prs:Array|null, killed?:boolean,
- *   fixGate?:{admit:boolean, kind?:string, why?:string}|null}} o
+ *   fixGate?:{admit:boolean, kind?:string, why?:string}|null, rerunPending?:boolean}} o
  * @returns {{owed:boolean, reason:string, why?:string}}
  */
-export function decideOwner({ state, now, settings = MAIN_CI_RED_DEFAULTS, owner = null, prs = [], killed = false, fixGate = null }) {
+export function decideOwner({ state, now, settings = MAIN_CI_RED_DEFAULTS, owner = null, prs = [], killed = false, fixGate = null, rerunPending = false }) {
   if (!settings.mainCiRedOwnerDispatch) return { owed: false, reason: 'dispatch-off' };
   if (!settings.mainCiRedEnabled) return { owed: false, reason: 'smell-off' };
   if (state?.status !== 'red') return { owed: false, reason: state?.status === 'green' ? 'main-green' : 'main-state-unknown' };
+  if (rerunPending) return { owed: false, reason: 'flake-rerun-pending' };
   if (!isRedLongEnough(state, { now, thresholdMs: settings.mainCiRedThresholdMs })) return { owed: false, reason: 'below-threshold' };
   if (prs === null) return { owed: false, reason: 'owner-unknown', why: 'open PRs unreadable' };
   if (owner) return { owed: false, reason: 'owned', why: `${owner.kind} ${owner.ref}` };
@@ -494,7 +654,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
  * take in the others' branches, so one PR carries every fix.
  *
  * @param {{mainFailingJobs:string[], fixPrs:Array<{number:number, createdAt?:string, headRefName?:string,
- *   ci:{status:'green'|'red'|'pending'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
+ *   ci:{status:'green'|'red'|'inconclusive'|'pending'|'missing'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
  *   `ci` is the PR's latest FINISHED CI run with a complete job list; anything else is `unknown` (never acted on).
  *   `passedJobs` = the jobs whose conclusion was `success` (skipped / cancelled / absent are NOT in it): the only
  *   evidence that this PR fixes a main cause.
@@ -608,4 +768,71 @@ export function mainRedDeliveryClass(job, record, { now, repo = 'we' } = {}) {
   if (job?.kind === 'owner' || job?.kind === 'combine') return 'P0';
   if (job?.kind === 'pr' && mainRedPriorityRank(job.pr, record, { now, repo }) === 0) return 'P0';
   return 'P3';
+}
+
+/** card 302: progress is observed CI or a dispatch still inside its PR deadline. PURE. */
+export function assessOwnerProgress({ state, owner, ownerPrs = [], ledgerEntry, now, rerunPending, settings = MAIN_CI_RED_DEFAULTS }) {
+  const moving = (reason) => ({ moving: true, reason });
+  if (!settings.mainCiRedEnabled || !(settings.mainCiRedOwnerStallMin > 0)) return moving('stall-off');
+  if (state?.status !== 'red' || !owner) return moving('no-red-owner');
+  if (rerunPending) return moving('rerun-pending');
+  if (!Number.isFinite(now) || ownerPrs === null) return moving('progress-unknown');
+  const recent = now - settings.mainCiRedOwnerStallMin * MINUTE;
+  if (ownerPrs.some((pr) => pr.ci?.pending === true)) return moving('owner-ci-pending');
+  if (ownerPrs.some((pr) => ts(pr.ci?.completedAt) !== null && ts(pr.ci.completedAt) > recent)) return moving('owner-ci-recent');
+  let reason, since;
+  if (ownerPrs.length) {
+    // A legacy pending label without observed in-flight evidence also needs a deadline.
+    const missing = (pr) => ['missing', 'pending'].includes(pr.ci?.status);
+    // Unknown or green CI is not proof of a stalled red owner.
+    if (ownerPrs.some((pr) => !missing(pr)
+      && (!['red', 'inconclusive'].includes(pr.ci?.status) || ts(pr.ci?.completedAt) === null))) return moving('owner-ci-not-red');
+    const hasMissing = ownerPrs.some(missing);
+    if (hasMissing && !(settings.mainCiRedOwnerPrDeadlineMin > 0)) return moving('owner-ci-deadline-off');
+    // Anchor the grace to PR creation, never a poll or PR updatedAt (comments can change it).
+    // Sparse callers fall back to dispatch, then the red episode's start; neither slides on polling.
+    const deadlines = ownerPrs.map((pr) => {
+      if (!missing(pr)) return ts(pr.ci.completedAt);
+      const started = ts(pr.createdAt) ?? (Number.isFinite(ledgerEntry?.at) ? ledgerEntry.at : state.redSinceMs);
+      return Number.isFinite(started) ? started + settings.mainCiRedOwnerPrDeadlineMin * MINUTE : null;
+    });
+    if (deadlines.some((at) => at === null)) return moving('progress-unknown');
+    since = Math.max(...deadlines);
+    if (now < since) return moving('owner-ci-deadline');
+    reason = hasMissing ? 'owner-ci-missing'
+      : ownerPrs.some((pr) => pr.ci.status === 'inconclusive') ? 'owner-ci-inconclusive' : 'owner-ci-red';
+  } else {
+    if (owner.kind !== 'dispatched' || !(settings.mainCiRedOwnerPrDeadlineMin > 0)
+      || !Number.isFinite(ledgerEntry?.at)) return moving('dispatch-unknown');
+    since = ledgerEntry.at + settings.mainCiRedOwnerPrDeadlineMin * MINUTE;
+    if (now < since) return moving('owner-pr-deadline');
+    reason = 'no-owner-pr';
+  }
+  const firstRed = state.firstRed;
+  const approval = firstRed?.attempt === 1 && !firstRed.rerunRequested
+    ? `approve a re-run of main run ${firstRed.runId} (gh run rerun ${firstRed.runId} --failed)`
+    : `review a revert of ${String(firstRed?.sha ?? '').slice(0, 9)} (the first red commit)`;
+  return { stalled: true, reason, since, approval, firstRedSha: firstRed?.sha };
+}
+
+/** card 302: a fresh subject each period while the owner remains stalled. PURE. */
+export function planEscalation({ state, stall, now, settings = MAIN_CI_RED_DEFAULTS }) {
+  if (!settings.mainCiRedEnabled || !stall?.stalled || state?.status !== 'red'
+    || !(settings.mainCiRedEscalateAfterMin > 0) || !(settings.mainCiRedEscalateEveryMin > 0)
+    || !Number.isFinite(state.redSinceMs) || !Number.isFinite(stall.since) || !Number.isFinite(now)) return null;
+  const at = Math.max(stall.since, state.redSinceMs + settings.mainCiRedEscalateAfterMin * MINUTE);
+  if (now < at) return null;
+  return { n: 1 + Math.floor((now - at) / (settings.mainCiRedEscalateEveryMin * MINUTE)), at };
+}
+
+/** card 302: only one first-attempt rerun is safe; a revert is merely a proposal. PURE. */
+export function planStalledRecovery({ stall, failingRun, reruns = {}, settings = MAIN_CI_RED_DEFAULTS, now }) {
+  if (!settings.mainCiRedEnabled || !settings.mainCiRedAutoRecover || !(settings.mainCiRedAutoRecoverAfterMin > 0)
+    || !stall?.stalled || !Number.isFinite(stall.since) || !Number.isFinite(now)
+    || now - stall.since < settings.mainCiRedAutoRecoverAfterMin * MINUTE) return null;
+  if (failingRun?.status === 'completed' && classifyRun(failingRun) === 'red' && failingRun.attempt === 1
+    && !Object.hasOwn(reruns, failingRun.databaseId)) {
+    return { kind: 'rerun', runId: failingRun.databaseId, sha: failingRun.headSha, reason: 'owner-stalled' };
+  }
+  return { kind: 'revert-proposal', sha: stall.firstRedSha, reason: 'owner-stalled' };
 }

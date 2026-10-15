@@ -24,6 +24,11 @@ Cached input is a subset of input; reasoning is a subset of output when reported
 
 > Tier-1 reference. Read when writing or changing tests.
 
+Keep the 50-tick daemon soak baseline alone in shard 1 when splitting the soak suite. Balance break
+scenarios by measured time across the remaining shards; timing estimates must never put a sibling
+scenario beside the baseline. Those scenarios fork real daemon and git children, so concurrent worlds
+can exhaust the baseline's wall-clock timeout while its per-tick invariants continue to hold.
+
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
@@ -41,6 +46,15 @@ at high effort so evidence routing, backend holds and fixer escalation remain ef
 Codex retry order through `codex.modelByTask` settings; use an explicit route fixture for launch-boundary tests.
 Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
 per-lens design models still override the helper default.
+
+## Smoke sentinel worker isolation
+
+Daemon rebuild dispatch dry-runs force `WE_WORKER_WRAPPER=off` so injected spawners capture both fix and
+review prompts. Missing or blank captures fail; synthetic review PRs inject an allowed CI gate so the brief
+check cannot silently skip dispatch. Wrapped launches also refuse sentinel PRs (`9xxxxx`) and session slugs
+ending in that sentinel unless `smokeRealWorker.allowSentinel` resolves true through the shared cascade
+(`scripts/settings/smoke-real-worker.json`, env `WE_SMOKE_ALLOW_REAL_WORKER=1|true`). The deliberate overlay
+real-worker smoke sets this opt-in itself. Test refusal with an injected launcher, for every default-on role.
 
 ## Wrapped worker verification waits
 
@@ -93,7 +107,10 @@ derive their roots from `import.meta.url`. Daemon clones remain read-only launch
 test snapshots every launch-checkout file, including `.git`, across success and pre-worker failure.
 Prepare edits only the target card body and preparation stamps, never claims/resolves it, and verifies
 the runner-authored stamp before opening a parked PR. Its implementation scope does not bound preparation;
-the card path does. Decision preparation remains a Claude judgment role.
+the card path does. `prepare.runner=codex` passes that card path to routing; `scope` retains implementation-scope
+gating, and `claude` forces the daemon fallback. Use a named critical gate file (for example,
+`scripts/lib/dispatch-contracts.mjs`) in scope-gating fixtures: arbitrary `scripts/lib/` files are not
+critical by directory alone. Decision preparation remains a Claude judgment role.
 Flash keeps the Codex read-only checker; a checker refusal undoes the attempt.
 `test-fix` uses Flash without a separate simple flag and refuses non-test worker diffs.
 The CI-heal decision currently has no structured failing-file list; do not infer one from check names.
@@ -649,6 +666,19 @@ pinned to `CONSTELLATION_REPOS` by `scripts/lib/__tests__/review-core.test.mjs`.
 
 ### Operator notification probes
 
+Operator send-back regressions replay the whole PR thread, including a newer mechanical conflict bounce,
+fix-end and advisory accept. `scripts/lib/operator-send-backs.mjs` owns resolution: trusted fix evidence must
+explicitly name the request and a different head (short/full SHA spellings of the same commit do not count).
+Acceptance labels alone never clear it. Evidence comments begin with a standalone `## Fix evidence` heading
+or a standalone addresses marker (optionally preceded by `Head:`). Reviewer prose, blockquotes, fenced and
+indented examples of those formats must never resolve a request, even from a trusted author. Keep evidence
+markers in fixer prompts and replay quoted instructions through queue holds and verdict reduction. Verify the
+complete comment reader retains URLs, and exercise planning, resumed prompts, review reduction, red-team
+input fingerprints and both operator-queue entry paths. Unknown send-back heads remain open conservatively.
+Partial operator-queue CLI copies load the send-back reader optionally, report import errors, and withhold
+all readiness when it is unavailable. Notice retry receipts stay separate from thread-derived `noticedRungs`
+and are scoped to the dispatch target, head and rung; a failed post must remain retryable.
+
 `operator-notify` consumes only `operator-queue`'s `ready` rows. Tests inject the notifier,
 including child CLI probes; never exercise real desktop delivery in this suite. Persisted
 successes deduplicate until an item leaves NEEDS YOU; queue errors preserve all prior keys.
@@ -860,6 +890,19 @@ existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
 
+### Grouped build recovery
+
+Grouped members have no worker run row of their own. Restart adoption must use the lead's
+PID, session liveness or bound resume marker, using the single-card liveness classifier.
+Only the lead resumes or settles that worker; the daemon's grouped retirement path owns
+member cleanup. Probe real member claim files with a dead daemon PID and a live lead,
+including session and resumed-worker evidence. Recovery carries the durable dispatch's
+full member list through resumability, resume argv and wrapper publication; a missing
+original dispatch record refuses publication. Member claim edits are wrapper-owned,
+while unrelated card edits still refuse recovery. Test generated mixed numeric/hash
+`Resolves` lines through the real resolution reader, retaining diff corroboration and
+bornAs alias checks for hashes.
+
 ### Enqueue catch-up ordering
 
 The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
@@ -874,3 +917,33 @@ Confirmed drain gate skips and revalidation aborts also release room; successful
 and ambiguous failures consume it. Give each fake child its actual target PR number.
 Also cover a queue that fills while the window is closed and an unreadable next snapshot:
 retained attempts must stay within the latest room, and cannot use a failed snapshot.
+
+Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
+remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
+reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+A batching deferral stops new starts but lets existing children finish their locked admission checks.
+Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
+scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
+
+## Referral rulings answering stand-downs
+
+The ruling pass relays a later trusted operator referral ruling through the existing operator-answer
+builder only when the current head has no pending, blocked or disputed findings and later operator rulings
+cover every explicit `{runId, key}` subject in the stand-down's final trailer. The stand-down CLI accepts
+`--finding-refs='[{"runId":"review run","key":"finding key"}]'` for a referral question; legacy markers and
+non-finding questions require an explicit operator answer. The builder encodes these subjects as base64url
+JSON, so quoted/free-text trailers cannot inject them. Multiple unresolved stand-downs also require an
+explicit answer: the shared answer ceremony supersedes older questions as well as the named question.
+Replay with real referral, ruling and stand-down
+builders; verify comment-before-label order, retry after either write fails, fresh same-head findings,
+head movement during the answer post, and auto-policy exclusion. The fixer brief's referral escalation
+command must pass `--finding-refs`; check that producer/consumer contract directly. Legacy holds,
+including the original #5246 marker, still require an explicit operator answer; do not infer subjects
+from free text. Failed label writes recover only with a complete paged label-event history that
+strictly predates the relay answer (equal-second timestamps are ambiguous). Re-read the head and
+revalidate comments and label history after posting the answer and before editing labels. Keep
+resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS YOU lists outstanding
+findings before the first ruling.
+The queue routes needs-judgment questions to NEEDS YOU
+by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.

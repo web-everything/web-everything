@@ -87,3 +87,14 @@ describe('resolveMainFixPushPolicy — the policy cascade (same semantics as fix
     expect(formatMainFixPushPolicyLine(resolveMainFixPushPolicy({ health: 'off' }))).toBe('main-fix-push-policy: mainCiRed.pushBeforeGate=off (health)');
   });
 });
+
+
+describe('main-red rerun and repair declaration settings', () => {
+  it('preserves array settings and each rerun off value', () => {
+    const config = { mainCiRedFlakeRerun: false, mainCiRedFlakeSignaturePattern: '', mainCiRedKnownFlakyTests: ['a.test.mjs'],
+      mainCiRedRerunUnrelatedChange: false, mainCiRedNonCodePaths: ['notes/'], mainCiRedRerunCancelledTip: false,
+      mainCiRedOwnerLabels: [], mainCiRedOwnerSupersedeMarker: false };
+    expect(mainCiRedSettings(config)).toMatchObject(config);
+    expect(mainCiRedSettings({ mainCiRedFlakeRerun: 'false' }).mainCiRedFlakeRerun).toBe(true);
+  });
+});

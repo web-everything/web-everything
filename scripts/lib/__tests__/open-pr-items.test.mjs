@@ -537,6 +537,23 @@ function statusDiff(path, from, to) {
 }
 const diffOf = (...parts) => parts.join('\n');
 
+describe('grouped Resolves declarations with hash members', () => {
+  const diff = diffOf(statusDiff('backlog/7102-member.md', 'open', 'active'),
+    statusDiff('backlog/xabc123-member.md', 'open', 'active'));
+  const changedFiles = ['scripts/a.mjs', 'backlog/7102-member.md', 'backlog/xabc123-member.md'];
+  it('credits a numbered hash alias using the same corroborated card transition as heading markers', () => {
+    expect(declaredResolvedIdsFromPr('lane/7101-build', 'Build', { body: 'Resolves #7102, #xabc123',
+      diff, changedFiles, landedNumberFor: hash => hash === 'xabc123' ? '7103' : null }).sort())
+      .toEqual(['7102', '7103']);
+  });
+  it('does not credit an unclaimed hash or a mid-sentence resolves mention', () => {
+    expect(declaredResolvedIdsFromPr('lane/7101-build', 'Build', { body: 'Resolves #7102, #xdef456',
+      diff, changedFiles })).toEqual(['7102']);
+    expect(declaredResolvedIdsFromPr('lane/7101-build', 'Build', {
+      body: 'This references Resolves #7102, #xabc123', diff, changedFiles })).toEqual([]);
+  });
+});
+
 describe('declaredResolvedIdsFromPr (#xqpqyr2 — ride-along cards a PR declares/resolves besides its own single ref-led id)', () => {
   describe('signal 1 — explicit "resolves #N" / "Resolves: …" LINE markers', () => {
     // Signal 1 is corroborated: the PR's own diff must move the named card's frontmatter status to

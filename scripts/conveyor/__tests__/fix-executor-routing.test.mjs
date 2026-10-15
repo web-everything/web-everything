@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
-import { fixDetachedProvider } from '../../operations/dispatch-providers/fix.mjs';
-import { dispatchFix, roundEscalationFor } from '../reconcile-fix-dispatch.mjs';
+import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
+import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
 describe('fix.executor cascade', () => {
@@ -277,6 +277,7 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
   const run = async (extra, executor, { fixSettings = { strongerModelFromRound: 3 } } = {}) => {
     const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
     const dispatch = vi.fn(() => ({ pr: 42 }));
+    const borrowGate = { consider: vi.fn(() => ({ borrow: true, executor, waitedMinutes: 30 })), clear: vi.fn() };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const result = runReconcileFixDispatch({
@@ -286,10 +287,10 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
         findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
         loadItems: () => [], pickFreeLanes: () => [2], listBuildClaims: () => [], listFixClaims: () => [],
         dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'fixer cap full' }) },
-        borrowGate: { consider: () => ({ borrow: true, executor, waitedMinutes: 30 }), clear: vi.fn() },
+        borrowGate,
         tryResume: () => ({ resumed: false }), tryResumeRound: () => ({ resumed: false }), dispatch,
       });
-      return { result, dispatch };
+      return { result, dispatch, borrowGate };
     } finally { log.mockRestore(); }
   };
   it.each([
@@ -300,12 +301,40 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
     ['ordinary round-3 escalation', { attempts: 2 }],
     ['round-3 repair with no stronger-model rung configured', { attempts: 2 }, { fixSettings: { strongerModelFromRound: 0 } }],
     ['round-2 repair on a stronger-model rung (fix.strongerModelFromRound=2)', { attempts: 1 }, { fixSettings: { strongerModelFromRound: 2 } }],
-    ['red-main fix', { mainFix: true }],
   ])('refuses a codex borrow for a %s and keeps waiting', async (_name, extra, opts) => {
     const { result, dispatch } = await run(extra, 'codex', opts);
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.dispatched).toHaveLength(0);
     expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
+  });
+  it('dispatches a red-main fix past the full fixer cap by default without borrowing, preserving its Claude route', async () => {
+    const previous = process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    try {
+      const { result, dispatch, borrowGate } = await run({ mainFix: true }, 'codex');
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ mainFix: true }));
+      expect(result.dispatched).toHaveLength(1);
+      expect(result.dispatched[0].borrowed).toBeUndefined();
+      expect(borrowGate.consider).not.toHaveBeenCalled();
+      expect(result.refusals).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+      else process.env.WE_MAIN_FIX_PAST_FIX_CAP = previous;
+    }
+  });
+  it('keeps a red-main fix waiting for Claude under a full fixer cap when passing the cap is off', async () => {
+    const previous = process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+    process.env.WE_MAIN_FIX_PAST_FIX_CAP = 'off';
+    try {
+      const { result, dispatch } = await run({ mainFix: true }, 'codex');
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.dispatched).toHaveLength(0);
+      expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
+    } finally {
+      if (previous === undefined) delete process.env.WE_MAIN_FIX_PAST_FIX_CAP;
+      else process.env.WE_MAIN_FIX_PAST_FIX_CAP = previous;
+    }
   });
   it('still lets a table-bearing entry borrow a Claude-class slot, and an ordinary one borrow codex', async () => {
     const claude = await run({ rulingNotAddressed: { rung, route: claudeRoute, matches: [] } }, 'claude');
@@ -472,5 +501,68 @@ describe('CI-heal stale-base dispatch seam', () => {
         if (mode === 'throw') expect(log).toHaveBeenCalledWith(expect.stringContaining('stale-base gate failed open: probe failed'));
       }
     } finally { log.mockRestore(); }
+  });
+});
+
+describe('fallback chain routing', () => {
+  const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
+  it('skips opted-in Argon while its production confinement contract is unavailable', () => {
+    expect(chooseFixExecutor({ setting, chain, codexUnproductive: 3, launcherAvailable: fixLauncherAvailable }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', reason: expect.stringContaining('argon launcher unavailable') });
+  });
+  it.each(['fix', 'ci-heal'])('round 3 %s with two unproductive runs still tries codex-alt', kind => {
+    const head = 'a'.repeat(40);
+    const decision = routeFixExecutor({ repo: 'we', pr: 42, kind, round: 3, headRefOid: head }, {
+      setting, chain, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null,
+      launcherAvailable: () => true, criticalFor: () => false,
+      readRouted: () => ({ 'we#42': [{ head, outcome: 'failed' }, { head, outcome: 'no-change' }] }),
+    });
+    expect(decision).toMatchObject({ rung: 'codex-alt', executor: 'codex' });
+  });
+  it('routes triggers through the chain and keeps main-fix on Claude', () => {
+    const decision = chooseFixExecutor({setting,chain,strongerModel:true,launcherAvailable:()=>true});
+    expect(decision).toMatchObject({rung:'codex-alt',source:'repo',policyRoute:{model:'gpt-6-astra',effort:'high'}});
+    expect(formatFixExecutorLog(decision)).toContain('fix executor: codex rung=codex-alt model=gpt-6-astra effort=high');
+    expect(chooseFixExecutor({setting,chain,mainFix:true,launcherAvailable:true}).executor).toBe('claude');
+  });
+  it('routes Argon CI-heal with its policy and suppresses the Claude stronger rung', async () => {
+    const {createRoutedCiHealDispatch} = await import('../../lib/fix-slot-borrow.mjs');
+    const launchCodex = vi.fn(()=>'pid:1');
+    const dispatch = vi.fn(async (p,{sinks,routeHeal}) => { expect(p.strongerModel).toBe(false); expect(routeHeal()).toBe(null); return sinks.launch({sessionSlug:'heal',prompt:'p'}); });
+    const run = createRoutedCiHealDispatch({dispatch, route:()=>chooseFixExecutor({setting,chain,codexUnproductive:3,launcherAvailable:()=>true}),
+      createSinks:({provider})=>({launch:provider}),launchCodex,writePrompt:()=>'/tmp/p',removePrompt:vi.fn(),stampExecutor:vi.fn(),profileFor:()=>({slug:'o/r'})});
+    const log = vi.spyOn(console,'error').mockImplementation(()=>{});
+    try { await run({pr:42,scope:['we:x'],strongerModel:true}); } finally {log.mockRestore();}
+    expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({policyRoute:{provider:'antigravity',model:'gemini-4-argon-high'}}));
+  });
+});
+
+describe('chain dispatch and critical scope', () => {
+  const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
+  const options = {setting,chain,fixSettings:{strongerModelFromRound:3},loadLadder:()=>null,readRouted:()=>({}),launcherAvailable:()=>true};
+  it.each([{}, {scope:[]}, {scope:['we:scripts/lib/critical-work.mjs']}])('fails closed for critical scope %j', scope => {
+    expect(routeFixExecutor({pr:42,strongerModel:true,...scope},options)).toMatchObject({executor:'claude',reason:'critical work never leaves Claude'});
+  });
+  it('uses the injected critical verdict and fails closed on errors', () => {
+    const planned = {pr:42,strongerModel:true,scope:['we:x.ts']};
+    const criticalFor = vi.fn(()=>false);
+    expect(routeFixExecutor(planned,{...options,criticalFor}).rung).toBe('codex-alt');
+    expect(criticalFor).toHaveBeenCalledWith(planned);
+    expect(routeFixExecutor(planned,{...options,criticalFor:()=>{throw Error('unreadable');}}).executor).toBe('claude');
+  });
+  it('stamps Argon as routed and forwards the model without a Claude ladder claim', () => {
+    const spawnBorrowed = vi.fn(()=>'pid:1'), stampExecutor = vi.fn();
+    const log = vi.spyOn(console,'error').mockImplementation(()=>{});
+    try {
+      dispatchFix({pr:42,itemNum:'42',lane:2,laneRef:'lane/42-x',scope:['we:x.ts'],
+        rulingNotAddressed:{rung:{id:'opus-high',at:1},route:{provider:'claude',model:'opus'}}}, {
+        root:'/repo',readBrief:()=>'{{PR_NUM}} {{LANE_REF}}',readFixClaim:()=>null,acquireClaim:()=>({ok:true}),
+        stampExecutor,stampRunner:vi.fn(),postNotice:vi.fn(),fixExecutorRoute:()=>chooseFixExecutor({setting,chain,codexUnproductive:3,launcherAvailable:()=>true}),
+        writeBorrowedPrompt:()=>'/tmp/p',spawnBorrowed,spawnAgent:()=>{throw Error('unexpected Claude');},
+      });
+      expect(spawnBorrowed).toHaveBeenCalledWith(expect.objectContaining({policyRoute:{provider:'antigravity',model:'gemini-4-argon-high'}}));
+      expect(stampExecutor).toHaveBeenCalledWith(expect.objectContaining({decision:expect.objectContaining({executor:'antigravity',rung:'argon'})}));
+      expect(log.mock.calls.find(([line])=>line.includes('ruling-not-addressed rung'))[0]).toContain('model=gemini-4-argon-high');
+    } finally {log.mockRestore();}
   });
 });

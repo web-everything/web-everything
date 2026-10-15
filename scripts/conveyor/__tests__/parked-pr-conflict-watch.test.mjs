@@ -1428,7 +1428,7 @@ describe('defaultListPrComments — argv shape + @tsv round-trip incl. author.lo
     let capturedArgv;
     defaultListPrComments({ number: 42, repo: 'o/n', exec: (cmd, argv) => { capturedArgv = argv; return ''; } });
     expect(capturedArgv).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/42/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv']);
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv']);
   });
 
   it("falls back to gh's own {owner}/{repo} template when repo is omitted", () => {
@@ -2009,9 +2009,10 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
-vi.mock('../../lib/gh-throttle.mjs', async () => {
+vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
+    ...await importOriginal(),
     execFileSyncThrottled: vi.fn((file, args, opts) => execFileSync(file, args, opts)),
     runGhSync: vi.fn((args, opts) => execFileSync('gh', args, opts)),
   };

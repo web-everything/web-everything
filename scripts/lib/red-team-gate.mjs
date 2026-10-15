@@ -159,14 +159,19 @@ export function redTeamGateMarker(pr, rev, outcome) {
   return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome} -->`;
 }
 
+/** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. */
+export function parseRedTeamGateMarker(body) {
+  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+) -->/.exec(String(body ?? '').trimStart());
+  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3] } : null;
+}
+
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */
 export function gateOutcomesForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
-  const re = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+) -->/;
   const found = new Set();
   for (const c of Array.isArray(comments) ? comments : []) {
-    const m = re.exec(String((typeof c === 'string' ? c : c?.body) ?? '').trimStart());
-    if (m && Number(m[1]) === Number(pr) && m[2] === live && isTrustedMarkerAuthor(c)) found.add(m[3]);
+    const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
+    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c)) found.add(m.outcome);
   }
   return found;
 }

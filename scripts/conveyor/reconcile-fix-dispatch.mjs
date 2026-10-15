@@ -66,10 +66,13 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
+import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
@@ -116,6 +119,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
+import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
@@ -162,6 +166,20 @@ import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+
+// card 302 — resolve red-main capacity through the shared policy layers.
+export function resolveMainFixCapacity(env = process.env) {
+  try {
+    const raw = String(env?.WE_MAIN_FIX_PAST_FIX_CAP ?? '').trim().toLowerCase();
+    const pastFixCap = ['on', 'true', '1'].includes(raw) ? true
+      : ['off', 'false', '0'].includes(raw) ? false : undefined;
+    const resolved = cascadePolicy('mainFixCapacity', readDeclaredSettings().settings.mainFixCapacity, {
+      standard: { pastFixCap: true }, env, envValues: { pastFixCap },
+      valid: { pastFixCap: value => typeof value === 'boolean' },
+    });
+    return { pastFixCap: resolved.value.pastFixCap, source: resolved.sources.pastFixCap };
+  } catch { return { pastFixCap: true, source: 'standard' }; }
+}
 
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
 const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -356,9 +374,9 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         isConflict: isConflictItemless, body: entry.body ?? null, headRefOid: entry.headRefOid ?? null,
         ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
         ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
+        ...(entry.openOperatorSendBacks?.length ? { openOperatorSendBacks: entry.openOperatorSendBacks } : {}),
         ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
         ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
-      ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
         ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
@@ -479,6 +497,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       // fix procedure — the saved alt branch of a concurrent-author pause this PR re-armed from, if any.
       ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
       ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
+      ...(entry.openOperatorSendBacks?.length ? { openOperatorSendBacks: entry.openOperatorSendBacks } : {}),
       ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
@@ -842,6 +861,7 @@ export function freeLaneNumbers({ exec = execFileSync, root = REPO_ROOT, lanePoo
 export function tryResumeFix(planned, {
   repo = 'we',
   root = REPO_ROOT,
+  postNotice = postRulingNotice,
   spawnAgent = defaultSpawnAgent,
   listAgentsAll = () => defaultListAgents({ all: true }),
   stop = stopSession,
@@ -912,9 +932,10 @@ export function tryResumeFix(planned, {
     };
   }
 
+  postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
   return resumeBgSession(planned, {
     candidate,
-    prompt: withOperatorAnswer(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned.operatorAnswer),
+    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1098,6 +1119,7 @@ export function tryResumeRoundFix(planned, {
  * alone. The same text is the durable PR comment {@link postRulingNotice} writes.
  */
 export function withRulingNotAddressed(prompt, ruling) {
+  if (ruling?.source === 'operator-send-back') return prompt; // the complete ledger leads withPlannedContext
   return ruling?.matches?.length ? `${fixerRulingBrief(ruling)}${prompt}` : prompt;
 }
 
@@ -1150,7 +1172,7 @@ export function fixerTableFor(ruling) {
 
 /** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
 export function withPlannedContext(prompt, planned) {
-  return withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
+  return renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
 }
 
 /**
@@ -1177,8 +1199,11 @@ function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readR
 }
 
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
-export function routeFixExecutor(planned, { setting, fixSettings, loadLadder, launcherAvailable, readRouted }) {
-  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, launcherAvailable });
+export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLadder, launcherAvailable, readRouted,
+  criticalFor = p => criticalWorkVerdict({ taskType: p.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: p.scope ?? [] }).critical }) {
+  let critical = true;
+  try { critical = criticalFor(planned); } catch { /* unknown verdict fails closed */ }
+  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable });
 }
 
 /** Card xrbu1bp — the routing table this fix launch runs on: the ruling rung, the takeover rung, or the round rung. */
@@ -1240,13 +1265,23 @@ export function postTakeoverVoid({ repo, pr, head, exec = execFileSyncThrottled 
   return true;
 }
 
-/** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
+// Successful posts on a planning snapshot, scoped to the caller's repo/PR/head/rung.
+// Keep these retry receipts separate from the thread-derived `noticedRungs`: a snapshot
+// may be reused for another dispatch target, and a failed post must remain retryable.
+const postedRulingNotices = new WeakMap();
+
+/** Post the send-back notice once per head and rung (the durable record the fixer reads on the thread). */
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
   // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
   if (!ruling?.matches?.length || (ruling.noticedRungs ?? []).includes(ruling.rung?.id ?? '*')) return false;
   const slug = ghRepoSlug(repo);
+  const receipt = JSON.stringify([repo, String(pr), ruling.head, ruling.rung?.id ?? '*']);
+  if (postedRulingNotices.get(ruling)?.has(receipt)) return false;
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', renderRulingNotAddressed(ruling)],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+  // A failed resume may cold-start from this same snapshot before the thread is read again.
+  if (!postedRulingNotices.has(ruling)) postedRulingNotices.set(ruling, new Set());
+  postedRulingNotices.get(ruling).add(receipt);
   return true;
 }
 
@@ -1444,7 +1479,7 @@ export function dispatchFix(planned, {
     const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
     const ladderTable = launchTableFor(planned, roundEscalation); // may refuse before anything is posted
     if (roundEscalation) {
-      console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${roundEscalation.round} on the ${roundEscalation.rung.id} route (fix.strongerModelFromRound=${roundEscalation.fromRound}) model=${ladderTable?.model ?? 'default-fix-route'}`);
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${roundEscalation.round} on the ${roundEscalation.rung.id} route (fix.strongerModelFromRound=${roundEscalation.fromRound}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     try {
       postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
@@ -1462,13 +1497,13 @@ export function dispatchFix(planned, {
         throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} takeover marker post failed for PR #${planned.pr}: ${describeSpawnFailure(e, { label: 'gh comment' })}`);
       }
       takeoverMarked = true;
-      console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover ${planned.takeover.n ?? 1} of ${planned.takeover.budget ?? 1} at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${ladderTable?.model ?? 'default-fix-route'}`);
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover ${planned.takeover.n ?? 1} of ${planned.takeover.budget ?? 1} at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     if (planned.rulingNotAddressed?.rung) {
-      console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
-    if (!borrowed && decision.executor === 'codex') stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
+    if (!borrowed && decision.executor !== 'claude') stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
     if (decision.executor !== 'claude') {
       // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
       const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
@@ -1480,7 +1515,7 @@ export function dispatchFix(planned, {
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
           mergeOnto: mergeOntoFor(planned),
-          policyRoute: { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
+          policyRoute: decision.policyRoute ?? { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
       } catch (e) {
         removePromptFile(promptFile); // the launcher never started, so nothing else will delete the brief
@@ -1748,6 +1783,8 @@ export function runReconcileFixDispatch({
   // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
   readMainRedPriorityRecord = () => readMainRedPriority(),
 } = {}) {
+  const now = Date.now();
+  const mainFixCapacity = resolveMainFixCapacity();
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
   // #x1rr9rh (multi-repo slice 2) — this staleness check guards the DISPATCHING checkout (this WE checkout's
@@ -1903,7 +1940,13 @@ export function runReconcileFixDispatch({
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
     let borrowed = null;
-    if (!t.admit) {
+    // card 302 — only a red-main owner may pass the fixer cap without borrowing.
+    const pastFixCap = !t.admit && t.kind === 'fix-cap' && mainFixCapacity.pastFixCap
+      && (entry.mainFix === true || mainRedPriorityRank(entry.pr, readMainRedPriorityRecord(), { now, repo: repoKey }) === 0);
+    if (pastFixCap) {
+      console.error(`reconcile-fix-dispatch: PR #${entry.pr} red-main fix admitted past the fixer cap (${t.why}) — mainFixCapacity.pastFixCap=true (source ${mainFixCapacity.source})`);
+    }
+    if (!t.admit && !pastFixCap) {
       const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
       // A borrowed non-Claude launch skips the router, so any entry the router keeps on Claude (ruling send-back,

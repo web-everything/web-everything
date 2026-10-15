@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAuthorshipCache, DISPATCH_PR_COUNT_API_CAP } from '../../lib/pr-limit.mjs';
 import {
-  queueFileRows,
+  projectBuildQueueRow, queueFileRows,
   dispatchPlan, selectClearedRows, clearedNotReady,
   // #3457/#3460 — the age-gated already-done ground-truth enrichment (Fork 2(b)).
   isStaleEnoughForGroundTruth, ALREADY_DONE_AGE_GATE_MS,
@@ -1448,5 +1448,14 @@ describe('settleFreeLanes — a failed lane-pool read degrades to zero free lane
   it('a read that throws synchronously is also caught', async () => {
     const r = await settleFreeLanes(() => { throw new Error('boom'); });
     expect(r).toEqual({ freeLanes: [], error: 'boom' });
+  });
+});
+
+
+describe('queue-row projection for grouping', () => {
+  it('preserves grouping metadata and existing scope normalization', () => {
+    const row = projectBuildQueueRow({ num: '42' }, { kind: 'task', parent: '100', size: 1, estimatedLoc: 90, tags: ['finding'], locus: 'we', blockedBy: ['43'], scope: ['we:scripts/a.mjs'], openBlockers: [] });
+    expect(row).toMatchObject({ num: '42', kind: 'task', parent: '100', size: 1, estimatedLoc: 90, tags: ['finding'], locus: 'we', blockedBy: ['43'], scope: ['scripts/a.mjs'], rawScope: ['we:scripts/a.mjs'] });
+    expect(projectBuildQueueRow({ num: 'missing' })).toMatchObject({ num: 'missing', tags: [], blockedBy: [], openBlockers: [] });
   });
 });

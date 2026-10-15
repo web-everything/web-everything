@@ -23,7 +23,7 @@ import { routeWorkerResult, settleWorkerResult } from './worker-result-router.mj
 export const REVIEW_JOB_LAUNCHER = 'node-job';
 
 /** The review job's own outcome words -> worker-result outcome / blocker kind. Anything unknown fails closed (blocked). */
-const DONE_OUTCOMES = new Set(['parked', 'auto-cleared', 'bounced']);
+const DONE_OUTCOMES = new Set(['parked', 'auto-cleared', 'bounced', 'carried']);
 
 /**
  * PURE — the worker result for one classified review-job round. `parked` / `auto-cleared` / `bounced` are finished

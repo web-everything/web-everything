@@ -36,6 +36,20 @@ const standDown = { id: 'SD1', body: `${STAND_DOWN_MARKER}\nNeed a ruling`, auth
 const answer = { id: 'A1', body: buildOperatorAnswer({ standDownId: 'SD1', reason: 'Proceed', actor: 'chalbert', channel: 'console' }), author: { login: 'web-everything' }, createdAt: '2026-10-11T11:00:00Z' };
 const pr = (number, comments) => ({ number, title: `PR ${number}`, labels: [], comments, mergeable: 'MERGEABLE' });
 
+it.each(['review:human', 'review:accepted'])('holds an unresolved operator send-back out of NEEDS YOU with %s', label => {
+  const oldHead = 'e5ed9cb74', head = '245c40542' + 'b'.repeat(31);
+  const comments = [{ id: 'SB1', author: { login: 'chalbert' }, createdAt: '2026-10-14T20:07:00Z',
+    body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nOperator send-back at head ${oldHead}.\nRepair the original guard.` },
+  { author: { login: 'web-everything' }, body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${'a'.repeat(40)}..${head}\`` }];
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(5243, comments), headRefOid: head,
+    labels: [{ name: label }, { name: 'advisory:accepted' }] }]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.ready).toEqual([]);
+  expect(report.notReady).toContainEqual(expect.objectContaining({ number: 5243,
+    reasons: expect.arrayContaining(['operator send-back of 2026-10-14T20:07:00.000Z not yet addressed']) }));
+});
+
 it('does not surface an answered hold that lapsed on a new head', () => {
   vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');
   const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', head: 'a'.repeat(40) }) };
@@ -47,6 +61,7 @@ it('does not surface an answered hold that lapsed on a new head', () => {
 });
 
 it('answers the latest live hold rather than a newer lapsed hold', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
   vi.stubEnv('WE_STAND_DOWN_LAPSE_ON_NEW_HEAD', 'on');
   const head = 'b'.repeat(40);
   const live = { ...standDown, id: 'LIVE', createdAt: '2026-10-11T09:00:00Z',
@@ -136,7 +151,7 @@ describe('operator queue read safety', () => {
     expect(execFileSync).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledTimes(1);
     expect(sleep).toHaveBeenCalledWith(500);
-    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledTimes(2);
     expect(stderr).toHaveBeenCalledWith('operator-queue: read attempts=2 (source: env)');
   });
 
@@ -145,7 +160,7 @@ describe('operator queue read safety', () => {
     readSettings.mockReturnValue({ operatorQueue: { readAttempts: 4 } });
     execFileSync.mockReturnValue('[]');
     run();
-    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledTimes(2);
     expect(stderr).toHaveBeenCalledWith('operator-queue: read attempts=4 (source: settings)');
     expect(execFileSync).toHaveBeenCalledTimes(1);
   });
@@ -177,7 +192,7 @@ describe('operator queue read safety', () => {
     expect(execFileSync).toHaveBeenCalledTimes(4);
     expect(execFileSync).toHaveBeenLastCalledWith('gh', [
       'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/1/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv',
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv',
     ], expect.objectContaining({ encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
     expect(process.exitCode).toBeUndefined();
   });
@@ -353,4 +368,56 @@ describe('staged copies missing an optional reader', () => {
     expect(report.stoodDown).toEqual([]);
     expect(process.exitCode).toBe(1);
   });
+});
+
+it('routes needs-judgment to NEEDS YOU with the fixer question', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule not-real on this finding.' }) };
+  execFileSync.mockReturnValue(JSON.stringify([pr(7, [held])]));
+  run(['--json']);
+  expect(JSON.parse(stdout())).toMatchObject({ stoodDown: [], needsYouStandDowns: [
+    { number: 7, question: 'Please rule not-real on this finding', remaining: [] },
+  ] });
+});
+it('prints the fixer question under NEEDS YOU without an empty placeholder', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
+  execFileSync.mockReturnValue(JSON.stringify([pr(7, [{ ...standDown,
+    body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) }])]));
+  run();
+  const section = stdout().split('NEEDS YOU (')[1].split('RULING NEEDED')[0];
+  expect(section).toContain('o/n#7  PR 7');
+  expect(section).toContain('the fixer asks] Please rule');
+  expect(section).not.toContain('(none)');
+});
+it('resolved needs-judgment drops off and the stood-down setting restores the old section', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
+  execFileSync.mockReturnValue(JSON.stringify([pr(7, [held]), pr(8, [held, answer])]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.needsYouStandDowns ?? []).toEqual([]);
+  expect(report).toMatchObject({ stoodDown: [{ number: 7 }] });
+});
+it.each([false, true])('shows outstanding findings with subsequent operator ruling=%s', async (ruled) => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
+  const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } = await import('../../lib/jury-core.mjs');
+  const repo = 'o/n', head = 'a'.repeat(40), runId = 'review-pr-7', seat = 'judgeCorrectnessAdvisory';
+  const reviewer = mandatoryReferralReviewer(runId);
+  const referrals = ['scripts/first.mjs', '', 'scripts/third.mjs'].map((file, i) => {
+    const f = { file, line: i === 2 ? 12 : null, summary: `finding ${i}`, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    return { key: referralFindingKey(seat, f), seat, original: f, finding: normalizeFinding(f) };
+  });
+  const record = { version: 1, repo, pr: 7, head, runId, reviewer, authorBody: '<!-- authored-by-actor: author -->', attempted: true, referrals,
+    rulings: referrals.map((f, i) => ({ id: `${runId}:${i}`, key: f.key, reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'checked', evidence: ['diff'] })) };
+  const ruling = { version: 1, repo, pr: 7, head, actor: 'chalbert', channel: 'chat', reason: 'Not real',
+    at: '2026-10-11T11:00:00Z', clearerId: 'session-1', rulings: [{ runId, key: referrals[0].key, result: 'not-real' }] };
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
+  const comments = [{ id: 'ref', body: renderReferralRecord(record), author: { login: 'web-everything' }, createdAt: '2026-10-11T09:00:00Z' },
+    held, ...(ruled ? [{ id: 'ruling', body: buildOperatorRulingComment(ruling), author: { login: 'chalbert' }, createdAt: ruling.at }] : [])];
+  execFileSync.mockReturnValue(JSON.stringify([{ ...pr(7, comments), headRefOid: head, body: record.authorBody }]));
+  run();
+  const section = stdout().split('NEEDS YOU (')[1].split('RULING NEEDED')[0];
+  expect(section).toContain('still needs your ruling: (no file)  finding 1');
+  expect(section).toContain('still needs your ruling: scripts/third.mjs:12  finding 2');
+  if (!ruled) expect(section).toContain('still needs your ruling: scripts/first.mjs  finding 0');
 });

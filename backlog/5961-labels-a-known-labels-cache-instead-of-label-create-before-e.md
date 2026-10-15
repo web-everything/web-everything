@@ -5,14 +5,14 @@ size: 2
 status: open
 scope: ["we:scripts/lib/ensure-label.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/lib/forge-land-provider.mjs", "we:scripts/lib/__tests__/ensure-label.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/review-label-provider.test.mjs", "we:scripts/lib/__tests__/forge-land-provider.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "8e6ac5c8b85595160693d112b6996004db63cd16"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
 tags: []
 ---
 
 # Labels: a known-labels cache instead of label create before every edit
 
-Held finding 227 (coroner-5). 4,118 label create calls in 12 h (merge-ai-prs 3,083, review-daemon 709, fix-procedure 134, pr-land 111); 295/h after the 18:30 ET fix. Each is an idempotent ensure-exists. Fix: a per-repo known-labels cache (refreshed daily or on a 422 label-not-found); create a label only when the edit fails for a missing label. Evidence: the conveyor calls ledger, op label create.
+Held finding 227 (coroner-5). 4,118 label create calls in 12 h (merge-ai-prs 3,083, review-daemon 709, fix-procedure 134, pr-land 111); 295/h after the 18:30 ET fix. Each is an idempotent ensure-exists. Fix: a per-repo known-labels cache (refreshed daily or on a 422 label-not-found); ensure on a cache miss or expiry, and invalidate/re-ensure once when label application reports that exact label missing. Evidence: the conveyor calls ledger, op label create.
 
 ## Acceptance
 
@@ -24,18 +24,22 @@ Held finding 227 (coroner-5). 4,118 label create calls in 12 h (merge-ai-prs 3,0
 
 ## Progress
 
-- Premise check (2026-10-13, main 8e6ac5c8): not delivered. `git log` finds only the drain JIT-number commit for 5961. `we:scripts/merge-ai-prs.mjs` still mints via raw `gh label create` at :4758 and :5357, memoized only in-process by `ensuredLabels` (:4447), so every drain process start re-mints (the 3,083 calls).
-- Scope corrected: the old scope entry `we:scripts/review-set-label.mjs` never calls `label create` itself; it routes through `createGhProvider`. The shared home is `we:scripts/lib/review-label-provider.mjs:169` (`ensureLabel`, `--force` create argv at :105), reaching review-daemon, fix-procedure and pr-land (`we:scripts/pr-land.mjs:729,1054,1144,1154,1230`). The new scope lists `we:scripts/lib/review-label-provider.mjs` in its place.
-- Review round 1 corrections: `we:scripts/pr-land.mjs:703` uses `createGhLandProvider` (`we:scripts/lib/forge-land-provider.mjs:130` `labelCreate`, `:197` `ensureLabel`), a separate adapter from the review provider, so it is added to scope. Also: `labelCreate` and the two merge-ai-prs creates run WITHOUT `--force`, so on an existing label they fail and the error is swallowed — a naive "record only on success" cache would never fill in steady state (the actual 3,083 calls). Design below treats "already exists" as success.
-- `size:` 1 → 2 (new module + three call-site families + tests).
+- Current-checkout recheck at 6d77e9169: the helper is still planned, not delivered. Raw creates remain at `we:scripts/merge-ai-prs.mjs:4748` and `we:scripts/merge-ai-prs.mjs:5370`; process-local memoization is at `we:scripts/merge-ai-prs.mjs:4436`. Retain the corrected four-source/four-test scope and size 2. Correct the opening wording: this is ensure-on-cache-miss plus retry after a precise missing-label failure, not edit-first creation exclusively. The historical rate is not a current measurement.
+
+- Rechecked at 17242a56d: not delivered; planned `we:scripts/lib/ensure-label.mjs` remains absent. Original premise was repeated idempotent creates across processes. Current drain sites are `we:scripts/merge-ai-prs.mjs:4748` and `we:scripts/merge-ai-prs.mjs:5370`, with process-local memoization near line 4432. The old citations at lines 4758 and 5357 were stale.
+- Corrected scope retains the existing new-helper plus three caller-family design and all four matching tests. The review CLI is an indirect consumer, not an additional edit: `we:scripts/lib/review-label-provider.mjs:169` implements its ensure. The land adapter is separate (`we:scripts/lib/forge-land-provider.mjs:197`) and implicitly targets the cwd repository; it must resolve that identity before sharing a persistent cache.
+- Corrected factual premise: only the review provider uses forced creation (`we:scripts/lib/review-label-provider.mjs:105`); the land provider (`we:scripts/lib/forge-land-provider.mjs:130`) and drain do not. Existing-label errors must fill the cache, without adding force. The prior design's generic “existing idempotent forced create” description was inaccurate.
+- Retain size 2: approximately 120 helper lines, 50 review-provider lines, 35 land-provider lines, 35 drain lines and 180 lines across the four scoped tests. Shared atomic/lock utilities are consumed unchanged. Historical call counts in the opening are incident evidence, not a fresh measurement. No stamps or dependency changes.
 
 ## Design
 
-New `we:scripts/lib/ensure-label.mjs` exports `ensureLabelCached({ repo, name, create, now })`. State is one JSON file in the conveyor state directory (under the user's Claude home; env override `WE_KNOWN_LABELS_FILE`) shaped `{ "<repo>::<name>": { at: <epoch ms> } }`. If the entry exists and `now - at < TTL` (24 h), return without calling `create`. Otherwise call `create` (the existing idempotent `gh label create --force`), then record the entry. Writes use `withFileLock` + `writeJsonAtomic` from `we:scripts/lib/atomic-json-file.mjs`, re-reading inside the lock and merging (compare-and-set), since drain, review-daemon and pr-land are separate processes.
+New `we:scripts/lib/ensure-label.mjs` exports `ensureLabelCached({ repo, name, create, now })`. State is one JSON file in the conveyor state directory (under the user's Claude home; env override `WE_KNOWN_LABELS_FILE`) keyed by an unambiguous encoded (repo, name) tuple with `{ at: <epoch ms> }` values. If the entry exists and `now - at < TTL` (24 h), return without calling `create`. Otherwise call `create` (the caller-provided create operation, retaining its existing force/no-force argv), then record the entry. Use `withFileLock` + `writeJsonAtomic` from `we:scripts/lib/atomic-json-file.mjs`, with the cache hit rechecked under the lock before calling create and updating state. This serializes concurrent cold misses for the same key as well as merging different keys. The create callback stays synchronous to match all three callers. Inject cache path and clock for hermetic tests. On a cache read/lock/write failure, perform the original uncached ensure if it has not already run; never suppress a required create or run it twice merely because persistence failed. Only definitive create success or a specific existing-label response records a positive entry; preserve other create errors for the caller.
 
-Call sites: (1) `we:scripts/merge-ai-prs.mjs:4758` and `:5357` replace the raw `execFileSync('gh', ['label','create', …])` with `ensureLabelCached`, keeping the in-process `ensuredLabels` set as the first-level skip. (2) `we:scripts/lib/review-label-provider.mjs:169` `ensureLabel` wraps its `exec` in `ensureLabelCached` (covers review-daemon and fix-procedure). (3) `we:scripts/lib/forge-land-provider.mjs:197` `ensureLabel` wraps its `exec` the same way (covers pr-land's five sites). The merge-ai-prs and land-provider creates have no `--force`, so on an existing label `gh` exits non-zero with "already exists": `ensureLabelCached` treats a failure whose `e.stderr ?? e.message` matches `/already exists/i` as SUCCESS and records it; any other failure records nothing and rethrows (call sites keep their existing swallow). Creation of a genuinely new label also records. `--force` stays only where it already is, so the 24 h TTL delays only the review provider's metadata update-on-force, which is accepted.
+Call sites: (1) `we:scripts/merge-ai-prs.mjs:4748` and `we:scripts/merge-ai-prs.mjs:5370` replace the raw `execFileSync('gh', ['label','create', …])` with `ensureLabelCached`, replacing the process-lifetime `ensuredLabels` skip with TTL-aware cache checks, so a long-running watch also observes expiry. (2) `we:scripts/lib/review-label-provider.mjs:169` `ensureLabel` wraps its `exec` in `ensureLabelCached` (covers review-daemon and fix-procedure). (3) `we:scripts/lib/forge-land-provider.mjs:197` `ensureLabel` wraps its `exec` the same way (covers pr-land's five sites). The merge-ai-prs and land-provider creates have no `--force`, so on an existing label `gh` exits non-zero with "already exists": `ensureLabelCached` treats a failure whose `e.stderr ?? e.message` matches `/already exists/i` as SUCCESS and records it; any other failure records nothing and rethrows (call sites keep their existing swallow). Creation of a genuinely new label also records. `--force` stays only where it already is, so the 24 h TTL delays only the review provider's metadata update-on-force, which is accepted.
 
-Invalidation on need: `invalidateKnownLabel(repo, name)`. The review provider keeps a per-name map of the last `ensureLabel` opts; `setLabels` (:165) catches a failure whose `e.stderr ?? e.message` matches `/not found/i` AND contains the label name being added, invalidates that entry, calls the (cache-wrapped, so it now creates) `ensureLabel` with the remembered opts (default `ededed`/empty when none), and retries once; any other failure (rate limit, PR not found) propagates unchanged. The merge-ai-prs `applyLabel` path does not use this provider, so it gets only the TTL protection, not the retry.
+Invalidation on need: `invalidateKnownLabel(repo, name)`. The review provider keeps a per-name map of the last `ensureLabel` opts; `setLabels` (:165) catches a failure whose `e.stderr ?? e.message` matches the concrete missing-label diagnostic and names an exact label being added, invalidates that entry, calls the (cache-wrapped, so it now creates) `ensureLabel` with the remembered opts (default `ededed`/empty when none), and retries once; any other failure (rate limit, PR not found) propagates unchanged. Apply the same one-retry contract to the land provider's `addLabel` (`we:scripts/lib/forge-land-provider.mjs:187`) and the drain's direct label application, using the metadata already available at their ensure sites. The invalidation must also remove any in-process memoized hit. Match a concrete missing-label response for an exact requested label, not a generic HTTP 422 or arbitrary “not found” substring; unrelated PR/repository/auth/rate-limit errors never retry. If no metadata was ensured in this process, retain the existing default color/description rather than inventing metadata.
+
+Resolve an implicit cwd repository once per adapter instance using the existing repository-resolution facility, and include the resulting full repo slug in every key. If resolution fails, bypass persistent caching and retain the original uncached operation; never share a null/empty-repo key. Use nested maps or collision-safe tuple encoding for exact repo/name keys, not ambiguous concatenation. Reject malformed or future-dated timestamps as cache misses. Do not persist credentials or error bodies.
 
 ## MVP
 
@@ -43,31 +47,35 @@ Musts: the cache module with TTL + lock/atomic write; review provider, land prov
 
 ## Test plan
 
+Run all four scoped tests and the standards gate only through Node on `we:scripts/readiness/heavy-admission.mjs` (`run -- npx vitest run` with test filesystem paths, or `run -- npm run check:standards`). Repo prefixes in this card are documentation only. No real forge calls are needed.
+
+
 In `we:scripts/lib/__tests__/ensure-label.test.mjs` with injected `create` and clock (all RED before: module absent):
 - Capability (Red today): hit within TTL → `create` not called.
 - Capability (Red today): miss, expired entry (TTL+1 ms), and different repo/name → `create` called once each.
 - Capability (Red today): `create` throws → nothing recorded, error surfaces (no false "known").
 - Capability (Red today): corrupt/unparseable state file → treated as empty and rewritten valid; create still runs.
-- Capability (Red today): two interleaved writers keep both keys (merge under lock).
+- Capability (Red today): concurrent child processes with isolated state retain different keys, and two cold ensures for the same key execute one create under normal lock acquisition. Lock/read/write faults preserve uncached behavior without false positive entries or duplicate create within one attempt.
 - Capability (Red today): `invalidateKnownLabel` forces the next ensure to create.
 - Capability (Red today): `create` failing with realistic "label with name \"X\" already exists" stderr → treated as success and recorded (second call makes no `gh` call); a different failure (auth/network) records nothing and rethrows.
 - Capability (Red today): name starting with `--` is rejected before any `create`.
 - Capability (Red today): review provider, in `we:scripts/lib/__tests__/review-label-provider.test.mjs`: `setLabels` failing with realistic "could not add label: 'X' not found" invalidates, re-ensures once with remembered opts, retries once; a second failure propagates.
 - Preservation (GREEN today; mutation proof: make the retry unconditional and it fails): same file, an unrelated `setLabels` failure (rate limit, PR not found) neither invalidates nor retries.
+- Capability (Red today): land and drain add-label failures with a concrete missing label invalidate, re-ensure and retry once; a second failure and unrelated errors propagate under existing caller handling. Unknown implicit repo bypasses caching, two cwd repos never share hits, future timestamps miss, and a long-running watch rechecks after TTL expiry.
 - Capability (Red today): land provider, in `we:scripts/lib/__tests__/forge-land-provider.test.mjs`: a second `ensureLabel` for the same label within the TTL makes no `gh` call.
 - Capability (Red today): in `we:scripts/__tests__/merge-ai-prs.test.mjs`, two sweeps in separate processes (fresh `ensuredLabels`) mint each label once, not twice.
 
 ## Proof plan
 
-Before/after on the live drain: count `label create` rows per hour in the conveyor calls ledger (op label create) before the change vs after a drain restart on the new build; expect at most one create per (repo, label) per 24 h window (counted per repo and label over one full TTL after restart) vs the current 295/h. Also a CLI probe: call `ensureLabelCached` twice for one label against a real repo and show the second makes no `gh` call.
+Before/after on the live drain: count `label create` rows per hour in the conveyor calls ledger (op label create) before the change vs after a drain restart on the new build; expect at most one create per (repo, label) per 24 h window during normal cache operation, excluding explicit invalidation and documented cache/lock faults (counted per repo and label over one full TTL after restart) vs a newly captured baseline (the incident reported 295/h). Also a CLI probe: call `ensureLabelCached` twice for one label against a real repo and show the second makes no `gh` call.
 
 ## Edge cases this change must handle
 
-1. **Untrusted text** — keys are `repo::name`; names come from constant tables (`REVIEW_LABEL_META`) or `review-round:<N>` (numeric N); a name starting with `--` is rejected before argv; the JSON key is only a data key, never a path, shell or regex.
+1. **Untrusted text** — keys encode the exact (repo, name) tuple; names come from constant tables (`REVIEW_LABEL_META`) or `review-round:<N>` (numeric N); a name starting with `--` is rejected before argv; the JSON key is only a data key, never a path, shell or regex.
 2. **Truncated reads** — n/a: the cache reads only its own small JSON file; not-found detection reads the single `gh` failure text, not a paged list.
 3. **Shared state files** — written by several processes: `withFileLock` + `writeJsonAtomic`, re-read and merge inside the lock; stale-lock steal is already guarded in `withFileLock`.
 4. **Fail closed** — unreadable/corrupt cache means "unknown", so we create (never skip); a failed `create` records nothing; a failed cache write after a successful create is swallowed (the next process just re-creates).
-5. **Identity scoping** — key includes repo slug (`null` resolved to the cwd repo slug, never a bare shared key) and exact label name.
+5. **Identity scoping** — key includes repo slug (`null` resolved to the cwd repo slug or caching bypassed, never a bare shared key) and exact label name.
 6. **State over time** — 24 h TTL bounds drift from hand-deleted labels; the not-found invalidate-and-retry covers deletion inside the TTL; a restart mid-write leaves the old or new file (atomic rename).
 7. **Who wrote it** — n/a: the file grants no trust, it is only a "created recently" hint; a forged entry can at worst delay a create, and the not-found retry repairs that.
 
