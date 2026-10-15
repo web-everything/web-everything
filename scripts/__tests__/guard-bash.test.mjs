@@ -784,6 +784,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd <(true a) && ls')).toBe(REPORTED);
     expect(at('cd <(true a) /protected/clone')).toBe(REPORTED);
     expect(at('<(true a) cd /protected/clone')).toBe(REPORTED);
+    // …but as a redirect's target, or glued to a word, it is not the command word
+    for (const c of ['< <(git status) cd /protected/clone', '> >(cat) cd /protected/clone', 'X=/etc<(true) cd /protected/clone',
+      'LOG=/tmp/x>(cat) cd /protected/clone']) {
+      expect(at(c), c).toBe('/protected/clone');
+    }
+    expect(at('X=/protected/clone; X=/etc < <(true); cd "$X"')).toBe('/etc');
+    expect(at('X=/protected/clone; X=/etc 2> >(cat); cd "$X"')).toBe('/etc');
     // a redirect inside `${…}` / `$[…]` / `$(…)` is part of the expansion, and `$$` opens nothing
     for (const v of ['${Y:-<}', '${Y:-a<b}', '${Y:->}', '${Y:-<none>}', '${Y:-a >b}', '$[1>0]', '${A[i<2]}', '$(cat <f)', '$$', '$${']) {
       expect(at(`X=${v} cd /protected/clone; cd sub`), v).toBe('/protected/clone');
@@ -796,6 +803,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       ': $(( $N[0]++ ))', ': $(( $N[0]-- ))', ': $(( ${N}[0]++ ))', 'let "$N[0]++"', '(( "$N"++ ))',
       '! ((LANE=0))', 'time ((LANE=0))', '{ ((LANE=0))', 'if ((LANE=0))', 'while ((LANE=0))',
       ': "$(((LANE=2)))"', ': "$((((LANE=2))))"', ': "$(( ((0)) + (LANE=2) ))"',
+      ': $((echo ")" ")") ) "it\'s ${LANE:=/etc} it\'s"', ': $((echo "(") ) "it\'s ${LANE:=/etc} it\'s"',
+      ': $((echo "it\'s") ) ${LANE:=/etc} \'a\'', 'Z=abcdef; : $((echo ")" ")") ) "it\'s ${Z:LANE=1} it\'s"',
     ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }

@@ -2524,12 +2524,23 @@ const OPAQUE_BLANK = String.fromCharCode(0xe000);
 // marked `redir`, so the substitution scan sees every character (`${Y:-<}`, `$(cat <f)`); `parseStatement`
 // drops the top-level ones. A `#` comment (a word that begins with an unquoted `#`) is cut with everything after.
 function shellWords(stmt) {
-  const tokens = shellTokens(String(stmt).replace(ODD_BLANK, OPAQUE_BLANK), { preserveQuotes: true });
+  const s = String(stmt).replace(ODD_BLANK, OPAQUE_BLANK);
+  const tokens = shellTokens(s, { preserveQuotes: true });
+  // Where each token starts in `s` (-1 when it cannot be placed, e.g. across a line continuation).
+  const at = [];
+  for (let i = 0, pos = 0; i < tokens.length; i++) {
+    const idx = s.indexOf(tokens[i].text, pos);
+    at.push(idx);
+    if (idx >= 0) pos = idx + tokens[i].text.length;
+  }
   const words = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    // `<(…)` / `>(…)` is a process substitution — a word (`/dev/fd/63`), not a redirect
-    if (t.op && (t.text === '<' || t.text === '>') && tokens[i + 1]?.text.startsWith('(')) {
+    // `<(…)` / `>(…)` starting a word is a process substitution — a word (`/dev/fd/63`), not a redirect. As a
+    // redirect's target (`< <(cmd)`) it stays a dropped redirect operand; glued to a word, it belongs to it.
+    const startsWord = at[i] === 0 || (at[i] > 0 && /\s/.test(s[at[i] - 1]));
+    if (t.op && (t.text === '<' || t.text === '>') && startsWord && !tokens[i - 1]?.op
+      && tokens[i + 1]?.text.startsWith('(') && at[i + 1] === at[i] + 1) {
       const raw = t.text + tokens[++i].text;
       words.push({ raw, text: raw, redir: false });
       continue;
@@ -2585,20 +2596,24 @@ function expandableText(stmt) {
   const s = String(stmt);
   let out = '';
   let dq = false;
-  let arith = 0;
+  let arith = 0;                                                // open parens of a `$((…))`
+  let aq = false;                                               // inside double quotes within it
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === '\\') { i++; out += ' '; continue; }
-    if (!dq && c === "'") {
+    if (!dq && !(arith && aq) && c === "'") {
       const close = s.indexOf("'", i + 1);
       if (close < 0) break;
       i = close;
       out += ' ';
       continue;
     }
-    if (arith) {                                                // inside `$((…))`: parens are arithmetic
-      if (c === '(') arith++;
-      else if (c === ')') arith--;
+    if (arith) {
+      // parens count only outside quotes: `$((echo ")") )` is a command substitution bash also accepts
+      if (c === '"') aq = !aq;
+      else if (!aq && c === '(') arith++;
+      else if (!aq && c === ')') arith--;
+      if (!arith) aq = false;
     } else if (c === '$' && s[i + 1] === '(' && s[i + 2] === '(') { out += '$(('; i += 2; arith = 2; continue; }
     else if (c === '"') dq = !dq;
     else if (!dq && c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;
