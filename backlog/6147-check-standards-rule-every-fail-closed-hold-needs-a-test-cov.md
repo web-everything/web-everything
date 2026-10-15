@@ -1,4 +1,5 @@
 ---
+bornAs: x6pj1po
 kind: story
 size: 3
 status: active
