@@ -2,10 +2,11 @@
 bornAs: x8rsopp
 kind: story
 size: 2
-status: active
+status: resolved
 scope: ["we:scripts/conveyor/mechanical-round-cap.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/mechanical-round-cap.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs"]
 dateOpened: "2026-10-12"
 dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "37d55ee65aad06d177e15de929b4115762a3b0bf"
 tags: []
