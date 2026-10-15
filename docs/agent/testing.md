@@ -50,7 +50,8 @@ fixtures so synthetic heads never cause real network fetches. `review.humanSurfa
 Public comments use fixed failure reasons; raw git diagnostics stay in local logs. Test fetch,
 merge-base and diff failures containing private paths and remote URLs, plus thrown reader errors.
 Every fail-closed branch needs a named test, including successful-looking net results with missing
-or non-string file arrays. Deterministic reader tests must reject branch/worktree mutation commands;
+or non-string file arrays, including sparse arrays whose empty slots `.every()` skips. Validate both
+net and fallback lists with the same check. Deterministic reader tests must reject branch/worktree mutation commands;
 real-git fixtures must preserve HEAD, branch, index, status and dirty file contents around each read.
 Review checklist: for each new fail-closed path, does the failure mode scale per PR or per sweep?
 

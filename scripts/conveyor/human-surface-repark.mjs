@@ -21,6 +21,8 @@ const healCandidate = labels => hasReviewLabel(labels, REVIEW_LABELS.human)
   && !hasReviewLabel(labels, REVIEW_LABELS.changes) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
 const errorText = e => String(e?.message ?? e).split('\n')[0];
 const sameSha = (a, b) => !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
+// Array.from visits empty slots too: a sparse list cannot establish a complete file set.
+const usableFileList = files => Array.isArray(files) && Array.from(files).every(file => typeof file === 'string');
 
 /**
  * PR #5273 — the machine-readable marker in this sweep's park comment, so a later reader can tell this park from
@@ -117,14 +119,13 @@ export function sweepHumanSurfaceRepark({
         let net;
         try { net = readNetFiles({ repo: resolvedRepo, number: num, headRefOid: state.headRefOid }); }
         catch (e) { net = { ok: false, reason: errorText(e) }; }
-        if (net?.ok && Array.isArray(net.files) && net.files.every(file => typeof file === 'string')) files = net.files;
+        if (net?.ok && usableFileList(net.files)) files = net.files;
         else {
           netFailure = publicHumanSurfaceNetFailure(net?.reason || 'net file set returned no usable array');
           // A sweep-wide fetch outage must not park PRs whose complete GitHub list is clean.
           // A cap-sized, malformed or unavailable list cannot establish that absence.
           try { files = provider.readPrFiles(resolvedRepo, num); } catch { files = null; }
-          const complete = Array.isArray(files) && files.length < GH_API_FILE_CAP
-            && files.every(file => typeof file === 'string');
+          const complete = usableFileList(files) && files.length < GH_API_FILE_CAP;
           if (complete && !sensitiveSurfaceHits(files, () => undefined, resolveSurfaces()).some(hit => hit.category !== 'permission')) {
             results.push({ num, skipped: 'net file set unavailable; complete GitHub list has no human-only surface' });
             continue;

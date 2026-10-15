@@ -103,7 +103,7 @@ describe('human surface re-park sweep', () => {
     expect(results.filter(result => result.repark === 'reparked')).toHaveLength(0);
     expect(f.calls).toEqual([]);
   });
-  it.each([{ ok: true }, { ok: true, files: [null] }])('fails closed for malformed net result %j', net => {
+  it.each([{ ok: true }, { ok: true, files: [null] }, { ok: true, files: Array(1) }])('fails closed for malformed net result %j', net => {
     const f = fixture();
     expect(f.run({ readNetFiles: () => net })[0].repark).toBe('reparked');
     expect(f.calls[0][3]).toContain('no usable array');
@@ -117,6 +117,7 @@ describe('human surface re-park sweep', () => {
   it.each([
     () => Array.from({ length: 3000 }, (_, i) => `src/${i}.mjs`),
     () => [null],
+    () => Array(1),
     () => null,
     () => { throw new Error('API unavailable'); },
   ])('fails closed when the fallback list may be incomplete', readPrFiles => {

@@ -62,6 +62,19 @@ export default {
     if (outageResults.length !== 3 || outageResults.some(result => !result.skipped) || outageEffects.length) {
       violations.push(`net outage re-parked clean PRs: parks=${outageResults.filter(result => result.repark).length}; effects=${outageEffects.length}`);
     }
+    for (const variant of ['net', 'fallback']) {
+      const sparseResults = sweepHumanSurfaceRepark({
+        repo: 'o/n', listPrs: () => [{ number: 5405, labels: ['review:accepted'] }], dryRun: true,
+        resolveSurfaces: () => 'narrow', resolveNetSetting: () => ({ value: true }),
+        readNetFiles: () => variant === 'net' ? { ok: true, files: Array(1) } : { ok: false, reason: 'fetch failed' },
+        readComments: () => [],
+        provider: {
+          readPrState: () => ({ state: 'OPEN', headRefOid: head, labels: ['review:accepted'], comments: [] }),
+          readPrFiles: () => variant === 'fallback' ? Array(1) : ['.github/workflows/ci.yml'],
+        },
+      });
+      if (sparseResults[0]?.repark !== 'would-repark') violations.push(`sparse ${variant} file list bypassed the human hold`);
+    }
     const renameResults = sweepHumanSurfaceRepark({
       repo: 'o/n', listPrs: () => [{ number: 5404, labels: ['review:accepted'] }], dryRun: true,
       resolveSurfaces: () => 'narrow',
