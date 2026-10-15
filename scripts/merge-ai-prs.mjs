@@ -2456,7 +2456,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     if (landedThisPass.has(id)) return !coupleIncomplete.has(id);   // (1) — landed this run, unless its couple is provably NOT whole (#3004)
     if (openItems.has(id)) return false;       // (2)
     if (provenOnMain.has(id)) return true;     // (3)
-    return typeof id === 'number' && Number.isFinite(id); // (4); a hash → false (5)
+    return contextComplete === true && typeof id === 'number' && Number.isFinite(id); // (4) needs trustworthy absence
   };
   // #999/xq985wu LIVENESS FIX — an item is a LIVE blocker only if it is open AND not proven landed. This mirrors
   // `stackProven`'s landedThisPass-BEFORE-openItems precedence on the `blockedBy` path, which it lacked: the
@@ -2487,7 +2487,8 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
       continue;
     }
     if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
-    const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => openItems.has(b) && !provenLanded(b));
+    // Failed/truncated context cannot establish that an absent dependency has landed.
+    const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (contextComplete !== true || openItems.has(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier
     // when `joinImplToCouples` stamped `coupleDefer` — a carrier that is OPEN-AND-HELD, unnameable, degraded, or
@@ -4154,12 +4155,16 @@ const execFileP = execDrainAsync;
 
 // The ordered pool lives in drain-concurrency.mjs; the public export above remains compatible.
 
+/** Manifest bodies can change at the same head SHA; an unknown body/identity must remain retryable. */
+export function prReadCacheIdentity(p) {
+  return p.headRefOid && typeof p.body === 'string' ? JSON.stringify([p.headRefOid, p.body]) : null;
+}
+
 /**
- * #2417 — cross-pass read cache for the drain's per-PR candidate reads, keyed on `(repo, number, headSha)`.
+ * #2417 — cross-pass read cache for the drain's per-PR candidate reads, keyed on `(repo, number, identity)`.
  * Under `--watch` the sweep re-runs every `--interval`s FOREVER; a PR whose head SHA is UNCHANGED since the
- * previous pass reuses its cached commits/manifest instead of re-issuing the reads every pass. A changed SHA
- * (rebase-drop rebuilt the conflicting tip, or the producer pushed a fix) MISSES the cache and re-fetches —
- * the only reads that must be fresh. PRs absent from the current pass's set are evicted so a long-lived watch's
+ * previous pass reuses its cached commits/manifest only while its body also matches. A changed SHA or body
+ * MISSES the cache and re-fetches. PRs absent from the current pass's set are evicted so a long-lived watch's
  * cache tracks the live open set (bounded growth, never a leak).
  *
  * The fetch fans out through `mapWithConcurrency`. Pure + injectable — `keyOf` / `shaOf` / `fetchOne` are
@@ -4608,15 +4613,14 @@ async function runCli() {
     // null here after the PR-body gh read THREW is a spurious degrade — surface `fromPr.degraded` so it re-fetches.
     return { manifest: null, degraded: fromPr.degraded };
   };
-  // #2417 — a PR's HEAD SHA cache key. `gh pr list --json headRefOid` supplies it in the SAME list call (no
-  // extra round-trip); a PR whose SHA is unchanged since the previous `--watch` pass reuses its cached reads.
+  // #2417 — commits/legacy manifests use the head SHA; combined read caches also include the listed body.
   const prCacheKey = (repo, num) => `${repo || 'cwd'}::${num}`;
   const prHeadSha = (p) => p.headRefOid || null;
   // Cross-pass read caches (live for the whole runCli lifetime, so a `--watch` loop reuses them each pass, like
   // `ensuredLabels` above). Two independent caches for the two deliberately-independent listings (#2421): the
   // unfiltered open-PR context, and the (possibly `--label`-scoped) merge-candidate sweep.
-  const ctxReadCache = new Map();   // collectOpenPrContext: (repo, num, sha) → { manifest, commits }
-  const sweepReadCache = new Map(); // the merge-candidate loop: (repo, num, sha) → { commits, manifest }
+  const ctxReadCache = new Map();   // collectOpenPrContext: (repo, num, sha + body) → { manifest, commits }
+  const sweepReadCache = new Map(); // the merge-candidate loop: (repo, num, sha + body) → { commits, manifest }
   // #3674 — each swept repo's default branch (`gh repo view --json defaultBranchRef`), resolved once per run and
   // reused across `--watch` passes. A failed read stays unresolved (retried next pass) and leaves the
   // non-default-base arm inert for that repo, so the chain degrades to its pre-#3674 behaviour, never to a land.
@@ -4684,26 +4688,33 @@ async function runCli() {
       // (`SWEEP_LIST_FIELDS` widens that call to cover everything this context needs too) — reuse it instead of
       // a second `gh pr list` round-trip for the SAME repo, same pass. Only covers `repo`s in `REPOS`; a repo
       // that is in `CONTEXT_REPOS` but not `REPOS` (a narrowed `--repos`/`--this-repo` sweep's extra
-      // constellation-context repos — rare, a no-op on the common full sweep) falls through to the snapshot/live
-      // read below, unchanged.
+      // constellation-context repos — rare, a no-op on the common full sweep) needs its own live open set.
       if (liveByRepo.has(repo)) return liveByRepo.get(repo);
       // xsbyo56 — `body` added so the #2832 held-reconcile branch (below) can read back the PR's own
       // `## Escalation reason` block (`buildHeldReviewHoldReason`/`parseEscalationReason`) and name the
       // specific file(s) that forced a review:human/pending/changes hold, not just the label.
-      // #gh-graphql-budget — the host-shared open-PR snapshot (the same right-sized list every daemon reads,
-      // at most one refresh per repo per TTL) — falls back to this pass's own listing when not applicable.
-      const shared = readSharedOpenPrs({ repo, fields: CONTEXT_LIST_FIELDS, caller: 'merge-ai-prs.mjs' });
-      if (shared) return resolveListedChecks(repo, shared);
+      // Extra context repos need the same freshness as candidate repos: a snapshot can omit a new blocker.
+      // Reuse its heavy fields only after matching them against the live pages.
+      const slug = repo || localSlug;
+      if (slug) {
+        let seed = [];
+        try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
+        const listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } });
+        drainHeavyCacheByRepo.set(repo, listed.cache);
+        return resolveListedChecks(repo, listed.rows);
+      }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return resolveListedChecks(repo, JSON.parse(stdout.trim() || '[]'));
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
-    // across `--watch` passes on unchanged head SHA. Returns the reduced key→{manifest, commits, degraded} map.
+    // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
     fetchReads: async (flat) => {
       const readsRaw = await fetchPrReadsCached(flat, {
         cache: ctxReadCache,
         keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
-        shaOf: ({ p }) => prHeadSha(p),
+        shaOf: ({ p }) => prReadCacheIdentity(p),
         isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
@@ -4943,34 +4954,38 @@ async function runCli() {
     try {
       const slug = repo || localSlug;
       let listed;
-      // A fast drain reuses snapshot context, but its sole candidate is always read live.
+      let snapshotSeed;
+      // Snapshot rows seed heavy fields only. The open set must still be listed live:
+      // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
       if (slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
         const fields = RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
         try {
-          const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields, caller: 'merge-ai-prs.mjs' }));
+          const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
           if (snap == null) {
             process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
           } else {
             const targetRow = await __t.timeAsync('listing.target', async () => {
-              const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},state`],
+              const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
                 { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
               return JSON.parse(stdout.trim() || 'null');
             });
-            listed = { rows: mergeLiveTargetIntoRows(snap, targetRow, onlyPr), truncated: false, cache: drainHeavyCacheByRepo.get(repo) || {} };
+            snapshotSeed = mergeLiveTargetIntoRows(snap, targetRow, onlyPr);
           }
         } catch {
           process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
         }
       }
-      if (slug && !listed) {
+      if (slug) {
         const paging = resolvePrListPaging();
         const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
         const wanted = (r) => filterOpenPrsByBase(filterOpenPrsByLabel([r], label).prs, base).length > 0;
         // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
         // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
-        let seed = [];
-        try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+        let seed = snapshotSeed || [];
+        if (!snapshotSeed) {
+          try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+        }
         listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
           heavyFields, needsHeavy: RECONCILE ? () => true : wanted, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
@@ -5008,7 +5023,7 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
-  // #4108 — this pass's already-fetched rows per repo (full passes live; snapshot fast drains have a live target).
+  // #4108 — this pass's already-fetched live rows per repo (snapshot data only seeds heavy fields).
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
@@ -5038,7 +5053,7 @@ async function runCli() {
   // test suite so tests drive the same wiring runCli does).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   // #2417 — fan out the per-PR commits + manifest reads across EVERY candidate PR at once (bounded pool),
-  // cached across `--watch` passes on unchanged head SHA — was one serial `gh pr view --json commits` + one
+  // cached across `--watch` passes on unchanged head SHA + body — was one serial `gh pr view --json commits` + one
   // serial manifest probe per PR, one repo at a time (~2×N serial `gh` round-trips a pass). The merge cascade
   // downstream keeps branch and main writers serial; independent queue preparation uses its own bounded pool.
   const sweepFlat = [];
@@ -5047,7 +5062,7 @@ async function runCli() {
     concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
     cache: sweepReadCache,
     keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
-    shaOf: ({ p }) => prHeadSha(p),
+    shaOf: ({ p }) => prReadCacheIdentity(p),
     isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
     fetchOne: async ({ repo, p }) => {
       const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);

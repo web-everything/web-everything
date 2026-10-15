@@ -1,4 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
+import { buildManifest, embedManifestInBody, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
+import { fetchPrReadsCached, prReadCacheIdentity, reduceOpenPrContext, planDrainPass } from '../../merge-ai-prs.mjs';
 import {
   shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, mergeLiveTargetIntoRows, shouldReadContextCommits,
   filterToFastDrainTarget, readLegacyManifestCached,
@@ -106,4 +114,185 @@ describe('mergeLiveTargetIntoRows', () => {
     expect(mergeLiveTargetIntoRows(rows, target, '7')).toEqual([other]);
     expect(rows).toEqual([stale, other]);
   });
+});
+
+describe('snapshot fast drain CLI dependency context', () => {
+  const repo = 'fixture/repo';
+  const pr = (number, item, blockedBy = []) => ({
+    number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: `sha${number}`,
+    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
+    labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    body: embedManifestInBody('fixture', buildManifest({ item, blockedBy,
+      repos: [{ repo: 'we', ref: `lane/${item}` }] })),
+  });
+
+  // Exercise the actual listOne -> context -> planner wiring, with a still-servable snapshot that predates A.
+  // No git repository or network is needed: fake git supplies only the local repo identity.
+  const run = ({ snapshot, live, target = live.find(p => p.number === 7), failPage = false, extraLive = {} }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fast-drain-context-'));
+    try {
+      const bin = join(dir, 'bin');
+      const snapshots = join(dir, 'snapshots');
+      mkdirSync(bin);
+      mkdirSync(snapshots);
+      mkdirSync(join(dir, 'backlog'));
+      writeFileSync(join(snapshots, 'fixture__repo.json'), JSON.stringify({ v: 1, repo,
+        fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: snapshot.length, prs: snapshot }));
+      for (const name of ['frontierui', 'plateau-app']) {
+        writeFileSync(join(snapshots, `fixture__${name}.json`), JSON.stringify({ v: 1, repo: `fixture/${name}`,
+          fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: 0, prs: [] }));
+      }
+      writeFileSync(join(dir, 'fixture.json'), JSON.stringify({ live, target, failPage, extraLive }));
+      writeFileSync(join(dir, 'calls.jsonl'), '');
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const a = process.argv.slice(2);
+const f = JSON.parse(fs.readFileSync(process.env.CONTEXT_FIXTURE, 'utf8'));
+fs.appendFileSync(process.env.CONTEXT_LOG, JSON.stringify(a) + '\\n');
+const output = value => { fs.writeSync(1, JSON.stringify(value)); process.exit(0); };
+if (a[0] === 'repo' && a[1] === 'view') { fs.writeSync(1, 'main'); process.exit(0); }
+if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
+  if (f.failPage === true || f.failPage === process.env.GH_REPO) { fs.writeSync(2, 'fixture listing unreadable'); process.exit(1); }
+  const rows = process.env.GH_REPO === 'fixture/repo' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
+  output({data:{repository:{pullRequests:{totalCount:rows.length,
+    pageInfo:{hasNextPage:false,endCursor:null},nodes:rows.map(p => ({...p, labels:{nodes:p.labels},
+      commits:{nodes:[{commit:{statusCheckRollup:{contexts:{nodes:p.statusCheckRollup.map(c => ({...c,__typename:'CheckRun'}))}}}}]}}))}}}});
+}
+if (a[0] === 'pr' && a[1] === 'list') output([]);
+if (a[0] === 'pr' && a[1] === 'view') {
+  const fields = (a[a.indexOf('--json') + 1] || '').split(',');
+  if (fields.includes('state')) output(f.target);
+  if (fields.includes('commits')) output({commits:[]});
+  const repoIdx = a.indexOf('--repo');
+  const rows = repoIdx < 0 || a[repoIdx + 1] === 'fixture/repo' ? f.live : (f.extraLive[a[repoIdx + 1]] || []);
+  output(rows.find(p => p.number === Number(a[2])) || {});
+}
+output({});
+`, { mode: 0o755 });
+      const script = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs');
+      const result = spawnSync(process.execPath, [script,
+        `--repos=${repo}`, '--only=7', `--only-repo=${repo}`, '--label=ready-to-merge', '--dry-run', '--json',
+        '--no-drain-lease', '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
+        cwd: dir, encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_FAST_DRAIN_LISTING: 'snapshot',
+          HOME: dir, WE_UNDER_TEST: '1', WE_GITHUB_AUTH: 'personal',
+          WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_PR_SNAPSHOT_TTL_MS: '600000',
+          WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'),
+          WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
+          CONTEXT_FIXTURE: join(dir, 'fixture.json'), CONTEXT_LOG: join(dir, 'calls.jsonl') },
+      });
+      const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+      return { ...result, payload: JSON.parse(result.stdout.trim() || '{}'), calls };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('defers B on an unlabelled, cross-base blocker opened after the snapshot', () => {
+    const staleB = pr(7, 'xbbbbbb');
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const a = { ...pr(8, 'xaaaaaa'), labels: [], baseRefName: 'develop' };
+    const r = run({ snapshot: [staleB], live: [a, b] });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.considered).toBe(1);
+    expect(r.payload.deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
+    ]));
+  }, 30_000);
+
+  it('fails the pass when live context cannot be read, even with a usable snapshot and target', () => {
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const r = run({ snapshot: [b], live: [b], failPage: true });
+    expect(r.status, r.stderr).toBe(4);
+    expect(r.payload).toMatchObject({ ok: false, reason: 'gh-error' });
+  }, 30_000);
+
+  it('keeps a dependency added to B between the target read and the live pages', () => {
+    const earlierB = pr(7, 'xbbbbbb');
+    const b = { ...pr(7, 'xbbbbbb', ['xaaaaaa']), updatedAt: '2026-10-14T00:01:00Z' };
+    const a = { ...pr(8, 'xaaaaaa'), labels: [] };
+    const r = run({ snapshot: [earlierB], live: [a, b], target: earlierB });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
+    ]));
+  }, 30_000);
+
+  it('invalidates watch manifest reads after a body edit at an unchanged head SHA', async () => {
+    const cache = new Map();
+    const a = pr(8, 'xaaaaaa');
+    const b = pr(7, 'xbbbbbb');
+    const fetchOne = vi.fn(async p => ({ manifest: extractManifestFromBody(p.body) }));
+    const read = rows => fetchPrReadsCached(rows, { cache, keyOf: p => `${repo}::${p.number}`,
+      shaOf: prReadCacheIdentity, fetchOne });
+    await read([a, b]);
+    const changedB = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const rows = [a, changedB];
+    const reads = await read(rows);
+    const context = reduceOpenPrContext({ listings: [{ repo, prs: rows }],
+      reads: new Map([...reads].map(([key, entry]) => [key, entry.value])) });
+    const { plan } = planDrainPass({ openPrContext: context, verdicts: [{ num: 7, repo, item: 'xbbbbbb',
+      hasManifest: true, decision: 'merge', blockedBy: reads.get(`${repo}::7`).value.manifest.blockedBy }] });
+    expect(plan.ready).toEqual([]);
+    expect(plan.deferred[0].waitOn).toContain('xaaaaaa');
+    expect(fetchOne).toHaveBeenCalledTimes(3); // A remains cached; B's changed body is read again.
+  });
+
+  it('also discovers a new blocker in a context-only repository', () => {
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const a = { ...pr(8, 'xaaaaaa'), labels: [] };
+    const r = run({ snapshot: [b], live: [b], extraLive: { 'fixture/frontierui': [a] } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
+    ]));
+  }, 30_000);
+
+  it('defers B when a context-only repository is unreadable', () => {
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const r = run({ snapshot: [b], live: [b], failPage: 'fixture/frontierui',
+      extraLive: { 'fixture/frontierui': [pr(8, 'xaaaaaa')] } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
+    ]));
+  }, 30_000);
+
+  it.each([
+    ['blockedBy', 'xaaaaaa'], ['blockedBy', 123], ['stackParents', 'xaaaaaa'], ['stackParents', 123],
+  ])('requires complete context or positive proof for an absent %s dependency %s', (edge, item) => {
+    const verdict = { num: 7, repo, item: 'xbbbbbb', hasManifest: true, decision: 'merge', [edge]: [item] };
+    const openPrContext = { contextComplete: false, truncated: true, openItems: new Set() };
+    const { plan } = planDrainPass({ openPrContext, verdicts: [verdict] });
+    expect(plan.ready).toEqual([]);
+    expect(plan.deferred[0].waitOn).toContain(item);
+    const proven = planDrainPass({ openPrContext, verdicts: [verdict], provenOnMain: new Set([item]) });
+    expect(proven.plan.ready).toHaveLength(1);
+  });
+
+  it('hydrates a sibling whose manifest changed at the same head SHA', () => {
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const staleA = { ...pr(8, 'xcccccc'), labels: [] };
+    const a = { ...pr(8, 'xaaaaaa'), labels: [], updatedAt: '2026-10-14T00:01:00Z' };
+    const r = run({ snapshot: [b, staleA], live: [b, a] });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, waitOn: expect.arrayContaining(['xaaaaaa']) }),
+    ]));
+    expect(r.calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '8')).toBe(true);
+  }, 30_000);
+
+  it('drops a closed sibling and reuses unchanged heavy fields without another target hydration', () => {
+    const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
+    const r = run({ snapshot: [b, pr(8, 'xaaaaaa')], live: [b] });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.payload.deferred).toEqual([]);
+    expect(r.payload.toMerge).toEqual(expect.arrayContaining([expect.objectContaining({ num: 7 })]));
+    const heavyReads = r.calls.filter(a => a[0] === 'pr' && a[1] === 'view'
+      && a[a.indexOf('--json') + 1] === 'body,files');
+    expect(heavyReads).toEqual([]);
+  }, 30_000);
 });
