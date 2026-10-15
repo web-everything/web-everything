@@ -1,14 +1,15 @@
 ---
+bornAs: x2c9ue0
 kind: task
 status: open
-scope: ["we:scripts/operations/file-item-io.mjs"]
+scope: ["we:scripts/operations/dispatch-lane-io.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# file-item: honour BACKLOG_TZ and the host zone for the filing date
+# dispatch: a self-asserted operatorTask must not force the full delivery-agent route
 
-Ruling card from PR #5242 (operator, 2026-10-15). we:scripts/operations/file-item-io.mjs (~39) hard-codes the ET zone as the default today for every filing, replacing scaffold's localToday, which honours BACKLOG_TZ and the host zone. Restore localToday semantics, with a test.
+Ruling card from PR #5242 (operator, 2026-10-15), same authority gap as card xqqmw6g. we:scripts/operations/dispatch-lane-io.mjs (~1802) routes any card with operatorTask: true and report: true to the full delivery agent, skipping the probation worker and policy route; both fields are self-asserted card frontmatter. Gate the route on verified operator authority (xqqmw6g), with a test.
 
 ## Acceptance
 

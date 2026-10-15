@@ -1,14 +1,15 @@
 ---
+bornAs: xupy359
 kind: task
 status: open
-scope: ["we:scripts/operations/dispatch-lane-io.mjs"]
+scope: ["we:scripts/operations/operator-controls.mjs", "we:scripts/operations/operator-controls-io.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# dispatch: a self-asserted operatorTask must not force the full delivery-agent route
+# operator controls: accept hash card ids (x…) for item controls
 
-Ruling card from PR #5242 (operator, 2026-10-15), same authority gap as card xqqmw6g. we:scripts/operations/dispatch-lane-io.mjs (~1802) routes any card with operatorTask: true and report: true to the full delivery agent, skipping the probation worker and policy route; both fields are self-asserted card frontmatter. Gate the route on verified operator authority (xqqmw6g), with a test.
+Ruling card from PR #5169 (operator, 2026-10-15; confirmed red-team break). we:scripts/operations/operator-controls.mjs (~51) rejects hash card ids such as x9wyb24 ('--item must be a positive numeric card id') for retry-prepare and unpark, though why recommends them and buildDispatchResource accepts them; the release calls also Number() the id. Accept canonical hash ids end to end, with a test.
 
 ## Acceptance
 

@@ -1,14 +1,15 @@
 ---
+bornAs: xn899c9
 kind: task
 status: open
-scope: ["we:scripts/operations/operator-controls.mjs", "we:scripts/operations/operator-controls-io.mjs"]
+scope: ["we:scripts/operations/file-item-io.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# operator controls: accept hash card ids (x…) for item controls
+# file-item: honour BACKLOG_TZ and the host zone for the filing date
 
-Ruling card from PR #5169 (operator, 2026-10-15; confirmed red-team break). we:scripts/operations/operator-controls.mjs (~51) rejects hash card ids such as x9wyb24 ('--item must be a positive numeric card id') for retry-prepare and unpark, though why recommends them and buildDispatchResource accepts them; the release calls also Number() the id. Accept canonical hash ids end to end, with a test.
+Ruling card from PR #5242 (operator, 2026-10-15). we:scripts/operations/file-item-io.mjs (~39) hard-codes the ET zone as the default today for every filing, replacing scaffold's localToday, which honours BACKLOG_TZ and the host zone. Restore localToday semantics, with a test.
 
 ## Acceptance
 
