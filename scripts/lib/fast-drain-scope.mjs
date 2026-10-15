@@ -57,7 +57,7 @@ const MANIFEST_PATH = '.lane-manifest.json';
  * shared by every drain process in the clone. "No manifest" is definitive only when ls-tree lists the head
  * tree without the file. A head that stays unreadable (missing after both fetches, or an ls-tree/show error)
  * returns `unreadable` so the caller fails closed for this pass instead of reading it as "not a carrier".
- * Without a usable sha, the ref fallbacks are used but never definitive.
+ * Without a usable sha, nothing can be verified as the head, so it is `unreadable` too.
  * `headRef` is a gh-supplied refname and may lead with a dash, so every ref argument sits behind --end-of-options.
  * @returns {{manifest: object|null, definitive: boolean, unreadable: boolean}}
  */
@@ -83,12 +83,7 @@ export function readLegacyLocalManifestAt({ headRef, headSha, prNumber, git }) {
     // A commit's bytes never change, so even an unparseable manifest is a final answer.
     return { manifest: parse(raw), definitive: true, unreadable: false };
   }
-  fetch(headRef);
-  for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
-    let raw;
-    try { raw = git(['show', '--end-of-options', `${rev}:${MANIFEST_PATH}`]); } catch { continue; }
-    const manifest = parse(raw);
-    if (manifest) return { manifest, definitive: false, unreadable: false };
-  }
-  return { manifest: null, definitive: false, unreadable: false };
+  // No usable head sha (the listing always supplies headRefOid, so this is not expected): no ref can be
+  // verified as the head, and FETCH_HEAD may hold another process's PR — fail closed rather than guess.
+  return unreadable;
 }

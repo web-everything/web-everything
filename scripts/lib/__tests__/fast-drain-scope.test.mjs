@@ -160,10 +160,10 @@ describe('legacy manifest revision identity', () => {
     const { git } = fakeGit({ commits, fetch: () => { commits[HEAD] = { item: 7 }; } });
     expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha: HEAD, prNumber: 7, git })).toEqual({ manifest: { item: 7 }, definitive: true, unreadable: false });
   });
-  it.each([null, '', 'HEAD', `--output=/tmp/x`, 'A'.repeat(40), 'a'.repeat(39)])('never trusts or passes an invalid head sha %s', (headSha) => {
+  it.each([null, '', 'HEAD', `--output=/tmp/x`, 'A'.repeat(40), 'a'.repeat(39)])('fails closed on an invalid head sha %s without using FETCH_HEAD', (headSha) => {
     const { git, calls } = fakeGit({ commits: { [OTHER]: { item: 1 } }, refs: { FETCH_HEAD: OTHER } });
-    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha, prNumber: 7, git })).toEqual({ manifest: { item: 1 }, definitive: false, unreadable: false });
-    expect(calls.some(a => a[0] === 'cat-file')).toBe(false);
+    expect(readLegacyLocalManifestAt({ headRef: 'lane/x', headSha, prNumber: 7, git })).toEqual(UNREADABLE);
+    expect(calls).toEqual([]);
   });
   it('keeps a dash-leading head ref behind --end-of-options', () => {
     const { git, calls } = fakeGit({ fetch: failFetch });
