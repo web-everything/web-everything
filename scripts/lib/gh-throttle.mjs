@@ -179,7 +179,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { URL as NodeURL, fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 
 import { tryAcquireSlot, releaseOwnedSlot, admissionStatus, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
@@ -1727,7 +1727,7 @@ function finishedCiContext(throttle, childEnv, bin, cwd = process.cwd()) {
   const settings = resolveFinishedCiCacheSettings(env);
   const nowMs = (throttle.now || Date.now)();
   if (!settings.enabled) return { env, authScope: null, settings, nowMs };
-  const absCwd = resolve(cwd instanceof URL ? fileURLToPath(cwd) : cwd || process.cwd());
+  const absCwd = resolve(cwd instanceof NodeURL ? fileURLToPath(cwd) : cwd || process.cwd());
   const probeBin = bin.includes('/') ? resolve(absCwd, bin) : bin;
   const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(absCwd, path)).join(delimiter) };
   // A keychain login, routing fallback, or App shim can change credentials without changing the caller's env.

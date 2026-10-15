@@ -122,8 +122,10 @@ describe('finished CI cache (card 309)', () => {
   it('scopes synchronous cache entries to the child environment, not throttle configuration', () => {
     const f = fixture('first identity'); runGhSync(log, f.opts);
     const opts = { ...f.opts, env: { ...f.env, GH_TOKEN: 'ghs_different_child' } };
-    f.spawn.mockImplementation((_bin, args) => ({ status: 0,
-      stdout: Buffer.from(args[1].endsWith('/456') ? '{"status":"completed"}' : 'second identity'), stderr: Buffer.alloc(0) }));
+    f.spawn.mockImplementation((_bin, args, spawnOpts) => {
+      const text = args[1].endsWith('/456') ? '{"status":"completed"}' : 'second identity';
+      return { status: 0, stdout: spawnOpts.encoding ? text : Buffer.from(text), stderr: Buffer.alloc(0) };
+    });
     expect(runGhSync(log, opts)).toBe('second identity');
   });
   it.each([false, true])('tracks inherited process credentials despite unchanged throttle env (CLI=%s)', cli => {
@@ -143,6 +145,9 @@ describe('finished CI cache (card 309)', () => {
       if (dynamic) { f.throttle.personalRoute = true; f.throttle.personalToken = 'personal_fixture'; }
       else for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) {
         delete f.env[key]; vi.stubEnv(key, undefined);
+        // Vitest 1.x stringifies undefined; remove the key after registering it for restoration.
+        delete process.env[key];
+        expect(process.env[key]).toBeUndefined();
       }
       const call = () => cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(log, f.opts);
       call(); call(); expect(f.files()).toHaveLength(0);
