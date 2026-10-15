@@ -10,6 +10,7 @@ import {
 import { decideDispatchRoute as currentRoute } from '../dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
+import { readBuildArgonSettings } from '../build-argon-settings.mjs';
 import { taskTypeFor } from '../dispatch-task-type.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
 
@@ -43,7 +44,7 @@ describe('selectProbationWorker', () => {
     expect(PROBATION_ROSTER['ci-heal']).toEqual(['antigravity-claude', 'codex', 'antigravity-gemini']);
     expect(PROBATION_WORKERS['antigravity-gemini']).toMatchObject({ simpleOnly: true, checker: 'codex', model: AGY_GEMINI_SIMPLE_MODEL });
     expect(PROBATION_ROSTER.bugfix).toEqual(['codex', 'antigravity-claude', 'antigravity-gemini']);
-    expect(PROBATION_ROSTER['build-new-feature']).toEqual(['codex']);
+    expect(PROBATION_ROSTER['build-new-feature']).toEqual(['codex', 'antigravity-argon']);
     expect(PROBATION_ROSTER['conflict-resolution']).toBeUndefined();
   });
 
@@ -247,5 +248,77 @@ describe('gate/approval-only critical scope', () => {
     const route = decideDispatchRoute({ kind: 'build', size: 2, scopePaths: ['we:skills-src/conveyor/build-dispatch-daemon.mjs'], ...extra });
     expect(route.outcome).toBe('routed');
     expect(route.probationWorker).toBeNull();
+  });
+});
+
+
+describe('Argon probation builds', () => {
+  const task = { taskType: 'build-new-feature' };
+  const context = (extra = {}) => ({
+    kind: 'build', filesTouched: ['a.mjs'], estimatedSize: 40, ...open,
+    scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: task.taskType })],
+    ...extra,
+  });
+
+  it('rotates an opened non-simple build to Argon with a Codex checker and full review', () => {
+    expect(PROBATION_WORKERS['antigravity-argon']).toMatchObject({ simpleOnly: false });
+    expect(selectProvider(task, context())).toMatchObject({
+      recommendation: 'claude', probationWorker: {
+        id: 'antigravity-argon', provider: 'antigravity', model: 'gemini-4-argon-high',
+        executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', checker: 'codex',
+        supervision: 'full', review: 'full', runRating: 'required',
+      },
+    });
+  });
+
+  it.each(['antigravity-argon', 'antigravity', 'codex'])('skips Argon when %s is held', (id) => {
+    const res = selectProvider(task, context({ availability: { [id]: 'held' } }));
+    expect(res.probationWorker?.id).not.toBe('antigravity-argon');
+    expect(res.auditTrail).toContainEqual(expect.objectContaining({ criterion: 'probation-candidate:antigravity-argon', result: 'quota-held' }));
+  });
+
+  it('skips Argon when build.argon.enabled is off and records its source', () => {
+    const res = selectProvider(task, context({ argonSettings: { value: { enabled: false, model: 'gemini-4-argon-high' }, sources: { enabled: 'tool', model: 'standard' } } }));
+    expect(res.probationWorker?.id).toBe('codex');
+    expect(res.auditTrail).toContainEqual(expect.objectContaining({ criterion: 'probation-candidate:antigravity-argon', result: 'disabled', dataConsulted: expect.stringContaining('tool') }));
+  });
+
+  it.each([
+    { criticalWork: { critical: true, reasons: [] } },
+    { criticalWork: undefined },
+    { criticalMisses: undefined },
+    { filesTouched: ['docs/agent/platform-decisions.md'] },
+    { criticalMisses: [{ provider: 'antigravity', model: 'gemini-4-argon-high', taskType: task.taskType }] },
+  ])('retains the critical, statute and exact-triple vetoes: %j', (extra) => {
+    expect(selectProvider(task, context(extra)).probationWorker?.id).not.toBe('antigravity-argon');
+  });
+});
+
+
+describe('build.argon settings cascade', () => {
+  it('defaults enabled and logs standard sources', () => {
+    const messages = [];
+    const result = readBuildArgonSettings({ read: () => ({}), platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log: message => messages.push(message) });
+    expect(result).toEqual({ value: { enabled: true, model: 'gemini-4-argon-high' }, sources: { enabled: 'standard', model: 'standard' } });
+    expect(messages.join(' ')).toContain('argon.enabled=true (standard)');
+  });
+
+  it('resolves platform and tool independently per leaf, including the model used for routing', () => {
+    const result = readBuildArgonSettings({
+      read: () => ({ build: { argon: { model: 'gemini-4-argon-custom' } } }),
+      platform: { argon: { enabled: false, model: 'gemini-4-argon-high' } }, env: {},
+    });
+    expect(result).toEqual({ value: { enabled: false, model: 'gemini-4-argon-custom' }, sources: { enabled: 'platform', model: 'tool' } });
+    const enabled = { ...result, value: { ...result.value, enabled: true } };
+    expect(selectProbationWorker({ taskType: 'build-new-feature', argonSettings: enabled,
+      scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
+    }).worker.model).toBe('gemini-4-argon-custom');
+  });
+
+  it('ignores invalid tool leaves and tolerates unreadable tool settings', () => {
+    const platform = { argon: { enabled: false, model: 'gemini-4-argon-high' } };
+    for (const read of [() => ({ build: { argon: { enabled: 'true', model: false } } }), () => { throw new Error('unreadable'); }]) {
+      expect(readBuildArgonSettings({ read, platform, env: {} }).sources).toEqual({ enabled: 'platform', model: 'platform' });
+    }
   });
 });

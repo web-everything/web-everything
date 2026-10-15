@@ -1326,7 +1326,7 @@ describe('EXTERNAL_WORKER_CANDIDATES, externalTierEquivalent and the critical-wo
     expect(PROBATION_ROSTER.prepare).toEqual(['codex', 'antigravity-gemini']);
     expect(PROBATION_ROSTER.bugfix).toEqual(['codex', 'antigravity-claude', 'antigravity-gemini']);
     expect(rows['build-new-feature']).toBe(true);
-    expect(PROBATION_ROSTER['build-new-feature']).toEqual(['codex']);
+    expect(PROBATION_ROSTER['build-new-feature']).toEqual(['codex', 'antigravity-argon']);
     expect(rows['conflict-resolution']).toBe(false);
   });
 
