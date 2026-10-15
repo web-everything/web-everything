@@ -91,7 +91,10 @@ export default {
         quarantine: quarantine ? { mode: quarantine.mode, shadow: quarantine.shadow, action: quarantine.plan?.action ?? null, tests: quarantine.plan?.tests ?? [], why: quarantine.plan?.why ?? null, ...(quarantine.error ? { error: quarantine.error } : {}) } : null,
       },
       summary: `main CI red for ${fmtMin(redFor)} since ${sha9} (last green ${state.lastGreen?.sha.slice(0, 9) ?? 'unknown'}); failing: ${(failing.jobs || []).join(', ') || 'unknown'}; ${ownerText}${mainCiRuns?.priority ? `; PR #${mainCiRuns.priority.pr} has queue priority` : ''}${evidence ? `; merge-group run ${evidence.runId} passed the failing jobs on the main tip — flake, re-run requested` : ''}.`,
-      recommendation: owner
+      // card 302: ownership alone is not progress.
+      recommendation: mainCiRuns?.ownerStall?.stalled
+        ? `Main is red since ${sha9}; ${ownerText} is stalled (${mainCiRuns.ownerStall.reason}) since ${new Date(mainCiRuns.ownerStall.since).toISOString()}; ${mainCiRuns.ownerStall.approval}.`
+        : owner
         ? `Main is red since ${sha9}; ${owner.kind} ${owner.ref} owns the fix. Watch it land; do not fix main by hand.`
         : `Main is red since ${sha9} and has no owner (${decision?.reason ?? 'not decided'}). The main-red owner dispatch (main-ci-red-io.mjs) should send one; check why it did not.`,
     }];
