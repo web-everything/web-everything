@@ -242,9 +242,27 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.reasons).toEqual(touched ? [touchedReason] : []);
   });
 
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])('a tracked file named %s cannot hide a shared change', async (name) => {
+    const fx = fixture();
+    writeFileSync(join(fx.shared, name), 'initial\n');
+    commit(fx.shared);
+    const out = await fx.run(() => writeFileSync(join(fx.shared, name), 'changed\n'),
+      () => [tool(join(fx.shared, name), { status: 'TOOL_ERROR', tool_name: 'write_to_file' })]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toEqual([touchedReason]);
+  });
+
   it('review lane changes remain strict', async () => {
     const fx = fixture();
     const out = await fx.run(() => writeFileSync(join(fx.lane, 'file.txt'), 'changed\n'));
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toContain('change outside the juror lane: the review lane');
+  });
+
+  it('a further edit to an already-dirty review lane file named __proto__ is still seen', async () => {
+    const fx = fixture();
+    writeFileSync(join(fx.lane, '__proto__'), 'dirty before\n');
+    const out = await fx.run(() => writeFileSync(join(fx.lane, '__proto__'), 'changed again\n'));
     expect(out.status).toBe('voided');
     expect(out.reasons).toContain('change outside the juror lane: the review lane');
   });

@@ -214,8 +214,9 @@ export function snapshotCheckout(dir, exec = defaultExec, { control = gitControl
         if (origin) origins.push({ line: `${xy} ${origin}`, path: origin });
       }
     }
-    const contents = {};
-    for (const { path } of [...entries, ...origins]) if (!path.endsWith('/')) contents[path] = fingerprintFile(join(dir, path));
+    // Object.fromEntries defines own keys: a plain `obj[path] = …` would drop a file named `__proto__`.
+    const contents = Object.fromEntries([...entries, ...origins].filter(({ path }) => !path.endsWith('/'))
+      .map(({ path }) => [path, fingerprintFile(join(dir, path))]));
     return { head, status: entries.map((e) => e.line).join('\n') + (entries.length ? '\n' : ''),
       paths: Object.fromEntries([...entries, ...origins].map((e) => [e.path, e.line.slice(0, 2)])), contents, control: control(dir) };
   } catch (e) {
@@ -354,9 +355,11 @@ function sharedChangeTouched(dir, before, after, touched, exec) {
   const checkoutTouched = touched.some((p) => overlaps(p, root));
   // Missing/unreadable snapshots (including control changes) leave the changed set unknown.
   if (!before || before.unreadable || !after || after.unreadable) return checkoutTouched;
-  const paths = new Set([...Object.keys(before.contents ?? {}), ...Object.keys(after.contents ?? {})]);
-  const changed = [...paths].filter((p) => before.paths?.[p] !== after.paths?.[p]
-    || before.contents?.[p] !== after.contents?.[p]);
+  // Own keys only: a pathname like `constructor` must not read an inherited value on either side.
+  const own = (o, k) => (o && Object.hasOwn(o, k) ? o[k] : undefined);
+  const paths = new Set([before, after].flatMap((s) => [...Object.keys(s.paths ?? {}), ...Object.keys(s.contents ?? {})]));
+  const changed = [...paths].filter((p) => own(before.paths, p) !== own(after.paths, p)
+    || own(before.contents, p) !== own(after.contents, p));
   if (before.head !== after.head) {
     try {
       // defaultExec adds SAFE_GIT; -z preserves every pathname verbatim. No git after control changes.
