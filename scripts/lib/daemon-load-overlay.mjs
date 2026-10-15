@@ -658,7 +658,7 @@ export async function runDaemonLoadOverlay({
     while (remaining() > 0) {
       const remainingMs = remaining();
       if (remainingMs <= 0) break;
-      result = await rebuild({ root, env, log, mainOnly: false, runSmoke, lockOpts: { waitMs: remainingMs } });
+      result = await rebuild({ root, env, log, mainOnly: false, runSmoke, admissionWaitMs: remainingMs });
       if (result.reason !== 'rebuild-in-progress') return result;
       if (!waited) {
         waited = true;

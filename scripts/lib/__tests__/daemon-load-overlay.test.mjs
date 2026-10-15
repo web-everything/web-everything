@@ -27,6 +27,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
+import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
+
+it('preserves the real rebuild finalize wait on first admission, late retries, and starvation', async () => {
+  const report = await finalizeWaitBreak.run();
+  expect(finalizeWaitBreak.judge(report)).toEqual([]);
+}, 60_000);
 
 describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunRebuildFn)', () => {
   it('requires --clone', async () => {
@@ -1033,9 +1039,9 @@ describe('the race: overlay registered AFTER the build being adopted was smoked 
     });
     expect(rebuild).toHaveBeenCalledTimes(2);
     expect(rebuild.mock.calls[1][0]).toEqual({
-      ...rebuild.mock.calls[0][0], lockOpts: { waitMs: expect.any(Number) },
+      ...rebuild.mock.calls[0][0], admissionWaitMs: expect.any(Number),
     });
-    expect(rebuild.mock.calls[1][0].lockOpts.waitMs).toBeLessThanOrEqual(rebuild.mock.calls[0][0].lockOpts.waitMs);
+    expect(rebuild.mock.calls[1][0].admissionWaitMs).toBeLessThanOrEqual(rebuild.mock.calls[0][0].admissionWaitMs);
     expect(installed).toHaveBeenCalledTimes(2);
   });
 
@@ -1132,7 +1138,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     const result = await runDaemonLoadOverlay({ ...options, rebuild, log });
     expect(result).toMatchObject({ adopted: true, overlayInHead: true, installedCheck: present, waitedMs: 500 });
     expect(sleep.mock.calls).toEqual([[250], [250]]);
-    expect(rebuild.mock.calls.map(([o]) => o.lockOpts.waitMs)).toEqual([600, 350, 100]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
     expect(log.error).toHaveBeenCalledTimes(2);
   });
 
@@ -1141,7 +1147,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     const rebuild = vi.fn().mockResolvedValue(busy);
     const result = await runDaemonLoadOverlay({ ...options, rebuild });
     expect(result).toMatchObject({ adopted: false, reason: 'rebuild-in-progress', waitedMs: 600 });
-    expect(rebuild.mock.calls.map(([o]) => o.lockOpts.waitMs)).toEqual([600, 350, 100]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 100]);
     expect(sleep.mock.calls).toEqual([[250], [250], [100]]);
   });
 
@@ -1153,7 +1159,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     const installed = vi.fn().mockReturnValueOnce({ ...present, inHead: false, head: 'old' }).mockReturnValue(present);
     const result = await runDaemonLoadOverlay({ ...options, rebuild, installed });
     expect(result).toMatchObject({ adopted: true, followUps: 1, waitedMs: 500 });
-    expect(rebuild.mock.calls.map(([o]) => o.lockOpts.waitMs)).toEqual([600, 350, 350, 100]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350, 350, 100]);
   });
 
   it('does not admit a stale-adoption follow-up after the deadline', async () => {
@@ -1172,7 +1178,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     });
     expect(await runDaemonLoadOverlay({ ...options, rebuild })).toMatchObject({ adopted: true, waitedMs: 1_250 });
     expect(sleep.mock.calls).toEqual([[250]]);
-    expect(rebuild.mock.calls.map(([o]) => o.lockOpts.waitMs)).toEqual([600, 350]);
+    expect(rebuild.mock.calls.map(([o]) => o.admissionWaitMs)).toEqual([600, 350]);
   });
 
   it('still removes the overlay and recovers when candidate smoke fails after a busy wait', async () => {
@@ -1200,7 +1206,7 @@ describe('legacy explicit load — bounded busy wait', () => {
     const { options } = fixture(budget);
     const rebuild = vi.fn().mockResolvedValue({ adopted: true });
     await runDaemonLoadOverlay({ ...options, rebuild });
-    expect(rebuild.mock.calls[0][0].lockOpts.waitMs).toBe(60_000);
+    expect(rebuild.mock.calls[0][0].admissionWaitMs).toBe(60_000);
   });
 
   it('does not retry another refusal or a thrown rebuild error', async () => {
