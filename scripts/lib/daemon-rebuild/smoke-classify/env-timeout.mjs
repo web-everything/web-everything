@@ -46,28 +46,37 @@ function fragmentBudget(text) {
   return scan ? { kind: 'scan', budget: Number(scan[1]) } : null;
 }
 
+// The gate prints how many repos failed, and each repo runs once. A child's stderr line rides inside the summary,
+// so a "; <repo>: …" in it splices a unit the gate never recorded (or names a repo twice, the later copy hiding the
+// earlier). Units that are not exactly that many distinct repos are text the gate did not write: they prove nothing.
+function countedUnits(entries, count) {
+  const units = new Map(entries);
+  return units.size === entries.length && units.size === Number(count) ? units : null;
+}
+
 // What a timeout row measured, as unit → {kind, budget it ran out of}. A multi-repo reconcile row is one unit per
 // repo; every other row is a single unit. null when any unit is something other than a timeout (a real error
 // beside a timeout). The kill summary prints only the FIRST repo's budget, and the shared deadline can only shrink
 // a later repo's cap: on the candidate it bounds every repo, on the control it proves only the first (later control
-// repos get NaN, which no comparison accepts).
+// repos get NaN, which no comparison accepts). Both summaries must name exactly the gate's own failure count of
+// distinct repos ({@link countedUnits}).
 function timeoutProfile(row, side) {
   const detail = String(row.detail ?? '');
-  const kills = /^reconcile-pass dry-run \(\d+\/\d+ repo\(s\) — (.+)\) failed: (timed out after \d+ms \(process group killed\))$/.exec(detail);
+  const kills = /^reconcile-pass dry-run \((\d+)\/\d+ repo\(s\) — (.+)\) failed: (timed out after \d+ms \(process group killed\))$/.exec(detail);
   if (kills) {
-    const b = fragmentBudget(kills[2]);
-    return new Map(kills[1].split(', ').map((repo, i) => [repo, side === 'control' && i > 0 ? { ...b, budget: NaN } : b]));
+    const b = fragmentBudget(kills[3]);
+    return countedUnits(kills[2].split(', ').map((repo, i) => [repo, side === 'control' && i > 0 ? { ...b, budget: NaN } : b]), kills[1]);
   }
-  const mixed = /^reconcile-pass dry-run failed for \d+\/\d+ repo\(s\): (.+)$/.exec(detail);
+  const mixed = /^reconcile-pass dry-run failed for (\d+)\/\d+ repo\(s\): (.+)$/.exec(detail);
   if (mixed) {
-    const units = new Map();
-    for (const part of mixed[1].split('; ')) {
+    const units = [];
+    for (const part of mixed[2].split('; ')) {
       const m = PREFIXED.exec(part);
       const budget = m ? fragmentBudget(m[2]) : null;
       if (budget === null) return null;
-      units.set(m[1], budget);
+      units.push([m[1], budget]);
     }
-    return units;
+    return countedUnits(units, mixed[1]);
   }
   const one = ONE_CHECK.exec(detail);
   const budget = one ? fragmentBudget(one[1]) : null;

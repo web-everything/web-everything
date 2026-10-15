@@ -261,6 +261,27 @@ describe('env-timeout hold escape', () => {
     }
   });
 
+  // A child's stderr line rides inside the summary, so a "; <repo>: …" in it splices a unit the gate never recorded.
+  // The gate's own failure count is the check: a summary whose units disagree with it proves no timeout.
+  it.each([
+    ['a control summary with a spliced repo unit',
+      `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: timed out after 100000ms (process group killed)`,
+      `reconcile-pass dry-run failed for 1/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: timed out after 150000ms (process group killed)`],
+    ['a candidate summary with a spliced repo unit',
+      `reconcile-pass dry-run failed for 1/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: timed out after 100000ms (process group killed)`,
+      `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: timed out after 150000ms (process group killed)`],
+    ['a control summary naming one repo twice',
+      `reconcile-pass dry-run failed for 1/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}`,
+      `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(60_000)}; a: exited 1: ✗ ${scanText(120_000)}`],
+    ['a kill summary whose repo list disagrees with its count',
+      'reconcile-pass dry-run (1/2 repo(s) — a) failed: timed out after 100000ms (process group killed)',
+      'reconcile-pass dry-run (2/2 repo(s) — a) failed: timed out after 150000ms (process group killed)'],
+  ])('holds on %s', async (_label, candidateDetail, controlDetail) => {
+    const { r, ctx } = await runWith({ ...failed[0], detail: candidateDetail }, { ...failed[0], detail: controlDetail });
+    expect(r.reason).toBe('smoke-env-timeout');
+    expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
   it('does not report a textual control skip as a reproduced timeout', async () => {
     const skipped = { ...failed[0], detail: 'skipped: budget — scan exceeded its 120000ms budget' };
     const ctx = context({ smokeSha: vi.fn().mockResolvedValue({ smokeResult: { ...smokeResult, smoke: { results: [skipped] } } }) });
