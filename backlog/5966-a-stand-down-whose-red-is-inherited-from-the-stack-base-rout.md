@@ -68,8 +68,8 @@ Authorization controls are required at every boundary in the matrix below. The p
 
 | Authorization requirement | Required negative control | Expected result |
 | --- | --- | --- |
-| Require a trusted author | A forged (non-trusted) author supplies the otherwise-valid leading marker | Refused |
-| Require a leading marker | A trusted author supplies a quoted (not leading) marker; run blockquote, fenced-code and after-prose forms separately | Refused |
+| Require a trusted author | A forged (non-trusted) author supplies the otherwise-valid leading marker | The forged author with the marker is refused, even when all other evidence is valid |
+| Require a leading marker | A trusted author supplies a quoted (not leading) marker; run blockquote, fenced-code and after-prose forms separately | The quoted (not leading) marker is refused, even when the author is trusted and all other evidence is valid |
 
 Keep all other evidence identical to the positive control so each refusal independently proves its corresponding requirement. Neither negative control may authorize a base fix, release a child hold, trigger delivery or refresh, or acknowledge delivery and suppress a legitimate retry. Both must pass at every boundary; the combined negative case below is additional coverage, not a substitute for either independent refusal.
 
