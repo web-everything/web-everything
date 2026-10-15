@@ -1387,6 +1387,9 @@ describe('#4315 durable referral effects', () => {
     const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(askedKeys(h)).toEqual([key]);
     expect(out.pending).not.toContain(key);
+    // The record the sink posts names the carry's real ruler, read from the recorded backing ruling.
+    const posted = h.state.comments.map(c => c.body).filter(b => b.includes('<!-- mandatory-referrals-v1:') && b.includes(`- ${key}: carried`));
+    expect(posted.at(-1)).toContain('(operator block, from');
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(askedKeys(h)).toEqual([key]);                      // bounded: no second ask
   });
