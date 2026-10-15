@@ -343,3 +343,23 @@ wrong conclusion about why the remaining two mattered.
 
 The instruction that follows from it: **a claim about a mechanism is worth exactly as much as the
 command you ran to check it.** The false one here was the flat assertion, not the subtle one.
+
+## Operator session attention feed
+
+Health-watch supervises one sha-pinned `needs-you-feed` job, polling the declared operator queue every two
+minutes, counting queue-read time toward the interval. Cold snapshots use the existing detached
+health-job prewarm gate. New NEEDS YOU / RULING NEEDED / stood-down items and their clears append to the handoff home's
+`needs-you-events.jsonl`; incomplete reads never clear items. Any operating session applies
+`node scripts/operations/run.mjs operator-session-bootstrap` once for the 30-minute movement-sweep cron,
+quiet-hours rules, resolved monitor command and unacknowledged replay. The exact monitor command is:
+
+```bash
+tail -n 0 -F "$(node scripts/operations/handoff-home.mjs path)/needs-you-events.jsonl" | grep --line-buffered NEEDS-YOU
+```
+
+`node scripts/operations/needs-you-feed.mjs monitor-command` resolves overrides too. After reading, run
+`node scripts/operations/needs-you-feed.mjs ack`; the timestamp cursor is shared, without session IDs.
+Settings cascade env > `scripts/settings/needs-you-feed.json` > defaults (`enabled`, `intervalMinutes`,
+`path`, `allowPrimary`), logging values and sources once per run. Env names are `WE_NEEDS_YOU_FEED_ENABLED`,
+`WE_NEEDS_YOU_FEED_INTERVAL_MINUTES`, `WE_NEEDS_YOU_FEED`, `WE_NEEDS_YOU_FEED_ALLOW_PRIMARY`.
+Daemon seam: a future daemon may consume the same `bootstrapPlan()` object instead of a chat session.

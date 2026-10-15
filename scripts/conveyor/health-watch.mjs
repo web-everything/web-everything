@@ -40,6 +40,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
@@ -1300,6 +1301,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // `ghJob` (the job's own failure, supplied once when it is consumed) is held the same way, so a job that keeps
   // dying builds its own streak across the ticks between its failures.
   const carryProbeErrors = ghJobsOn && ghDue && !ghFromJob ? [...GH_GROUP_PROBE_NAMES, 'ghJob'] : [];
+  if (!flags['state-root'] && !flags['dry-run']) {
+    await attempt('needsYouFeed', () => (deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)({ now }));
+  }
   const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, deps.smells || SMELLS, now, { config, probeErrors, activeCards, carryProbeErrors });
   // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
   if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
