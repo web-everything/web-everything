@@ -1,5 +1,6 @@
 /** Shared prepare identity and duplicate-launch guards. Pure: callers supply observed state. */
 import { normNum } from './queue-store.mjs';
+import { releasedAttempt } from './prepare-failure-policy.mjs';
 
 const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const newestFirst = (a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? ''));
@@ -20,7 +21,7 @@ export function preparePrGuard({ num, bornAs, prs = [], lastDispatchAt }) {
 }
 
 export function prepareLaunchRefusal({ num, bornAs, prs = [], lastDispatchAt,
-  now = Date.now(), mergedGuardHours = 24, claims = [], liveRows = [], ledgerFailures = [] }) {
+  now = Date.now(), mergedGuardHours = 24, claims = [], liveRows = [], ledgerFailures = [], releases = [] }) {
   const matching = prs.filter(pr => isPreparePrFor(pr, { num, bornAs })).sort(newestFirst);
   const open = matching.find(pr => pr.state === 'OPEN');
   if (open) return { reason: `open prepare PR #${open.number} (${open.headRefName})` };
@@ -38,7 +39,7 @@ export function prepareLaunchRefusal({ num, bornAs, prs = [], lastDispatchAt,
   const latest = ledgerFailures.filter(f => normNum(f.num) === key)
     .sort((a, b) => String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')))[0];
   if (latest?.holdReason?.startsWith('needs-you') && (latest.held === true || latest.completed === true)
-    && !latest.releasedAt && !latest.releasedBy) {
+    && !latest.releasedAt && !latest.releasedBy && !releasedAttempt(releases, key, latest.attempt)) {
     return { reason: `parked needs-you: ${latest.holdReason.slice(0, 120)}` };
   }
   return null;

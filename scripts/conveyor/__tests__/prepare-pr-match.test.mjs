@@ -74,6 +74,18 @@ describe('prepare launch refusal', () => {
   it.each(['releasedAt', 'releasedBy'])('honors an explicit %s release', field => {
     expect(refuse({ ledgerFailures: [{ num: '5028', held: true, completed: true, holdReason: 'needs-you: call', [field]: 'release' }] })).toBeNull();
   });
+  // PR #5366 review: a reviewed release lives in the releases store, not on the ledger record.
+  it.each([{ held: true }, { held: false, completed: true }])('honors a reviewed release of the newest attempt: %j', flags => {
+    const ledgerFailures = [{ num: '5028', attempt: 'run x', recordedAt: '2026-10-14', holdReason: 'needs-you: call', ...flags }];
+    expect(refuse({ ledgerFailures, releases: [{ target: '5028', attempt: 'run x' }] })).toBeNull();
+  });
+  it.each([
+    ['another attempt', { target: '5028', attempt: 'run old' }],
+    ['another card', { target: '99', attempt: 'run x' }],
+  ])('keeps the park when the release names %s', (_name, release) => {
+    const ledgerFailures = [{ num: '5028', attempt: 'run x', recordedAt: '2026-10-14', holdReason: 'needs-you: call', held: true }];
+    expect(refuse({ ledgerFailures, releases: [release] })).toEqual({ reason: 'parked needs-you: needs-you: call' });
+  });
   it('uses only the newest record for this card, independent of array order', () => {
     expect(refuse({ ledgerFailures: [
       { num: '5028', recordedAt: '2026-10-15', holdReason: 'transient', held: true },

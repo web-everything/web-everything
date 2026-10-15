@@ -1840,6 +1840,22 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });
+  // PR #5366 review: the operator's reviewed release (releases store) lifts a needs-you park at launch too.
+  it.each([[[{ target: '5028', attempt: 'run x' }], true], [[], false]])(
+    'a reviewed release of a held needs-you record launches the card (releases=%j, launches=%s)', async (releases, launches) => {
+      const effects = fixture();
+      effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+      effects.listPreparePrs = () => [];
+      effects.listPrepareFailures = () => [{ num: '5028', attempt: 'run x', stage: 'result', cause: 'needs-you',
+        held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }];
+      effects.listPrepareReleases = () => releases;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const tick = await runBuildDispatchTick({ live: true, effects });
+        expect(tick.prepare.launched.map(r => r.num)).toEqual(launches ? ['5028'] : []);
+        expect(tick.prepare.refused).toEqual(launches ? [] : [{ num: '5028', reason: 'parked needs-you: needs-you: decide scope' }]);
+      } finally { log.mockRestore(); }
+    });
   it.each([[12, false], [6, true], [0, true]])(
     'uses the tick policy merged guard (%sh, launches=%s)', async (mergedGuardHours, launches) => {
       const effects = fixture();

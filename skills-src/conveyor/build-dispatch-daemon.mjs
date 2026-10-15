@@ -1203,7 +1203,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
           refusal = prepareLaunchRefusal({ num, bornAs, prs,
             lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
-            claims: prepareClaims, liveRows: prepareRows, ledgerFailures });
+            claims: prepareClaims, liveRows: prepareRows, ledgerFailures, releases });
         } catch {
           refusal = { reason: 'prepare PR listing unavailable' };
         }
