@@ -164,6 +164,10 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, require
   if (hasReviewLabel(live.labels, REVIEW_LABELS.changes) || hasReviewLabel(live.labels, REVIEW_LABELS.heldMechanical)) return false;
   // Right after its own write the sweep knows the park is its own; a later heal must prove it from the thread.
   if (requireMarker && !raceLostParkProven(after, head)) return false;
+  // Beside `review:accepted`, `review:human` may also be a keep-clearance park (the drain's tamper park) whose comment
+  // is not posted yet. Heal that shape only when the park marker itself is the last trusted comment.
+  if (requireMarker && hasReviewLabel(live.labels, REVIEW_LABELS.accepted)
+    && !marksPark(after.filter(isTrustedMarkerAuthor).at(-1), head)) return false;
   // Neither label: something else took the acceptance away. Never create one.
   if (!hasReviewLabel(live.labels, REVIEW_LABELS.human)) return hasReviewLabel(live.labels, REVIEW_LABELS.accepted);
   if (dryRun) return true;

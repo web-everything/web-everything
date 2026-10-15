@@ -239,9 +239,13 @@ describe('human surface re-park sweep', () => {
       expect(r.live.labels).toEqual(['ready-to-merge', 'review:accepted']);
       expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, reason: 'healed a park that lost a race with a human clearance' }]);
     });
-    it('withdraws a marked park beside the review:accepted a racing clear-human re-added', () => {
-      const r = heal({ labels: ['review:human', 'review:accepted'] });
+    it('withdraws a marked park beside review:accepted when the park marker is the last trusted comment', () => {
+      const r = heal({ labels: ['review:human', 'review:accepted'], comments: [{ id: 'C_clear', ...clearance(head) }, park] });
       expect(r.effects).toEqual([{ add: 'review:accepted', remove: ['review:human'] }]);
+    });
+    it('leaves review:human beside review:accepted when the clearance is last (a keep-clearance park may not have commented yet)', () => {
+      const r = heal({ labels: ['review:human', 'review:accepted'] });
+      expect(r.effects).toEqual([]);
     });
     it('withdraws a mechanical-hold hand-off park whose own re-check never ran', () => {
       const handoff = { id: 'C_handoff', author: { login: 'web-everything' }, body: `🧑‍⚖️ review — mechanical hold handed to the operator\n\n<!-- mechanical-hold-handoff: ${head} -->` };
