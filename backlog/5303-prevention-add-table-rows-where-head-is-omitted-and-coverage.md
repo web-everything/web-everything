@@ -60,6 +60,16 @@ At implementation time, add the focused capability rows first and run them again
 
 All test execution must use the host heavy-run queue, invoked via `we:scripts/readiness/heavy-admission.mjs` with run, then the command separator, then npx vitest run and the selected repository-relative test arguments. Run the four scoped test suites plus regression-only `we:scripts/__tests__/pr-merge-gate.test.mjs` and `we:scripts/lib/__tests__/pr-state-review-exempt.test.mjs`. Run npm run check:standards through the same queue. Record actual before/after output and any unrelated failures. The preparation runner owns preparation checks and stamps; this card edit does not claim implementation tests passed.
 
+## Edge cases this change must handle
+
+1. **Untrusted text** — Head and coverage values are evidence, not instructions. Keep unreadable/unverifiable reasons fixed; never embed a non-string sha value in a reason or coerce it to text. No new shell, argv, path or regex is built from these inputs. Preserve exact string comparison without normalization.
+2. **Truncated reads** — n/a: the gate is a pure decision over supplied facts and adds no paginated or buffered reads. Preserve the callers' unreadable-evidence flags as defer; unavailable evidence must never become clearance.
+3. **Shared state files** — n/a: no shared file, writer or lock is added. The gate must leave the supplied facts unchanged; the shadow regression asserts the input verdict is unchanged.
+4. **Fail closed** — Non-array holds other than the existing undefined default defer as ledger-unreadable without throwing. Otherwise-clearing results with an absent, empty or non-string head defer; verdict-backed clearance also requires usable coverage. Keep unreadable precedence, ordinary holds, the fixed ledger-head-unverifiable reason and the CI/shadow fail-closed mappings.
+5. **Identity scoping** — Compare the supplied live PR head and current verdict coverage head as non-empty strings with exact equality. Missing identity defers and a different head remains a non-deferred mismatch hold. Use each caller's existing repo/PR facts; introduce no cross-PR cache or new identity lookup. Labels authority still returns before inspecting ledger evidence.
+6. **State over time** — A new live head with old verdict coverage remains held on mismatch; missing current coverage cannot clear a verdict-backed result. Preserve the valid no-current-verdict exemption separately and ensure a current verdict cannot bypass coverage through reviewExempt. No persisted state, TTL or restart behavior is added.
+7. **Who wrote it** — Preserve the existing verdict-ledger authority and the exemption derived by pr-state against the live full head SHA. Do not infer exemption from labels, comment text or an arbitrary reviewExempt flag alongside a current verdict. This gate consumes those existing derived facts and adds no new author-trust decision.
+
 ## Follow-ups
 
 - A repository-wide rule requiring unknown-input rows for every gate predicate is separate work; it is not necessary to close these concrete gaps.
@@ -68,3 +78,17 @@ All test execution must use the host heavy-run queue, invoked via `we:scripts/re
 ## Done when
 
 The new capability rows fail against the old gate and pass with the fix; positive clearance, review exemptions, ordinary holds, labels authority and shadow transient behavior remain covered. CI and shadow consumers demonstrate the intended fail-closed/unreadable mapping, and queued affected tests and standards checks pass.
+
+The following command passes with the new capability rows and caller assertions. The missing-head/missing-coverage and malformed-holds rows must fail against the unchanged gate as described in the proof plan.
+
+```sh
+npm run test:unit -- scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs scripts/lib/__tests__/merge-gate-ci.test.mjs scripts/lib/__tests__/drain-ledger-shadow.test.mjs
+```
+
+The following command passes as preservation evidence.
+
+```sh
+npm run test:unit -- scripts/__tests__/pr-merge-gate.test.mjs scripts/lib/__tests__/pr-state-review-exempt.test.mjs
+```
+
+- `npm run check:standards` passes. These npm scripts enter the host heavy-run queue; record their actual output at implementation time.
