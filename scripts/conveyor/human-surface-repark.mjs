@@ -12,8 +12,8 @@ import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-c
 
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
-// This sweep's own park shape: accepted removed, human added, no bounce or mechanical hold.
-const healCandidate = labels => hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.accepted)
+// A marked park can sit beside `review:accepted` (a racing clear-human re-adds it); never beside a bounce or mechanical hold.
+const healCandidate = labels => hasReviewLabel(labels, REVIEW_LABELS.human)
   && !hasReviewLabel(labels, REVIEW_LABELS.changes) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
 const errorText = e => String(e?.message ?? e).split('\n')[0];
 const sameSha = (a, b) => !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
@@ -28,6 +28,25 @@ export function hasHumanSurfaceReparkMarker(comments, headSha) {
   const want = buildHumanSurfaceReparkMarker(headSha);
   return (Array.isArray(comments) ? comments : [])
     .some(c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string' && c.body.toLowerCase().includes(want));
+}
+// Both automatic read-then-write parks: this sweep's, and review-set-label.mjs's mechanical-hold hand-off.
+const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
+const PARK_MARKER_HINT = /human-surface-repark:|mechanical-hold-handoff:/i;
+const marksPark = (c, head) => typeof c?.body === 'string' && [...c.body.matchAll(PARK_MARKER_RE)].some(m => sameSha(m[1], head));
+
+/**
+ * PR #5273 — proof, from the complete thread alone, that `review:human` at `head` is a marked park that lost a race
+ * with a clear-human of the same head: the latest clearance names `head`, a marked park of `head` exists, and the
+ * last trusted comment is one of those two. Any later trusted comment (a rearm, a verdict, a hold) may have put
+ * `review:human` back for its own reason, so the proof fails and the hold stays.
+ */
+export function raceLostParkProven(comments, head) {
+  const trusted = (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor);
+  if (!trusted.length || !sameSha(parseLatestHumanClearedSha(trusted), head)) return false;
+  const last = trusted.at(-1);
+  const clearsHead = c => sameSha(parseLatestHumanClearedSha([c]), head);
+  if (!marksPark(last, head) && !clearsHead(last)) return false;
+  return trusted.some(c => marksPark(c, head)) && trusted.some(clearsHead);
 }
 const commentKey = c => c?.id ?? JSON.stringify([c?.body, c?.createdAt, c?.author?.login]);
 
@@ -136,7 +155,7 @@ export function sweepHumanSurfaceRepark({
  * such a clearance, so the pair can only come from a race. Reads the complete thread, then the labels and head.
  * Leaves a moved head, a `review:changes` bounce or a mechanical hold alone. Returns whether it withdrew.
  */
-function withdrawRaceLostPark({ provider, repo, num, head, readComments, requireMarker = false }) {
+function withdrawRaceLostPark({ provider, repo, num, head, readComments, requireMarker = false, dryRun = false }) {
   const after = readComments(num, { repo });
   if (!Array.isArray(after)) throw new Error('comments read returned no array');
   const live = provider.readPrState(repo, num);
@@ -144,33 +163,31 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, require
   if (!sameSha(live.headRefOid, head) || !sameSha(parseLatestHumanClearedSha(after), head)) return false;
   if (hasReviewLabel(live.labels, REVIEW_LABELS.changes) || hasReviewLabel(live.labels, REVIEW_LABELS.heldMechanical)) return false;
   // Right after its own write the sweep knows the park is its own; a later heal must prove it from the thread.
-  if (requireMarker && !hasHumanSurfaceReparkMarker(after, head)) return false;
-  const remove = hasReviewLabel(live.labels, REVIEW_LABELS.human) ? [REVIEW_LABELS.human] : [];
-  if (!remove.length && hasReviewLabel(live.labels, REVIEW_LABELS.accepted)) return true;
-  provider.setLabels(repo, num, { add: REVIEW_LABELS.accepted, remove });
+  if (requireMarker && !raceLostParkProven(after, head)) return false;
+  // Neither label: something else took the acceptance away. Never create one.
+  if (!hasReviewLabel(live.labels, REVIEW_LABELS.human)) return hasReviewLabel(live.labels, REVIEW_LABELS.accepted);
+  if (dryRun) return true;
+  provider.setLabels(repo, num, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
   return true;
 }
 
 /**
- * Heal a park left behind when the post-write check (or clear-human's own re-check) never ran: a crash, or a failed
- * read. Only this sweep's own park shape: `review:human` without `review:accepted`, this sweep's marker at the live
- * head, and a trusted clearance of that head.
+ * Heal a marked park left behind when no post-write check caught the race: a crash, or a failed read, on the
+ * sweep, the mechanical-hold hand-off or clear-human. Acts only on {@link raceLostParkProven}. The listed (oldest)
+ * comments pre-filter: a short listed thread with no park marker is never read in full.
  */
 function healRaceLostParks({ prs, provider, repo, readComments, dryRun, results }) {
   for (const pr of prs) {
     if (!healCandidate(pr.labels)) continue;
+    if (Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
+      && !pr.comments.some(c => PARK_MARKER_HINT.test(String(c?.body ?? '')))) continue;
     const num = pr.number;
     try {
       const state = provider.readPrState(repo, num);
       if (state?.state !== 'OPEN' || !state.headRefOid || !healCandidate(state.labels)) continue;
-      if (dryRun) {
-        const comments = readComments(num, { repo });
-        if (Array.isArray(comments) && hasHumanSurfaceReparkMarker(comments, state.headRefOid)
-          && sameSha(parseLatestHumanClearedSha(comments), state.headRefOid)) results.push({ num, repark: 'would-withdraw', head: state.headRefOid });
-        continue;
-      }
-      if (withdrawRaceLostPark({ provider, repo, num, head: state.headRefOid, readComments, requireMarker: true })) {
-        results.push({ num, repark: 'withdrawn', head: state.headRefOid, reason: 'healed a park that lost a race with a human clearance' });
+      if (withdrawRaceLostPark({ provider, repo, num, head: state.headRefOid, readComments, requireMarker: true, dryRun })) {
+        results.push(dryRun ? { num, repark: 'would-withdraw', head: state.headRefOid }
+          : { num, repark: 'withdrawn', head: state.headRefOid, reason: 'healed a park that lost a race with a human clearance' });
       }
     } catch (e) {
       results.push({ num, skipped: `heal read failed: ${errorText(e)}` });

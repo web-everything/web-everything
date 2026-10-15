@@ -239,6 +239,24 @@ describe('human surface re-park sweep', () => {
       expect(r.live.labels).toEqual(['ready-to-merge', 'review:accepted']);
       expect(r.results).toEqual([{ num: 7, repark: 'withdrawn', head, reason: 'healed a park that lost a race with a human clearance' }]);
     });
+    it('withdraws a marked park beside the review:accepted a racing clear-human re-added', () => {
+      const r = heal({ labels: ['review:human', 'review:accepted'] });
+      expect(r.effects).toEqual([{ add: 'review:accepted', remove: ['review:human'] }]);
+    });
+    it('withdraws a mechanical-hold hand-off park whose own re-check never ran', () => {
+      const handoff = { id: 'C_handoff', author: { login: 'web-everything' }, body: `🧑‍⚖️ review — mechanical hold handed to the operator\n\n<!-- mechanical-hold-handoff: ${head} -->` };
+      const r = heal({ comments: [{ id: 'C_clear', ...clearance(head) }, handoff] });
+      expect(r.live.labels).toContain('review:accepted');
+      expect(r.live.labels).not.toContain('review:human');
+    });
+    it('does not read in full a short listed thread with no park marker', () => {
+      const readPrState = vi.fn();
+      const readComments = vi.fn();
+      const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels: ['review:human'], comments: [{ body: 'hi' }] }], provider: { readPrState }, readComments, resolveSurfaces: () => 'narrow' });
+      expect(results).toEqual([]);
+      expect(readPrState).not.toHaveBeenCalled();
+      expect(readComments).not.toHaveBeenCalled();
+    });
     it('reports only, in dry-run', () => {
       const r = heal({ dryRun: true });
       expect(r.effects).toEqual([]);
@@ -249,7 +267,7 @@ describe('human surface re-park sweep', () => {
       ['a marker for an older head', { comments: [{ ...park, body: buildHumanSurfaceReparkComment({ headSha: 'b'.repeat(40), hits: [] }) }, { id: 'C_clear', ...clearance(head) }] }],
       ['an untrusted marker', { comments: [{ ...park, author: { login: 'outsider' } }, { id: 'C_clear', ...clearance(head) }] }],
       ['no clearance of the live head', { comments: [park, { id: 'C_clear', ...clearance('b'.repeat(40)) }] }],
-      ['review:accepted kept beside the hold', { labels: ['review:human', 'review:accepted'] }],
+      ['a later trusted comment (another hold may have re-added review:human)', { comments: [park, { id: 'C_clear', ...clearance(head) }, { id: 'C_rearm', author: { login: 'web-everything' }, body: '🔁 review re-armed' }] }],
       ['a review:changes bounce', { labels: ['review:human', 'review:changes'] }],
       ['a mechanical hold', { labels: ['review:human', 'review:held-mechanical'] }],
     ])('leaves the hold with %s', (_name, extra) => {
