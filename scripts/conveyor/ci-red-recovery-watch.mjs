@@ -59,8 +59,9 @@
 import { resolve } from 'node:path';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { resolveCiHealBudget } from './reconcile-core.mjs';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
-  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, EXHAUSTED_RETRY_SPENT_MARKER } from './exhausted-retry.mjs';
+  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, trustedRetryMarkerComments, EXHAUSTED_RETRY_SPENT_MARKER } from './exhausted-retry.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -231,7 +232,7 @@ export function sweepCiRedRecovery({
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   readMainFailureSignature = defaultReadMainFailureSignature, exhaustedRetrySettings = null,
-  ciHealCap = defaultCiHealCap(),
+  ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
   readIsCrossRepository = defaultReadIsCrossRepository,
   maxRebaseRetriesPerSha = resolveRecoveryCaps().rebaseRetriesPerSha, checkClaim = pushRefusal,
@@ -240,6 +241,7 @@ export function sweepCiRedRecovery({
   // Card xu1nixv — the published red-main priority record (WE only); hermetic (null) inside a test run.
   readPriority = () => readMainRedPriority(),
 } = {}) {
+  const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
   const prs = readOpenPrs({ repo });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
@@ -274,7 +276,7 @@ export function sweepCiRedRecovery({
     let exhaustionComments;
     if (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0) {
       exhaustionComments = readComments(c.prNumber, { repo });
-      c = { ...c, comments: exhaustionComments, exhaustion: exhaustionFacts({ comments: exhaustionComments, ciHealCap, headSha: c.headSha }) };
+      c = { ...c, comments: exhaustionComments, exhaustion: exhaustionFacts({ comments: exhaustionComments, ciHealBudget, ciHealCap, headSha: c.headSha }) };
     }
     if (!(c.aheadBy > 0)) return c;
     const attribution = classifyCiFailureAttribution({ failureCompletedAt: c.failureCompletedAt, mainRedWindows });
@@ -296,8 +298,9 @@ export function sweepCiRedRecovery({
         withFacts.mainFixedSignature = readMainFixedSignatureFacts({ repo, defaultBranch,
           detailsUrl: c.detailsUrl, failureCompletedAt: c.failureCompletedAt });
         if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) {
+          if (!retrySettings.enabled || retrySettings.maxRetries === 0) return withFacts;
           withFacts.mainFailureSignature = readMainFailureSignature({ repo, detailsUrl: c.detailsUrl,
-            failingCheckName: c.failingCheckName, mainRuns, lookbackHours: (exhaustedRetrySettings ?? resolveExhaustedRetry()).lookbackHours });
+            failingCheckName: c.failingCheckName, mainRuns, lookbackHours: retrySettings.lookbackHours });
           if (!withFacts.mainFailureSignature?.matched) return withFacts;
         }
       }
@@ -310,7 +313,10 @@ export function sweepCiRedRecovery({
   const prio = readPriority();
   const isWe = repo == null || repo === 'we' || repo === CONSTELLATION_REPOS.we.slug;
   const mainFixPrs = prio && prio.repo === 'we' && isWe ? (Array.isArray(prio.prs) ? prio.prs : [prio.pr]) : [];
-  const plan = planMainRedRebases({ candidates: candidates.filter(c => !c.exhaustion?.exhausted), mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
+  for (const c of candidates) {
+    c.mainRecoveryOwned = existingMainRecoveryOwns(c, { mainRedWindows, mainLatestCheckRuns });
+  }
+  const plan = planMainRedRebases({ candidates: candidates.filter(c => !c.exhaustion?.exhausted || c.mainRecoveryOwned), mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
   // `rebaseDropManifest` needs a REAL LOCAL checkout of the repo it rebases (this file's own header). Left at
@@ -387,13 +393,13 @@ export function defaultReadMainFailureSignature({ repo, detailsUrl, failingCheck
   } catch { return null; }
 }
 
-function defaultCiHealCap(env = process.env) {
-  let cap = 3;
-  for (const raw of [readPlatformPreferences({ env }).prefs?.ciHeal?.attemptCap, readSettings()?.ciHeal?.attemptCap, env.WE_CI_HEAL_ATTEMPT_CAP]) {
-    const text = String(raw ?? '').trim();
-    if (/^\d{1,2}$/.test(text) && Number(text) > 0) cap = Number(text);
-  }
-  return cap;
+function defaultCiHealBudget(env = process.env) {
+  return resolveCiHealBudget({ env, platform: readPlatformPreferences({ env }).prefs, repo: readSettings()?.ciHeal });
+}
+
+function existingMainRecoveryOwns(c, { mainRedWindows = [], mainLatestCheckRuns = [] } = {}) {
+  const cls = classifyMainDefect({ ...c, requiredCheckCompletedAt: c.failureCompletedAt, mainRedWindows, mainLatestCheckRuns });
+  return cls.mainDefect && cls.via !== 'main-failure-signature';
 }
 
 export function defaultReadMainTip({ repo, defaultBranch = 'main', exec = execFileSyncThrottled } = {}) {
@@ -411,7 +417,7 @@ export function defaultPostExhaustedRetryComment(prNumber, { body, repo, exec = 
 }
 
 export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch = 'main', settings = resolveExhaustedRetry(),
-  ciHealCap = defaultCiHealCap(), now = Date.now(), candidates = null, mainRuns = null,
+  ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap, now = Date.now(), candidates = null, mainRuns = null,
   readOpenPrs = defaultReadOpenPrs, readAttributedRequiredChecks = defaultReadAttributedRequiredChecks,
   readAheadBy = defaultReadAheadBy, readComments = defaultReadPrComments, readMainRuns = defaultReadMainRuns,
   readMainTip = defaultReadMainTip, readMainFailureSignature = defaultReadMainFailureSignature,
@@ -431,9 +437,11 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
   let mainTip;
   for (const c of candidates) {
     const comments = c.comments ?? readComments(c.prNumber, { repo });
-    const facts = c.exhaustion ?? exhaustionFacts({ comments, ciHealCap, headSha: c.headSha });
+    const facts = c.exhaustion ?? exhaustionFacts({ comments, ciHealBudget, ciHealCap, headSha: c.headSha });
     if (!facts.exhausted) continue;
     mainRuns ??= readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME });
+    // Existing main attribution keeps its recovery gates and per-head cap, even after heal exhaustion.
+    if (c.mainRecoveryOwned ?? existingMainRecoveryOwns({ ...c, comments }, { mainRedWindows: computeMainRedWindows(mainRuns) })) continue;
     mainTip ??= readMainTip({ repo, defaultBranch });
     // Shared candidates from the red sweep carry the already-read signature facts (including a failed read).
     const signature = Object.hasOwn(c, 'mainFailureSignature') ? c.mainFailureSignature
@@ -445,8 +453,8 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     if (decision.action !== 'retry') {
       if (decision.action === 'none') continue;
       refusals.push(d);
-      const spent = comments.some(comment => String(comment?.body ?? comment).includes(EXHAUSTED_RETRY_SPENT_MARKER)
-        && bodyHasExactLine(String(comment?.body ?? comment), `head: ${c.headSha}`));
+      const spent = trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_SPENT_MARKER)
+        .some(comment => bodyHasExactLine(comment.body, `head: ${c.headSha}`));
       if (apply && decision.action === 'needs-you' && !spent) {
         postComment(c.prNumber, { repo, body: buildExhaustedRetrySpentComment({ kind: facts.kind, check: c.failingCheckName, headSha: c.headSha }) });
       }
@@ -465,10 +473,13 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     if (!result.ok && checkClaim({ repo, branch: c.headRefName })) result = { ...result, deferred: true };
     if (!result.ok || result.deferred) {
       refusals.push({ ...d, kind: 'exhausted-retry-failed', why: result.error ?? 'retry deferred' });
-    } else {
+    }
+    // Claim holds spend nothing; every actual attempt, including conflicts and thrown push errors, is bounded.
+    if (!result.deferred) {
       postComment(c.prNumber, { repo, body: buildExhaustedRetryComment({ prNumber: c.prNumber, kind: facts.kind,
-        trigger: decision.trigger, mode: decision.mode, mainSha: mainTip.sha, headSha: c.headSha, why: decision.why }) });
-      if (result.action === 'rebased' && result.newCommit) reconcileAcceptance({ prNumber: c.prNumber, newHead: result.newCommit, repo, root });
+        trigger: decision.trigger, mode: decision.mode, mainSha: mainTip.sha, headSha: c.headSha,
+        retryHeadSha: result.newCommit ?? result.newHeadSha ?? c.headSha, why: decision.why, ok: result.ok }) });
+      if (result.ok && result.action === 'rebased' && result.newCommit) reconcileAcceptance({ prNumber: c.prNumber, newHead: result.newCommit, repo, root });
     }
     applied.push({ prNumber: c.prNumber, ...result });
   }

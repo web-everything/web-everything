@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
   buildExhaustedRetryComment, buildExhaustedRetrySpentComment } from '../exhausted-retry.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
+import { planReconcile, resolveCiHealBudget } from '../reconcile-core.mjs';
+import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildStandDownComment, standDownComments } from '../stand-down.mjs';
 import { extractInfraSignatures, planMainRedRebases, classifyMainDefect } from '../main-red-recovery.mjs';
 import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature } from '../ci-red-recovery-watch.mjs';
@@ -53,6 +55,7 @@ describe('exhausted retry', () => {
     const retry = buildExhaustedRetryComment({ prNumber: 5195, kind: facts.kind, trigger: 'main-move', mode: 'rebase', mainSha, headSha, why: 'moved' });
     const spent = buildExhaustedRetrySpentComment({ kind: facts.kind, check: 'daemon-soak', headSha });
     expect(countExhaustedRetries([trusted(retry), trusted(spent)])).toBe(1);
+    expect(countExhaustedRetries([{ ...trusted(retry), author: { login: 'outsider' } }])).toBe(0);
     expect(spent).toContain(`head: ${headSha}`);
     expect(standDownComments([trusted(spent)])).toHaveLength(1);
   });
@@ -77,16 +80,22 @@ describe('exhausted retry', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledTimes(2);
   });
-  it('keeps dry runs and failed or held retries free of durable retry markers', () => {
+  it('counts failed retry attempts durably, but leaves dry runs and claim holds free', () => {
     const c = { prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy: 2, failureCompletedAt: at, failingCheckName: 'daemon-soak',
-      comments: heals, exhaustion: facts, mainFailureSignature: null };
-    const postComment = vi.fn(), refresh = vi.fn(() => ({ ok: false, error: 'conflict' }));
+      comments: [...heals], exhaustion: facts, mainFailureSignature: null };
+    const postComment = vi.fn((n, { body }) => c.comments.push(trusted(body)));
+    const refresh = vi.fn(() => ({ ok: false, error: 'conflict' }));
     const options = { candidates: [c], mainRuns: [], settings: settings(), ciHealCap: 3, readMainTip: () => ({ sha: mainSha, committedAt: later }),
       checkClaim: () => null, readIsCrossRepository: () => false, refresh, postComment };
     expect(sweepExhaustedRetry(options).dispatch).toHaveLength(1);
     expect(refresh).not.toHaveBeenCalled();
     expect(sweepExhaustedRetry({ ...options, apply: true }).refusals[0].kind).toBe('exhausted-retry-failed');
-    expect(postComment).not.toHaveBeenCalled();
+    expect(countExhaustedRetries(c.comments)).toBe(1);
+    expect(postComment.mock.calls[0][1].body).toContain('failed');
+    expect(sweepExhaustedRetry({ ...options, apply: true }).refusals[0].kind).toBe('needs-you');
+    expect(refresh).toHaveBeenCalledOnce();
+    c.comments = [...heals];
+    postComment.mockClear();
     refresh.mockClear();
     sweepExhaustedRetry({ ...options, apply: true, checkClaim: () => ({ message: 'held' }) });
     expect(refresh).not.toHaveBeenCalled();
@@ -108,6 +117,82 @@ describe('exhausted retry', () => {
     expect(sweepExhaustedRetry({ settings: settings(), ciHealCap: 3, readOpenPrs: () => [], readAttributedRequiredChecks: read,
       readAheadBy: read, readComments: read, readMainRuns: read, readMainTip: read, readMainFailureSignature: read }).dispatch).toEqual([]);
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('matches reconciler exhaustion across fixer head resets (reset=%s)', resetOnFixHead => {
+    const fix = [trusted(buildFixBeginComment({ who: 'fix-5195', why: 'repair', branch: 'lane/5195', headSha })),
+      { ...trusted(buildFixEndComment({ who: 'fix-5195', headSha: 'c'.repeat(40) })), createdAt: later }];
+    const ciHealBudget = resolveCiHealBudget({ repo: { resetOnFixHead } });
+    for (const comments of [heals, [...heals, ...fix], [...heals, ...fix, ...heals.map(c => ({ ...c, createdAt: '2026-10-14T04:00:00Z' }))]]) {
+      const plan = planReconcile({ prs: [{ number: 5195, state: 'OPEN', headRefOid: 'c'.repeat(40),
+        mergeStateStatus: 'CLEAN', labels: [{ name: 'ci:failed' }], comments,
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }],
+        agents: [], ciHealBudget, now: Date.parse('2026-10-14T05:00:00Z') });
+      expect(exhaustionFacts({ comments, ciHealBudget, headSha: 'c'.repeat(40) }).exhausted)
+        .toBe(plan.notes.some(n => n.kind === 'ci-heal-exhausted'));
+    }
+    const priorStandDown = trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', head: headSha }));
+    expect(exhaustionFacts({ comments: [priorStandDown, ...fix], ciHealBudget, headSha: 'c'.repeat(40) }).exhausted)
+      .toBe(false);
+  });
+
+  it('lapses old fix-loop holds on unrelated heads, but hands off on the recorded mechanical retry head', () => {
+    const comments = [trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', head: headSha }))];
+    let currentHead = headSha;
+    const retryHead = 'c'.repeat(40);
+    const refresh = vi.fn(() => { currentHead = retryHead; return { ok: true, action: 'rebased', newCommit: retryHead }; });
+    const postComment = vi.fn((n, { body }) => comments.push({ ...trusted(body), createdAt: later }));
+    const options = { apply: true, settings: settings(), ciHealCap: 3,
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+      readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
+      readMainRuns: () => [], readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature: () => null,
+      refresh, postComment, checkClaim: () => null, reconcileAcceptance: () => ({}) };
+    sweepExhaustedRetry(options);
+    expect(comments[1].body).toContain(`retry-head: ${retryHead}`);
+    expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(standDownComments(comments, { headRefOid: retryHead, lapseOnNewHead: 'on' })).toHaveLength(1);
+    currentHead = 'd'.repeat(40); // manual push, without fix-begin/fix-end
+    expect(standDownComments(comments, { headRefOid: currentHead, lapseOnNewHead: 'on' })).toHaveLength(0);
+    expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'on' }).exhausted).toBe(false);
+    expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'off' }).exhausted).toBe(true);
+    expect(sweepExhaustedRetry(options).refusals).toEqual([]);
+    expect(postComment).toHaveBeenCalledTimes(2);
+    const forged = comments.map(c => c.body.includes(`retry-head: ${retryHead}`) ? { ...c, author: { login: 'outsider' } } : c);
+    expect(exhaustionFacts({ comments: forged, headSha: retryHead, lapseOnNewHead: 'on' }).exhausted).toBe(false);
+  });
+
+  it.each([true, false])('bounds thrown and refused attempts across sweeps (throw=%s)', throws => {
+    const comments = [...heals];
+    const refresh = vi.fn(() => { if (throws) throw Error('push refused'); return { ok: false, error: 'push refused' }; });
+    const options = { apply: true, settings: settings(), candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha,
+      aheadBy: 2, comments, exhaustion: facts, mainFailureSignature: null }], mainRuns: [],
+      readMainTip: () => ({ sha: mainSha, committedAt: later }), refresh, checkClaim: () => null,
+      postComment: (n, { body }) => comments.push(trusted(body)) };
+    sweepExhaustedRetry(options);
+    expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
+    sweepExhaustedRetry(options);
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(standDownComments(comments)).toHaveLength(1);
+  });
+
+  it('ignores forged spent handoffs and quoted retry markers', () => {
+    const retry = trusted(buildExhaustedRetryComment({ headSha }));
+    expect(countExhaustedRetries([trusted(`quoted\n${retry.body}`), retry.body, { body: retry.body }])).toBe(0);
+    const comments = [...heals, retry, { ...trusted(buildExhaustedRetrySpentComment({ headSha })), author: { login: 'outsider' } }];
+    const postComment = vi.fn();
+    sweepExhaustedRetry({ apply: true, settings: settings(), mainRuns: [], candidates: [{ prNumber: 5195, headSha, aheadBy: 2,
+      comments, exhaustion: facts, mainFailureSignature: null }], readMainTip: () => ({ sha: mainSha, committedAt: later }), postComment });
+    expect(postComment).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('checks signature matching against age expiry without later main runs (matched=%s)', matched => {
+    for (const elapsed of [false, true]) {
+      const decision = basePlan({ mainFailureSignature: { matched, signature: 'test-timeout' }, mainRecoveredForCheck: false,
+        aheadBy: 0, mainTip: { sha: mainSha, committedAt: at }, now: Date.parse(at) + (elapsed ? 12 : 11) * 3600000 });
+      expect(decision.action).toBe(!matched && elapsed ? 'retry' : 'wait');
+    }
   });
 
 });
@@ -156,6 +241,38 @@ describe('main failure signatures', () => {
       readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature, readComments });
     expect(readMainFailureSignature).toHaveBeenCalledOnce();
     expect(readComments).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ enabled: false }, { maxRetries: 0 }])('disabling retries preserves own-failure decisions (%j)', disabled => {
+    const readMainFailureSignature = vi.fn(() => signature), refresh = vi.fn();
+    const result = sweepCiRedRecovery({ apply: true, exhaustedRetrySettings: { ...settings(), ...disabled },
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+      readMainRuns: () => [{ ...redRun, updatedAt: '2026-10-14T00:00:00Z' }, greenRun], readAheadBy: () => 2,
+      readAttributedRequiredChecks: () => ['daemon-soak'], readMainLatestCheckRuns: () => [], readMainGreenFixFacts: () => ({}),
+      readMainFixedSignatureFacts: () => null, readPriority: () => null, readComments: () => heals, readMainFailureSignature, refresh });
+    expect(result.refusals[0].kind).toBe('own-failure');
+    expect(readMainFailureSignature).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('keeps exhausted main-red PRs on the existing recovery path, before and after main recovers', () => {
+    const failureAt = '2026-10-14T02:30:00Z';
+    for (const recovered of [false, true]) {
+      const options = { readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: failureAt }] }],
+        readMainRuns: () => recovered ? [redRun, greenRun] : [redRun], readAheadBy: () => 2,
+        readAttributedRequiredChecks: () => ['daemon-soak'], readMainLatestCheckRuns: () => [], readPriority: () => null,
+        readComments: () => heals };
+      const old = sweepCiRedRecovery(options);
+      const exhausted = sweepCiRedRecovery({ ...options, exhaustedRetrySettings: settings() });
+      expect(exhausted.dispatch).toEqual(old.dispatch);
+      expect(exhausted.refusals).toEqual(old.refusals);
+      expect(recovered ? exhausted.dispatch[0].kind : exhausted.refusals[0].kind).toBe(recovered ? 'rebase-onto-main' : 'main-still-red');
+      const retry = sweepExhaustedRetry({ settings: settings(), candidates: exhausted.candidates, mainRuns: exhausted.mainRuns,
+        now: Date.parse(at) + 24 * 3600000, readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature: () => null });
+      expect(retry.dispatch).toEqual([]);
+    }
   });
 
   it('caps sibling logs at six and main history at four recent failed runs, newest first', () => {
