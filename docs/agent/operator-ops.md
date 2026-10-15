@@ -28,8 +28,9 @@ Unpark does not bypass the clearance ceremony's evidence/independence refusals.
 Each applied control verifies the mutation before recording an `operator-action`.
 PR actions post a comment containing actor, channel, quoted reason, undo and the
 JSON marker `<!-- operator-action: {...} -->`. Item actions append a JSON line to
-`<coordination root>/operator-actions.jsonl`. Keys include the pre-state, so a
-recorded action is not repeated on the same state. Sinks re-read and refuse stale
+`<coordination root>/operator-actions.jsonl`. Keys include the pre-state and the
+plan time, so replaying one plan is not repeated, while a fresh action on a state
+that came back (the same labels on the same head) applies. Sinks re-read and refuse stale
 plans. A mutation whose verification or record fails requires inspection before
 retrying; the record is evidence of verified completion, not a transaction journal.
 

@@ -212,3 +212,62 @@ describe('operator control review regressions', () => {
     expect(runGit.mock.calls.some(([, argv]) => argv[0] === 'fetch')).toBe(false);
   });
 });
+
+// A label/hold/claim state can come back on the same head. A fresh operator action there must apply;
+// only a replay of the SAME planned payload may dedupe (finding operator-controls-io.mjs:166, PR #5169).
+describe('operator action dedupe is per plan, not per recurring state', () => {
+  const T1 = '2026-10-15T10:00:00.000Z', T2 = '2026-10-15T11:00:00.000Z';
+  const sinkWith = (getState, records = []) => {
+    const mutate = vi.fn();
+    const sink = createOperatorControlsSinks({ readContext: () => getState(), mutate, verify: () => true,
+      readRecords: async () => records, writeRecord: async r => { records.push(r); } })['operator.control'];
+    return { sink, mutate, records };
+  };
+  it('PR rearm: a second bounce on the same head and labels re-arms again, via the posted comment marker', async () => {
+    let state = { ...before, now: T1 };
+    const runGh = vi.fn(argv => { state = { ...state, comments: [...state.comments, trusted(argv[argv.indexOf('--body') + 1])] }; });
+    const mutate = vi.fn(() => { state = { ...state, labels: ['review:pending'] }; });
+    const sink = createOperatorControlsSinks({ readContext: () => state, mutate, verify: () => true, runGh })['operator.control'];
+    const p1 = planOperatorControl('rearm', state, input);
+    expect(await sink(p1)).toMatchObject({ action: 'apply' });
+    state = { ...state, labels: ['review:changes'], now: T2 };
+    const p2 = planOperatorControl('rearm', state, input);
+    expect(p2.action).toBe('apply');
+    expect(await sink(p2)).toMatchObject({ action: 'apply' });
+    expect(mutate).toHaveBeenCalledTimes(2);
+    expect(parseOperatorActions(state.comments).map(r => r.key)).toEqual([p1.record.key, p2.record.key]);
+    // Replaying an already-applied payload still dedupes.
+    state = { ...state, labels: ['review:changes'] };
+    expect(await sink(p2)).toMatchObject({ action: 'noop', why: 'operator action key already recorded' });
+    expect(mutate).toHaveBeenCalledTimes(2);
+  });
+  it('PR unpark: review:human returning on the same head is unparked again', async () => {
+    const i = { ...input, reason: 'unpark' };
+    let state = { ...before, labels: ['review:human'], now: T1 };
+    const { sink, mutate } = sinkWith(() => state);
+    await sink(planOperatorControl('unpark', state, i));
+    state = { ...state, now: T2 };
+    expect(await sink(planOperatorControl('unpark', state, i))).toMatchObject({ action: 'apply' });
+    expect(mutate).toHaveBeenCalledTimes(2);
+  });
+  it('item unpark: an identical hold re-placed later is released again', async () => {
+    const i = { repo: input.repo, item: '42', actor: 'chalbert', channel: 'test', reason: 'unpark' };
+    let state = { holds: [{ num: 42, reason: 'builder-failed' }], failures: [], now: T1 };
+    const { sink, mutate } = sinkWith(() => state);
+    const p1 = planOperatorControl('unpark', state, i);
+    await sink(p1);
+    state = { ...state, now: T2 };
+    expect(await sink(planOperatorControl('unpark', state, i))).toMatchObject({ action: 'apply' });
+    expect(mutate).toHaveBeenCalledTimes(2);
+    expect(await sink(p1)).toMatchObject({ action: 'noop' });
+  });
+  it('clear-claim: an identical stale claim re-taken later is released again', async () => {
+    const i = { ...input, kind: 'fix', reason: 'stale' };
+    let state = { claims: [{ owner: 'fix-7', meta: { repo: 'we', pr: 7, kind: 'fix' }, live: false }], comments: [], now: T1 };
+    const { sink, mutate } = sinkWith(() => state);
+    await sink(planOperatorControl('clear-claim', state, i));
+    state = { ...state, now: T2 };
+    expect(await sink(planOperatorControl('clear-claim', state, i))).toMatchObject({ action: 'apply' });
+    expect(mutate).toHaveBeenCalledTimes(2);
+  });
+});

@@ -96,9 +96,12 @@ export function planOperatorControl(name, read, input) {
     steps = (read.claims ?? []).map(c => `releaseFixDispatchClaim(${c.meta.repo}#${c.meta.pr}, kind=${c.meta.kind}, owner=${c.owner})`);
   }
   const fingerprint = controlFingerprint(name, read, input);
+  // A key names one plan (pre-state + plan time), not a state: labels, holds and claims recur on the
+  // same head, and a fresh action there must apply. Replaying the same payload keeps its key and dedupes.
+  const planKey = digest => `${digest}@${read.now}`;
   const record = { version: 1, op: name, repo: input.repo, ...(input.pr ? { pr: input.pr } : {}), ...(input.item ? { item: input.item } : {}),
-    ...attribution, at: read.now, key: `${name}:${input.repo}:${target}:${fingerprint}`, details: { undo, ...(['grant-rounds', 'clear-claim'].includes(name) ? { kind: input.kind ?? 'fix' } : {}), ...(name === 'grant-rounds' ? { n: input.n ?? 1 } : {}), ...(name === 'refresh' ? { previousHead: read.head, headRef: read.headRef, main: read.main } : {}), ...(input.file ? { file: input.file } : {}) } };
-  const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${stateDigest(c)}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
+    ...attribution, at: read.now, key: `${name}:${input.repo}:${target}:${planKey(fingerprint)}`, details: { undo, ...(['grant-rounds', 'clear-claim'].includes(name) ? { kind: input.kind ?? 'fix' } : {}), ...(name === 'grant-rounds' ? { n: input.n ?? 1 } : {}), ...(name === 'refresh' ? { previousHead: read.head, headRef: read.headRef, main: read.main } : {}), ...(input.file ? { file: input.file } : {}) } };
+  const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${planKey(stateDigest(c))}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
   if (!why) steps.push(input.item ? 'append operator-action record to operator-actions.jsonl' : 'post one operator-action comment per PR target');
   return { op: name, target, action: why ? 'noop' : 'apply', ...(why ? { why } : {}), steps, undo, record, records,
     body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension };
