@@ -78,27 +78,49 @@ export function drainLedgerReadStore(repo, env = process.env) {
   return VERDICT_LEDGER_STORES.includes(store) ? 'git' : store;
 }
 
+// Home can lag the shared store: a release that reached git but then missed home (a partial release) leaves home
+// showing a hold git has released. So a read failure vouches only for home rows written since this repo's last good
+// shared read in this process (or since the process started). A release is planned only from a good read and written
+// after it, so a hold written since then is newer than any release home could be missing.
+const PROCESS_START_MS = Date.now();
+const lastGoodReadMs = new Map();
+
+/** The home rows a failed shared read still vouches for: those strictly after `error.homeTrustedFrom` (a row in the
+ *  same millisecond as the read may predate it, so it is not trusted; the cost is one extra hold). An error without
+ *  that bound (a plain seam error) vouches for none, so the caller records its hold rather than dedup it away. */
+export function homeRowsTrustedAfterReadFailure(rows, error) {
+  const from = Number(error?.homeTrustedFrom);
+  if (!Number.isFinite(from) || !Array.isArray(rows)) return [];
+  return rows.filter(row => Date.parse(row?.at) > from);
+}
+
 /** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. Keyed by the
  *  exact repo text the writes use (the git path and the store read are case-sensitive). A failed read throws from the
- *  reader: releases then write nothing, and `recordDrainHold` still records its hold (F4). */
-export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore } = {}) {
+ *  reader: releases then write nothing, and `recordDrainHold` still records its hold (F4). The thrown error carries
+ *  `homeTrustedFrom` (see {@link homeRowsTrustedAfterReadFailure}). */
+export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore,
+  clock = Date.now } = {}) {
   const snapshot = new Map();
   const exact = repo => String(repo ?? '').trim();
   for (const repo of repos) {
     const key = exact(repo);
     if (!key || snapshot.has(key)) continue;
+    const startedAt = clock();
     try {
       // Home keeps the whole-file read (the recorders filter by slug); the store read filters by the exact repo text.
       const store = drainLedgerReadStore(key, env);
       const read = store === 'home' ? { status: 'ok', rows: readHome(key) } : await readStore(key, { store, env });
-      snapshot.set(key, read?.status === 'ok' && Array.isArray(read.rows) ? { rows: read.rows }
-        : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
+      const ok = read?.status === 'ok' && Array.isArray(read.rows);
+      snapshot.set(key, ok ? { rows: read.rows } : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });
+      if (ok) lastGoodReadMs.set(key, startedAt);
     } catch (error) { snapshot.set(key, { error: String(error?.message ?? error).split('\n')[0] }); }
   }
+  const failure = (repo, message) => Object.assign(new Error(message),
+    { homeTrustedFrom: lastGoodReadMs.get(exact(repo)) ?? PROCESS_START_MS });
   return repo => {
     const entry = snapshot.get(exact(repo));
-    if (!entry) throw new Error(`ledger not read for ${repo}`);
-    if (entry.error) throw new Error(`ledger unreadable for ${repo}: ${entry.error}`);
+    if (!entry) throw failure(repo, `ledger not read for ${repo}`);
+    if (entry.error) throw failure(repo, `ledger unreadable for ${repo}: ${entry.error}`);
     return entry.rows;
   };
 }

@@ -200,7 +200,7 @@ import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBra
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
-import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
+import { drainReviewGateFact, homeRowsTrustedAfterReadFailure, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
@@ -3089,10 +3089,11 @@ export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
-    // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups against home, which
-    // holds every spilled hold, so a lasting read failure cannot append a duplicate on every pass.
+    // An unreadable shared ledger still records the hold (F4: a hold is never dropped). It dedups only against the home
+    // rows the failed read vouches for (written since the last good shared read): home can lag a release that reached
+    // git but missed home, so an older home hold must not hide it. A lasting failure still appends the hold only once.
     let events;
-    try { events = (read ?? readHome)(repo); } catch { events = readHome(repo); }
+    try { events = (read ?? readHome)(repo); } catch (e) { events = homeRowsTrustedAfterReadFailure(readHome(repo), e); }
     const prior = events.filter((e) => (e.type === EVENT_TYPES.HOLD || e.type === EVENT_TYPES.RELEASE) && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
     if (prior.length && prior[prior.length - 1].type === EVENT_TYPES.HOLD && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
     const written = append(buildLedgerEvent({

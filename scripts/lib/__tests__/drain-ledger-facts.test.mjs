@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
   recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord, verdictLedgerPath } from '../verdict-ledger.mjs';
@@ -172,20 +172,50 @@ describe('drain ledger facts — the recorders read the store their writes land 
     expect(recordDrainHold({ repo: 'z/w', pr: 1, reason: 'review', read, append })).toMatchObject({ ok: true, appended: true });
     expect(writes.map(r => [r.type, r.repo])).toEqual([['hold', 'x/y'], ['hold', 'z/w']]);
   });
-  it('a lasting read failure dedups the hold against home instead of appending one every pass', () => {
+  // Home is a real file here: the hold's read-failure fallback reads the home ledger itself.
+  const withHome = async body => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-facts-home-')), prev = process.env.WE_VERDICT_LEDGER_DIR;
     process.env.WE_VERDICT_LEDGER_DIR = dir;
     try {
-      writeFileSync(verdictLedgerPath(repo), `${JSON.stringify(hold)}\n`);
-      const writes = [], read = () => { throw new Error('no-board'); };
-      expect(recordDrainHold({ repo, pr: 1, reason: 'review', read, append: row => { writes.push(row); return { ok: true }; } }))
-        .toMatchObject({ ok: true, appended: false });
-      expect(writes).toEqual([]);
+      const git = [], home = () => readFileSync(verdictLedgerPath(repo), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+      const append = ({ homeFails = false, gitFails = false } = {}) => row => appendVerdict(row, { store: 'dual', board: '/board', warn: () => {},
+        gitAppend: a => { if (gitFails) throw new Error('push refused'); git.push(...a.records); return { status: 'appended' }; },
+        homeAppend: r => { if (homeFails) throw new Error('home locked'); appendFileSync(verdictLedgerPath(repo), `${JSON.stringify(r)}\n`); return { ok: true, record: r }; } });
+      const snapshot = ok => readDrainLedgerSnapshot([repo], { env: dual,
+        readStore: async () => (ok ? { status: 'ok', rows: [...git] } : { status: 'unreadable', reason: 'read-cap', error: 'down' }) });
+      await body({ git, home, append, snapshot });
     } finally {
       if (prev === undefined) delete process.env.WE_VERDICT_LEDGER_DIR; else process.env.WE_VERDICT_LEDGER_DIR = prev;
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  };
+  it('a partial release (git written, home missed) never lets the home fallback drop a needed shared hold', () => withHome(async s => {
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(true), append: s.append() })).toMatchObject({ ok: true, appended: true });
+    // The PR is merge-decided: its release reaches git, then the home write fails.
+    const released = recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read: await s.snapshot(true), append: s.append({ homeFails: true }) });
+    expect(released).toMatchObject({ ok: false, appended: { released: 0 } });
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release']);
+    expect(s.home().map(e => e.type)).toEqual(['hold']);
+    // The merge did not land and the PR is held again while the shared read is down: home still shows the old hold.
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(false), append: s.append() })).toMatchObject({ ok: true, appended: true });
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release', 'hold']);
+  }));
+  it('a lasting read failure records the hold once, then dedups against the hold it wrote instead of appending every pass', () => withHome(async s => {
+    writeFileSync(verdictLedgerPath(repo), `${JSON.stringify(hold)}\n`);
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(false), append: s.append({ gitFails: true }) }))
+      .toMatchObject({ ok: false, appended: false });
+    expect(s.home().map(e => e.type)).toEqual(['hold', 'hold']);
+    for (let pass = 0; pass < 3; pass++) {
+      expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(false), append: s.append({ gitFails: true }) }))
+        .toMatchObject({ ok: true, appended: false });
+    }
+    expect(s.home()).toHaveLength(2);
+    // A plain seam error vouches for no home rows: the hold is recorded rather than deduped against unknown state.
+    const writes = [];
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: () => { throw new Error('no-board'); }, append: row => { writes.push(row); return { ok: true }; } }))
+      .toMatchObject({ ok: true, appended: true });
+    expect(writes).toHaveLength(1);
+  }));
 });
 
 describe('drain ledger facts — head prefixes and numeric strings', () => {
