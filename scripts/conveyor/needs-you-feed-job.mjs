@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Card 359 — persistent sha-pinned attention producer, supervised by health-watch. */
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { createJobStore, runJob, selfHandle, reattachTick, probeHandle } from '.
 import { parseJobHandle } from '../operations/job-record.mjs';
 import { daemonJobsDir } from '../operations/run-store.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
+import { readGit } from '../lib/proc-read.mjs';
 import { CHECKOUT_ROOT, runOnce, resolveSettings, readSettings, logSettings } from '../operations/needs-you-feed.mjs';
 
 export const NEEDS_YOU_FEED_KIND = defineJobKind({ kind: 'needs-you-feed', entry: 'scripts/conveyor/needs-you-feed-job.mjs', codeMode: 'readonly-tree', nodeModules: true, maxAttempts: 1000 });
@@ -34,7 +35,7 @@ export async function superviseNeedsYouFeed({ checkoutRoot = CHECKOUT_ROOT, env 
   logSettings(settings, log);
   if (!settings.enabled.value) return { disabled: true };
   const codeSha = requestedSha ?? (basename(dirname(checkoutRoot)) === 'code' && /^[a-f0-9]{40}$/.test(basename(checkoutRoot))
-    ? basename(checkoutRoot) : execFileSync('git', ['rev-parse', 'HEAD'], { cwd: checkoutRoot, encoding: 'utf8', timeout: 10000 }).trim());
+    ? basename(checkoutRoot) : readGit(['rev-parse', 'HEAD'], { cwd: checkoutRoot, timeout: 10000 }).trim());
   mkdirSync(dir, { recursive: true });
   const store = createJobStore(dir);
   const result = withFileLock(join(dir, 'ensure-feed.lock'), () => ensureNeedsYouFeedJob({ store, codeSha, now, input: { intervalMs: settings.intervalMinutes.value * 60000,
