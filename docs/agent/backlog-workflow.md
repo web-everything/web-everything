@@ -1326,7 +1326,7 @@ now, see above), and `--report`.
 (a step that never runs is not recorded), the standards gate still checks the fields on a hand-edited card,
 and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, and the operator
 record that would authorize them is still self-asserted. Turning them back on waits on verified operator-task
-authority (`we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md`). Only `--report`
+authority (#xqqmw6g). Only `--report`
 currently adds a step.
 
 These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge

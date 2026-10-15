@@ -1,10 +1,10 @@
 ---
 kind: story
 size: 3
-status: active
+status: open
 scaffoldedBy: "fix-5242"
 dateScaffolded: "2026-10-15"
-scope: ["we:scripts/operations/operator-task-brief.mjs", "we:scripts/backlog/operator-task.mjs", "we:scripts/lib/operator-task-settings.mjs", "we:scripts/settings/operator-task.json", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/lib/build-queue.mjs"]
+scope: ["we:scripts/operations/operator-task-brief.mjs", "we:scripts/backlog/operator-task.mjs", "we:scripts/lib/operator-task-settings.mjs", "we:scripts/settings/operator-task.json", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/lib/build-queue.mjs", "we:scripts/lib/__tests__/build-queue.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-io.test.mjs", "we:scripts/operations/__tests__/operator-task.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---

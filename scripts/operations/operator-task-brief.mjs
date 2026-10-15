@@ -38,7 +38,7 @@ export function renderOperatorProofStep(liveProof) {
  * Edge-load and live-proof steps are OFF for every card, whatever the card, settings or policy say (operator
  * send-back on PR 5242, 2026-10-15): they run commands named by card frontmatter, and the operator record that
  * would authorize them is still self-asserted. Re-enabling them waits on verified operator-task authority
- * (we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md).
+ * (#xqqmw6g).
  */
 export function planOperatorPostBuild(item, { settings = readSettings().build, operator = resolveOperatorTask(settings), policy = operator.postBuild, enabled = operator.enabled, kind = 'build' } = {}) {
   // Only a build composes steps; any other kind (a prepare that would repair the card) never fails on its fields.

@@ -77,7 +77,7 @@ export function operatorTaskFields(input, { at, role } = {}) {
   // Edge-load and live-proof steps are off for every card (we:scripts/operations/operator-task-brief.mjs
   // #planOperatorPostBuild), so filing them would record a step that never runs: refuse rather than ignore.
   if (input.edgeClone || input['liveProof-command'] || input['liveProof-expect']) {
-    throw new Error('--edgeClone and --liveProof-* are refused: edge-load and live-proof post-build steps are off for every card until operator-task authority is verified (we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md)');
+    throw new Error('--edgeClone and --liveProof-* are refused: edge-load and live-proof post-build steps are off for every card until operator-task authority is verified (#xqqmw6g)');
   }
   if (input.report !== undefined && input.report !== '') {
     if (![true, false, 'true', 'false'].includes(input.report)) throw new Error('report must be a boolean');
