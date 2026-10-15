@@ -1,4 +1,5 @@
 ---
+bornAs: xiqz2ih
 kind: story
 size: 3
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Overlay ci-heal real-worker smoke reuses a cached verdict keyed on the tested files' hash
 
-The overlay dispatch smoke (we:scripts/lib/daemon-load-overlay.mjs runRealDispatchSmoke, ci-heal-999998) launches one REAL claude worker per overlay load: 187 sessions so far. Its verdict only depends on the dispatch-path files it exercises (the inspect matched set plus the launch harness we:scripts/lib/dispatch-smoke-launch.mjs). Cache a passing verdict keyed on a content hash of those files (a cascade setting, default on, old always-launch behaviour selectable; source logged), and launch a real worker only on a cache miss. Kept out of x0dcjec (its N1 non-goal): it needs its own cache-invalidation tests. Prove: a second overlay load on an unchanged dispatch path starts zero real claude processes.
+The overlay dispatch smoke (we:scripts/lib/daemon-load-overlay.mjs runRealDispatchSmoke, ci-heal-999998) launches one REAL claude worker per overlay load: 187 sessions so far. Its verdict only depends on the dispatch-path files it exercises (the inspect matched set plus the launch harness we:scripts/lib/dispatch-smoke-launch.mjs). Cache a passing verdict keyed on a content hash of those files (a cascade setting, default on, old always-launch behaviour selectable; source logged), and launch a real worker only on a cache miss. Kept out of 6134 (its N1 non-goal): it needs its own cache-invalidation tests. Prove: a second overlay load on an unchanged dispatch path starts zero real claude processes.
 
 ## Acceptance
 
