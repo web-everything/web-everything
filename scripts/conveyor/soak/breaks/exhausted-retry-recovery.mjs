@@ -2,8 +2,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { sweepCiRedRecovery, sweepExhaustedRetry } from '../../ci-red-recovery-watch.mjs';
+import * as watcher from '../../ci-red-recovery-watch.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../../ci-heal-mark.mjs';
-import { resolveExhaustedRetry, countExhaustedRetries } from '../../exhausted-retry.mjs';
+import { resolveExhaustedRetry, countExhaustedRetries, buildExhaustedRetryComment } from '../../exhausted-retry.mjs';
 import { standDownComments, buildStandDownComment } from '../../stand-down.mjs';
 
 export default {
@@ -14,7 +15,7 @@ export default {
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('existingMainRecoveryOwns');
   },
-  run() {
+  async run() {
     const violations = [];
     const at = '2026-10-14T01:00:00Z';
     const head = 'a'.repeat(40);
@@ -70,6 +71,33 @@ export default {
     sweepExhaustedRetry(options);
     if (comments.length !== beforeManualPush) violations.push('manual head inherited a lapsed fix-loop stand-down');
     if (standDownComments(comments, { headRefOid: currentHead, lapseOnNewHead: 'on' }).length) violations.push('spent handoff still blocks the manual head');
+    // PR #5331 round 2: the real CLI must share ownership, even when the main-red per-head cap refuses.
+    const cappedPr = { number: 5195, headRefName: 'lane/5195', headRefOid: head,
+      statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] };
+    const cliOptions = { ...options, readOpenPrs: () => [cappedPr], readComments: () => Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER)),
+      exhaustedRetrySettings: settings, readMainRuns: () => [], readPriority: () => null,
+      readMainLatestCheckRuns: () => [{ name: 'daemon-soak', status: 'completed', conclusion: 'success', head_sha: main }],
+      readMainGreenFixFacts: () => ({ prContainsMainGreenSha: false, mergeBaseCheckRuns: [], mergeBaseRunConclusion: 'success' }),
+      maxRebaseRetriesPerSha: 0, refresh: () => { violations.push('CLI bypassed the main-recovery per-head cap'); return { ok: false }; } };
+    let hung = false, missing = false;
+    const exitCode = process.exitCode;
+    try {
+      await watcher.main(['sweep', '--apply', '--json'], { sweepOptions: cliOptions,
+        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; },
+        writeLine: () => {}, writeAll: () => {} });
+      // A fresh complete thread spends the budget even if discovery only has the oldest 100 comments.
+      const fullThread = [...Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER))];
+      const truncatedPr = { ...cappedPr, comments: [...fullThread, ...Array.from({ length: 97 }, () => trusted('old discussion'))] };
+      fullThread.push(trusted(buildExhaustedRetryComment({ headSha: head, ok: false })));
+      sweepExhaustedRetry({ ...cliOptions, readOpenPrs: () => [truncatedPr], readComments: () => fullThread });
+      hung = false; missing = false;
+      await watcher.main(['sweep', '--apply', '--json'], { sweepOptions: { ...cliOptions, readMainLatestCheckRuns: () => [],
+        readMainFixedSignatureFacts: () => null, readMainTip: () => { throw Error('transient main-tip read'); } },
+        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; },
+        writeLine: () => {}, writeAll: () => {} });
+    } catch (e) { violations.push(`CLI recovery failed: ${e.message}`); }
+    finally { process.exitCode = exitCode; }
+    if (!hung || !missing) violations.push('CLI skipped a later recovery pass');
     return { violations };
   },
   judge(report) { return report.violations; },

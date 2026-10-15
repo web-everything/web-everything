@@ -9,6 +9,7 @@ import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildStandDownComment, standDownComments } from '../stand-down.mjs';
 import { extractInfraSignatures, planMainRedRebases, classifyMainDefect } from '../main-red-recovery.mjs';
 import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature, defaultEditExhaustedRetryComment, defaultReadPrComments } from '../ci-red-recovery-watch.mjs';
+import * as watcher from '../ci-red-recovery-watch.mjs';
 
 const at = '2026-10-14T01:00:00Z';
 const later = '2026-10-14T02:00:00Z';
@@ -24,6 +25,108 @@ const redRun = { databaseId: 42, headSha: mainSha, status: 'completed', conclusi
 const greenRun = { status: 'completed', conclusion: 'success', updatedAt: '2026-10-14T03:00:00Z', checkConclusions: { 'daemon-soak': 'success' } };
 const basePlan = extra => planExhaustedRetry({ facts, retriesUsed: 0, settings: settings(), mainTip: { sha: mainSha, committedAt: later },
   aheadBy: 2, now: Date.parse(later), ...extra });
+
+describe('PR #5331 production wiring and complete threads', () => {
+  const redPr = () => ({ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+    statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] });
+  const io = () => ({ exhaustedRetrySettings: settings(), settings: settings(), ciHealCap: 3,
+    excuseHolds: prs => prs, readOpenPrs: vi.fn(() => [redPr()]),
+    readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2,
+    readComments: vi.fn(() => heals), readMainRuns: () => [], readMainLatestCheckRuns: () => [],
+    readMainGreenFixFacts: () => ({}), readMainFixedSignatureFacts: () => null,
+    readMainFailureSignature: vi.fn(() => null), readPriority: () => null,
+    readMainTip: () => ({ sha: mainSha, committedAt: later }), checkClaim: () => null,
+    refresh: vi.fn(() => ({ ok: false, error: 'conflict' })), postComment: vi.fn() });
+  const cli = (sweepOptions, overrides = {}) => ({ sweepOptions, sweepHung: vi.fn(() => ({})),
+    sweepMissingRun: vi.fn(() => ({})), writeLine: vi.fn(), writeAll: vi.fn(), ...overrides });
+
+  it.each(['green-fix', 'signature'])('CLI preserves %s ownership and the per-head cap', async via => {
+    const options = io();
+    if (via === 'green-fix') {
+      options.readMainLatestCheckRuns = () => [{ head_sha: mainSha, name: 'daemon-soak', conclusion: 'success', status: 'completed' }];
+      options.readMainGreenFixFacts = () => ({ prContainsMainGreenSha: false, mergeBaseCheckRuns: [], mergeBaseRunConclusion: 'success' });
+    } else {
+      options.readMainFixedSignatureFacts = () => ({ signatures: [{ emitterFiles: ['test.mjs'], fixCommits: [mainSha] }] });
+    }
+    options.maxRebaseRetriesPerSha = 0;
+    const sweepExhausted = vi.fn(sweepExhaustedRetry);
+    const calls = cli(options, { sweepExhausted });
+    await watcher.main(['sweep', '--apply', '--json'], calls);
+    const result = JSON.parse(calls.writeAll.mock.calls[0][1]);
+    expect(result.mainRedRecovery.candidates[0].mainRecoveryOwned).toBe(true);
+    expect(sweepExhausted.mock.calls[0][0].candidates).toBeDefined();
+    expect(result.exhaustedRetry.dispatch).toEqual([]);
+    expect(options.refresh).not.toHaveBeenCalled();
+    expect(options.readOpenPrs).toHaveBeenCalledOnce();
+    expect(options.readComments).toHaveBeenCalledOnce();
+    expect(options.readMainFailureSignature).not.toHaveBeenCalled();
+  });
+
+  it.each(['readMainTip', 'postComment', 'editComment', 'main-red', 'hung'])('CLI continues after a throwing %s', async failure => {
+    const options = io();
+    const calls = cli(options);
+    const boom = () => { throw Error('transient read/write failure'); };
+    if (failure === 'main-red') calls.sweepMainRed = boom;
+    else if (failure === 'hung') calls.sweepHung = vi.fn(boom);
+    else if (failure === 'editComment') {
+      const pr = redPr();
+      pr.statusCheckRollup[0] = { ...pr.statusCheckRollup[0], conclusion: 'SUCCESS', completedAt: later };
+      options.readOpenPrs = () => [pr];
+      options.readComments = () => [...heals, trusted(buildExhaustedRetrySpentComment({ headSha }))];
+      options.editComment = boom;
+    } else options[failure] = boom;
+    const previousExitCode = process.exitCode;
+    try {
+      await watcher.main(['sweep', '--apply', '--json'], calls);
+      expect(calls.sweepHung).toHaveBeenCalledOnce();
+      expect(calls.sweepMissingRun).toHaveBeenCalledOnce();
+      expect(calls.writeLine.mock.calls.flat().join(' ')).toContain('transient read/write failure');
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = previousExitCode; }
+  });
+
+  it.each(['truncated', 'stale'])('ignores %s discovery comments for retry and handoff budgets', mode => {
+    const comments = [...heals, trusted(buildExhaustedRetryComment({ headSha, ok: false })),
+      trusted(buildExhaustedRetrySpentComment({ headSha }))];
+    const pr = { ...redPr(), comments: mode === 'truncated'
+      ? [...heals, ...Array.from({ length: 97 }, () => trusted('old discussion'))] : heals };
+    const options = { ...io(), apply: true, readOpenPrs: vi.fn(() => [pr]), readComments: vi.fn(() => comments) };
+    for (let tick = 0; tick < 3; tick++) {
+      expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
+    }
+    expect(options.refresh).not.toHaveBeenCalled();
+    expect(options.postComment).not.toHaveBeenCalled();
+    expect(options.readComments).toHaveBeenCalledTimes(3);
+    expect(options.readOpenPrs.mock.calls[0][0].extraFields).not.toContain('comments');
+  });
+
+  it('uses the fresh thread for recovery deduplication and stand-down edits', () => {
+    const retry = trusted(buildExhaustedRetryComment({ headSha }));
+    const spent = { ...trusted(buildExhaustedRetrySpentComment({ headSha })), id: 'IC_stale' };
+    const recovered = { ...trusted(`${EXHAUSTED_RETRY_RECOVERED_MARKER}\nhead: ${headSha}`), createdAt: later };
+    const pr = { ...redPr(), comments: [...heals, retry, spent] };
+    pr.statusCheckRollup[0] = { ...pr.statusCheckRollup[0], conclusion: 'SUCCESS', completedAt: later };
+    const options = { ...io(), apply: true, readOpenPrs: () => [pr], editComment: vi.fn(),
+      readComments: vi.fn(() => [...heals, retry, { ...spent, body: buildResolvedSpentComment(spent, headSha) }, recovered]) };
+    sweepExhaustedRetry(options);
+    expect(options.readComments).toHaveBeenCalledOnce();
+    expect(options.postComment).not.toHaveBeenCalled();
+    expect(options.editComment).not.toHaveBeenCalled();
+  });
+
+  it('CLI still publishes recovery when all required checks have gone green', async () => {
+    const options = io();
+    const pr = redPr();
+    pr.statusCheckRollup[0] = { ...pr.statusCheckRollup[0], conclusion: 'SUCCESS', completedAt: later };
+    options.readOpenPrs = vi.fn(() => [pr]);
+    options.readComments = vi.fn(() => [...heals, trusted(buildExhaustedRetryComment({ headSha }))]);
+    const calls = cli(options);
+    await watcher.main(['sweep', '--apply', '--json'], calls);
+    expect(options.postComment).toHaveBeenCalledOnce();
+    expect(options.postComment.mock.calls[0][1].body).toContain(EXHAUSTED_RETRY_RECOVERED_MARKER);
+    expect(options.readOpenPrs).toHaveBeenCalledOnce();
+  });
+});
 
 describe('exhausted retry', () => {
   it('resolves standards and per-field cascade sources, rejecting invalid values', () => {
@@ -393,7 +496,10 @@ describe('retried CI verdicts', () => {
   });
   it('preserves the node id in the reader and sends the edit via GraphQL', () => {
     const comment = { ...trusted('original'), id: 'IC_spent' };
-    expect(defaultReadPrComments(5169, { repo: 'o/r', exec: () => JSON.stringify({ comments: [comment] }) })).toEqual([comment]);
+    const read = vi.fn(() => `${comment.body}\t${comment.createdAt}\t${comment.author.login}\t${comment.id}\n`);
+    expect(defaultReadPrComments(5169, { repo: 'o/r', exec: read })).toEqual([comment]);
+    expect(read.mock.calls[0][1]).toContain('--paginate');
+    expect(() => defaultReadPrComments(5169, { repo: 'o/r', exec: () => { throw Error('unreadable'); } })).toThrow('unreadable');
     const exec = vi.fn(() => JSON.stringify({ data: { updateIssueComment: { issueComment: { id: comment.id } } } }));
     defaultEditExhaustedRetryComment(comment.id, { repo: 'o/r', body: 'resolved', exec });
     expect(exec.mock.calls[0][1]).toEqual(['api', 'graphql', '-f',
