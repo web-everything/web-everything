@@ -38,6 +38,7 @@ export default {
       fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }),
       listPrepareInFlight: () => [],
+      listPreparePrs: () => [],
       listPrepareClaims: () => [...claims.values()],
       acquirePrepareClaim: (o) => { claims.set(o.num, { meta: { num: o.num, claimedAt: new Date().toISOString() } }); return { ok: true }; },
       releasePrepareClaim: ({ num }) => { claims.delete(num); },
@@ -50,6 +51,7 @@ export default {
     log?.(`planned=${planned.join(',')} dispatched=${dispatched.join(',')}`);
     const violations = [];
     if (planned.length === 0) violations.push({ invariant: 'stale-reprepare-dropped', detail: 'the tick core offered two prepare-stale cards and the daemon planned neither' });
+    if (dispatched.length !== spawns.length) violations.push({ invariant: 'stale-reprepare-not-launched', detail: 'planned stale prepares must actually dispatch' });
     return { violations, planned };
   },
   judge(report) {

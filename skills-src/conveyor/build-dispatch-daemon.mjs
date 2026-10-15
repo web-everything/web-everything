@@ -861,17 +861,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         && prepareSpawns.some((s) => normNum(s.num) === num)) continue;
       const prDone = ['MERGED', 'CLOSED'].includes(status?.pr?.state);
       const awaitingPr = status?.pr?.state === 'OPEN';
+      const stampedOpenPr = awaitingPr && status.pr.preparedDate;
       let why = status?.preparedDate ? 'prepared on main' : prDone ? `prepare PR ${status.pr.state.toLowerCase()}` : null;
       const worker = prepareRows.find((r) => normNum(r.num) === num)?.row;
       const now = effects.now?.() ?? Date.now();
       const sessionDead = worker?.entry?.live === false
         && (now > Date.parse(worker.entry.expectedBy)
           || now - Date.parse(worker.entry.lastSeenLiveAt) > PREPARE_SESSION_DEAD_GRACE_MS);
-      if (!why && sessionDead && !awaitingPr) {
+      if (!why && sessionDead && !stampedOpenPr) {
         why = 'prepare-session-dead';
       }
-      // An OPEN prepare PR keeps the card in flight even if its worker has ended.
-      if (!why && claim && !awaitingPr && isLeaseExpired(claim, effects.now?.() ?? Date.now(), DEFAULT_LEASE_MINUTES)) {
+      // A stamped OPEN PR awaits landing; an unstamped one still needs dead-worker recovery.
+      if (!why && claim && !stampedOpenPr && isLeaseExpired(claim, effects.now?.() ?? Date.now(), DEFAULT_LEASE_MINUTES)) {
         // Probe the worker independently: the claim owner is the long-lived daemon, not the worker.
         // A failed Claude listing stays unknown; use owner-PID fallback only when no worker row exists.
         const host = claim.owner?.slice(0, claim.owner.lastIndexOf(':'));
@@ -893,9 +894,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
         && (mainHasResult || (awaitingPr && status.pr.hasSections));
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
+        || (why === 'prepare-session-dead' && awaitingPr)
         || (currentSettled && !prepareBusy.has(num));
-      // An OPEN or MERGED prepare PR is in flight or delivered, even before a stamp is visible.
-      let unstamped = status && !status.preparedDate && ended && !['OPEN', 'MERGED'].includes(status.pr?.state);
+      // MERGED is delivered. Ended, unstamped OPEN attempts recover or hold without re-dispatching.
+      let unstamped = status && !status.preparedDate && ended && status.pr?.state !== 'MERGED' && !stampedOpenPr;
       const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
       const failureHeld = Boolean(priorFailure);
       const recoverable = !failureHeld && unstamped && (mainHasResult || (awaitingPr && status.pr.hasSections));
@@ -963,7 +965,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           prepare.retired.push({ num, why, released: live });
         }
         finishedPrepares.add(num);
-        if (awaitingPr) prepareBusy.add(num);
+        if (awaitingPr && !status.preparedDate) prepareBusy.add(num);
         else prepareBusy.delete(num);
       } else if (claim || awaitingPr) prepareBusy.add(num);
     } catch (e) {
@@ -982,11 +984,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — a light prepare skips an open-PR-count freeze (`lightOpenPrFreeze: skip`); a kill switch or a
   // freeze label still holds it. Rule OFF: `freezeHolds` is exactly `plan.freeze.frozen` (today).
   prepare.freezeHeld = freezeHolds('prepare-item', plan.freeze, costSettings);
+  const refusedPrepares = new Set();
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
-      if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
+      if (finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
@@ -1002,8 +1005,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
         // effects stub without the read records nothing — only a test double lacks it.)
         let replacesStamp;
+        let cardBornAs;
         try {
           const before = await effects.readPreparedStamp?.({ num });
+          cardBornAs = before?.bornAs;
           if (before) replacesStamp = before.preparedDate
             ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null;
         } catch (e) {
@@ -1011,7 +1016,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           await failPrepare(num, 'stamp-read', String(e?.message || e));
           continue;
         }
-        const bornAs = pick.bornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs;
+        const bornAs = pick.bornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
         const lastDispatchAt = [
           ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
           ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
@@ -1020,14 +1025,17 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         ].filter(Boolean).sort().at(-1);
         let refusal;
         try {
-          refusal = prepareLaunchRefusal({ num, bornAs, prs: await effects.listPreparePrs?.({ num, bornAs }),
+          if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
+          const prs = await effects.listPreparePrs({ num, bornAs });
+          if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
+          refusal = prepareLaunchRefusal({ num, bornAs, prs,
             lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
             claims: prepareClaims, liveRows: prepareRows, ledgerFailures });
         } catch {
           refusal = { reason: 'prepare PR listing unavailable' };
         }
         if (refusal) {
-          prepareBusy.add(num);
+          refusedPrepares.add(num);
           prepare.refused.push({ num, reason: refusal.reason });
           console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
           continue;
@@ -1768,9 +1776,10 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
     if (offset !== bytes.length) throw new Error('unexpected prepare card batch output');
     for (const [sha, status] of statuses) prepareBlobStatuses.set(sha, status);
   }
+  const prListArgs = (search, limit) => ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
+    '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)];
   function ghPrList(search, limit) {
-    const list = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-      '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)], opts));
+    const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
     if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
     return list;
   }
@@ -1781,17 +1790,29 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
     try {
       const floor = minClaimedAt?.slice(0, 10);
       const limit = floor ? 500 : 1000;
-      const prs = ghPrList(`head:lane/${floor ? ` created:>=${floor}` : ''}`, limit);
+      // Title-only identities can live on ANY branch, not just lane/.
+      const prs = ghPrList(floor ? `created:>=${floor}` : '', limit);
       return (listing = { prs, floor, complete: prs.length < limit });
     } catch (error) { prError = error; throw error; }
   }
   /** One item's own listing: the fallback when the shared one cannot be trusted. Saturation fails closed. */
-  function itemPrs(num) {
-    const key = normNum(num);
+  function itemQuery(num, bornAs) {
+    const ids = [...new Set([normNum(num), normNum(bornAs)].filter(Boolean))];
+    if (!ids.length || ids.some(id => !/^[a-z0-9._-]+$/.test(id))) throw new Error('invalid prepare PR search identity');
+    return { key: JSON.stringify(ids), searches: [
+      ...ids.map(id => `head:lane/${id}`), `in:title "WE #${normNum(num)}: prepare"`,
+    ] };
+  }
+  const uniquePrs = prs => [...new Map(prs.map(pr => [pr.number ?? pr.headRefName, pr])).values()];
+  function itemPrs(num, bornAs) {
+    const { key, searches } = itemQuery(num, bornAs);
     if (!itemListings.has(key)) {
-      const prs = ghPrList(`head:lane/${key}`, ITEM_PR_LIMIT);
-      if (prs.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${key} saturated at ${ITEM_PR_LIMIT}`);
-      itemListings.set(key, prs);
+      const prs = searches.flatMap(search => {
+        const found = ghPrList(search, ITEM_PR_LIMIT);
+        if (found.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${normNum(num)} saturated at ${ITEM_PR_LIMIT}`);
+        return found;
+      });
+      itemListings.set(key, uniquePrs(prs));
     }
     return itemListings.get(key);
   }
@@ -1800,17 +1821,17 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
    * indistinguishable from "no PR"), and dated no later than this read's claim (a read with an earlier or missing
    * claim date can have its PR outside the date window). Otherwise fall back to the item's own search.
    */
-  function prsFor(num, claimedAt) {
+  function prsFor(num, claimedAt, bornAs) {
     const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
     if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
       const shared = listPrs();
       if (shared.complete) return shared.prs;
     }
-    return itemPrs(num);
+    return itemPrs(num, bornAs);
   }
-  /** Would `prsFor` fall back to this item's own listing? Mirrors its test exactly; never throws. */
-  function needsItemListing(num, claimedAt) {
-    if (itemListings.has(normNum(num))) return false;
+  /** Would `prsFor` fall back to this item's own listing? Mirrors its completeness test. */
+  function needsItemListing(num, claimedAt, bornAs) {
+    if (itemListings.has(itemQuery(num, bornAs).key)) return false;
     const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
     if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
       try { if (listPrs().complete) return false; } catch { return false; } // the lazy read rethrows the cached error
@@ -1824,23 +1845,29 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
    * prefetch is dropped so the lazy read hits (and reports) the same failure it always did.
    */
   async function prefetchItemListings(entries) {
-    const todo = [...new Set(entries.filter(e => {
+    const todo = [...new Map(entries.flatMap(e => {
       const card = tree?.get(normNum(e.num));
-      if (!card) return false;
+      if (!card) return [];
       const stamped = prepareBlobStatuses.get(card.sha);
       if (stamped?.preparedDate && stampCoversClaim(stamped.preparedDate, e.claimedAt,
-        { replaces: undefined, preparedAgainstSha: stamped.preparedAgainstSha })) return false;
-      return needsItemListing(e.num, e.claimedAt);
-    }).map(e => normNum(e.num)))];
+        { replaces: undefined, preparedAgainstSha: stamped.preparedAgainstSha })) return [];
+      const bornAs = e.bornAs ?? stamped?.bornAs;
+      if (!needsItemListing(e.num, e.claimedAt, bornAs)) return [];
+      const query = itemQuery(e.num, bornAs);
+      return [[query.key, query]];
+    })).values()];
     let next = 0;
     const worker = async () => {
       while (next < todo.length) {
-        const key = todo[next++];
+        const { key, searches } = todo[next++];
         try {
-          const prs = JSON.parse(await execAsync('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-            '--search', `head:lane/${key}`, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository',
-            '--limit', String(ITEM_PR_LIMIT)], opts));
-          if (Array.isArray(prs) && prs.length < ITEM_PR_LIMIT) itemListings.set(key, prs);
+          const prs = [];
+          for (const search of searches) {
+            const found = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+            if (!Array.isArray(found) || found.length >= ITEM_PR_LIMIT) throw new Error('prepare PR listing unavailable or saturated');
+            prs.push(...found);
+          }
+          itemListings.set(key, uniquePrs(prs));
         } catch { /* the lazy read repeats this call and reports its own failure */ }
       }
     };
@@ -1866,13 +1893,21 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
       return prepareBlobStatuses.get(card.sha);
     },
     listPrs({ num, bornAs }) {
-      return prsFor(num).filter(pr => isPreparePrFor(pr, { num, bornAs }));
+      // Settlement callers and older claims carry only num; recover the identity from the main card.
+      if (bornAs == null) {
+        const card = loadTree().get(normNum(num));
+        if (!card) throw new Error(`prepare card #${num} not found on origin/main`);
+        loadBlobs([card]);
+        bornAs = prepareBlobStatuses.get(card.sha)?.bornAs;
+      }
+      return prsFor(num, undefined, bornAs).filter(pr => isPreparePrFor(pr, { num, bornAs }));
     },
     read({ num, bornAs, claimedAt, replacesStamp }) {
       const card = loadTree().get(normNum(num));
       if (!card) throw new Error(`prepare card #${num} not found on origin/main`);
       loadBlobs([card]);
       const stamped = prepareBlobStatuses.get(card.sha);
+      bornAs ??= stamped.bornAs;
       const { path } = card;
       // Card 80 — the stamp the claim recorded at spawn is the one a re-prepare (`prepare-stale`) is replacing, not
       // its result: read it as unprepared so the claim is not retired at once, and look for the attempt's PR. Judged
@@ -1882,7 +1917,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         { replaces: replacesStamp, preparedAgainstSha: stamped.preparedAgainstSha })) return { ...stamped, path };
       const main = stamped.preparedDate ? { ...stamped, preparedDate: null, replacedPreparedDate: stamped.preparedDate } : stamped;
       // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
-      const pr = prsFor(num, claimedAt).filter(p => isPreparePrFor(p, { num, bornAs })
+      const pr = prsFor(num, claimedAt, bornAs).filter(p => isPreparePrFor(p, { num, bornAs })
         && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (!pr) return { ...main, path, pr: null };
       let status = { preparedDate: null };
@@ -1909,7 +1944,9 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
  */
 function stampedCardStatus(raw) {
   const sha = readField(raw, 'preparedAgainstSha');
-  return { ...prepareCardStatus(raw), ...(/^[0-9a-f]{7,64}$/i.test(sha ?? '') ? { preparedAgainstSha: sha } : {}) };
+  const bornAs = normNum(readField(raw, 'bornAs'));
+  return { ...prepareCardStatus(raw), ...(bornAs ? { bornAs } : {}),
+    ...(/^[0-9a-f]{7,64}$/i.test(sha ?? '') ? { preparedAgainstSha: sha } : {}) };
 }
 
 /** One-off callers use the same reader with a fresh remote-main snapshot. */

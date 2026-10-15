@@ -717,6 +717,17 @@ verify the committed stamp and submit via `open-pr --mode=label-on-green`; only 
 `prepare-unstamped`. Test fresh-main and existing-PR recovery, lane-local command paths, stale section
 observations, resolved cards, failed stamps, freeze/dry-run, and a fresh Node `--bogus-flag` boot.
 
+Duplicate-prepare guards must preserve recovery: cross OPEN/MERGED/CLOSED/no PR with main stamps,
+sections and worker liveness in daemon-tick tests. An OPEN unstamped PR with a dead worker recovers
+its stamp when sectioned and surfaces `prepare-unstamped` otherwise; a stamped OPEN PR awaits landing,
+and a MERGED PR never triggers an unstamped retry. Keep replaced-stamp and live-worker cases pinned.
+Offer two persistently refused candidates before a clean successor at cap two, across successive ticks:
+refusals must not consume worker capacity. Missing, non-callable, throwing or malformed PR-list effects
+must refuse dispatch. Reader integration fixtures must apply the actual search filters, including title-only
+PRs outside `lane/`, `bornAs` branches, saturated shared listings, date-floor fallback and async prefetch.
+Every component search must be complete before its union can prove absence; cache by both identities.
+When replacing a regression test, identify the replacement covering its original recovery behavior during review.
+
 
 ### Probation prepare validation and fallback
 

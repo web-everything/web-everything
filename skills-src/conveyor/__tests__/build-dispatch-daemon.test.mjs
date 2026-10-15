@@ -132,6 +132,107 @@ function prepareGitFixture(cards, prs = []) {
 }
 
 describe('prepare status batched', () => {
+  it.each(['shared', 'saturated', 'date fallback', 'prefetched'])('discovers every identity through query-aware %s reads and refuses dispatch', async mode => {
+    for (const [headRefName, title, bornAs, fromCard] of [
+      ['lane/5028d-prepare-x', 'ordinary', undefined],
+      ['custom-prepare-x', 'WE #5028: prepare — scope', undefined],
+      ['lane/1234d-prepare-x', 'ordinary', '1234'],
+      ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12'],
+      ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12', true],
+    ]) {
+      const identity = fromCard ? undefined : bornAs;
+      const card = `---\nstatus: open\n${fromCard ? `bornAs: ${bornAs}\n` : ''}---\nquery-aware`;
+      const pr = { number: 95028, state: 'OPEN', headRefName, title, headRefOid: 'e'.repeat(40),
+        createdAt: '2026-10-10', isCrossRepository: false };
+      const git = prepareGitFixture({ 5028: card });
+      const answer = (cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ content: Buffer.from(card).toString('base64') });
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1] ?? '';
+        const head = /head:([^ ]+)/.exec(search)?.[1];
+        const phrase = /"([^"]+)"/.exec(search)?.[1];
+        const floor = /created:>=(\S+)/.exec(search)?.[1];
+        const matches = (!head || headRefName.startsWith(head)) && (!phrase || title.includes(phrase))
+          && (!floor || pr.createdAt >= floor);
+        const perItem = /^head:lane\/\S+$/.test(search) || search.includes('in:title');
+        if (['saturated', 'prefetched'].includes(mode) && !perItem) {
+          return JSON.stringify(Array.from({ length: Number(args[args.indexOf('--limit') + 1]) }, (_, i) =>
+            ({ number: i, state: 'CLOSED', headRefName: `lane/unrelated-${i}`, createdAt: '2026-10-14' })));
+        }
+        return JSON.stringify(matches ? [pr] : []);
+      };
+      const reader = createPrepareStatusReader({ exec: answer,
+        ...(mode === 'prefetched' ? { execAsync: async (...args) => answer(...args) } : {}) });
+      const claimedAt = mode === 'date fallback' ? '2026-10-14' : '2026-10-01';
+      await reader.prime([{ num: 5028, bornAs: identity, claimedAt }]);
+      expect(reader.read({ num: 5028, bornAs: identity, claimedAt: '2026-10-01' }).pr).toMatchObject({ number: pr.number, state: 'OPEN' });
+      const dispatch = vi.fn();
+      const tick = await runBuildDispatchTick({ live: true, effects: {
+        planTick: () => ({ decisions: { itemPrepareSpawns: [{ num: '5028', bornAs: identity }] }, nextState: {} }),
+        fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+        killSwitch: () => ({ engaged: false }), listPreparePrs: args => reader.listPrs(args), dispatch,
+        readPreparedStamp: args => reader.stamp(args),
+        acquirePrepareClaim: vi.fn(() => ({ ok: true })),
+      } });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(tick.prepare.refused).toEqual([{ num: '5028', reason: `open prepare PR #${pr.number} (${headRefName})` }]);
+    }
+  });
+  it('does not reuse an item fallback cached without its bornAs identity', () => {
+    const searches = [];
+    const pr = { number: 91, state: 'OPEN', headRefName: 'lane/abc.12d-prepare-x' };
+    const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\nidentity cache' });
+    const reader = createPrepareStatusReader({ exec(cmd, args, opts) {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      expect(cmd).toBe('gh');
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      if (search === '') return JSON.stringify(Array.from({ length: 1000 }, (_, number) => ({ number })));
+      return JSON.stringify(search === 'head:lane/abc.12' ? [pr] : []);
+    } });
+    expect(reader.listPrs({ num: '#05028' })).toEqual([]);
+    expect(reader.listPrs({ num: 5028, bornAs: 'ABC.12' })).toEqual([pr]);
+    expect(searches).toContain('head:lane/abc.12');
+  });
+  it.each(['title saturated', 'bornAs saturated', 'title failed', 'title malformed'])(
+    'refuses incomplete component searches after async prefetch: %s', async failure => {
+      const git = prepareGitFixture({ 5028: '---\nstatus: open\n---\npartial query' });
+      const answer = (cmd, args, opts) => {
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1];
+        const badComponent = search.includes('in:title') ? failure.startsWith('title')
+          : search === 'head:lane/1234' && failure.startsWith('bornAs');
+        if (badComponent && failure.endsWith('failed')) throw new Error('listing unavailable');
+        if (badComponent && failure.endsWith('malformed')) return '{}';
+        if (search === '' || badComponent) return JSON.stringify(Array.from({ length: Number(args[args.indexOf('--limit') + 1]) },
+          (_, number) => ({ number })));
+        return '[]';
+      };
+      const reader = createPrepareStatusReader({ exec: answer, execAsync: async (...args) => answer(...args) });
+      await reader.prime([{ num: 5028, bornAs: '1234' }]);
+      expect(() => reader.listPrs({ num: 5028, bornAs: '1234' })).toThrow(/saturated|unavailable/);
+    });
+  it('recovers a dead worker’s alias-only PR through the real reader without an explicit bornAs argument', async () => {
+    const main = '---\nstatus: open\nbornAs: abc.12\n---\ncard identity';
+    const sectioned = '---\nstatus: open\n---\n' + ['Design', 'MVP', 'Test plan', 'Proof plan']
+      .map(heading => `## ${heading}\nSubstantive completed work.\n`).join('\n');
+    const pr = { number: 95029, state: 'OPEN', headRefName: 'lane/abc.12d-prepare-x',
+      title: 'ordinary', headRefOid: 'f'.repeat(40), createdAt: '2026-10-14' };
+    const git = prepareGitFixture({ 5028: main }, [pr]);
+    const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => cmd === 'gh' && args[0] === 'api'
+      ? JSON.stringify({ content: Buffer.from(sectioned).toString('base64') }) : git(cmd, args, opts) });
+    const stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects: {
+      planTick: () => ({ decisions: {}, nextState: {} }), fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }),
+      listPrepareInFlight: () => [{ num: '5028', row: { runId: 'alias', entry: { key: 'alias', live: false, expectedBy: '2020-01-01' } } }],
+      readPrepareStatus: args => reader.read(args), placePrepareHold: vi.fn(), stampPrepare,
+    } });
+    expect(stampPrepare).toHaveBeenCalledWith(expect.objectContaining({ num: '5028', status: expect.objectContaining({
+      pr: expect.objectContaining({ number: pr.number, hasSections: true }),
+    }) }));
+    expect(tick.prepare.inFlight).not.toContain('5028');
+  });
   it.each([
     ['lane/5028d-prepare-x', undefined],
     ['lane/5028e-prepare-x', undefined],
@@ -164,7 +265,7 @@ describe('prepare status batched', () => {
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
     expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/ created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -180,6 +281,7 @@ describe('prepare status batched', () => {
       if (cmd === 'gh' && args[0] === 'pr') {
         const search = args[args.indexOf('--search') + 1];
         const m = /^head:lane\/(\d+)$/.exec(search);
+        if (search.includes('in:title')) return '[]';
         return JSON.stringify(m ? [own(m[1])] : filler); // the shared listing is capped (saturated), so it cannot answer
       }
       if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ encoding: 'base64', content: Buffer.from('---\nstatus: open\n---\nx').toString('base64') });
@@ -206,7 +308,7 @@ describe('prepare status batched', () => {
     expect(actual).toEqual(expected);
     expect(syncItemCallsAfterPrime).toBe(0);
     expect(syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /^head:lane\/\d+$/.test(a[a.indexOf('--search') + 1]))).toHaveLength(0);
-    expect(execAsync).toHaveBeenCalledTimes(nums.length);
+    expect(execAsync).toHaveBeenCalledTimes(nums.length * 2); // branch + title, still bounded by eight workers
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(8);
   });
@@ -229,7 +331,7 @@ describe('prepare status batched', () => {
     expect(reader.read({ num: 7100 }).pr).toBeNull();
     expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
     const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
-    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/');
+    expect(args[args.indexOf('--search') + 1]).toBe('');
     expect(args[args.indexOf('--limit') + 1]).toBe('1000');
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
     expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
@@ -279,7 +381,7 @@ describe('prepare status batched', () => {
     }
     it('rejects saturated shared PR listings instead of reporting absent PRs', () => {
       const exec = searchExec({ 7500: '---\nstatus: open\n---\nsaturated' }, (search, limit) =>
-        /^head:lane\/\d+$/.test(search) ? [prFor(7500)] : filler(limit));
+        /^head:lane\/\d+$/.test(search) ? [prFor(7500)] : search.includes('in:title') ? [] : filler(limit));
       const reader = createPrepareStatusReader({ exec });
       reader.prime([{ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }]);
       expect(reader.read({ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
@@ -1653,6 +1755,7 @@ describe('automatic item preparation', () => {
       fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
       killSwitch: () => ({ engaged: false }),
       listPrepareInFlight: () => inFlight,
+      listPreparePrs: () => [],
       listPrepareClaims: () => listBuildDispatchClaims({ lockRoot }),
       acquirePrepareClaim: (o) => acquireBuildDispatchClaim({ ...o, lockRoot, owner: `host:${pid}`, pid }),
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
@@ -1681,8 +1784,29 @@ describe('automatic item preparation', () => {
       expect(log).toHaveBeenCalledWith('build-dispatch-daemon: prepare launch of #5028 refused: open prepare PR #91 (lane/5028d-prepare-x)');
     } finally { log.mockRestore(); }
   });
+  it.each(['park', 'open PR', 'listing failure'])('refused %s candidates leave capacity for a clean successor across ticks', async kind => {
+    const effects = fixture();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: ['5028', '5029', '5030'].map(num => ({ num })) }, nextState: {} });
+    effects.listPrepareFailures = () => kind === 'park' ? ['5028', '5029'].map(num => ({ num,
+      completed: true, held: false, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
+    effects.listPreparePrs = ({ num }) => {
+      if (num === '5030' || kind === 'park') return [];
+      if (kind === 'listing failure') throw new Error('unavailable');
+      return [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}-prepare-x` }];
+    };
+    for (let i = 0; i < 2; i++) {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.refused.map(r => r.num)).toEqual(['5028', '5029']);
+      expect(tick.prepare.launched.map(r => r.num)).toEqual(['5030']);
+      effects.releasePrepareClaim({ num: '5030' });
+    }
+  });
   it.each([
     ['listing unavailable', () => { throw new Error('network failed'); }, [], 'prepare PR listing unavailable'],
+    ['listing effect absent', undefined, [], 'prepare PR listing unavailable'],
+    ['listing effect not callable', true, [], 'prepare PR listing unavailable'],
+    ['listing result absent', () => undefined, [], 'prepare PR listing unavailable'],
+    ['listing result invalid', () => ({}), [], 'prepare PR listing unavailable'],
     ['merged after dispatch', () => [{ number: 92, state: 'MERGED', headRefName: 'lane/5028e-prepare-x',
       createdAt: '2026-10-15' }], [{ num: '5028', recordedAt: '2026-10-14' }], 'merged prepare PR #92 after last dispatch (within 24h guard)'],
     ['completed needs-you park', () => [], [{ num: '5028', recordedAt: '2026-10-14', completed: true,
@@ -2252,16 +2376,39 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.failures).toContainEqual(expect.objectContaining({ num: '4501', stage: 'retirement' }));
     expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4502']);
   });
-  it.each([false, true])('keeps a dead worker’s open unstamped PR in flight (sections=%s)', async hasSections => {
+  it.each([false, true])('recovers or holds a dead worker’s open unstamped PR (sections=%s)', async hasSections => {
     const effects = fixture();
     claimed(effects);
     effects.readPrepareStatus = () => ({ preparedDate: null, pr: { state: 'OPEN', preparedDate: null, hasSections } });
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
     const tick = await runBuildDispatchTick({ live: true, effects });
-    expect(tick.prepare.retired).toEqual([]);
-    expect(effects.placePrepareHold).not.toHaveBeenCalled();
-    expect(tick.prepare.failures).toEqual([]);
-    expect(tick.prepare.inFlight).toContain('4501');
+    expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501',
+      reason: hasSections ? 'prepare-stamp-pending' : 'prepare-unstamped' });
+    expect(effects.stampPrepare).toHaveBeenCalledTimes(hasSections ? 1 : 0);
+    expect(tick.prepare.inFlight).not.toContain('4501');
+    expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
   });
+  it.each(['OPEN', 'MERGED', 'CLOSED', null].flatMap(state => [false, true].flatMap(stamped =>
+    [false, true].flatMap(hasSections => [false, true].map(workerLive => ({ state, stamped, hasSections, workerLive }))))))(
+    'settles prepare state matrix %j', async ({ state, stamped, hasSections, workerLive }) => {
+      const effects = fixture({ inFlight: [{ num: '4501', row: { runId: 'matrix', entry: {
+        key: 'matrix', live: workerLive, expectedBy: '2020-01-01',
+      } } }] });
+      claimed(effects);
+      effects.readPrepareStatus = () => ({ preparedDate: stamped ? '2026-10-15' : null,
+        hasSections: state === 'OPEN' ? false : hasSections,
+        pr: state ? { state, preparedDate: null, hasSections } : null });
+      effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      const recovery = !workerLive && !stamped && state !== 'MERGED' && hasSections;
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(recovery ? 1 : 0);
+      const hold = !workerLive && !stamped && !hasSections && ['OPEN', 'CLOSED'].includes(state);
+      if (recovery || hold) expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501',
+        reason: recovery ? 'prepare-stamp-pending' : 'prepare-unstamped' });
+      else expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      expect(tick.prepare.inFlight.includes('4501')).toBe(workerLive);
+      expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('4501');
+    });
   it('keeps a dead-owner claim whose open PR is stamped (valid run awaiting landing)', async () => {
     const effects = fixture();
     claimed(effects);
