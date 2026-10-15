@@ -43,6 +43,27 @@ describe('operator send-backs, PR #5243 replay', () => {
     '2026-10-14T20:07:00.000Z', 'send-back of ~16:20 ET'])('resolves only explicitly named later-head evidence: %s', text => {
     expect(openOperatorSendBacks(fixture({ comments: [original, evidence(HEAD, text)] }))).toEqual([]);
   });
+  it.each([
+    ['<!<!-- hidden -->-- visible -->', '<! -- visible -->'],
+    ['<!-- first -->left<!-- second -->right', 'left right'],
+    ['<!<!-- hidden\r\nmetadata -->-- visible -->', '<! -- visible -->'],
+  ])('keeps a separator when removing comments from send-back bodies: %s', (text, expected) => {
+    const c = { ...original, body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\n${text}` };
+    const [item] = operatorSendBacks([c]);
+    expect(item.body).toBe(expected);
+    expect(item.body).not.toContain('<!--');
+    expect(renderOperatorSendBackBrief([item])).toContain(expected);
+    expect(renderOperatorSendBackReviewBlock([item])).toContain(expected);
+  });
+  it.each([
+    ['1001', '10<!-- hidden -->01'],
+    ['request-url', original.url.replace('issuecomment-', 'issue<!-- hidden -->comment-')],
+    ['1001', '2026-10-14T20:<!-- hidden -->07:00.000Z'],
+    ['1001', 'send-back of 16:2<!-- hidden -->0 ET'],
+  ])('does not manufacture an evidence reference for %s by removing comments: %s', (id, text) => {
+    expect(openOperatorSendBacks(fixture({ comments: [{ ...original, id }, evidence(HEAD, text)] })))
+      .toHaveLength(1);
+  });
   it('does not resolve same-head evidence even when the PR has since moved', () => {
     expect(openOperatorSendBacks(fixture({ comments: [original, evidence(OLD)] }))).toHaveLength(1);
     expect(openOperatorSendBacks(fixture({ comments: [original, evidence('e5ed9cb74')] }))).toHaveLength(1);

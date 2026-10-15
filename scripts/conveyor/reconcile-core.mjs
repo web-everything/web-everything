@@ -1766,7 +1766,8 @@ function operatorFixBudget(comments, roundCap) {
  */
 function operatorSendBackBody(commentBody) {
   const parts = String(commentBody ?? '').split(/\n\n/);
-  return parts.slice(2).join('\n\n').replace(/<!--[\s\S]*?-->/g, '').trim();
+  // Preserve a separator so removing metadata cannot assemble a new HTML comment.
+  return parts.slice(2).join('\n\n').replace(/<!--[\s\S]*?-->/g, ' ').trim();
 }
 
 /**

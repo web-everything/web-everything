@@ -2,7 +2,8 @@
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 const commentsOf = pr => Array.isArray(pr?.comments) ? pr.comments : [];
-const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, '');
+// Keep a separator so removal cannot assemble new comment delimiters or evidence references.
+const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ');
 const shaOf = value => /^[a-f0-9]{7,40}$/i.test(String(value ?? '')) ? String(value).toLowerCase() : null;
 // Short and full spellings of the same head must never count as a push.
 const differentHead = (from, to) => {
