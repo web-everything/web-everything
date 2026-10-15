@@ -92,10 +92,46 @@ describe('human surface re-park sweep', () => {
     expect(f.calls[0][3]).toContain(reason);
     expect(f.calls[0][3]).toContain('Net file set unavailable');
   });
-  it('fails closed even when GitHub lists no sensitive files', () => {
+  it('skips clean GitHub lists across a sweep-wide net outage', () => {
     const f = fixture({ readPrFiles: () => ['scripts/example.mjs'] });
-    expect(f.run({ readNetFiles: () => { throw new Error('fetch failed'); } })[0].repark).toBe('reparked');
+    const results = f.run({
+      listPrs: () => [7, 8, 9].map(number => ({ number, labels })),
+      readNetFiles: () => { throw new Error('fetch failed'); },
+    });
+    expect(results).toHaveLength(3);
+    expect(results.every(result => result.skipped)).toBe(true);
+    expect(results.filter(result => result.repark === 'reparked')).toHaveLength(0);
+    expect(f.calls).toEqual([]);
+  });
+  it.each([{ ok: true }, { ok: true, files: [null] }])('fails closed for malformed net result %j', net => {
+    const f = fixture();
+    expect(f.run({ readNetFiles: () => net })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('no usable array');
+  });
+  it('re-parks a sensitive old rename path during a net outage', () => {
+    const f = fixture({ readPrFiles: () => ['archive/ci.yml', '.github/workflows/ci.yml'] });
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason: 'fetch failed' }) })[0].files)
+      .toEqual(['.github/workflows/ci.yml']);
+    expect(f.calls[1][3].add).toBe('review:human');
+  });
+  it.each([
+    () => Array.from({ length: 3000 }, (_, i) => `src/${i}.mjs`),
+    () => [null],
+    () => null,
+    () => { throw new Error('API unavailable'); },
+  ])('fails closed when the fallback list may be incomplete', readPrFiles => {
+    const f = fixture({ readPrFiles });
+    expect(f.run({ readNetFiles: () => ({ ok: false, reason: 'fetch failed' }) })[0].repark).toBe('reparked');
     expect(f.calls[0][3]).toContain('fetch failed');
+  });
+  it.each([
+    () => ({ ok: false, reason: "fatal: '/Users/operator/private/repo' is invalid" }),
+    () => { throw new Error('https://secret:password@example.com/private.git'); },
+  ])('does not publish private reader diagnostics', readNetFiles => {
+    const f = fixture();
+    expect(f.run({ readNetFiles })[0].repark).toBe('reparked');
+    expect(f.calls[0][3]).toContain('net read failed');
+    for (const secret of ['/Users/', 'private/repo', 'secret', 'password', 'example.com']) expect(f.calls[0][3]).not.toContain(secret);
   });
   it('production reader defaults fail closed when this repository has no checkout', () => {
     const f = fixture();

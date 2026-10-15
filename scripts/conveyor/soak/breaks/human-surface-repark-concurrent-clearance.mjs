@@ -45,6 +45,35 @@ export default {
       },
     });
     const violations = [];
+    // PR #5400: a shared fetch outage must not move every accepted, clean PR to review:human.
+    const outageEffects = [];
+    const outageResults = sweepHumanSurfaceRepark({
+      repo: 'o/n', listPrs: () => [5401, 5402, 5403].map(number => ({ number, labels: ['review:accepted'] })),
+      resolveSurfaces: () => 'narrow',
+      readNetFiles: () => { throw new Error('fetch failed'); },
+      readComments: () => [],
+      provider: {
+        readPrState: () => ({ state: 'OPEN', headRefOid: head, labels: ['review:accepted'], comments: [] }),
+        readPrFiles: () => ['scripts/example.mjs'],
+        postComment: () => outageEffects.push('comment'),
+        setLabels: () => outageEffects.push('labels'),
+      },
+    });
+    if (outageResults.length !== 3 || outageResults.some(result => !result.skipped) || outageEffects.length) {
+      violations.push(`net outage re-parked clean PRs: parks=${outageResults.filter(result => result.repark).length}; effects=${outageEffects.length}`);
+    }
+    const renameResults = sweepHumanSurfaceRepark({
+      repo: 'o/n', listPrs: () => [{ number: 5404, labels: ['review:accepted'] }], dryRun: true,
+      resolveSurfaces: () => 'narrow',
+      readNetFiles: () => ({ ok: false, reason: 'fetch failed' }), readComments: () => [],
+      provider: {
+        readPrState: () => ({ state: 'OPEN', headRefOid: head, labels: ['review:accepted'], comments: [] }),
+        readPrFiles: () => ['archive/ci.yml', '.github/workflows/ci.yml'],
+      },
+    });
+    if (renameResults[0]?.repark !== 'would-repark' || !renameResults[0]?.files.includes('.github/workflows/ci.yml')) {
+      violations.push('net outage hid a human-only old rename path');
+    }
     if (reads !== 2 || state.comments.length !== 102 || parseLatestHumanClearedSha(state.comments) !== head) violations.push('scenario did not expose valid clearance beyond the final state page');
     if (results.some(result => result.repark) || effects.length || !state.labels.includes('review:accepted') || state.labels.includes('review:human')) {
       violations.push(`concurrent clearance overwritten: labels=${state.labels.join(',')}; effects=${effects.join(',')}`);

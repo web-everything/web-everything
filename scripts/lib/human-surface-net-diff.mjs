@@ -4,6 +4,12 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { normOnOff, REVIEW_SETTINGS_FILE } from './review-seat-settings.mjs';
 import { defaultGitDirFor, gitExec, readNetFileSets } from '../operations/free-scope-io.mjs';
 
+// These fixed reasons may cross the public-comment boundary; subprocess diagnostics may not.
+const PUBLIC_FAILURES = new Set(['fetch failed', 'net diff failed', 'net read failed',
+  'no local checkout of this repo', 'no usable head commit id', 'missing head commit', 'net file set not read',
+  'net file set returned no usable array']);
+export const publicHumanSurfaceNetFailure = reason => PUBLIC_FAILURES.has(reason) ? reason : 'net read failed';
+
 /** Standard true → platform review preference → review.json → env; cascade logs the source. */
 export function resolveHumanSurfaceNetSetting({ env = process.env, readFile = readFileSync, platform, log } = {}) {
   let tool;
@@ -19,21 +25,32 @@ export function resolveHumanSurfaceNetSetting({ env = process.env, readFile = re
 
 /**
  * Reuse the shared merge-base reader, but refuse its offline cached-base fallback. A successful fetch is
- * required on every read; neither the GitHub list nor a memoized net set can establish absence of a surface.
+ * required on every net read. The sweep may skip on a complete, clean GitHub list if this read fails.
  * No checkout, branch switch or working-tree change. The fetch updates only origin/main and fetches PR objects.
  */
 export function readHumanSurfaceNetFiles({ repo, number, headRefOid }, {
-  git = gitExec(), gitDirFor = defaultGitDirFor,
+  git = gitExec(), gitDirFor = defaultGitDirFor, log = message => console.error(message),
 } = {}) {
   let fetchFailure;
+  const diagnostic = error => {
+    try { log(`[human-surface-net-diff] ${String(error?.stderr || error?.message || error)}`); }
+    catch { /* A local logging failure must not bypass the failed-read result. */ }
+  };
   try {
     const result = readNetFileSets({ dir: gitDirFor(repo), rows: [{ number, headRefOid }], git: (dir, args) => {
       try { return git(dir, args); }
       catch (error) {
-        if (args[0] === 'fetch') fetchFailure = `fetch failed: ${String(error?.stderr || error?.message || error).trim().split('\n')[0]}`;
+        diagnostic(error);
+        if (args[0] === 'fetch') fetchFailure = 'fetch failed';
         throw error;
       }
     } }).get(number);
-    return fetchFailure ? { ok: false, reason: fetchFailure } : result ?? { ok: false, reason: 'net file set not read' };
-  } catch (error) { return { ok: false, reason: String(error?.message ?? error).split('\n')[0] }; }
+    if (fetchFailure) return { ok: false, reason: fetchFailure };
+    if (!result) return { ok: false, reason: 'net file set not read' };
+    if (!result.ok) return { ok: false, reason: PUBLIC_FAILURES.has(result.reason) ? result.reason : 'net diff failed' };
+    return result;
+  } catch (error) {
+    diagnostic(error);
+    return { ok: false, reason: 'net read failed' };
+  }
 }

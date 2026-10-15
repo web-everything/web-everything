@@ -150,7 +150,7 @@ describe('the gh adapter', () => {
 
   it('readPrFiles shells --method GET (load-bearing: an -F param silently flips gh to POST, which pulls/files 404s on)', () => {
     expect(GH_ARGV.readPrFiles('o/n', 2223)).toEqual([
-      'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/pulls/2223/files', '--jq', '.[].filename',
+      'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/pulls/2223/files', '--jq', '.[] | .filename, (.previous_filename // empty)',
     ]);
   });
 

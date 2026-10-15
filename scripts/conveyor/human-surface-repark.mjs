@@ -11,7 +11,8 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
-import { readHumanSurfaceNetFiles, resolveHumanSurfaceNetSetting } from '../lib/human-surface-net-diff.mjs';
+import { readHumanSurfaceNetFiles, resolveHumanSurfaceNetSetting, publicHumanSurfaceNetFailure } from '../lib/human-surface-net-diff.mjs';
+import { GH_API_FILE_CAP } from '../operations/free-scope.mjs';
 
 const candidate = labels => hasReviewLabel(labels, REVIEW_LABELS.accepted)
   && !hasReviewLabel(labels, REVIEW_LABELS.human) && !hasReviewLabel(labels, REVIEW_LABELS.heldMechanical);
@@ -81,7 +82,7 @@ export function buildHumanSurfaceReparkComment({ headSha, hits, netFailure }) {
   if (!missingHead && !/^[0-9a-f]{40}$/i.test(String(headSha))) throw new Error('re-park comment needs a 40-hex head sha');
   return (missingHead ? 'Human-only surface check with missing head:\n\n' : `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`)
     + hits.map(hit => `- \`${neutralizeCommentText(hit.file)}\` (${neutralizeCommentText(hit.category)})`).join('\n')
-    + (netFailure ? `\n\nNet file set unavailable: ${String(netFailure).split(' ').map(neutralizeCommentText).join(' ')}. Failing closed; the absence of human-only changes could not be verified against current origin/main.` : '')
+    + (netFailure ? `\n\nNet file set unavailable: ${publicHumanSurfaceNetFailure(netFailure)}. Failing closed; the absence of human-only changes could not be verified against current origin/main.` : '')
     + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n'
     + (missingHead ? '' : `\n${buildHumanSurfaceReparkMarker(headSha)}\n`);
 }
@@ -118,10 +119,18 @@ export function sweepHumanSurfaceRepark({
         catch (e) { net = { ok: false, reason: errorText(e) }; }
         if (net?.ok && Array.isArray(net.files) && net.files.every(file => typeof file === 'string')) files = net.files;
         else {
-          netFailure = net?.reason || 'net file set returned no usable array';
-          // GitHub can supply diagnostic hits, but cannot clear a PR when the net basis is unknown.
-          try { files = provider.readPrFiles(resolvedRepo, num); } catch { files = []; }
+          netFailure = publicHumanSurfaceNetFailure(net?.reason || 'net file set returned no usable array');
+          // A sweep-wide fetch outage must not park PRs whose complete GitHub list is clean.
+          // A cap-sized, malformed or unavailable list cannot establish that absence.
+          try { files = provider.readPrFiles(resolvedRepo, num); } catch { files = null; }
+          const complete = Array.isArray(files) && files.length < GH_API_FILE_CAP
+            && files.every(file => typeof file === 'string');
+          if (complete && !sensitiveSurfaceHits(files, () => undefined, resolveSurfaces()).some(hit => hit.category !== 'permission')) {
+            results.push({ num, skipped: 'net file set unavailable; complete GitHub list has no human-only surface' });
+            continue;
+          }
           if (!Array.isArray(files)) files = [];
+          files = files.filter(file => typeof file === 'string');
         }
       } else {
         if (!state.headRefOid) throw new Error('missing head');
