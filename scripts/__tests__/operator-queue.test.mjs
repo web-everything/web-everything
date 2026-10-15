@@ -232,7 +232,7 @@ describe('main', () => {
       });
       expect(execFileSync).toHaveBeenLastCalledWith('gh', [
         'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
-        'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,comments',
+        'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,body,createdAt,comments',
       ], expect.objectContaining({ encoding: 'utf8' }));
       expect(execFileSync.mock.calls.filter(([, args]) =>
         args[args.indexOf('--repo') + 1] === 'owner/broken').length).toBeGreaterThan(1);
