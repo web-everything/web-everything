@@ -2554,7 +2554,7 @@ const ARITH_ASSIGN_OP = /(?:<<|>>|[-+*/%&^|])?=(?!=)/g;
 function arithmeticOps(expr) {
   if (expr.length > LET_MAX_CHARS) return [CLEAR_ALL];
   if (/[$`]/.test(expr)) {
-    if (/\+\+|--/.test(expr)) return [CLEAR_ALL];
+    if (/[$}\)`]\w*\s*(?:\+\+|--)|(?:\+\+|--)\s*[$`]/.test(expr)) return [CLEAR_ALL]; // `$N++`, `++${N}`
     for (const m of expr.matchAll(ARITH_ASSIGN_OP)) {
       if (m[0] === '=' && /[=!<>]/.test(expr[m.index - 1] ?? '')) continue; // `==`, `!=`, `<=`, `>=` compare
       let j = m.index;
@@ -2610,7 +2610,9 @@ function expansionOps(stmt) {
     else if (/^:(?![-+=?])/.test(m[3])) ops.push(...arithmeticOps(m[3].slice(1)));
   }
   count = 0;
+  const head = text.search(/\S/);
   for (let i = text.indexOf('(('); i >= 0; i = text.indexOf('((', i + 2)) {
+    if (text[i - 1] !== '$' && i !== head) continue;            // `$((…))`, or a `((…))` command; else literal
     if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
     let depth = 0;
     let j = i + 2;
@@ -2624,26 +2626,30 @@ function expansionOps(stmt) {
   return ops;
 }
 
-// Scan one word's spelling for substitutions, carrying the open-context `stack` (`)` for `$(`/`(`, `"`, `` ` ``)
-// across the statement's words: tokenizing splits an unquoted `$(echo a b)` into several words. Quotes nest the
-// way bash nests them (`"$(echo "a b")"`). false = a `)` that closes nothing. Linear.
+// Scan one word's spelling for expansions, carrying the open-context `stack` (the closer each one waits for:
+// `)` for `$(`/`(`, `}` for `${`, `]` for `$[`, `"`, `` ` ``) across the statement's words: tokenizing splits
+// an unquoted `$(echo a b)` or `${A[ (1 + 2) ]}` into several words. Quotes nest the way bash nests them
+// (`"$(echo "a b")"`); inside `${…}` / `$[…]` a bare paren is literal (`${Y//(/a}`). false = a `)` that closes
+// nothing, or an unclosed `'`. Linear.
+const EXPANSION_CLOSER = { '(': ')', '{': '}', '[': ']' };
 function scanSubstitutions(raw, stack) {
   for (let i = 0; i < raw.length; i++) {
     const c = raw[i];
     const top = stack[stack.length - 1];
     if (c === '\\') { i++; continue; }
+    if (c === '$' && EXPANSION_CLOSER[raw[i + 1]]) { stack.push(EXPANSION_CLOSER[raw[i + 1]]); i++; continue; }
     if (top === '"') {
       if (c === '"') stack.pop();
       else if (c === '`') stack.push('`');
-      else if (c === '$' && raw[i + 1] === '(') { stack.push(')'); i++; }
       continue;
     }
+    if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); continue; }
     if (c === "'") {
       const close = raw.indexOf("'", i + 1);
       if (close < 0) return false;
       i = close;
     } else if (c === '"') stack.push('"');
-    else if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); }
+    else if (top === '}' || top === ']') { if (c === top) stack.pop(); }
     else if (c === '(') stack.push(')');
     else if (c === ')') { if (top !== ')') return false; stack.pop(); }
   }
@@ -2659,14 +2665,16 @@ function scanSubstitutions(raw, stack) {
 function parseStatement(tokens) {
   // Re-join the words tokenizing split inside a substitution (`X=$(echo a b)` is ONE shell word).
   const words = [];
+  const firstToken = [];                                        // words[n] starts at tokens[firstToken[n]]
   const stack = [];
   let open = -1;
   let broken = false;
   let cdAfterOpen = false;
-  for (const w of tokens) {
+  for (const [t, w] of tokens.entries()) {
     if (broken) {
       if (w.text === 'cd') cdAfterOpen = true;
       words.push(w);
+      firstToken.push(t);
       continue;
     }
     const inside = stack.length > 0;
@@ -2676,6 +2684,7 @@ function parseStatement(tokens) {
       words[words.length - 1] = { raw: `${prev.raw} ${w.raw}`, text: `${prev.text} ${w.text}` };
     } else {
       words.push(w);
+      firstToken.push(t);
       if (broken || stack.length) open = words.length - 1;
     }
     if (broken && open < 0) open = words.length - 1;
@@ -2683,7 +2692,8 @@ function parseStatement(tokens) {
   if (!broken && !stack.length) open = -1;                      // every substitution closed
   if (open >= 0) {
     const head = parseStatement(words.slice(0, open));
-    const opaque = words.slice(open).map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
+    // every token from the opener on, not the re-joined words: a `Z=…` glued into the open word still counts
+    const opaque = tokens.slice(firstToken[open]).map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
     // bare prefix assignments before the open word may be temporary (it is the command) or persist (it expands
     // to nothing): unknown either way
     if (!head.cmd.length) opaque.push(...head.prefix.map((w) => assignmentOp(w).name));
@@ -2770,8 +2780,8 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
   if (opaque) return [...statementBindings({ invalid, prefix, cmd }), ...opaque.map(forget)];
   if (invalid) return [];
   if (!cmd.length) return prefix.map(assignmentOp);              // bare assignments persist, in order
-  // A command word that is an expansion may expand to nothing, and then the prefix assignments persist.
-  if (/^(?:\$|`)/.test(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
+  // A command word that is one bare expansion may expand to nothing, and then the prefix assignments persist.
+  if (/^(?:\$[A-Za-z_]\w*|\$\{[^]*\}|\$\([^]*\)|`[^]*`)$/.test(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
   const name = cmd[0].text;
   const args = cmd.slice(1);
   const names = (ws) => ws.map((w) => w.text).filter((t) => VALID_NAME.test(t)).map((t) => t.match(NAME_PREFIX)[0]);

@@ -762,6 +762,20 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('M=/a; export L=$(true M=/protected/clone ); cd "$M"')).toBe('/a');
     // a substitution left open (the segment was cut inside it) or a stray `)` hides any cd after it
     expect(at('$(true a) ) cd /protected/clone; cd /bin')).toBe(REPORTED);
+    // …and every name assigned from the open word on is unknown, even when glued into it
+    expect(at('Z=/usr; X=`true; echo a` Z=/protected/clone; cd "$Z"')).toBe(REPORTED);
+    expect(at('Z=/usr; X=`cd /bin; pwd` Z=/protected/clone; cd "$Z"')).toBe(REPORTED);
+    // `${…}` and `$[…]` split by the tokenizer are one word; a bare paren inside `${…}` is literal
+    for (const v of ['${Y//(/a}', '${Y:-(}', '${A[ (1 + 2) ]}', '$[ (1 + 2) ]', '${A[ $(echo 1) ]}']) {
+      expect(at(`Z=/usr; X=${v} Z=/protected/clone; cd "$Z"`), v).toBe('/protected/clone');
+    }
+    // a command word that cannot expand to nothing keeps its prefix temporary
+    for (const c of ['$HOME/bin/tool', "$'true'", '"$CMD"x']) {
+      expect(at(`X=/protected/clone; X=/etc ${c} f; cd "$X"`), c).toBe('/protected/clone');
+    }
+    for (const c of ['$CMD', '${CMD}', '$(echo true)', '`echo true`']) {
+      expect(at(`X=/protected/clone; X=/etc ${c} f; cd "$X"`), c).toBe(REPORTED);
+    }
   });
   it('arithmetic inside `${…}` and nested `((…))` forgets what it assigns; quoting is read in context', () => {
     for (const stmt of [
@@ -770,7 +784,10 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
-    for (const stmt of ['echo hi # ${LANE:=/bin}', 'echo hi # ((LANE=0))', ": '${LANE:=/x}'", 'let "i = $i + 1"']) {
+    for (const stmt of [
+      'echo hi # ${LANE:=/bin}', 'echo hi # ((LANE=0))', ": '${LANE:=/x}'", 'let "i = $i + 1"', 'echo $(( $a + i++ ))',
+      'git commit -m "fix ((LANE=b) parse"',
+    ]) {
       expect(at(`LANE=/protected/clone; ${stmt}\ncd "$LANE"`), stmt).toBe('/protected/clone');
     }
   });
