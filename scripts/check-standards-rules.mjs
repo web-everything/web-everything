@@ -38,6 +38,7 @@ const COMMENT_MARKER_PARSERS_REVIEWED = new Set([
   'scripts/conveyor/exhausted-retry.mjs#exhaustionFacts', // standDownComments / trustedRetryMarkerComments authenticate the parsed comments
   'scripts/conveyor/fix-takeover.mjs#takeoverLedger',
   'scripts/conveyor/reconcile-note-comment.mjs#hasPostedNoteComment',
+  'scripts/conveyor/review-hold-reconcile.mjs#sweepReviewHoldLabels', // its one direct body read is of the record latestAcceptRecord returned, which authenticates every author via isTrustedMarkerAuthor
   'scripts/conveyor/round-extension-mark.mjs#roundExtensionGrants',
   'scripts/conveyor/stand-down-answer-core.mjs#parseOperatorAnswer',
   'scripts/conveyor/stand-down.mjs#supersedeHoldsOn',
