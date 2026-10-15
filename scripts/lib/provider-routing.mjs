@@ -410,7 +410,7 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
     }
     const held = availability[id] || availability[def.provider] || (def.checker && availability[def.checker]);
     if (held) {
-      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'quota-held', dataConsulted: String(held), reasoning: 'active backend or checker hold; availability otherwise unknown' });
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'quota-held', dataConsulted: settingLabel(held), reasoning: 'active backend or checker hold; availability otherwise unknown' });
       return;
     }
     const model = id === 'antigravity-argon'

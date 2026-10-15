@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   selectProvider,
+  selectProbationWorker,
   selectSupervisionLevel,
   isStatuteTierPath,
   isHighStakesTask,
@@ -35,6 +36,30 @@ import {
   PROBATION_ROSTER,
 } from '../provider-routing.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
+
+describe('probation availability audit', () => {
+  it.each(['antigravity-argon', 'antigravity', 'codex'])('keeps the worker held without coercing malformed %s hold values', (key) => {
+    for (const held of [{ toString: null }, [{ toString: null }]]) {
+      const context = {
+        kind: 'build', filesTouched: ['a.mjs'], estimatedSize: 40,
+        criticalWork: { critical: false, reasons: [] }, criticalMisses: [],
+        availability: { [key]: held },
+        argonSettings: { value: { enabled: true, model: 'gemini-4-argon-high' }, sources: {} },
+      };
+      const direct = selectProbationWorker({ taskType: 'build-new-feature', ...context });
+      const routed = selectProvider({ taskType: 'build-new-feature' }, context);
+      for (const result of [direct, routed]) {
+        const worker = 'worker' in result ? result.worker : result.probationWorker;
+        expect(worker?.id).not.toBe('antigravity-argon');
+        expect(worker?.id ?? null).toBe(key === 'codex' ? null : 'codex');
+        expect(result.auditTrail).toContainEqual(expect.objectContaining({
+          criterion: 'probation-candidate:antigravity-argon', result: 'quota-held',
+          dataConsulted: '<object>',
+        }));
+      }
+    }
+  });
+});
 
 // ── Fixture Scorecard Helpers ──────────────────────────────────────────────────
 
