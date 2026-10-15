@@ -234,7 +234,7 @@ describe('sweepReviewHoldLabels', () => {
   });
 
   it('FLAGS (never heals) when the PR\'s own comments prove a GENUINE current human clearance', () => {
-    const p = provider({ readPrState: () => ({ headRefOid: 'aaa1111', comments: [{ body: '<!-- reviewed-sha: aaa1111 -->\n<!-- cleared-human: Ada -->', author: bot }] }) });
+    const p = provider({ readPrState: () => ({ headRefOid: 'aaa1111', comments: [{ body: '✅ review — `review:human` cleared via the sanctioned path\n<!-- reviewed-sha: aaa1111 -->\n<!-- cleared-human: Ada -->', author: bot }] }) });
     const results = sweepFixture({
       repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2767, LIVE_LABELS)],
@@ -379,7 +379,7 @@ describe('fresh complete review-hold decisions (#5955)', () => {
   const labels = ['review:human', 'review:accepted'];
   const head = 'a'.repeat(40);
   const filler = () => ({ body: 'discussion', author: { login: 'stranger' } });
-  const clearance = { body: `<!-- reviewed-sha: ${head} -->\n<!-- cleared-human: Ada -->`, author: { login: 'web-everything' } };
+  const clearance = { body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${head} -->\n<!-- cleared-human: Ada -->`, author: { login: 'web-everything' } };
   const live = (extra = {}) => ({ state: 'OPEN', labels, headRefOid: head, comments: [], ...extra });
   const run = ({ snapshot = { number: 7, labels, comments: [] }, state = live(), comments = [], dryRun = false } = {}) => {
     const p = provider({ readPrState: () => state });

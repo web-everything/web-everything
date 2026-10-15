@@ -22,7 +22,7 @@ function repository({ mainFirst = true, conflict = false } = {}) {
   const main = commit(conflict ? 'src/x.txt' : 'unrelated.txt', 'main change\n');
   git('update-ref', 'refs/remotes/origin/main', main);
   const diff = (sha) => git('diff', git('merge-base', main, sha), sha);
-  const humanClearance = latestHumanClearance([{ viewerDidAuthor: true, body: [buildReviewedShaMarker(a), buildReviewedDiffMarker(diff(a)), buildClearedHumanMarker('op')].join('\n') }]);
+  const humanClearance = latestHumanClearance([{ viewerDidAuthor: true, body: ['✅ review — `review:human` cleared via the sanctioned path', buildReviewedShaMarker(a), buildReviewedDiffMarker(diff(a)), buildClearedHumanMarker('op')].join('\n') }]);
   if (!mainFirst) git('checkout', '-q', 'lane');
   try { git('merge', '--no-ff', '--no-edit', mainFirst ? 'lane' : 'main'); }
   catch (e) { if (!conflict) throw e; commit('src/x.txt', 'resolved differently\n'); }

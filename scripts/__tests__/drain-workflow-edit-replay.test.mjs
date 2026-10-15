@@ -12,7 +12,7 @@ const fixtures = [
 ];
 function replay(pr, { setting, clearance, author = 'web-everything', ...extra } = {}) {
   const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
-  if (clearance) comments.push({ author: { login: author }, body: `<!-- reviewed-sha: ${clearance} -->\n<!-- cleared-human: operator -->` });
+  if (clearance) comments.push({ author: { login: author }, body: `✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${clearance} -->\n<!-- cleared-human: operator -->` });
   const repo = 'web-everything/web-everything';
   const [v] = buildDrainVerdicts({ prsByRepo: new Map([[repo, [pr]]]), repos: [repo], readOf: () => ({}) });
   return decideDrainReviewGate({ labels: v.prLabels, escalate: true }, {

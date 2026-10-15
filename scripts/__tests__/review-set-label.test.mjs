@@ -2683,6 +2683,7 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
     const original = '95cb216548ba6b8e702c49527745ccd50355a7d6';
     const contribution = '27381bade5815ad928b373dff9ead23134402e24f9ea2a69dbc3405164c182dc';
     const comments = [{ author: { login: 'web-everything' }, body: [
+      '✅ review — `review:human` cleared via the sanctioned path', // PR #5237: only the producer's shape clears
       buildReviewedShaMarker(original),
       buildReviewedDiffMarker('be21b72e986d883b6ac7ab615b855b8469ce7db910e17fd94b23f8b509169c50'),
       buildReviewedContributionMarker(contribution), buildClearedHumanMarker('chalbert'),
@@ -2710,6 +2711,7 @@ describe('decideRestampHumanClearance (#x9krtkb — is a restamp carrying a huma
   // its own automation credential, and `parseReviewedSha`/`parseReviewedDiff` now require a trusted author.
   const humanClearedComment = (sha = HUMAN_SHA, diff = DIFF, contrib = CONTRIB) => ({
     body: [
+      '✅ review — `review:human` cleared via the sanctioned path', // PR #5237: only the producer's shape clears
       buildReviewedShaMarker(sha), buildReviewedDiffMarker(diff), buildReviewedContributionMarker(contrib),
       buildClearedHumanMarker('chalbert'),
     ].join('\n'),
@@ -2922,6 +2924,7 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     const DIFF = 'd'.repeat(64);
     const humanClearedComment = {
       body: [
+        '✅ review — `review:human` cleared via the sanctioned path', // PR #5237: only the producer's shape clears
         buildReviewedShaMarker(STALE_HEAD), buildReviewedDiffMarker(DIFF), buildReviewedContributionMarker(DIFF),
         buildClearedHumanMarker('chalbert'),
       ].join('\n'),

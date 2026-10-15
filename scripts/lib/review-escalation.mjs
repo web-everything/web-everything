@@ -24,6 +24,8 @@ import { POLICY_THRESHOLDS, POLICY_VERSION, POLICY_DIGEST } from './review-polic
 // `parseReviewedDiff`, `parseReviewedContribution`, `parseLatestHumanClearedSha`) now runs every comment through
 // before matching its marker, closing the residual `marker-authorship.mjs`'s own header named as a follow-up.
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { loadReviewClearanceSetting } from './review-clearance-settings.mjs';
+import { isKnownMachineBody, isLaterVerdictBody } from './accept-carry-forward.mjs';
 
 /** Shared operation identity; core consumers must not import operation declarations. */
 export const REVIEW_PR_OP_ID = 'review-pr';
@@ -1901,28 +1903,178 @@ export function parseOperatorClearance(comments) {
  * `reviewed-sha` + `cleared-human` comment posted after a REAL plain accept upgraded that accept into a human
  * clearance (review round 1 on PR #2716 — the "piggyback").
  */
-export function parseLatestHumanClearedSha(comments) {
+export function parseLatestHumanClearedSha(comments, { sameShaCarries = sameShaCarriesSetting() } = {}) {
   let latestSha = null;
   let latestWasHumanCleared = false;
+  // #5193 (2026-10-13, reviewClearance.humanClearanceSurvivesSameShaAccept): a later plain accept of the SAME sha a
+  // human cleared does not revoke that clearance — the human looked at exactly this tree. Tracked per run of
+  // consecutive same-sha records, so a clearance never carries across a record for a different tree (#xuboo0q).
+  let humanInSameShaRun = false;
   for (const c of Array.isArray(comments) ? comments : []) {
     const body = c && typeof c.body === 'string' ? c.body : '';
     if (!body) continue;
-    if (!isTrustedMarkerAuthor(c)) continue; // #4140 — an untrusted commenter's marker is never counted
     REVIEWED_SHA_RE.lastIndex = 0;
     let m;
     let bodySha = null;
-    while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
-    if (bodySha === null) continue; // not an accept-shaped comment — carries no reviewed-sha at all
-    CLEARED_HUMAN_RE.lastIndex = 0;
-    let bodyHumanCleared = CLEARED_HUMAN_RE.exec(body) !== null;
-    if (!bodyHumanCleared) {
-      CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
-      bodyHumanCleared = CLEARED_HUMAN_PROSE_RE.exec(body) !== null;
+    if (isTrustedMarkerAuthor(c)) { // #4140 — an untrusted commenter's marker is never counted
+      while ((m = REVIEWED_SHA_RE.exec(body)) !== null) bodySha = m[1].toLowerCase();
     }
+    const machineNote = isMachineNoteBody(c) || (isTrustedMarkerAuthor(c) && isApprovalPreventionNoteBody(body));
+    if (bodySha === null) {
+      // PR #5237 round 4: a comment with no reviewed-sha marker can still revoke (a changes verdict, re-arm,
+      // stand-down, park, a revocation note, operator text). Any author's comment that is not a known machine
+      // shape ends the same-sha run, so a later plain accept of that sha cannot revive the clearance (fail closed).
+      if (!machineNote) humanInSameShaRun = false;
+      continue;
+    }
+    // PR #5237 operator send-back (2026-10-14): a quote of a whole clearance block is not a clearance. Only a comment
+    // authored in the sanctioned shape counts, so a revoked clearance stays revoked until a NEW clear-human ceremony.
+    const bodyHumanCleared = isSanctionedClearanceBody(body);
+    // PR #5237 round 5: carrying the marker does not make a comment an acceptance. A revocation can QUOTE it (in a
+    // fence, a blockquote, a whole line or inline). The run continues only through a recognised acceptance
+    // (`isSanctionedAcceptRecordBody`: the heading AND the marker block at the end, so a pasted acceptance followed by a
+    // revocation does not count) or a machine note; any other marker-bearing comment ends it, like a marker-free one.
+    humanInSameShaRun = (bodySha === latestSha && humanInSameShaRun && (isSanctionedAcceptRecordBody(body) || machineNote)
+      && !isLaterVerdictBody(body)) || bodyHumanCleared;
     latestSha = bodySha;
     latestWasHumanCleared = bodyHumanCleared;
   }
-  return latestWasHumanCleared ? latestSha : null;
+  return latestWasHumanCleared || (sameShaCarries && humanInSameShaRun) ? latestSha : null;
+}
+
+/**
+ * The headings of the comments that RECORD an acceptance, as their producers write them on the first line:
+ * `buildVerdictComment` (we:scripts/review-set-label.mjs: accepted, clear-human, restamp) and `buildCarryRecordBody`
+ * (we:scripts/lib/human-clearance-carry.mjs). PR #5237 round 5: a comment that only carries a `reviewed-sha` marker
+ * (a revocation quoting it) is not an acceptance. Missing a heading here fails closed: the comment ends a same-sha
+ * clearance run and cannot be restored from. A renamed heading stays listed: records written under the old name
+ * are still on open PRs (the carry heading read "identical net diff" until 2026-10-11).
+ */
+const ACCEPT_RECORD_HEADINGS = [
+  '✅ review — accepted',
+  '✅ review — `review:human` cleared via the sanctioned path',
+  '📌 review — acceptance re-stamped after a rebase (no new review)',
+  '📌 review — human clearance carried forward (equivalent change after a mechanical refresh, no new review)',
+  '📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)',
+];
+
+const bodyLines = (body) => String(typeof body === 'string' ? body : '').split('\n').map((l) => l.replace(/\r$/, ''));
+
+/**
+ * Pure: does this comment body open with an acceptance heading (its first non-blank line, exactly, at column 0)? An
+ * indented heading is a Markdown code block, i.e. a quote, and does not count.
+ */
+export function isAcceptRecordBody(body) {
+  const first = bodyLines(body).find((l) => l.trim() !== '');
+  return first !== undefined && ACCEPT_RECORD_HEADINGS.includes(first.trimEnd());
+}
+
+/** The headings whose producers stamp a human clearance (clear-human, a restamp or carry of one); never a plain accept. */
+const CLEARANCE_HEADINGS = ACCEPT_RECORD_HEADINGS.filter((h) => h !== '✅ review — accepted');
+const CLEARED_HUMAN_LINE_RE = new RegExp(`^<!--\\s*${CLEARED_HUMAN_MARKER}:\\s*([^>]*?)\\s*-->$`);
+const REVIEWED_SHA_LINE_RE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*[0-9a-fA-F]{7,40}\\s*-->$`);
+/** Exactly ONE `<!-- … -->` comment filling the line: `<!-- a --> visible text <!-- b -->` is not a marker line. */
+const MARKER_LINE_RE = /^<!--(?:(?!-->).)*-->$/;
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
+/** Per line: is it a fence line or inside a fenced code block? An unclosed fence runs to the end (fail closed). */
+function fencedLines(lines) {
+  let fence = null; // { char, len } while inside a fenced code block
+  return lines.map((line) => {
+    const f = FENCE_LINE_RE.exec(line);
+    if (!f) return fence !== null;
+    if (!fence) fence = { char: f[1][0], len: f[1].length };
+    else if (f[1][0] === fence.char && f[1].length >= fence.len && line.trim() === f[1]) fence = null;
+    return true;
+  });
+}
+
+/** The marker block a body ENDS with: consecutive whole-line markers, one comment per line, outside any fence. */
+function markerBlockAtEnd(lines) {
+  const fenced = fencedLines(lines);
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === '') end--;
+  let start = end;
+  while (start > 0 && !fenced[start - 1] && MARKER_LINE_RE.test(lines[start - 1])) start--;
+  return lines.slice(start, end);
+}
+
+/**
+ * Pure: is this comment an acceptance record AUTHORED in the sanctioned shape (PR #5237 operator ruling, 2026-10-14,
+ * red-team break #1)? Its first non-blank line is an acceptance heading at column 0 ({@link isAcceptRecordBody}) AND
+ * the body ENDS with its marker block holding the `reviewed-sha` marker, as every producer writes it
+ * (`buildVerdictComment` accepted / clear-human / restamp, `buildCarryRecordBody`). A raw paste of an old acceptance
+ * keeps the heading, so the heading alone is not enough: text after the marker block ("The clearance above is
+ * REVOKED.") makes it a quote, not an acceptance. A sanctioned clearance ({@link isSanctionedClearanceBody}) counts too.
+ */
+export function isSanctionedAcceptRecordBody(body) {
+  if (!isAcceptRecordBody(body)) return false;
+  return markerBlockAtEnd(bodyLines(body)).some((l) => REVIEWED_SHA_LINE_RE.test(l)) || isSanctionedClearanceBody(body);
+}
+
+const RESTAMP_LEAD_RE = /^\s*📌 review — /;
+
+/**
+ * Pure: a machine note that says nothing about the clearance ({@link isKnownMachineBody}), except that a re-stamp's
+ * own comment counts only in its sanctioned shape ({@link isSanctionedAcceptRecordBody}). `isKnownMachineBody` reads
+ * the re-stamp heading off the first line alone, so a pasted re-stamp followed by "REVOKED" passed as a note (PR #5237
+ * operator ruling, self-review). Only narrows the machine shapes: anything failing here is a possible hold.
+ *
+ * Takes the COMMENT, not its body: every machine shape (🔔 conveyor —, fix-begin/fix-end, CI-heal, drain notes, advisory
+ * notes) is a note only from a trusted author ({@link isTrustedMarkerAuthor}: the delivery bot, or the operator whose
+ * login the drain also posts under). `isKnownMachineBody` matches the leading line from any author, so an outsider's
+ * comment that merely opened with one was ignored as a hold (PR #5237 operator ruling, 2026-10-15 ~07:25 ET). An empty
+ * comment says nothing whoever wrote it. A missing or unreadable author is untrusted (fail closed).
+ */
+export function isMachineNoteBody(comment) {
+  const body = typeof comment?.body === 'string' ? comment.body : '';
+  if (!body.trim()) return true;
+  if (!isTrustedMarkerAuthor(comment) || !isKnownMachineBody(body)) return false;
+  return !RESTAMP_LEAD_RE.test(body) || isSanctionedAcceptRecordBody(body);
+}
+
+/**
+ * Pure: is this the approval-time prevention notice exactly as `review-set-label.mjs` posts it after a clearance (its
+ * marker line, then the one "Filed the prevention guard(s)…" line, nothing else)? PR #5237 round 10 (block): matching
+ * the marker on the first line alone let a trusted comment open with it and revoke the clearance underneath, read as a
+ * note. A producer change makes the notice a possible hold: the fail-closed side.
+ */
+const PREVENTION_NOTE_MARKER_LINE_RE = /^<!-- approval-prevention-filed:[0-9a-f]{7,40} -->(?: <!-- approval-prevention-job:[A-Za-z0-9._-]{1,120} -->)?$/;
+const PREVENTION_NOTE_TEXT_LINE_RE = /^Filed the prevention guard\(s\) owed by [\w.-]+\/[\w.-]+#\d+'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[\w.-]+ \(#[\w?-]+\)|queued for landing via a lane \(tracking (?:pid:\d+|an untracked job)\))\.$/;
+export function isApprovalPreventionNoteBody(body) {
+  const lines = bodyLines(typeof body === 'string' ? body.trim() : '');
+  return lines.length === 2 && PREVENTION_NOTE_MARKER_LINE_RE.test(lines[0]) && PREVENTION_NOTE_TEXT_LINE_RE.test(lines[1]);
+}
+
+/**
+ * Pure: is this comment a human clearance AUTHORED in the sanctioned shape, not one quoted inside other prose (PR #5237
+ * operator send-back, 2026-10-14)? Exactly as its producers write it (`buildVerdictComment` clear-human / a restamp
+ * carrying one, `buildCarryRecordBody`): the first non-blank line is a clearance-stamping heading at column 0
+ * ({@link CLEARANCE_HEADINGS}), and the body ENDS with its marker block (consecutive whole-line markers, one comment per
+ * line, column 0, outside any fence) holding the `cleared-human` marker. The legacy prose attribution
+ * (`CLEARED_HUMAN_PROSE_RE`, anchored under the heading) counts only with a `reviewed-sha` marker in that same block.
+ * Anything else fails: a bare marker-only body (no producer writes one), a blockquote, an indented block, a fence, prose
+ * before the heading, a marker mid-line or with visible text around it, or text after the marker block (a raw paste of
+ * a clearance followed by "revoked").
+ */
+export function isSanctionedClearanceBody(body) {
+  const lines = bodyLines(body);
+  const first = lines.find((l) => l.trim() !== '');
+  if (first === undefined || !CLEARANCE_HEADINGS.includes(first.trimEnd())) return false;
+  const tail = markerBlockAtEnd(lines);
+  if (tail.some((l) => CLEARED_HUMAN_LINE_RE.test(l))) return true;
+  CLEARED_HUMAN_PROSE_RE.lastIndex = 0;
+  return CLEARED_HUMAN_PROSE_RE.exec(String(body)) !== null && tail.some((l) => REVIEWED_SHA_LINE_RE.test(l));
+}
+
+/** `reviewClearance.humanClearanceSurvivesSameShaAccept` (cascade + logged source: we:scripts/lib/review-clearance-settings.mjs). */
+let sameShaCarriesDefault;
+function sameShaCarriesSetting() {
+  if (sameShaCarriesDefault === undefined) {
+    try { sameShaCarriesDefault = loadReviewClearanceSetting({ key: 'humanClearanceSurvivesSameShaAccept' }).value === 'on'; }
+    catch { sameShaCarriesDefault = false; }
+  }
+  return sameShaCarriesDefault;
 }
 
 /**

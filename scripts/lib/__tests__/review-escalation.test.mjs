@@ -2262,11 +2262,13 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
     expect(parseOperatorClearance(null)).toBe(null);
   });
 
+  // PR #5237: a clearance counts only in its producer's shape (the clear-human heading, then the marker block).
+  const CLEAR_HUMAN_HEADING = '✅ review — `review:human` cleared via the sanctioned path';
   it('#xuboo0q — parseLatestHumanClearedSha binds the SHA and the clear-human marker to the SAME comment', () => {
     // A real clear-human comment stamps BOTH markers together, in one comment. #4140 — posted under the
     // automation's own login, as every real one is (the reader is trusted-author gated).
     const bot = { login: 'web-everything' };
-    const clearHumanAt111 = { body: `${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
+    const clearHumanAt111 = { body: `${CLEAR_HUMAN_HEADING}\n${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
     expect(parseLatestHumanClearedSha([clearHumanAt111])).toBe('1111111');
     // A plain accept stamps ONLY reviewed-sha — never covers a tampering finding.
     const plainAcceptAt222 = { body: buildReviewedShaMarker('2222222'), author: bot };
@@ -2281,7 +2283,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
   // cleared-human must neither BE the latest accept-shaped comment nor upgrade a real plain accept.
   it('#4140 — parseLatestHumanClearedSha ignores an UNTRUSTED author entirely (forged or piggybacking)', () => {
     const forged = {
-      body: `${buildReviewedShaMarker('5555555')}\n${buildClearedHumanMarker('mallory')}`, author: { login: 'mallory' },
+      body: `${CLEAR_HUMAN_HEADING}\n${buildReviewedShaMarker('5555555')}\n${buildClearedHumanMarker('mallory')}`, author: { login: 'mallory' },
     };
     expect(parseLatestHumanClearedSha([forged])).toBe(null);
     expect(parseLatestHumanClearedSha([{ body: forged.body }])).toBe(null); // no author → fail closed
@@ -2289,7 +2291,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
     expect(parseLatestHumanClearedSha([realPlainAccept, forged])).toBe(null);
     // …and a forged plain accept cannot mask a REAL, latest-trusted clear-human either.
     const realClear = {
-      body: `${buildReviewedShaMarker('6666666')}\n${buildClearedHumanMarker('Ada')}`, author: { login: 'chalbert' },
+      body: `${CLEAR_HUMAN_HEADING}\n${buildReviewedShaMarker('6666666')}\n${buildClearedHumanMarker('Ada')}`, author: { login: 'chalbert' },
     };
     const forgedPlain = { body: buildReviewedShaMarker('7777777'), author: { login: 'mallory' } };
     expect(parseLatestHumanClearedSha([realClear, forgedPlain])).toBe('6666666');
@@ -2302,12 +2304,12 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
     // would let #2440's anti-gaming gate be silently bypassed by a plain agent accept riding on a stale human
     // clearance. This function must report null for the new head instead.
     const bot = { login: 'web-everything' };
-    const clearHumanAt111 = { body: `${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
+    const clearHumanAt111 = { body: `${CLEAR_HUMAN_HEADING}\n${buildReviewedShaMarker('1111111')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
     const laterPlainAcceptAt333 = { body: buildReviewedShaMarker('3333333'), author: bot };
     expect(parseLatestHumanClearedSha([clearHumanAt111, laterPlainAcceptAt333])).toBe(null);
     // …but the reverse order — clear-human is genuinely the LATEST accept-shaped comment — correctly covers it.
     const plainAcceptAt222 = { body: buildReviewedShaMarker('2222222'), author: bot };
-    const laterClearHumanAt444 = { body: `${buildReviewedShaMarker('4444444')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
+    const laterClearHumanAt444 = { body: `${CLEAR_HUMAN_HEADING}\n${buildReviewedShaMarker('4444444')}\n${buildClearedHumanMarker('Ada')}`, author: bot };
     expect(parseLatestHumanClearedSha([plainAcceptAt222, laterClearHumanAt444])).toBe('4444444');
   });
 
