@@ -236,11 +236,14 @@ describe('operator task post-build', () => {
     expect(errors({ report: 'true' })).toContain('report must');
   });
   it('writes the flags through the existing scaffold renderer', () => {
-    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '', sessionRole: 'orchestrator' }, { title: 'Test', kind: 'investigation', operatorTask: true, operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'Report it.', edgeClone: 'review', 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready', report: true });
+    const filing = { title: 'Test', kind: 'investigation', operatorTask: true, operatorActor: OPERATOR_LOGINS[0], operatorChannel: 'operator console', operatorWords: 'Report it.', report: true };
+    const result = planScaffold({ existingIds: [], today: '2026-10-13', dir: '', sessionRole: 'orchestrator' }, filing);
     expect(result.content).toContain('operatorTask: true');
-    expect(result.content).toContain('edgeClone: "review"');
-    expect(result.content).toContain('liveProof: {"command":"printf \\"ready\\"","expect":"ready"}');
     expect(result.content).toContain('report: true');
+    // Edge-load and live-proof steps are off, so filing them is refused rather than recorded and ignored.
+    for (const extra of [{ edgeClone: 'review' }, { 'liveProof-command': 'printf "ready"', 'liveProof-expect': 'ready' }, { 'liveProof-expect': 'ready' }]) {
+      expect(() => planScaffold({ existingIds: [], today: '2026-10-13', dir: '', sessionRole: 'orchestrator' }, { ...filing, ...extra })).toThrow(/edgeClone and --liveProof-\* are refused/);
+    }
     expect(() => planScaffold({ existingIds: [], today: '2026-10-13' }, { title: 'Test', kind: 'investigation', edgeClone: '/tmp/daemon' })).toThrow(/edgeClone/);
     expect(() => planScaffold({ existingIds: [], today: '2026-10-13' }, { title: 'Test', kind: 'investigation', report: true })).toThrow(/require operatorTask: true/);
   });
@@ -291,7 +294,7 @@ describe('operator task post-build', () => {
     const parsed = parseOperationArgv(declaration, ['--title=we: operator report', '--kind=investigation',
       '--operatorTask', `--operatorActor=${OPERATOR_LOGINS[0]}`, '--operatorChannel=operator console', '--operatorWords=Report it.',
       '--priority=P0', '--scope=we:scripts/example.mjs', `--digest=${brief}`,
-      '--report', '--edgeClone=review', '--liveProof-command=printf ready', '--liveProof-expect=ready']);
+      '--report']);
     expect(parsed.errors).toEqual([]);
     const run = advanceWhileRunning(startRun({ op: 'file-item', id: 'operator-file', registry, input: parsed.input }), { registry });
     expect(readField(run.verdict.content, 'priority')).toBe('P0');
@@ -299,8 +302,7 @@ describe('operator task post-build', () => {
     expect(readField(run.verdict.content, 'preparedAgainstSha')).toBe(context.originMainSha);
     expect(run.verdict.content).toContain('operatorTask: true');
     expect(run.verdict.content).toContain('report: true');
-    expect(run.verdict.content).toContain('liveProof: {"command":"printf ready","expect":"ready"}');
-    expect(run.verdict.content).toContain('edgeClone: "review"');
+    expect(run.verdict.content).not.toMatch(/edgeClone|liveProof/);
     const root = process.cwd();
     // A card requesting a post-build step without operatorTask: true is refused, never silently composed.
     expect(() => readTick({

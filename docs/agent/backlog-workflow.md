@@ -1319,11 +1319,12 @@ fast-path admission so the card can build after preparation while disabled.
 
 ### Operator card post-build steps
 
-`we:scripts/operations/run.mjs file-item` accepts `--edgeClone=review|fix|control|drain|health-watch`,
-`--liveProof-command='<shell command>'`, `--liveProof-expect='<substring or /regex/flags>'`, and `--report`.
-**Edge-load and live-proof steps are off for every card.** Filing still records `edgeClone` and `liveProof`,
-and the standards gate still checks them, but `planOperatorPostBuild` never turns them into brief steps,
-whatever the card, settings or policy leaves say. They run commands named by card frontmatter, and the operator
+`we:scripts/operations/run.mjs file-item` declares `--edgeClone=review|fix|control|drain|health-watch`,
+`--liveProof-command='<shell command>'`, `--liveProof-expect='<substring or /regex/flags>'` (all refused for
+now, see above), and `--report`.
+**Edge-load and live-proof steps are off for every card.** Filing refuses `--edgeClone` and `--liveProof-*`
+(a step that never runs is not recorded), the standards gate still checks the fields on a hand-edited card,
+and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, and the operator
 record that would authorize them is still self-asserted. Turning them back on waits on verified operator-task
 authority (`we:backlog/xqqmw6g-verify-operator-task-authority-before-post-build-steps-run.md`). Only `--report`
 currently adds a step.

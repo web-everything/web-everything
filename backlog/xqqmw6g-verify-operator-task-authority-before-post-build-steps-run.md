@@ -4,7 +4,7 @@ size: 3
 status: active
 scaffoldedBy: "fix-5242"
 dateScaffolded: "2026-10-15"
-scope: ["we:scripts/operations/operator-task-brief.mjs", "we:scripts/backlog/operator-task.mjs", "we:scripts/lib/operator-task-settings.mjs", "we:scripts/settings/operator-task.json"]
+scope: ["we:scripts/operations/operator-task-brief.mjs", "we:scripts/backlog/operator-task.mjs", "we:scripts/lib/operator-task-settings.mjs", "we:scripts/settings/operator-task.json", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/lib/build-queue.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
@@ -21,6 +21,8 @@ Gate post-build steps on an operator-task status that is verified by a recorded 
 - build.operatorTask.enabled and the postBuild leaves gate those steps as documented in we:docs/agent/backlog-workflow.md.
 - The PR 5242 review finding on we:scripts/operations/operator-task-brief.mjs line 16 (the steps depend on self-asserted operatorTask frontmatter) is resolved.
 - renderOperatorEdgeStep and renderOperatorProofStep are wired back into planOperatorPostBuild, and the postBuild defaults in we:scripts/lib/operator-task-settings.mjs and we:scripts/settings/operator-task.json are revisited.
+- file-item accepts --edgeClone and --liveProof-* again (operatorTaskFields in we:scripts/backlog/operator-task.mjs refuses them while the steps are off).
+- The other treatments the same self-asserted record still grants are gated the same way, or explicitly ruled safe by the operator: the report step and the operatorPostBuild route flag it sets (which forces the agent route in we:scripts/operations/dispatch-lane-io.mjs), the operator-filing prepare stamp, and an explicit P0 in we:scripts/lib/build-queue.mjs.
 
 ## Edge cases
 - A card that copies a real operator record from another card.
