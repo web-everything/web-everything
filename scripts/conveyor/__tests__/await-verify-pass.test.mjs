@@ -753,8 +753,9 @@ describe('a failed store write or delete never repeats an effect (#5137 review)'
     for (let i = 0; i < 5; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
     expect(h.calls.rerequest).toEqual([]);
   });
-  it('re-request: with a working store the retry budget still bounds it (≤ maxRetries, then the infra resume)', async () => {
+  it('non-fix waits retain the original bounded infra exit', async () => {
     const h = harness();
+    h.store.set(rec().sessionId, rec({ kind: 'ci-heal' }));
     h.io.rerequest = (l) => { h.calls.rerequest.push(l); return { ok: true, status: 'requested' }; };
     h.state.marker = null;
     for (let i = 0; i < 6; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
@@ -1085,5 +1086,76 @@ describe('default IO includes and resumes wrapped workers', () => {
     const wrapped = Object.defineProperty([], 'incomplete', { value: [gap] });
     const io = await defaultAwaitVerifyIo({ dispatchIo: { defaultListAgents: () => [] }, listWrappedWorkers: () => wrapped });
     expect(io.listSessions().incomplete).toEqual([gap]);
+  });
+});
+
+// #5233: infra-only verification never spends another fixer turn.
+describe('verify-only infra retries', () => {
+  const retryPolicy = { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } },
+    sources: { 'infraRetry.maxAttempts': 'standard', 'infraRetry.backoffMinutes': 'platform' } };
+  const tick = (h, nowMs) => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, retryPolicy });
+  const blocked = () => {
+    const h = harness({ records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA } })] });
+    h.state.marker = marker('infrastructure-failure');
+    return h;
+  };
+  it.each(['green', 'red'])('backs off without a model, then uses the existing %s handoff', async (verdict) => {
+    const h = blocked();
+    const first = await tick(h, T0);
+    expect(first.rows[0]).toMatchObject({ action: 'infra-retry-scheduled' });
+    expect(first.rows[0].reason).toContain('maxAttempts=3 (standard)');
+    expect(first.rows[0].reason).toContain('backoffMinutes=15 (platform)');
+    expect(h.calls.resume).toHaveLength(0);
+    expect(h.calls.rerequest).toHaveLength(0);
+    await tick(h, T0 + 15 * 60_000 - 1);
+    expect(h.calls.rerequest).toHaveLength(0);
+    await tick(h, T0 + 15 * 60_000);
+    expect(h.calls.rerequest).toEqual([rec().lane]);
+    expect(h.calls.resume).toHaveLength(0);
+    expect([...h.store.values()][0]).toMatchObject({ sha: SHA, infraRetry: { attempts: 1 } });
+    h.state.marker = marker(verdict);
+    await tick(h, T0 + 16 * 60_000);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].session.sessionId).toBe(rec().sessionId);
+    expect(h.calls.resume[0].prompt).toContain(verdict === 'green' ? 'before/after evidence comment' : 'Verify is RED');
+    expect(h.calls.push).toHaveLength(verdict === 'green' ? 1 : 0);
+  });
+  it('retries an overdue running marker after backoff rather than waiting another full TTL', async () => {
+    const h = blocked(); h.state.marker = marker('running');
+    await tick(h, T0 + TTL + 1);
+    await tick(h, T0 + TTL + 15 * 60_000 + 1);
+    expect(h.calls.rerequest).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(0);
+  });
+  it('persists attempts across restarted passes and stops at the cap without waking a fixer', async () => {
+    const h = blocked();
+    await tick(h, T0);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await tick(h, T0 + attempt * 16 * 60_000);
+      h.state.marker = marker('infrastructure-failure');
+      await tick(h, T0 + (attempt * 16 + 1) * 60_000);
+    }
+    await tick(h, T0 + 100 * 60_000);
+    expect(h.calls.rerequest).toHaveLength(3);
+    expect(h.calls.resume).toHaveLength(0);
+    expect([...h.store.values()][0].infraRetry.exhausted).toBe(true);
+  });
+  it('does not retry a moved head or a dirty lane; a failed store cannot enqueue', async () => {
+    for (const state of [lane({ head: OTHER }), lane({ dirty: true })]) {
+      const h = blocked(); h.state.lane = state;
+      await tick(h, T0);
+      expect(h.calls.rerequest).toHaveLength(0);
+      expect(h.calls.resume[0].prompt).toContain('no longer matches');
+    }
+    const h = blocked(); h.io.writeRecord = () => ({ ok: false });
+    await tick(h, T0); await tick(h, T0 + 20 * 60_000);
+    expect(h.calls.resume).toHaveLength(0); expect(h.calls.rerequest).toHaveLength(0);
+  });
+  it('adopts an already-persisted infra resume without delivering it', async () => {
+    const h = blocked();
+    h.store.set(rec().sessionId, rec({ retries: 2, pendingResume: { kind: 'infra' } }));
+    await tick(h, T0);
+    expect(h.calls.resume).toHaveLength(0);
+    expect([...h.store.values()][0].pendingResume).toBeUndefined();
   });
 });

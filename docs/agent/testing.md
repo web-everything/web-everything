@@ -948,3 +948,20 @@ resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS Y
 findings before the first ruling.
 The queue routes needs-judgment questions to NEEDS YOU
 by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.
+
+### Fix verification infrastructure retries
+
+An await-verify `infra` verdict for a fix stays in the harness: it persists a same-head
+retry before requesting verification, with `verify.infraRetry.maxAttempts` (3) and
+`verify.infraRetry.backoffMinutes` (15) resolved through the policy cascade and logged
+with their sources. No model wakes during backoff or an infrastructure retry. Green
+uses the existing evidence/hand-back resume; a real red resumes the repair loop.
+Exhaustion is logged once and retains the infrastructure wait for operator recovery;
+it never creates a new fixer. Probe restart persistence, write failure, head movement,
+and both terminal verdicts with the pass's injected ports.
+
+`verify.gateCeiling` defaults to `load-scaled`, using rebuild smoke's bounded load/core
+factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute override.
+The gate job records the same resolved budget its supervisor used; admission waits
+still consume only the separate queue ceiling. Reconcile probes bound PIDs each pass
+and must discard a previous `pidAlive` value if the new probe is unknown.

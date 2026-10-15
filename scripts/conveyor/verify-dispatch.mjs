@@ -131,7 +131,9 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, loadavg, cpus } from 'node:os';
+import { smokeLoadFactor } from '../lib/daemon-live-smoke.mjs';
+import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { readVerifyMarker, VERIFY_FILENAME, verifyFinishBody, verificationInfrastructureFailure, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from '../lib/lane-verify.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -145,10 +147,16 @@ import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-set
  *  post-{@link GATE_STARTED_MARKER} phase — see {@link spawnGateBounded}. Overridable so tests don't need to
  *  wait 30 real minutes to prove the mechanism. */
 const DEFAULT_VERIFY_DISPATCH_TIMEOUT_MS = 30 * 60 * 1000;
-const VERIFY_DISPATCH_TIMEOUT_MS =
-  Number(process.env.VERIFY_DISPATCH_TIMEOUT_MS) > 0
-    ? Number(process.env.VERIFY_DISPATCH_TIMEOUT_MS)
-    : DEFAULT_VERIFY_DISPATCH_TIMEOUT_MS;
+/** Same bounded load/core factor as rebuild smoke; an explicit timeout stays absolute. */
+export function resolveGateCeiling({ env = process.env, policy = loadVerifyRecoverySettings({ env }),
+  load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+  const override = Number(env.VERIFY_DISPATCH_TIMEOUT_MS);
+  const mode = policy.value.gateCeiling;
+  const factor = mode === 'load-scaled' ? smokeLoadFactor(env, { load, cores }) : 1;
+  return { ms: Number.isFinite(override) && override > 0 ? override : Math.round(DEFAULT_VERIFY_DISPATCH_TIMEOUT_MS * factor),
+    factor: Number.isFinite(override) && override > 0 ? 1 : factor,
+    mode, source: Number.isFinite(override) && override > 0 ? 'env' : policy.sources.gateCeiling };
+}
 
 /** The literal marker `verify-lane.mjs` writes to its OWN stderr the instant before it runs the real gate
  *  command (see that file's call site) — the ONE signal this file needs to tell "still queuing" from "gate
@@ -632,7 +640,8 @@ export function killAdoptedGroup({ pid, runId }, { kill = process.kill.bind(proc
  * @returns {Promise<{pid:number}>}
  */
 export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate = spawnGateBounded, log: say = log,
-  onSpawn, onGateStarted, logPath = dispatchLogPath(dir) }) {
+  onSpawn, onGateStarted, logPath = dispatchLogPath(dir), gateCeiling = resolveGateCeiling() }) {
+  say(`  gate ceiling: ${gateCeiling.ms}ms, ${gateCeiling.mode} (${gateCeiling.source}), load factor ×${gateCeiling.factor}`);
   let owned = { ...marker, startedAt: null, requestStartedAt: marker.startedAt ?? null, runId };
   const args = [VERIFY_LANE_CLI, `--repo=${dir}`, '--json', `--run-id=${runId}`];
   if (marker.suites) args.push(`--gate=${marker.suites}`);
@@ -644,7 +653,7 @@ export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate
     logPath,
     onNotice: (line) => say(`  ${line.trim().replace(/^⚠ verify-lane:/, `⚠ ${pool}/lane-${lane}:`)}`),
     queueCeilingMs: QUEUE_PHASE_CEILING_MS,
-    gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS,
+    gateCeilingMs: gateCeiling.ms,
     // #4360 — the live proof this card's Proof plan needs: a real per-lane timestamp for when the gate
     // actually started (as opposed to when it was merely offered to the semaphore), so two lanes' overlap
     // can be shown from real evidence rather than assumed from the code shape.
@@ -656,7 +665,7 @@ export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate
     },
   }); } catch (error) { gate = Promise.reject(error); }
   return Promise.resolve(gate).catch((error) => {
-    const ceilingMs = error?.timedOutPhase === 'queue' ? QUEUE_PHASE_CEILING_MS : VERIFY_DISPATCH_TIMEOUT_MS;
+    const ceilingMs = error?.timedOutPhase === 'queue' ? QUEUE_PHASE_CEILING_MS : gateCeiling.ms;
     try { recordKilledVerification(dir, owned, error, ceilingMs); }
     catch (writeError) { say(`  ⚠ ${pool}/lane-${lane}: could not record infrastructure failure: ${writeError.message}`); }
     throw error;
@@ -664,8 +673,8 @@ export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate
 }
 
 /** The two ceilings in force for this process (the gate job reports them in its result). */
-export function gateCeilings() {
-  return { queueCeilingMs: QUEUE_PHASE_CEILING_MS, gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS };
+export function gateCeilings(gateCeiling = resolveGateCeiling()) {
+  return { queueCeilingMs: QUEUE_PHASE_CEILING_MS, gateCeilingMs: gateCeiling.ms };
 }
 
 /** Exposed for the gate job: the lane's marker (worktree-safe git-dir resolution) and HEAD. */
@@ -834,11 +843,12 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     inFlight?.set(dir, entry);
     if (!awaitSettle) dispatched.push({ pool, lane, sha: headSha, launched: true });
     log(`  dispatching verify for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${suites || 'default'})…`);
-    const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate, log,
+    const gateCeiling = resolveGateCeiling();
+    const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate, log, gateCeiling,
       onSpawn: (pid, path) => { entry.pid = pid; entry.logPath = path; } });
     return gate.then(
-      value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha }),
-      reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha }),
+      value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha, gateCeiling }),
+      reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha, gateCeiling }),
     ).catch((error) => {
       // Settlement (including marker reads/logging) must never leave an unhandled rejection.
       try { log(`  ⚠ ${pool}/lane-${lane}: settlement failed (non-fatal): ${error.message}`); } catch {}
@@ -852,7 +862,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     });
   });
 
-  function settle(result, { pool, lane, dir, headSha }) {
+  function settle(result, { pool, lane, dir, headSha, gateCeiling }) {
     if (result.status === 'fulfilled') {
       if (awaitSettle) dispatched.push({ pool, lane, sha: headSha });
       return;
@@ -875,7 +885,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     const timedOut = !!(e && e.timedOutPhase);
     if (timedOut) {
       const phase = e.timedOutPhase || 'gate';
-      const ceilingMs = phase === 'queue' ? QUEUE_PHASE_CEILING_MS : VERIFY_DISPATCH_TIMEOUT_MS;
+      const ceilingMs = phase === 'queue' ? QUEUE_PHASE_CEILING_MS : gateCeiling.ms;
       log(`  ⚠ ${pool}/lane-${lane}: verify-lane exceeded the ${ceilingMs}ms ${phase}-phase ceiling — killed (tree included). Recorded infrastructure failure for the still-owned request; inspect the cause before an explicit retry.`);
       recordFailure({ pool, lane, sha: headSha, timedOut: true, timedOutPhase: phase, infrastructure: markerFor(dir)?.infrastructure });
     } else if (status === 2) {

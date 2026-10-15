@@ -430,8 +430,9 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
     const alive = probe(Number.isInteger(a?.pid) ? a.pid : null);
+    const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
-      ...a,
+      ...fresh,
       laneHeadOid: cwd ? headCache.get(cwd) : null,
       ...(alive === null ? {} : { pidAlive: alive }),
     };
