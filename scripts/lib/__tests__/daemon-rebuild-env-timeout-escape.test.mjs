@@ -139,7 +139,8 @@ describe('env-timeout hold escape', () => {
   });
 
   it('adopts when a scan give-up reproduces with the same budget on every repo', async () => {
-    const scan = { ...failed[0], detail: `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: exited 1: ✗ ${scanText(60_000)}` };
+    // The repos run one after another, so the row clock spent both budgets.
+    const scan = { ...failed[0], ms: 181_000, detail: `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: exited 1: ✗ ${scanText(60_000)}` };
     const candidate = { verdict: 'env-timeout', smoke: { results: [scan] } };
     const reordered = { ...scan, detail: `reconcile-pass dry-run failed for 2/2 repo(s): b: exited 1: ✗ ${scanText(60_000)}; a: exited 1: ✗ ${scanText(120_000)}` };
     const ctx = context({ a: { smokeResult: candidate }, failedA: candidate.smoke.results,
@@ -147,8 +148,9 @@ describe('env-timeout hold escape', () => {
     expect((await envTimeout.run(ctx)).reason).toBe('env-timeout-adopted-not-worse');
   });
 
-  const killRow = (ms) => ({ ...failed[0], detail: `reconcile failed: timed out after ${ms}ms (process group killed)` });
-  const repoKills = (repos, total, ms) => ({ ...failed[0],
+  // A kill row's clock ran its cap.
+  const killRow = (ms) => ({ ...failed[0], ms, detail: `reconcile failed: timed out after ${ms}ms (process group killed)` });
+  const repoKills = (repos, total, ms) => ({ ...failed[0], ms,
     detail: `reconcile-pass dry-run (${repos.length}/${total} repo(s) — ${repos.join(', ')}) failed: timed out after ${ms}ms (process group killed)` });
   const runWith = (candidateRow, controlRow) => {
     const candidate = { verdict: 'env-timeout', smoke: { results: [candidateRow] } };
@@ -280,6 +282,20 @@ describe('env-timeout hold escape', () => {
     const { r, ctx } = await runWith({ ...failed[0], detail: candidateDetail }, { ...failed[0], detail: controlDetail });
     expect(r.reason).toBe('smoke-env-timeout');
     expect(ctx.finalize).not.toHaveBeenCalled();
+  });
+
+  // One row clock covers every repo of a reconcile row: a scan unit that quit early cannot borrow a sibling's time.
+  const scanAndKill = (killMs) => `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: timed out after ${killMs}ms (process group killed)`;
+  const twoScans = `reconcile-pass dry-run failed for 2/2 repo(s): a: exited 1: ✗ ${scanText(120_000)}; b: exited 1: ✗ ${scanText(120_000)}`;
+  it.each([
+    ['a scan unit whose time a sibling kill spent', { ms: 151_000, detail: scanAndKill(150_000) }, { ms: 275_000, detail: scanAndKill(150_000) }, false],
+    ['two scan units that could not both have spent their budget', { ms: 110_000, detail: twoScans }, { ms: 250_000, detail: twoScans }, false],
+    ['a control that could not have spent both budgets', { ms: 250_000, detail: twoScans }, { ms: 230_000, detail: twoScans }, false],
+    ['rows whose clocks cover every unit', { ms: 271_000, detail: scanAndKill(150_000) }, { ms: 275_000, detail: scanAndKill(150_000) }, true],
+  ])('multi-repo row clock: %s', async (_label, candidate, control, adopted) => {
+    const { r, ctx } = await runWith({ ...failed[0], ...candidate }, { ...failed[0], ...control });
+    expect(r.reason).toBe(adopted ? 'env-timeout-adopted-not-worse' : 'smoke-env-timeout');
+    if (!adopted) expect(ctx.finalize).not.toHaveBeenCalled();
   });
 
   it('does not report a textual control skip as a reproduced timeout', async () => {

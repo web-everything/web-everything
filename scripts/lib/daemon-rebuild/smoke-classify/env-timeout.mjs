@@ -90,17 +90,19 @@ function timeoutProfile(row, side) {
 // about as long as the candidate (the 0.9 kill tolerance of isEnvTimeoutRow). A scan budget is set by the gate
 // (the same widened value on both runs) and is not cut by the deadline, so it must match exactly: a smaller printed
 // candidate budget means the candidate broke its own scan budget — code, not load. A scan gives up only once its
-// budget elapsed, so each row's own clock must show it spent that budget (a scan quitting early is code too).
+// budget elapsed, so each row's own clock must show it spent that budget (a scan quitting early is code too). A
+// reconcile row's units run one after another under ONE row clock: it must cover the SUM of that side's budgets, or a
+// unit that quit early would count time a sibling repo spent. A control budget the summary hides (NaN) adds nothing.
 function sameTimeout(candidateRow, controlRow) {
   const want = timeoutProfile(candidateRow, 'candidate');
   const got = timeoutProfile(controlRow, 'control');
   const spent = Number(controlRow.ms);
   const took = Number(candidateRow.ms);
-  const covers = (w, g) => g?.kind === w.kind && (w.kind === 'scan'
-    ? g.budget === w.budget && took >= w.budget * 0.9 && spent >= g.budget * 0.9
-    : g.budget >= w.budget);
+  const spentAll = (units, ms) => ms >= [...units.values()].reduce((sum, u) => sum + (Number.isFinite(u.budget) ? u.budget : 0), 0) * 0.9;
+  const covers = (w, g) => g?.kind === w.kind && (w.kind === 'scan' ? g.budget === w.budget : g.budget >= w.budget);
   return !!want && !!got && candidateRow.name === controlRow.name
     && Number.isFinite(spent) && Number.isFinite(took) && spent >= took * 0.9
+    && spentAll(want, took) && spentAll(got, spent)
     && [...want].every(([unit, w]) => covers(w, got.get(unit)));
 }
 
