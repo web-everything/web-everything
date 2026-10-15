@@ -2,8 +2,10 @@ import { validateBacklogItem } from '../../check-standards-rules.mjs';
 import { planScaffold } from '../scaffold.mjs';
 import { composeOperatorTaskBrief, planOperatorPostBuild, renderOperatorEdgeStep, renderOperatorProofStep, resolveOperatorPostBuild } from '../operator-task-brief.mjs';
 import { readFileSync } from 'node:fs';
-import { readTick, routeDispatchProvider } from '../dispatch-lane-io.mjs';
-import { shapeDispatchRead, fillBrief } from '../dispatch-lane.mjs';
+import { readTick, routeDispatchProvider, createDispatchSinks } from '../dispatch-lane-io.mjs';
+import { shapeDispatchRead, fillBrief, dispatchLaneOperation, DISPATCH_LANE_OP, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+import { applyPendingEffects } from '../effect-executor.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
 import { renderOperatorReport } from '../../worker-brief.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { planFileItem, fileItemOperation } from '../file-item.mjs';
@@ -306,6 +308,67 @@ describe('operator task post-build', () => {
       agent: request => { seen = request; return 'agent-handle'; },
     })).toBe('agent-handle');
     expect(seen.prompt).toBe(shaped.prompt);
+  });
+  // The route flag crosses three hops with no shared type: readTick's verdict -> shapeDispatchRead -> the
+  // dispatch-lane effect payload -> createDispatchSinks' provider request. Run the real chain (default sink router,
+  // stub spawner) with build forced mechanical, so a hop that drops the flag sends the card to the wrapper, which
+  // cannot post the report. The ordinary card is the control: it must reach the wrapper.
+  async function dispatchOperatorCard(extra) {
+    const num = '9101';
+    const registry = createRegistry();
+    registry.register(dispatchLaneOperation({
+      readTick: asked => readTick({
+        ...asked,
+        runNode: () => JSON.stringify({
+          decisions: { spawnBuilds: [{ num, lane: 4 }], spawnPrepareScope: [], spawnPrepareDecision: [], spawnInvestigations: [],
+            spawnFixes: [], spawnCiHeals: [], suppressedBuilds: [], statusLine: '', notes: [] },
+          nextState: { tick: 1, buildGuards: [{ num, lane: 4, spawnedTick: 0 }] },
+        }),
+        readText: path => readFileSync(path, 'utf8'),
+        loadItems: () => [{ num, slug: 'operator-route', scope: ['we:scripts/worker-brief.mjs'], size: 3, ...extra }],
+        listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+        listAgents: () => [],
+        checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+        checkBuildDelivery: () => null,
+        readScorecards: () => [],
+        readDeliveryAgentOverride: () => null,
+        dispatchModes: () => ({}),
+      }),
+    }));
+    const spawned = [];
+    const wrapped = [];
+    const run = advanceWhileRunning(startRun({ op: DISPATCH_LANE_OP, id: `run-${num}`, input: { num }, registry }), { registry });
+    const outcome = await applyPendingEffects(run, {
+      sinks: createDispatchSinks({
+        root: '/primary/webeverything',
+        modes: { build: 'mechanical' },
+        registry: { build: { provider: request => { wrapped.push(request); return { handle: 'wrapper' }; } } },
+        scriptExists: () => true,
+        probationLaunch: 'off',
+        reserveLane: () => ({ reserved: false }),
+        spawnAgent: (argv, opts) => { spawned.push({ argv, opts }); return 'backgrounded · 1ae0905c · x\n'; },
+        mintSessionId: () => 'sess-9101',
+        now: () => new Date('2026-10-15T10:00:00.000Z'),
+      }),
+      store: createMemoryRunStore(),
+    });
+    const effect = outcome.run.effects.find(e => e.type === DISPATCH_EFFECT);
+    return { read: run.findings.read, effect, spawned, wrapped };
+  }
+  it('carries operatorPostBuild from the read verdict through the effect payload to the agent route', async () => {
+    const operator = await dispatchOperatorCard({ ...OP, report: true });
+    expect(operator.read.operatorPostBuild).toBe(true);
+    expect(operator.effect.payload.operatorPostBuild).toBe(true);
+    expect(operator.wrapped).toEqual([]);
+    expect(operator.spawned).toHaveLength(1);
+    expect(operator.spawned[0].argv.join('\n')).toContain('<!-- operator-task-report -->');
+    // Control: the same card without the report step takes the mechanical wrapper, with the flag false on every hop.
+    const ordinary = await dispatchOperatorCard({ ...OP, report: false });
+    expect(ordinary.read.operatorPostBuild).toBe(false);
+    expect(ordinary.effect.payload.operatorPostBuild).toBe(false);
+    expect(ordinary.spawned).toEqual([]);
+    expect(ordinary.wrapped).toHaveLength(1);
+    expect(ordinary.wrapped[0].operatorPostBuild).toBe(false);
   });
   it('derives operatorPostBuild from the card decision, never from prompt text', () => {
     const card = extra => [{ num: '123', slug: 'test', scope: ['we:scripts/worker-brief.mjs'], ...extra }];
