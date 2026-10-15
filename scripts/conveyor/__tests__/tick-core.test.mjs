@@ -23,6 +23,7 @@ import {
   retireFixGuards,
   clearTerminalFixAttempts,
   planCiHealSpawns,
+  ciHealFloorFromComments,
   retireCiHealGuards,
   clearTerminalCiHealAttempts,
   armWatchers,
@@ -46,7 +47,7 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
-import { ciHealBudgetEvidence, buildCiHealComment } from '../ci-heal-mark.mjs';
+import { buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
@@ -2311,9 +2312,10 @@ describe('CI-heal reset refund through the tick evidence path (#5968)', () => {
   ];
   const threeBefore = () => [heal('2026-10-09T16:00:00Z'), heal('2026-10-09T19:00:00Z'), heal('2026-10-10T21:00:00Z')];
   // What the tick's durable comment read hands the planner for one PR.
+  // The production helper `main()` calls for each PR's durable comment read.
   const evidenceFor = (comments, o = {}) => {
-    const e = ciHealBudgetEvidence(comments, o);
-    return { prCiHealCounts: { 99: e.chargeable }, prCiHealRefunds: { 99: e.refunded } };
+    const floor = ciHealFloorFromComments(comments, { policy: { resetOnFixHead: true }, restore: true, ...o });
+    return { prCiHealCounts: { 99: floor.count }, prCiHealRefunds: { 99: floor.refunded } };
   };
   const base = { prs: [{ num: 40, prNumber: 99, state: 'OPEN', ci: 'fail', labels: ['ready-to-merge'] }], launchedNums: [40], availableLanes: [5] };
 
@@ -2362,9 +2364,13 @@ describe('CI-heal reset refund through the tick evidence path (#5968)', () => {
     expect(args).toMatchObject({ prCiHealCounts: { 99: 0 }, prCiHealRefunds: { 99: 3 } }); // not 3 + 2
   });
   it('reset disabled: durable heals all count and nothing is refunded', () => {
-    const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush], { resetOnFixHead: false }) };
+    const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush], { policy: { resetOnFixHead: false } }) };
     expect(args).toMatchObject({ prCiHealCounts: { 99: 3 }, prCiHealRefunds: { 99: 0 } });
     expect(planCiHealSpawns({ ...args, ciHealAttempts: {} }).notes[0]).toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3 });
+  });
+  it('the helper defaults to the environment policy and ignores non-array input', () => {
+    expect(ciHealFloorFromComments([...threeBefore(), ...fixPush])).toEqual({ count: 0, refunded: 3 });
+    expect(ciHealFloorFromComments(null)).toEqual({ count: 0, refunded: 0 });
   });
   it('through planTick: a queue-held launch rolls the gross tally back to its prior value', () => {
     const args = evidenceFor([...threeBefore(), ...fixPush]);

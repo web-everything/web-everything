@@ -240,8 +240,9 @@ export function ciHealBudgetResetAt(comments) {
 
 /**
  * PURE: drop heal markers PROVEN to predate the reset — a finite timestamp at or before a finite cutoff. A heal whose
- * time cannot be established (missing, invalid, a bare string) stays charged: fail closed, never refund on a guess
- * (#5968). Every non-heal comment stays, so attributed-window evidence survives.
+ * time cannot be established (missing or invalid) stays in the list and so stays charged: fail closed, never refund
+ * on a guess (#5968). (A bare-string comment has no author, so the counter never counts it either way.) Every
+ * non-heal comment stays, so attributed-window evidence survives.
  */
 function healCommentsSince(comments, resetAt) {
   const list = Array.isArray(comments) ? comments : [];
@@ -261,12 +262,12 @@ function healCommentsSince(comments, resetAt) {
  * `onlyReason`; an unreadable reason stays charged) → minus those proven before the fix-head reset → minus those
  * inside an attributed-main window. Refunds are the DIFFERENCES between successive counts, so an attempt covered by
  * both the reset and a window is refunded once. `reset` may be injected (already resolved); an invalid one is no reset.
- * @returns {{chargeable:number, reset:{at:string,by:string,sha:string}|null, spentBeforeReset:number, windowRefunded:number, refunded:number, comments:Array}}
+ * @returns {{chargeable:number, reset:{at:string,by:string,sha:string}|null, spentBeforeReset:number, windowRefunded:number, refunded:number}}
  */
 export function ciHealBudgetEvidence(comments, { resetOnFixHead = true, restore = true, onlyReason = null, reset } = {}) {
   const list = Array.isArray(comments) ? comments : [];
-  const found = reset !== undefined ? reset : (resetOnFixHead ? ciHealBudgetResetAt(list) : null);
-  const proven = resetOnFixHead && found && Number.isFinite(Date.parse(found.at)) ? found : null;
+  const found = !resetOnFixHead ? null : reset !== undefined ? reset : ciHealBudgetResetAt(list);
+  const proven = found && Number.isFinite(Date.parse(found.at)) ? found : null;
   const narrowed = onlyReason ? list.filter((c) => {
     const reason = ciHealCommentReason(typeof c === 'string' ? c : c?.body);
     return reason === null || reason === onlyReason;
@@ -277,7 +278,7 @@ export function ciHealBudgetEvidence(comments, { resetOnFixHead = true, restore 
   const chargeable = countChargeableCiHealComments(afterReset, { restore });
   return {
     chargeable, reset: proven, spentBeforeReset: raw - sinceReset, windowRefunded: sinceReset - chargeable,
-    refunded: raw - chargeable, comments: afterReset,
+    refunded: raw - chargeable,
   };
 }
 

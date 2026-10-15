@@ -633,14 +633,16 @@ describe('ciHealBudgetEvidence — shared reset + attributed-window accounting (
     expect(ciHealBudgetEvidence([begin, fixEnd(), heal(RESET)]).chargeable).toBe(0);
     expect(ciHealBudgetEvidence([begin, fixEnd(), heal('2026-10-11T02:06:49Z')]).chargeable).toBe(1);
   });
-  it('charges a heal whose time cannot be established (missing, invalid, bare string) — fail closed', () => {
-    for (const odd of [heal(undefined), heal('not-a-date'), heal(null), `${CI_HEAL_COMMENT_MARKER}\nbare`]) {
-      expect(ciHealBudgetEvidence([begin, fixEnd(), heal('2026-10-09T16:00:00Z'), odd])).toMatchObject({ chargeable: typeof odd === 'string' ? 0 : 1, spentBeforeReset: 1 });
+  it('charges a heal whose time cannot be established (missing, invalid) — fail closed', () => {
+    for (const odd of [heal(undefined), heal('not-a-date'), heal(null)]) {
+      expect(ciHealBudgetEvidence([begin, fixEnd(), heal('2026-10-09T16:00:00Z'), odd])).toMatchObject({ chargeable: 1, spentBeforeReset: 1 });
     }
+    // a bare-string comment carries no author, so it is never counted — charged or refunded
+    expect(ciHealBudgetEvidence([begin, fixEnd(), `${CI_HEAL_COMMENT_MARKER}\nbare`])).toMatchObject({ chargeable: 0, spentBeforeReset: 0 });
     // an undated heal alongside three dated ones before the reset: 3 refunded, 1 charged
     expect(ciHealBudgetEvidence([...history().slice(0, 5), heal(undefined)]).chargeable).toBe(1);
   });
-  it('is not reset by an untrusted fix-end, an unchanged sha, or when the setting is off', () => {
+  it('is not reset by an untrusted fix-end, an unchanged sha (ci-heal-attempts.test.mjs), or when the setting is off', () => {
     expect(ciHealBudgetEvidence([begin, fixEnd(RESET, { login: 'outsider' }), ...history().slice(2)]).chargeable).toBe(4);
     expect(ciHealBudgetEvidence(history(), { resetOnFixHead: false })).toMatchObject({ chargeable: 4, reset: null, spentBeforeReset: 0 });
   });

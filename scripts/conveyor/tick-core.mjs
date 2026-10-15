@@ -160,6 +160,7 @@ import { createQueueBudget, dispatchDemandMinutes, DEFAULT_ARRIVAL_WINDOW_MINUTE
 import { readPreparePolicy } from './prepare-policy-settings.mjs';
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
+import { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } from './ci-heal-mark.mjs'; // #5968 — the shared CI-heal budget calculation
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
@@ -910,6 +911,18 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
     newGuards.push({ pr, num: p.num, lane, ...spawnStamp(tick, now) });
   }
   return { spawns, newGuards, ciHealAttempts: nextAttempts, consumedLanes, notes };
+}
+
+/**
+ * PURE (#5968): the durable CI-heal floor for one PR, read off its comments with the SAME shared calculation reconcile
+ * and landing use — `count` is what is still chargeable, `refunded` is every attempt a proven fix-head reset or an
+ * attributed-main window removed (each counted once). `planCiHealSpawns` takes both: it subtracts `refunded` from its
+ * gross in-session tally, so a refund is never applied twice. `policy`/`restore` default to the environment's.
+ * @returns {{count:number, refunded:number}}
+ */
+export function ciHealFloorFromComments(comments, { policy = resolveCiHealBudget({ env: process.env }), restore = resolveCiHealBudgetRestore(process.env) } = {}) {
+  const { chargeable, refunded } = ciHealBudgetEvidence(comments, { resetOnFixHead: policy.resetOnFixHead, restore });
+  return { count: chargeable, refunded };
 }
 
 /**
@@ -2130,8 +2143,6 @@ async function main(argv) {
   // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
   // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
   const { countRearmComments } = await import('./rearm-review.mjs');
-  const { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } = await import('./ci-heal-mark.mjs');
-  const ciHealPolicy = resolveCiHealBudget({ env: process.env });
   const prRearmCounts = {};
   const prCiHealCounts = {};
   const prCiHealRefunds = {};
@@ -2160,10 +2171,9 @@ async function main(argv) {
       const comments = JSON.parse(raw)?.comments;
       if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments);
       if (wantsCiHeal) {
-        // One shared calculation (#5968): the same reset + attributed-window evidence reconcile and landing read.
-        const evidence = ciHealBudgetEvidence(comments, { resetOnFixHead: ciHealPolicy.resetOnFixHead, restore: resolveCiHealBudgetRestore(process.env) });
-        prCiHealCounts[p.prNumber] = evidence.chargeable;
-        prCiHealRefunds[p.prNumber] = evidence.refunded;
+        const floor = ciHealFloorFromComments(comments);
+        prCiHealCounts[p.prNumber] = floor.count;
+        prCiHealRefunds[p.prNumber] = floor.refunded;
       }
     } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
   }
