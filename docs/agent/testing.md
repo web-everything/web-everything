@@ -958,3 +958,6 @@ retains additive caps. Each cap anchors to its own counter on the thread prefix 
 never use the current durable count map as historical evidence. Open send-back allowances use
 trusted fix-end comments after the latest open operator ceremony and `fix.operatorRulingExtraRounds`.
 Set that allowance to zero in tests isolating the older `operatorFixBudget` mechanism.
+An open send-back allowance must preserve the takeover gate predicate: a reviewed head with zero
+open defects and an own-gate hold still goes through cap handling for its advisory or operator note.
+Replay human, awaiting-base, stacked-base, review-gate and merge-gate holds alongside the allowance.

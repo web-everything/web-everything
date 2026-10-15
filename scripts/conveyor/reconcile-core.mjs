@@ -109,7 +109,7 @@ import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-s
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -1696,8 +1696,13 @@ function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountToward
 }
 
 /** A latest open send-back buys a bounded repair opportunity, even after the ordinary cap. */
-export function operatorSendBackRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT } = {}) {
+export function operatorSendBackRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT,
+  defaultBranch = 'main' } = {}) {
   if (!Number.isInteger(allowance) || allowance <= 0 || threadMayBeTruncated(pr)) return null;
+  // Match the takeover gate: a reviewed head with no open defect is waiting on its own gate,
+  // not another repair. Leave cap handling to supply the owed advisory or operator handoff.
+  const defects = openDefects(pr?.comments, pr?.headRefOid ?? null);
+  if (defects?.count === 0 && gateHoldReason(pr, { defaultBranch })) return null;
   const latest = openOperatorSendBacks(pr).at(-1);
   if (!latest) return null;
   const used = pr.comments.slice(latest.index + 1).filter(c => isTrustedMarkerAuthor(c)
@@ -2338,7 +2343,7 @@ export function planReconcile({
     // The shared round count — see REFUSAL 3 below for why it is a `Math.max` over three durable sources.
     const roundAttempts = () => sharedRoundAttempts(pr, { durableCount: counts[prNumber],
       realFixRounds, operatorBudget, mechanicalRoundsCountTowardCap });
-    const sendBackRound = operatorSendBackRound(pr, { allowance: operatorRulingExtraRounds.value });
+    const sendBackRound = operatorSendBackRound(pr, { allowance: operatorRulingExtraRounds.value, defaultBranch });
     const sendBackRoundFields = sendBackRound ? { operatorSendBackRound: { ...sendBackRound,
       setting: `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}`, source: operatorRulingExtraRounds.source } } : {};
     const sendBackRoundWhy = `open operator send-back grants a repair round via fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;

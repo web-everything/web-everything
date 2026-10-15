@@ -45,6 +45,22 @@ describe('grants anchored to spent rounds', () => {
 });
 
 describe('open operator send-back past the cap', () => {
+  it.each([
+    { labels: [{ name: 'review:changes' }, { name: 'review:human' }] },
+    { labels: [{ name: 'review:changes' }, { name: 'review-status:awaiting-base' }] },
+    { baseRefName: 'lane/base' },
+    { statusCheckRollup: [{ name: 'merge-gate', conclusion: 'FAILURE' }] },
+    { statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] },
+  ])('preserves a gate hold after a review leaves no open defects: %j', over => {
+    const comments = [...Array.from({ length: 8 }, round), sendBack, round(), round(),
+      { author: bot, body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${'0'.repeat(40)}..${'a'.repeat(40)}\`` }];
+    const p = { comments, headRefOid: 'a'.repeat(40), baseRefName: 'main', ...over };
+    expect(core.operatorSendBackRound(p)).toBeNull();
+    expect(plan(comments, { roundCapAction: 'takeover', takeoverBudget: 2 }, over).dispatch).toEqual([]);
+    // A repository's default branch is not a stacked-base hold.
+    expect(core.operatorSendBackRound({ ...p, labels: [], statusCheckRollup: [], baseRefName: 'trunk' },
+      { defaultBranch: 'trunk' })).toMatchObject({ sendBackId: 'operator', used: 0 });
+  });
   it.each([false, true])('dispatches its directed allowance, prior fixer chance=%s', chance => {
     const result = plan([...Array.from({ length: 8 }, round), sendBack, round(), round()], {}, { headRefOid: (chance ? 'b' : 'a').repeat(40) });
     expect(result.dispatch[0]).toMatchObject({ kind: 'fix', ...(chance ? { mode: 'ruling-not-addressed' } : {}),
