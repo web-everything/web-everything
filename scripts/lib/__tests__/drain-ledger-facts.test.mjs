@@ -57,6 +57,26 @@ describe('drain ledger facts', () => {
     expect(plan(events, { reviewGate: {} })).toMatchObject([{ type: 'release', reasonCode: 'review', holdSource: 'drain' }]);
     expect(plan(events, { decision: 'skip', reviewGate: {} })).toEqual([]);
   });
+  it('writes no fact of any kind for a head the drain did not decide to merge', () => {
+    // The review gate runs before the CI, CodeQL, conflict and red-main holds; only the final decision may clear.
+    const cases = [
+      ['exempt', [], { reviewGate: { reviewExempt: true } }],
+      ['restamped', [verdict('accepted')], { reviewGate: { acceptedMerge: true } }],
+      ['released', [event('hold', { reasonCode: 'ci', holdSource: 'drain' })], { reviewGate: {} }],
+    ];
+    for (const [kind, events, gate] of cases) {
+      expect(plan(events, { ...gate, decision: 'merge' }), kind).toHaveLength(1);
+      for (const decision of ['skip', undefined, null, 'MERGE', 'merge ']) {
+        expect(plan(events, { ...gate, decision }), `${kind} on decision ${decision}`).toEqual([]);
+      }
+    }
+    const writes = [];
+    const result = recordDrainLedgerFacts({ localSlug: repo, now: () => now, read: () => [verdict('accepted')],
+      append: row => { writes.push(row); return { ok: true }; },
+      verdicts: [{ ...v, decision: 'skip', reviewGate: { reviewExempt: true, acceptedMerge: true } }] });
+    expect(result).toMatchObject({ ok: true, appended: { exempt: 0, restamped: 0, released: 0 } });
+    expect(writes).toEqual([]);
+  });
   it('rejects foreign repos and invalid heads or PR numbers', () => {
     for (const overrides of [{ repo: 'other/r' }, { num: 'x' }, { num: 0 }, { listedHeadSha: 'abc' }]) expect(plan([], overrides)).toEqual([]);
   });

@@ -1,6 +1,7 @@
 /**
  * The drain writes three facts: no-review head exemptions, carried-acceptance restamps,
- * and releases of its open holds. Additive and fail-soft: recording never throws or
+ * and releases of its open holds, each only for a PR the drain finally decided to merge (a skipped head gets no
+ * fact that could clear it). Additive and fail-soft: recording never throws or
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
 import { readFileSync } from 'node:fs';
@@ -30,6 +31,9 @@ function planRows({ verdicts, repo, events, now }, emit) {
     return checked.record;
   });
   for (const v of verdicts) {
+    // One eligibility check for every fact kind: each one can clear the ledger, and the review gate that set
+    // `reviewGate` runs before the CI, CodeQL, conflict and red-main holds. Only the final merge decision counts.
+    if (v?.decision !== 'merge') continue;
     const pr = Number(v?.num);
     if (slug(v.repo || repo) !== slug(repo) || !Number.isInteger(pr) || pr <= 0) continue;
     const rawHead = v.listedHeadSha || v.headSha;
@@ -49,7 +53,6 @@ function planRows({ verdicts, repo, events, now }, emit) {
       emit('restamped', buildVerdictRecord, { ...common, verdict: 'restamped', headSha: head,
         reason: `drain carried the acceptance from ${old ? old.slice(0, 8) : 'no head'} to ${head.slice(0, 8)}: its review gate verified the accepted content still covers this head (no new review)` });
     }
-    if (v.decision !== 'merge') continue;
     const last = new Map();
     for (const e of mine) if (e.holdSource === 'drain' && [EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE].includes(e.type)) last.set(e.reasonCode, e);
     for (const [reasonCode, e] of last) if (e.type === EVENT_TYPES.HOLD) {
