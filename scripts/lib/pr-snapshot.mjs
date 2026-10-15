@@ -27,17 +27,25 @@
  * a burst of writes cannot turn into a refresh per write. Single-flight: one process refreshes under a file
  * lock; the rest wait for its result instead of fetching in parallel.
  *
+ * SMOKE ONLY: WE_PR_SNAPSHOT_SAMPLE caps the returned projection to the oldest PRs.
+ * WE_PR_SNAPSHOT_STALE_OK_MS serves snapshots within that age despite TTL/dirty marks; beyond the normal
+ * TTL it schedules one detached refresh per repo/process. Marked rebuild-smoke dry-run children inherit
+ * unset controls from their own tree's rebuildSmokeDryRun settings; other processes preserve normal reads.
+ *
  * COST: refreshes use small GraphQL pages configured by `prListPaging` (see pr-list-paged.mjs), without
  * comments/body/files. Per-PR `gh pr view` hydrates those heavy fields only when their cached identity or age
  * is stale; unchanged PRs reuse the previous snapshot's heavy fields.
  */
 import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
+import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
 import { listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
-import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry } from './gh-throttle.mjs';
+import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry, WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
 import {
   PR_SNAPSHOT_VERSION, prSnapshotEnabled, prSnapshotDir, snapshotKey, snapshotPath, readSnapshotFile, latestDirtyMs,
 } from './pr-snapshot-store.mjs';
@@ -49,6 +57,69 @@ export const SNAPSHOT_FIELDS = Object.freeze([
   'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
   'labels', 'files', 'comments', 'statusCheckRollup',
 ]);
+
+/** Smoke-only controls; unset keeps the normal snapshot read unchanged. */
+export const WE_PR_SNAPSHOT_SAMPLE = 'WE_PR_SNAPSHOT_SAMPLE';
+export const WE_PR_SNAPSHOT_STALE_OK_MS = 'WE_PR_SNAPSHOT_STALE_OK_MS';
+/** Controls that must not escape into a refresh which can outlive the smoke. */
+export const SMOKE_SCOPED_ENV_KEYS = Object.freeze([
+  WE_GH_READ_MEMO_DIR, WE_PR_SNAPSHOT_SAMPLE, WE_PR_SNAPSHOT_STALE_OK_MS,
+  'WE_SMOKE_LIVE_CLONE', 'WE_SMOKE_PR_SAMPLE', 'WE_SMOKE_SNAPSHOT_STALE_OK_MS',
+]);
+function refreshEnv(env) {
+  const clean = { ...env };
+  for (const key of SMOKE_SCOPED_ENV_KEYS) delete clean[key];
+  return clean;
+}
+const refreshStarted = new Set();
+let sampleLogged = false;
+let candidateDefaultsLogged = false;
+const positiveInteger = value => /^\d+$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 0;
+
+function isSmokeDryRunChild() {
+  return /(?:^|[/\\])scripts[/\\]conveyor[/\\]reconcile-pass\.mjs$/.test(process.argv[1] ?? '')
+    || process.execArgv.some(arg => arg === '-e' || arg === '--eval' || arg.startsWith('--eval='));
+}
+
+function candidateSmokeEnv(env, smokeChild) {
+  if (!env.WE_SMOKE_LIVE_CLONE || !smokeChild) return env;
+  const sampleUnset = env[WE_PR_SNAPSHOT_SAMPLE] === undefined;
+  const staleUnset = env[WE_PR_SNAPSHOT_STALE_OK_MS] === undefined;
+  if (!sampleUnset && !staleUnset) return env;
+  const settings = resolveSmokeDryRun(env);
+  const effective = { ...env,
+    ...(sampleUnset ? { [WE_PR_SNAPSHOT_SAMPLE]: String(settings.prSample) } : {}),
+    ...(staleUnset ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(settings.snapshotStaleOkMs) } : {}),
+  };
+  if (!candidateDefaultsLogged) {
+    candidateDefaultsLogged = true;
+    const sources = `prSample=${sampleUnset ? settings.sources.prSample : 'env'}, snapshotStaleOkMs=${staleUnset ? settings.sources.snapshotStaleOkMs : 'env'}`;
+    console.error(`pr-snapshot: rebuild-smoke candidate defaults — sample ${positiveInteger(effective[WE_PR_SNAPSHOT_SAMPLE])}, staleOk ${positiveInteger(effective[WE_PR_SNAPSHOT_STALE_OK_MS])} (source ${sources})`);
+  }
+  return effective;
+}
+
+function smokeProjection(snap, fields, env) {
+  const sample = positiveInteger(env[WE_PR_SNAPSHOT_SAMPLE]);
+  if (!sample) return projectPrs(snap.prs, fields);
+  if (!sampleLogged) {
+    sampleLogged = true;
+    console.error(`pr-snapshot: smoke sample — ${sample} oldest of ${snap.prs.length} open PRs (WE_PR_SNAPSHOT_SAMPLE)`);
+  }
+  const oldest = [...snap.prs].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.number - b.number);
+  return projectPrs(oldest.slice(0, sample), fields);
+}
+
+function detachedRefresh({ repo, fields, env, dir }) {
+  // The injected seam can observe scheduling in tests; real background processes never run there.
+  if (isUnderTest(env) || isUnderTest()) return;
+  const childEnv = refreshEnv({ ...process.env, ...env, WE_PR_SNAPSHOT_DIR: dir });
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--refresh', `--repo=${repo}`, `--fields=${fields.join(',')}`], {
+    detached: true, stdio: 'ignore', env: childEnv,
+  });
+  child.on('error', () => {}); // best-effort; serving a snapshot never depends on refresh success
+  child.unref();
+}
 
 export const DEFAULT_TTL_MS = 75_000;
 /** Minimum age before a DIRTY snapshot is refreshed — bounds refresh spend under a write burst. */
@@ -130,32 +201,46 @@ function logHit(env, caller, repo) {
 /**
  * The shared open-PR read. Returns the projected PR array, or `null` when not applicable (see the file header).
  * @param {{repo:string|null, fields:string|string[], env?:NodeJS.ProcessEnv, nowMs?:number, exec?:Function,
- *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object}} o
+ *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object, spawnRefresh?:Function,
+ *   smokeChild?:boolean}} o
+ *   `smokeChild`: defaults to the reconcile CLI or Node eval launch; with WE_SMOKE_LIVE_CLONE, fills unset smoke controls.
  *   `allowDeferred`: opt in to receiving the truthy `{outcome:'deferred-low-budget'}` object (the caller MUST
  *   check `isGhDeferred`); by default a deferral returns `null`, keeping the `Array|null` contract for every reader.
  * @returns {Array<object>|null}
  */
 export function readSharedOpenPrs({
-  repo, fields, env = process.env, now = () => Date.now(), exec = execFileSyncThrottled,
+  repo, fields, env = process.env, now = () => Date.now(), exec,
   dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false,
-  paging = null,
+  paging = null, spawnRefresh = null, smokeChild = isSmokeDryRunChild(),
 } = {}) {
   if (!prSnapshotEnabled(env) && !dir) return null;
   if (!snapshotKey(repo)) return null;
   const want = normalizeFields(fields);
   if (!want.length || !want.every((f) => SNAPSHOT_FIELDS.includes(f))) return null;
+  env = candidateSmokeEnv(env, smokeChild);
   const root = dir || prSnapshotDir(env);
   const path = snapshotPath(root, repo);
   const ttl = ttlMs != null ? ttlMs : resolveTtlMs(env);
   const who = caller || deriveGhCaller({}, env);
 
+  const staleOkMs = positiveInteger(env[WE_PR_SNAPSHOT_STALE_OK_MS]);
+  const injectedExec = exec !== undefined;
+  if (exec === undefined) exec = execFileSyncThrottled;
   const servable = () => {
     const snap = readSnapshotFile(path);
+    if (staleOkMs && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
+      if (now() - snap.fetchedAtMs >= ttl && !injectedExec
+        && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
+        refreshStarted.add(snapshotKey(repo));
+        try { (spawnRefresh || detachedRefresh)({ repo, fields: want, env, dir: root }); } catch { /* best-effort */ }
+      }
+      return snap;
+    }
     return isServable(snap, { fields: want, nowMs: now(), ttlMs: ttl, dirtyMs: latestDirtyMs(root, repo) }) ? snap : null;
   };
 
   const hit = servable();
-  if (hit) { logHit(env, who, repo); return projectPrs(hit.prs, want); }
+  if (hit) { logHit(env, who, repo); return smokeProjection(hit, want, env); }
 
   if (cacheOnly) return null;
   mkdirSync(root, { recursive: true });
@@ -181,7 +266,7 @@ export function readSharedOpenPrs({
     logSnapshot(env, { outcome: 'paged', repo, caller: who, pages, pageSize, pageSizeSource: source,
       bytes, ms, hydrated, reused, count: result.snap.count });
   }
-  return projectPrs(result.snap.prs, want);
+  return smokeProjection(result.snap, want, env);
 }
 
 /** The last snapshot's open-PR count for `repo` (no gh call, any age), or null when there is none / disabled. */
@@ -229,5 +314,20 @@ export function writeShaCache({ repo, num, sha, kind, value, env = process.env, 
     return true;
   } catch {
     return false;
+  }
+}
+
+// Refresh CLI: force a normal, single-flight refresh; never inherit the smoke stale allowance.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv.includes('--refresh')) {
+  const repo = process.argv.find(arg => arg.startsWith('--repo='))?.slice('--repo='.length);
+  const fields = process.argv.find(arg => arg.startsWith('--fields='))?.slice('--fields='.length);
+  const env = refreshEnv(process.env);
+  // gh readers inherit process.env; scrubbing only the local snapshot options cannot force fresh gh reads.
+  for (const key of SMOKE_SCOPED_ENV_KEYS) delete process.env[key];
+  try {
+    if (readSharedOpenPrs({ repo, fields, env, ttlMs: 0 }) === null) process.exitCode = 1;
+  } catch (e) {
+    console.error(`pr-snapshot: refresh failed: ${e?.message ?? e}`);
+    process.exitCode = 1;
   }
 }

@@ -110,7 +110,10 @@ jobs:
     # this; a HUNG one now gets killed by GitHub itself within the hour instead of waiting 6h, and the
     # new `scripts/conveyor/ci-red-recovery-watch.mjs` hung-run sweep (see its own header) no longer has
     # to out-wait this job to reclaim the PR.
-    timeout-minutes: 15
+    # 2026-10-14 RE-SIZED 15 -> 25: the 2026-09-25 sample above is stale (shards then ran ~4 min; they now take ~9-11 min
+    # on a normal runner). Main went red at 8cd0b3d12 with no code cause: shard 2 needed ~14 min on a slow runner and the
+    # 15-min cap cancelled it. 25 min = ~1.8x the slowest observed; a HUNG shard is still killed within the half hour.
+    timeout-minutes: 25
     strategy:
       # Don't cancel sibling shards when one fails — the `test` aggregator reports the combined red, and
       # cancelling would hide which other shards also failed.
@@ -466,9 +469,14 @@ jobs:
 
       - name: Does this PR touch daemon code?
         id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          changed="$(git diff --name-only '${{ github.event.pull_request.base.sha }}' HEAD)"
+          # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
+          # --no-renames preserves the source path when daemon code is moved outside the scope.
+          changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
           hits="$(printf '%s\n' "$changed" | grep -E '^(skills-src/conveyor/|scripts/conveyor/|scripts/lib/daemon-|scripts/lib/gh-app-shim|scripts/lib/main-staleness|scripts/lane-pool|scripts/review-set-label\.mjs$|scripts/operations/[^/]*dispatch[^/]*$|vitest\.soak\.config\.ts$)' || true)"
           if [ -n "$hits" ]; then
             echo "Daemon code touched — running the soak:"; printf '  %s\n' $hits
@@ -489,6 +497,8 @@ jobs:
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
     # 15m15s mid-`scorecard-dirt` with no assertion failing, which reddened the required `daemon-soak` aggregate.
+    # Shard 1's 50-tick baseline also took 550s on the last green run and hit the old 10-min Vitest cap at 615s
+    # on main at 8cd0b3d12. Its new 17-min timeout (`vitest.soak.config.ts`) must stay below this job cap.
     # 30 min leaves real headroom for a slow runner while still killing a HUNG shard long before GitHub's 360-min
     # default would.
     timeout-minutes: 30

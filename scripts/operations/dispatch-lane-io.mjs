@@ -1,3 +1,4 @@
+import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
@@ -305,6 +306,7 @@ export function readTick({
   // missing or unreadable store reads as NO trials, which is the fail-closed direction: with no clean trials
   // the cascade can never find a non-Claude provider fit and resolves to Claude.
   readScorecards = () => defaultReadScorecards(),
+  preparePolicy = readPreparePolicy,
   // #3843 (#3801 Fork 4 (b)) — the checked-in unsized-card size policy, read at this same io edge.
   readSizePolicy = () => defaultReadSizePolicy({ root, readText }),
   // #3784 (rule 6 of #3690) — the checked-in supervision-promotion record, read at this same io edge.
@@ -541,6 +543,7 @@ export function readTick({
     deliveryAgentOverride = override ? { ...override, honoured: overrideHonoured } : null;
     routing = decideDispatchRoute({
       kind: launchKind,
+      ...(launchKind === 'prepare-item' && preparePolicy().runner === 'codex' ? { cardPath: item?.specPath } : {}),
       // The tick has no CAUSE axis — `we:scripts/conveyor/reconcile-fix-dispatch.mjs` is the one dispatch path
       // that knows a bounce was conflict-caused, and it carries its own cause (#3717's table).
       cause: null,
