@@ -311,9 +311,11 @@ describe('operator task post-build', () => {
   });
   // The route flag crosses three hops with no shared type: readTick's verdict -> shapeDispatchRead -> the
   // dispatch-lane effect payload -> createDispatchSinks' provider request. Run the real chain (default sink router,
-  // stub spawner) with build forced mechanical, so a hop that drops the flag sends the card to the wrapper, which
-  // cannot post the report. The ordinary card is the control: it must reach the wrapper.
-  async function dispatchOperatorCard(extra) {
+  // stub spawner) on two non-agent routes: build forced mechanical, and the routing policy's own codex route for a
+  // docs-only card under default modes (the path production takes). A hop that drops the flag, or an operator check
+  // moved below the policy branch, sends the card to the wrapper, which cannot post the report. The ordinary card is
+  // the control: it must reach the wrapper.
+  async function dispatchOperatorCard(extra, { scope = ['we:scripts/worker-brief.mjs'], modes = { build: 'mechanical' } } = {}) {
     const num = '9101';
     const registry = createRegistry();
     registry.register(dispatchLaneOperation({
@@ -325,7 +327,7 @@ describe('operator task post-build', () => {
           nextState: { tick: 1, buildGuards: [{ num, lane: 4, spawnedTick: 0 }] },
         }),
         readText: path => readFileSync(path, 'utf8'),
-        loadItems: () => [{ num, slug: 'operator-route', scope: ['we:scripts/worker-brief.mjs'], size: 3, ...extra }],
+        loadItems: () => [{ num, slug: 'operator-route', scope, size: 3, ...extra }],
         listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
         listAgents: () => [],
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
@@ -341,11 +343,18 @@ describe('operator task post-build', () => {
     const outcome = await applyPendingEffects(run, {
       sinks: createDispatchSinks({
         root: '/primary/webeverything',
-        modes: { build: 'mechanical' },
-        registry: { build: { provider: request => { wrapped.push(request); return { handle: 'wrapper' }; } } },
+        modes,
+        registry: { build: { runScript: 'scripts/operations/fake-wrapper.mjs', provider: request => { wrapped.push(request); return { handle: 'wrapper' }; } } },
         scriptExists: () => true,
+        providerAvailable: () => true,
         probationLaunch: 'off',
         reserveLane: () => ({ reserved: false }),
+        // The file-writing seams, stubbed as the sibling sink tests do, so nothing is created on disk.
+        sessionCwdFor: () => '/primary/.operations/dispatch/sess-9101',
+        ensureSessionCwd: dir => dir,
+        grantLanePermission: () => {},
+        ensureWorktreeIsolation: () => {},
+        resolveSettingsEnv: () => null,
         spawnAgent: (argv, opts) => { spawned.push({ argv, opts }); return 'backgrounded · 1ae0905c · x\n'; },
         mintSessionId: () => 'sess-9101',
         now: () => new Date('2026-10-15T10:00:00.000Z'),
@@ -369,6 +378,21 @@ describe('operator task post-build', () => {
     expect(ordinary.spawned).toEqual([]);
     expect(ordinary.wrapped).toHaveLength(1);
     expect(ordinary.wrapped[0].operatorPostBuild).toBe(false);
+  });
+  it('sends an operator report card to the agent even when the routing policy picks a non-Claude worker', async () => {
+    // A doc-fix card outside docs/agent/ (which the policy keeps on Claude) routes to codex in the shipped policy.
+    const policy = { scope: ['we:docs/operator-route-note.md'], modes: {} };
+    const ordinary = await dispatchOperatorCard({ ...OP, report: false }, policy);
+    // Control: under default modes the policy's own route takes the docs-only card to the wrapper.
+    expect(ordinary.effect.payload.routing?.policyRoute?.provider).toBe('codex');
+    expect(ordinary.spawned).toEqual([]);
+    expect(ordinary.wrapped).toHaveLength(1);
+    const operator = await dispatchOperatorCard({ ...OP, report: true }, policy);
+    expect(operator.effect.payload.routing?.policyRoute?.provider).toBe('codex');
+    expect(operator.effect.payload.operatorPostBuild).toBe(true);
+    expect(operator.wrapped).toEqual([]);
+    expect(operator.spawned).toHaveLength(1);
+    expect(operator.spawned[0].argv.join('\n')).toContain('<!-- operator-task-report -->');
   });
   it('derives operatorPostBuild from the card decision, never from prompt text', () => {
     const card = extra => [{ num: '123', slug: 'test', scope: ['we:scripts/worker-brief.mjs'], ...extra }];
