@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE } from '../shard-files.mjs';
+import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE, REPO_ROOT } from '../shard-files.mjs';
 import { loadTimings } from '../../../ci/shard-assign.mjs';
 
 describe('soak shard-files — isolated baseline and time-balanced breaks', () => {
@@ -62,25 +62,26 @@ describe('soak shard-files — isolated baseline and time-balanced breaks', () =
 
   it('reserves shard 1 for the baseline even when timings make it the cheapest file', () => {
     withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs'], (dir) => {
-      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
-        timings: { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 100, 'b.soak.test.mjs': 100 } };
-      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
-      const breaks = [2, 3].flatMap((shard) => shardFiles({ ...opts, shard }));
-      expect(breaks.sort()).toEqual(['a.soak.test.mjs', 'b.soak.test.mjs']);
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
+      for (const timings of [{}, { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 100, 'b.soak.test.mjs': 200 }]) {
+        expect(shardFiles({ ...opts, shard: 1, timings })).toEqual(['base.soak.test.mjs']);
+        const breaks = [2, 3].flatMap((shard) => shardFiles({ ...opts, shard, timings }));
+        expect(breaks.sort()).toEqual(['a.soak.test.mjs', 'b.soak.test.mjs']);
+      }
     });
   });
 
-  it('balances breaks by measured time across the remaining shards', () => {
+  it('balances break scenarios by stored timings across the remaining shards', () => {
     withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs'], (dir) => {
       const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
-        timings: { 'base.soak.test.mjs': 1000, 'a.soak.test.mjs': 20, 'b.soak.test.mjs': 10, 'c.soak.test.mjs': 10 } };
+        timings: { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 40, 'b.soak.test.mjs': 20, 'c.soak.test.mjs': 20 } };
       expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
       expect(shardFiles({ ...opts, shard: 2 })).toEqual(['a.soak.test.mjs']);
       expect(shardFiles({ ...opts, shard: 3 })).toEqual(['b.soak.test.mjs', 'c.soak.test.mjs']);
     });
   });
 
-  it('balances by the stored timings: the heavy file sits alone, light files fill the rest', () => {
+  it('total=2 puts all breaks in the second shard', () => {
     const names = ['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'];
     withBreaks(names, (dir) => {
       const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
@@ -140,6 +141,14 @@ describe('soak shard-files — isolated baseline and time-balanced breaks', () =
 
   it('BASELINE_FILE resolves to the 50-tick soak test', () => {
     expect(BASELINE_FILE).toMatch(/daemon-soak\.soak\.test\.mjs$/);
+  });
+
+  it('the generic timing CLI uses the same soak allocation as the runner', () => {
+    for (const shard of [1, 2]) {
+      const out = execFileSync(process.execPath, [join(REPO_ROOT, 'scripts/ci/shard-assign.mjs'),
+        '--suite=soak', `--shard=${shard}/4`], { encoding: 'utf8' });
+      expect(out.trim().split('\n')).toEqual(shardFiles({ shard, total: 4 }));
+    }
   });
 });
 

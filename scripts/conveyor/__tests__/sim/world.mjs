@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
 import { createSimClock } from './clock.mjs';
+import { nodeRuntimeEnv } from './node-runtime-env.mjs';
 import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
@@ -288,6 +289,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   }
   const env = {
     ...isolatedProcessEnv(root),
+    // Every tick launches many Node CLIs over the same large daemon module graph. One disposable cache per
+    // world reduces repeated compilation within the sibling scenario / 50-tick soak budgets, without
+    // sharing module state or skipping any real tick.
+    ...nodeRuntimeEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
     NODE_OPTIONS: clock.env.NODE_OPTIONS,
     HOME: home,

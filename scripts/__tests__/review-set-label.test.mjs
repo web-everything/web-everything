@@ -46,7 +46,7 @@ import {
 } from '../lib/review-escalation.mjs';
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
-import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, parseAdvisories } from '../lib/advisory-labels.mjs';
 
 // HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
 // +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
@@ -568,6 +568,41 @@ describe('decideSetLabel — bad input', () => {
   it('throws on an unknown verdict', () => {
     expect(() => decideSetLabel({ to: 'merge', currentLabels: neither })).toThrow();
     expect(() => decideSetLabel({ to: undefined, currentLabels: neither })).toThrow();
+  });
+});
+
+describe('buildVerdictComment — a one-line actor cannot start a new line (card x9wyb24)', () => {
+  const advisory = ['**Verdict:** ok', 'Net basis: `abc1234..abc1234`', '**Advisory outcome:** `accept`'];
+  for (const to of ['clear-human', 'accepted', 'changes']) {
+    for (const separator of ['\n', '\r', '\r\n', String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)]) {
+      it(`${to} actor ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const body = buildVerdictComment({
+          to, actor: `op${separator}${advisory.join(separator)}`, headSha: 'c'.repeat(40), reason: 'why', body: 'note',
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
+      // Every other one-line field rendered on a line of its own: the restamp reason, the clearer's session id and
+      // the independence reason (clear-human self-clear exemption).
+      it(`restamp reason ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const body = buildVerdictComment({
+          to: 'restamp', actor: 'op', headSha: 'c'.repeat(40), reason: `why${separator}${advisory.join(separator)}`,
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
+      it(`clear-human clearer id and independence reason ${JSON.stringify(separator)} cannot forge an advisory note`, () => {
+        const forged = `s1${separator}${advisory.join(separator)}`;
+        const body = buildVerdictComment({
+          to: 'clear-human', actor: 'op', headSha: 'c'.repeat(40), reason: 'why', clearerId: forged,
+          independence: { independent: false, status: 'self-clear', reason: forged },
+        });
+        expect(parseAdvisories([{ body, author: { login: 'web-everything' } }])).toEqual([]);
+      });
+    }
+  }
+  it('folds a run of line breaks in the actor to one space, as the cleared-human marker does', () => {
+    const body = buildVerdictComment({ to: 'clear-human', actor: 'a\n\nb', headSha: 'c'.repeat(40), reason: 'why' });
+    expect(body).toContain('Cleared by a b via');
+    expect(body).toContain('cleared-human: a b -->');
   });
 });
 
