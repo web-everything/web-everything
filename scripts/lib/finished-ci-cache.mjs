@@ -8,7 +8,7 @@
  * WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS, WE_FINISHED_CI_CACHE_CHECK_RUNS_REVALIDATE_MS.
  * WE_FINISHED_CI_CACHE_DIR overrides ~/.claude/conveyor/finished-ci-cache (leading ~ expands).
  * All cache IO is best effort and injectable via options.fs; no cache failure reaches a gh caller.
- * Entries are scoped to a hash of explicit credentials; stored-login and dynamically routed auth stay live.
+ * Entries are scoped to a hash of the host and explicit credentials; stored-login and dynamically routed auth stay live.
  */
 import * as nodeFs from 'node:fs';
 import { homedir } from 'node:os';
@@ -49,7 +49,7 @@ export function finishedCiAuthScope(env = process.env) {
   const keys = host === 'github.com' || host.endsWith('.ghe.com')
     ? ['GH_TOKEN', 'GITHUB_TOKEN'] : ['GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'];
   const token = env[keys[0]] || env[keys[1]];
-  return token ? createHash('sha256').update(String(token)).digest('hex') : null;
+  return token ? createHash('sha256').update(JSON.stringify([host, String(token)])).digest('hex') : null;
 }
 export function classifyFinishedCiRead(args) {
   if (!Array.isArray(args) || args[0] !== 'api' || typeof args[1] !== 'string') return null;
@@ -153,45 +153,18 @@ export function invalidateForWrite(args, o = {}) {
   try {
     const c = context(o); const { settings, dir } = c; fs = c.fs;
     if (!settings.enabled || !Array.isArray(args)) return;
-    // Remove option values before looking for positionals: --job 456 must not become the run id.
-    const valued = new Set(['--repo', '--job', '--hostname', '--header', '--method', '--input', '--field', '--raw-field', '--preview', '--jq', '--template']);
-    const positional = [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === '--') { positional.push(...args.slice(i + 1)); break; }
-      if (args[i].startsWith('-') && !args[i].startsWith('--')) {
-        // pflag allows -iX POST, -if key=value and run rerun -dj 456 123.
-        // -f is a boolean for `run rerun`, but takes a field value for `api`.
-        const shortValued = positional[0] === 'run' ? 'Rj' : 'RjXfFHpqt';
-        for (let j = 1; j < args[i].length; j++) {
-          if (!shortValued.includes(args[i][j])) continue;
-          if (j === args[i].length - 1) i++;
-          break;
-        }
-        continue;
-      }
-      if (valued.has(args[i])) { i++; continue; }
-      if (!args[i].startsWith('-')) positional.push(args[i]);
-    }
-    let id; let rerun = false;
-    if (positional[0] === 'run' && positional[1] === 'rerun') {
-      rerun = true;
-      id = positional.slice(2).find(a => /^\d+$/.test(a));
-    }
-    if (positional[0] === 'api') {
-      // Called only after success. Invalidate conservatively for this endpoint regardless of method spelling:
-      // gh infers POST from fields/input, accepts clustered short flags, and uses the last repeated method.
-      // Search the original argv so future value flags cannot hide the endpoint. Extra matches can only evict
-      // more data; the generation already invalidates every run list, so API reruns purge all of them on disk.
-      rerun = args.some(a => /^\/?repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+\/rerun[^\s?]*(?:\?[^\s]*)?$/.test(a));
-    }
+    // Called only after success. Match conservatively in argv: gh supports global options,
+    // clustered flags, implicit POST via fields/input, and interactive reruns without an id.
+    // Every rerun invalidates the directory-wide generation, so no run-id parsing is needed.
+    const rerun = (args.includes('run') && args.includes('rerun'))
+      || (args.includes('api') && args.some(arg => /^(?:https?:\/\/[^/\s]+\/(?:api\/v3\/)?)?\/?repos\/[^/\s?]+\/[^/\s?]+\/actions\/(?:runs|jobs)\/\d+\/rerun[^\s?]*(?:\?[^\s]*)?$/.test(arg)));
     if (!rerun) return;
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); fs.chmodSync(dir, 0o700);
     const generationPath = join(dir, '.run-generation'); tmp = `${generationPath}.${randomUUID()}.tmp`;
     fs.writeFileSync(tmp, randomUUID(), { mode: 0o600, flag: 'wx' }); fs.renameSync(tmp, generationPath);
-    // The SHA is not carried by a rerun command; conservatively drop every check-runs entry.
-    // Interactive and API reruns without a reliable positional id drop every run job list as well.
+    // Job reruns do not carry their parent run id. Purge all collections, matching generation scope.
     for (const name of fs.readdirSync(dir)) {
-      if ((name.startsWith('check-runs-') || name.startsWith(id ? `run-jobs-${id}-` : 'run-jobs-')) && name.endsWith('.json.gz')) {
+      if ((name.startsWith('check-runs-') || name.startsWith('run-jobs-')) && name.endsWith('.json.gz')) {
         try { fs.unlinkSync(join(dir, name)); } catch { /* A concurrent invalidator may have removed it. */ }
       }
     }

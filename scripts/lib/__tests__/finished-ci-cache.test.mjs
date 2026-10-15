@@ -153,6 +153,23 @@ describe('finished CI cache (card 309)', () => {
       call(); call(); expect(f.files()).toHaveLength(0);
     }
   });
+  it.each([false, true])('isolates identical credentials and paths across GH_HOST values (CLI=%s)', cli => {
+    for (const args of [log, jobs]) {
+      const f = fixture();
+      f.spawn.mockImplementation((_bin, argv, opts) => ({ status: 0,
+        stdout: Buffer.from(argv[1] === args[1]
+          ? args === log ? opts.env.GH_HOST : JSON.stringify({ total_count: 1, jobs: [{ status: 'completed', name: opts.env.GH_HOST }] })
+          : '{"status":"completed"}'), stderr: Buffer.alloc(0) }));
+      const call = () => String(cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(args, f.opts));
+      const first = call(); expect(call()).toBe(first);
+      f.env.GH_HOST = 'tenant.ghe.com'; vi.stubEnv('GH_HOST', f.env.GH_HOST);
+      const second = call(); expect(second).toContain('tenant.ghe.com');
+      expect(second).not.toBe(first); expect(call()).toBe(second);
+      f.env.GH_HOST = 'github.com'; vi.stubEnv('GH_HOST', f.env.GH_HOST);
+      expect(call()).toBe(first);
+      expect(f.files()).toHaveLength(2);
+    }
+  });
   it('uses the applicable explicit token and its precedence as the auth scope', () => {
     const primary = finishedCiAuthScope({ GH_TOKEN: 'first' });
     expect(finishedCiAuthScope({ GITHUB_TOKEN: 'first' })).toBe(primary);
@@ -160,8 +177,9 @@ describe('finished CI cache (card 309)', () => {
     expect(finishedCiAuthScope({ GH_TOKEN: 'second' })).not.toBe(primary);
     expect(finishedCiAuthScope({ GH_ENTERPRISE_TOKEN: 'first' })).toBeNull();
     expect(finishedCiAuthScope({ GH_HOST: 'enterprise.example', GH_TOKEN: 'first' })).toBeNull();
-    expect(finishedCiAuthScope({ GH_HOST: 'enterprise.example', GH_ENTERPRISE_TOKEN: 'first' })).toBe(primary);
-    expect(finishedCiAuthScope({ GH_HOST: 'tenant.ghe.com', GH_TOKEN: 'first' })).toBe(primary);
+    expect(finishedCiAuthScope({ GH_HOST: 'enterprise.example', GH_ENTERPRISE_TOKEN: 'first' })).not.toBe(primary);
+    expect(finishedCiAuthScope({ GH_HOST: 'tenant.ghe.com', GH_TOKEN: 'first' })).not.toBe(primary);
+    expect(finishedCiAuthScope({ GH_HOST: 'GITHUB.COM', GH_TOKEN: 'first' })).toBe(primary);
   });
   it('rejects payloads whose credential scope does not match their filename', () => {
     const f = fixture(); const cls = classifyFinishedCiRead(log);
@@ -241,6 +259,8 @@ describe('finished CI cache (card 309)', () => {
   it.each([
     ['run', 'rerun', '--failed', '123'],
     ['-R', 'o/r', 'run', 'rerun', '123'],
+    ['run', '--repo', 'o/r', 'rerun', '123'],
+    ['run', '-Ro/r', 'rerun', '123'],
     ['--repo=o/r', 'run', 'rerun', '--job', '456', '123'],
     ['run', 'rerun', '-dj', '456', '123'],
     ['api', '--method=POST', 'repos/o/r/actions/runs/123/rerun'],
@@ -252,11 +272,21 @@ describe('finished CI cache (card 309)', () => {
     ['api', 'repos/o/r/actions/runs/123/rerun', '-F', 'enable_debug_logging=true'],
     ['api', '--field=enable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
     ['api', '-fenable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
+    ['api', '-X', 'POST', 'repos/o/r/actions/jobs/456/rerun'],
+    ['api', '--method=POST', '/repos/o/r/actions/jobs/456/rerun'],
+    ['api', '-iXPOST', 'repos/o/r/actions/jobs/456/rerun'],
+    ['api', 'repos/o/r/actions/jobs/456/rerun', '-F', 'enable_debug_logging=true'],
+    ['api', '-XPOST', 'repos/{owner}/{repo}/actions/jobs/456/rerun'],
+    ['api', '-XPOST', 'repos/{owner}/{repo}/actions/runs/123/rerun'],
+    ['api', '-XPOST', 'https://api.github.com/repos/o/r/actions/jobs/456/rerun'],
+    ['api', '-XPOST', 'https://enterprise.example/api/v3/repos/o/r/actions/jobs/456/rerun'],
+    ['api', '-XPOST', 'https://enterprise.example/api/v3/repos/o/r/actions/runs/123/rerun'],
     ['run', 'rerun'],
   ].map(args => ({ args })))('invalidates run jobs and check-runs for successful rerun $args', ({ args }) => {
     for (const cli of [false, true]) {
       const f = fixture();
       storeFinishedCi(classifyFinishedCiRead(jobs), Buffer.from('jobs'), f.cacheOpts());
+      storeFinishedCi(classifyFinishedCiRead(['api', 'repos/other/repo/actions/runs/789/jobs']), Buffer.from('other jobs'), f.cacheOpts());
       storeFinishedCi(classifyFinishedCiRead(checks), Buffer.from('checks'), f.cacheOpts());
       storeFinishedCi(classifyFinishedCiRead(log), Buffer.from('logs'), f.cacheOpts());
       if (cli) runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }); else runGhSync(args, f.opts);
@@ -264,13 +294,18 @@ describe('finished CI cache (card 309)', () => {
       expect(f.files()[0]).toMatch(/^job-log-/);
     }
   });
-  it.each([false, true])('does not let a reader repopulate run jobs after a rerun (CLI=%s)', cli => {
+  it.each([
+    { cli: false, rerunArgs: ['run', 'rerun', '123'] },
+    { cli: true, rerunArgs: ['run', 'rerun', '123'] },
+    { cli: false, rerunArgs: ['api', '-XPOST', 'repos/o/r/actions/jobs/456/rerun'] },
+    { cli: true, rerunArgs: ['api', '-XPOST', 'repos/o/r/actions/jobs/456/rerun'] },
+  ])('does not let a reader repopulate run jobs after $rerunArgs (CLI=$cli)', ({ cli, rerunArgs }) => {
     const f = fixture(); const original = f.spawn.getMockImplementation(); let reran = false;
     f.spawn.mockImplementation((bin, args, opts) => {
       const result = original(bin, args, opts);
       if (args[1] === jobs[1] && !reran) {
         reran = true;
-        invalidateForWrite(['run', 'rerun', '123'], f.cacheOpts());
+        invalidateForWrite(rerunArgs, f.cacheOpts());
       }
       return result;
     });
@@ -352,13 +387,22 @@ describe('finished CI cache (card 309)', () => {
     runGhSync(jobs, { ...f.opts, input: 'body' }); expect(f.reads()).toHaveLength(2);
     expect(exec).toHaveBeenCalledTimes(1);
   });
-  it('failed rerun and job rerun preserve run entries', () => {
-    const f = fixture(); runGhSync(jobs, f.opts);
-    f.spawn.mockReturnValueOnce({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
-    runGhCliPassthrough(['run', 'rerun', '123'], { throttle: f.throttle, spawn: f.spawn });
-    expect(f.files()).toHaveLength(1);
-    invalidateForWrite(['api', 'repos/o/r/actions/jobs/456/rerun', '--method', 'POST'], f.cacheOpts());
-    expect(f.files()).toHaveLength(1);
+  it.each([false, true])('successful job rerun fetches current parent state with zero revalidation (CLI=%s)', cli => {
+    const f = fixture(); f.env.WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS = '0';
+    const call = args => cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(args, f.opts);
+    expect(JSON.parse(String(call(jobs))).jobs[0].status).toBe('completed');
+    call(['api', 'repos/o/r/actions/jobs/456/rerun', '--method', 'POST']);
+    f.spawn.mockReturnValue({ status: 0, stdout: Buffer.from('{"total_count":1,"jobs":[{"status":"in_progress"}]}'), stderr: Buffer.alloc(0) });
+    expect(JSON.parse(String(call(jobs))).jobs[0].status).toBe('in_progress');
+  });
+  it.each([false, true])('failed run and job reruns preserve run entries (CLI=%s)', cli => {
+    for (const args of [['run', 'rerun', '123'], ['api', '-XPOST', 'repos/o/r/actions/jobs/456/rerun']]) {
+      const f = fixture(); runGhSync(jobs, f.opts);
+      f.spawn.mockReturnValueOnce({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+      if (cli) expect(runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).status).toBe(1);
+      else expect(() => runGhSync(args, f.opts)).toThrow();
+      expect(f.files()).toHaveLength(1);
+    }
   });
   it('corrupt/unreadable cache and injected fs failures are misses', () => {
     const f = fixture(); const fs = { readFileSync: () => { throw new Error('IO'); }, mkdirSync: () => { throw new Error('IO'); } };
