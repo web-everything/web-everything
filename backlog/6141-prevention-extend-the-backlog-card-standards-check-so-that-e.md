@@ -1,4 +1,5 @@
 ---
+bornAs: xmp4wwb
 kind: story
 size: 3
 parent: "4075"
@@ -11,7 +12,7 @@ tags: []
 # Prevention — Extend the backlog-card standards check so that each non-n/a line under 'Edge cases this change m… (from web-everything/web-everything#5351 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x9w8zdl-soak-replay-gate-fail-a-pr-that-adds-a-soak-break-whose-fix.md:29` — Extend the backlog-card standards check so that each non-n/a line under 'Edge cases this change must handle' must map to an Acceptance item that names a test case.
+1. `we:backlog/6140-soak-replay-gate-fail-a-pr-that-adds-a-soak-break-whose-fix.md:29` — Extend the backlog-card standards check so that each non-n/a line under 'Edge cases this change must handle' must map to an Acceptance item that names a test case.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5360.
 
