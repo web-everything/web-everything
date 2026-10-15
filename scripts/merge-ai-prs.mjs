@@ -4591,10 +4591,13 @@ async function runCli() {
     }
     const legacy = await readLegacyManifestCached({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha,
       readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef, headSha) });
-    if (legacy) return { manifest: legacy, degraded: false };
+    // A non-definitive git answer (not read from the head sha itself) is used for this pass only: `transient`
+    // keeps `fetchPrReadsCached` from latching it, without the `degraded` fail-closed (the R2 livelock).
+    const transient = !legacy.definitive;
+    if (legacy.manifest) return { manifest: legacy.manifest, degraded: false, transient };
     // Local git fallback found nothing. Post-cutover lanes carry the manifest in the PR BODY (not the tree), so a
     // null here after the PR-body gh read THREW is a spurious degrade — surface `fromPr.degraded` so it re-fetches.
-    return { manifest: null, degraded: fromPr.degraded };
+    return { manifest: null, degraded: fromPr.degraded, transient };
   };
   // #2417 — a PR's HEAD SHA cache key. `gh pr list --json headRefOid` supplies it in the SAME list call (no
   // extra round-trip); a PR whose SHA is unchanged since the previous `--watch` pass reuses its cached reads.
@@ -4692,11 +4695,11 @@ async function runCli() {
         cache: ctxReadCache,
         keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
         shaOf: ({ p }) => prHeadSha(p),
-        isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
+        isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
           const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
-          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded };
+          return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
         },
       });
       const out = new Map();
@@ -5015,10 +5018,10 @@ async function runCli() {
     cache: sweepReadCache,
     keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
     shaOf: ({ p }) => prHeadSha(p),
-    isDegraded: (v) => !!v?.degraded, // #2417 review — an error-path read is NOT cached (re-fetches next pass)
+    isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
       const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
-      return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded };
+      return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient };
     },
   }));
   // #2421 (generalizes #2216) — total ci-lifecycle relabel first, per swept repo.

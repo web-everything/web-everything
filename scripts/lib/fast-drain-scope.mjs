@@ -36,48 +36,51 @@ export function filterToFastDrainTarget(prs, { onlyPr, scope, isTarget }) {
  * (stale origin ref, same-named local branch, FETCH_HEAD another drain moved) is returned but stays retryable.
  */
 export async function readLegacyManifestCached({ repo, num, sha, readCache, writeCache, readLegacy }) {
-  if (!sha) return (await readLegacy()).manifest;
+  if (!sha) return { manifest: (await readLegacy()).manifest, definitive: false };
   const key = { repo, num, sha, kind: 'legacy-manifest' };
   const cached = readCache(key);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return { manifest: cached, definitive: true };
   const { manifest, definitive } = await readLegacy();
   if (definitive) writeCache({ ...key, value: manifest });
-  return manifest;
+  return { manifest, definitive: !!definitive };
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
+const MANIFEST_PATH = '.lane-manifest.json';
 
 /**
  * Read the tree-committed `.lane-manifest.json` for one PR head. `git(args)` returns stdout or throws.
- * The head sha is read directly once its object is local (fetching only when missing), so FETCH_HEAD,
- * which concurrent drains in one clone share, never decides it. Without a usable head object, fall back to
- * FETCH_HEAD / origin/<ref> / <ref> and mark the answer non-definitive. `headRef` is a gh-supplied refname
- * and may lead with a dash, so every ref argument sits behind --end-of-options.
+ * With a full head sha, only that commit answers (fetching it when missing): FETCH_HEAD, origin/<ref> and a
+ * same-named local branch can only name ANOTHER commit there, and FETCH_HEAD is shared by every drain process
+ * in the clone. "No manifest" is definitive only when ls-tree lists the head tree without the file; a failed
+ * git read is non-definitive. Without a usable sha, the ref fallbacks are used but never definitive.
+ * `headRef` is a gh-supplied refname and may lead with a dash, so every ref argument sits behind --end-of-options.
  * @returns {{manifest: object|null, definitive: boolean}}
  */
 export function readLegacyLocalManifestAt({ headRef, headSha, git }) {
   const sha = typeof headSha === 'string' && FULL_SHA.test(headSha) ? headSha : null;
-  const readAt = (rev) => {
-    try {
-      const m = JSON.parse(git(['show', '--end-of-options', `${rev}:.lane-manifest.json`]));
-      return m && m.item != null ? m : null;
-    } catch { return null; }
-  };
-  const hasHead = () => {
-    try { git(['cat-file', '-e', '--end-of-options', `${sha}^{commit}`]); return true; } catch { return false; }
-  };
-  let fetched = false;
+  const parse = (raw) => { try { const m = JSON.parse(raw); return m && m.item != null ? m : null; } catch { return null; } };
   const fetch = () => {
-    fetched = true;
     try { git(['fetch', '--quiet', '--end-of-options', 'origin', headRef]); } catch { /* ref may be local */ }
   };
   if (sha) {
+    const hasHead = () => {
+      try { git(['cat-file', '-e', '--end-of-options', `${sha}^{commit}`]); return true; } catch { return false; }
+    };
     if (!hasHead()) fetch();
-    if (hasHead()) return { manifest: readAt(sha), definitive: true };
+    if (!hasHead()) return { manifest: null, definitive: false };
+    let listed;
+    try { listed = git(['ls-tree', '--end-of-options', sha, '--', MANIFEST_PATH]); } catch { return { manifest: null, definitive: false }; }
+    if (!String(listed ?? '').trim()) return { manifest: null, definitive: true };
+    let raw;
+    try { raw = git(['show', '--end-of-options', `${sha}:${MANIFEST_PATH}`]); } catch { return { manifest: null, definitive: false }; }
+    return { manifest: parse(raw), definitive: true }; // a commit's bytes never change, so even unparseable is final
   }
-  if (!fetched) fetch();
+  fetch();
   for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
-    const manifest = readAt(rev);
+    let raw;
+    try { raw = git(['show', '--end-of-options', `${rev}:${MANIFEST_PATH}`]); } catch { continue; }
+    const manifest = parse(raw);
     if (manifest) return { manifest, definitive: false };
   }
   return { manifest: null, definitive: false };
