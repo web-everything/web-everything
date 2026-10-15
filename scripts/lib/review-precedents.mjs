@@ -344,8 +344,10 @@ export function captureFromComment(comment, { operatorLogins = [], automationLog
   // review-escalation's `parseChangesVerdictProse` / `parseClearedHumanProse`), so this reader cannot drift from
   // what review-set-label.mjs writes.
   // The recorded actor must be an operator too: a mechanical pass (`auto-policy`, a conflict watch) posts send-backs
-  // under the operator's login, and those are not human decisions.
-  const recorded = trusted(author, operatorLogins) ? parseChangesVerdict?.(body) : null;
+  // under the operator's login, and those are not human decisions. review-set-label.mjs posts through the automation
+  // account, so a trusted automation author counts too (as on the clear-human path below) — the recorded actor is
+  // still the operator check.
+  const recorded = trusted(author, operatorLogins) || trusted(author, automationLogins) ? parseChangesVerdict?.(body) : null;
   if (recorded && trusted(recorded.actor, operatorLogins)) {
     const text = body.slice(recorded.end).trim();
     // The head and the operator's words come from the write-up's lead paragraph only, never from later text.

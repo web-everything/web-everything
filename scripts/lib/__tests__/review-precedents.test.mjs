@@ -169,6 +169,19 @@ describe('recorded operator capture', () => {
     expect(p.captureFromComment(comment(`Quoting:\n${quoted}`), options)).toEqual([]);
     expect(p.captureFromComment(comment(quoted), { ...options, parseChangesVerdict: undefined })).toEqual([]);
   });
+  it('captures a real review-set-label changes comment posted by the automation account for an operator actor', () => {
+    // review-set-label.mjs posts through the automation account; the operator is only the recorded actor.
+    const writeUp = 'Operator send-back, at head `54e662a11`. Operator: "ok".\n\nOne fix: accept the automation-posted verdict.';
+    const real = (actor) => buildVerdictComment({ to: 'changes', actor, channel: 'claude-code-chat', body: writeUp });
+    expect(p.captureFromComment(comment(real('chalbert'), 'review-bot'), options)).toMatchObject([{ kind: 'changes', decision: 'changes',
+      actor: 'chalbert', channel: 'claude-code-chat', head: '54e662a11', operatorWords: '"ok".', body: writeUp }]);
+    // Automation still cannot mint a human decision: a mechanical actor, or an untrusted poster, captures nothing.
+    for (const actor of ['auto-policy', 'parked-pr-conflict-watch (a mechanical reconciliation pass)', 'stranger']) {
+      expect(p.captureFromComment(comment(real(actor), 'review-bot'), options)).toEqual([]);
+    }
+    expect(p.captureFromComment(comment(real('chalbert'), 'stranger'), options)).toEqual([]);
+    expect(p.captureFromComment(comment(`Quoting:\n${real('chalbert')}`, 'review-bot'), options)).toEqual([]);
+  });
   it('captures meaningful quoted clear-human notes from a trusted tool identity', () => {
     const reason = 'These ten words explain why this finding needs no changes.';
     const clear = buildVerdictComment({ to: 'clear-human', actor: 'chalbert', headSha: SHA, reason });
