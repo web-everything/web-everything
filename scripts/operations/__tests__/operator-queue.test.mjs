@@ -349,15 +349,17 @@ it('separates answered stand-downs while a newer unanswered question still needs
 });
 
 describe('staged copies missing an optional reader', () => {
-  const importWithout = async (missing) => {
-    vi.resetModules();
+  const importWithout = async (missing, load) => {
+    // Re-evaluate only the queue with a distinct module URL. Resetting the entire graph
+    // reloads unrelated review/dispatch modules and can exhaust the unit-test timeout in CI.
     vi.doMock(missing, () => { throw new Error(`Cannot find module ${missing}`); });
-    try { return await import('../operator-queue.mjs'); }
+    try { return await load(); }
     finally { vi.doUnmock(missing); }
   };
 
   it('missing answer reader leaves a stand-down visible as unanswered', async () => {
-    const staged = await importWithout('../../conveyor/stand-down-answer-core.mjs');
+    const staged = await importWithout('../../conveyor/stand-down-answer-core.mjs',
+      () => import('../operator-queue.mjs?missing-answer-reader'));
     execFileSync.mockReturnValue(JSON.stringify([pr(1, [standDown, answer])]));
     await staged.main(['--repo=o/n', '--json'], { sleep, unsupportedPath: '/nonexistent-operator-queue-test/unsupported-repo.json' });
     const report = JSON.parse(stdout());
@@ -367,7 +369,8 @@ describe('staged copies missing an optional reader', () => {
   });
 
   it('missing complete reader marks the split read incomplete, never an empty thread', async () => {
-    const staged = await importWithout('../../conveyor/pr-comments-complete.mjs');
+    const staged = await importWithout('../../conveyor/pr-comments-complete.mjs',
+      () => import('../operator-queue.mjs?missing-complete-reader'));
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       return JSON.stringify([pr(1)]);

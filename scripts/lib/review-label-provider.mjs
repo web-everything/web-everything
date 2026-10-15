@@ -41,6 +41,16 @@ import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from './gh-throttle.mjs';
+import { REVIEW_LABELS } from './review-labels.mjs';
+
+/**
+ * Finish the labels after a caller has proven and durably recorded an acceptance carry.
+ * The caller owns the proof, record and retry boundary; the accepted-label write stays in this port.
+ */
+export function finishRecordedAcceptanceLabels({ provider, repo, pr, currentLabels }) {
+  const accepted = currentLabels.some((label) => (typeof label === 'string' ? label : label?.name) === REVIEW_LABELS.accepted);
+  provider.setLabels(repo, pr, { add: accepted ? undefined : REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending] });
+}
 
 // GitHub rejects longer label descriptions with HTTP 422:
 // "description is too long (maximum is 100 characters)".
@@ -95,6 +105,11 @@ export const GH_ARGV = Object.freeze({
   // `--body-file`, never `--body`: the verdict body carries newlines and emoji, and shell-quoting them is the
   // kind of thing that works until one comment does not.
   postComment: (repo, pr, bodyFile) => ['pr', 'comment', String(pr), '--repo', repo, '--body-file', bodyFile],
+  // Replace one issue comment's body by its GraphQL node id (the `id` the complete comment reader returns). The body is
+  // read from a file (`-F body=@…`), for the same reason as `postComment`.
+  editComment: (commentId, bodyFile) => ['api', 'graphql',
+    '-f', 'query=mutation($id: ID!, $body: String!) { updateIssueComment(input: {id: $id, body: $body}) { issueComment { id } } }',
+    '-f', `id=${commentId}`, '-F', `body=@${bodyFile}`],
   currentRepo: () => ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
   // `--force` makes this CREATE-OR-UPDATE, never an error on an already-existing label — the only shape that
   // is safe to call unconditionally before every `setLabels`. `gh pr edit --add-label` REFUSES a label that
@@ -178,6 +193,18 @@ export function createGhProvider({
       try {
         writeFile(path, body, 'utf8');
         exec(GH_ARGV.postComment(repo, pr, path), { maxBuffer: 16 * 1024 * 1024 });
+      } finally {
+        try { removeFile(path); } catch { /* best-effort cleanup */ }
+      }
+    },
+
+    // `repo` names the thread for symmetry with `postComment`; the node id alone addresses the comment.
+    editComment(_repo, commentId, body, { pr = 'comment' } = {}) {
+      if (typeof commentId !== 'string' || !/^IC_[A-Za-z0-9_-]+$/.test(commentId)) throw new Error('invalid comment node id');
+      const path = join(tmpDir, `review-label-${pr}-${process.pid}-edit.md`);
+      try {
+        writeFile(path, body, 'utf8');
+        exec(GH_ARGV.editComment(commentId, path), { maxBuffer: 16 * 1024 * 1024 });
       } finally {
         try { removeFile(path); } catch { /* best-effort cleanup */ }
       }

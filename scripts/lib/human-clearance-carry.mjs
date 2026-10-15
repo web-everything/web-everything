@@ -37,6 +37,7 @@
  *   `git patch-id --stable` also differs (it hashes context), so carry compares the contribution fingerprint
  *   (reviewed-contribution, identical 4b8019dbed02) and proves the move by replay: `git merge-tree` of the cleared
  *   change onto the new main base reproduces the head tree, .lane-manifest.json ignored.
+ *   Live #5025: drain card-numbering changes fingerprints; a separate numbering-only proof carries the original clearance.
  *   Setting: `review.carryEquivalence` (contribution|strict), env `WE_REVIEW_CARRY_EQUIVALENCE`.
  */
 import { readFileSync } from 'node:fs';
@@ -47,6 +48,8 @@ import {
   buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
+import { isNumberingTolerableLaterBody, proveNumberingOnlyMove } from './numbering-carry.mjs';
+import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const HUMAN_CLEARANCE_CARRY_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
@@ -104,8 +107,9 @@ export function latestHumanClearance(comments) {
  * code span or invisible/bidi character can reach the record.
  */
 export function sanitizeActor(actor) {
-  const name = String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim();
-  return name.slice(0, 64) || 'the operator';
+  // Cut by code point before trimming, so a sanitized name sanitizes to itself (numbering-carry compares the two).
+  const name = Array.from(String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ')).slice(0, 64).join('').trim();
+  return name || 'the operator';
 }
 
 /**
@@ -197,7 +201,8 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
  * @returns {{carry:boolean, applicable:boolean, reason:string, fromSha?:string, toSha?:string,
  *   fingerprint?:string, actor?:string, tier?:string, mechanicalReason?:string}}
  */
-export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main', equivalence = resolveCarryEquivalenceSetting().value } = {}) {
+export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main',
+  equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove } = {}) {
   try {
     const clearance = evidence?.humanClearance;
     if (!clearance || !evidence?.headSha) return { carry: false, applicable: false, reason: 'no recorded human clearance or live head' };
@@ -210,8 +215,17 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     }
     const inputs = { enabled, equivalence, clearance, headSha: evidence.headSha, headDiff: evidence.headDiff };
     const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
-    if (!pre.carry) return { ...pre, applicable: true };
     const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
+    if (!pre.carry) {
+      // Only a PROVEN fingerprint mismatch (both sides read) earns the git proof: absent or unread fingerprints keep
+      // refusing before git is touched, as they always did.
+      if (!enabled || !clearance.diff || !liveCarryFingerprints(evidence.headDiff).diff) return { ...pre, applicable: true };
+      const proof = proveNumbering({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+      if (proof.ok) return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
+        fingerprint: liveCarryFingerprints(evidence.headDiff).diff || 'unscored', actor: clearance.actor,
+        tier: 'numbering', mechanicalReason: proof.reason, reason: proof.reason };
+      return { ...pre, applicable: true, reason: `${pre.reason}; numbering tier: ${proof.reason}` };
+    }
     const mechanical = proveMechanicalMove({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef, requireReplay: pre.tier === 'contribution' });
     const decision = decideHumanClearanceCarry({ ...inputs, mechanical });
     return { ...decision, applicable: true, ...(decision.carry ? { mechanicalReason: mechanical.reason, reason: mechanical.reason } : {}) };
@@ -237,10 +251,12 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     '',
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
-      + (tier === 'contribution'
+      + (tier === 'numbering'
+        ? `the head moved only by the drain's own card-numbering commit(s), verified mechanically (${mechanicalReason})`
+        : tier === 'contribution'
         ? "the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree"
         : `the PR's net diff vs its merge-base is byte-identical (\`${fingerprint.slice(0, 12)}\`) and the move is mechanical`)
-      + `${mechanicalReason ? ` (${mechanicalReason})` : ''}. Any substantive change still needs a fresh human approval.`,
+      + `${mechanicalReason && tier !== 'numbering' ? ` (${mechanicalReason})` : ''}. Any substantive change still needs a fresh human approval.`,
     '',
     buildReviewedShaMarker(toSha),
     buildReviewedDiffMarker(headDiffText),
@@ -271,6 +287,30 @@ export function logCarrySettingOnce(setting, write = (s) => process.stderr.write
 }
 
 /**
+ * IO: re-read the PR right before the carry record is posted. Returns why the proven carry no longer stands, or null.
+ * `readLiveEvidence()` → {headSha, comments, reviews}; an unreadable thread or formal reviews never let it stand.
+ */
+function liveCarryChange({ readLiveEvidence, carried }) {
+  let live;
+  try { live = readLiveEvidence(); }
+  catch (e) { return `live re-read failed: ${String(e?.message ?? e).split('\n')[0]}`; }
+  if (!live || !Array.isArray(live.comments)) return 'live re-read returned no complete thread';
+  if (String(live.headSha ?? '').toLowerCase() !== carried.toSha.toLowerCase()) return 'the head moved during the proof';
+  const clearance = latestHumanClearance(live.comments);
+  if (!clearance || clearance.sha !== carried.fromSha.toLowerCase() || clearance.actor !== carried.actor) {
+    return 'the recorded clearance changed during the proof';
+  }
+  const rec = latestAcceptRecord(live.comments);
+  if (!rec || rec.sha !== clearance.sha) return 'a later acceptance record changed during the proof';
+  if (rec.laterBodyDerivedHold || live.comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+    return 'a later verdict or unknown comment stands';
+  }
+  if (!Array.isArray(live.reviews)) return 'formal reviews unreadable';
+  if (laterReviewHold(live.reviews, rec.at)) return 'a formal review hold stands';
+  return null;
+}
+
+/**
  * IO: the drain's carry step, run once per gate decision on an ACCEPTED PR. Given the drain's acceptance evidence
  * (`readDrainAcceptance`, which carries `humanClearance` from {@link latestHumanClearance}, `headSha`, `headDiff`), decide the carry and — when it
  * holds — post the durable record BEFORE the caller honours it. Returns:
@@ -281,11 +321,11 @@ export function logCarrySettingOnce(setting, write = (s) => process.stderr.write
  * Every carry and every refused carry of a real clearance is logged to stderr (the daemon log).
  */
 export function applyHumanClearanceCarry({
-  evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main',
-  equivalence = resolveCarryEquivalenceSetting().value,
+  evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main', readLiveEvidence = null,
+  equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
-  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence });
+  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering });
   if (!d.applicable) return null;
   logCarrySettingOnce(setting, log);
   logEquivalenceSettingOnce(equivalence, log);
@@ -295,9 +335,25 @@ export function applyHumanClearanceCarry({
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };
+  // The proof is slow (fetches, blob reads): a hold posted meanwhile would sit BEFORE this record and read as
+  // superseded. The numbering tier (new with #5233) never records without a live re-read — checked before the dry
+  // run so a preview never reports a carry the real pass refuses; the older tiers re-read whenever the caller
+  // supplies one.
+  if (d.tier === 'numbering' && typeof readLiveEvidence !== 'function') {
+    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the numbering tier records only after a live re-read\n`);
+    return null;
+  }
   if (dryRun) {
     log(`  human-clearance-carry ${tag}: WOULD carry ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; tier ${d.tier}; dry run, no record)\n`);
     return { carried };
+  }
+  if (typeof readLiveEvidence === 'function') {
+    const changed = liveCarryChange({ readLiveEvidence, carried: d });
+    if (changed) {
+      log(`  human-clearance-carry ${tag}: carry proven but NOT recorded — ${changed}; deferring, no label change\n`);
+      return { action: 'defer', applyLabel: null,
+        reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
+    }
   }
   const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
   try {

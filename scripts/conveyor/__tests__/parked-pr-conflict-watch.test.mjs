@@ -70,11 +70,17 @@ import { notifyDesktopChecked } from '../branch-sync.mjs';
 // real subprocess run — so the tests below can assert exactly what got posted/notified without a real `gh`/
 // `osascript` call anywhere in this file (mirrors this file's own top-of-file `node:child_process` mock for
 // every OTHER real IO call).
+// The spies are hoisted and shared by every evaluation of a factory: a mock factory that awaits `importOriginal()` can
+// be evaluated twice when the watcher and this file import the module while the first evaluation is still pending,
+// and a per-evaluation `vi.fn()` would then leave the watcher calling a spy these assertions never see.
+const { postNoteCommentSpy, notifyDesktopSpy } = vi.hoisted(() => ({
+  postNoteCommentSpy: vi.fn(() => ({ ok: true })), notifyDesktopSpy: vi.fn(() => ({ ok: true })),
+}));
 vi.mock('../reconcile-note-comment.mjs', async (importOriginal) => ({
-  ...(await importOriginal()), postNoteComment: vi.fn(() => ({ ok: true })),
+  ...(await importOriginal()), postNoteComment: postNoteCommentSpy,
 }));
 vi.mock('../branch-sync.mjs', async (importOriginal) => ({
-  ...(await importOriginal()), notifyDesktopChecked: vi.fn(() => ({ ok: true })),
+  ...(await importOriginal()), notifyDesktopChecked: notifyDesktopSpy,
 }));
 
 // #xu2krte — `watchParkedPrConflicts` now routes every `newlyDetected` conflict to `postFinding` or

@@ -159,6 +159,14 @@ export default defineConfig({
       ['scripts/__tests__/gate-entrypoint-integration.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
       ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
+      // Rust parity tests compile the scanner and scan the real repository. A separate threads pool
+      // runs concurrently with this single fork, so those CPU-heavy checks still competed with the
+      // daemon scenarios (self-sync sibling A3 timed out at 180s while citation parity took 185s).
+      // Queue them with the scenarios so compilation and repository scans cannot overlap their ticks.
+      ['scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-locus-prefix-parity.test.mjs', 'forks'],
+      ['scripts/__tests__/rust-scan-citation-check-parity.test.mjs', 'forks'],
       // #3383 — the daemon-scenario tracer forks a long-lived daemon host child (itself dynamically importing
       // and running the sim clone's whole module graph) plus many short-lived `node`/`git` children per tick —
       // isolated here for the identical contention reason as this array's other members.

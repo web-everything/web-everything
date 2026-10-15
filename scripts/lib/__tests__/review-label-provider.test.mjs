@@ -14,7 +14,34 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
+
+describe('label provider import boundary', () => {
+  it('loads without importing the fix-procedure CLI that lazily loads this provider', () => {
+    // A fresh Node process exercises native ESM linking, which Vitest's transformed imports do not.
+    // Refuse the back edge before it can execute any CLI or forge operation.
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      const result = await nextResolve(specifier, context);
+      if (result.url.endsWith('/conveyor/fix-procedure.mjs')) {
+        throw new Error('label provider imports its fix-procedure caller');
+      }
+      return result;
+    }`;
+    // Not `new URL(rel, import.meta.url)`: the test environment shadows `URL` with a localhost-based one.
+    const providerUrl = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../review-label-provider.mjs')).href;
+    const script = `import { register } from 'node:module';
+      register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(loader)}`)}, import.meta.url);
+      await import(${JSON.stringify(providerUrl)});`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+  });
+});
 
 describe('clampLabelDescription', () => {
   it('exports the GitHub limit and preserves strings up to that limit', () => {
@@ -123,6 +150,31 @@ describe('the gh adapter', () => {
     expect(wrote[0].body).toBe('# hello\n\nwith newlines 🎉');
     expect(seenArgv[seenArgv.indexOf('--body-file') + 1]).toBe(wrote[0].path);
     expect(removed).toEqual([wrote[0].path]);
+  });
+
+  it('edits a comment by node id with the body from a file, and removes the file after', () => {
+    const wrote = [];
+    const removed = [];
+    let seenArgv = null;
+    const p = createGhProvider({
+      exec: (argv) => { seenArgv = argv; return ''; },
+      writeFile: (path, body) => wrote.push({ path, body }),
+      removeFile: (path) => removed.push(path),
+      tmpDir: '/tmpdir',
+    });
+    p.editComment('o/n', 'IC_kwDO-c8_x', '🚫 withdrawn\n\nbody', { pr: 7 });
+    expect(seenArgv).toEqual(GH_ARGV.editComment('IC_kwDO-c8_x', wrote[0].path));
+    expect(seenArgv.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(seenArgv).toContain('id=IC_kwDO-c8_x');
+    expect(seenArgv).toContain(`body=@${wrote[0].path}`);
+    expect(wrote[0].body).toBe('🚫 withdrawn\n\nbody');
+    expect(removed).toEqual([wrote[0].path]);
+    expect(seenArgv.join(' ')).toContain('updateIssueComment');
+  });
+
+  it.each([undefined, '', '12345', '-f', 'IC_x y', 'IC_x\nquery=…'])('refuses an edit without a comment node id: %j', (id) => {
+    const p = createGhProvider({ exec: () => { throw new Error('unexpected exec'); } });
+    expect(() => p.editComment('o/n', id, 'x')).toThrow(/invalid comment node id/);
   });
 
   // A failed post must not leave the body behind — it can be large, and it is the adapter's litter.

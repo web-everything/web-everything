@@ -113,7 +113,7 @@
  * — inventing a parallel per-sha marker here would duplicate a cap this population already inherits for free.
  */
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
-import { resolve, join } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
@@ -126,7 +126,9 @@ import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { REVIEW_LABELS, hasReviewLabel, hasUnclearedReviewLabel, isDeclarativeLeashPath, isStatutePath } from '../lib/review-escalation.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
+// Resolve paths locally: dispatch-lane-io participates in the review/reconcile import cycle
+// and its root may still be uninitialized when this module's adapters are called.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 import {
   standDownComments, WATCHER_STAND_DOWN_ACTOR, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, isStandDownSuperseded,
 } from './stand-down.mjs';
@@ -148,8 +150,8 @@ import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflic
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
 // much heavier transitive import graph (`rearm-review.mjs` → `review-set-label.mjs` → `merge-ai-prs.mjs`, which
 // calls `promisify(execFile)` at module load — the exact hazard `stuck-pr-dispatch-marker.mjs`'s own header
-// documents avoiding). `defaultListAgents` is already this file's own sibling import (`REPO_ROOT` already comes
-// from the same module) — no new heavy dependency, just one more named export off it.
+// documents avoiding). The agent-list adapter comes from the existing dispatch IO module;
+// filesystem paths are resolved locally to avoid depending on that module's initialization order.
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { deriveReviewStatus } from './review-status-tag.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
