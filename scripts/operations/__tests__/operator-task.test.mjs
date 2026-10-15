@@ -368,6 +368,11 @@ describe('operator task post-build', () => {
     const operator = await dispatchOperatorCard({ ...OP, report: true });
     expect(operator.read.operatorPostBuild).toBe(true);
     expect(operator.effect.payload.operatorPostBuild).toBe(true);
+    // The read-to-payload hop copies each route-relevant key by hand; a dropped line changes where the card runs.
+    for (const key of ['num', 'launchKind', 'lane', 'sessionSlug', 'scope', 'groupMembers', 'prompt', 'routing', 'taskType']) {
+      expect(operator.read[key], `read.${key}`).not.toBeUndefined();
+      expect(operator.effect.payload[key], `payload.${key}`).toEqual(operator.read[key] ?? null);
+    }
     expect(operator.wrapped).toEqual([]);
     expect(operator.spawned).toHaveLength(1);
     expect(operator.spawned[0].argv.join('\n')).toContain('<!-- operator-task-report -->');
