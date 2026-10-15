@@ -648,9 +648,8 @@ describe('ciHealBudgetEvidence — shared reset + attributed-window accounting (
     expect(ciHealBudgetEvidence([begin, sameSha, ...history().slice(2)])).toMatchObject({ chargeable: 4, reset: null });
     expect(ciHealBudgetEvidence(history(), { resetOnFixHead: false })).toMatchObject({ chargeable: 4, reset: null, spentBeforeReset: 0 });
   });
-  it('ignores an invalid injected reset, and honours a valid one', () => {
-    expect(ciHealBudgetEvidence(history(), { reset: { at: 'garbage', by: 'x', sha: 'y' } }).chargeable).toBe(4);
-    expect(ciHealBudgetEvidence(history(), { reset: { at: '2026-10-10T00:00:00Z', by: 'x', sha: 'y' } }).chargeable).toBe(2);
+  it('a fix-end whose own time is unreadable is no reset (the reset time must be provable)', () => {
+    expect(ciHealBudgetEvidence([begin, { ...fixEnd(), createdAt: 'garbage' }, ...history().slice(2)])).toMatchObject({ chargeable: 4, reset: null });
   });
   it('refunds an attempt covered by both the reset and a window once, and keeps restore independent of reset', () => {
     const window = { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' };

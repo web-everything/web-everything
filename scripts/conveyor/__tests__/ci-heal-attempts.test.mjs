@@ -166,8 +166,9 @@ describe('ci-heal budget reset fails closed on malformed times (#5968)', () => {
   });
 });
 
-// Review finding (#5968, converge): production reconcile defaults its policy to the environment cascade, and so do tick
-// and landing. This pins that all three read the SAME setting, so the reset cannot be off for one and on for another.
+// Review finding (#5968, converge): production reconcile defaults its policy to the environment layer, and so do tick
+// and landing. This pins the env layer only (the platform/repo layers are not passed to any of the three in production;
+// landing's env default is pinned in land-advance-io.test.mjs).
 describe('reconcile, tick and landing share the environment reset policy (#5968)', () => {
   afterEach(() => { vi.unstubAllEnvs(); });
   const comments = () => [...threeHeals(), ...fixPushAfterHeals()];

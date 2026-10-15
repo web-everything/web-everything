@@ -261,13 +261,12 @@ function healCommentsSince(comments, resetAt) {
  * (reconcile, tick, landing; #5968). Stages, each counted with attempt-id dedupe: the heals (optionally narrowed to
  * `onlyReason`; an unreadable reason stays charged) → minus those proven before the fix-head reset → minus those
  * inside an attributed-main window. Refunds are the DIFFERENCES between successive counts, so an attempt covered by
- * both the reset and a window is refunded once. `reset` may be injected (already resolved); an invalid one is no reset.
+ * both the reset and a window is refunded once.
  * @returns {{chargeable:number, reset:{at:string,by:string,sha:string}|null, spentBeforeReset:number, windowRefunded:number, refunded:number}}
  */
-export function ciHealBudgetEvidence(comments, { resetOnFixHead = true, restore = true, onlyReason = null, reset } = {}) {
+export function ciHealBudgetEvidence(comments, { resetOnFixHead = true, restore = true, onlyReason = null } = {}) {
   const list = Array.isArray(comments) ? comments : [];
-  const found = !resetOnFixHead ? null : reset !== undefined ? reset : ciHealBudgetResetAt(list);
-  const proven = found && Number.isFinite(Date.parse(found.at)) ? found : null;
+  const proven = resetOnFixHead ? ciHealBudgetResetAt(list) : null; // its `at` is always a finite, trusted time
   const narrowed = onlyReason ? list.filter((c) => {
     const reason = ciHealCommentReason(typeof c === 'string' ? c : c?.body);
     return reason === null || reason === onlyReason;
