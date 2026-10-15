@@ -31,7 +31,7 @@ export function resolveHumanSurfaceNetSetting({ env = process.env, readFile = re
 export function readHumanSurfaceNetFiles({ repo, number, headRefOid }, {
   git = gitExec(), gitDirFor = defaultGitDirFor, log = message => console.error(message),
 } = {}) {
-  let fetchFailure;
+  let fetchFailure, netDiffFailure;
   const diagnostic = error => {
     try { log(`[human-surface-net-diff] ${String(error?.stderr || error?.message || error)}`); }
     catch { /* A local logging failure must not bypass the failed-read result. */ }
@@ -42,10 +42,12 @@ export function readHumanSurfaceNetFiles({ repo, number, headRefOid }, {
       catch (error) {
         diagnostic(error);
         if (args[0] === 'fetch') fetchFailure = 'fetch failed';
+        if (args[0] === 'merge-base' || args[0] === 'diff') netDiffFailure = 'net diff failed';
         throw error;
       }
     } }).get(number);
     if (fetchFailure) return { ok: false, reason: fetchFailure };
+    if (netDiffFailure) return { ok: false, reason: netDiffFailure };
     if (!result) return { ok: false, reason: 'net file set not read' };
     if (!result.ok) return { ok: false, reason: PUBLIC_FAILURES.has(result.reason) ? result.reason : 'net diff failed' };
     return result;
