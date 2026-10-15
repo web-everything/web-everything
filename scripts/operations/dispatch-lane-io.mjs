@@ -1584,6 +1584,7 @@ export function createDispatchSinks({
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
+          // Operator post-build route flag; pinned by the createDispatchSinks tests in operator-task.test.mjs.
           operatorPostBuild: payload?.operatorPostBuild === true,
           headRefOid: payload?.headRefOid,
           claimOwner: payload?.claimOwner,

@@ -394,6 +394,65 @@ describe('operator task post-build', () => {
     expect(operator.spawned).toHaveLength(1);
     expect(operator.spawned[0].argv.join('\n')).toContain('<!-- operator-task-report -->');
   });
+  // The sink hop on its own: a build effect payload goes straight into createDispatchSinks, and the provider request
+  // the sink builds is recorded before the real router sees it. Pins the line that copies payload.operatorPostBuild
+  // onto the request (dispatch-lane-io.mjs) and its strict `=== true`: only a boolean true is a route flag.
+  async function sinkRequestFor(payloadExtra, { modes = { build: 'mechanical' }, routing } = {}) {
+    const requests = [];
+    const agentLaunches = [];
+    const wrapped = [];
+    const registry = { build: { runScript: 'scripts/operations/fake-wrapper.mjs', provider: request => { wrapped.push(request); return { handle: 'wrapper' }; } } };
+    const sinks = createDispatchSinks({
+      root: '/primary/webeverything',
+      provider: request => {
+        requests.push(request);
+        return routeDispatchProvider(request, { modes, registry, scriptExists: () => true, providerAvailable: () => true,
+          agent: r => { agentLaunches.push(r); return 'agent-handle'; } });
+      },
+      reserveLane: () => ({ reserved: false }),
+      sessionCwdFor: () => '/primary/.operations/dispatch/sess-9102',
+      ensureSessionCwd: dir => dir,
+      resolveLaneGrant: () => ({}),
+      grantLanePermission: () => {},
+      ensureWorktreeIsolation: () => {},
+      resolveSettingsEnv: () => null,
+      mintSessionId: () => 'sess-9102',
+      now: () => new Date('2026-10-15T10:00:00.000Z'),
+    });
+    await sinks[DISPATCH_EFFECT]({ num: '9102', launchKind: 'build', lane: 4, sessionSlug: 'conveyor-9102',
+      scope: ['we:scripts/worker-brief.mjs'], prompt: 'brief', routing, ...payloadExtra }, { runId: 'run-9102', key: 'dispatch' });
+    expect(requests).toHaveLength(1);
+    return { request: requests[0], agentLaunches, wrapped };
+  }
+  it('createDispatchSinks puts operatorPostBuild: true on the provider request, which reaches the agent route', async () => {
+    const { request, agentLaunches, wrapped } = await sinkRequestFor({ operatorPostBuild: true });
+    expect(request.operatorPostBuild).toBe(true);
+    expect(wrapped).toEqual([]);
+    expect(agentLaunches).toHaveLength(1);
+    expect(agentLaunches[0].operatorPostBuild).toBe(true);
+  });
+  it('createDispatchSinks sends false for an absent or non-boolean flag, so the card keeps its mechanical route', async () => {
+    for (const extra of [{}, { operatorPostBuild: false }, { operatorPostBuild: 'true' }, { operatorPostBuild: 1 }]) {
+      const { request, agentLaunches, wrapped } = await sinkRequestFor(extra);
+      expect(request.operatorPostBuild).toBe(false);
+      expect(agentLaunches).toEqual([]);
+      expect(wrapped).toHaveLength(1);
+    }
+  });
+  it('createDispatchSinks routes an operatorPostBuild payload to the agent over the payload\'s own policy route', async () => {
+    const routing = { policyRoute: { provider: 'codex', model: 'gpt-5.5-codex', effort: 'medium', fallback: [] } };
+    // Control: the codex policy route takes the payload to the wrapper when the flag is off.
+    const ordinary = await sinkRequestFor({ operatorPostBuild: false }, { modes: {}, routing });
+    expect(ordinary.request.policyRoute?.provider).toBe('codex');
+    expect(ordinary.agentLaunches).toEqual([]);
+    expect(ordinary.wrapped).toHaveLength(1);
+    const operator = await sinkRequestFor({ operatorPostBuild: true }, { modes: {}, routing });
+    expect(operator.request.operatorPostBuild).toBe(true);
+    expect(operator.request.policyRoute?.provider).toBe('codex');
+    expect(operator.wrapped).toEqual([]);
+    expect(operator.agentLaunches).toHaveLength(1);
+    expect(operator.agentLaunches[0].policyRoute).toBeNull();
+  });
   it('derives operatorPostBuild from the card decision, never from prompt text', () => {
     const card = extra => [{ num: '123', slug: 'test', scope: ['we:scripts/worker-brief.mjs'], ...extra }];
     const ordinary = tickFor(card({ operatorTask: true, report: false }));

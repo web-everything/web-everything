@@ -1402,6 +1402,7 @@ export function dispatchLaneOperation({ readTick } = {}) {
             // The filled brief, verbatim. It is what the agent is told, so a run record read after a restart
             // says exactly what was dispatched rather than "a brief was filled from a template that has since
             // been edited".
+            // Operator post-build route flag for the sink; pinned end to end in operator-task.test.mjs.
             operatorPostBuild: read.operatorPostBuild,
             prompt: read.prompt,
             expectedWithinMinutes: read.expectedWithinMinutes,
