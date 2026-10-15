@@ -26,7 +26,8 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
-  planPriority, admitMainFixDispatch,
+  planPriority, admitMainFixDispatch, parseVitestFailures, classifyFlakeRun, planMainCiRerun, hexSha, FLAKE_RERUN_ROUNDS,
+  findMergeGroupFlakeEvidence, mainCiRedSettingSource,
 } from './main-ci-red-core.mjs';
 import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
 
@@ -44,6 +45,33 @@ function ghJson(exec, argv) {
   });
   if (isGhDeferred(out)) throw new Error('gh read deferred (low budget)');
   return JSON.parse(String(out || 'null'));
+}
+
+/** Read raw Actions log text, refusing a deferred GitHub read. */
+export function readJobLog(jobId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
+  const out = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  if (isGhDeferred(out)) throw new Error('gh log read deferred (low budget)');
+  return String(out ?? '');
+}
+
+/** Read the compare's changed paths; both refs must be hex commit IDs. */
+export function readChangedFiles(base, head, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
+  if (!hexSha(base) || !hexSha(head)) throw new Error('invalid compare sha');
+  const files = ghJson(exec, ['api', `repos/${repoSlug}/compare/${base}...${head}`, '--jq', '[.files[].filename]']);
+  if (!Array.isArray(files) || !files.every((f) => typeof f === 'string')) throw new Error('compare returned no file list');
+  return files;
+}
+
+/** Request only failed and cancelled jobs through the daemon's actions:write identity. */
+export function rerunMainRun(runId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
+  const out = exec('gh', ['run', 'rerun', String(runId), '--failed', '--repo', repoSlug], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  if (isGhDeferred(out)) throw new Error('gh rerun deferred (low budget)');
+  return out;
 }
 
 /**
@@ -101,9 +129,9 @@ export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_R
  * "only cancelled / no runner" (`infraOnly`, not a code failure), plus the failing jobs and tests of the latest real
  * red run. Throws on an unreadable runs read (= unknown).
  */
-export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings(), readRequired = getRequiredStatusChecks } = {}) {
+export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, config = {}, settings = mainCiRedSettings(config), readRequired = getRequiredStatusChecks } = {}) {
   const list = (limit) => ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', settings.mainCiRedBranch,
-    '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName']);
+    '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName,attempt']);
   let runs = list(settings.mainCiRedRunLimit);
   if (!Array.isArray(runs)) throw new Error('main CI runs read returned no list');
   // No green run in a full first page: read deeper once, so the FIRST red commit (the dedupe key) is the real one.
@@ -126,6 +154,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   // A failure whose job list is complete, NON-EMPTY and holds no failed job (only cancelled / never ran) is infra, not
   // code. An empty list is not infra: a `startup_failure` run (a broken workflow file) has zero jobs and IS the defect.
   const markInfraOnly = (r, jobs) => { if (jobs && jobs.complete && jobs.count > 0 && jobs.failed.length === 0) { r.infraOnly = true; return true; } return false; };
+  let failingRun = null;
   let reads = 0;
   for (const r of sorted) {
     const v = classifyRun(r);
@@ -134,7 +163,8 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     reads += 1;
     const jobs = jobsOf(r);
     if (markInfraOnly(r, jobs)) continue;
-    if (jobs && !failing.jobs.length) {
+    if (jobs && !failingRun) {
+      failingRun = r;
       failing.jobs = jobs.failed.map((j) => j.name);
       for (const j of jobs.failed.slice(0, 2)) {
         try { failing.tests.push(...readFailingTests(j.id, { exec, repoSlug })); } catch { /* jobs alone still name the failure */ }
@@ -155,6 +185,43 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
   const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired });
+  if (settings.mainCiRedFlakeRerun && failingRun) {
+    // Rerun evidence is best-effort: unreadable logs/diffs never poison the primary runs probe.
+    failing.failures = null;
+    try {
+      const jobs = jobsOf(failingRun).failed.filter((j) => !settings.mainCiRedSummaryJobs.includes(j.name)).slice(0, 2);
+      failing.failures = jobs.flatMap((j) => parseVitestFailures(readJobLog(j.id, { exec, repoSlug })));
+    } catch { failing.failures = null; }
+    const previous = sorted.slice(sorted.indexOf(failingRun) + 1).find((r) => r.status === 'completed' && classifyRun(r) !== 'ignore');
+    failing.prevRunGreen = !!previous && classifyRun(previous) === 'green';
+    const classify = () => classifyFlakeRun({ run: failingRun, failedJobs: failing.jobs, failures: failing.failures,
+      prevRunGreen: failing.prevRunGreen, changedFiles: failing.changedFiles, groupEvidence: failing.groupEvidence, settings });
+    if (!classify().eligible && failing.prevRunGreen && settings.mainCiRedRerunUnrelatedChange) {
+      try { failing.changedFiles = readChangedFiles(previous.headSha, failingRun.headSha, { exec, repoSlug }); }
+      catch { failing.changedFiles = null; }
+    }
+    // card 303: one list read and at most two complete job reads; evidence never clears main red.
+    failing.groupEvidence = null;
+    if (settings.mainCiRedMergeGroupFlakeEvidence && settings.mainCiRedMergeGroupRunLimit > 0 && tip?.sha) {
+      try {
+        const groupRuns = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow,
+          '--event', 'merge_group', '--limit', String(settings.mainCiRedMergeGroupRunLimit), '--json',
+          'databaseId,conclusion,status,createdAt,updatedAt,headBranch,headSha,event,attempt']);
+        let groupReads = 0;
+        failing.groupEvidence = findMergeGroupFlakeEvidence({ groupRuns, tipSha: tip.sha, failedJobs: failing.jobs, settings,
+          jobsOf: (runId) => {
+            if (groupReads >= 2) return null;
+            groupReads += 1;
+            return readRunJobs(runId, { exec, repoSlug });
+          } });
+      } catch { failing.groupEvidence = null; }
+      if (failing.groupEvidence) {
+        const e = failing.groupEvidence;
+        process.stderr.write(`main-ci-red: flake evidence — merge-group run ${e.runId} (${e.headBranch}) passed ${e.coveredJobs.join(', ')} on main tip ${tip.sha.slice(0, 9)} (setting mainCiRedMergeGroupFlakeEvidence=${settings.mainCiRedMergeGroupFlakeEvidence}, source ${mainCiRedSettingSource(config, 'mainCiRedMergeGroupFlakeEvidence')})\n`);
+      }
+    }
+    failing.flake = { runId: failingRun.databaseId, sha: failingRun.headSha, ...classify(), groupEvidence: failing.groupEvidence };
+  }
   return { runs: sorted, failing, ...(tip ? { tip } : {}) };
 }
 
@@ -185,7 +252,7 @@ export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAU
 /** Open PRs for the owner check, or `null` when unreadable or possibly cut off (= ownership unknown). */
 export function readOpenPrsForOwner({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
   try {
-    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,headRefOid,createdAt,state,author']);
+    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,headRefOid,createdAt,state,author,labels']);
     if (!Array.isArray(rows) || rows.length >= OPEN_PR_LIMIT) return null;
     return rows;
   } catch { return null; }
@@ -237,12 +304,65 @@ export async function probeAndOwnMainCi({
   listAgents = async () => (await import('../operations/dispatch-lane-io.mjs')).defaultListAgents(),
   gates = defaultGates, dispatch = defaultDispatchOwner, publishPriority = writeMainRedPriority,
   publishState = writeMainRedState,
+  rerun = (runId) => rerunMainRun(runId, { repoSlug }),
   readPrCi = (pr) => readFixPrCi(pr, { repoSlug }),
 } = {}) {
   const settings = mainCiRedSettings(config);
-  const probe = readRuns({ repoSlug, settings });
+  const probe = readRuns({ repoSlug, settings, config });
+  const ledgerPath = ledgerPathIn(dir);
+  let reruns;
+  const loadReruns = () => { reruns = readOwnerLedger(ledgerPath)._reruns ?? {}; };
+  if (dryRun) loadReruns();
+  else {
+    mkdirSync(dirname(ledgerPath), { recursive: true });
+    withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
+  }
+  for (const run of probe.runs || []) {
+    // Our flake reruns are ledgered, but a person's manual re-run (or a run whose ledger entry is lost or unreadable) shows
+    // only as attempt > 1. A ledgered run of another kind (the cancelled tip) was never a settled red, so it stays out.
+    const kind = reruns[run.databaseId]?.kind;
+    if (kind != null ? kind !== 'flake' : !(Number(run.attempt) > 1)) continue;
+    // The rerun replaces the original verdict: while it runs the run stays red, and a rerun that finishes with no
+    // verdict (cancelled / skipped / infra-only) must not erase the failure it was meant to settle.
+    if (run.status !== 'completed') run.rerunPending = true;
+    else run.rerunInconclusive = true;
+  }
   const state = mainRedState(probe.runs, { tip: probe.tip });
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };
+  const newest = [...(probe.runs || [])].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+  let issued = false;
+  if (state.status !== 'green') {
+    const plan = planMainCiRerun({ runs: probe.runs, tipSha: probe.tip?.sha ?? newest?.headSha, reruns, flake: probe.failing?.flake, settings });
+    if (plan && dryRun) base.rerun = { ...plan, status: 'dry-run' };
+    else if (plan) {
+      mkdirSync(dirname(ledgerPath), { recursive: true });
+      let reserved = false;
+      withFileLock(`${ledgerPath}.lock`, () => {
+        const ledger = readOwnerLedger(ledgerPath);
+        ledger._reruns ??= {};
+        const prev = ledger._reruns[plan.runId];
+        if (Object.hasOwn(ledger._reruns, plan.runId) && !(plan.retry && (prev?.rounds ?? 1) < FLAKE_RERUN_ROUNDS)) return;
+        ledger._reruns[plan.runId] = { at: now, kind: plan.kind, sha: plan.sha, reason: plan.reason, status: 'requested', rounds: prev ? (prev.rounds ?? 1) + 1 : 1 };
+        writeJsonAtomic(ledgerPath, ledger);
+        reserved = true;
+      }, { timeoutMs: 30_000 });
+      if (reserved) {
+        let status = 'issued', error;
+        try { await rerun(plan.runId); issued = true; }
+        catch (e) { status = 'failed'; error = String(e?.message ?? e).split('\n')[0]; }
+        withFileLock(`${ledgerPath}.lock`, () => {
+          const ledger = readOwnerLedger(ledgerPath);
+          ledger._reruns[plan.runId] = { ...ledger._reruns[plan.runId], status, ...(error !== undefined ? { error } : {}) };
+          writeJsonAtomic(ledgerPath, ledger);
+        }, { timeoutMs: 30_000 });
+        base.rerun = { ...plan, status };
+        if (issued) process.stderr.write(`main-ci-red: re-ran run ${plan.runId} (${plan.kind}: ${plan.reason}) on ${plan.sha.slice(0, 9)}\n`);
+      }
+      withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
+    }
+  }
+  const rerunPending = issued || (probe.runs || []).some((r) => r.rerunPending)
+    || !!(newest && newest.status !== 'completed' && Object.hasOwn(reruns, newest.databaseId));
   // Main green: clear the owner-PR priority. Unknown: leave it to expire on its own TTL (never act on a blind read).
   if (state.status === 'pending') {
     if (!dryRun) { publishPriority(null); publishState(null); }
@@ -256,7 +376,14 @@ export async function probeAndOwnMainCi({
       // Mark the end of any red streak, so a later red window never inherits this window's owner.
       const path = ledgerPathIn(dir);
       mkdirSync(dirname(path), { recursive: true });
-      withFileLock(`${path}.lock`, () => { const l = readOwnerLedger(path); l._greenSeenAt = now; writeJsonAtomic(path, l); }, { timeoutMs: 30_000 });
+      withFileLock(`${path}.lock`, () => {
+        const l = readOwnerLedger(path);
+        l._greenSeenAt = now;
+        for (const [id, entry] of Object.entries(l._reruns ?? {})) {
+          if (now - entry.at > 7 * 24 * 60 * 60_000) delete l._reruns[id];
+        }
+        writeJsonAtomic(path, l);
+      }, { timeoutMs: 30_000 });
     }
     return { ...base, decision: { owed: false, reason: state.status === 'green' ? 'main-green' : 'main-state-unknown' } };
   }
@@ -287,7 +414,7 @@ export async function probeAndOwnMainCi({
   // the SAME admission rule as the owner (F6): the kill switch, host load, and the fixer cap (main-red work may go past
   // a full cap only when `mainCiRedOwnerPriorityOverFixCap` is on). A refusal reserves nothing, so the next tick retries.
   let combineAdmit = { admit: false };
-  if (combine?.deadlock && !dryRun && settings.mainCiRedOwnerDispatch) {
+  if (combine?.deadlock && !rerunPending && !dryRun && settings.mainCiRedOwnerDispatch) {
     combineAdmit = admitMainFixDispatch({ ...(await readGates()), settings });
     if (!combineAdmit.admit) base.combineHeld = { reason: combineAdmit.reason, ...(combineAdmit.why ? { why: combineAdmit.why } : {}) };
   }
@@ -321,7 +448,7 @@ export async function probeAndOwnMainCi({
     }
   }
   // Cheap verdicts first: no agent/gate read while main is not red long enough or dispatch is off.
-  const pre = decideOwner({ state, now, settings, owner: null, prs: [] });
+  const pre = decideOwner({ state, now, settings, owner: null, prs: [], rerunPending });
   if (!pre.owed) {
     const owner = prs === null ? null : findOwner({ firstRed: state.firstRed, prs, ledger: readOwnerLedger(ledgerPathIn(dir)), settings, redShas: state.redShas });
     return { ...base, owner, decision: pre };
@@ -340,7 +467,7 @@ export async function probeAndOwnMainCi({
   lock(() => {
     const ledger = readOwnerLedger(path);
     const owner = findOwner({ firstRed: state.firstRed, prs: prs ?? [], agents, ledger, settings, redShas: state.redShas });
-    const decision = decideOwner({ state, now, settings, owner, prs, killed, fixGate });
+    const decision = decideOwner({ state, now, settings, owner, prs, killed, fixGate, rerunPending });
     result = { ...base, owner, decision };
     if (!decision.owed || dryRun) return;
     ledger[sha] = { at: now, sessionSlug, status: 'dispatching', latestRedSha: state.latestRed.sha };

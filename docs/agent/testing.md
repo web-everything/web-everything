@@ -94,7 +94,10 @@ derive their roots from `import.meta.url`. Daemon clones remain read-only launch
 test snapshots every launch-checkout file, including `.git`, across success and pre-worker failure.
 Prepare edits only the target card body and preparation stamps, never claims/resolves it, and verifies
 the runner-authored stamp before opening a parked PR. Its implementation scope does not bound preparation;
-the card path does. Decision preparation remains a Claude judgment role.
+the card path does. `prepare.runner=codex` passes that card path to routing; `scope` retains implementation-scope
+gating, and `claude` forces the daemon fallback. Use a named critical gate file (for example,
+`scripts/lib/dispatch-contracts.mjs`) in scope-gating fixtures: arbitrary `scripts/lib/` files are not
+critical by directory alone. Decision preparation remains a Claude judgment role.
 Flash keeps the Codex read-only checker; a checker refusal undoes the attempt.
 `test-fix` uses Flash without a separate simple flag and refuses non-test worker diffs.
 The CI-heal decision currently has no structured failing-file list; do not infer one from check names.

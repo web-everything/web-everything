@@ -103,7 +103,7 @@
  * its call costs more than the default passes `throttle.points` explicitly.
  *
  * A CALL BEYOND BUDGET WAITS, IT DOES NOT FIRE — {@link acquireGhPointsSync} polls (bounded, fail OPEN on
- * timeout, mirroring {@link acquireGhSlotSync}'s own policy exactly) until the current window has room or a
+ * timeout) until the current window has room or a
  * new window rolls over, exactly the shape `acquireGhSlotSync` already uses for the concurrency slot.
  *
  * RECORDING — {@link recordGhCallLogEntry} appends one JSON line per `gh` attempt (`calls.jsonl`, a sibling of
@@ -176,7 +176,7 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -192,7 +192,7 @@ import { retryAfterMs } from '../readiness/model-proposer.mjs';
 import { createTelemetryRecorder } from '../operations/telemetry-store.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs';
-export { isGhDeferred } from './gh-deferred.mjs';
+export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
@@ -206,9 +206,9 @@ export const DEFAULT_GH_CONCURRENCY_CAP = 6;
  *  this polls faster than heavy-admission.mjs's 2000ms default). */
 export const DEFAULT_ACQUIRE_POLL_MS = 250;
 
-/** How long a caller polls for a free CONCURRENCY slot before giving up and proceeding unslotted — fail OPEN,
- *  mirroring heavy-admission.mjs's own named policy: a queuing timeout must never strand an otherwise-healthy
- *  `gh` call behind a stuck semaphore. Overridable via `WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS`. */
+/** Priority CONCURRENCY-slot wait; background reads use GH_SLOT_WAIT_STANDARD.backgroundWaitMs.
+ *  A timeout returns retryable throttling by default (card 308), with an explicit `ungated` opt-out.
+ *  Overridable via `WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS`; also bounds the separate budget gates. */
 export const DEFAULT_ACQUIRE_TIMEOUT_MS = 2 * 60_000;
 
 /** Backoff base for a RATE-LIMIT retry (distinct from the acquire-poll interval above — this is the wait AFTER
@@ -469,6 +469,54 @@ export function classifyGhRead(argvRaw) {
   return false;
 }
 
+/** Memo-only GraphQL query allowlist; never changes identity routing or budget/write gates. */
+export function isGhGraphqlReadQuery(args) {
+  if (!Array.isArray(args) || args[0] !== 'api' || args[1] !== 'graphql') return false;
+  let query = null;
+  const fields = new Set(['-f', '-F', '--field', '--raw-field']);
+  const values = new Set(['--jq', '-q', '--cache', '-H', '--header']);
+  const switches = new Set(['--paginate', '-i', '--include']);
+  for (let i = 2; i < args.length; i++) {
+    if (typeof args[i] !== 'string') return false;
+    const equals = args[i].indexOf('=');
+    const flag = equals < 0 ? args[i] : args[i].slice(0, equals);
+    if (switches.has(flag)) {
+      if (equals >= 0) return false;
+      continue;
+    }
+    if (!fields.has(flag) && !values.has(flag)) return false;
+    const value = equals < 0 ? args[++i] : args[i].slice(equals + 1);
+    if (typeof value !== 'string' || !value || value.startsWith('-')) return false;
+    if (fields.has(flag)) {
+      const separator = value.indexOf('=');
+      if (separator <= 0) return false;
+      if (value.slice(0, separator) === 'query') {
+        if (query !== null) return false;
+        query = value.slice(separator + 1);
+      }
+    }
+  }
+  if (query === null) return false;
+  // Remove comments and strings together so '#' and braces inside strings cannot hide an operation.
+  const text = query.replace(/"""(?:\\[\s\S]|(?!""")[\s\S])*"""|"(?:\\[\s\S]|[^"\\])*"|#[^\r\n]*/g, ' ').trim();
+  if (!/^(?:query\b|\{)/.test(text)) return false;
+  // Only document-level operation keywords count: names/fields can legally be 'mutation'.
+  const stack = [];
+  let operationStart = true;
+  for (const token of text.match(/[A-Za-z_][A-Za-z_0-9]*|[{}()[\]]/g) || []) {
+    if (!stack.length && operationStart) {
+      if (token === 'mutation' || token === 'subscription') return false;
+      operationStart = false;
+    }
+    if (['{', '(', '['].includes(token)) stack.push(token);
+    else if (['}', ')', ']'].includes(token)) {
+      if (stack.pop() !== { '}': '{', ')': '(', ']': '[' }[token]) return false;
+      if (!stack.length && token === '}') operationStart = true;
+    }
+  }
+  return stack.length === 0;
+}
+
 /**
  * Is this `gh` call answered from local state alone (no GitHub request)? `gh auth token` reads the stored login
  * from the local keyring/hosts file. Such a call spends no budget, so the shared budget-block gate must never
@@ -514,13 +562,65 @@ export function deriveGhCaller(throttle, env) {
 
 /** Operator ruling 2026-09-30: reserve GraphQL headroom for reviews and landing. */
 export const GH_PRIORITY_THRESHOLDS = Object.freeze({ background: 0.25, normal: 0.10, critical: 0 });
+function normalizeGhCaller(caller) {
+  return basename(String(caller).replace(/^we:/, '')).replace(/\.mjs(?=:|$)/, '');
+}
 export function ghCallerPriority(caller, args = []) {
-  const name = basename(String(caller).replace(/^we:/, '')).replace(/\.mjs(?=:|$)/, '');
+  const name = normalizeGhCaller(caller);
   if (/^(review-daemon|review-set-label|review-pr|merge-ai-prs)(:|$)/.test(name)) return 'critical';
   if (/^pr-land(:|$)/.test(name) && (name.includes(':land') || args[0] === 'pr' && args[1] === 'merge')) return 'critical';
   if (/^ci-heal(?:-run|-pr-dispatch)?(:|$)/.test(name) && (name.includes(':push') || classifyGhWrite(args))) return 'critical';
   if (/^(dispatch-plan|parked-pr-conflict-watch|parked-pr-progress-watch|active-progress-watch|progress-board|lane-whois|reconcile-pass|reconcile-fix-dispatch|reconcile-snapshot)(:|$)/.test(name)) return 'background';
   return 'normal';
+}
+
+/**
+ * Card 308: background reads wait briefly; priority calls keep the long slot wait.
+ * Slot timeouts default to retryable `throttled`; `ungated` explicitly restores fail-open.
+ * Points/write budget timeouts and acquire exceptions retain their existing policies.
+ */
+export const GH_SLOT_WAIT_STANDARD = Object.freeze({
+  backgroundWaitMs: 8000,
+  onSlotTimeout: 'throttled',
+  priorityCallers: Object.freeze(['^(ci-red-recovery|main-ci-red|red-main|main-red|enqueue)']),
+  backgroundCallers: Object.freeze(['^(lane-pool-health-watch|parked-pr-|load-flake-reverify|advisory-label-sweep|merge-orphan-sweep|health-watch|build-dispatch-daemon|already-done-refresh|lease-reaper|rebuild-smoke|reconcile-fix-dispatch-daemon)']),
+});
+
+export function resolveGhSlotWait(env = process.env) {
+  try {
+    const raw = env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS;
+    const r = cascadePolicy('ghThrottleSlotWait', undefined, {
+      env, standard: GH_SLOT_WAIT_STANDARD,
+      envValues: {
+        backgroundWaitMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined,
+        onSlotTimeout: env?.WE_GH_THROTTLE_ON_SLOT_TIMEOUT,
+      },
+      valid: {
+        backgroundWaitMs: n => Number.isInteger(n) && n >= 0 && n <= 120000,
+        onSlotTimeout: v => v === 'throttled' || v === 'ungated',
+        backgroundCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
+        priorityCallers: v => Array.isArray(v) && v.every(x => typeof x === 'string'),
+      },
+    });
+    return { ...GH_SLOT_WAIT_STANDARD, ...(r.value || {}), source: r.sources || {} };
+  } catch {
+    return { ...GH_SLOT_WAIT_STANDARD, source: Object.fromEntries(Object.keys(GH_SLOT_WAIT_STANDARD).map(k => [k, 'standard'])) };
+  }
+}
+
+/** PURE slot-wait classification; malformed regex entries never interrupt a caller. */
+export function ghSlotWaitClass({ caller, args = [], isWrite, settings = GH_SLOT_WAIT_STANDARD }) {
+  if (isWrite || classifyGhWrite(args)) return 'priority';
+  const priority = ghCallerPriority(caller, args);
+  if (priority === 'critical') return 'priority';
+  const name = normalizeGhCaller(caller);
+  const matches = patterns => Array.isArray(patterns) && patterns.some(pattern => {
+    if (typeof pattern !== 'string') return false;
+    try { return new RegExp(pattern).test(name); } catch { return false; }
+  });
+  if (matches(settings.priorityCallers)) return 'priority';
+  if (priority === 'background' || matches(settings.backgroundCallers)) return 'background';
+  return 'priority';
 }
 
 function headroomPath(lockRoot, identity) {
@@ -1022,8 +1122,8 @@ import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCal
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
 /**
- * Poll for a free `gh`-call slot until one is won or `timeoutMs` elapses. FAILS OPEN on timeout (`{ ok:false,
- * timedOut:true }`) — mirrors `heavy-admission.mjs#acquireSlotBlocking`'s own policy, at a SYNCHRONOUS sleep
+ * Poll for a free `gh`-call slot until one is won or `timeoutMs` elapses (`{ ok:false, timedOut:true }`).
+ * The runners decide whether to throttle or opt into ungated execution. Uses a SYNCHRONOUS sleep
  * (`sleepSyncMs`, from `we:scripts/readiness/drain-lock.mjs`) rather than an async one, since `runGhSync` (this
  * module's whole point) must stay a synchronous, execFileSync-shaped call — the same reason `gh` calls
  * themselves run via `execFileSync`/`spawnSync`, not an async `exec`.
@@ -1100,8 +1200,8 @@ export function decideGhPointsSpend({ state, points, nowMs, budgetPerMin, window
  * waiting) until `points` fits in the current 60s window or `timeoutMs` elapses, guarding the shared window
  * state with `file-locks.mjs#reserve`/`releaseLockDir` (a plain single-holder mutex, held only across one
  * tiny JSON read/write — see the module header's #3670 section for why this reuses that primitive rather than
- * inventing a new one). FAILS OPEN on timeout (`{ok:false, timedOut:true}`) — mirrors {@link acquireGhSlotSync}
- * exactly: a stuck budget gate must never strand an otherwise-healthy `gh` call forever.
+ * inventing a new one). FAILS OPEN on timeout (`{ok:false, timedOut:true}`): a stuck budget gate must never
+ * strand an otherwise-healthy `gh` call forever. Slot timeouts use the separate card 308 policy.
  */
 export function acquireGhPointsSync({
   lockRoot, points = 1, budgetPerMin, owner, pid = process.pid,
@@ -1158,7 +1258,7 @@ function writeGhWriteBudgetState(lockRoot, state) {
  * lock key so exhausting the write budget never blocks a read and vice versa. A caller QUEUES here (spins,
  * bounded, injectable `sleep`/`now` for tests) rather than firing — the #gh-write-burst fix's whole point:
  * a write past budget waits for the window instead of hammering GitHub. FAILS OPEN on timeout, identically to
- * every other gate in this module. Cost is always 1 per call (write calls are not weighted by REST points —
+ * the points-budget gate. Cost is always 1 per call (write calls are not weighted by REST points —
  * unlike the points budget, this ledger counts MUTATIONS, not spend).
  */
 export function acquireGhWriteBudgetSync({
@@ -1482,8 +1582,8 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  */
 /**
  * A concurrency-slot acquire that TIMED OUT used to proceed ungated with no trace at all — the 2026-10-07 stall
- * cost every gh call on the host 2 minutes and nothing said so. Now it is a `slot_timeout` line in `calls.jsonl`
- * (with how long it waited) plus a stderr warning, so a starved pool is visible the first time it happens.
+ * cost every gh call on the host 2 minutes and nothing said so. The explicit `ungated` opt-out records a
+ * `slot_timeout` line and warning here; the default refusal records `slot_throttled` instead (card 308).
  */
 export function noteSlotTimeout(logPath, acq, entry, warn) {
   if (!acq || !acq.timedOut) return false;
@@ -1491,6 +1591,20 @@ export function noteSlotTimeout(logPath, acq, entry, warn) {
   const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated; holders: ${ghHoldersSummary(acq.holders)}`;
   try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
   return true;
+}
+
+/** Card 308: refuse a timed-out slot before entering the subprocess retry loop. */
+function slotTimeoutMessage(logPath, acq, entry, settings, waitClass, warn) {
+  if (!acq?.timedOut) return null;
+  if (settings.onSlotTimeout === 'ungated') {
+    noteSlotTimeout(logPath, acq, entry, warn);
+    return null;
+  }
+  const waitedMs = acq.waitedMs ?? 0;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_throttled', waitedMs, class: waitClass });
+  const message = `gh-throttle: throttled — no gh slot within ${waitedMs / 1000}s (class=${waitClass}); retry next tick\n`;
+  try { (warn || (m => process.stderr.write(m)))(message); } catch { /* best-effort */ }
+  return message;
 }
 
 /** gh-budget-burn: the call log had grown to 640 MB with no rotation. Past this size it is renamed to
@@ -1571,6 +1685,35 @@ export function recordGhCallLogEntry(logPath, entry) {
 
 // ── the transparent, importable, drop-in replacement for `execFileSync('gh', args, opts)` ───────────────────
 
+export const WE_GH_READ_MEMO_DIR = 'WE_GH_READ_MEMO_DIR';
+
+function ghReadMemoContext(execOpts, throttle, env) {
+  // The executor inherits process.env unless opts.env is explicit; throttle.env configures gates only.
+  const childEnv = execOpts.env || process.env;
+  const cwd = resolve(execOpts.cwd || process.cwd());
+  const bin = throttle.bin || 'gh';
+  const probeBin = bin.includes('/') ? resolve(cwd, bin) : bin;
+  const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(cwd, path)).join(delimiter) };
+  // The App shim can choose a credential from its caller map even when a token was supplied.
+  const callerSelectsAuth = (!bin.includes('/') && !childEnv.PATH) || ghBinIsWeShim(probeBin, probeEnv);
+  const contextEnv = bag => Object.fromEntries(Object.keys(bag).sort()
+    .filter(key => (key !== 'GH_CALLER' || callerSelectsAuth) && key !== WE_GH_READ_MEMO_DIR
+      && (/^(?:GH_|GITHUB_|GIT_|WE_GH_|WE_GITHUB_)/.test(key) || ['HOME', 'XDG_CONFIG_HOME', 'PATH'].includes(key)))
+    .map(key => [key, bag[key]]));
+  // Hash all credential material: ghAuthIdentity deliberately groups unknown App tokens into one bucket.
+  return createHash('sha256').update(JSON.stringify({
+    identity: ghAuthIdentity(childEnv), cwd,
+    bin: throttle.bin || 'gh', childEnv: contextEnv(childEnv), configEnv: contextEnv(env),
+    personalRoute: throttle.personalRoute, personalToken: throttle.personalToken,
+  })).digest('hex');
+}
+
+function ghReadMemoHasFileInput(args) {
+  return args.some((arg, i) => arg === '--input' || arg.startsWith('--input=')
+    || ((args[i - 1] === '-F' || args[i - 1] === '--field' || arg.startsWith('-F') || arg.startsWith('--field='))
+      && /=@/.test(arg)));
+}
+
 /**
  * Run `gh` with `args`, gated by the concurrency semaphore and retried with bounded backoff on a rate-limit-
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
@@ -1604,8 +1747,57 @@ export function recordGhCallLogEntry(logPath, entry) {
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
+ * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
+  const { throttle = {}, ...execOpts } = opts;
+  const env = throttle.env || process.env;
+  const dir = env[WE_GH_READ_MEMO_DIR];
+  if (!dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
+      || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))
+      // Personal routing can fall back to another identity as budget/access state changes.
+      || (classifyGhRead(args) && (throttle.personalRoute ?? resolvePersonalRouteEnabled(env)))) {
+    return runGhSyncUnmemoized(args, opts);
+  }
+  let key, path;
+  try {
+    const context = ghReadMemoContext(execOpts, throttle, env);
+    // Exact argv preserves conditional validators: 304 for one ETag is not a 200 body for another.
+    key = createHash('sha256').update(JSON.stringify({ args, context })).digest('hex');
+    path = join(dir, `${key}.json`);
+  } catch { return runGhSyncUnmemoized(args, opts); } // Unsupported context disables optional memoization.
+  const encoding = execOpts.encoding && execOpts.encoding !== 'buffer' ? execOpts.encoding : null;
+  try {
+    const entry = JSON.parse(readFileSync(path, 'utf8'));
+    if (entry.key === key && JSON.stringify(entry.args) === JSON.stringify(args) && typeof entry.stdout === 'string'
+        && Buffer.isEncoding(entry.encoding)
+        && (entry.encoding !== 'base64' || Buffer.from(entry.stdout, 'base64').toString('base64') === entry.stdout)) {
+      const bytes = Buffer.from(entry.stdout, entry.encoding);
+      const result = encoding ? bytes.toString(encoding) : bytes;
+      const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
+      recordGhCallLogEntry(throttle.logPath || ghThrottleLogPath(lockRoot), {
+        outcome: 'memo_hit', op: throttle.op || args.slice(0, 2).join(' '), caller: deriveGhCaller(throttle, env), points: 0,
+      });
+      return result;
+    }
+  } catch { /* Unreadable entries are misses. */ }
+
+  const result = runGhSyncUnmemoized(args, opts);
+  if (isGhDeferred(result) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    // The smoke owns directory creation/removal. A late reader must never resurrect it.
+    writeFileSync(tmp, JSON.stringify({ key, args, stdout: Buffer.isBuffer(result) ? result.toString('base64') : result,
+      encoding: Buffer.isBuffer(result) ? 'base64' : encoding || 'utf8' }), { mode: 0o600, flag: 'wx' });
+    renameSync(tmp, path);
+  } catch { /* Memo storage must not fail a successful read. */ }
+  finally {
+    try { unlinkSync(tmp); } catch { /* Renamed or never created. */ }
+  }
+  return result;
+}
+
+function runGhSyncUnmemoized(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
   if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
@@ -1655,6 +1847,10 @@ export function runGhSync(args, opts = {}) {
   const isWrite = classifyGhWrite(args);
   const writeBudgetPerMin = throttle.writeBudgetPerMin != null ? throttle.writeBudgetPerMin : resolveGhWriteBudgetPerMin(env);
   const caller = deriveGhCaller(throttle, env);
+  const slotWait = resolveGhSlotWait(env);
+  const waitClass = ghSlotWaitClass({ caller, args: args, isWrite, settings: slotWait });
+  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
+    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see that section above).
   const resource = classifyGhResource(args);
   // The credential the child really uses: the caller's explicit env, else — a config-only `throttle.env` carries
@@ -1708,12 +1904,14 @@ export function runGhSync(args, opts = {}) {
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: args, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: args, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
-    // Fail OPEN on an acquire timeout too — proceeding unslotted rather than stranding this `gh` call forever
-    // (the residual-risk policy heavy-admission.mjs itself names: a fixed cap bounds concurrency and makes the
-    // wait observable, it does not claim to eliminate contention).
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, slotWait, waitClass, throttle.warn);
+    if (throttledMessage) {
+      const error = new Error(throttledMessage);
+      Object.assign(error, { status: 1, stdout: '', stderr: throttledMessage, ghThrottled: { class: waitClass, waitedMs: acq.waitedMs ?? 0 } });
+      throw error;
+    }
     let result;
     let failure = null;
     try {
@@ -1873,6 +2071,10 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const isWrite = classifyGhWrite(argv);
   const writeBudgetPerMin = throttle.writeBudgetPerMin != null ? throttle.writeBudgetPerMin : resolveGhWriteBudgetPerMin(env);
   const caller = deriveGhCaller(throttle, env);
+  const slotWait = resolveGhSlotWait(env);
+  const waitClass = ghSlotWaitClass({ caller, args: argv, isWrite, settings: slotWait });
+  const slotTimeoutMs = throttle.acquireTimeoutMs != null ? throttle.acquireTimeoutMs
+    : waitClass === 'background' ? slotWait.backgroundWaitMs : acquireTimeoutMs;
   // #gh-graphql-budget — the shared primary-budget backoff (see runGhSync's identical wiring).
   const resource = classifyGhResource(argv);
 
@@ -1936,9 +2138,10 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
+      return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now() }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
-    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, throttle.warn);
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, slotWait, waitClass, throttle.warn);
+    if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});
