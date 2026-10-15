@@ -4,7 +4,7 @@
  * changes a drain decision. Ledger clearance stays fail-closed on missing or unreadable evidence.
  */
 import { readFileSync } from 'node:fs';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord, DEFAULT_VERDICT_LEDGER_STORE, EVENT_TYPES, foldVerdictLedger,
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, foldVerdictLedger,
   parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoard, resolveLedgerStoreChoice, validateLedgerEvent,
   VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
@@ -70,12 +70,14 @@ const readHome = repo => {
 };
 
 /** The store the drain's writes land in, resolved as `appendVerdict` resolves it. `dual` and `git` read git: a hold
- *  that missed git spills to home, and a release can reach git but not home, so a home read would hide the miss. */
+ *  that missed git spills to home, and a release can reach git but not home, so a home read would hide the miss.
+ *  With no board, named or not, git is never written (a hold lands only in home, a release is refused), so home is the
+ *  store: reading git would fail every pass, and a failed read records the hold again each pass without end. */
 export function drainLedgerReadStore(repo, env = process.env) {
-  const { store, named } = resolveLedgerStoreChoice(undefined, env);
+  const { store } = resolveLedgerStoreChoice(undefined, env);
   if (store === 'home') return 'home';
-  if (!named && store === DEFAULT_VERDICT_LEDGER_STORE && !resolveLedgerBoard(repo, {}, env)) return 'home';
-  return VERDICT_LEDGER_STORES.includes(store) ? 'git' : store;
+  if (!VERDICT_LEDGER_STORES.includes(store)) return store;
+  return resolveLedgerBoard(repo, {}, env) ? 'git' : 'home';
 }
 
 /** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. Keyed by the

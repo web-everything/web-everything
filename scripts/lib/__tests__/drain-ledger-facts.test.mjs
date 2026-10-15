@@ -120,7 +120,7 @@ describe('drain ledger facts', () => {
 describe('drain ledger facts — the recorders read the store their writes land in', () => {
   const hold = event('hold', { reasonCode: 'review', holdSource: 'drain' });
   const release = event('release', { reasonCode: 'review', holdSource: 'drain' });
-  const dual = { WE_VERDICT_LEDGER_STORE: 'dual' };
+  const dual = { WE_VERDICT_LEDGER_STORE: 'dual', WE_VERDICT_LEDGER_BOARD: '/board' };
   const stores = () => {
     const git = [], home = [];
     const append = fail => row => appendVerdict(row, { store: 'dual', board: '/board', warn: () => {},
@@ -132,9 +132,12 @@ describe('drain ledger facts — the recorders read the store their writes land 
   it('resolves the read store as the write path does', () => {
     expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'home' })).toBe('home');
     expect(drainLedgerReadStore(repo, dual)).toBe('git');
-    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'git' })).toBe('git');
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'git', WE_VERDICT_LEDGER_BOARD: '/board' })).toBe('git');
     expect(drainLedgerReadStore(repo, { VITEST: 'true' })).toBe('home');
     expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_BOARD: '/board' })).toBe('git');
+    // A NAMED store with no board never writes git (holds land in home, releases are refused): home is the store.
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'dual' })).toBe('home');
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'git' })).toBe('home');
   });
   it('a hold that misses the shared store is reported and recorded again on the next pass', async () => {
     const s = stores();
@@ -224,6 +227,16 @@ describe('drain ledger facts — the recorders read the store their writes land 
     expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(true), append: s.append() })).toMatchObject({ ok: true, appended: true });
     expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(true), append: s.append() })).toMatchObject({ ok: true, appended: false });
     expect(s.git.map(e => e.type)).toEqual(['hold']);
+  }));
+  it('a named store with no board reads home, so a held PR records its hold once over many passes', () => withHome(async s => {
+    const noBoard = { WE_VERDICT_LEDGER_STORE: 'dual' };
+    const append = row => appendVerdict(row, { env: noBoard, warn: () => {},
+      homeAppend: r => { appendFileSync(verdictLedgerPath(repo), `${JSON.stringify(r)}\n`); return { ok: true, record: r }; } });
+    const pass = async () => recordDrainHold({ repo, pr: 1, reason: 'review', append,
+      read: await readDrainLedgerSnapshot([repo], { env: noBoard, readStore: async () => { throw new Error('a no-board repo must not read git'); } }) });
+    expect(await pass()).toMatchObject({ appended: false, errors: [expect.stringMatching(/ledger-write-miss/)] });
+    for (let n = 0; n < 4; n++) expect(await pass()).toMatchObject({ ok: true, appended: false });
+    expect(s.home().map(e => e.type)).toEqual(['hold']);
   }));
 });
 

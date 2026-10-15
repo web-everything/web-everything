@@ -3079,7 +3079,7 @@ export function drainHoldReasonCode(reason) {
 /**
  * E3 (#3929, plan R8) — append ONE `drain-hold` event when the drain's reason for holding a PR changes. Reads the
  * PR's last drain-hold event (the drain passes `readDrainLedgerSnapshot`, the store its writes land in; the default
- * reads home); an identical code appends nothing, so a `--watch` loop re-reaching the same state stays silent. A hold
+ * reads home, which is right only for store=home); an identical code appends nothing, so a `--watch` loop re-reaching the same state stays silent. A hold
  * that missed the shared store is reported as a failure, and the next pass's shared read retries it.
  * FAIL-SOFT and additive: never throws, never touches a label or a decision. `read`/`append` are test seams.
  * @param {{repo: string, pr: number|string, reason: string, read?: Function, append?: Function}} o
