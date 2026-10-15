@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE, REPO_ROOT } from '../shard-files.mjs';
 import { loadTimings } from '../../../ci/shard-assign.mjs';
 
-describe('soak shard-files — time-balanced split (card 11)', () => {
+describe('soak shard-files — isolated baseline and time-balanced breaks', () => {
   it('every file (baseline + breaks) is assigned to exactly one shard', () => {
     const total = 4;
     const seen = [];
@@ -48,6 +48,7 @@ describe('soak shard-files — time-balanced split (card 11)', () => {
     withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs'], (dir) => {
       const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
         timings: { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 40, 'b.soak.test.mjs': 20, 'c.soak.test.mjs': 20 } };
+      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
       expect(shardFiles({ ...opts, shard: 2 })).toEqual(['a.soak.test.mjs']);
       expect(shardFiles({ ...opts, shard: 3 })).toEqual(['b.soak.test.mjs', 'c.soak.test.mjs']);
     });

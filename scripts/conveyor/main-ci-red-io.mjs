@@ -27,7 +27,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
   planPriority, admitMainFixDispatch, parseVitestFailures, classifyFlakeRun, planMainCiRerun, hexSha, FLAKE_RERUN_ROUNDS,
-  findMergeGroupFlakeEvidence, mainCiRedSettingSource,
+  findMergeGroupFlakeEvidence, mainCiRedSettingSource, assessOwnerProgress, planEscalation, planStalledRecovery,
 } from './main-ci-red-core.mjs';
 import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
 
@@ -227,25 +227,39 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
 
 /**
  * One fix PR's CI for the combine rule: its latest FINISHED ci.yml run on the PR head, with a complete job list.
- * `{status:'green'|'red'|'pending'|'unknown', failedJobs}` — anything not provable is `pending`/`unknown`.
+ * `{status:'green'|'red'|'inconclusive'|'pending'|'missing'|'unknown', failedJobs}` — completed runs without a verdict
+ * are inconclusive; a successful lookup with no current-head runs is missing. Neither proves CI is in flight
+ * or proves any job fixes to the combine rule. Unreadable responses remain unknown.
  */
 export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
   try {
+    // Filter before the server's limit: other heads must not crowd this head's runs out of the sample.
     const runs = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', String(pr.headRefName),
-      '--limit', '5', '--json', 'databaseId,conclusion,status,createdAt,headSha']);
-    const done = (Array.isArray(runs) ? runs : []).filter((r) => classifyRun(r) !== 'ignore')
+      ...(pr.headRefOid ? ['--commit', String(pr.headRefOid)] : []),
+      '--limit', '5', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha']);
+    if (!Array.isArray(runs)) return { status: 'unknown', failedJobs: [] };
+    const headRuns = runs.filter((r) => !pr.headRefOid || r.headSha === pr.headRefOid);
+    if (!headRuns.length) return { status: 'missing', failedJobs: [], completedAt: null };
+    const done = headRuns.filter((r) => r.status === 'completed')
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
-    if (!done) return { status: 'pending', failedJobs: [] };
-    if (pr.headRefOid && done.headSha !== pr.headRefOid) return { status: 'pending', failedJobs: [] };
+    // card 302: a newer in-flight run supersedes the finished verdict for progress.
+    const pending = headRuns.some((r) => ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(r.status)
+      && (!done || Date.parse(r.createdAt) >= Date.parse(done.createdAt)));
+    const progress = { completedAt: done?.updatedAt ?? null, ...(pending ? { pending: true } : {}) };
+    if (pending) return { status: 'pending', failedJobs: [], ...progress };
+    if (!done) return { status: 'unknown', failedJobs: [], ...progress };
+    if (classifyRun(done) === 'ignore') return { status: 'inconclusive', failedJobs: [], ...progress };
     if (classifyRun(done) === 'green') {
       // A green run can still have skipped jobs, so read the jobs: only the ones that SUCCEEDED prove a fix (F5). An
       // unreadable job list leaves the PR green with no proof — it can then fix nothing, but it is not "unknown".
       let passedJobs = [];
       try { passedJobs = readRunJobs(done.databaseId, { exec, repoSlug }).passed; } catch { passedJobs = []; }
-      return { status: 'green', failedJobs: [], passedJobs };
+      return { status: 'green', failedJobs: [], passedJobs, ...progress };
     }
-    const jobs = readRunJobs(done.databaseId, { exec, repoSlug });
-    return jobs.complete ? { status: 'red', failedJobs: jobs.failed.map((j) => j.name), passedJobs: jobs.passed } : { status: 'unknown', failedJobs: [] };
+    let jobs;
+    try { jobs = readRunJobs(done.databaseId, { exec, repoSlug }); }
+    catch { return { status: 'unknown', failedJobs: [], ...progress }; }
+    return jobs.complete ? { status: 'red', failedJobs: jobs.failed.map((j) => j.name), passedJobs: jobs.passed, ...progress } : { status: 'unknown', failedJobs: [], ...progress };
   } catch { return { status: 'unknown', failedJobs: [] }; }
 }
 
@@ -318,10 +332,10 @@ export async function probeAndOwnMainCi({
     withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
   }
   for (const run of probe.runs || []) {
-    // Our flake reruns are ledgered, but a person's manual re-run (or a run whose ledger entry is lost or unreadable) shows
-    // only as attempt > 1. A ledgered run of another kind (the cancelled tip) was never a settled red, so it stays out.
+    // Our flake and owner-stalled reruns are ledgered, but a person's manual re-run (or a run whose ledger entry is lost or
+    // unreadable) shows only as attempt > 1. A ledgered run of another kind (the cancelled tip) was never a settled red, so it stays out.
     const kind = reruns[run.databaseId]?.kind;
-    if (kind != null ? kind !== 'flake' : !(Number(run.attempt) > 1)) continue;
+    if (kind != null ? !['flake', 'owner-stalled'].includes(kind) : !(Number(run.attempt) > 1)) continue;
     // The rerun replaces the original verdict: while it runs the run stays red, and a rerun that finishes with no
     // verdict (cancelled / skipped / infra-only) must not erase the failure it was meant to settle.
     if (run.status !== 'completed') run.rerunPending = true;
@@ -331,34 +345,41 @@ export async function probeAndOwnMainCi({
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };
   const newest = [...(probe.runs || [])].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
   let issued = false;
-  if (state.status !== 'green') {
-    const plan = planMainCiRerun({ runs: probe.runs, tipSha: probe.tip?.sha ?? newest?.headSha, reruns, flake: probe.failing?.flake, settings });
-    if (plan && dryRun) base.rerun = { ...plan, status: 'dry-run' };
-    else if (plan) {
-      mkdirSync(dirname(ledgerPath), { recursive: true });
-      let reserved = false;
+  // card 302: both recovery rules share the same once-per-run reservation.
+  const requestRerun = async (plan) => {
+    if (dryRun) return { ...plan, status: 'dry-run' };
+    mkdirSync(dirname(ledgerPath), { recursive: true });
+    let reserved = false;
+    withFileLock(`${ledgerPath}.lock`, () => {
+      const ledger = readOwnerLedger(ledgerPath);
+      ledger._reruns ??= {};
+      const prev = ledger._reruns[plan.runId];
+      if (Object.hasOwn(ledger._reruns, plan.runId) && !(plan.retry && (prev?.rounds ?? 1) < FLAKE_RERUN_ROUNDS)) return;
+      ledger._reruns[plan.runId] = { at: now, kind: plan.kind, sha: plan.sha, reason: plan.reason, status: 'requested', rounds: prev ? (prev.rounds ?? 1) + 1 : 1 };
+      writeJsonAtomic(ledgerPath, ledger);
+      reserved = true;
+    }, { timeoutMs: 30_000 });
+    let outcome = null;
+    if (reserved) {
+      let status = 'issued', error;
+      try { await rerun(plan.runId); issued = true; }
+      catch (e) { status = 'failed'; error = String(e?.message ?? e).split('\n')[0]; }
       withFileLock(`${ledgerPath}.lock`, () => {
         const ledger = readOwnerLedger(ledgerPath);
-        ledger._reruns ??= {};
-        const prev = ledger._reruns[plan.runId];
-        if (Object.hasOwn(ledger._reruns, plan.runId) && !(plan.retry && (prev?.rounds ?? 1) < FLAKE_RERUN_ROUNDS)) return;
-        ledger._reruns[plan.runId] = { at: now, kind: plan.kind, sha: plan.sha, reason: plan.reason, status: 'requested', rounds: prev ? (prev.rounds ?? 1) + 1 : 1 };
+        ledger._reruns[plan.runId] = { ...ledger._reruns[plan.runId], status, ...(error !== undefined ? { error } : {}) };
         writeJsonAtomic(ledgerPath, ledger);
-        reserved = true;
       }, { timeoutMs: 30_000 });
-      if (reserved) {
-        let status = 'issued', error;
-        try { await rerun(plan.runId); issued = true; }
-        catch (e) { status = 'failed'; error = String(e?.message ?? e).split('\n')[0]; }
-        withFileLock(`${ledgerPath}.lock`, () => {
-          const ledger = readOwnerLedger(ledgerPath);
-          ledger._reruns[plan.runId] = { ...ledger._reruns[plan.runId], status, ...(error !== undefined ? { error } : {}) };
-          writeJsonAtomic(ledgerPath, ledger);
-        }, { timeoutMs: 30_000 });
-        base.rerun = { ...plan, status };
-        if (issued) process.stderr.write(`main-ci-red: re-ran run ${plan.runId} (${plan.kind}: ${plan.reason}) on ${plan.sha.slice(0, 9)}\n`);
-      }
-      withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
+      outcome = { ...plan, status };
+      if (issued && plan.kind !== 'owner-stalled') process.stderr.write(`main-ci-red: re-ran run ${plan.runId} (${plan.kind}: ${plan.reason}) on ${plan.sha.slice(0, 9)}\n`);
+    }
+    withFileLock(`${ledgerPath}.lock`, loadReruns, { timeoutMs: 30_000 });
+    return outcome;
+  };
+  if (state.status !== 'green') {
+    const plan = planMainCiRerun({ runs: probe.runs, tipSha: probe.tip?.sha ?? newest?.headSha, reruns, flake: probe.failing?.flake, settings });
+    if (plan) {
+      const outcome = await requestRerun(plan);
+      if (outcome) base.rerun = outcome;
     }
   }
   const rerunPending = issued || (probe.runs || []).some((r) => r.rerunPending)
@@ -397,11 +418,48 @@ export async function probeAndOwnMainCi({
   const prs = readPrs();
   const ownerPrs = prs === null ? [] : findOwnerPrs({ firstRed: state.firstRed, prs, settings });
   const priority = prs === null ? null : planPriority({ state, ownerPrs, now, settings });
+  // card 302: read each owner PR's CI once, shared with the combine rule.
+  const ciRead = new Map();
+  const ownerCi = (pr) => {
+    if (!ciRead.has(pr.number)) {
+      try { ciRead.set(pr.number, readPrCi(pr)); }
+      catch { ciRead.set(pr.number, { status: 'unknown' }); }
+    }
+    return ciRead.get(pr.number);
+  };
+  const withProgress = async (result) => {
+    if (!result.owner || !(settings.mainCiRedOwnerStallMin > 0) || !settings.mainCiRedEnabled) return result;
+    const ledger = readOwnerLedger(ledgerPath);
+    const entry = Object.entries(ledger).find(([key, value]) => !key.startsWith('_') && value?.sessionSlug === result.owner.ref)?.[1];
+    const firstRun = probe.runs.find((r) => r.databaseId === state.firstRed.runId);
+    const progressState = { ...state, firstRed: { ...state.firstRed, attempt: firstRun?.attempt,
+      rerunRequested: Object.hasOwn(reruns, state.firstRed.runId) } };
+    const full = new Map((prs || []).map((pr) => [Number(pr.number), pr]));
+    const progressPrs = prs === null ? null : ownerPrs.map((pr) => {
+      const p = full.get(pr.number) ?? pr;
+      return { ...pr, createdAt: p.createdAt, ci: ownerCi(p) };
+    });
+    const ownerStall = assessOwnerProgress({ state: progressState, owner: result.owner, ownerPrs: progressPrs,
+      ledgerEntry: entry, now, rerunPending, settings });
+    const escalation = planEscalation({ state, stall: ownerStall, now, settings });
+    const failingRun = [...probe.runs].filter((r) => classifyRun(r) === 'red')
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    let recovery = planStalledRecovery({ stall: ownerStall, failingRun, reruns, settings, now });
+    if (recovery?.kind === 'rerun') {
+      if (probe.runs.some((r) => r.status !== 'completed')) recovery = null;
+      else recovery = await requestRerun({ ...recovery, kind: 'owner-stalled' });
+      if (recovery) recovery = { ...recovery, kind: 'rerun' };
+    }
+    const sourceText = (keys) => keys.map((key) => `${key}=${settings[key]} (source ${mainCiRedSettingSource(config, key)})`).join(', ');
+    if (escalation) process.stderr.write(`main-ci-red: owner ${result.owner.ref} stalled (${ownerStall.reason}), escalation ${escalation.n}; ${sourceText(['mainCiRedOwnerStallMin', 'mainCiRedOwnerPrDeadlineMin', 'mainCiRedEscalateAfterMin', 'mainCiRedEscalateEveryMin'])}\n`);
+    if (recovery) process.stderr.write(`main-ci-red: owner ${result.owner.ref} recovery ${recovery.kind} ${recovery.runId ?? recovery.sha} (${recovery.status ?? 'proposed'}); ${sourceText(['mainCiRedOwnerStallMin', 'mainCiRedOwnerPrDeadlineMin', 'mainCiRedAutoRecover', 'mainCiRedAutoRecoverAfterMin'])}\n`);
+    return { ...result, ownerStall, escalation, recovery };
+  };
   // Several fix PRs (one per red cause) can deadlock — each failing CI on the other's cause (live 2026-10-08).
   let combine = null;
   if (priority && settings.mainCiRedCombineFixPrs && ownerPrs.length >= 2) {
     const full = new Map((prs || []).map((p) => [Number(p.number), p]));
-    const fixPrs = ownerPrs.map((o) => { const p = full.get(o.number) ?? o; return { number: o.number, createdAt: p.createdAt, headRefName: p.headRefName ?? null, ci: readPrCi(p) }; });
+    const fixPrs = ownerPrs.map((o) => { const p = full.get(o.number) ?? o; return { number: o.number, createdAt: p.createdAt, headRefName: p.headRefName ?? null, ci: ownerCi(p) }; });
     combine = planCombinedFix({ mainFailingJobs: probe.failing?.jobs ?? [], fixPrs, summaryJobs: settings.mainCiRedSummaryJobs });
     if (combine.owedElsewhere.length || combine.deadlock) priority.combine = combine;
   }
@@ -451,7 +509,7 @@ export async function probeAndOwnMainCi({
   const pre = decideOwner({ state, now, settings, owner: null, prs: [], rerunPending });
   if (!pre.owed) {
     const owner = prs === null ? null : findOwner({ firstRed: state.firstRed, prs, ledger: readOwnerLedger(ledgerPathIn(dir)), settings, redShas: state.redShas });
-    return { ...base, owner, decision: pre };
+    return withProgress({ ...base, owner, decision: pre });
   }
   let agents = [];
   try { agents = await listAgents(); } catch { agents = []; }
@@ -473,7 +531,7 @@ export async function probeAndOwnMainCi({
     ledger[sha] = { at: now, sessionSlug, status: 'dispatching', latestRedSha: state.latestRed.sha };
     writeJsonAtomic(path, ledger);
   });
-  if (!result.decision?.owed || dryRun) return result;
+  if (!result.decision?.owed || dryRun) return withProgress(result);
   // Phase 2: dispatch, then settle the reservation. A crash here leaves the reservation (never a second owner).
   const prompt = buildOwnerBrief({ state, failing: probe.failing, weRoot: weRoot ?? process.cwd(), repoSlug, settings });
   let out;
@@ -490,5 +548,5 @@ export async function probeAndOwnMainCi({
     writeJsonAtomic(path, ledger);
   });
   if (out?.held) return { ...result, owner: null, decision: { owed: true, reason: 'dispatch-held', why: out.reason } };
-  return { ...result, owner: { kind: 'dispatched', ref: sessionSlug }, dispatched: { sessionSlug, handle: out?.handle ?? null } };
+  return withProgress({ ...result, owner: { kind: 'dispatched', ref: sessionSlug }, dispatched: { sessionSlug, handle: out?.handle ?? null } });
 }
