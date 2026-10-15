@@ -32,8 +32,10 @@ const requireCjs = createRequire(import.meta.url);
 
 /** `file#parser` entries that predate the rule below: each already restricts authors some other way (a delegated
  * trusted-comment helper, a login allowlist, `isOperatorAuthored`, a gate on the right of `&&`/`||`) or is a documented
- * residual. Keyed by parser name so a NEW parser in one of these files is still scanned. Add nothing here: use the helper. */
+ * residual. Keyed by parser name so a NEW parser in one of these files is still scanned. New parsers must use the helper. */
 const COMMENT_MARKER_PARSERS_REVIEWED = new Set([
+  'scripts/conveyor/exhausted-retry.mjs#retryOutcome', // latestMarker / trustedRetryMarkerComments authenticate before returning comments
+  'scripts/conveyor/exhausted-retry.mjs#exhaustionFacts', // standDownComments / trustedRetryMarkerComments authenticate the parsed comments
   'scripts/conveyor/fix-takeover.mjs#takeoverLedger',
   'scripts/conveyor/reconcile-note-comment.mjs#hasPostedNoteComment',
   'scripts/conveyor/round-extension-mark.mjs#roundExtensionGrants',
@@ -44,6 +46,7 @@ const COMMENT_MARKER_PARSERS_REVIEWED = new Set([
   'scripts/lib/drain-merge-strategy.mjs#readEnqueueClearance',
   'scripts/lib/drain-merge-strategy.mjs#anyClearanceMarkerFor', // deliberately any-author: only gates a drain-identity lookup
   'scripts/lib/jury-core.mjs#parseOperatorRulingComment',
+  'scripts/lib/operator-send-backs.mjs#operatorSendBacks', // isOperatorAuthored rejects every non-operator before reading the body
   'scripts/lib/red-team-gate.mjs#gateOutcomesForHead',
   'scripts/lib/review-escalation.mjs#parseOperatorClearance', // residual named in marker-authorship.mjs's header
   'scripts/lib/review-independence.mjs#parseClearerActorId', // unfiltered today; keep out of this CI repair

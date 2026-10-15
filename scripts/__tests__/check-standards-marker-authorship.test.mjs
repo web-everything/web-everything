@@ -65,3 +65,15 @@ it('accepts the live review ceremony parser with its compound author and body gu
   const content = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../review-set-label.mjs'), 'utf8');
   expect(scanUnauthenticatedCommentMarkerParsers([{ file, content }])).toEqual([]);
 });
+
+it.each([
+  'scripts/conveyor/exhausted-retry.mjs',
+  'scripts/lib/operator-send-backs.mjs',
+])('accepts reviewed readers in %s while still rejecting a new unauthenticated parser', file => {
+  const content = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../..', file), 'utf8');
+  expect(scanUnauthenticatedCommentMarkerParsers([{ file, content }])).toEqual([]);
+  const unguarded = '\nexport function parseNewCommentMarker(comments) { return comments.flatMap(c => c.body.match(/<!-- action: (.*?) -->/g)); }';
+  const findings = scanUnauthenticatedCommentMarkerParsers([{ file, content: content + unguarded }]);
+  expect(findings).toHaveLength(1);
+  expect(findings[0].message).toContain('parseNewCommentMarker');
+});
