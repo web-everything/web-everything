@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
 import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, resolveSettings, runOnce, assertProducerCheckout } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
-import { bootstrapPlan, operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
+import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
+import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
+import { withRealRepo } from './helpers/real-repo.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'needs-feed-')); dirs.push(d); return d; };
 afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })));
@@ -77,17 +79,22 @@ describe('feed', () => {
     expect(opts.log).toHaveBeenCalledWith(expect.stringContaining('intervalMinutes=2 source=default'));
     expect(opts.log).toHaveBeenCalledTimes(12);
   });
-  it('bootstrap reads canonical prompt, quiet rules, monitor and pending events', () => {
-    const home = temp(), path = feedPath({ home, env: {} }); mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(join(dirname(path), 'handoff-webeverything-rules.md'), 'ordinary\nQUIET after ten\nquiet before seven\n');
-    appendLines(path, diffFeed([], [item], at).lines);
-    expect(isReadOnlyOperation(operatorSessionBootstrapOperation())).toBe(true);
-    const plan = bootstrapPlan({ home, env: {}, log: () => {} });
-    expect(plan.cron.schedule).toBe('*/30 * * * *');
-    expect(plan.cron.prompt).toContain(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../operator-session/pr-movement-sweep.prompt.md'), 'utf8').trim());
-    expect(plan.cron.prompt).toContain('Quiet-hours rules (from handoff rules)');
-    expect(plan.cron.prompt).toContain('QUIET after ten'); expect(plan.cron.prompt).not.toContain('ordinary');
-    expect(plan.monitorCommand).toContain(path); expect(plan.monitorCommand).toContain('grep --line-buffered NEEDS-YOU');
-    expect(plan.unacknowledged).toHaveLength(1); expect(plan.ackCommand).toContain('ack');
+  it('bootstrap reads canonical prompt, quiet rules, monitor and pending events without changing the checkout', async () => {
+    await withRealRepo(({ root: home, git }) => {
+      const path = feedPath({ home, env: {} }); mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(join(dirname(path), 'handoff-webeverything-rules.md'), 'ordinary\nQUIET after ten\nquiet before seven\n');
+      appendLines(path, diffFeed([], [item], at).lines);
+      git(['add', '.']); // Track snapshot bytes so status also detects content changes.
+      const before = git(['status', '--porcelain', '--untracked-files=all']);
+      expect(isReadOnlyOperation(operatorSessionBootstrapOperation({ collect: () => bootstrapPlan({ home, env: {}, log: () => {} }) }))).toBe(true);
+      const plan = bootstrapPlan({ home, env: {}, log: () => {} });
+      expect(plan.cron.schedule).toBe('*/30 * * * *');
+      expect(plan.cron.prompt).toContain(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../operator-session/pr-movement-sweep.prompt.md'), 'utf8').trim());
+      expect(plan.cron.prompt).toContain('Quiet-hours rules (from handoff rules)');
+      expect(plan.cron.prompt).toContain('QUIET after ten'); expect(plan.cron.prompt).not.toContain('ordinary');
+      expect(plan.monitorCommand).toContain(path); expect(plan.monitorCommand).toContain('grep --line-buffered NEEDS-YOU');
+      expect(plan.unacknowledged).toHaveLength(1); expect(plan.ackCommand).toContain('ack');
+      expect(git(['status', '--porcelain', '--untracked-files=all'])).toBe(before);
+    });
   });
 });
