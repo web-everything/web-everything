@@ -850,14 +850,19 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
   });
 
   it('with NO injected seam, the default reader resolves the real shared cache file and answers from it (zero gh calls)', async () => {
-    const { mkdirSync, writeFileSync } = await import('node:fs');
-    const { dirname } = await import('node:path');
+    const { mkdirSync, writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+    const { dirname, join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
     const { defaultCachePath } = await import('../../lib/required-status-checks.mjs');
-    const path = defaultCachePath(); // the per-test throwaway coordination root (vitest.setup.ts)
+    const root = mkdtempSync(join(tmpdir(), 'ci-red-default-cache-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', root); // never the operator's real cache, whatever the setup file does
+    const path = defaultCachePath();
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ entries: { 'web-everything/web-everything@main': {
       checks: ['test', 'merge-gate'], classic: ['test'], source: 'live', fetchedAtMs: Date.now() } } }));
-    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything' })).toEqual(['test']);
+    try {
+      expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything' })).toEqual(['test']);
+    } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
 
   it('wires through the REAL shared cache: a fresh entry on disk answers with zero gh calls', async () => {
