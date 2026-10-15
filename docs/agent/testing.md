@@ -24,6 +24,11 @@ Cached input is a subset of input; reasoning is a subset of output when reported
 
 > Tier-1 reference. Read when writing or changing tests.
 
+Keep the 50-tick daemon soak baseline alone in shard 1 when splitting the soak suite. Balance break
+scenarios by measured time across the remaining shards; timing estimates must never put a sibling
+scenario beside the baseline. Those scenarios fork real daemon and git children, so concurrent worlds
+can exhaust the baseline's wall-clock timeout while its per-tick invariants continue to hold.
+
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
@@ -887,6 +892,14 @@ Confirmed drain gate skips and revalidation aborts also release room; successful
 and ambiguous failures consume it. Give each fake child its actual target PR number.
 Also cover a queue that fills while the window is closed and an unreadable next snapshot:
 retained attempts must stay within the latest room, and cannot use a failed snapshot.
+
+Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
+remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
+reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+A batching deferral stops new starts but lets existing children finish their locked admission checks.
+Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
+scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
 
 ## Referral rulings answering stand-downs
 

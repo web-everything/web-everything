@@ -36,7 +36,9 @@ const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
  * pools CONCURRENTLY (only files WITHIN one pool serialize against each other), moving it into the isolated
  * `forks` pool below removes it from that contention AND stops it dragging the other ~18 files down, at the
  * cost of queuing behind its 3 forks-pool siblings (all small next to it) rather than the ~18-file `threads`
- * pool. Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
+ * pool. The four Rust scan parity files also share that serial fork: their compilation and repository scans
+ * must not overlap the daemon scenarios' many child processes (A3 exhausted its 180s deadline in CI run
+ * 38619616650). Everything else stays on this config's default `threads` pool — with the ~2000-file unit suite no
  * longer sharing it, ordinary multi-worker parallelism is enough; they don't need to queue behind one
  * another the way `singleFork` would force.
  */
