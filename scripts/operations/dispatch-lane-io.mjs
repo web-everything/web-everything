@@ -116,7 +116,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, PROBATION_WORKERS } from '../lib/provider-routing.mjs';
-import { dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
+import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
@@ -279,6 +279,7 @@ export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
  */
 export function readTick({
   num,
+  groupMembers = [],
   bookkeepingFile = '',
   tickFile = '',
   root = REPO_ROOT,
@@ -580,6 +581,7 @@ export function readTick({
     suppressed: match(decisions.suppressedBuilds),
     dispatchedGuard,
     item,
+    groupItems: parseGroupMembers(groupMembers).map(member => findItem(member, loadItems)),
     briefTemplate: String(readText(briefPath(root, launchKind))),
     nextState,
     statusLine: String(decisions.statusLine || ''),
@@ -1092,7 +1094,7 @@ export function resolveDeliveryBase(target, num, registry) {
 
 /** `readTick` bound to one root — the shape the declaration wants. */
 export function createTickReader(bindings = {}) {
-  return ({ num, bookkeepingFile, tickFile, all = false, verbose = bindings.verbose }) => readTick({ ...bindings, num, bookkeepingFile, tickFile, all, verbose });
+  return ({ num, bookkeepingFile, tickFile, groupMembers = [], all = false, verbose = bindings.verbose }) => readTick({ ...bindings, num, bookkeepingFile, tickFile, groupMembers, all, verbose });
 }
 
 /**
@@ -1592,6 +1594,7 @@ export function createDispatchSinks({
           // the effect payload; part of the port's request because a MECHANICAL provider (a wrapper, not an
           // agent reading a brief) needs them as data. The `claude --bg` path ignores all five.
           launchKind: payload?.launchKind,
+          groupMembers: payload?.groupMembers,
           lane: payload?.lane,
           scope: payload?.scope,
           pr: payload?.pr,
@@ -1774,6 +1777,14 @@ export function routeDispatchProvider(request, {
   resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
+  const grouped = Boolean(request?.groupMembers?.length);
+  if (grouped && !['build', 'prepare-item'].includes(kind)) {
+    throw notApplied(`dispatch-lane: grouped requests are unsupported for ${kind}`);
+  }
+  const launchAgent = r => {
+    if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
+    return agent(r);
+  };
   if (request.policyRoute) {
     // Launchability is checked BEFORE starting anything. A failed/indeterminate worker is never retried here.
     let candidates = [request.policyRoute, ...request.policyRoute.fallback];
@@ -1804,12 +1815,18 @@ export function routeDispatchProvider(request, {
     if (chosen !== candidates[0]) console.error(`routing-policy-fallback: ${kind} → ${chosen.provider}/${chosen.model} (primary adapter unavailable)`);
     if (chosen.provider === 'claude') {
       request = { ...request, probationWorker: null, table: { model: chosen.model, effort: chosen.effort, tier: Object.entries(CLAUDE_NATIVE_MODEL_BY_TIER).find(([, id]) => id === chosen.model)?.[0] ?? null, reason: 'routing-policy' } };
-      return agent(request);
+      return launchAgent(request);
     }
     // Only a proven pre-launch refusal may advance the cascade. An indeterminate launch
     // stops here: another worker could otherwise race the first one in the same lane.
-    const launch = () => probationLaunchDecision(request, probationLaunch).launch
-      ? probation(request) : registry[kind].provider({ ...request, probationWorker: null });
+    const launch = () => {
+      if (probationLaunchDecision(request, probationLaunch).launch) {
+        if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
+        return probation(request);
+      }
+      if (grouped && kind !== 'build') throw notApplied('dispatch-lane: grouped preparation requires the probation prepare provider');
+      return registry[kind].provider({ ...request, probationWorker: null });
+    };
     try { return launch(); } catch (error) {
       if (!error?.notApplied) throw error;
       const remaining = candidates.slice(candidates.indexOf(chosen) + 1);
@@ -1826,6 +1843,7 @@ export function routeDispatchProvider(request, {
   // agy-launcher-probation — FIRST: an opened, non-critical ci-heal the router gave a probation worker runs on that
   // worker (see `dispatch-providers/probation-worker.mjs#probationLaunchDecision` for every condition).
   if (probationLaunchDecision(request, probationLaunch).launch) {
+    if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
     const runScript = PROBATION_LAUNCHABLE_KINDS[kind].runScript;
     if (!scriptExists(runScript)) {
       throw notApplied(`dispatch-lane: the probation launcher ${runScript} is not in this checkout — refusing before any process starts`);
@@ -1834,6 +1852,7 @@ export function routeDispatchProvider(request, {
   }
   const entry = dispatchProviderEntry(kind, registry);
   if (entry && modes?.[kind] === 'mechanical') {
+    if (grouped && kind !== 'build') throw notApplied('dispatch-lane: grouped preparation requires the probation prepare provider');
     if (entry.runScript && !scriptExists(entry.runScript)) {
       throw notApplied(
         `dispatch-lane: ${entry.modeEnv ?? 'the registry'} selects the mechanical ${kind} provider, but its wrapper `
@@ -1843,7 +1862,7 @@ export function routeDispatchProvider(request, {
     return entry.provider(request);
   }
   request.reportModel?.(request.table?.model ?? null);
-  return agent(request);
+  return launchAgent(request);
 }
 
 /**
@@ -1868,6 +1887,9 @@ export function defaultClaudeProvider(request, {
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
   launchWrapped = launchWrappedClaudeWorker,
 } = {}) {
+  if (request?.groupMembers?.length) {
+    throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
+  }
   // #x2psfwz — a PR_KIND session name (`review-`/`fix-`/`ci-heal-`/`inspect-<PR>`) carries NO attempt suffix
   // (session-slug.mjs's `mintSessionSlug` forbids one for these kinds), so a round-2 dispatch for the SAME PR
   // reuses the EXACT name round 1 used. Round 1's own agent brief wrote a completion record under that name

@@ -1,0 +1,24 @@
+{
+  "$comment": "Grouped builds cascade per key: standard -> platform build -> tool build -> env. Invalid layer values are ignored. build.groupSmallFindings: Enable grouping of small finding cards. Default true; env WE_BUILD_GROUP_SMALL_FINDINGS. build.groupMin: Minimum total cards including the lead; integer >=2. A minimum unsupported by any maximum layer is ignored; maximum overrides below the effective minimum are ignored. Default 3; env WE_BUILD_GROUP_MIN. build.groupMax: Maximum total cards including the lead; integer >=groupMin. Default 6; env WE_BUILD_GROUP_MAX. build.groupMaxSize: Largest qualifying card size; positive number. A present size takes precedence over estimatedLoc. Default 2; env WE_BUILD_GROUP_MAX_SIZE. build.groupMaxLoc: Largest estimatedLoc for a card with no size; positive integer. Default 150; env WE_BUILD_GROUP_MAX_LOC. build.groupKinds: Allowed card kinds. Default [\"task\", \"story\"]; env WE_BUILD_GROUP_KINDS (comma-separated list). build.groupRelatedBy: Ordered OR signals relating candidates to the lead: pathPrefix (shared directory prefix), parent (same nonempty parent), tag (shared tag), disjointFiles (no scope overlap with any current member), locus (same nonempty locus). A candidate without scope never joins. Default [\"pathPrefix\", \"parent\", \"disjointFiles\"]; env WE_BUILD_GROUP_RELATED_BY (comma-separated list). build.groupPathPrefixDepth: Directory segments compared after stripping the repo prefix for pathPrefix; integer >=1. Default 2; env WE_BUILD_GROUP_PATH_PREFIX_DEPTH. build.groupRequireSameLocus: Require members to share the lead locus/repo: one PR is one repo. Missing locus uses scope repository. Default true; env WE_BUILD_GROUP_REQUIRE_SAME_LOCUS. build.groupAllowBlockedBy: Allow blockedBy references between group members, including the lead. Default false; env WE_BUILD_GROUP_ALLOW_BLOCKED_BY. build.groupPrepare: Prepare as one group (per-group) or each card separately (per-card). Default \"per-group\"; env WE_BUILD_GROUP_PREPARE. build.groupMemberFailure: On a reported member drop, requeue it alone (requeue-alone) or fail the whole delivery (fail-group). Default \"requeue-alone\"; env WE_BUILD_GROUP_MEMBER_FAILURE. Worked examples: to group only cards under the same parent epic, set groupRelatedBy to [\"parent\"]; to prepare each card alone, set groupPrepare to \"per-card\"; to turn grouping off, set groupSmallFindings to false. Example cards #101, #102, #103, each size 1, same parent #100, scope in the same repo, and no mutual blockedBy references become one group led by #101 with members #102 and #103. All bounds count the lead.",
+  "build": {
+    "groupSmallFindings": true,
+    "groupMin": 3,
+    "groupMax": 6,
+    "groupMaxSize": 2,
+    "groupMaxLoc": 150,
+    "groupKinds": [
+      "task",
+      "story"
+    ],
+    "groupRelatedBy": [
+      "pathPrefix",
+      "parent",
+      "disjointFiles"
+    ],
+    "groupPathPrefixDepth": 2,
+    "groupRequireSameLocus": true,
+    "groupAllowBlockedBy": false,
+    "groupPrepare": "per-group",
+    "groupMemberFailure": "requeue-alone"
+  }
+}
