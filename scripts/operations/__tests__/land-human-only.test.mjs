@@ -331,8 +331,9 @@ describe('land-human-only — the reader', () => {
       throw new Error(`unexpected read: ${args.join(' ')}`);
     };
     // The transport supplies the recorded ceremony; the drain parses its real markers and evaluates all gates.
+    // The sanctioned clearance shape (heading, then the marker block at the end), as `buildVerdictComment` writes it: a bare marker-only body is not a clearance.
     const comments = clearedHead ? [{ author: { login: 'chalbert' }, body:
-      `<!-- reviewed-sha: ${clearedHead} -->\n<!-- cleared-human: chalbert -->` }] : [];
+      `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${clearedHead} -->\n<!-- cleared-human: chalbert -->` }] : [];
     const acceptance = readDrainAcceptance({ pr: 7, repo, carrySetting: 'off',
       exec: () => JSON.stringify({ headRefOid: head, headRefName: live.headRefName, comments }) });
     const gather = vi.fn(({ expectedHeadSha, defaultBranch }) => ({
