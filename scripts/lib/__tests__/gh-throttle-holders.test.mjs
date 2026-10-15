@@ -217,6 +217,16 @@ describe('hold policy and execution', () => {
     [['api', '--method', 'POST', '--method', 'GET', 'repos/o/r'], false], [['api', '-X', 'GET', 'repos/o/r', '-f', 'per_page=1'], false],
     [['api', 'repos/o/r/labels', '-fname=x'], true], [['api', 'repos/o/r/labels', '--field=name=x'], true], [['api', 'repos/o/r', '--raw-field=a=b'], true],
     [['-R', 'o/r', 'pr', 'view', '1'], false], [['pr', 'view', 'comment'], false],
+    // a flag value that looks like a flag stays a value; clustered short flags still count
+    [['api', 'repos/o/r', '-H', '-XPOST'], false], [['api', 'repos/o/r', '-X', 'GET', '-q', '-XPOST'], false], [['api', 'repos/o/r', '--jq', '-XPOST'], false],
+    [['api', '-iXDELETE', 'repos/o/r/git/refs/heads/x'], true], [['api', '-iX', 'POST', 'repos/o/r'], true], [['api', '-if', 'title=x', 'repos/o/r/issues'], true],
+    // the graphql read exemption: endpoint by parse, every --input spelling, every query spelling (gh sends the last)
+    [['--hostname', 'graphql', 'api', 'repos/o/r/issues', '-f', 'query={x}'], true], [['api', 'graphql', '--input=q.json', '-f', 'query={viewer{login}}'], true],
+    [['api', 'graphql', '-f', 'query={viewer{login}}', '-F', 'query=mutation{x}'], true], [['api', 'graphql', '-f', 'query={viewer{login}}', '-f', 'query=mutation{x}'], true],
+    [['api', 'graphql', '-fquery={viewer{login}}'], false], [['api', 'graphql', '--raw-field=query={viewer{login}}'], false], [['api', 'graphql', '--jq', '.x', '-f', 'query={viewer{login}}'], false],
+    [['api', 'graphql', '-F', 'query=@q.graphql'], true], [['api', 'graphql', '-f', 'owner=o'], true],
+    // non-strings are compared as spawn stringifies them, so gh's real command decides
+    [[5, 'pr', 'merge'], false],
   ])('classifies a write from gh command positions and every method spelling: %j', (args, write) => {
     expect(classifyGhWrite(args)).toBe(write);
   });
@@ -225,7 +235,11 @@ describe('hold policy and execution', () => {
     expect(ghCallerPriority('pr-land', ['-R', 'o/r', 'pr', 'view', '1'])).toBe('normal');
     expect(classifyGhResource(['-R', 'o/r', 'pr', 'list'])).toBe('graphql');
     expect(classifyGhResource(['--repo', 'o/r', 'run', 'list'])).toBe('core');
-    expect(classifyGhResource(['-R', 'o/r', 'api', 'graphql', '-f', 'query=x'])).toBe('graphql');
+    expect(classifyGhResource(['api', '-iq', '.data', 'graphql', '-f', 'query={x}'])).toBe('graphql');
+    expect(classifyGhResource(['api', '-iH', 'graphql', 'repos/o/r'])).toBe('core');
+    expect(ghCallerPriority('pr-land', [5, 'pr', 'merge'])).toBe('normal');
+    expect(isGhWatch([null, 'run', 'watch'])).toBe(false);
+    expect(classifyGhResource(['--hostname', 'h', 'api', 'graphql', '-f', 'query=x'])).toBe('graphql');
     expect(classifyGhResource(['--hostname', 'h', 'api', '-X', 'POST', 'graphql'])).toBe('graphql');
     expect(classifyGhResource(['-R', 'o/r', 'api', 'repos/o/r'])).toBe('core');
   });

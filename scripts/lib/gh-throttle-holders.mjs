@@ -35,7 +35,7 @@ const groupBools = { long: new Set(['help', 'version']), short: new Set(['h']) }
 export function ghCommandWords(args) {
   const words = [];
   for (let i = 0; Array.isArray(args) && i < args.length && words.length < 2; i++) {
-    const s = typeof args[i] === 'string' ? args[i] : '';
+    const s = String(args[i]); // as spawn stringifies it, so every classifier sees the argv gh receives
     if (s === '--') break;
     const long = s.startsWith('--') && !groupBools.long.has(s.slice(2));
     if (!s.includes('=') && (long || (s.length === 2 && s[0] === '-' && !groupBools.short.has(s[1])))) i++;
@@ -91,7 +91,7 @@ const pflagTrue = new Set(['1', 't', 'T', 'TRUE', 'true', 'True']);
 function pflagLongValue(args, bools, name) {
   let value;
   for (let i = 0; i < args.length; i++) {
-    const s = typeof args[i] === 'string' ? args[i] : '';
+    const s = String(args[i]);
     if (s === '--') break;
     if (s.startsWith('--')) {
       const eq = s.indexOf('='), key = eq < 0 ? s.slice(2) : s.slice(2, eq);

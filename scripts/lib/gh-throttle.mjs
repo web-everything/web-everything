@@ -309,30 +309,25 @@ export function resolveGhWriteBudgetPerMin(env = process.env) {
 export function classifyGhWrite(args) {
   const a = Array.isArray(args) ? args : [];
   // Command words by gh's own parse, so a leading `-R o/r` cannot hide a mutation from the write budget.
-  const [cmd, sub] = ghCommandPath(a);
+  const words = ghCommandWords(a);
+  const [cmd, sub] = words.map((w) => w.word);
   if (cmd === 'pr') return ['edit', 'comment', 'close', 'merge', 'reopen', 'ready', 'create', 'review'].includes(sub);
   if (cmd === 'issue') return ['edit', 'comment', 'close', 'reopen', 'create'].includes(sub);
   if (cmd === 'label') return ['create', 'delete', 'edit'].includes(sub);
   if (cmd === 'run') return ['cancel', 'rerun'].includes(sub);
   if (cmd === 'api') {
-    // Every pflag spelling of the method (`--method X`, `--method=X`, `-X X`, `-XX`, `-X=X`); the last one wins.
-    let method = null;
-    a.forEach((t, i) => {
-      if (typeof t !== 'string') return;
-      if (t === '--method' || t === '-X') method = String(a[i + 1] || '');
-      else if (t.startsWith('--method=')) method = t.slice(9);
-      else if (/^-X./.test(t)) method = t.slice(2).replace(/^=/, '');
-    });
-    method = method ? method.toUpperCase() : null;
+    // One pflag parse of everything but the `api` word (see parseGhApiArgs): every method/payload spelling, and
+    // a flag value that looks like a flag (`-H -XPOST`) stays a value. pflag keeps the LAST method.
+    const p = parseGhApiArgs(a.filter((_, i) => i !== words[0].at));
+    const method = p.methods.length ? p.methods[p.methods.length - 1] || null : null;
     if (method) return method !== 'GET' && method !== 'HEAD';
-    // `gh api graphql -f query=…` is POST only because of the flag. Read exemption is an ALLOWLIST: only an
-    // inline `-f/--raw-field query=<text with no mutation>` and no `--input`/`@file` value anywhere. A `query=@file`
-    // token or `--input` hides the text, so it stays a write.
-    if (a[1] === 'graphql' && !a.includes('--input') && !a.some((t) => typeof t === 'string' && /^(query=)?@/.test(t) && t !== '@')) {
-      const qi = a.findIndex((t, i) => (t === '-f' || t === '--raw-field') && typeof a[i + 1] === 'string' && a[i + 1].startsWith('query=') && !a[i + 1].startsWith('query=@'));
-      if (qi >= 0 && !/\bmutation\b/i.test(a[qi + 1])) return false;
-    }
-    return a.some((t) => typeof t === 'string' && /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(t));
+    if (!p.payload) return false;
+    // `gh api graphql -f query=…` is POST only because of the flag. Read exemption is an ALLOWLIST: the endpoint
+    // is `graphql`, there is no `--input`, and EVERY `query` field (any spelling; gh sends the last) is inline
+    // text with no mutation. A `query=@file` value or `--input` hides the text, so it stays a write.
+    const queries = p.fields.filter((f) => f.startsWith('query=')).map((f) => f.slice(6));
+    if (p.positionals[0] === 'graphql' && !p.input && queries.length && queries.every((q) => !q.startsWith('@') && !/\bmutation\b/i.test(q))) return false;
+    return true;
   }
   return false;
 }
@@ -385,8 +380,15 @@ const GH_API_SHORT_BOOL_FLAGS = new Set(['i']);
  * @returns {{methods: string[], payload: boolean, unknown: boolean}}
  */
 export function scanGhApiFlags(args) {
+  const { methods, payload, unknown } = parseGhApiArgs(args);
+  return { methods, payload, unknown };
+}
+// `gh api`'s long flags that take a value: a bare `--jq X` consumes X even when X looks like a flag (`-XPOST`).
+const GH_API_LONG_VALUE_FLAGS = new Set(['cache', 'field', 'header', 'hostname', 'input', 'jq', 'method', 'preview', 'raw-field', 'template']);
+/** {@link scanGhApiFlags} plus the field values (`key=value`, in order), `--input` and the positionals. */
+function parseGhApiArgs(args) {
   const a = Array.isArray(args) ? args.map(String) : [];
-  const out = { methods: [], payload: false, unknown: false };
+  const out = { methods: [], payload: false, unknown: false, input: false, fields: [], positionals: [] };
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
     // No early stop at `--`: pflag takes it as the VALUE of a preceding long flag (`--preview -- -XPOST` still
@@ -394,12 +396,13 @@ export function scanGhApiFlags(args) {
     if (t === '--') continue;
     if (t.startsWith('--')) {
       const name = t.slice(2).split('=')[0];
-      const hasInline = t.includes('=');
-      if (name === 'method') out.methods.push((hasInline ? t.slice(t.indexOf('=') + 1) : String(a[++i] ?? '')).toUpperCase());
-      else if (name === 'input' || name === 'field' || name === 'raw-field') out.payload = true;
+      const value = !GH_API_LONG_VALUE_FLAGS.has(name) ? '' : t.includes('=') ? t.slice(t.indexOf('=') + 1) : String(a[++i] ?? '');
+      if (name === 'method') out.methods.push(value.toUpperCase());
+      else if (name === 'input') { out.payload = true; out.input = true; }
+      else if (name === 'field' || name === 'raw-field') { out.payload = true; out.fields.push(value); }
       continue;
     }
-    if (!t.startsWith('-') || t.length < 2) continue; // a positional (or a bare `-`)
+    if (!t.startsWith('-') || t.length < 2) { out.positionals.push(t); continue; } // a positional (or a bare `-`)
     for (let j = 1; j < t.length; j++) {
       const c = t[j];
       if (GH_API_SHORT_BOOL_FLAGS.has(c)) continue;
@@ -407,7 +410,7 @@ export function scanGhApiFlags(args) {
       const rest = t.slice(j + 1);
       const value = rest.length ? rest : String(a[++i] ?? '');
       if (c === 'X') out.methods.push(value.toUpperCase());
-      if (c === 'f' || c === 'F') out.payload = true;
+      if (c === 'f' || c === 'F') { out.payload = true; out.fields.push(value); }
       break; // a value-taking flag consumes the rest of the token (or the next arg)
     }
   }
@@ -1324,9 +1327,9 @@ export function classifyGhResource(args) {
   const cmd = first?.word;
   if (['issue', 'pr', 'repo', 'project', 'search'].includes(cmd)) return 'graphql';
   if (cmd === 'api') {
-    // The endpoint is the first positional past the `api` word itself, so leading flags (`-R o/r api graphql`) cannot shift it.
-    const positional = a.slice(first.at + 1).filter((t, i, arr) => !t.startsWith('-') && !(i > 0 && /^-(X|H|f|F|q|t|p)$|^--(method|header|field|raw-field|jq|template|input|preview|hostname|cache)$/.test(arr[i - 1])));
-    return positional[0] === 'graphql' ? 'graphql' : 'core';
+    // The endpoint is the first positional of the pflag parse without the `api` word, so neither leading flags
+    // (`-R o/r api graphql`) nor clustered short flags (`-iq .x graphql`, `-iH graphql r`) can shift it.
+    return parseGhApiArgs(a.filter((_, i) => i !== first.at)).positionals[0] === 'graphql' ? 'graphql' : 'core';
   }
   return 'core';
 }
