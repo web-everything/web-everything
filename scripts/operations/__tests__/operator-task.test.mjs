@@ -413,6 +413,30 @@ describe('operator authority record', () => {
     const proven = tick({ operatorTask: true, report: true, operatorInstruction: record });
     expect(shapeDispatchRead(proven, { num: '123' }).operatorPostBuild).toBe(true);
   });
+  it('refuses a grouped build whose lead or member carries operator post-build steps, never drops them', () => {
+    const root = process.cwd();
+    const cards = [
+      { num: '123', slug: 'lead', scope: ['we:scripts/worker-brief.mjs'] },
+      { num: '124', slug: 'member', scope: ['we:scripts/other.mjs'] },
+    ];
+    const tick = (items, groupMembers = ['124']) => readTick({
+      root, num: '123', groupMembers,
+      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '123', lane: 16 }] }, nextState: { tick: 1 } }),
+      readText: path => readFileSync(path, 'utf8'),
+      loadItems: () => items,
+      listAgents: () => [], checkAlreadyDone: () => ({ done: false, checked: true }), checkBuildDelivery: () => null,
+      readDeliveryAgentOverride: () => null,
+    });
+    expect(tick(cards).groupItems.map(m => m.num)).toEqual(['124']);
+    // An operator member (verified record + a post-build step) in an ordinary lead's group.
+    expect(() => tick([cards[0], { ...cards[1], ...OP, report: true }])).toThrow(/cannot run in a grouped build/);
+    // An operator lead launched as a group lead.
+    expect(() => tick([{ ...cards[0], ...OP, report: true }, cards[1]])).toThrow(/cannot run in a grouped build/);
+    // The same operator member without a verified record is an ordinary card: no steps, no refusal.
+    expect(tick([cards[0], { ...cards[1], operatorTask: true }]).groupItems).toHaveLength(1);
+    // An ungrouped operator build is unaffected.
+    expect(tick([{ ...cards[0], ...OP, report: true }, cards[1]], []).operatorPostBuild).toBe(true);
+  });
   it('prepare-stamp may remove preparedBy without tripping the probation tamper check', () => {
     const fm = body => `---\n${body}\n---\n\n# t\n`;
     const before = fm('status: open\noperatorTask: true\npreparedBy: "operator-filing"\npreparedDate: "2026-10-01"');

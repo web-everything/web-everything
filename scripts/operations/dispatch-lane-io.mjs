@@ -567,6 +567,12 @@ export function readTick({
   // One decision from the verified card (operator record + settings) feeds both the brief and the route flag.
   const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
   const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
+  const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
+  // A grouped build runs from the lead's brief alone, so an operator member's post-build steps would be dropped
+  // silently (and an operator lead cannot launch grouped). Refuse the group rather than lose the guarantee.
+  if (groupItems.length && [{ steps: operatorSteps }, ...groupItems.map(member => ({ steps: planOperatorPostBuild(member ?? {}, operatorOptions) }))].some(({ steps }) => steps.length)) {
+    throw new Error('dispatch-lane: an operator task with post-build steps cannot run in a grouped build');
+  }
   return {
     resolvedNum: key,
     admission: tick.decisions?.admission ? {
@@ -585,7 +591,7 @@ export function readTick({
     suppressed: match(decisions.suppressedBuilds),
     dispatchedGuard,
     item,
-    groupItems: parseGroupMembers(groupMembers).map(member => findItem(member, loadItems)),
+    groupItems,
     briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
     // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
     operatorPostBuild: operatorSteps.length > 0,
