@@ -125,7 +125,7 @@ export const GH_ARGV = Object.freeze({
   // `gh pr view --json comments` stops at one page (100): on a long thread a hold or the clear-human past comment 100 is
   // invisible, which the carry rule must never read as "nothing stands against it" (PR #4631 round 3, truncated-read row).
   readComments: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${pr}/comments`,
-    '--jq', '.[] | {id: .node_id, url: .html_url, author: {login: .user.login}, body, createdAt: .created_at}'],
+    '--jq', '.[] | {author: {login: .user.login}, body, createdAt: .created_at}'],
 });
 
 /** `gh pr view --json comments` returns at most this many comments; a thread this long may be truncated. */
@@ -180,16 +180,6 @@ export function createGhProvider({
         exec(GH_ARGV.postComment(repo, pr, path), { maxBuffer: 16 * 1024 * 1024 });
       } finally {
         try { removeFile(path); } catch { /* best-effort cleanup */ }
-      }
-    },
-
-    /** Update a referral's cumulative snapshot in its original comment. */
-    editComment(id, body) {
-      const result = JSON.parse(exec(['api', 'graphql', '-f',
-        'query=mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}',
-        '-f', `id=${id}`, '-f', `body=${body}`], { maxBuffer: 16 * 1024 * 1024 }));
-      if (result.errors?.length || result.data?.updateIssueComment?.issueComment?.id !== id) {
-        throw new Error('referral comment update failed');
       }
     },
 

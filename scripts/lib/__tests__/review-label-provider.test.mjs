@@ -212,17 +212,3 @@ describe('writeOrder', () => {
     expect(writeOrder({})).toEqual(['comment', 'swap']);
   });
 });
-
-
-describe('referral comment updates', () => {
-  it('updates the original node with the full multiline snapshot and checks the returned id', () => {
-    const calls = [];
-    const provider = createGhProvider({ exec: argv => { calls.push(argv);
-      return JSON.stringify({ data: { updateIssueComment: { issueComment: { id: 'IC_referral' } } } }); } });
-    provider.editComment('IC_referral', 'first line\nsecond line');
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain('id=IC_referral');
-    expect(calls[0]).toContain('body=first line\nsecond line');
-    expect(() => createGhProvider({ exec: () => '{}' }).editComment('IC_referral', 'body')).toThrow(/update failed/);
-  });
-});

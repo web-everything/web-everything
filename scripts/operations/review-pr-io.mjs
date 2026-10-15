@@ -52,6 +52,7 @@ import { currentActorId, parseAuthorActorId } from '../lib/review-independence.m
 // always couples a comment with a label swap — #2644 — and this step swaps no label). `createGhProvider`'s
 // `postComment` is the SAME primitive that single home already uses, imported rather than re-implemented.
 import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
@@ -866,7 +867,7 @@ export function createReviewPrSinks({
   postComment = createGhProvider().postComment,
   // The forge port the ADVISORY_LABEL sink reads live PR state and writes labels through — injectable so the sink
   // is testable with no `gh`, exactly like `postComment` above. Defaults to the same real provider.
-  labelProvider = createGhProvider(),
+  labelProvider = createReferralGhProvider(),
   // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own two primitives (see the header note above).
   readLabels = createGhProvider().readLabels,
   setLabels = createGhProvider().setLabels,
