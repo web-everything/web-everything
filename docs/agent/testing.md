@@ -913,10 +913,12 @@ Sources are logged and carried into the child report. Diagnosis defaults off and
 A session owns a PR only while it is actively running: every listed `state`/`status` value is
 `working`, `running` or `busy`, its pid probes alive, and its transcript (or its start) is newer than
 `sessionActiveWithinMinutes` (default 30). Finished fixers are listed `idle`, `offline`, `blocked` or
-`waiting`, so those and any unknown state never own a PR.
+`waiting`, so those and any unknown state never own a PR. A running, live session whose transcript cannot
+be read (a review job has none) is `unknown`: its PR keeps its previous episode, neither owned nor alerted.
 
-A failed owner read pauses stuck-alert episode updates. So does an agent listing that reports unreadable
-records (`incomplete`), since a missing session is unknown, not gone. An incomplete operator queue also pauses them,
+A failed owner read pauses stuck-alert episode updates. An agent listing with unreadable records
+(`incomplete`) pauses only the PRs those records' sessions name, since a missing session is unknown, not
+gone; a gap that names no session pauses the whole read. An incomplete operator queue also pauses them,
 since operator-owned PRs cannot safely be distinguished, and preserves the previous NEEDS YOU set.
 A complete first queue sample records the set without alerting. A PR move or head change resets its
 unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due

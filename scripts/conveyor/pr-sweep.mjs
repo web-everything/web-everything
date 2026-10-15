@@ -17,6 +17,7 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
+import { parseSessionSlug } from './session-slug.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -66,10 +67,16 @@ export async function readSweepAgents({ env, listWrapped, readRows } = {}) {
     const { defaultReadAgents, enrichAgents } = await import('./reconcile-pass.mjs');
     return enrichAgents(defaultReadAgents({ env }));
   };
-  // The merged listing drops `incomplete` while mapping, so ask the wrapped store directly.
-  const gaps = listWrapped().incomplete ?? [];
+  // The merged listing drops `incomplete` while mapping, so ask the wrapped store
+  // after the rows: a record unreadable there, or listed there but missing from
+  // the rows (torn during the row read), is a gap scoped to its session.
   const rows = await readRows();
-  return gaps.length && Array.isArray(rows) ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
+  if (!Array.isArray(rows)) return rows;
+  const wrapped = listWrapped() ?? [];
+  const names = new Set(rows.map((a) => a?.name));
+  const gaps = [...(wrapped.incomplete ?? []), ...wrapped.filter((w) => w?.name && !names.has(w.name))
+    .map((w) => ({ reason: `wrapped session ${w.name} missing from the agent listing`, session: w.name }))];
+  return gaps.length ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
 }
 export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
   readAgents = () => readSweepAgents({ env }), readActivity = async (agent) => {
@@ -78,14 +85,22 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
 }) {
-  let sessions = []; let health = {}; const logs = [];
+  let sessions = []; let health = {}; const logs = []; let unreadSessions = [];
   const guarded = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
   sessions = await guarded('agents', async () => {
     const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array');
-    // A session missing from a partial listing is unknown, not gone: fail the owner read.
-    if (rows.incomplete?.length) throw new Error(`agent listing incomplete: ${rows.incomplete.map((g) => g?.reason ?? g).join('; ')}`);
-    return Promise.all(rows.map(async (a) => isRunningSession(a)
-      ? { ...a, lastActivityAt: await guarded(`activity ${a.name}`, () => readActivity(a), null) } : a));
+    // A session missing from a partial listing is unknown, not gone. A gap naming a
+    // session pauses only that session's PR; an unscoped gap fails the whole read.
+    const gaps = rows.incomplete ?? [];
+    const unscoped = gaps.filter((g) => !parseSessionSlug(g?.session));
+    if (unscoped.length) throw new Error(`agent listing incomplete: ${unscoped.map((g) => g?.reason ?? g).join('; ')}`);
+    unreadSessions = gaps.map((g) => g.session);
+    // A transcript that cannot be read leaves activity unknown, not stale.
+    return Promise.all(rows.map(async (a) => {
+      if (!isRunningSession(a)) return a;
+      let at = null; try { at = await readActivity(a); } catch { at = null; }
+      return Number.isFinite(at) ? { ...a, lastActivityAt: at } : { ...a, lastActivityAt: null, activityUnknown: true };
+    }));
   }, []);
   health = await guarded('health state', async () => { const state = await readHealth(); if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('expected health object'); return state; }, {});
   const roots = await guarded('daemon roots', cloneRoots, []);
@@ -112,7 +127,7 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
     }
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
-    return [prKey(pr), { sessions, daemons, smell: episode?.smell }];
+    return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions }];
   }));
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,

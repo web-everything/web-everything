@@ -21,7 +21,7 @@ export default {
   fixPresent(root) {
     return ['pr-sweep-core.mjs', 'pr-sweep-job.mjs', 'pr-sweep.mjs', 'health-watch.mjs'].every((name) => {
       const source = readFileSync(join(root, 'scripts/conveyor', name), 'utf8');
-      return name === 'pr-sweep-core.mjs' ? source.includes('isActiveSession(a, now') && source.includes('a.pidAlive === true') && source.includes("d.kind !== 'refusal'")
+      return name === 'pr-sweep-core.mjs' ? source.includes('sessionActivity(a, now') && source.includes('a.pidAlive === true') && source.includes("d.kind !== 'refusal'")
         : source.includes('realpathSync(argv1)') && (name !== 'pr-sweep.mjs' || source.includes('String(text).matchAll'));
     });
   },

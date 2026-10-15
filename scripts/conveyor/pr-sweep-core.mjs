@@ -6,7 +6,8 @@ import { findFixerSession } from './health-smells/pr-no-owner.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
 import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 export const prKey = (pr) => `${ghRepoSlug(pr.repo)}#${pr.number}`;
-const ms = (v) => typeof v === 'number' ? v : Date.parse(v);
+// Epoch numbers may arrive as numeric strings; everything else is an ISO date.
+const ms = (v) => typeof v === 'number' ? v : /^\d+$/.test(String(v ?? '')) ? Number(v) : Date.parse(v);
 export function classifyIdlePrs({ prs, now, idleMinutes }) {
   return prs.filter((p) => (!p.state || p.state.toUpperCase() === 'OPEN') && now - ms(p.updatedAt) > idleMinutes * 60000)
     .map((p) => ({ ...p, ageMin: (now - ms(p.updatedAt)) / 60000 }));
@@ -21,20 +22,31 @@ export function isRunningSession(a) {
   const vals = [a?.state, a?.status].filter((v) => v !== undefined && v !== null && v !== '').map((v) => String(v).toLowerCase());
   return vals.length > 0 && vals.every((v) => RUNNING.has(v)) && a.pidAlive === true && !DONE_FLAGS.some((f) => a[f] === true);
 }
-/** An owner is running, alive and active within the window; a recent start counts as activity. */
-export function isActiveSession(a, now, activeWithinMinutes = 30) {
-  const seen = Math.max(...[a?.lastActivityAt, a?.startedAt].map(ms).filter(Number.isFinite));
-  return isRunningSession(a) && Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000;
+/**
+ * 'yes' when running, alive and active within the window (a recent start counts);
+ * 'unknown' when running and alive but its activity could not be read; else 'no'.
+ * Future timestamps are not evidence.
+ */
+export function sessionActivity(a, now, activeWithinMinutes = 30) {
+  if (!isRunningSession(a)) return 'no';
+  const seen = Math.max(...[a.lastActivityAt, a.startedAt].map(ms).filter((t) => Number.isFinite(t) && t <= now + 60000));
+  if (Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000) return 'yes';
+  return a.activityUnknown === true ? 'unknown' : 'no';
 }
+export const isActiveSession = (a, now, activeWithinMinutes) => sessionActivity(a, now, activeWithinMinutes) === 'yes';
 export function resolveOwner(pr, signals = {}) {
-  const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [] } = signals;
+  const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [], unreadSessions = [] } = signals;
   const base = { owner: null, state: 'none', why: 'No owner signal', ownerLastSeenAt: null };
   if (operator) return { ...base, owner: 'operator', state: 'waiting-operator', why: 'NEEDS YOU / RULING NEEDED' };
-  const live = sessions.filter((a) => isActiveSession(a, now, sessionActiveWithinMinutes)).filter((a) => {
+  const bound = sessions.filter((a) => {
     const slug = parseSessionSlug(a.name);
     return slug ? slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number)
       : (a.repo ? repoKeyForSlug(a.repo) === repoKeyForSlug(pr.repo) : repoKeyForSlug(pr.repo) === 'we');
   });
+  const live = bound.filter((a) => sessionActivity(a, now, sessionActiveWithinMinutes) === 'yes');
+  // A bound session we could not read (activity or listing record) is unknown, not absent.
+  const unread = bound.some((a) => sessionActivity(a, now, sessionActiveWithinMinutes) === 'unknown')
+    || unreadSessions.some((name) => { const slug = parseSessionSlug(name); return slug?.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number); });
   const session = findFixerSession(live, pr.number) ?? live.find((a) => ['review', 'inspect'].includes(parseSessionSlug(a.name)?.kind));
   // Refusals and diagnostics never acquired ownership. Keep them out of the
   // progress clock, including legacy refusal signals carrying only `reason`.
@@ -44,6 +56,7 @@ export function resolveOwner(pr, signals = {}) {
   // A healthy live session is current evidence even when its creation timestamp is old.
   const at = session ? now : daemon ? ms(daemon.at) : null;
   const stuck = Boolean(smell) || (at !== null && now - at > stuckAfterMinutes * 60000);
+  if (unread && !smell && (stuck || !owner)) return { ...base, owner, state: 'unknown', why: 'Bound session could not be read' };
   return { ...base, owner, ownerLastSeenAt: at === null ? null : new Date(at).toISOString(),
     state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
@@ -55,6 +68,8 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
   const report = { idle: idle.map((p) => ({ ...p, ...owners[prKey(p)] })), needsYou: needsYou ?? null, needsYouAdded: [] };
   for (const p of idle) {
     const key = prKey(p); const owner = owners[key];
+    // An unreadable owner keeps its previous episode untouched, like a failed read.
+    if (owner?.state === 'unknown' && prevState.episodes?.[key]) episodes[key] = prevState.episodes[key];
     if (!ownerReadsOk || !prsReadOk || !['none', 'stuck'].includes(owner?.state)) continue;
     const old = prevState.episodes?.[key];
     const episode = old?.head === p.headRefOid && old?.updatedAt === p.updatedAt ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, firstUnownedAt: now, alerted: false };

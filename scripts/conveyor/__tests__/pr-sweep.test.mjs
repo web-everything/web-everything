@@ -248,23 +248,45 @@ describe('only an actively running session owns a PR', () => {
     expect(signals[`${pr.repo}#12`].sessions[0].lastActivityAt).toBe(now - 2000);
     expect(resolveOwner(pr, { now, ...settings, ...signals[`${pr.repo}#12`] }).state).toBe('active');
   });
-  it('an incomplete agent listing keeps the previous episode instead of alerting', async () => {
+  const sweepWith = (listing, previous, tick = now + 100 * 60000, readActivity = () => null) => runPrSweep({ now: tick, dryRun: true, config: {},
+    settings: { value: settings, sources: {} }, readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+    readSignals: (args) => collectOwnerSignals({ ...args, readAgents: () => listing, readActivity, cloneRoots: () => [], readHealth: () => ({}) }) });
+  const gapped = (...gaps) => Object.defineProperty([], 'incomplete', { value: gaps });
+  it('an unreadable record pauses only its own PR; an unscoped gap pauses the whole read', async () => {
     const first = plan();
-    const listing = Object.defineProperty([], 'incomplete', { value: [{ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }] });
-    const report = await runPrSweep({ now: now + 100 * 60000, dryRun: true, config: {}, settings: { value: settings, sources: {} },
-      readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => first.nextState,
-      readSignals: (args) => collectOwnerSignals({ ...args, readAgents: () => listing, cloneRoots: () => [], readHealth: () => ({}) }) });
-    expect(report.errors.join(' ')).toContain('incomplete'); expect(report.alerts).toEqual([]);
-    expect(report.nextState.episodes).toEqual(first.nextState.episodes);
+    const own = await sweepWith(gapped({ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }), first.nextState);
+    expect(own.errors).toEqual([]); expect(own.idle[0].state).toBe('unknown'); expect(own.alerts).toEqual([]);
+    expect(own.nextState.episodes).toEqual(first.nextState.episodes);
+    const other = await sweepWith(gapped({ reason: 'wrapped record fix-13 unreadable', session: 'fix-13' }), first.nextState);
+    expect(other.errors).toEqual([]); expect(other.alerts).toHaveLength(1);
+    const unscoped = await sweepWith(gapped({ reason: 'wrapped record ??? unreadable', session: 'not a slug' }), first.nextState);
+    expect(unscoped.errors.join(' ')).toContain('agent listing incomplete'); expect(unscoped.alerts).toEqual([]);
+    expect(unscoped.nextState.episodes).toEqual(first.nextState.episodes);
   });
-  it('the default reader carries unreadable wrapped records into the listing', async () => {
+  it('a busy live job with no readable transcript is unknown, never a false stall or a forever owner', async () => {
+    const first = plan();
+    const job = running(now, { name: 'review-12', sessionId: null, lastActivityAt: undefined, startedAt: now + 60 * 60000 });
+    const report = await sweepWith([job], first.nextState);
+    expect(report.errors).toEqual([]); expect(report.idle[0].state).toBe('unknown'); expect(report.alerts).toEqual([]);
+    expect(report.nextState.episodes).toEqual(first.nextState.episodes);
+    const thrown = await sweepWith([job], first.nextState, now + 100 * 60000, () => { throw new Error('tail read failed'); });
+    expect(thrown.idle[0].state).toBe('unknown'); expect(thrown.alerts).toEqual([]);
+    expect((await sweepWith([{ ...job, pidAlive: false }], first.nextState)).alerts).toHaveLength(1);
+    expect(resolveOwner(pr, { now, sessions: [running(now, { lastActivityAt: now + 10 * 60 * 60000 })] }).state).toBe('none');
+    expect(resolveOwner(pr, { now, sessions: [running(now, { lastActivityAt: String(now - 60000) })] }).state).toBe('active');
+  });
+  it('the default reader scopes unreadable or torn wrapped records to their sessions', async () => {
     const { readSweepAgents } = await import('../pr-sweep.mjs');
     const gaps = [{ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }];
     const torn = await readSweepAgents({ listWrapped: () => Object.defineProperty([], 'incomplete', { value: gaps }), readRows: () => [running()] });
     expect(torn).toHaveLength(1); expect(torn.incomplete).toEqual(gaps);
-    expect((await readSweepAgents({ listWrapped: () => [], readRows: () => [running()] })).incomplete).toBeUndefined();
+    expect((await readSweepAgents({ listWrapped: () => [running()], readRows: () => [running()] })).incomplete).toBeUndefined();
+    const missing = await readSweepAgents({ listWrapped: () => [running(now, { name: 'fix-14' })], readRows: () => [running()] });
+    expect(missing.incomplete).toEqual([{ reason: 'wrapped session fix-14 missing from the agent listing', session: 'fix-14' }]);
     const errors = [];
-    await collectOwnerSignals({ prs: [pr], dir: tmpdir(), env: {}, errors, readAgents: () => torn, cloneRoots: () => [], readHealth: () => ({}) });
-    expect(errors.join(' ')).toContain('agent listing incomplete: wrapped record fix-12 unreadable');
+    const signals = await collectOwnerSignals({ prs: [pr], dir: tmpdir(), env: {}, errors, readAgents: () => torn, readActivity: () => now, cloneRoots: () => [], readHealth: () => ({}) });
+    expect(errors).toEqual([]); expect(signals[`${pr.repo}#12`].unreadSessions).toEqual(['fix-12']);
+    expect(resolveOwner(pr, { now, ...signals[`${pr.repo}#12`] }).state).toBe('active');
+    expect(resolveOwner(pr, { now, ...signals[`${pr.repo}#12`], sessions: [] }).state).toBe('unknown');
   });
 });
