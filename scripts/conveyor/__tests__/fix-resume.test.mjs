@@ -19,7 +19,7 @@ const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 const SID = '11111111-2222-4333-8444-555555555555';
 const OPUS = { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' };
-/** The platform ladder with the stronger-model rung routed to Opus on Claude (cross-provider unavailable). */
+/** A legacy Opus ladder: launch policy must still apply the current critical-work verdict. */
 const LADDER = {
   policy: DEFAULT_FIXER_ESCALATION,
   routes: { resend: null, 'stronger-model': OPUS, 'cross-provider': { provider: 'codex', model: 'astra' } },
@@ -75,12 +75,12 @@ describe('rung by round (planRoundEscalation / roundEscalationFor)', () => {
     expect(roundEscalationFor(planned({ attempts: 1 }), { fixSettings: SETTINGS, loadLadder: load })).toBeNull();
     expect(load).not.toHaveBeenCalled(); // the ladder is only read once a round reaches the setting
   });
-  it('the launch table of a round-3 fix is the routing policy\'s stronger-model route', () => {
+  it('ordinary rounds use Sonnet even with a legacy Opus ladder', () => {
     const esc = roundEscalationFor(planned({ attempts: 2 }), { fixSettings: SETTINGS, loadLadder: () => LADDER });
-    expect(launchTableFor(planned({ attempts: 2 }), esc)).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' });
-    expect(launchTableFor(planned({ attempts: 1 }), null)).toBeNull();
+    expect(launchTableFor(planned({ attempts: 2 }), esc)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' });
+    expect(launchTableFor(planned({ attempts: 1 }), null)).toMatchObject({ model: 'claude-sonnet-5-5' });
   });
-  it('dispatchFix launches a round-3 ordinary fix with --model opus, and a round-2 fix on the ordinary route', () => {
+  it('dispatchFix explicitly launches round-3 and round-2 ordinary fixes on Sonnet', () => {
     const launch = (attempts) => {
       const calls = [];
       dispatchFix({ ...planned({ attempts }), itemNum: '3438', laneRef: 'lane/3438-x', lane: 9 }, {
@@ -95,9 +95,9 @@ describe('rung by round (planRoundEscalation / roundEscalationFor)', () => {
       return calls[0];
     };
     const r3 = launch(2);
-    expect(r3[r3.indexOf('--model') + 1]).toBe('opus');
+    expect(r3[r3.indexOf('--model') + 1]).toBe('sonnet');
     const r2 = launch(1);
-    expect(r2.indexOf('--model') === -1 || r2[r2.indexOf('--model') + 1] !== 'opus').toBe(true);
+    expect(r2[r2.indexOf('--model') + 1]).toBe('sonnet');
   });
 });
 
@@ -365,12 +365,18 @@ describe('tryResumeRoundFix', () => {
     expect(opts.prompt).toContain('New review round — PR #77');
     expect(opts.sessionCwdFor()).toBe('/scratch/x');
   });
-  it('declined: a round-3 fix that escalates the model cold-starts instead of resuming a Sonnet session', () => {
+  it('declined: a critical round-3 fix cold-starts instead of resuming a Sonnet session', () => {
     const resume = vi.fn();
-    const r = tryResumeRoundFix(planned({ attempts: 2 }), { ...base, readInputs: () => ({ prior, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
+    const r = tryResumeRoundFix(planned({ attempts: 2, scope: ['we:scripts/lib/provider-routing.mjs'] }), { ...base, readInputs: () => ({ prior, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
     expect(r.resumed).toBe(false);
     expect(r.resumeAttempt).toMatchObject({ attempted: false, refused: 'model-escalated', round: 3 });
     expect(resume).not.toHaveBeenCalled();
+  });
+  it('an ordinary round-3 fix resumes Sonnet, but cold-starts a legacy Opus session', () => {
+    const readInputs = model => () => ({ prior, job: { ...job, respawnFlags: ['--model', model] }, transcript: true, lane: freeLane, base: { rebased: false } });
+    const p = planned({ attempts: 2 });
+    expect(tryResumeRoundFix(p, { ...base, dryRun: true, readInputs: readInputs('sonnet') }).decision.resume).toBe(true);
+    expect(tryResumeRoundFix(p, { ...base, dryRun: true, readInputs: readInputs('opus') }).decision.resume).toBe(false);
   });
   it('declined: the wrapped launch and round 1 never even read the inputs', () => {
     const readInputs = vi.fn();
@@ -428,7 +434,7 @@ describe('runReconcileFixDispatch — the round resume runs before the lane pop'
 });
 
 describe('replayFixLaunch / formatReplay — the read-only replay of the next fix launch', () => {
-  const view = (o = {}) => JSON.stringify({ number: 4757, headRefName: 'lane/fixer-resume-ladder', headRefOid: HEAD, baseRefName: 'lane/b', labels: [{ name: 'review:changes' }], state: 'OPEN', ...o });
+  const view = (o = {}) => JSON.stringify({ number: 4757, headRefName: 'lane/fixer-resume-ladder', headRefOid: HEAD, baseRefName: 'lane/b', labels: [{ name: 'review:changes' }], state: 'OPEN', files: [{ path: 'scripts/x.mjs' }], ...o });
   const exec = (o) => (cmd, args) => {
     expect(args.slice(0, 2)).toEqual(['pr', 'view']);
     return view(o);
@@ -439,11 +445,11 @@ describe('replayFixLaunch / formatReplay — the read-only replay of the next fi
     const r = replayFixLaunch({ pr: 4757, round: 6, exec: exec(), readComments, fixSettings: SETTINGS, resumeRound, loadLadder: () => LADDER });
     expect(readComments).not.toHaveBeenCalled();
     expect(resumeRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 4757, attempts: 5, baseRefName: 'lane/b', headRefOid: HEAD }), expect.objectContaining({ dryRun: true }));
-    expect(r).toMatchObject({ pr: 4757, round: 6, attempts: 5, roundOverride: true, route: { rung: 'stronger-model', cliModel: 'opus', fromRound: 3 } });
+    expect(r).toMatchObject({ pr: 4757, round: 6, attempts: 5, roundOverride: true, route: { rung: 'stronger-model', cliModel: 'sonnet', fromRound: 3 } });
     expect(r.launch).toEqual({ mode: 'resume', sessionId: SID, lane: 4, lanePath: '/lanes/we/lane-4', held: 'free' });
     const text = formatReplay(r);
     expect(text).toContain('next fix would be round 6 (round given)');
-    expect(text).toContain('stronger-model route — claude-opus-5-5 (--model opus), from round 3');
+    expect(text).toContain('stronger-model route — claude-sonnet-5-5 (--model sonnet), from round 3');
     expect(text).toContain(`resume ${SID} — no cold start; checkout: re-take its untouched lane-4 (--no-reset)`);
     expect(text).toContain('dry run: nothing claimed, posted, spawned or resumed');
   });
