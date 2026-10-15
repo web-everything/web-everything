@@ -5,6 +5,7 @@ size: 3
 parent: "4075"
 status: open
 scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs", "we:scripts/lib/__tests__/drain-ledger-shadow.test.mjs"]
+scopeRationale: "The ledger table suite covers the gate changes; we:scripts/__tests__/pr-merge-gate.test.mjs and we:scripts/lib/__tests__/pr-state-review-exempt.test.mjs run unchanged as regression checks, so neither belongs in the predicted write-set."
 dateOpened: "2026-10-07"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "4e7914456dc4199144b7e050f86d27fa7d0f1186"
