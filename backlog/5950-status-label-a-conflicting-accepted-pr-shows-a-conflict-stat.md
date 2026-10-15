@@ -2,11 +2,13 @@
 bornAs: xdohuyg
 kind: story
 size: 1
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/__tests__/pr-status-label.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-14"
-preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
+preparedDate: "2026-10-15"
+preparedAgainstSha: "24d9ebca8ca0b935093575ddbcac52f217c0a6d2"
 tags: []
 ---
 
@@ -16,8 +18,13 @@ A PR with a known merge conflict must not be described as ready to merge just be
 
 ## Progress
 
+- Sanity read confirmed the spec remains applicable: accepted readiness still bypassed explicit merge conflicts. Added the managed conflict state after operator/red-CI checks, retaining active repair precedence. Added snapshot and sole-writer regression coverage for both conflict fields, contradictory/unknown fields, operator rulings, red CI, live workers, and conflict/clearance label transitions.
+- Validation passed through the host heavy-admission queue: `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/conveyor/__tests__/pr-status-label.test.mjs` — 1 file, 96 tests passed. Injected green-CI snapshots for both conflict representations replace `status:ready-to-merge` with `status:conflict`; clearing the conflict reverses the transition through the existing label writer. No live label mutations.
+
+- Rechecked at 24d9ebca8: original source-only scope omitted the matching test; retain the corrected two-file scope. Current operator/CI precedence is at `we:scripts/conveyor/pr-status-label.mjs:119` and `we:scripts/conveyor/pr-status-label.mjs:121`; acceptance still returns readiness without a conflict check at `we:scripts/conveyor/pr-status-label.mjs:125`. The managed vocabulary at `we:scripts/conveyor/pr-status-label.mjs:19` still lacks conflict. Existing readiness cases are at `we:scripts/conveyor/__tests__/pr-status-label.test.mjs:63`. Retain size 1 (approximately 8 source + 45 test lines); this is source evidence, not a reproduced live incident. Runner-owned stamps are unchanged.
+
 - Original scope omitted the existing matching test; corrected scope includes it. Original incident #4792 described red CI plus conflict showing ready; that is historical evidence, not a current live observation.
-- Current code already checks required red CI before acceptance in we:scripts/conveyor/pr-status-label.mjs:120–124. The remaining defect is a known conflict with no higher-priority CI/operator state: the accepted branch returns readiness without checking either mergeability field.
+- Current code already checks required red CI before acceptance in we:scripts/conveyor/pr-status-label.mjs:119–125. The remaining defect is a known conflict with no higher-priority CI/operator state: the accepted branch returns readiness without checking either mergeability field.
 - The status vocabulary and descriptions are declared in we:scripts/conveyor/pr-status-label.mjs:18–42; add the new state there so existing label planning recognizes and removes it normally. Current readiness/CI tests live in we:scripts/conveyor/__tests__/pr-status-label.test.mjs:63 and :163.
 - Size remains 1: approximately 8 source lines and 45 test lines across two files.
 

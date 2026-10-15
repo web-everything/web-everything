@@ -13,9 +13,9 @@
  * byte-identical to *"a fixer died"*. Any reconciler reading that PR re-dispatches the refusal forever, burning
  * tokens to re-ask a question nobody is there to answer. This marker is the one bit that tells them apart.
  *
- * Head-bound holds lapse on a new push by default; unbound holds remain terminal.
+ * Holds lapse on a new head by default; legacy unbound holds use head-change evidence after their timestamp.
  * TERMINAL FOR THE RECONCILER, NOT FOR A PERSON. `planReconcile` treats a PR carrying this marker as terminal
- * on the recorded head (or indefinitely without one): it will not dispatch a fixer there again. The
+ * on the recorded head: it will not dispatch a fixer there again. The
  * intended exit is a HUMAN — who reads the escalation, makes the judgment, and clears the marker (or takes the
  * PR over via `/finish`). That asymmetry is deliberate and it is stated in the comment body itself, because a
  * marker that quietly buries a PR forever would be a worse defect than the one it fixes.
@@ -43,6 +43,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readBotLogins } from '../lib/github-app-identity.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 /**
  * we:scripts/conveyor/stand-down.mjs#STAND_DOWN_MARKER — the stable FIRST LINE of the durable stand-down comment.
@@ -186,6 +187,29 @@ export function resolveStandDownLapseOnNewHead({ env = process.env, file = STAND
   return { value: 'on', source: 'default' };
 }
 
+/** Standard false → platform preference → fix.json → env. Keep the old on/off switch as a compatibility alias. */
+export function resolveStandDownHoldsAcrossHeads({ env = process.env, read = readFileSync, platform } = {}) {
+  let tool;
+  try { tool = JSON.parse(read(join(dirname(STAND_DOWN_SETTINGS_FILE), 'fix.json'), 'utf8'))?.fix?.standDownHoldsAcrossHeads; } catch { /* standard */ }
+  if (tool === undefined && resolveStandDownLapseOnNewHead({ env: {} }).value === 'off') tool = true;
+  const raw = env.WE_FIX_STAND_DOWN_HOLDS_ACROSS_HEADS;
+  const alias = onOff(env.WE_STAND_DOWN_LAPSE_ON_NEW_HEAD);
+  const fromEnv = raw === undefined ? (alias ? alias === 'off' : undefined)
+    : raw === 'true' || raw === '1' ? true : raw === 'false' || raw === '0' ? false : raw;
+  const key = 'standDownHoldsAcrossHeads';
+  const resolved = cascadePolicy('fix', { [key]: tool }, {
+    standard: { [key]: false }, platform, env, envValues: { [key]: fromEnv },
+    valid: { [key]: value => typeof value === 'boolean' },
+  });
+  return { value: resolved.value[key], source: resolved.sources[key] };
+}
+
+/** Evidence about the current head only; updatedAt also moves on comments and is never head-change proof. */
+export function standDownHeadChangeAt(pr) {
+  const commit = (Array.isArray(pr?.commits) ? pr.commits : []).find(c => isSafeGitSha(c?.oid) && isSafeGitSha(pr?.headRefOid) && sameCommit(c.oid, pr.headRefOid));
+  return pr?.headChangedAt ?? commit?.committedDate ?? null;
+}
+
 /** Read only the machine trailer or the legacy ci-heal Head sentence. */
 export function standDownHead(body) {
   if (typeof body !== 'string') return null;
@@ -195,17 +219,23 @@ export function standDownHead(body) {
   const legacyFixLoop = trailer ? trailer[1] === 'fix-loop-exhausted'
     : body.split('\n')[2]?.split('stopped rather than guessing: ')[1]?.startsWith(`${STAND_DOWN_REASONS['fix-loop-exhausted']}.`);
   if (!legacyFixLoop) return null;
-  return /\bHead: ([0-9a-f]{40})\b/.exec(body)?.[1] ?? null;
+  return /\bHead: `?([0-9a-f]{7,40})\b/i.exec(body)?.[1] ?? null;
 }
 
 /** A trusted head-bound hold lapses on a new head, or proven red-main-only loop exhaustion. */
-export function standDownLapse(comment, headRefOid, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, redMainLapse } = {}) {
+export function standDownLapse(comment, headRefOid, { lapseOnNewHead, headChangedAt, redMainLapse } = {}) {
   const body = typeof comment === 'string' ? comment : comment?.body;
   if (typeof body !== 'string'
     || !body.trimStart().startsWith(STAND_DOWN_MARKER) || !isTrustedMarkerAuthor(comment)) return null;
   const reason = STAND_DOWN_TRAILER_RE.exec(body)?.[1]?.toLowerCase() ?? null;
   const fromHead = standDownHead(body);
-  if (reason === 'superseded' || !fromHead || !isSafeGitSha(headRefOid)) return null;
+  if (reason === 'superseded' || !isSafeGitSha(headRefOid)) return null;
+  lapseOnNewHead ??= resolveStandDownHoldsAcrossHeads().value ? 'off' : 'on';
+  if (!fromHead) {
+    const posted = Date.parse(comment?.createdAt ?? '');
+    return lapseOnNewHead === 'on' && Date.parse(headChangedAt ?? '') > posted
+      ? { fromHead: null, toHead: headRefOid, reason, lapse: 'head-changed-after-comment' } : null;
+  }
   if (sameCommit(fromHead.toLowerCase(), headRefOid.toLowerCase())) {
     return reason === 'fix-loop-exhausted' && redMainLapse?.(headRefOid) === true
       ? { fromHead, toHead: headRefOid, reason, lapse: 'red-main-only' } : null;
@@ -219,16 +249,17 @@ function logStandDownLapse({ pr, fromHead, toHead, lapse }) {
   const key = `${pr}:${fromHead}:${toHead}`;
   if (loggedLapses.has(key)) return;
   loggedLapses.add(key);
-  console.error(`stand-down: PR #${pr} stand-down for head ${fromHead.slice(0, 7)} lapsed — ${lapse === 'red-main-only' ? 'its repair attempts all ran while main was red (fix.loopHold.redMainDiscount=on)' : `head moved to ${toHead.slice(0, 7)} (standDown.lapseOnNewHead=on)`}`);
+  console.error(`stand-down: PR #${pr} stand-down for head ${fromHead?.slice(0, 7) ?? 'unknown'} lapsed — ${lapse === 'red-main-only' ? 'its repair attempts all ran while main was red (fix.loopHold.redMainDiscount=on)' : `head moved to ${toHead.slice(0, 7)} (fix.standDownHoldsAcrossHeads=false)`}`);
 }
 
 /** Annotate the snapshot; the durable comment thread is unchanged. */
-export function annotateLapsedStandDowns(pr, { lapseOnNewHead = resolveStandDownLapseOnNewHead().value, onLapse = logStandDownLapse, redMainLapse } = {}) {
+export function annotateLapsedStandDowns(pr, { lapseOnNewHead, onLapse = logStandDownLapse, redMainLapse } = {}) {
   if (!Array.isArray(pr?.comments)) return pr;
+  lapseOnNewHead ??= resolveStandDownHoldsAcrossHeads().value ? 'off' : 'on';
   const standDownLapses = [];
   const comments = pr.comments.map((c) => {
     if (c?.standDownLapsed) return c;
-    const lapse = standDownLapse(c, pr.headRefOid, { lapseOnNewHead, redMainLapse: redMainLapse && (head => redMainLapse(head, pr)) });
+    const lapse = standDownLapse(c, pr.headRefOid, { lapseOnNewHead, headChangedAt: standDownHeadChangeAt(pr), redMainLapse: redMainLapse && (head => redMainLapse(head, pr)) });
     if (!lapse) return c;
     standDownLapses.push(lapse);
     onLapse({ pr: pr.number, ...lapse });
@@ -500,12 +531,12 @@ export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
  * @param {Array<{body?:string, createdAt?:string, author?:{login?:string}}|string>|null|undefined} comments
  * @returns {Array<{body: string, createdAt: ?string}>}
  */
-export function standDownComments(comments, { headRefOid = null, lapseOnNewHead } = {}) {
+export function standDownComments(comments, { headRefOid = null, lapseOnNewHead, headChangedAt } = {}) {
   if (!Array.isArray(comments)) return [];
-  if (headRefOid && lapseOnNewHead === undefined) lapseOnNewHead = resolveStandDownLapseOnNewHead().value;
+  if (headRefOid && lapseOnNewHead === undefined) lapseOnNewHead = resolveStandDownHoldsAcrossHeads().value ? 'off' : 'on';
   const out = [];
   for (const c of comments) {
-    if (c?.standDownLapsed || (headRefOid && standDownLapse(c, headRefOid, { lapseOnNewHead }))) continue;
+    if (c?.standDownLapsed || (headRefOid && standDownLapse(c, headRefOid, { lapseOnNewHead, headChangedAt }))) continue;
     const body = typeof c === 'string' ? c : c?.body;
     // fix procedure — a concurrent-author stand-down is a re-armable pause, never a terminal stand-down.
     if (typeof body === 'string' && body.trimStart().startsWith(STAND_DOWN_MARKER) && isTrustedMarkerAuthor(c)
@@ -524,8 +555,8 @@ export function standDownComments(comments, { headRefOid = null, lapseOnNewHead 
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @returns {number} the number of conveyor stand-down comments on the PR (0 for a non-array / empty input)
  */
-export function countStandDownComments(comments, { headRefOid = null, isSuperseded, lapseOnNewHead } = {}) {
-  return standDownComments(comments, { headRefOid, lapseOnNewHead }).length + (loadFlakeHoldState({ comments, headRefOid, isSuperseded }).live ? 1 : 0);
+export function countStandDownComments(comments, { headRefOid = null, isSuperseded, lapseOnNewHead, headChangedAt } = {}) {
+  return standDownComments(comments, { headRefOid, lapseOnNewHead, headChangedAt }).length + (loadFlakeHoldState({ comments, headRefOid, isSuperseded }).live ? 1 : 0);
 }
 
 /**
@@ -643,7 +674,7 @@ export function isStandDownSuperseded(comments, index) {
 export function countTerminalStandDowns(comments, options = {}) {
   if (!Array.isArray(comments)) return 0;
   if (options.headRefOid && options.lapseOnNewHead === undefined) {
-    options = { ...options, lapseOnNewHead: resolveStandDownLapseOnNewHead().value };
+    options = { ...options, lapseOnNewHead: resolveStandDownHoldsAcrossHeads().value ? 'off' : 'on' };
   }
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {

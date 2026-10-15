@@ -76,6 +76,19 @@ describe('soak shard-files — isolated baseline and time-balanced breaks', () =
     });
   });
 
+  it('keeps the baseline alone even when its timing is missing or smaller than every break', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
+      const breaks = { 'a.soak.test.mjs': 40, 'b.soak.test.mjs': 30, 'c.soak.test.mjs': 20, 'd.soak.test.mjs': 10 };
+      for (const timings of [breaks, { ...breaks, 'base.soak.test.mjs': 1 }]) {
+        expect(shardFiles({ ...opts, shard: 1, timings })).toEqual(['base.soak.test.mjs']);
+        const remaining = [2, 3].map((shard) => shardFiles({ ...opts, shard, timings }));
+        expect(remaining.flat().sort()).toEqual(Object.keys(breaks).sort());
+        expect(remaining.map((files) => files.reduce((sum, file) => sum + timings[file], 0))).toEqual([50, 50]);
+      }
+    });
+  });
+
   it('a new break with no stored timing is assigned (median fallback), none lost', () => {
     withBreaks(['a.soak.test.mjs', 'new.soak.test.mjs'], (dir) => {
       const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir, timings: { 'a.soak.test.mjs': 5, 'base.soak.test.mjs': 50 } };

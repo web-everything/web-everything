@@ -2,9 +2,11 @@
 bornAs: x3or1a2
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-14"
 preparedAgainstSha: "6742d1202f2de0350e0a5a6978cebaa385be8b43"
 tags: []

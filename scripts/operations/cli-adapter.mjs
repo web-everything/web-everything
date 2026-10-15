@@ -1481,7 +1481,7 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
         lines: [
           `run ${run.id} — complete, but ${refused.length} effect(s) were REFUSED/FAILED — nothing they asked for happened.`,
           ...refused.flatMap(({ type, step, result }) => [
-            `  ${type} (step ${step}): ${result.outcome} — ${result.reason}`,
+            `  ${type} (step ${step}): ${result.outcome} — ${result.reason ?? result.error ?? 'no failure reason supplied'}`,
             ...(result.detail != null ? [`    detail: ${result.detail}`] : []),
             ...(result.pr != null ? [`    pr: ${result.pr}${result.url ? ` ${result.url}` : ''}`] : []),
           ]),

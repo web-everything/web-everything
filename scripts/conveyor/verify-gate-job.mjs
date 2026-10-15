@@ -54,7 +54,7 @@ import { evictSnapshots } from '../lib/daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, parseJobHandle } from '../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { cloneNodeModulesInstaller } from '../lib/daemon-rebuild/rebuild-job.mjs';
-import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings, killOrphanGroup } from './verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings, resolveGateCeiling, killOrphanGroup } from './verify-dispatch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const CLONE_ROOT = resolve(dirname(SELF), '..', '..');
@@ -704,10 +704,11 @@ export async function runGateStep({
   groupExists = groupExistsDefault, listJobs = () => createJobStore(jobsDir).list(), scanLane = findLaneGatePidsDefault,
   supervisorHandle = selfHandleOrNull, onGateSettled = () => {},
 }) {
+  const gateCeiling = resolveGateCeiling();
   const deps = { probe, pidExists, groupExists };
   const where = `${input.pool}/lane-${input.lane} @ ${String(input.headSha).slice(0, 8)}`;
   const finish = (result) => {
-    const full = { ...result, attempt, finishedAt: new Date().toISOString(), ...gateCeilings() };
+    const full = { ...result, attempt, finishedAt: new Date().toISOString(), ...gateCeilings(gateCeiling) };
     writeJson(resultPath(jobsDir, jobId), full);
     log(`[verify-gate-job ${jobId}] ${full.finishedAt} ${where}: ${full.outcome}`);
     return { outcome: full.outcome };
@@ -809,6 +810,7 @@ export async function runGateStep({
   let error = null;
   try {
     await runGate({
+      gateCeiling,
       pool: input.pool, lane: input.lane, dir: input.dir, headSha: input.headSha, runId: input.runId,
       marker: { ...marker, suites: input.suites ?? marker.suites, startedAt: input.requestStartedAt ?? marker.startedAt },
       log,

@@ -7,7 +7,9 @@
  * MEASURED time (`scripts/ci/test-timings.json`, greedy longest-first, `scripts/ci/shard-assign.mjs`), rather than
  * round-robining them by sorted index, blind to cost. A file with no stored
  * timing gets the median, so a new break (one file, discovered from disk — never from `breaks/index.mjs`'s registry)
- * lands in a shard automatically with no shard-list edit.
+ * lands in a shard automatically with no shard-list edit. The 50-tick baseline keeps shard 1 to itself:
+ * balancing file durations alone put it beside concurrent worlds; CI exhausted its 10-minute budget with
+ * every completed tick still holding its invariants. Balance the breaks on shards 2..N.
  */
 
 import { readdirSync } from 'node:fs';
@@ -47,8 +49,9 @@ export function shardFiles({ shard, total, breaksDir = BREAKS_DIR, baselineFile 
   if (!Number.isInteger(total) || total < 1) throw new Error(`soak shard-files: --shard total must be a positive integer, got "${total}"`);
   if (!Number.isInteger(shard) || shard < 1 || shard > total) throw new Error(`soak shard-files: --shard index must be 1..${total}, got "${shard}"`);
 
-  const [baseline, ...breaks] = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
-  if (total === 1) return [baseline, ...breaks];
+  const all = listAllSoakFiles({ breaksDir, baselineFile, repoRoot });
+  if (total === 1) return all;
+  const [baseline, ...breaks] = all;
   if (shard === 1) return [baseline];
   // A new break still gets the median timing and lands automatically. Baseline isolation must not depend
   // on its stored timing being current, nor on how much break coverage has accumulated.

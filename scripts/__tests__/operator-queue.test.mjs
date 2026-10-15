@@ -216,6 +216,7 @@ describe('main', () => {
       expect(JSON.parse(log.mock.calls[0][0])).toEqual({
         ready: [{ repo: 'owner/good', number: 42, title: 'Ready for review' }],
         rulingNeeded: [],
+        needsPerson: [],
         pending: [],
         notReady: [{
           repo: 'owner/good', number: 43, title: 'Ready for review',
@@ -251,7 +252,7 @@ describe('main', () => {
       .mockReturnValueOnce(JSON.stringify({ mergeable: 'MERGEABLE' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
+      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], rulingNeeded: [], needsPerson: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
     });
     expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([1000, 2000]);
   });
@@ -263,7 +264,7 @@ describe('main', () => {
     execFileSync.mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [], rulingNeeded: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
+      ready: [], rulingNeeded: [], needsPerson: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
     });
     expect(sleep).toHaveBeenCalledTimes(4);
   });

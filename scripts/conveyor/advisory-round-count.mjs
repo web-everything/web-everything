@@ -51,8 +51,8 @@ export const ADVISORY_NOTE_MARKER = '**⚠️ THIS IS AN ADVISORY REVIEW, NOT A 
 /** Pinned against jury-core's producer constant in tests; keep this module's imports leaf-light. */
 export const OPERATOR_RULING_MARKER_TAG = 'mandatory-referral-operator-ruling-v1';
 
-/** Read only the producer's fixed footer slot, never quoted or fenced examples. */
-function judgedHead(body) {
+/** Read only the producer's fixed footer slot, never quoted or fenced examples. Also read by the precedent backfill. */
+export function judgedHead(body) {
   const lines = body.split('\n').map((line) => line.replace(/\r$/, ''));
   let separator = -1;
   let fence = null;

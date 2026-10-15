@@ -24,13 +24,14 @@ export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reaso
 }
 
 /** Repo keys and their canonical slugs name the same grant; unknown repos match exactly. */
-export function countGrantedRoundExtensions(comments, { repo, pr }) {
+export function roundExtensionGrants(comments, { repo, pr }) {
   const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
-  const total = (Array.isArray(comments) ? comments : []).reduce((sum, comment) => {
+  let remaining = MAX_TOTAL_ROUND_EXTENSIONS;
+  return (Array.isArray(comments) ? comments : []).flatMap((comment, index) => {
     if (!isOperatorAuthored(comment) || typeof comment?.body !== 'string'
-      || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) return sum;
+      || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) return [];
     const matches = [...comment.body.matchAll(/^<!-- round-extension: (.+) -->$/gm)];
-    if (matches.length !== 1) return sum;
+    if (matches.length !== 1) return [];
     try {
       const r = JSON.parse(matches[0][1]);
       if (r?.version !== 1 || slug(r.repo) !== slug(repo) || r.pr !== Number(pr)
@@ -38,9 +39,15 @@ export function countGrantedRoundExtensions(comments, { repo, pr }) {
         || typeof r.actor !== 'string' || !OPERATOR_LOGINS.includes(r.actor.toLowerCase())
         || typeof r.reason !== 'string' || !r.reason.trim()
         || typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel)
-        || typeof r.at !== 'string' || !r.at.trim()) return sum;
-      return sum + r.by;
-    } catch { return sum; }
-  }, 0);
-  return Math.min(total, MAX_TOTAL_ROUND_EXTENSIONS);
+        || typeof r.at !== 'string' || !r.at.trim()) return [];
+      const by = Math.min(r.by, remaining);
+      remaining -= by;
+      return by > 0 ? [{ index, by, at: r.at }] : [];
+    } catch { return []; }
+  });
+}
+
+/** Total grants retain the same authentication and ten-round ceiling as the indexed reader. */
+export function countGrantedRoundExtensions(comments, scope) {
+  return roundExtensionGrants(comments, scope).reduce((sum, grant) => sum + grant.by, 0);
 }

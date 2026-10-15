@@ -87,6 +87,8 @@ Use `isGhDeferred` from `we:scripts/lib/gh-deferred.mjs` before parsing query da
 a deferred response is not an empty PR list. Discovery CLI passes can use `deferGhPass` to skip before
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
+The gh holder policy lives in `scripts/settings/gh-throttle.json` and resolves once per process/env object. Holder tests use a temporary lock root and injected clock/sleep; watch calls must remain unslotted. Watch detection and the write/op classifiers read gh argv the way gh's own parser does, so test leading global flags (`--repo o/r run watch`), `--flag=value` booleans and flag values that look like flags (`--body --watch`). Verify timeout fidelity against a real local child, preserving native timeout errors and releasing its slot without signalling the holder process.
+Holder diagnostics persist only allowlisted command labels, omitting endpoints and all argument values. Sanitize old metadata and process-table commands at the output boundary as well as new lock writes. Cover admission with a decision table over caller-capped, pool-full and over-age states. Reaping waits for the greater of policy and the recorded effective timeout plus grace; an explicit zero timeout prevents age-based reaping of that holder. Metric operation labels use the same bounded vocabulary as default call logs.
 Daemon simulator worlds with independent clocks must each override `WE_GH_THROTTLE_LOCK_ROOT`
 and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A previous world's
 future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.
@@ -96,6 +98,10 @@ GitHub App shim directories before scanning the host's tool PATH.
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
+Generated shims that embed functions with `Function#toString` must embed every dependency as well.
+Keep the resource classifier and its argv parsers together in `scripts/lib/gh-argv.mjs`: imported
+references inside a stringified function can retain Vite's SSR binding names. Exercise the emitted
+source in an empty VM context and the real shim after its generating checkout is removed.
 For Node subprocess script paths imported by Vitest's browser environment, use
 `join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
 import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.
@@ -950,3 +956,41 @@ resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS Y
 findings before the first ruling.
 The queue routes needs-judgment questions to NEEDS YOU
 by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.
+
+### Fix verification infrastructure retries
+
+An await-verify `infra` verdict for a fix stays in the harness: it persists a same-head
+retry before requesting verification, with `verify.infraRetry.maxAttempts` (3) and
+`verify.infraRetry.backoffMinutes` (15) resolved through the policy cascade and logged
+with their sources. No model wakes during backoff or an infrastructure retry. Green
+uses the existing evidence/hand-back resume; a real red resumes the repair loop.
+Exhaustion is logged once and retains the infrastructure wait for operator recovery;
+it never creates a new fixer. Probe restart persistence, write failure, head movement,
+and both terminal verdicts with the pass's injected ports.
+
+`verify.gateCeiling` defaults to `load-scaled`, using rebuild smoke's bounded load/core
+factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute override.
+The gate job records the same resolved budget its supervisor used; admission waits
+still consume only the separate queue ceiling. Reconcile probes bound PIDs each pass
+and must discard a previous `pidAlive` value if the new probe is unknown.
+
+### Operator repair round replay
+
+Replay round-extension grants after an already over-cap thread, then a completed repair and the
+review of its new head. Fix admission uses `< cap`; the owed review uses `<= cap`.
+`fix.roundExtensionAnchor` defaults to `grant` (env `WE_FIX_ROUND_EXTENSION_ANCHOR`); `off`
+retains additive caps. Each cap anchors to its own counter on the thread prefix before the grant;
+never use the current durable count map as historical evidence. Open send-back allowances use
+trusted fix-end comments after the latest open operator ceremony and `fix.operatorRulingExtraRounds`.
+Set that allowance to zero in tests isolating the older `operatorFixBudget` mechanism.
+An open send-back allowance must preserve the takeover gate predicate: a reviewed head with zero
+open defects and an own-gate hold still goes through cap handling for its advisory or operator note.
+Replay human, awaiting-base, stacked-base, review-gate and merge-gate holds alongside the allowance.
+
+### Stand-down head lifetime
+
+Terminal stand-downs hold on their recorded head. Reconcile and operator/health listings use the shared
+`stand-down.mjs` head reader; legacy unbound comments lapse with later current-head commit evidence, never
+from PR `updatedAt` (comments also update it). `fix.standDownHoldsAcrossHeads` defaults to false through
+the standard → platform → tool → env cascade and logs its source. Replay both raw planner inputs and
+queue listings; include same-head holds, abbreviated legacy Head markers and missing/older timestamps.

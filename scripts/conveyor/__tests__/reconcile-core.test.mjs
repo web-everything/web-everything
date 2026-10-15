@@ -3035,7 +3035,7 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'already-reviewed-head', prNumber: 2588, headSha: HEAD, reviewedSha: HEAD })]);
   });
 
-  it('the SAME guard applies to a `needs-human` (review:human) PR — not just `needs-review`', () => {
+  it('a needs-human PR with no advisory falls through to the ordinary CI gate', () => {
     const pr = {
       number: 2589, state: 'OPEN', headRefName: 'lane/review-loop-2589', headRefOid: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
@@ -3043,6 +3043,36 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
     };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals[0].kind).toBe('review-ci');
+  });
+
+  // Live #5323: the drain re-stamped acceptance after a content-preserving rebase,
+  // but the human still needs an advisory on the new head.
+  const restamped = (phase, advisoryHead) => ({
+    number: 5323, state: 'OPEN', headRefName: 'lane/5323', headRefOid: HEAD,
+    labels: lbl(phase === 'needs-human' ? 'review:human' : 'review:pending'),
+    mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup,
+    comments: [{ author: AUTOMATION, createdAt: '2026-10-15T00:00:00Z',
+      body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** ✅ pass — no blocking findings\nNet basis: \`${OLDER_HEAD}..${advisoryHead}\`` },
+    { author: AUTOMATION, createdAt: '2026-10-15T01:00:00Z',
+      body: `📌 review — acceptance re-stamped after a rebase (no new review)\n\n${buildReviewedShaMarker(HEAD)}` }],
+  });
+
+  it('live #5323: needs-human with a re-stamped reviewed-sha and only an old advisory dispatches the owed advisory', () => {
+    const plan = planReconcile({ prs: [restamped('needs-human', OLDER_HEAD)], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5323, phase: 'needs-human', advisoryOwed: true })]);
+    expect(plan.refusals.some(row => row.kind === 'already-reviewed-head')).toBe(false);
+  });
+
+  it('keeps the reviewed-head refusal when an advisory already covers the live head', () => {
+    const plan = planReconcile({ prs: [restamped('needs-human', HEAD)], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals[0].kind).toBe('already-reviewed-head');
+  });
+
+  it('keeps the needs-review refusal with an old advisory and a re-stamped reviewed-sha', () => {
+    const plan = planReconcile({ prs: [restamped('needs-review', OLDER_HEAD)], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([]);
     expect(plan.refusals[0].kind).toBe('already-reviewed-head');
   });
 
@@ -3111,8 +3141,8 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
 
     it('a `review:human` head is NOT treated as a dropped label (escalated-after-accept is legitimate; only the ceremony clears it)', () => {
       const plan = planReconcile({ prs: [stuckPr({ labels: lbl('review:human') })], agents: [], durableCounts: {}, now: NOW });
-      expect(plan.dispatch).toHaveLength(0);
-      expect(plan.refusals[0].kind).toBe('already-reviewed-head');
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', advisoryOwed: true })]);
+      expect(plan.dispatch[0].relabelOwed).toBeUndefined();
     });
 
     it('the ci-red-parallel caller retains owed-ci-rerun even with a stuck accept label', () => {
@@ -3199,7 +3229,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
     expect(plan.refusals[0].kind).toBe('already-reviewed-head');
   });
 
-  it('a needs-human PR with an accept marker but NO escalation comment at all still refuses `already-reviewed-head` (the ORIGINAL #2588 guard, unweakened)', () => {
+  it('a needs-human PR with no escalation or advisory reaches the ordinary CI gate', () => {
     const pr = {
       number: 2779, state: 'OPEN', headRefName: 'lane/2779', headRefOid: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
@@ -3207,7 +3237,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
     };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals[0].kind).toBe('already-reviewed-head');
+    expect(plan.refusals[0].kind).toBe('review-ci');
   });
 
   it('an escalation comment that PREDATES the accept (not a supersession) does not convert', () => {
@@ -3218,7 +3248,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
     };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals[0].kind).toBe('already-reviewed-head');
+    expect(plan.refusals[0].kind).toBe('review-ci');
   });
 
   it('`convert-advisory` is on the frozen DISPATCH_KINDS list', () => {
@@ -3338,7 +3368,9 @@ describe('operator send-back renews a bounded durable fix budget', () => {
     ...over,
   });
   const plan = (comments, extra = {}) => planReconcile({
-    prs: [pr1563({ comments, labels: lbl('review:changes', 'review:human') })], now: NOW, ...extra,
+    prs: [pr1563({ comments, labels: lbl('review:changes', 'review:human') })], now: NOW,
+    // Isolate the existing durable budget from the separate open-send-back allowance.
+    operatorRulingExtraRounds: { value: 0, source: 'repo' }, ...extra,
   });
   const burned = () => Array.from({ length: 5 }, round);
 

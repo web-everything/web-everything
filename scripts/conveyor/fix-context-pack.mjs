@@ -218,7 +218,7 @@ export function localTestsSection(mode, kind = 'fix') {
   if (mode !== 'proof-only') return '';
   const red = kind === 'ci-heal'
     ? 'If you need a red proof of the CI break, run the failing test file ONCE (`npm run test:unit -- <that file>`).'
-    : 'Run the failing (or new) test file ONCE, before the fix, as the red proof (`npm run test:unit -- <that file>`).';
+    : 'Run the failing (or new) test file ONCE, before the fix, as the red proof (`npm run test:unit -- <that file>`). If an earlier commit already fixed the finding, do not edit the guard out by hand to show red (the auto-mode classifier denies that as `[Security Weaken]` and then refuses the rest of the session, PR #5242); run `node scripts/operations/run.mjs revert-red-check --checkout=<lane> --base=<the commit before that fix>` and cite its output as the red proof.';
   return [
     '### Local tests — proof-only (`fix.localTests`)',
     '',

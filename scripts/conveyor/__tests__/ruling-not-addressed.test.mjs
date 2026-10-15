@@ -360,6 +360,7 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
       enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
       enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
       enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
+      loadRoundExtensionAnchorSetting: () => ({ value: 'grant', source: 'env' }),
       loadFixSettings: () => ({ roundCapAction: 'takeover' }), loadTakeoverBudget: () => ({ value: 2, source: 'env' }), ...loaders,
       resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
     try {
@@ -374,6 +375,7 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
       const d = out.dispatch.find((x) => x.operatorRulingRound);
       expect(d).toBeTruthy();
       expect(d.operatorRulingRound.source).toBe('env');
+      expect(log.mock.calls.flat().join('\n')).toMatch(/round-extension-anchor: fix\.roundExtensionAnchor=grant \(source: env\)/);
       expect(log.mock.calls.flat().join('\n')).toMatch(/operator-ruling-round: fix\.operatorRulingExtraRounds=1 \(source: env\)/);
     } finally { log.mockRestore(); }
   });
