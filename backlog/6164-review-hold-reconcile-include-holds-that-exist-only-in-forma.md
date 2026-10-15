@@ -1,14 +1,15 @@
 ---
+bornAs: x7rm6ia
 kind: task
 status: open
-scope: ["we:scripts/lib/numbering-carry.mjs"]
+scope: ["we:scripts/conveyor/review-hold-reconcile.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# numbering carry: remember label-only failed withdrawals across a restart
+# review-hold reconcile: include holds that exist only in formal reviews
 
-Ruling card from PR #5233 (operator, 2026-10-15). In we:scripts/lib/numbering-carry.mjs a failed withdrawal caused solely by label changes is held only in memory and is forgotten after a restart, so it is never retried. Persist it durably and retry, with a restart test.
+Ruling card from PR #5233 (operator, 2026-10-15). we:scripts/conveyor/review-hold-reconcile.mjs skips stranded numbering records whose intervening hold exists only in formal GitHub reviews (not comments or labels). Read formal reviews too, with a test.
 
 ## Acceptance
 
