@@ -21,20 +21,23 @@
  *   a clone refresh or a pass: both use the same clone). Before its next pass it awaits `idle()`. So a fast drain and
  *   a full pass never run at the same time in one clone.
  *
- * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number,
- *   catchUp: { enabled: boolean, intervalMinutes: number, concurrency: number, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, order: string } }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, order:"priority-then-first-accept"}}` → platform
+ * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number, timeoutSeconds: number,
+ *   catchUp: { enabled: boolean, intervalMinutes: number, concurrency: number, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, timeoutBackoffRounds: number, order: string } }`, resolved through the shared
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, timeoutSeconds:600, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, timeoutBackoffRounds:3, order:"priority-then-first-accept"}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
  *   debounceSeconds: wait this long after the PR's LAST eligible event before running (check suites finish in a
  *   burst, and GitHub's mergeable state lags the last check by a few seconds).
+ *   timeoutSeconds: integer 60–3600 (standard 600); SIGTERM a fast drain after this duration and report timeout.
  *
  *   missSmellAfter: positive integer (standard 3); every threshold of consecutive admission misses logs
  *   SMELL enqueue-not-entering. Enqueue claims are re-read from GitHub; misses retry next catch-up.
  *
  *   blockedBackoffRounds: nonnegative integer (standard 6; 0 disables); skip the next N catch-up listings
  *   after a BLOCKED branch-protection / merge-gate hold, unless the head or check states change. Events bypass it.
+ *   timeoutBackoffRounds: nonnegative integer (standard 3; 0 disables); skip the next N catch-up listings
+ *   after a fast-drain timeout, unless the head or check states change. Events bypass it.
  *
  *   concurrency: positive integer (standard 3; 1 retains serial drains). Only children overlap; each start
  *   rechecks live room and reserves space for active siblings. The child rechecks batching under its land lock;
@@ -67,8 +70,8 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, order: 'priority-then-first-accept' }) });
-/** A fast drain that runs longer than this is stopped (SIGTERM); the PR rides the next full pass. */
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, order: 'priority-then-first-accept' }) });
+/** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
@@ -83,17 +86,19 @@ const CATCH_UP_VALID = {
   maxQueued: (v) => Number.isInteger(v) && v >= 1,
   missSmellAfter: (v) => Number.isInteger(v) && v >= 1,
   blockedBackoffRounds: (v) => Number.isInteger(v) && v >= 0,
+  timeoutBackoffRounds: (v) => Number.isInteger(v) && v >= 0,
   order: (v) => ['priority-then-first-accept', 'oldest-ready'].includes(v),
 };
 const VALID = {
   catchUp: (v) => Object.values(CATCH_UP_VALID).some((valid) => valid(v)),
   enabled: (v) => typeof v === 'boolean',
   debounceSeconds: (v) => Number.isFinite(v) && v >= 0 && v <= 600,
+  timeoutSeconds: (v) => Number.isInteger(v) && v >= 60 && v <= 3600,
 };
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -110,6 +115,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   const out = {
     enabled: v.enabled === true,
     debounceSeconds: VALID.debounceSeconds(v.debounceSeconds) ? v.debounceSeconds : ENQUEUE_ON_EVENT_DEFAULTS.debounceSeconds,
+    timeoutSeconds: VALID.timeoutSeconds(v.timeoutSeconds) ? v.timeoutSeconds : ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds,
     catchUp: {},
     sources: { ...(c.sources || {}) },
     invalid: [...(c.invalid || []), ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
@@ -126,11 +132,11 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // The cascade rejects values outside the union before the per-leaf type check can see them.
   for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|order)=.*)$/.exec(invalid);
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|order)=.*)$/.exec(invalid);
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -207,6 +213,20 @@ export function summarizeFastDrain(json, num) {
   if (skip) return `skipped: ${String(skip.reason || skip.kind || '').slice(0, 200)}`;
   if (!json.considered) return 'not listed (not ready-to-merge, closed, or already queued)';
   return 'no verdict for the PR';
+}
+
+/** Classify the final fast-drain summary, including timeout and spawn failures. PURE.
+ * @returns {'enqueued'|'not-enqueued'|'skipped'|'not-listed'|'timeout'|'error'|'refused'|'other'}
+ */
+export function fastDrainOutcome({ summary = '', timedOut = false, error } = {}) {
+  if (timedOut) return 'timeout';
+  if (error || summary.startsWith('could not run')) return 'error';
+  if (summary.startsWith('passed every drain gate — enqueued')) return 'enqueued';
+  if (/^not enqueued:/i.test(summary)) return 'not-enqueued';
+  if (summary.startsWith('skipped:')) return 'skipped';
+  if (summary.startsWith('not listed')) return 'not-listed';
+  if (summary.startsWith('refused:')) return 'refused';
+  return 'other';
 }
 
 /** A definite gate skip can release room; an ambiguous enqueue failure cannot. */
@@ -414,17 +434,17 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = '
 
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
-    let stdout = ''; let stderrTail = '';
+    let stdout = ''; let stderrTail = ''; let timedOut = false;
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
     onChild(child);
     child.stdout?.on('data', (d) => { stdout += d; });
     child.stderr?.on('data', (d) => { stderrTail = (stderrTail + d).slice(-2000); });
-    const killer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
+    const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
     killer.unref?.();
-    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, stdout, stderrTail, error: String(e?.message || e) }); });
-    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, stdout, stderrTail }); });
+    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, stdout, stderrTail, timedOut, error: String(e?.message || e) }); });
+    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, stdout, stderrTail, timedOut }); });
   });
 }
 
@@ -448,7 +468,7 @@ export function createEnqueueOnEvent({
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
-  timeoutMs = FAST_DRAIN_TIMEOUT_MS, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
+  timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
 } = {}) {
   const misses = new Map();
   const backoff = new Map();
@@ -567,13 +587,15 @@ export function createEnqueueOnEvent({
       try { pr = await readPr({ repo: p.repo, num: p.num }); } catch { pr = null; }
       const signature = prHeadSignature(pr);
       const blockedRounds = s.catchUp?.blockedBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.blockedBackoffRounds;
+      const timeoutRounds = s.catchUp?.timeoutBackoffRounds ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.timeoutBackoffRounds;
       const held = backoff.get(p.num);
-      if (held && (!blockedRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
+      const backoffRounds = held?.reason === 'timeout' ? timeoutRounds : blockedRounds;
+      if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
       if (pr && (pr.state && pr.state !== 'OPEN' || !pr.labels?.some(l => l?.name === READY_LABEL))) backoff.delete(p.num);
       const w = wakeWorthy(pr);
       if (!w.wake) {
         log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`);
-        ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}` });
+        ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}`, outcome: 'skipped' });
         // A skipped wake used no queue space: try the next candidate in priority order.
         if (p.catchUp) refillCatchUp();
         continue;
@@ -583,9 +605,9 @@ export function createEnqueueOnEvent({
       const blocked = p.catchUp && taken.causes.every(c => c === 'catch-up') && backoff.get(p.num);
       if (blocked) {
         const left = Math.min(blocked.rounds, blocked.untilRound - catchUpRound + 1);
-        const what = `backed off: BLOCKED at head ${pr.headRefOid.slice(0, 9)} (${left} of ${blocked.rounds} catch-up(s) left; retried sooner if its head or checks change)`;
+        const what = `backed off: ${blocked.reason === 'timeout' ? 'fast drain TIMED OUT' : 'BLOCKED'} at head ${pr.headRefOid.slice(0, 9)} (${left} of ${blocked.rounds} catch-up(s) left; retried sooner if its head or checks change)`;
         log(`${prefix} — ${what}`);
-        ran.push({ ...metadata, num: p.num, code: null, what });
+        ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'skipped' });
         refillCatchUp();
         continue;
       }
@@ -595,7 +617,7 @@ export function createEnqueueOnEvent({
         try { depth = await readQueueDepth({ repo: localSlug }); } catch { depth = null; }
         const { capacity } = await readCapacity(s);
         if (depth?.ok && depth.queuedNums?.includes(p.num)) {
-          ran.push({ ...metadata, num: p.num, code: null, what: 'not woken: already queued' });
+          ran.push({ ...metadata, num: p.num, code: null, what: 'not woken: already queued', outcome: 'skipped' });
           refillCatchUp();
           continue;
         }
@@ -612,15 +634,19 @@ export function createEnqueueOnEvent({
       log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const finish = async () => {
         let ownChild;
-        const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
+        const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
+        const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
         const json = lastJsonLine(r.stdout);
-        let what = r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
+        let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
         if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
         if (p.catchUp && !r.error && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {
           // A listing consumes a round even if capacity/window holds this PR until a later tick.
-          backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds });
+          backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
+        }
+        if (p.catchUp && r.timedOut && timeoutRounds > 0 && signature) {
+          backoff.set(p.num, { signature, rounds: timeoutRounds, untilRound: catchUpRound + timeoutRounds, reason: 'timeout' });
         }
         let verified = null;
         let missed = what.startsWith('not enqueued:');
@@ -654,17 +680,18 @@ export function createEnqueueOnEvent({
           pending = new Map(pending);
           for (const [key, entry] of pending) if (entry.catchUp) { pending.delete(key); dropped++; }
           log(`enqueue-on-event: catch-up stopping this round — batching deferred #${p.num} (${summary.slice('not enqueued: batching-deferred:'.length).trim()}); ${dropped} PR(s) retried at the next catch-up`);
-        } else if (p.catchUp && !r.error && fastDrainUsedNoRoom(json, p.num)) {
+        } else if (p.catchUp && !r.timedOut && !r.error && fastDrainUsedNoRoom(json, p.num)) {
           catchUpRoom++;
           refillCatchUp();
         }
-        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what}`);
-        ran.push({ ...metadata, num: p.num, code: r.code, what, verified });
+        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
+        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]`);
+        ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
       const task = finish().catch(e => {
         const what = `could not finish (${String(e?.message || e).split('\n')[0]})`;
         log(`${prefix} — ${what}`);
-        ran.push({ ...metadata, num: p.num, code: null, what });
+        ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'error' });
       }).finally(() => { active.delete(p.num); activeNums.delete(p.num); });
       active.set(p.num, task);
       if (!p.catchUp || concurrency === 1) await task; // retained serial path

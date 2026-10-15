@@ -121,7 +121,7 @@
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -4562,23 +4562,13 @@ async function runCli() {
   // pre-PR-body-cutover git fallback is serialized. It is a fallback (~every current lane rides the PR-BODY
   // manifest), so serializing it costs ~nothing while keeping the fan-out correct.
   const legacyGitManifestMutex = makeAsyncMutex();
-  const readLegacyLocalManifest = (headRef) => legacyGitManifestMutex.run(() => {
-    // The same argv class, third instance. NOTE: no repo-wide lint exists for it — an earlier version of this
-    // comment cited one, which read as captured prevention and is exactly how a sibling instance survived one
-    // function away. Guarded by hand here; the lint is filed, not built. `headRef` is a
-    // `gh`-supplied refname and a dash-leading one is legal, so bare it is parsed as an option. It reaches TWO
-    // calls here: the fetch, and — via `rev` — the `git show` argument, where `git show` accepts diff options
-    // including `--output=`. Both guarded.
-    let fetchSucceeded = false;
-    try { execFileSync('git', ['fetch', '--quiet', '--end-of-options', 'origin', headRef], { stdio: ['ignore', 'ignore', 'ignore'] }); fetchSucceeded = true; } catch { /* ref may be local */ }
-    for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
-      try {
-        const m = JSON.parse(readGit(['show', '--end-of-options', `${rev}:.lane-manifest.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
-        if (m && m.item != null) return { manifest: m, fetchSucceeded };
-      } catch { /* try next rev */ }
-    }
-    return { manifest: null, fetchSucceeded };
-  });
+  // The same argv class, third instance. NOTE: no repo-wide lint exists for it — guarded by hand inside
+  // `readLegacyLocalManifestAt` (every ref argument sits behind --end-of-options). It reads the PR's head sha
+  // directly, so only an answer from that exact commit is cached under it.
+  const readLegacyLocalManifest = (headRef, headSha) => legacyGitManifestMutex.run(() => readLegacyLocalManifestAt({
+    headRef, headSha,
+    git: (args) => readGit(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }),
+  }));
   // #2417 review — returns `{ manifest, degraded }`. `degraded:true` marks a null that came from a swallowed gh
   // error (a transient failure we couldn't distinguish from truth), so `fetchPrReadsCached` skips caching it and
   // the next `--watch` pass re-fetches instead of latching the degraded read for the head-SHA lifetime. A null
@@ -4600,7 +4590,7 @@ async function runCli() {
       return await readRemoteManifestViaApi({ exec: execFileP, repo, headRef });
     }
     const legacy = await readLegacyManifestCached({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha,
-      readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef) });
+      readCache: readShaCache, writeCache: writeShaCache, readLegacy: () => readLegacyLocalManifest(headRef, headSha) });
     if (legacy) return { manifest: legacy, degraded: false };
     // Local git fallback found nothing. Post-cutover lanes carry the manifest in the PR BODY (not the tree), so a
     // null here after the PR-body gh read THREW is a spurious degrade — surface `fromPr.degraded` so it re-fetches.
