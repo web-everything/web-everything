@@ -717,6 +717,73 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
     expect(existsSync(`${cachePath}.lock`)).toBe(false);
   });
 
+  describe('overlapping writers for the SAME repo (PR #5404 red team)', () => {
+    const denied = () => { throw new Error('Resource not accessible by integration (HTTP 403)'); };
+    const entryOf = cachePath => JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`];
+
+    it('a denied reader that started first never overwrites a newer live entry with the declared policy', () => {
+      const cachePath = join(dir, 'cache.json');
+      // Reader A (cold cache, t=1000) is in flight when reader B (t=2000) saves a live policy; then A is denied.
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: () => ['test', 'security-scan'] });
+        return denied();
+      };
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 2000 });
+      const next = vi.fn(() => ['never']);
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3000, readChecks: next }))
+        .toEqual({ checks: ['test', 'security-scan'], source: 'cache' });
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('a denied reader never replaces an OLDER live entry that landed while it read either', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
+        return denied();
+      };
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: readA });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 1000 });
+    });
+
+    it('an older live read never moves a newer live entry backwards', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: () => ['test', 'security-scan'] });
+        return ['test'];
+      };
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 2000 });
+    });
+
+    it('a live read replaces a declared entry that landed while it read, even a newer one', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: denied });
+        return ['test', 'security-scan'];
+      };
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 1000 });
+    });
+
+    it('a legacy source-less entry counts as live: a concurrent denial never replaces it', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        writeFileSync(cachePath, JSON.stringify({ entries: { [`${WE}@main`]: { checks: ['test', 'security-scan'], fetchedAtMs: 1500 } } }));
+        return denied();
+      };
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      expect(entryOf(cachePath)).toEqual({ checks: ['test', 'security-scan'], fetchedAtMs: 1500 });
+    });
+
+    it('a newer write still replaces an older entry of the same kind (no regression)', () => {
+      const cachePath = join(dir, 'cache.json');
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 10, readChecks: () => ['test'] });
+      getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, ttlMs: 10, readChecks: () => ['test', 'smoke'] });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'smoke'], source: 'live', fetchedAtMs: 2000 });
+    });
+  });
+
   it('a lock that cannot be taken skips the write but never fails the read', () => {
     const cachePath = join(dir, 'cache.json');
     writeFileSync(`${cachePath}.lock`, `${process.pid}\n`); // a live holder (this process) — never stale-stolen

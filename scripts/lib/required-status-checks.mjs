@@ -275,6 +275,26 @@ export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, re
   throw withPartialChecks(rulesError, checks);
 }
 
+/** A usable cache entry holds real branch-protection data: source `live`, or a legacy source-less entry. */
+function isLiveCacheEntry(entry) {
+  return entry.source !== 'declared' && entry.source !== 'unavailable';
+}
+
+/**
+ * Does the cache's CURRENT entry for a key outrank a write about to replace it? Readers overlap, so the entry
+ * can be one another reader saved after this read began (PR #5404 red team). A live entry outranks a declared or
+ * unavailable write at any age — the same rule as a denial never clobbering a live cache. Otherwise, of two
+ * entries of the same kind, the newer `fetchedAtMs` wins, so a slower reader never moves the entry backwards.
+ * A live write always replaces a non-live entry. An invalid or missing entry never outranks anything.
+ */
+function cacheEntryOutranks(current, incoming) {
+  if (!current || !Array.isArray(current.checks) || !Number.isFinite(current.fetchedAtMs)) return false;
+  const currentLive = isLiveCacheEntry(current);
+  const incomingLive = isLiveCacheEntry(incoming);
+  if (currentLive !== incomingLive) return currentLive;
+  return current.fetchedAtMs > incoming.fetchedAtMs;
+}
+
 /**
  * One source read fine while the other failed: attach the readable source's checks to the failure as
  * `partialChecks` — never a live set, but a floor {@link getRequiredStatusChecks} adds to every degraded result.
@@ -332,6 +352,9 @@ export function getRequiredStatusChecks({
         // other. A lock timeout throws and skips the write — the read itself never fails over it.
         withFileLock(`${cachePath}.lock`, () => {
           const entries = readCacheEntries(cachePath);
+          // The same key may have changed since this read began (`cache` is a pre-read snapshot): keep the
+          // current entry if it outranks this write — see cacheEntryOutranks.
+          if (cacheEntryOutranks(entries[key], { source, fetchedAtMs: now })) return;
           entries[key] = { checks, source, fetchedAtMs: now, ...(Array.isArray(classic) ? { classic } : {}) };
           writeJsonAtomic(cachePath, { entries });
         }, { timeoutMs: 2_000 });
@@ -360,7 +383,7 @@ export function getRequiredStatusChecks({
       // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
-      const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
+      const hasLiveCache = cache && isLiveCacheEntry(cache);
       if (!hasLiveCache) {
         if (declared) return save(withPartial(declared), 'declared');
         if (!cache) return { checks: [], source: 'fallback' };
