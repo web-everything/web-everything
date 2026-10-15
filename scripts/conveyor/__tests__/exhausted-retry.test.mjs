@@ -2,11 +2,14 @@ import { describe, it, expect, vi } from 'vitest';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
   buildExhaustedRetryComment, buildExhaustedRetrySpentComment, retryOutcome, realRequiredFailures, wrongSpentStandDowns,
   EXHAUSTED_RETRY_RECOVERED_MARKER, EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER,
-  trustedRetryMarkerComments, buildResolvedSpentComment } from '../exhausted-retry.mjs';
+  trustedRetryMarkerComments, buildResolvedSpentComment, countBlockingRetryStandDowns } from '../exhausted-retry.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
 import { planReconcile, resolveCiHealBudget } from '../reconcile-core.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
-import { buildStandDownComment, standDownComments } from '../stand-down.mjs';
+import { buildStandDownComment, standDownComments, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER } from '../stand-down.mjs';
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { ADVISORY_FIX_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
 import { extractInfraSignatures, planMainRedRebases, classifyMainDefect } from '../main-red-recovery.mjs';
 import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature, defaultEditExhaustedRetryComment, defaultReadPrComments } from '../ci-red-recovery-watch.mjs';
 import * as watcher from '../ci-red-recovery-watch.mjs';
@@ -39,6 +42,22 @@ describe('PR #5331 production wiring and complete threads', () => {
     refresh: vi.fn(() => ({ ok: false, error: 'conflict' })), postComment: vi.fn() });
   const cli = (sweepOptions, overrides = {}) => ({ sweepOptions, sweepHung: vi.fn(() => ({})),
     sweepMissingRun: vi.fn(() => ({})), writeLine: vi.fn(), writeAll: vi.fn(), ...overrides });
+
+  it.each([0, 2, 3])('signature and exhausted recovery honor unresolved holds with %s heals', healCount => {
+    const stop = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', head: headSha })), id: 'IC_hold' };
+    const comments = [...heals.slice(0, healCount), stop];
+    const options = { ...io(), apply: true, readComments: () => comments,
+      readMainRuns: () => [redRun, greenRun], readMainFailureSignature: () => signature };
+    const run = () => {
+      const first = sweepCiRedRecovery(options);
+      sweepExhaustedRetry({ ...options, candidates: first.candidates, mainRuns: first.mainRuns });
+    };
+    run();
+    expect(options.refresh).not.toHaveBeenCalled();
+    comments.push(trusted(buildOperatorAnswer({ standDownId: stop.id, reason: 'Proceed with the retry', actor: 'chalbert', channel: 'Codex chat' })));
+    run();
+    expect(options.refresh).toHaveBeenCalledOnce();
+  });
 
   it.each(['green-fix', 'signature'])('CLI preserves %s ownership and the per-head cap', async via => {
     const options = io();
@@ -129,6 +148,46 @@ describe('PR #5331 production wiring and complete threads', () => {
 });
 
 describe('exhausted retry', () => {
+  it('shares stand-down trust, lapse and resolution rules without losing comment identity', () => {
+    const stop = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', head: headSha })), id: 'IC_hold' };
+    const answer = trusted(buildOperatorAnswer({ standDownId: stop.id, reason: 'Proceed', actor: 'chalbert', channel: 'Codex chat' }));
+    expect(countBlockingRetryStandDowns([stop], headSha)).toBe(1);
+    expect(countBlockingRetryStandDowns([stop, answer], headSha)).toBe(0);
+    expect(countBlockingRetryStandDowns([stop, { ...answer, author: { login: 'outsider' } }], headSha)).toBe(1);
+    expect(countBlockingRetryStandDowns([stop], mainSha)).toBe(0);
+    expect(countBlockingRetryStandDowns([{ ...stop, author: { login: 'outsider' } }], headSha)).toBe(0);
+    const watcherStop = trusted(buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict', head: headSha }));
+    expect(countBlockingRetryStandDowns([watcherStop, trusted(SUPERSEDE_STAND_DOWN_MARKER)], headSha)).toBe(0);
+    expect(countBlockingRetryStandDowns([trusted(ADVISORY_NOTE_MARKER), trusted(ADVISORY_FIX_COMMENT_MARKER), stop], headSha)).toBe(0);
+    expect(countBlockingRetryStandDowns([trusted(buildStandDownComment({ reason: 'superseded', head: mainSha }))], headSha)).toBe(1);
+    expect(countBlockingRetryStandDowns([trusted(buildStandDownComment({ reason: 'needs-judgment' }))], headSha)).toBe(1);
+    for (const [reason, head] of [['fix-loop-exhausted', headSha], ['needs-judgment', mainSha]]) {
+      const newer = { ...trusted(buildStandDownComment({ reason, head })), id: 'IC_newer' };
+      const resolveNewer = trusted(buildOperatorAnswer({ standDownId: newer.id, reason: 'Proceed', actor: 'chalbert', channel: 'Codex chat' }));
+      expect(countBlockingRetryStandDowns([stop, newer, resolveNewer], headSha)).toBe(0);
+    }
+  });
+
+  it.each(['needs-judgment', 'superseded'])('preserves an active %s hold across retry modes and exhaustion kinds', reason => {
+    for (const aheadBy of [0, 2]) {
+      for (const exhaustion of [heals, [trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', head: headSha }))]]) {
+        const comments = [...exhaustion, trusted(buildStandDownComment({ reason, head: headSha }))];
+        const refresh = vi.fn(() => ({ ok: true, newCommit: 'c'.repeat(40) }));
+        const trigger = vi.fn(() => ({ ok: true }));
+        const postComment = vi.fn();
+        const result = sweepExhaustedRetry({ apply: true, settings: settings(), ciHealCap: 3,
+          candidates: [{ prNumber: 5195, headSha, aheadBy, comments, mainFailureSignature: null }], mainRuns: [],
+          now: Date.parse(at) + 24 * 3600000, readMainTip: () => ({ sha: mainSha, committedAt: later }),
+          checkClaim: () => null, refresh, trigger, postComment, reconcileAcceptance: () => ({}) });
+        expect(refresh).not.toHaveBeenCalled();
+        expect(trigger).not.toHaveBeenCalled();
+        expect(postComment).not.toHaveBeenCalled();
+        expect(result.dispatch).toEqual([]);
+        expect(result.refusals[0]).toMatchObject({ kind: 'stand-down' });
+      }
+    }
+  });
+
   it('resolves standards and per-field cascade sources, rejecting invalid values', () => {
     expect(settings()).toEqual({ enabled: true, onMainMove: true, maxRetries: 1, afterHours: 12, lookbackHours: 72,
       sources: Object.fromEntries(['enabled', 'onMainMove', 'maxRetries', 'afterHours', 'lookbackHours'].map(k => [k, 'standard'])), invalid: [] });
@@ -424,7 +483,7 @@ describe('retried CI verdicts', () => {
       reconcileAcceptance: unexpected, readIsCrossRepository: unexpected };
     return { options, comments, postComment, editComment };
   };
-  it('clears the exhausted state once for green CI with review holds', () => {
+  it('records recovery once for green CI with review holds', () => {
     const f = fixture();
     sweepExhaustedRetry(f.options);
     expect(f.postComment).toHaveBeenCalledOnce();
@@ -507,13 +566,31 @@ describe('retried CI verdicts', () => {
       '-f', 'id=IC_spent', '-f', 'body=resolved']);
     expect(() => defaultEditExhaustedRetryComment(comment.id, { body: 'resolved', exec: () => '{"errors":[{"message":"denied"}]}' })).toThrow('could not resolve');
   });
-  it('starts a fresh exhaustion budget after recovery', () => {
+  it('keeps exhaustion and retry budgets spent after recovery, matching the reconciler', () => {
     const recovered = { ...trusted(EXHAUSTED_RETRY_RECOVERED_MARKER), createdAt: '2026-10-14T04:00:00Z' };
     const stood = trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', head: sha }));
     const comments = [...heals, stood, retry, recovered];
-    expect(exhaustionFacts({ comments, ciHealCap: 3 }).exhausted).toBe(false);
-    expect(countExhaustedRetries(comments)).toBe(0);
-    expect(countExhaustedRetries([...comments, { ...retry, createdAt: '2026-10-14T05:00:00Z' }])).toBe(1);
+    expect(exhaustionFacts({ comments, ciHealCap: 3 }).exhausted).toBe(true);
+    expect(countExhaustedRetries(comments)).toBe(1);
+    expect(countExhaustedRetries([...comments, { ...retry, createdAt: '2026-10-14T05:00:00Z' }])).toBe(2);
+  });
+  it('hands off a new required failure on the recovered head instead of stranding it', () => {
+    const pr = green();
+    const f = fixture(pr);
+    sweepExhaustedRetry(f.options);
+    const failure = pr.statusCheckRollup.find(row => row.name === 'daemon-soak');
+    failure.conclusion = 'FAILURE';
+    failure.completedAt = '2026-10-14T05:00:00Z';
+    const ciHealBudget = resolveCiHealBudget({ repo: { resetOnFixHead: true } });
+    const plan = planReconcile({ prs: [{ ...pr, state: 'OPEN', mergeStateStatus: 'CLEAN',
+      labels: [{ name: 'ci:failed' }], comments: f.comments }], agents: [], ciHealBudget,
+      now: Date.parse('2026-10-14T06:00:00Z') });
+    expect(plan.notes.some(n => n.kind === 'ci-heal-exhausted')).toBe(true);
+    expect(exhaustionFacts({ comments: f.comments, ciHealBudget, headSha: sha }).exhausted).toBe(true);
+    expect(sweepExhaustedRetry(f.options).refusals[0]?.kind).toBe('needs-you');
+    expect(f.postComment).toHaveBeenCalledTimes(2);
+    sweepExhaustedRetry(f.options);
+    expect(f.postComment).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -555,10 +632,10 @@ describe('retry marker trust across recovery', () => {
     expect(wrongSpentStandDowns({ comments: [resolved], pr, requiredChecks })).toEqual([]);
   });
 
-  it('does not reuse an old recovered retry to judge a new exhaustion episode', () => {
+  it('keeps waiting for required results after recovery when a new run is incomplete', () => {
     const retry = trusted(buildExhaustedRetryComment({ headSha }));
     const recovered = { ...trusted(EXHAUSTED_RETRY_RECOVERED_MARKER), createdAt: later };
-    expect(retryOutcome({ comments: [retry, recovered], pr: { headRefOid: headSha }, requiredChecks: ['test'] })).toBeNull();
+    expect(retryOutcome({ comments: [retry, recovered], pr: { headRefOid: headSha }, requiredChecks: ['test'] })).toEqual({ state: 'pending' });
   });
 
   it('treats a failed mechanical attempt as terminal even though it launched no CI', () => {

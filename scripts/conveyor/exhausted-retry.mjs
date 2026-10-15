@@ -6,7 +6,9 @@ import { readFileSync } from 'node:fs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore } from './ci-heal-mark.mjs';
 import { ciHealBudgetResetAt, resolveCiHealBudget } from './reconcile-core.mjs';
-import { standDownComments, standDownReason, buildStandDownComment, STAND_DOWN_REASONS, STAND_DOWN_MARKER } from './stand-down.mjs';
+import { standDownComments, standDownReason, isStandDownSuperseded, buildStandDownComment, STAND_DOWN_REASONS, STAND_DOWN_MARKER } from './stand-down.mjs';
+import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
+import { isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
 
 export const EXHAUSTED_RETRY_MARKER = '<!-- we:exhausted-retry -->';
 export const EXHAUSTED_RETRY_SPENT_MARKER = '<!-- we:exhausted-retry-spent -->';
@@ -19,10 +21,18 @@ export const hasExhaustedRetryMarker = (comment, marker) => trustedRetryMarkerCo
 const latestMarker = (comments, marker) => trustedRetryMarkerComments(comments, marker)
   .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
 
-function sinceRecovery(comments) {
+function isFixLoopExhaustion(comment) {
+  const reason = standDownReason(comment?.body);
+  return reason === 'fix-loop-exhausted' || reason?.startsWith(STAND_DOWN_REASONS['fix-loop-exhausted']);
+}
+
+/** Only exhaustion grants an exception to the shared active terminal-hold policy. */
+export function countBlockingRetryStandDowns(comments, headSha) {
+  // Resolve against the intact thread: an answer to an exhaustion or lapsed hold can clear older holds too.
   const list = Array.isArray(comments) ? comments : [];
-  const recovered = latestMarker(list, EXHAUSTED_RETRY_RECOVERED_MARKER);
-  return recovered ? list.filter(c => Date.parse(c.createdAt) > Date.parse(recovered.createdAt)) : list;
+  return list.filter((c, i) => standDownComments([c], { headRefOid: headSha }).length && !isFixLoopExhaustion(c)
+    && !isStandDownSuperseded(list, i) && !isAdvisoryMechanismStandDownSuperseded(list, i)
+    && !isOperatorAnswerStandDownSuperseded(list, i)).length;
 }
 
 /** Required failures on this head, excluding proven review holds. */
@@ -51,7 +61,7 @@ function requiredCompleted(pr, requiredChecks, after = null) {
 }
 
 export function retryOutcome({ comments = [], pr, requiredChecks } = {}) {
-  const retry = latestMarker(sinceRecovery(comments), EXHAUSTED_RETRY_MARKER);
+  const retry = latestMarker(comments, EXHAUSTED_RETRY_MARKER);
   if (!retry) return null;
   // A failed mechanical attempt launched no CI run to wait for.
   if (retry.body.split(/\r?\n/).includes('retry-result: failed')
@@ -68,7 +78,7 @@ export function wrongSpentStandDowns({ comments = [], pr, requiredChecks } = {})
 }
 
 export function buildExhaustedRetryRecoveredComment({ kind, headSha }) {
-  return `${EXHAUSTED_RETRY_RECOVERED_MARKER}\nthe automatic retry after ${kind} went green on ${headSha?.slice(0, 7)}; the exhausted state is cleared\nhead: ${headSha}`;
+  return `${EXHAUSTED_RETRY_RECOVERED_MARKER}\nthe automatic retry after ${kind} went green on ${headSha?.slice(0, 7)}; the exhaustion and automatic retry budgets remain spent\nhead: ${headSha}`;
 }
 
 export function buildResolvedSpentComment(comment, headSha) {
@@ -101,7 +111,8 @@ export function resolveExhaustedRetry({ env = process.env, platform, file = new 
 
 export function exhaustionFacts({ comments = [], ciHealBudget = resolveCiHealBudget({ env: process.env }),
   ciHealCap = ciHealBudget.cap, headSha = null, env = process.env, lapseOnNewHead } = {}) {
-  const list = sinceRecovery(comments);
+  // Recovery records green CI; only the reconciler's fixer-head boundary resets the heal budget.
+  const list = Array.isArray(comments) ? comments : [];
   const reset = ciHealBudget.resetOnFixHead ? ciHealBudgetResetAt(list) : null;
   // Use the reconciler's durable fixer-head boundary, retaining refund-window comments.
   const budgetComments = reset ? list.filter(c => !countCiHealComments([c]) || Date.parse(c.createdAt) > Date.parse(reset.at)) : list;
@@ -113,9 +124,8 @@ export function exhaustionFacts({ comments = [], ciHealBudget = resolveCiHealBud
   }
   for (const c of standDownComments(list, { headRefOid: headSha, lapseOnNewHead })) {
     if (reset && Date.parse(c.createdAt) <= Date.parse(reset.at)) continue;
-    const reason = standDownReason(c.body);
     // The shared reader returns prose for built comments and a key for legacy comments.
-    if (reason === 'fix-loop-exhausted' || reason?.startsWith(STAND_DOWN_REASONS['fix-loop-exhausted'])) {
+    if (isFixLoopExhaustion(c)) {
       exhausted.push({ exhausted: true, kind: 'fix-loop-exhausted', at: c.createdAt });
     }
   }
@@ -132,7 +142,7 @@ export function exhaustionFacts({ comments = [], ciHealBudget = resolveCiHealBud
 }
 
 export function countExhaustedRetries(comments) {
-  return trustedRetryMarkerComments(sinceRecovery(comments), EXHAUSTED_RETRY_MARKER).length;
+  return trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_MARKER).length;
 }
 
 /** Both retry readers authenticate the author and the marker's header position. */

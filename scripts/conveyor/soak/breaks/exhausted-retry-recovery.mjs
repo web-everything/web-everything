@@ -4,8 +4,10 @@ import { join } from 'node:path';
 import { sweepCiRedRecovery, sweepExhaustedRetry } from '../../ci-red-recovery-watch.mjs';
 import * as watcher from '../../ci-red-recovery-watch.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../../ci-heal-mark.mjs';
-import { resolveExhaustedRetry, countExhaustedRetries, buildExhaustedRetryComment } from '../../exhausted-retry.mjs';
+import { resolveExhaustedRetry, countExhaustedRetries, buildExhaustedRetryComment, exhaustionFacts } from '../../exhausted-retry.mjs';
+import { planReconcile } from '../../reconcile-core.mjs';
 import { standDownComments, buildStandDownComment } from '../../stand-down.mjs';
+import { buildOperatorAnswer } from '../../stand-down-answer-core.mjs';
 
 export default {
   id: 'exhausted-retry-recovery',
@@ -24,6 +26,67 @@ export default {
     const settings = resolveExhaustedRetry({ env: {}, platform: {}, file: {} });
     const redRun = { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-14T02:00:00Z', checkConclusions: { 'daemon-soak': 'failure' } };
     const greenRun = { ...redRun, conclusion: 'success', updatedAt: '2026-10-14T03:00:00Z', checkConclusions: { 'daemon-soak': 'success' } };
+    // Both newly introduced recovery routes must release a hold only after an operator answer.
+    for (const healCount of [0, 2, 3]) {
+      const stop = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', head })), id: 'IC_hold' };
+      const thread = [...Array.from({ length: healCount }, () => trusted(CI_HEAL_COMMENT_MARKER)), stop];
+      let attempts = 0;
+      const options = { apply: true, settings, exhaustedRetrySettings: settings, ciHealCap: 3,
+        readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: head,
+          statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+        readComments: () => thread, readAheadBy: () => 2, readAttributedRequiredChecks: () => ['daemon-soak'],
+        readMainRuns: () => [redRun, greenRun], readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts: () => null,
+        readMainGreenFixFacts: () => ({}), readPriority: () => null,
+        readMainFailureSignature: () => ({ matched: true, signature: 'test-timeout' }),
+        readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }), checkClaim: () => null,
+        refresh: () => { attempts++; return { ok: false, error: 'conflict' }; },
+        postComment: (n, { body }) => { if (body) thread.push(trusted(body)); } };
+      for (const answered of [false, true]) {
+        if (answered) thread.push(trusted(buildOperatorAnswer({ standDownId: stop.id, reason: 'Proceed', actor: 'chalbert', channel: 'Codex chat' })));
+        const first = sweepCiRedRecovery(options);
+        sweepExhaustedRetry({ ...options, candidates: first.candidates, mainRuns: first.mainRuns });
+        if (attempts !== Number(answered)) violations.push(`${healCount} heals: ${answered ? 'answered hold blocked retry' : 'signature retry bypassed hold'}`);
+      }
+    }
+    // Round 3: unrelated terminal holds survive both mechanical retry modes.
+    for (const reason of ['needs-judgment', 'superseded']) {
+      for (const aheadBy of [0, 2]) {
+        const comments = [...Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER)),
+          trusted(buildStandDownComment({ reason, head }))];
+        const mutate = () => { violations.push(`${reason}: retry bypassed active hold (ahead=${aheadBy})`); return { ok: false }; };
+        sweepExhaustedRetry({ apply: true, settings, ciHealCap: 3, mainRuns: [],
+          readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: head,
+            statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+          readComments: () => comments, readAheadBy: () => aheadBy, readAttributedRequiredChecks: () => ['daemon-soak'],
+          readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }), readMainFailureSignature: () => null,
+          now: Date.parse(at) + 24 * 3600000, checkClaim: () => null, refresh: mutate, trigger: mutate,
+          postComment: () => violations.push(`${reason}: retry wrote through active hold`) });
+      }
+    }
+    // A successful retry is an observation, not a budget reset. A later red run needs a handoff.
+    const recoveredThread = [...Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER)),
+      trusted(buildExhaustedRetryComment({ headSha: head }))];
+    const recoveredPr = { number: 5195, state: 'OPEN', mergeStateStatus: 'CLEAN', labels: ['ci:failed'],
+      headRefName: 'lane/5195', headRefOid: head,
+      statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: greenRun.updatedAt }] };
+    const recoveredOptions = { apply: true, settings, ciHealCap: 3, mainRuns: [],
+      readOpenPrs: () => [recoveredPr], readComments: () => recoveredThread,
+      readAheadBy: () => 2, readAttributedRequiredChecks: () => ['daemon-soak'],
+      readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }), readMainFailureSignature: () => null,
+      refresh: () => { violations.push('recovery granted a second automatic retry'); return { ok: false }; },
+      checkClaim: () => null,
+      postComment: (n, { body }) => recoveredThread.push({ ...trusted(body), createdAt: '2026-10-14T04:00:00Z' }) };
+    sweepExhaustedRetry(recoveredOptions);
+    recoveredPr.statusCheckRollup[0] = { ...recoveredPr.statusCheckRollup[0], conclusion: 'FAILURE', completedAt: '2026-10-14T05:00:00Z' };
+    const reconcile = planReconcile({ prs: [{ ...recoveredPr, comments: recoveredThread }], agents: [],
+      now: Date.parse('2026-10-14T06:00:00Z') });
+    if (!reconcile.notes.some(n => n.kind === 'ci-heal-exhausted')
+      || !exhaustionFacts({ comments: recoveredThread, ciHealCap: 3, headSha: head }).exhausted) {
+      violations.push('recovery split the reconciler and watcher exhaustion budgets');
+    }
+    if (sweepExhaustedRetry(recoveredOptions).refusals[0]?.kind !== 'needs-you') violations.push('later required failure was stranded after recovery');
+    sweepExhaustedRetry(recoveredOptions);
+    if (standDownComments(recoveredThread).length !== 1) violations.push('later required failure did not get exactly one spent handoff');
     for (const inherited of [true, false]) {
       const comments = Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER));
       let attempts = 0;

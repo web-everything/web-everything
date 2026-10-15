@@ -60,7 +60,7 @@ import { resolve } from 'node:path';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { resolveCiHealBudget } from './reconcile-core.mjs';
-import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
+import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry, countBlockingRetryStandDowns,
   buildExhaustedRetryComment, buildExhaustedRetrySpentComment, trustedRetryMarkerComments, EXHAUSTED_RETRY_SPENT_MARKER,
   realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
@@ -318,10 +318,15 @@ export function sweepCiRedRecovery({
   const prio = readPriority();
   const isWe = repo == null || repo === 'we' || repo === CONSTELLATION_REPOS.we.slug;
   const mainFixPrs = prio && prio.repo === 'we' && isWe ? (Array.isArray(prio.prs) ? prio.prs : [prio.pr]) : [];
+  const signatureHolds = new Set();
   for (const c of candidates) {
     c.mainRecoveryOwned = existingMainRecoveryOwns(c, { mainRedWindows, mainLatestCheckRuns });
+    if (!c.mainRecoveryOwned && c.mainFailureSignature?.matched && countBlockingRetryStandDowns(c.comments, c.headSha)) {
+      signatureHolds.add(c);
+    }
   }
-  const plan = planMainRedRebases({ candidates: candidates.filter(c => !c.exhaustion?.exhausted || c.mainRecoveryOwned), mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
+  const plan = planMainRedRebases({ candidates: candidates.filter(c => !signatureHolds.has(c) && (!c.exhaustion?.exhausted || c.mainRecoveryOwned)), mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
+  plan.refusals.push(...[...signatureHolds].map(c => ({ ...c, kind: 'stand-down', why: 'an active stand-down requires operator resolution before signature recovery' })));
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
   // `rebaseDropManifest` needs a REAL LOCAL checkout of the repo it rebases (this file's own header). Left at
@@ -511,6 +516,10 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
       if (apply && decision.action === 'needs-you' && !spent) {
         postComment(c.prNumber, { repo, body: buildExhaustedRetrySpentComment({ kind: facts.kind, check: c.failingCheckName, headSha: c.headSha }) });
       }
+      continue;
+    }
+    if (countBlockingRetryStandDowns(comments, c.headSha)) {
+      refusals.push({ ...c, action: 'wait', kind: 'stand-down', why: 'an active stand-down other than fix-loop exhaustion requires operator resolution' });
       continue;
     }
     dispatch.push(d);
