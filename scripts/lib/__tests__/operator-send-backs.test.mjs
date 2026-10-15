@@ -163,7 +163,7 @@ describe('operator send-backs, PR #5243 replay', () => {
     expect(renderOperatorSendBackReviewBlock([])).toBe('');
   });
   it('carries resolution backwards from a later send-back naming 16:20 ET', () => {
-    const later = comment('1006', 'chalbert', '23:41', `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nOperator send-back ~19:45 ET, at head 245c40542. The 16:20 ET send-back was never addressed.`);
+    const later = comment('1006', 'chalbert', '23:41', `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nOperator send-back ~19:45 ET, at head e5ed9cb74. The 16:20 ET send-back was never addressed.`);
     const pr = fixture({ headRefOid: 'c'.repeat(40), comments: [original, mechanical, ended, advisory, later] });
     expect(openOperatorSendBacks(pr).map(x => x.id)).toEqual(['1001', '1006']);
     pr.comments.push(comment('1007', 'web-everything', '23:59', '## Fix evidence\nHead: `ccccccccccc`\n<!-- addresses-operator-send-back: 1006 -->'));
@@ -232,5 +232,43 @@ describe('send-back wiring', () => {
     expect(review.mandate + review.input).toContain('must NOT accept');
     expect(buildRedTeamTask({ pr: 5243, repo: 'we', openOperatorSendBacks: open })).toContain(MUST_FIX);
     expect(redTeamReadFingerprint(read)).not.toBe(redTeamReadFingerprint({ ...read, openOperatorSendBacks: [] }));
+  });
+});
+
+describe('operator re-rulings and legacy fixer evidence', () => {
+  const later = (head = '6b8a973a7') => comment('B', 'chalbert', '22:00', original.body
+    .replace('at head e5ed9cb74', `ON HEAD ${head}`).replace('~16:20 ET', '~17:45 ET'));
+  it('resolves the #5169 thread: re-ruling supersedes A and prose evidence addresses B', () => {
+    const a = { ...original, body: original.body.replace('at head e5ed9cb74', 'on head ce75f7d66') };
+    expect(operatorSendBacks([a])[0].head).toBe('ce75f7d66');
+    const fix = comment('fix', 'web-everything', '23:00', '🔧 fix evidence — operator send-back (escape, not strip)\n\n**Change (430bf3f2c, repaired)**');
+    expect(openOperatorSendBacks(fixture({ comments: [a, ended, later(), fix, mechanical] }))).toEqual([]);
+  });
+  it.each(['🔧 fix evidence — repair', '## 🔧 fix evidence — PR #5169', '**Fix-agent evidence — PR #5169**', '### Fix evidence'])('accepts fixer heading %s', heading => {
+    expect(openOperatorSendBacks(fixture({ comments: [original,
+      comment('fix', 'web-everything', '23:00', `${heading}\nOperator send back repaired.`)] }))).toEqual([]);
+  });
+  it('bounds prose coverage to before the next send-back', () => {
+    const b = later('e5ed9cb74');
+    const fix = evidence(HEAD, 'operator sendback repaired');
+    expect(openOperatorSendBacks(fixture({ comments: [original, b, fix] })).map(x => x.id)).toEqual(['1001']);
+  });
+  it('authenticates accept ceremonies', () => {
+    const accept = comment('accept', 'chalbert', '23:00', '✅ review — accepted\n\nRecorded by chalbert via claude-code-chat.');
+    for (const impostor of [{ ...accept, author: { login: 'stranger' } }, { ...accept, author: { login: 'web-everything' } },
+      { ...accept, body: accept.body.replace('by chalbert', 'by stranger') }]) {
+      expect(openOperatorSendBacks(fixture({ comments: [original, impostor] }))).toHaveLength(1);
+    }
+    expect(openOperatorSendBacks(fixture({ comments: [original, accept] }))).toEqual([]);
+  });
+  it('keeps a same-head re-send-back open without a fix round', () => {
+    expect(openOperatorSendBacks(fixture({ comments: [original, later('e5ed9cb74')] }))).toHaveLength(2);
+  });
+  it.each(['🔓 conveyor fix-end', '🔧 conveyor fix — re-armed for re-review'])('supersedes unknown heads only across trusted %s', body => {
+    const a = { ...original, body: original.body.replace('at head e5ed9cb74', 'unknown head') };
+    const b = later();
+    expect(openOperatorSendBacks(fixture({ comments: [a, b] }))).toHaveLength(2);
+    expect(openOperatorSendBacks(fixture({ comments: [a, comment('fix', 'stranger', '21:00', body), b] }))).toHaveLength(2);
+    expect(openOperatorSendBacks(fixture({ comments: [a, comment('fix', 'web-everything', '21:00', body), b] })).map(x => x.id)).toEqual(['B']);
   });
 });

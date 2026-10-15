@@ -36,7 +36,7 @@ const requireCjs = createRequire(import.meta.url);
 const COMMENT_MARKER_PARSERS_REVIEWED = new Set([
   'scripts/conveyor/fix-takeover.mjs#takeoverLedger',
   'scripts/conveyor/reconcile-note-comment.mjs#hasPostedNoteComment',
-  'scripts/conveyor/round-extension-mark.mjs#countGrantedRoundExtensions',
+  'scripts/conveyor/round-extension-mark.mjs#roundExtensionGrants',
   'scripts/conveyor/stand-down-answer-core.mjs#parseOperatorAnswer',
   'scripts/conveyor/stand-down.mjs#supersedeHoldsOn',
   'scripts/conveyor/stand-down.mjs#concurrentAuthorPauses',

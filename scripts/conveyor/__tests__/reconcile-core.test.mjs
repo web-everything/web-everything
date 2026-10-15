@@ -3368,7 +3368,9 @@ describe('operator send-back renews a bounded durable fix budget', () => {
     ...over,
   });
   const plan = (comments, extra = {}) => planReconcile({
-    prs: [pr1563({ comments, labels: lbl('review:changes', 'review:human') })], now: NOW, ...extra,
+    prs: [pr1563({ comments, labels: lbl('review:changes', 'review:human') })], now: NOW,
+    // Isolate the existing durable budget from the separate open-send-back allowance.
+    operatorRulingExtraRounds: { value: 0, source: 'repo' }, ...extra,
   });
   const burned = () => Array.from({ length: 5 }, round);
 

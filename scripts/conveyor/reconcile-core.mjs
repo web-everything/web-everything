@@ -100,7 +100,7 @@
  * transcript's mtime) is INJECTED on the input records by `we:scripts/conveyor/reconcile-pass.mjs`, so every
  * branch below is reachable in a test with no network and no credential.
  */
-import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
+import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
@@ -109,7 +109,7 @@ import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-s
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -1671,6 +1671,45 @@ export function resolveOperatorRulingExtraRounds({ env = {}, platform = null, re
   return { value: OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT, source: 'standard' };
 }
 
+/** `fix.roundExtensionAnchor`: grant-time counters by default; off retains additive caps. */
+export function resolveRoundExtensionAnchor({ env = {}, platform = null, repo = null } = {}) {
+  const envRaw = env?.WE_FIX_ROUND_EXTENSION_ANCHOR;
+  for (const [source, raw] of [
+    ['env', typeof envRaw === 'string' && !envRaw.trim() ? undefined : envRaw],
+    ['repo', repo?.fix?.roundExtensionAnchor], ['platform', platform?.fix?.roundExtensionAnchor],
+  ]) {
+    if (raw === undefined || raw === null) continue;
+    return ['grant', 'off'].includes(raw) ? { value: raw, source } : { value: 'off', source: `${source}-invalid` };
+  }
+  return { value: 'grant', source: 'standard' };
+}
+
+/** Shared fix/review counter. A sliced thread deliberately omits the unsliceable durableCounts fallback. */
+function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
+  realFixRounds = countRealFixRounds(pr), operatorBudget = operatorFixBudget(pr?.comments, 0) } = {}) {
+  return Math.max(
+    realFixRounds.ok ? realFixRounds.real : Number(durableCount) || 0,
+    operatorBudget?.attempts ?? 0,
+    realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
+    countAdvisoryComments(pr?.comments),
+  ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
+}
+
+/** A latest open send-back buys a bounded repair opportunity, even after the ordinary cap. */
+export function operatorSendBackRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT,
+  defaultBranch = 'main' } = {}) {
+  if (!Number.isInteger(allowance) || allowance <= 0 || threadMayBeTruncated(pr)) return null;
+  // Match the takeover gate: a reviewed head with no open defect is waiting on its own gate,
+  // not another repair. Leave cap handling to supply the owed advisory or operator handoff.
+  const defects = openDefects(pr?.comments, pr?.headRefOid ?? null);
+  if (defects?.count === 0 && gateHoldReason(pr, { defaultBranch })) return null;
+  const latest = openOperatorSendBacks(pr).at(-1);
+  if (!latest) return null;
+  const used = pr.comments.slice(latest.index + 1).filter(c => isTrustedMarkerAuthor(c)
+    && String(c?.body ?? '').trimStart().startsWith('🔓 conveyor fix-end')).length;
+  return used < allowance ? { sendBackId: latest.id, used, allowance } : null;
+}
+
 /**
  * PURE: the directed repair round an operator ruling grants on the blocked-findings round cap (live: PR #4631
  * @f0f4943fb, 2026-10-10 — the operator ruled every open finding `block` WITH A DIRECTION on the current head, and
@@ -1951,6 +1990,7 @@ export function planReconcile({
   // `fix.operatorRulingExtraRounds` ({value, source}; see {@link resolveOperatorRulingExtraRounds}). The IO shell passes
   // the resolved cascade; the default is the standard layer alone.
   operatorRulingExtraRounds = resolveOperatorRulingExtraRounds(),
+  roundExtensionAnchor = resolveRoundExtensionAnchor(),
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -2026,11 +2066,18 @@ export function planReconcile({
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
-    const roundExtensions = countGrantedRoundExtensions(pr?.comments, { repo, pr: prNumber });
-    // Operator grants extend EVERY auto-repair cap kind (review/fix, advisory-fix, conflict-fix), never just one.
-    const advisoryFixCapHere = advisoryFixCap + roundExtensions;
-    const conflictFixCapHere = conflictFixCap + roundExtensions;
-    const baseRoundCap = roundCap + roundExtensions;
+    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber });
+    const roundExtensions = grants.reduce((sum, g) => sum + g.by, 0);
+    // Each cap uses its own production counter on the thread prefix, never today's durable count map.
+    const anchoredCap = (cap, count) => Math.max(cap + roundExtensions,
+      ...grants.map(g => roundExtensionAnchor.value === 'grant'
+        ? count({ ...pr, comments: pr.comments.slice(0, g.index) }) + g.by : 0));
+    const advisoryFixCapHere = anchoredCap(advisoryFixCap, p => countCompletedAdvisoryEpisodes(p.comments));
+    const conflictFixCapHere = anchoredCap(conflictFixCap, p => countStaleConflictFixRounds(p.comments, {
+      currentRef: pr.baseRefName && pr.baseRefName !== defaultBranch ? pr.baseRefName : defaultBranch,
+      currentSha: pr.baseRefName && pr.baseRefName !== defaultBranch ? pr.baseRefSha : mainSha,
+    }).stale);
+    const baseRoundCap = anchoredCap(roundCap, p => sharedRoundAttempts(p, { mechanicalRoundsCountTowardCap }));
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
     const realFixRounds = countRealFixRounds(pr);
@@ -2038,7 +2085,10 @@ export function planReconcile({
     const base = {
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
-      ...(roundExtensions > 0 ? { roundExtensions } : {}),
+      ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {
+        setting: roundExtensionAnchor.value, source: roundExtensionAnchor.source,
+        caps: { fix: effectiveRoundCap, conflictFix: conflictFixCapHere, advisoryFix: advisoryFixCapHere },
+      } } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
       ...(operatorAnswer ? { operatorAnswer } : {}),
       // The red-main fix PR (published priority record): every fix / ci-heal row of it routes to Claude
@@ -2291,12 +2341,12 @@ export function planReconcile({
     };
     const refuseCapExhausted = capExhaustedVia(refuse);
     // The shared round count — see REFUSAL 3 below for why it is a `Math.max` over three durable sources.
-    const roundAttempts = () => Math.max(
-      realFixRounds.ok ? realFixRounds.real : Number(counts[prNumber]) || 0,
-      operatorBudget?.attempts ?? 0,
-      realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
-      countAdvisoryComments(pr?.comments),
-    ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
+    const roundAttempts = () => sharedRoundAttempts(pr, { durableCount: counts[prNumber],
+      realFixRounds, operatorBudget, mechanicalRoundsCountTowardCap });
+    const sendBackRound = operatorSendBackRound(pr, { allowance: operatorRulingExtraRounds.value, defaultBranch });
+    const sendBackRoundFields = sendBackRound ? { operatorSendBackRound: { ...sendBackRound,
+      setting: `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}`, source: operatorRulingExtraRounds.source } } : {};
+    const sendBackRoundWhy = `open operator send-back grants a repair round via fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;
 
     // ── REFUSAL 1 — `stood-down` is TERMINAL. No decay, no clock: `now` is not read on this path, so the same
     // PR returns the same refusal a week later unless an operator answer or supersede resolves it.
@@ -2535,13 +2585,14 @@ export function planReconcile({
     const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid));
     if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
       const attempts = roundAttempts();
-      if (attempts >= effectiveRoundCap) {
+      if (attempts >= effectiveRoundCap && !sendBackRound) {
         refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
           why: 'operator send-back remains unaddressed; automatic fix rounds exhausted' }, { allowTakeover: false });
       } else {
         dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed',
           findings: operatorRuling.items.length, rulingNotAddressed: operatorRuling,
-          why: 'operator send-back not yet addressed after a fixer had its chance' });
+          ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),
+          why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
       }
       continue;
     }
@@ -3554,7 +3605,7 @@ export function planReconcile({
     // `attempts` itself is `roundAttempts()` — the SAME derivation the review population's cap reads (via
     // {@link dispatchReviewRow}), so the two can never disagree about how many attempts a PR has spent. Only the
     // `fix` population reaches this point: every `review`-owed phase returned through that helper above.
-    if (attempts >= effectiveRoundCap) {
+    if (attempts >= effectiveRoundCap && !sendBackRound) {
       refuseCapExhausted({
         ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
         why: `the PR's own durable attempt count is ${attempts} against a cap of ${effectiveRoundCap} — auto-repair is exhausted here and a person must take it`,
@@ -3565,10 +3616,12 @@ export function planReconcile({
     // A rejected card batch (`lane/card-batch-*`, #4703) is not repaired in place: the one rejected card is extracted
     // into its own PR (`we:scripts/operations/card-batch-extract.mjs`) and the rest are re-sealed. Only this plain
     // bounce routes there; conflict/advisory/ruling fixes above keep their own `fix` kind.
-    const isCardBatch = cardBatchExtract && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
+    const isCardBatch = cardBatchExtract && !(attempts >= effectiveRoundCap && sendBackRound)
+      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
     dispatch.push({
       ...base, ...withPhase, kind: isCardBatch ? 'card-batch-extract' : 'fix', findings, attempts,
-      why: `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent${isCardBatch ? ' — card batch: extract the rejected card instead of an in-place fix' : ''}`,
+      ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),
+      why: attempts >= effectiveRoundCap && sendBackRound ? sendBackRoundWhy : `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent${isCardBatch ? ' — card batch: extract the rejected card instead of an in-place fix' : ''}`,
     });
   }
 

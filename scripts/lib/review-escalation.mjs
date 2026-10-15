@@ -1880,6 +1880,54 @@ export function parseOperatorClearance(comments) {
 }
 
 /**
+ * The prose clearance of ONE comment body, for a reader that needs more than the actor: the precedent capture
+ * (`we:scripts/lib/review-precedents.mjs#captureFromComment`) reads the quoted `--reason` that follows it. Pure.
+ * It uses `CLEARED_HUMAN_PROSE_RE` itself, so it matches exactly what `parseOperatorClearance` accepts: `null`
+ * unless the body OPENS with the `clear-human` heading and attribution `buildVerdictComment` renders.
+ * `end` is the offset just past the attribution match. `reviewedSha` is the body's last `reviewed-sha` MARKER, or
+ * '' — prose cannot forge one, because the render boundary escapes `<!--` in every caller field.
+ * @returns {{actor:string, end:number, reviewedSha:string}|null}
+ */
+export function parseClearedHumanProse(body) {
+  const text = typeof body === 'string' ? body : '';
+  const m = new RegExp(CLEARED_HUMAN_PROSE_RE.source).exec(text);
+  const actor = m ? m[1].trim() : '';
+  if (!actor) return null;
+  return { actor, end: m.index + m[0].length, reviewedSha: parseReviewedShaMarker(text) };
+}
+
+/**
+ * The `reviewed-sha` MARKER of ONE comment body, lower-cased, last match wins (as `parseReviewedSha`), or ''. Pure.
+ * Only the marker shape counts: `buildVerdictComment` escapes `<!--` in every caller field, so a quoted or prose
+ * `reviewed-sha: …` in a verdict write-up can never be read as the reviewed head.
+ */
+export function parseReviewedShaMarker(body) {
+  let sha = '';
+  for (const m of String(typeof body === 'string' ? body : '').matchAll(new RegExp(REVIEWED_SHA_RE.source, 'g'))) sha = m[1].toLowerCase();
+  return sha;
+}
+
+// The `--to=changes` sibling of `CLEARED_HUMAN_PROSE_RE`: the heading and attribution `buildVerdictComment` renders
+// (`Recorded by <actor>[ via <channel>].`), anchored at byte 0 so a caller field, always appended later, cannot
+// satisfy it. The actor may contain spaces and the channel is optional, exactly as the producer allows. The
+// attribution is matched as one line and split on ` via ` in code, so the match stays linear on hostile input.
+const CHANGES_VERDICT_PROSE_RE = /^🔁 review — changes requested\n\nRecorded by ([^\n]*?)\.(?=\n\n|$)/;
+
+/**
+ * The attribution of ONE `--to=changes` verdict comment, for the precedent capture. Pure. `null` unless the body
+ * opens with the exact heading and attribution. `end` is the offset just past the attribution sentence; the
+ * `--body-file` write-up follows it.
+ * @returns {{actor:string, channel:string, end:number}|null}
+ */
+export function parseChangesVerdictProse(body) {
+  const m = CHANGES_VERDICT_PROSE_RE.exec(typeof body === 'string' ? body : '');
+  if (!m) return null;
+  const at = m[1].indexOf(' via ');
+  const actor = (at === -1 ? m[1] : m[1].slice(0, at)).trim();
+  return actor ? { actor, channel: at === -1 ? '' : m[1].slice(at + 5).trim(), end: m.index + m[0].length } : null;
+}
+
+/**
  * #xuboo0q — did the LATEST accept-shaped comment (whichever comment stamped the most recent `reviewed-sha`
  * marker) ALSO carry the `clear-human` ceremony marker IN THAT SAME COMMENT? Pure.
  *
