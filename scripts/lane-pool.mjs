@@ -1788,7 +1788,9 @@ function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
 function clearForeignVerifyMarker(dir) {
   try {
     const gitDir = join(dir, '.git');
-    const head = git(['rev-parse', 'HEAD'], dir);
+    // Reuse the journal's spawn-free HEAD reader so the config scrub fits acquire's git-spawn budget.
+    const head = laneHead(dir);
+    if (!head) return; // preserve the marker when HEAD cannot be resolved
     if (!keepMarkerAfterReset(readVerifyMarker(gitDir), head)) rmSync(join(gitDir, VERIFY_FILENAME), { force: true });
   } catch { /* advisory */ }
 }
