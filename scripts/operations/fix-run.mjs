@@ -17,8 +17,7 @@
  * WHY THE LAUNCHER (not the agent) PUSHES. Codex runs in the same no-network `:workspace` sandbox as a build
  * (`codex-delivery-provider.mjs`, UNKNOWN 3): it cannot `gh`, `lane-pool` or `git push`. So this launcher owns every
  * step that needs the network or the lane pool — acquire the lane at the PR's head ref, push, re-arm, release — and
- * the agent only edits files in the lane. A preamble on the brief says so. `antigravity-*` has no delivery
- * provider on main, so it is refused up front rather than launched half-working.
+ * the agent only edits files in the lane. A preamble on the brief says so. Antigravity runs Gemini in the existing lane; the launcher owns commits and pushes.
  */
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
@@ -473,6 +472,12 @@ export function resolveRearmRefusalPolicy(env = process.env) {
   } catch { return { mode: 'noop', source: 'standard' }; }
 }
 
+/** Resolve the repair-only Gemini worker without changing delivery provider routing. */
+export async function resolveFixProvider(name) {
+  if (name === 'antigravity') return (await import('./agy-fix-provider.mjs')).AGY_FIX_PROVIDER;
+  return resolveDeliveryAgentProvider(name);
+}
+
 /**
  * THE CLI AS A FUNCTION. Exit 1 only when the launch itself threw; "agent made no change" is exit 0.
  * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
@@ -483,7 +488,7 @@ export async function runFixCli(argv = [], {
   readPrompt = (p) => readFileSync(p, 'utf8'),
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
-  resolveProvider = resolveDeliveryAgentProvider,
+  resolveProvider = resolveFixProvider,
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   readCiHeal = readCiHealInputs,
@@ -501,7 +506,7 @@ export async function runFixCli(argv = [], {
   let launch;
   let laneRelease = null;
   // How this launch (borrowed or routed) ended. Recorded in the borrow ledger (repeated failures stop the PR borrowing)
-  // and, for routed codex, the per-head ledger (repeated failures fall back to Claude). The claim is released on EVERY
+  // and, for routed non-Claude repairs, the per-head ledger (repeated failures advance the chain). The claim is released on EVERY
   // exit: a fix that ends must not keep holding its claim and a cap slot until the TTL.
   let before = null;
   let prHeadSha = null;
@@ -515,7 +520,7 @@ export async function runFixCli(argv = [], {
     reason = singleLine(reason);
     try { recordOutcome({ repo, pr: Number(launch.pr), outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
     const head = before ?? prHeadSha;
-    if (launch.provider === 'codex' && head) {
+    if (launch.provider !== 'claude' && head) {
       try {
         const id = { repo, pr: Number(launch.pr), head };
         // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message
@@ -667,7 +672,8 @@ export async function runFixCli(argv = [], {
       // `-q`, `--unmerged` and `--ignore-missing` apply only to the options after them, so they come first.
       git('update-index', '-q', '--unmerged', '--ignore-missing', '--refresh');
     };
-    const trailer = (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
+    const trailer = launch.provider === 'antigravity' ? 'Co-Authored-By: Antigravity (gemini-4-argon) <noreply@google.com>'
+      : (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
     const inMerge = () => { const path = mergeHeadPath(); return !!path && fileExists(resolve(lanePath, path)); };
     const commitMerge = () => git('commit', '--no-edit', '--trailer', trailer);
@@ -738,21 +744,27 @@ export async function runFixCli(argv = [], {
       const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
-    const spawned = await provider.spawn({
-      taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-      sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
-        ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-        : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
-      ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
-    }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
-      spawnAgent: async (...args) => {
-        try {
-          const result = await spawnCodex(...args);
-          finalMessage = agentFinalMessage(result);
-          return result;
-        } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
-      },
-    } : {}) });
+    let spawned;
+    try {
+      spawned = await provider.spawn({
+        taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
+        sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+          ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
+          : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+        ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
+      }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
+        spawnAgent: async (...args) => {
+          try {
+            const result = await spawnCodex(...args);
+            finalMessage = agentFinalMessage(result);
+            return result;
+          } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
+        },
+      } : {}) });
+    } catch (e) {
+      finalMessage = agentFinalMessage(e) || finalMessage;
+      throw e;
+    }
     finalMessage = agentFinalMessage(spawned) || finalMessage;
     const configAfterAgent = laneConfig();
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
