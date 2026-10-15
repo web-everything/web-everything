@@ -3,7 +3,7 @@ bornAs: xswexdn
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/scope-bloat.mjs", "we:scripts/backlog-stranded-sweep.mjs"]
+
 dateOpened: "2026-10-12"
 tags: []
 ---
@@ -35,3 +35,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Findings (standalone worker, 2026-10-15)
+
+The build-dispatch daemon held #5964 with:
+
+> worker-declined: Not prepared: #5964 — could-not-prepare. The unresolved choice is whether approval widens only the card’s predicted scope or also the running worker’s write authority. Decision #3993 explicitly leaves widening authority unratified; the current runner checks both card scope and dispatched scope ('we:scripts/operations/probation-build-run.mjs:626'). Updating the card alone therefore cannot authorize continued out-of-scope work. Preparing that behavior would require choosing the unresolved policy. No files changed; no stamps, commits, pushes, or PRs.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
