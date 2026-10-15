@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
@@ -778,10 +779,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
-  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource})`;
+  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource}) · mergedGuardHours=${preparePolicy.mergedGuardHours} (from ${preparePolicy.sources.mergedGuardHours})`;
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
-  const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
@@ -866,11 +867,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const sessionDead = worker?.entry?.live === false
         && (now > Date.parse(worker.entry.expectedBy)
           || now - Date.parse(worker.entry.lastSeenLiveAt) > PREPARE_SESSION_DEAD_GRACE_MS);
-      if (!why && sessionDead && !(awaitingPr && status.pr.preparedDate)) {
+      if (!why && sessionDead && !awaitingPr) {
         why = 'prepare-session-dead';
       }
-      // An OPEN PR only shields the claim when it is stamped; an unstamped one must not outlive a dead worker.
-      if (!why && claim && !(awaitingPr && status.pr.preparedDate) && isLeaseExpired(claim, effects.now?.() ?? Date.now(), DEFAULT_LEASE_MINUTES)) {
+      // An OPEN prepare PR keeps the card in flight even if its worker has ended.
+      if (!why && claim && !awaitingPr && isLeaseExpired(claim, effects.now?.() ?? Date.now(), DEFAULT_LEASE_MINUTES)) {
         // Probe the worker independently: the claim owner is the long-lived daemon, not the worker.
         // A failed Claude listing stays unknown; use owner-PID fallback only when no worker row exists.
         const host = claim.owner?.slice(0, claim.owner.lastIndexOf(':'));
@@ -893,8 +894,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         && (mainHasResult || (awaitingPr && status.pr.hasSections));
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
         || (currentSettled && !prepareBusy.has(num));
-      // An open, stamped PR is a valid finished agent run awaiting landing; main is not stamped yet.
-      let unstamped = status && !status.preparedDate && ended && !(awaitingPr && status.pr.preparedDate);
+      // An OPEN or MERGED prepare PR is in flight or delivered, even before a stamp is visible.
+      let unstamped = status && !status.preparedDate && ended && !['OPEN', 'MERGED'].includes(status.pr?.state);
       const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
       const failureHeld = Boolean(priorFailure);
       const recoverable = !failureHeld && unstamped && (mainHasResult || (awaitingPr && status.pr.hasSections));
@@ -962,7 +963,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           prepare.retired.push({ num, why, released: live });
         }
         finishedPrepares.add(num);
-        prepareBusy.delete(num);
+        if (awaitingPr) prepareBusy.add(num);
+        else prepareBusy.delete(num);
       } else if (claim || awaitingPr) prepareBusy.add(num);
     } catch (e) {
       // Failed observations never mean unprepared/dead. Keep a tracked item out of dispatch until a good read;
@@ -1007,6 +1009,27 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         } catch (e) {
           prepareBusy.add(num);
           await failPrepare(num, 'stamp-read', String(e?.message || e));
+          continue;
+        }
+        const bornAs = pick.bornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs;
+        const lastDispatchAt = [
+          ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
+          ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
+          ...allSettledPrepares.filter(r => normNum(r.num) === num).map(r => r.startedAt),
+          ...prepareRows.filter(r => normNum(r.num) === num).map(r => r.row?.entry?.startedAt),
+        ].filter(Boolean).sort().at(-1);
+        let refusal;
+        try {
+          refusal = prepareLaunchRefusal({ num, bornAs, prs: await effects.listPreparePrs?.({ num, bornAs }),
+            lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
+            claims: prepareClaims, liveRows: prepareRows, ledgerFailures });
+        } catch {
+          refusal = { reason: 'prepare PR listing unavailable' };
+        }
+        if (refusal) {
+          prepareBusy.add(num);
+          prepare.refused.push({ num, reason: refusal.reason });
+          console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
           continue;
         }
         const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
@@ -1747,7 +1770,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
   }
   function ghPrList(search, limit) {
     const list = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-      '--search', search, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)], opts));
+      '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)], opts));
     if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
     return list;
   }
@@ -1766,7 +1789,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
   function itemPrs(num) {
     const key = normNum(num);
     if (!itemListings.has(key)) {
-      const prs = ghPrList(`head:lane/${key}-prepare-`, ITEM_PR_LIMIT);
+      const prs = ghPrList(`head:lane/${key}`, ITEM_PR_LIMIT);
       if (prs.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${key} saturated at ${ITEM_PR_LIMIT}`);
       itemListings.set(key, prs);
     }
@@ -1815,7 +1838,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         const key = todo[next++];
         try {
           const prs = JSON.parse(await execAsync('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-            '--search', `head:lane/${key}-prepare-`, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository',
+            '--search', `head:lane/${key}`, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository',
             '--limit', String(ITEM_PR_LIMIT)], opts));
           if (Array.isArray(prs) && prs.length < ITEM_PR_LIMIT) itemListings.set(key, prs);
         } catch { /* the lazy read repeats this call and reports its own failure */ }
@@ -1842,7 +1865,10 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
       loadBlobs([card]);
       return prepareBlobStatuses.get(card.sha);
     },
-    read({ num, claimedAt, replacesStamp }) {
+    listPrs({ num, bornAs }) {
+      return prsFor(num).filter(pr => isPreparePrFor(pr, { num, bornAs }));
+    },
+    read({ num, bornAs, claimedAt, replacesStamp }) {
       const card = loadTree().get(normNum(num));
       if (!card) throw new Error(`prepare card #${num} not found on origin/main`);
       loadBlobs([card]);
@@ -1856,7 +1882,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         { replaces: replacesStamp, preparedAgainstSha: stamped.preparedAgainstSha })) return { ...stamped, path };
       const main = stamped.preparedDate ? { ...stamped, preparedDate: null, replacedPreparedDate: stamped.preparedDate } : stamped;
       // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
-      const pr = prsFor(num, claimedAt).filter(p => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
+      const pr = prsFor(num, claimedAt).filter(p => isPreparePrFor(p, { num, bornAs })
         && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (!pr) return { ...main, path, pr: null };
       let status = { preparedDate: null };
@@ -2160,6 +2186,7 @@ function cliEffects() {
       return prepareReader.prime(nums.map(num => ({ num,
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
+    listPreparePrs: args => (prepareReader ??= createPrepareStatusReader()).listPrs(args),
     readPrepareStatus: args => (prepareReader ??= createPrepareStatusReader()).read(args),
     // The card's stamp as it stands at spawn, recorded on the claim.
     readPreparedStamp: args => (prepareReader ??= createPrepareStatusReader()).stamp(args),

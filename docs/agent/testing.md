@@ -789,6 +789,16 @@ before the latched route returns. Neither elapsed time nor a later successful ru
 The incident report `reports/2026-09-30-prepare-failures-root-causes.md` distinguishes worker cause from
 claim retirement: dead-session cleanup frees capacity but does not prove why authoring failed.
 
+Prepare PR identity is shared in `we:scripts/conveyor/prepare-pr-match.mjs`: same-repo branches
+accept one uniqueness letter after the card number (or `bornAs`), with the `WE #<num>: prepare`
+title as a fallback. Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
+The launch guard must also run without a surviving claim, and refuse when PR listing throws.
+Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
+0 disables only the merged refusal); probe the time boundary with an injected clock.
+A needs-you park in the newest ledger record survives completion by a later stamp; only explicit
+`releasedAt`/`releasedBy` metadata clears that park for the launch guard. Cover that completed record
+separately from an ordinary completed failure, so stamp observation cannot silently authorize a retry.
+
 Stamp-recovery reservations do not expire. A terminal recovery error is recorded in its dispatch log,
 classified by the daemon, and cannot spawn again without a remaining transient budget or a cited fix.
 A new starting marker prevents the previous failure from being mistaken for the newly running job.
