@@ -28,7 +28,7 @@ export default {
     ]) {
       const dir = mkdtempSync(join(tmpdir(), 'overlay-finalize-'));
       const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], {
-        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
       });
       try {
         git(dir, 'init', '-q', '-b', 'main', 'origin');
