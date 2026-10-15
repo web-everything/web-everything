@@ -33,6 +33,62 @@ describe('feed', () => {
     expect(items.map(i => i.kind)).toEqual(['needs-you', 'needs-you', 'at-round-limit', 'escalated', 'ruling-needed', 'stood-down']);
     expect(items[1].command).toBe('merge'); expect(items.incomplete).toBe(true);
   });
+  it('uses section reasons, preserves row reasons and commands, and shows the title separately', () => {
+    const row = { repo: 'owner/repo', number: 12, title: 'A PR title' };
+    const items = itemsFromReport({ ready: [row, { ...row, reason: 'Specific reason', command: 'custom review' }],
+      needsYourMerge: [{ ...row, command: 'human merge' }], rulingNeeded: [row], stoodDown: [row] });
+    expect(items.map(i => i.reason)).toEqual([
+      'review:human + advisory:accepted, all gates pass — your review', 'Specific reason',
+      'approved, only a person may enqueue',
+      'review parked with confirmed findings — your block/card/not-real ruling',
+      'fix agent asked a question — your judgment; no label changed',
+    ]);
+    const review = `node scripts/operations/run.mjs review-pr --pr=12 --repo=owner/repo`;
+    for (const i of [items[0], items[3]]) {
+      expect(i.command).toBe(review);
+      expect(i.command).not.toContain('--cwd=');
+      expect(i.command).not.toMatch(/(?:^|[\s='"])(?:\/|[A-Za-z]:[\\/])/);
+    }
+    expect(items[1].command).toBe('custom review');
+    expect(items[2].command).toBe('human merge');
+    expect(items[4].command).toBeUndefined();
+    expect(items.every(i => i.title === row.title)).toBe(true);
+    const line = diffFeed([], [items[0]], at).lines[0];
+    expect(line.slice(0, line.indexOf(' {"at":'))).toContain(row.title);
+    expect(line).toContain(`| pick: ${review}`);
+    expect(parseFeedLine(line)).toMatchObject({ title: row.title, reason: items[0].reason });
+  });
+  it('resolves missing heads once per item before deduping and keeps supplied heads', async () => {
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const exec = vi.fn(() => JSON.stringify({ ready: [
+      { repo: 'r', number: 1, title: 'Lookup' }, { repo: 'r', number: 2, head: 'supplied' },
+    ] }));
+    const gh = vi.fn(() => JSON.stringify({ headRefOid: 'resolved' }));
+    const opts = { exec, gh, home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const first = await runOnce(opts);
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(gh).toHaveBeenCalledWith('gh', ['pr', 'view', '1', '--repo', 'r', '--json', 'headRefOid'],
+      expect.objectContaining({ cwd: checkoutRoot, encoding: 'utf8', maxBuffer: expect.any(Number), timeout: expect.any(Number) }));
+    expect(first.openKeys).toEqual(['r#1@resolved:needs-you', 'r#2@supplied:needs-you']);
+    expect(parseFeedLine(first.lines[0]).head).toBe('resolved');
+    expect((await runOnce(opts)).lines).toEqual([]);
+    gh.mockReturnValue(JSON.stringify({ headRefOid: 'new-head' }));
+    expect((await runOnce(opts)).lines).toHaveLength(2);
+  });
+  it.each(['throws', 'invalid JSON', 'missing head'])('logs head lookup failure (%s) and continues the pass', async failure => {
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const exec = () => JSON.stringify({ ready: [{ repo: 'r', number: 1 }, { repo: 'r', number: 2 }] });
+    const gh = vi.fn().mockImplementationOnce(() => {
+      if (failure === 'throws') throw Error('lookup failed');
+      return failure === 'invalid JSON' ? 'invalid' : '{}';
+    }).mockReturnValue(JSON.stringify({ headRefOid: 'second' }));
+    const log = vi.fn();
+    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
+    expect(result.openKeys).toEqual(['r#1@:needs-you', 'r#2@second:needs-you']);
+    expect(parseFeedLine(result.lines[0]).head).toBe('');
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/r#1.*head lookup failed/));
+    expect(gh).toHaveBeenCalledTimes(2);
+  });
   it('appends without replacing bytes and replays and acknowledges open events', () => {
     const path = join(temp(), 'events'); writeFileSync(path, 'existing\n');
     appendLines(path, diffFeed([], [item], at).lines);

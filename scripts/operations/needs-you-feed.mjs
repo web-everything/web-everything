@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Card 359 — session-independent operator attention feed. */
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, basename } from 'node:path';
@@ -45,15 +46,25 @@ export function assertProducerCheckout(checkoutRoot, { env = process.env, settin
   if (isLaneLocus(root) || isDaemonCloneRealpath(root, daemonCloneRoots(workspaceRootOf(root), { env })) || pinned) return;
   throw new Error('needs-you-feed: refusing primary checkout; use a lane, daemon clone or sha-pinned snapshot (WE_NEEDS_YOU_FEED_ALLOW_PRIMARY=1 overrides)');
 }
+const sectionReasons = {
+  ready: 'review:human + advisory:accepted, all gates pass — your review',
+  needsYourMerge: 'approved, only a person may enqueue',
+  rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
+  stoodDown: 'fix agent asked a question — your judgment; no label changed',
+};
+const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
   for (const [field, baseKind] of [['ready', 'needs-you'], ['needsYourMerge', 'needs-you'], ['rulingNeeded', 'ruling-needed'], ['stoodDown', 'stood-down']]) {
     for (const row of report[field] ?? []) {
       const clues = [row.kind, row.reason, ...(row.findings ?? []).map(f => f.reason)].filter(Boolean).join(' ');
       const kind = baseKind !== 'ruling-needed' ? baseKind : /round-cap|at-round-limit/.test(clues) ? 'at-round-limit' : /escalat|dispute/.test(clues) ? 'escalated' : baseKind;
-      const reason = row.reason || row.reasons?.join('; ') || row.findings?.map(f => f.summary || f.reason).join('; ') || row.title || baseKind;
-      items.push({ pr: row.number ?? row.pr, repo: row.repo, head: row.head ?? row.headRefOid ?? '', kind, reason,
-        ...(row.pick ? { pick: row.pick } : {}), ...(row.command ? { command: row.command } : {}) });
+      const reason = row.reason || sectionReasons[field];
+      const pr = row.number ?? row.pr;
+      const command = row.command || (field === 'ready' || field === 'rulingNeeded'
+        ? `node scripts/operations/run.mjs review-pr --pr=${shellArg(pr)} --repo=${shellArg(row.repo)}` : undefined);
+      items.push({ pr, repo: row.repo, head: row.head ?? row.headRefOid ?? '', kind, reason, title: row.title ?? '',
+        ...(row.pick ? { pick: row.pick } : {}), ...(command ? { command } : {}) });
     }
   }
   items.incomplete = !!report.incomplete;
@@ -71,7 +82,7 @@ export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomple
   const singleLine = s => String(s).replace(/[\r\n]+/g, ' ');
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
-    lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${singleLine(item.reason).slice(0, 100)}${item.pick || item.command ? ` | pick: ${singleLine(item.pick || item.command)}` : ''} ${JSON.stringify(event)}`);
+    lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${singleLine(item.reason).slice(0, 100)}${item.title ? ` | ${singleLine(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${singleLine(item.pick || item.command)}` : ''} ${JSON.stringify(event)}`);
   }
   if (!incomplete) for (const key of prev) if (!current.has(key)) {
     const event = { at, kind: 'cleared', ...fromKey(key) };
@@ -107,7 +118,7 @@ export function unacknowledged({ path = feedPath(), ackPath = join(dirname(path)
 export function monitorCommand(path = feedPath()) {
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
-export async function runOnce({ exec = execFileSync, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
+export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
   env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true } = {}) {
   logSettings(settings, log);
   assertProducerCheckout(checkoutRoot, { env, settings });
@@ -121,13 +132,26 @@ export async function runOnce({ exec = execFileSync, home = homedir(), now = new
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
+  const items = itemsFromReport(report);
+  // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
+  for (const item of items) if (!item.head) {
+    try {
+      const raw = await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'headRefOid'],
+        { cwd: checkoutRoot, encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+      const head = JSON.parse(String(raw)).headRefOid;
+      if (typeof head !== 'string' || !head.trim()) throw new Error('missing headRefOid');
+      item.head = head;
+    } catch (error) {
+      log(`needs-you-feed ${item.repo}#${item.pr} head lookup failed: ${error.message}`);
+    }
+  }
   const path = settings.path.value, statePath = join(dirname(path), 'needs-you-feed-state.json');
   mkdirSync(dirname(path), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, itemsFromReport(report), now);
+    const result = diffFeed(prev.openKeys, items, now);
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
@@ -144,7 +168,7 @@ export async function main(argv = process.argv.slice(2)) {
     assertProducerCheckout(CHECKOUT_ROOT, { settings });
     do {
       const started = Date.now();
-      try { await runOnce({ settings, log: () => {} }); } catch (error) { if (verb === 'once') throw error; console.error(`needs-you-feed: ${error.message}`); }
+      try { await runOnce({ settings }); } catch (error) { if (verb === 'once') throw error; console.error(`needs-you-feed: ${error.message}`); }
       if (verb === 'once') break;
       await new Promise(done => setTimeout(done, Math.max(0, settings.intervalMinutes.value * 60000 - (Date.now() - started))));
     } while (true);
