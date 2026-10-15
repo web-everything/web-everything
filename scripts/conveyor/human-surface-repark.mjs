@@ -4,7 +4,8 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
 import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman } from '../lib/review-escalation.mjs';
-import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { createGhProvider, parseJsonLines } from '../lib/review-label-provider.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import { restoreClearanceOverRacedPark } from '../review-set-label.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -65,9 +66,19 @@ export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha
   return { repark: true, hits, decision: decideParkToHuman({ currentLabels, keepHumanClearance: false }) };
 }
 
+/**
+ * PR #5273 (security) — a PR's file names are attacker text, and this comment is posted by the trusted account whose
+ * markers (`reviewed-sha`, `cleared-human`, the park markers) the parsers count. Percent-encode every character
+ * outside a plain path alphabet, so no name (alone, joined with another, or via newline, CR, U+2028, backtick or a
+ * full-width look-alike) can form `<!--`, `-->` or a new line.
+ */
+export const neutralizeCommentText = text => String(text ?? '').replace(/[^A-Za-z0-9._/+=,~@-]/g,
+  ch => [...new TextEncoder().encode(ch)].map(b => `%${b.toString(16).toUpperCase().padStart(2, '0')}`).join(''));
+
 export function buildHumanSurfaceReparkComment({ headSha, hits }) {
+  if (!/^[0-9a-f]{40}$/i.test(String(headSha))) throw new Error('re-park comment needs a 40-hex head sha');
   return `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`
-    + hits.map(hit => `- \`${hit.file}\` (${hit.category})`).join('\n')
+    + hits.map(hit => `- \`${neutralizeCommentText(hit.file)}\` (${neutralizeCommentText(hit.category)})`).join('\n')
     + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n'
     + `\n${buildHumanSurfaceReparkMarker(headSha)}\n`;
 }
@@ -75,6 +86,7 @@ export function buildHumanSurfaceReparkComment({ headSha, hits }) {
 export function sweepHumanSurfaceRepark({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(),
   readComments = readCompletePrComments, resolveSurfaces = resolveHumanReviewSurfaces, dryRun = false,
+  readLabelEvents = defaultReadLabelEvents,
 } = {}) {
   const results = [];
   let resolvedRepo = repo;
@@ -82,7 +94,7 @@ export function sweepHumanSurfaceRepark({
   if (prs.some(pr => healCandidate(pr.labels))) {
     try {
       resolvedRepo ??= provider.currentRepo();
-      if (resolvedRepo) healRaceLostParks({ prs, provider, repo: resolvedRepo, readComments, dryRun, results });
+      if (resolvedRepo) healRaceLostParks({ prs, provider, repo: resolvedRepo, readComments, readLabelEvents, dryRun, results });
     } catch (e) {
       results.push({ num: 0, skipped: `heal failed: ${errorText(e)}` });
     }
@@ -156,7 +168,32 @@ export function sweepHumanSurfaceRepark({
  * such a clearance, so the pair can only come from a race. Reads the complete thread, then the labels and head.
  * Leaves a moved head, a `review:changes` bounce or a mechanical hold alone. Returns whether it withdrew.
  */
-function withdrawRaceLostPark({ provider, repo, num, head, readComments, requireMarker = false, dryRun = false }) {
+/** The PR's label add/remove events, oldest first: `{event:'labeled'|'unlabeled', label, createdAt}`. Throws on a miss. */
+export function defaultReadLabelEvents(num, { repo, exec = execRead } = {}) {
+  const out = exec('gh', ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${num}/events`,
+    '--jq', '.[] | select(.event == "labeled" or .event == "unlabeled") | {event, label: .label.name, createdAt: .created_at}']);
+  return parseJsonLines(out);
+}
+
+// The park comment is posted, then its labels are written within seconds; a later add is someone else's.
+const PARK_LABEL_WINDOW_MS = 120_000;
+const PARK_LABEL_SKEW_MS = 5_000;
+
+/**
+ * PR #5273 — proof that the CURRENT `review:human` is the marked park's own write, not a later hold by someone else:
+ * the latest `review:human` label event is an add, made within seconds after the latest trusted park comment for
+ * `head`. A hold added afterwards (by hand, or by a park that writes its label before its comment) is a newer event.
+ */
+export function parkOwnsHumanLabel(events, comments, head) {
+  const park = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c) && marksPark(c, head)).at(-1);
+  const parkAt = Date.parse(park?.createdAt ?? '');
+  const last = (Array.isArray(events) ? events : []).filter(e => e?.label === REVIEW_LABELS.human).at(-1);
+  const addedAt = Date.parse(last?.createdAt ?? '');
+  if (!Number.isFinite(parkAt) || !Number.isFinite(addedAt) || last.event !== 'labeled') return false;
+  return addedAt >= parkAt - PARK_LABEL_SKEW_MS && addedAt <= parkAt + PARK_LABEL_WINDOW_MS;
+}
+
+function withdrawRaceLostPark({ provider, repo, num, head, readComments, readLabelEvents = null, requireMarker = false, dryRun = false }) {
   const after = readComments(num, { repo });
   if (!Array.isArray(after)) throw new Error('comments read returned no array');
   const live = provider.readPrState(repo, num);
@@ -171,6 +208,8 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, require
     && !marksPark(after.filter(isTrustedMarkerAuthor).at(-1), head)) return false;
   // Neither label: something else took the acceptance away. Never create one.
   if (!hasReviewLabel(live.labels, REVIEW_LABELS.human)) return hasReviewLabel(live.labels, REVIEW_LABELS.accepted);
+  // A later heal must also prove the label itself is the park's write (unreadable events: the hold stays).
+  if (requireMarker && !parkOwnsHumanLabel(readLabelEvents(num, { repo }), after, head)) return false;
   if (dryRun) return true;
   // The acceptance write has one home (the single-home rule); it re-checks this state before writing.
   return restoreClearanceOverRacedPark({ provider, repo, pr: num, headSha: head, comments: after, labels: live.labels });
@@ -181,7 +220,7 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, require
  * sweep, the mechanical-hold hand-off or clear-human. Acts only on {@link raceLostParkProven}. The listed (oldest)
  * comments pre-filter: a short listed thread with no park marker is never read in full.
  */
-function healRaceLostParks({ prs, provider, repo, readComments, dryRun, results }) {
+function healRaceLostParks({ prs, provider, repo, readComments, readLabelEvents, dryRun, results }) {
   for (const pr of prs) {
     if (!healCandidate(pr.labels)) continue;
     if (Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
@@ -190,7 +229,7 @@ function healRaceLostParks({ prs, provider, repo, readComments, dryRun, results 
     try {
       const state = provider.readPrState(repo, num);
       if (state?.state !== 'OPEN' || !state.headRefOid || !healCandidate(state.labels)) continue;
-      if (withdrawRaceLostPark({ provider, repo, num, head: state.headRefOid, readComments, requireMarker: true, dryRun })) {
+      if (withdrawRaceLostPark({ provider, repo, num, head: state.headRefOid, readComments, readLabelEvents, requireMarker: true, dryRun })) {
         results.push(dryRun ? { num, repark: 'would-withdraw', head: state.headRefOid }
           : { num, repark: 'withdrawn', head: state.headRefOid, reason: 'healed a park that lost a race with a human clearance' });
       }

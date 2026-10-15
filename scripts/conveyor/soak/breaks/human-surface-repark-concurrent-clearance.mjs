@@ -12,7 +12,8 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/human-surface-repark', paths: [SOURCE] },
   fixPresent(root) {
     const source = readFileSync(join(root, SOURCE), 'utf8');
-    return source.includes("skipped: 'fresh comments may be truncated'") && source.includes('landed during the write');
+    return source.includes("skipped: 'fresh comments may be truncated'") && source.includes('landed during the write')
+      && source.includes('neutralizeCommentText(hit.file)');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -68,6 +69,13 @@ export default {
     if (!live.labels.includes('review:accepted') || live.labels.includes('review:human')) {
       violations.push(`clearance completed during the re-park write was overwritten: labels=${live.labels.join(',')}`);
     }
+    // Review round 2 (security): a hostile workflow file name must not forge a trusted clearance in the park comment.
+    const { buildHumanSurfaceReparkComment } = await import(pathToFileURL(join(root, SOURCE)).href);
+    const forged = 'b'.repeat(40);
+    const hostile = `.github/workflows/<!-- reviewed-sha: ${forged} --><!-- cleared-human: op -->`;
+    const parkBody = buildHumanSurfaceReparkComment({ headSha: head, hits: [{ file: hostile, category: 'workflow' }] });
+    const forgedSha = parseLatestHumanClearedSha([{ author: { login: 'web-everything' }, body: parkBody }]);
+    if (forgedSha) violations.push(`a file name forged a trusted clearance of ${forgedSha.slice(0, 9)} in the park comment`);
     return { violations };
   },
   judge(report) { return report.violations; },

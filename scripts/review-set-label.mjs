@@ -209,7 +209,9 @@ export function defaultReadHumanOnlyHold({ headSha, baseRefName, comments, exec 
  * hand-off below. A concurrent `clear-human` of the marked head undoes only these parks.
  */
 export const HUMAN_SURFACE_REPARK_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
-export const buildMechanicalHandoffMarker = headSha => `<!-- mechanical-hold-handoff: ${String(headSha).toLowerCase()} -->`;
+// Only a 40-hex head is ever embedded (anything else yields no marker, so nothing undoes the hand-off).
+export const buildMechanicalHandoffMarker = headSha => (/^[0-9a-f]{40}$/i.test(String(headSha))
+  ? `<!-- mechanical-hold-handoff: ${String(headSha).toLowerCase()} -->` : '');
 
 /**
  * PR #5273 — after a marked park's own label write, read the complete thread and the live labels. When a trusted

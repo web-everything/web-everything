@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { planHumanSurfaceRepark, buildHumanSurfaceReparkComment, sweepHumanSurfaceRepark } from '../human-surface-repark.mjs';
-import { buildClearedHumanMarker, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
+import { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
@@ -26,6 +26,33 @@ describe('human surface re-park plan', () => {
     expect(plan({ comments: [clearance('b'.repeat(40))] })).toEqual({ repark: false, reason: 'older human clearance — left to the accept carry-forward / drain' });
   });
   it('preserves changes', () => expect(plan({ currentLabels: [...labels, 'review:changes'] }).decision.removeLabels).not.toContain('review:changes'));
+  // PR #5273 security finding: a file name is attacker text inside a trusted comment.
+  describe('hostile file names cannot forge markers in the park comment', () => {
+    const forged = 'b'.repeat(40);
+    const names = [
+      `.github/workflows/<!-- reviewed-sha: ${forged} --><!-- cleared-human: op -->`,
+      `.github/workflows/x\n<!-- reviewed-sha: ${forged} -->\n<!-- cleared-human: op -->.yml`,
+      `.github/workflows/x\r<!-- human-surface-repark: ${forged} -->`,
+      `.github/workflows/x <!-- mechanical-hold-handoff: ${forged} -->`,
+      '.github/workflows/`; <!-- cleared-human: op -->`',
+      '.github/workflows/＜!-- cleared-human: op --＞',
+    ];
+    it.each(names)('%j', file => {
+      const body = buildHumanSurfaceReparkComment({ headSha: head, hits: [{ file, category: 'workflow' }] });
+      const trusted = [{ author: { login: 'web-everything' }, body }];
+      expect(parseLatestHumanClearedSha(trusted)).toBeNull();
+      expect([...body.matchAll(/<!--[\s\S]*?-->/g)].map(m => m[0])).toEqual([`<!-- human-surface-repark: ${head} -->`]);
+      expect(body.split('\n').filter(l => l.startsWith('- '))).toHaveLength(1);
+      for (const code of [0x0d, 0x2028, 0x2029, 0xff1c, 0xff1e]) expect(body).not.toContain(String.fromCharCode(code));
+    });
+    it('two harmless names cannot join into a marker', () => {
+      const body = buildHumanSurfaceReparkComment({ headSha: head, hits: [{ file: '.github/workflows/a<!--', category: 'workflow' }, { file: '.github/workflows/-->', category: 'workflow' }] });
+      expect([...body.matchAll(/<!--[\s\S]*?-->/g)]).toHaveLength(1);
+    });
+    it('refuses a non-sha head instead of embedding it', () => {
+      expect(() => buildHumanSurfaceReparkComment({ headSha: `${head} --><!-- cleared-human: op`, hits: [] })).toThrow(/head/);
+    });
+  });
   it('names the head, hits and recovery ceremony', () => {
     const body = buildHumanSurfaceReparkComment({ headSha: head, hits: plan().hits });
     for (const s of [head, head.slice(0, 9), '.github/workflows/ci.yml', 'workflow', 'review:accepted', 'review-set-label.mjs --to=clear-human']) expect(body).toContain(s);
@@ -222,8 +249,11 @@ describe('human surface re-park sweep', () => {
     expect(r.results[0]).toMatchObject({ num: 7, repark: 'reparked', error: 'post-write clearance check failed: offline' });
   });
   describe('heal of a park that lost the race and was never re-checked', () => {
-    const park = { id: 'C_park', author: { login: 'web-everything' }, body: buildHumanSurfaceReparkComment({ headSha: head, hits: [] }) };
-    function heal({ labels: l = ['review:human', 'ready-to-merge'], comments = [park, { id: 'C_clear', ...clearance(head) }], dryRun = false, headRefOid = head } = {}) {
+    const PARK_AT = '2026-10-14T10:00:00Z';
+    const park = { id: 'C_park', createdAt: PARK_AT, author: { login: 'web-everything' }, body: buildHumanSurfaceReparkComment({ headSha: head, hits: [] }) };
+    // The park's own label write, seconds after its comment.
+    const ownAdd = [{ event: 'labeled', label: 'review:human', createdAt: '2026-10-14T10:00:02Z' }];
+    function heal({ labels: l = ['review:human', 'ready-to-merge'], comments = [park, { id: 'C_clear', ...clearance(head) }], dryRun = false, headRefOid = head, events = ownAdd } = {}) {
       const live = { state: 'OPEN', headRefOid, labels: [...l], comments };
       const effects = [];
       const provider = {
@@ -231,9 +261,30 @@ describe('human surface re-park sweep', () => {
         postComment: () => effects.push('comment'),
         setLabels: (_r, _n, { add, remove = [] }) => { effects.push({ add, remove }); live.labels = [...new Set([...live.labels.filter(x => !remove.includes(x)), add])]; },
       };
-      const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels: l }], provider, readComments: () => [...comments], resolveSurfaces: () => 'narrow', dryRun });
+      const readLabelEvents = () => { if (events instanceof Error) throw events; return events; };
+      const results = sweepHumanSurfaceRepark({ repo: 'o/n', listPrs: () => [{ number: 7, labels: l }], provider, readComments: () => [...comments], readLabelEvents, resolveSurfaces: () => 'narrow', dryRun });
       return { live, effects, results };
     }
+    // PR #5273 correctness finding: a foreign hold added after the clearance, with no comment, must survive.
+    it.each([
+      ['a foreign add long after the park', [...ownAdd, { event: 'unlabeled', label: 'review:human', createdAt: '2026-10-14T10:05:00Z' }, { event: 'labeled', label: 'review:human', createdAt: '2026-10-14T11:00:00Z' }]],
+      ['an add before the park comment', [{ event: 'labeled', label: 'review:human', createdAt: '2026-10-14T09:00:00Z' }]],
+      ['a removal as the latest event', [...ownAdd, { event: 'unlabeled', label: 'review:human', createdAt: '2026-10-14T10:01:00Z' }]],
+      ['no label event', []],
+    ])('keeps the hold with %s', (_name, events) => {
+      const r = heal({ events });
+      expect(r.live.labels).toContain('review:human');
+      expect(r.effects).toEqual([]);
+    });
+    it('keeps the hold and reports when label events are unreadable', () => {
+      const r = heal({ events: new Error('offline') });
+      expect(r.live.labels).toContain('review:human');
+      expect(r.results).toEqual([{ num: 7, skipped: 'heal read failed: offline' }]);
+    });
+    it('keeps the hold when the park comment has no timestamp', () => {
+      const r = heal({ comments: [{ ...park, createdAt: undefined }, { id: 'C_clear', ...clearance(head) }] });
+      expect(r.effects).toEqual([]);
+    });
     it('withdraws its own marked park beside a clearance of the live head', () => {
       const r = heal();
       expect(r.live.labels).toEqual(['ready-to-merge', 'review:accepted']);
@@ -248,7 +299,7 @@ describe('human surface re-park sweep', () => {
       expect(r.effects).toEqual([]);
     });
     it('withdraws a mechanical-hold hand-off park whose own re-check never ran', () => {
-      const handoff = { id: 'C_handoff', author: { login: 'web-everything' }, body: `🧑‍⚖️ review — mechanical hold handed to the operator\n\n<!-- mechanical-hold-handoff: ${head} -->` };
+      const handoff = { id: 'C_handoff', createdAt: PARK_AT, author: { login: 'web-everything' }, body: `🧑‍⚖️ review — mechanical hold handed to the operator\n\n<!-- mechanical-hold-handoff: ${head} -->` };
       const r = heal({ comments: [{ id: 'C_clear', ...clearance(head) }, handoff] });
       expect(r.live.labels).toContain('review:accepted');
       expect(r.live.labels).not.toContain('review:human');
