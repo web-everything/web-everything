@@ -728,7 +728,9 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
         getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: () => ['test', 'security-scan'] });
         return denied();
       };
-      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      // A's own answer is the entry that won, never the declared defaults the file no longer holds.
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'security-scan'], source: 'cache' });
       expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 2000 });
       const next = vi.fn(() => ['never']);
       expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3000, readChecks: next }))
@@ -742,8 +744,19 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
         getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
         return denied();
       };
-      getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: readA });
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'security-scan'], source: 'cache' });
       expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 1000 });
+    });
+
+    it('a denied reader answers with a winning live entry past its TTL as stale-cache, keeping the partial floor', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 10, readChecks: () => ['test', 'security-scan'] });
+        throw Object.assign(new Error('Resource not accessible by integration (HTTP 403)'), { partialChecks: ['merge-gate'] });
+      };
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 5000, ttlMs: 10, readChecks: readA }))
+        .toEqual({ checks: ['test', 'security-scan', 'merge-gate'], source: 'stale-cache', cacheAgeMs: 4000 });
     });
 
     it('an older live read never moves a newer live entry backwards', () => {
@@ -752,7 +765,8 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
         getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: () => ['test', 'security-scan'] });
         return ['test'];
       };
-      getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA });
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'security-scan'], source: 'cache' });
       expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 2000 });
     });
 

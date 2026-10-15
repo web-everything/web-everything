@@ -345,6 +345,7 @@ export function getRequiredStatusChecks({
   }
 
   const save = (checks, source, classic) => {
+    let winner = null;
     if (repo) {
       try {
         mkdirSync(dirname(cachePath), { recursive: true });
@@ -354,13 +355,24 @@ export function getRequiredStatusChecks({
           const entries = readCacheEntries(cachePath);
           // The same key may have changed since this read began (`cache` is a pre-read snapshot): keep the
           // current entry if it outranks this write — see cacheEntryOutranks.
-          if (cacheEntryOutranks(entries[key], { source, fetchedAtMs: now })) return;
+          if (cacheEntryOutranks(entries[key], { source, fetchedAtMs: now })) {
+            winner = entries[key];
+            return;
+          }
           entries[key] = { checks, source, fetchedAtMs: now, ...(Array.isArray(classic) ? { classic } : {}) };
           writeJsonAtomic(cachePath, { entries });
         }, { timeoutMs: 2_000 });
       } catch {
         /* the cache is an optimisation — never fail a read over a write */
       }
+    }
+    // The entry that outranked this write is what the cache now holds: answer with it, exactly as the next reader
+    // will, so this call never returns a policy (e.g. the declared defaults) the file already superseded.
+    if (winner) {
+      if (!isLiveCacheEntry(winner)) return withClassic({ checks: withPartial(winner.checks), source: winner.source }, winner);
+      return (now - winner.fetchedAtMs) < ttlMs
+        ? withClassic({ checks: winner.checks, source: 'cache' }, winner)
+        : withClassic({ checks: withPartial(winner.checks), source: 'stale-cache', cacheAgeMs: now - winner.fetchedAtMs }, winner);
     }
     return withClassic({ checks, source }, { classic });
   };
