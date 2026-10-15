@@ -10,7 +10,7 @@ import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
   MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
-  planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering, _resetNumberingRestampMemo,
+  planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering, _resetNumberingRestampMemo, numberingWithdrawalOwed,
   strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
 } from '../numbering-carry.mjs';
 
@@ -780,6 +780,41 @@ describe('numbering acceptance restamp', () => {
         provider.editComment = edit;
         expect(step()).toMatchObject({ action: 'withdrawn', withdrawn: 1 });
         expect(calls).toHaveLength(1);
+      });
+      // Operator send-back (#5233): the hold is a label swap the thread cannot show, and the one edit fails.
+      it('a withdrawal that failed behind a label-only hold stays owed and is finished by the next pass', async () => {
+        const { thread, calls, provider, step, labels } = liveThread();
+        const post = provider.postComment;
+        provider.postComment = (r, n, body) => { labels.push('review:human'); post(r, n, body); };
+        const edit = provider.editComment;
+        provider.editComment = () => { throw Error('rate limited'); };
+        expect(step()).toMatchObject({ action: 'error', reason: 'withdrawal failed: rate limited', commentPosted: true });
+        const record = thread.find((c) => c.id === 'IC_posted0');
+        expect(record.body).toContain('reviewed-sha:');
+        expect((await readers(thread)).drain.acceptedSha).toBe(TO);
+        expect(numberingWithdrawalOwed('o/n', 5025)).toBe(true);
+        // The labels, the carry switch and the settled memo no longer matter: the withdrawal is owed.
+        provider.editComment = edit;
+        expect(step({ enabled: false })).toMatchObject({ action: 'withdrawn', withdrawn: 1 });
+        expect(calls[calls.length - 1]).toEqual({ edit: 'IC_posted0', body: record.body });
+        expect(record.body).toContain('<!-- numbering-restamp-withdrawn:');
+        const seen = await readers(thread);
+        expect(seen.drain.acceptedSha).toBe(FROM);
+        expect(seen.spawned).toEqual([]);
+        expect(numberingWithdrawalOwed('o/n', 5025)).toBe(false);
+        expect(numberingWithdrawalOwed(null, 5025)).toBe(false);
+        expect(step({ enabled: false })).toBeNull();
+      });
+      it('an owed withdrawal whose record is gone from the thread is forgiven', () => {
+        const { thread, provider, step, labels } = liveThread();
+        const post = provider.postComment;
+        provider.postComment = (r, n, body) => { labels.push('review:human'); post(r, n, body); };
+        provider.editComment = () => { throw Error('offline'); };
+        step();
+        expect(numberingWithdrawalOwed('o/n', 5025)).toBe(true);
+        thread.splice(thread.findIndex((c) => c.id === 'IC_posted0'), 1);
+        expect(step()).toBeNull();
+        expect(numberingWithdrawalOwed('o/n', 5025)).toBe(false);
       });
       it('a forged withdrawal notice carrying an objection still holds', () => {
         const { thread } = liveThread();

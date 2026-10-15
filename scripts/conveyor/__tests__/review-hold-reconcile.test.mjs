@@ -602,6 +602,23 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
       numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
     expect(seen).toEqual([]);
   });
+  // Operator send-back (#5233): a failed withdrawal behind a hold the thread cannot show stays owed across sweeps.
+  it('keeps reaching a record whose withdrawal failed, though the thread shows no hold against it', () => {
+    _resetNumberingRestampMemo();
+    const failing = { editComment: () => { throw Error('rate limited'); } };
+    const first = restampAfterNumbering({ repo: 'o/n', pr: 5025, provider: failing, enabled: false,
+      state: { labels: [{ name: 'review:pending' }], headRefOid: 'a'.repeat(40), comments: [accept, objection, record] } });
+    expect(first).toMatchObject({ action: 'error', reason: 'withdrawal failed: rate limited' });
+    const seen = [];
+    const p = provider();
+    p.editComment = vi.fn();
+    const result = sweepFixture({ repo: 'o/n', provider: p,
+      listPrs: () => [{ ...pr(5025, ['review:human']), headRefOid: 'a'.repeat(40), comments: [accept, record], commentsComplete: true }],
+      numberingRestamp: (opts) => { seen.push(opts.pr); return { action: 'withdrawn', reason: 'withdrawn' }; } });
+    expect(seen).toEqual([5025]);
+    expect(result).toContainEqual({ num: 5025, numberingRestamp: 'withdrawn', detail: 'withdrawn' });
+    _resetNumberingRestampMemo();
+  });
   // Self-review (#5233): `gh pr list --json comments` stops at the first page, so a record past it is invisible there.
   describe('a capped listing on a label-held PR', () => {
     afterEach(_resetStrandedCheckMemo);

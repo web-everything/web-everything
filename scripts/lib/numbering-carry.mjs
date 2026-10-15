@@ -464,7 +464,18 @@ export function buildNumberingRestampBody({ fromSha, toSha, human, actor, headDi
 }
 
 const settledRestamps = new Set();
-export function _resetNumberingRestampMemo() { settledRestamps.clear(); }
+/**
+ * Re-stamp records whose withdrawal was started and not finished, by PR (`repo#pr` → comment node ids). A hold the
+ * thread cannot show (a label swap) leaves nothing to re-derive the withdrawal from, so a failed edit is remembered
+ * here and every later pass finishes it. Process-local, like the settled memo.
+ */
+const owedWithdrawals = new Map();
+export function _resetNumberingRestampMemo() { settledRestamps.clear(); owedWithdrawals.clear(); }
+/** Is a numbering re-stamp withdrawal still owed on this PR? `repo` null matches the PR number in any repository. */
+export function numberingWithdrawalOwed(repo, pr) {
+  const tail = `#${pr}`;
+  return [...owedWithdrawals].some(([k, ids]) => ids.size > 0 && (repo == null ? k.endsWith(tail) : k === `${repo}${tail}`));
+}
 /** Has this PR head already reached a settled numbering re-stamp outcome in this process? (lets a sweep skip its live re-read) */
 export function numberingRestampSettled(repo, pr, head) { return settledRestamps.has(`${repo}#${pr}@${head}`); }
 const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
@@ -506,6 +517,11 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
 export const MAX_WITHDRAWALS_PER_PASS = 10;
 function withdrawRecords({ provider, repo, pr, records, writer }) {
   const done = new Set();
+  const owedKey = `${repo}#${pr}`;
+  // Owed from the moment the withdrawal is decided until its edit lands: a failure (or a crash) leaves it owed.
+  const owed = owedWithdrawals.get(owedKey) ?? new Set();
+  for (const c of records) if (restampRecord(c) && typeof c.id === 'string' && c.id) owed.add(c.id);
+  if (owed.size) owedWithdrawals.set(owedKey, owed);
   for (const c of records) {
     const r = restampRecord(c);
     if (!r || done.has(c.id)) continue;
@@ -515,8 +531,23 @@ function withdrawRecords({ provider, repo, pr, records, writer }) {
     if (typeof provider?.editComment !== 'function') throw Error('provider cannot edit a comment');
     provider.editComment(repo, c.id, buildNumberingWithdrawnBody({ fromSha: r.from, toSha: r.to, writer }), { pr });
     done.add(c.id);
+    owed.delete(c.id);
+    if (!owed.size) owedWithdrawals.delete(owedKey);
   }
   return done.size;
+}
+
+/** PURE-ish: the owed records still standing on this thread; an owed id that is no longer a record is forgiven. */
+function owedRecordsOn({ repo, pr, comments }) {
+  const key = `${repo}#${pr}`;
+  const owed = owedWithdrawals.get(key);
+  if (!owed || !Array.isArray(comments)) return [];
+  const standing = comments.filter((c) => owed.has(c?.id) && restampRecord(c));
+  // Forgiven: edited into the notice (by anyone), or gone from the thread the caller just read.
+  const kept = new Set(standing.map((c) => c.id));
+  for (const id of [...owed]) if (!kept.has(id)) owed.delete(id);
+  if (!owed.size) owedWithdrawals.delete(key);
+  return standing;
 }
 
 /** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
@@ -529,10 +560,14 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
   // withdrawn first, whatever the labels, the carry switch or the settled memo say: switching the carry off must
   // never leave its records standing. The next pass plans from the thread as it then stands.
-  if (plan.stranded?.length) {
-    if (dryRun) return { action: 'would-withdraw', withdrawn: plan.stranded.length, reason: plan.reason ?? 'stranded re-stamp record' };
+  // A withdrawal an earlier pass started and could not finish is owed too, even when the hold that caused it (a label
+  // swap) cannot be re-derived from the thread now.
+  const owedNow = owedRecordsOn({ repo, pr, comments: state?.comments });
+  const toWithdraw = [...(plan.stranded ?? []), ...owedNow.filter((c) => !plan.stranded?.includes(c))];
+  if (toWithdraw.length) {
+    if (dryRun) return { action: 'would-withdraw', withdrawn: toWithdraw.length, reason: plan.reason ?? 'stranded re-stamp record' };
     let withdrawn;
-    try { withdrawn = withdrawRecords({ provider, repo, pr, records: plan.stranded, writer }); }
+    try { withdrawn = withdrawRecords({ provider, repo, pr, records: toWithdraw, writer }); }
     catch (e) { return { action: 'error', reason: `withdrawal failed: ${errorReason(e)}` }; }
     return { action: 'withdrawn', withdrawn, reason: 're-stamp record(s) that carry no standing acceptance withdrawn' };
   }

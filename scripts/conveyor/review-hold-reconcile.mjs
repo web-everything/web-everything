@@ -60,7 +60,7 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, restampAfterNumbering, strandedNumberingRecords } from '../lib/numbering-carry.mjs';
+import { NUMBERING_RESTAMP_MARKER, numberingRestampSettled, numberingWithdrawalOwed, restampAfterNumbering, strandedNumberingRecords } from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -172,10 +172,13 @@ export function sweepReviewHoldLabels({
     const listedState = () => {
       const listed = Array.isArray(pr.comments) ? pr.comments : null;
       const complete = Boolean(listed) && (pr.commentsComplete === true || listed.length < LIST_COMMENTS_CAP);
+      // A withdrawal an earlier pass started and could not finish (a hold the thread cannot show) is owed whatever the
+      // listing says.
+      const owed = numberingWithdrawalOwed(repo ?? resolvedRepo, pr.number);
       const shown = complete && strandedNumberingRecords(listed).length > 0;
       // Off the carry path a PR listed with no comment field at all says nothing either way and is left alone.
       return { listed, complete, shown,
-        stranded: shown || (!complete && (carryLabels || Boolean(listed)) && !strandedChecked.has(checkKey)) };
+        stranded: shown || owed || (!complete && (carryLabels || Boolean(listed)) && !strandedChecked.has(checkKey)) };
     };
     let view;
     if (carryLabels) view = listedState();
