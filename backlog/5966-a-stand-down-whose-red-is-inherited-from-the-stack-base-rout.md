@@ -66,10 +66,10 @@ All test execution goes through Node on `we:scripts/readiness/heavy-admission.mj
 
 Authorization controls are required at every boundary in the matrix below. The positive control uses a trusted author and a leading marker with otherwise-valid identities and reproduction evidence. Pair each authorization requirement with its independent negative control:
 
-| Authorization requirement | Required negative control | Expected result |
-| --- | --- | --- |
-| Require a trusted author | A forged (non-trusted) author supplies the otherwise-valid leading marker | The forged author with the marker is refused, even when all other evidence is valid |
-| Require a leading marker | A trusted author supplies a quoted (not leading) marker; run blockquote, fenced-code and after-prose forms separately | The quoted (not leading) marker is refused, even when the author is trusted and all other evidence is valid |
+| Authorization requirement | Positive control | Required negative control | Expected negative result |
+| --- | --- | --- | --- |
+| Require a trusted author | A trusted author supplies a leading marker and valid evidence | Change only the author to a forged (non-trusted) author; retain the same leading marker and valid evidence | The forged (non-trusted) author with the marker is refused |
+| Require a leading marker | A trusted author supplies a leading marker and valid evidence | Change only the marker placement to quoted (not leading); retain the trusted author and valid evidence, and run blockquote, fenced-code and after-prose forms separately | The quoted (not leading) marker is refused |
 
 Keep all other evidence identical to the positive control so each refusal independently proves its corresponding requirement. Neither negative control may authorize a base fix, release a child hold, trigger delivery or refresh, or acknowledge delivery and suppress a legitimate retry. Both must pass at every boundary; the combined negative case below is additional coverage, not a substitute for either independent refusal.
 
