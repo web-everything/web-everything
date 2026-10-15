@@ -295,8 +295,8 @@ it('preserves operator-protected Astra and ruling escalation routes', () => {
   const policy = copy();
   for (const k of ['prepare', 'prepare-decision', 'prepare-item', 'investigate']) expect(policy.operations[k].model).toBe('astra');
   for (const k of ['design', 'diagnosis']) expect(policy.taskTypes[k].model).toBe('astra');
-  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'opus', fallback: [] });
-  expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'opus', effort: 'high' }] });
+  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
+  expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }] });
 });
 
 it('honours a configured retry array at the real launch boundary', async () => {

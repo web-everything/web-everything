@@ -57,6 +57,7 @@ import {
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
@@ -372,6 +373,7 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
  */
 export async function runRealDispatchSmoke({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
+  routingPolicy = readRoutingPolicy(),
 }) {
   const t0 = Date.now();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
@@ -386,8 +388,9 @@ export async function runRealDispatchSmoke({
   const prompt = dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr });
   const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off', WE_SMOKE_ALLOW_REAL_WORKER: '1' }; // Deliberate real-worker sentinel smoke.
   const base = { sessionId, scratch };
-  log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker from ${tree} (scratch store ${store})`);
-  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt], {
+  const model = resolvePolicyModel('claude', routingPolicy.aliases.claude.haiku ? 'haiku' : 'sonnet', routingPolicy);
+  log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker model=${model} (source routing-policy cheapest Claude alias) from ${tree} (scratch store ${store})`);
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt, model], {
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {

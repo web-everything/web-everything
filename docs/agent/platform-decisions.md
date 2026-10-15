@@ -6225,6 +6225,13 @@ high-risk work, statute-tier paths, security-critical work, and decision prepara
 Dispatch machinery alone does not raise the model tier. This governs the work-doer,
 not the separate build-supervisor ladder or external-provider eligibility.
 
+Operator refinement, 2026-10-15: daemon fix rounds, ruling/operator send-backs and
+block-ruled fixes do not raise Claude to Opus. The critical-work verdict used by
+`CRITICAL_WORK_GATE` is the only Opus exception on this path. `fix.claudeEscalationModel`
+defaults to `sonnet` (allowed: `haiku`, `sonnet`), resolved through standard → platform →
+tool → `WE_FIX_CLAUDE_ESCALATION_MODEL`, with its source logged. Overlay dispatch smoke
+explicitly pins the routing policy's cheapest Claude alias: `haiku`, else `sonnet`.
+
 Review sessions always receive an explicit model: Sonnet by default, Opus for high
 care/escalation or statute-tier paths. The review daemon forwards the PR snapshot's
 escalation reasons and touched paths to the session launcher; CLI defaults never

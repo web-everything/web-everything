@@ -7,7 +7,8 @@
     "Card 84: review-seat:mandatory:<correctness|security> picks a review-pr mandatory seat's provider — absent or claude = Claude only; agy-claude with mode shadow = agy judges beside Claude and only Claude counts (agreement report: node scripts/lib/review-shadow-agreement.mjs --report); agy-claude without mode = agy judges, Claude on escape. review-seat:advisory:agy-correctness seats the advisory agy juror (delete the entry to turn it off).",
     "Review operation judges use judge:<operation> (for example judge:review-pr); review-seat:<lens> selects an added seat. Native agent-only adapters take the first Claude entry; unsupported or missing adapters take the declared fallback. Existing CLI pins remain explicit per-run choices.",
     "Astra effort correctness is unproven (see CODEX_TIER_EFFORT in we:scripts/lib/codex-model-routing.mjs): effort is a cost/latency dial until measured.",
-    "Operator 2026-09-30: Gemini only with confidence of value. smallPrepare controls the <=3, explicitly well-scoped, no-design prepare exception; widen it here as evidence arrives. Unknown size/design stays Codex."
+    "Operator 2026-09-30: Gemini only with confidence of value. smallPrepare controls the <=3, explicitly well-scoped, no-design prepare exception; widen it here as evidence arrives. Unknown size/design stays Codex.",
+    "Operator 2026-10-15: Claude workers default to Sonnet to contain cost. Fix rounds and send-backs alone never justify Opus; only a critical-work verdict may raise a Claude fix to Opus. Overlay dispatch smoke pins the cheapest Claude alias (haiku, else sonnet)."
   ],
   "version": 1,
   "aliases": {
@@ -75,8 +76,9 @@
     "*": {"inherit": true,"effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"}},
     "build": {"provider": "codex","model": "sol","effort": {"claude": "high","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
     "fix": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
-    "fix:ruling-escalation-stronger": {"provider": "claude","model": "opus","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": []},
-    "fix:ruling-escalation-cross-provider": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "opus","effort": "high"}]},
+    "fix:ruling-escalation-stronger": {"provider": "claude","model": "sonnet","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": []},
+    "fix:critical-work": {"provider": "claude","model": "opus","effort": "high","fallback": []},
+    "fix:ruling-escalation-cross-provider": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
     "ci-heal": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
     "prepare": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "prepare-decision": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},

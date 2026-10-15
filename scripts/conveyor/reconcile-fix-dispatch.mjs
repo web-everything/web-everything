@@ -163,6 +163,7 @@ import { loadFixerLadder } from './fixer-ladder.mjs';
 import { mainRedPriorityRank } from './main-ci-red-core.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
+import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routing-policy-io.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
@@ -1071,7 +1072,7 @@ export function tryResumeRoundFix(planned, {
   if (roundOf(planned) < 2) return declined({ resume: false, reason: 'first-round', why: 'round 1 has no earlier fixer session' });
   if (wrapFix) return declined({ resume: false, reason: 'wrapped-launch', why: 'the wrapped (claude -p) fix launch has no round resume yet' });
   const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
-  const table = launchTableFor(planned, roundEscalation);
+  const table = launchTableFor(planned, roundEscalation, { fixSettings });
   const desiredModel = table?.model ? claudeSpawnAlias(String(table.model)) : null;
   const defaultBranch = 'main'; // every constellation repo's default branch (reconcile-pass assumes the same)
   const inputs = readInputs({ planned, slug, root, listAgentsAll, defaultBranch, repoSlug: ghRepoSlug(repo) });
@@ -1206,9 +1207,20 @@ export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLad
   return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable });
 }
 
-/** Card xrbu1bp — the routing table this fix launch runs on: the ruling rung, the takeover rung, or the round rung. */
-export function launchTableFor(planned, roundEscalation) {
-  return fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
+/** Every Claude fix gets an explicit policy model, including send-backs without a ladder route.
+ * Uses the same critical-work verdict supplied to provider-routing's CRITICAL_WORK_GATE; a rung alone is no risk signal. */
+export function launchTableFor(planned, roundEscalation, { fixSettings = resolveFixSettings() } = {}) {
+  const table = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
+  const verdict = criticalWorkVerdict({ ...planned, taskType: 'fix', filesTouched: planned.scope ?? [] });
+  if (verdict.critical) {
+    const route = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', available: ['claude'], gateClosed: true });
+    return { ...table, model: route.model, effort: route.effort,
+      reason: `routing-policy fix:critical-work (${verdict.reasons.map(r => r.proxy).join(', ')})` };
+  }
+  const configured = fixSettings.claudeEscalationModel ?? 'sonnet';
+  const model = ['haiku', 'sonnet'].includes(configured) ? configured : 'sonnet';
+  return { ...table, model: resolvePolicyModel('claude', model), effort: table?.effort ?? 'high',
+    reason: `fix.claudeEscalationModel=${model} (source ${fixSettings.sources?.claudeEscalationModel ?? 'standard'})` };
 }
 
 /**
@@ -1477,7 +1489,8 @@ export function dispatchFix(planned, {
     // claim is released below, and the next tick retries; nothing has been spawned.
     // Card xrbu1bp — an ordinary round at or past `fix.strongerModelFromRound` runs on the stronger-model rung.
     const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
-    const ladderTable = launchTableFor(planned, roundEscalation); // may refuse before anything is posted
+    const ladderTable = launchTableFor(planned, roundEscalation, { fixSettings }); // may refuse before anything is posted
+    if (decision.executor === 'claude') console.error(`reconcile-fix-dispatch: PR #${planned.pr} model=${ladderTable.model} (${ladderTable.reason})`);
     if (roundEscalation) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${roundEscalation.round} on the ${roundEscalation.rung.id} route (fix.strongerModelFromRound=${roundEscalation.fromRound}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
@@ -2243,7 +2256,7 @@ export function replayFixLaunch({
   fixSettings = resolveFixSettings(), resumeRound = tryResumeRoundFix, loadLadder = () => loadFixerLadder(),
 } = {}) {
   const slug = ghRepoSlug(repo);
-  const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', slug, '--json', 'number,headRefName,headRefOid,baseRefName,labels,state'],
+  const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', slug, '--json', 'number,headRefName,headRefOid,baseRefName,labels,state,files'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
   let attempts;
   if (Number.isInteger(round) && round >= 1) attempts = round - 1;
@@ -2255,9 +2268,10 @@ export function replayFixLaunch({
   const planned = {
     pr: Number(view.number), itemNum: laneRefItemNum(view.headRefName) ?? null, laneRef: view.headRefName,
     headRefOid: view.headRefOid, baseRefName: view.baseRefName, attempts, isConflict: labels.includes(CONFLICT_LABEL),
+    scope: (view.files ?? []).map(file => file.path),
   };
   const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
-  const table = launchTableFor(planned, roundEscalation);
+  const table = launchTableFor(planned, roundEscalation, { fixSettings });
   const launch = resumeRound(planned, { repo, root, fixSettings, loadLadder, dryRun: true });
   return {
     pr: planned.pr, state: view.state ?? null, round: roundOf(planned), attempts, roundOverride: Number.isInteger(round),
