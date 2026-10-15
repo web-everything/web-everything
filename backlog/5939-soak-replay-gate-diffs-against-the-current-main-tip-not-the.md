@@ -2,9 +2,11 @@
 bornAs: x1tkiy5
 kind: story
 size: 1
-status: open
+status: resolved
 scope: ["we:.github/workflows/soak-replay-gate.yml", "we:scripts/lib/__tests__/soak-replay-gate-workflow.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "edb8055073a75ec1efa998a6d9778476e7437d4d"
 tags: []
