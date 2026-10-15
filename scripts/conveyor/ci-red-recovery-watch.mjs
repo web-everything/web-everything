@@ -57,6 +57,8 @@
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
 import { resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { resolveCiHealBudget } from './reconcile-core.mjs';
@@ -423,9 +425,10 @@ export function defaultReadMainTip({ repo, defaultBranch = 'main', exec = execFi
 }
 
 export function defaultPostExhaustedRetryComment(prNumber, { body, repo, exec = execFileSyncThrottled } = {}) {
-  exec('gh', ['pr', 'comment', String(prNumber), '--repo', repoSlug(repo), '--body', body], {
+  const out = exec('gh', ['pr', 'comment', String(prNumber), '--repo', repoSlug(repo), '--body', body], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
   });
+  if (isGhDeferred(out)) throw new Error('exhausted-retry comment publication deferred');
 }
 
 /** Edit our own erroneous stand-down using the node id returned by the complete comment reader. */
@@ -525,10 +528,20 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     dispatch.push(d);
     if (!apply) continue;
     const root = resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
+    const held = checkClaim({ repo, branch: c.headRefName });
+    if (held) {
+      refusals.push({ ...d, kind: 'exhausted-retry-failed', why: held.message });
+      applied.push({ prNumber: c.prNumber, ok: false, deferred: true, error: held.message });
+      continue;
+    }
+    const attempt = { prNumber: c.prNumber, kind: facts.kind, trigger: decision.trigger, mode: decision.mode,
+      mainSha: mainTip.sha, headSha: c.headSha, why: decision.why, attemptId: randomUUID() };
+    // Persist consumption BEFORE either side effect. If this write fails, no retry may execute.
+    postComment(c.prNumber, { repo, body: buildExhaustedRetryComment({ ...attempt, reserved: true }) });
     let result;
     try {
-      const held = checkClaim({ repo, branch: c.headRefName });
-      result = held ? { ok: false, deferred: true, error: held.message }
+      const claimed = checkClaim({ repo, branch: c.headRefName });
+      result = claimed ? { ok: false, deferred: true, error: claimed.message }
         : decision.mode === 'rebase' ? refresh(c.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
         : trigger(c, { repo: repoSlug(repo), defaultBranch });
     } catch (e) { result = { ok: false, error: describeExecError(e) }; }
@@ -536,13 +549,10 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     if (!result.ok || result.deferred) {
       refusals.push({ ...d, kind: 'exhausted-retry-failed', why: result.error ?? 'retry deferred' });
     }
-    // Claim holds spend nothing; every actual attempt, including conflicts and thrown push errors, is bounded.
-    if (!result.deferred) {
-      postComment(c.prNumber, { repo, body: buildExhaustedRetryComment({ prNumber: c.prNumber, kind: facts.kind,
-        trigger: decision.trigger, mode: decision.mode, mainSha: mainTip.sha, headSha: c.headSha,
-        retryHeadSha: result.newCommit ?? result.newHeadSha ?? c.headSha, why: decision.why, ok: result.ok }) });
-      if (result.ok && result.action === 'rebased' && result.newCommit) reconcileAcceptance({ prNumber: c.prNumber, newHead: result.newCommit, repo, root });
-    }
+    // Once reserved, even an ambiguous deferral consumes the attempt. A failed outcome write cannot refund it.
+    postComment(c.prNumber, { repo, body: buildExhaustedRetryComment({ ...attempt,
+      retryHeadSha: result.newCommit ?? result.newHeadSha ?? c.headSha, ok: result.ok && !result.deferred }) });
+    if (result.ok && result.action === 'rebased' && result.newCommit) reconcileAcceptance({ prNumber: c.prNumber, newHead: result.newCommit, repo, root });
     applied.push({ prNumber: c.prNumber, ...result });
   }
   return { dispatch, refusals, applied, settings };

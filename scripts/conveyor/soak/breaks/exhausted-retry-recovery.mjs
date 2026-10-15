@@ -26,6 +26,41 @@ export default {
     const settings = resolveExhaustedRetry({ env: {}, platform: {}, file: {} });
     const redRun = { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-14T02:00:00Z', checkConclusions: { 'daemon-soak': 'failure' } };
     const greenRun = { ...redRun, conclusion: 'success', updatedAt: '2026-10-14T03:00:00Z', checkConclusions: { 'daemon-soak': 'success' } };
+    // Round 4: terminal commit statuses complete retries, and publication failure cannot repeat an action.
+    for (const state of ['SUCCESS', 'FAILURE', 'ERROR']) {
+      const thread = [...Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER)),
+        trusted(buildExhaustedRetryComment({ headSha: head }))];
+      const result = sweepExhaustedRetry({ apply: true, settings, ciHealCap: 3, mainRuns: [],
+        excuseHolds: prs => prs,
+        readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: head,
+          statusCheckRollup: [{ __typename: 'StatusContext', context: 'external-ci', state, createdAt: greenRun.updatedAt }] }],
+        readComments: () => thread, readAheadBy: () => 2, readAttributedRequiredChecks: () => ['external-ci'],
+        readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }), readMainFailureSignature: () => null,
+        postComment: (n, { body }) => thread.push(trusted(body)) });
+      if (state === 'SUCCESS' ? !result.applied.some(a => a.kind === 'exhausted-retry-recovered')
+        : result.refusals[0]?.kind !== 'needs-you') violations.push(`terminal StatusContext ${state} stranded retry`);
+    }
+    for (const aheadBy of [0, 2]) {
+      for (const failFirst of [true, false]) {
+        const thread = Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER));
+        let attempts = 0;
+        const attempt = () => { attempts++; return { ok: false, error: 'conflict' }; };
+        for (let tick = 0; tick < 3; tick++) {
+          try {
+            sweepExhaustedRetry({ apply: true, settings, ciHealCap: 3, mainRuns: [],
+              candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha: head, aheadBy,
+                comments: thread, mainFailureSignature: null }],
+              now: Date.parse(at) + 24 * 3600000, readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }),
+              checkClaim: () => null, refresh: attempt, trigger: attempt,
+              postComment: (n, { body }) => {
+                if (failFirst || attempts) throw Error('comment unavailable');
+                thread.push(trusted(body));
+              } });
+          } catch (e) { if (e.message !== 'comment unavailable') throw e; }
+        }
+        if (attempts !== (failFirst ? 0 : 1)) violations.push(`publication failure repeated retry: ahead=${aheadBy}, first=${failFirst}, attempts=${attempts}`);
+      }
+    }
     // Both newly introduced recovery routes must release a hold only after an operator answer.
     for (const healCount of [0, 2, 3]) {
       const stop = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', head })), id: 'IC_hold' };

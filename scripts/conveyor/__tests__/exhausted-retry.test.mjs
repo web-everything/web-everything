@@ -11,7 +11,8 @@ import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { ADVISORY_FIX_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
 import { extractInfraSignatures, planMainRedRebases, classifyMainDefect } from '../main-red-recovery.mjs';
-import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature, defaultEditExhaustedRetryComment, defaultReadPrComments } from '../ci-red-recovery-watch.mjs';
+import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature, defaultEditExhaustedRetryComment, defaultReadPrComments,
+  defaultPostExhaustedRetryComment } from '../ci-red-recovery-watch.mjs';
 import * as watcher from '../ci-red-recovery-watch.mjs';
 
 const at = '2026-10-14T01:00:00Z';
@@ -30,6 +31,122 @@ const basePlan = extra => planExhaustedRetry({ facts, retriesUsed: 0, settings: 
   aheadBy: 2, now: Date.parse(later), ...extra });
 
 describe('PR #5331 production wiring and complete threads', () => {
+  it.each(['SUCCESS', 'FAILURE', 'ERROR'])('recognizes terminal required StatusContext results after retry: %s', state => {
+    const comments = [trusted(buildExhaustedRetryComment({ headSha }))];
+    const pr = { headRefOid: headSha, statusCheckRollup: [
+      { __typename: 'StatusContext', context: 'external-ci', state, createdAt: later },
+    ] };
+    expect(retryOutcome({ comments, pr, requiredChecks: ['external-ci'] })).toEqual(
+      state === 'SUCCESS' ? { state: 'recovered' } : { state: 'failed', failures: ['external-ci'] });
+    pr.statusCheckRollup[0].createdAt = at;
+    expect(retryOutcome({ comments, pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'pending' });
+    pr.statusCheckRollup[0] = { context: 'external-ci', state: 'PENDING', createdAt: later };
+    expect(retryOutcome({ comments, pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'pending' });
+    pr.statusCheckRollup[0] = { context: 'external-ci', state, createdAt: 'invalid' };
+    expect(retryOutcome({ comments, pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'pending' });
+  });
+
+  it('refuses a deferred reservation publication before executing the retry', () => {
+    const attempt = vi.fn();
+    expect(() => sweepExhaustedRetry({ apply: true, settings: settings(), mainRuns: [],
+      candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy: 2,
+        comments: heals, exhaustion: facts, mainFailureSignature: null }],
+      readMainTip: () => ({ sha: mainSha, committedAt: later }), checkClaim: () => null, refresh: attempt,
+      postComment: (prNumber, options) => defaultPostExhaustedRetryComment(prNumber,
+        { ...options, exec: () => JSON.stringify({ outcome: 'deferred-low-budget' }) }),
+    })).toThrow('publication deferred');
+    expect(attempt).not.toHaveBeenCalled();
+  });
+
+  it('counts a reservation and its outcome once and measures CI from the reservation', () => {
+    const reservation = trusted(buildExhaustedRetryComment({ headSha, attemptId: 'attempt-1', reserved: true }));
+    const outcome = { ...trusted(buildExhaustedRetryComment({ headSha, attemptId: 'attempt-1' })),
+      createdAt: '2026-10-14T03:00:00Z' };
+    const pr = { headRefOid: headSha, statusCheckRollup: [{ context: 'external-ci', state: 'SUCCESS', createdAt: later }] };
+    expect(countExhaustedRetries([reservation, outcome])).toBe(1);
+    expect(countExhaustedRetries([reservation, outcome, trusted(buildExhaustedRetryComment({ headSha }))])).toBe(2);
+    expect(retryOutcome({ comments: [reservation, outcome], pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'recovered' });
+    expect(retryOutcome({ comments: [reservation], pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'failed', failures: [] });
+    // GitHub comment timestamps can tie to the second; the later thread entry wins.
+    outcome.createdAt = at;
+    expect(retryOutcome({ comments: [reservation, outcome], pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'recovered' });
+    expect(retryOutcome({ comments: [reservation, { ...outcome, author: { login: 'outsider' } }], pr,
+      requiredChecks: ['external-ci'] })).toEqual({ state: 'failed', failures: [] });
+  });
+
+  it('rechecks a claim acquired during reservation publication and retains consumption', () => {
+    const comments = [...heals];
+    const refresh = vi.fn();
+    let claimed = false;
+    const options = { apply: true, settings: settings(), mainRuns: [],
+      candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy: 2,
+        comments, exhaustion: facts, mainFailureSignature: null }],
+      readMainTip: () => ({ sha: mainSha, committedAt: later }), refresh,
+      checkClaim: () => claimed ? { message: 'held' } : null,
+      postComment: (n, { body }) => { comments.push(trusted(body)); claimed = true; } };
+    expect(sweepExhaustedRetry(options).applied[0]).toMatchObject({ ok: false, deferred: true });
+    expect(countExhaustedRetries(comments)).toBe(1);
+    claimed = false;
+    expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 2])('does not repeat an attempt after retry-marker publication fails (ahead=%s)', aheadBy => {
+    const comments = [...heals];
+    const attempt = vi.fn(() => ({ ok: false, error: 'conflict' }));
+    const postComment = vi.fn(() => { throw Error('comment unavailable'); });
+    const options = { apply: true, settings: settings(), ciHealCap: 3, mainRuns: [],
+      candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy, comments,
+        exhaustion: facts, mainFailureSignature: null }],
+      now: Date.parse(at) + 24 * 3600000, readMainTip: () => ({ sha: mainSha, committedAt: later }),
+      checkClaim: () => null, refresh: attempt, trigger: attempt, postComment };
+    for (let tick = 0; tick < 3; tick++) {
+      try { sweepExhaustedRetry(options); } catch (e) { expect(e.message).toBe('comment unavailable'); }
+    }
+    expect(attempt).not.toHaveBeenCalled();
+  });
+
+  it.each([[0, false], [2, false], [0, true], [2, true]])('retains consumption when the outcome comment fails (ahead=%s, ok=%s)', (aheadBy, ok) => {
+    const comments = [...heals];
+    let currentHead = headSha;
+    const attempt = vi.fn(() => {
+      expect(countExhaustedRetries(comments)).toBe(1);
+      if (ok) currentHead = 'c'.repeat(40);
+      return ok ? { ok: true, newHeadSha: currentHead } : { ok: false, error: 'conflict' };
+    });
+    const options = { apply: true, settings: settings(), ciHealCap: 3, mainRuns: [],
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
+        statusCheckRollup: [{ context: 'external-ci', state: 'FAILURE', createdAt: at }] }],
+      excuseHolds: prs => prs, readAttributedRequiredChecks: () => ['external-ci'],
+      readComments: () => comments, readAheadBy: () => aheadBy, readMainFailureSignature: () => null,
+      now: Date.parse(at) + 24 * 3600000, readMainTip: () => ({ sha: mainSha, committedAt: later }),
+      checkClaim: () => null, refresh: attempt, trigger: attempt,
+      postComment: vi.fn((n, { body }) => {
+        if (attempt.mock.calls.length) throw Error('outcome unavailable');
+        comments.push(trusted(body));
+      }) };
+    for (let tick = 0; tick < 3; tick++) {
+      try { sweepExhaustedRetry({ ...options }); } catch (e) { expect(e.message).toBe('outcome unavailable'); }
+    }
+    expect(attempt).toHaveBeenCalledOnce();
+    expect(countExhaustedRetries(comments)).toBe(1);
+  });
+
+  it('keeps an accepted reservation consumed when its acknowledgement is lost', () => {
+    const comments = [...heals];
+    const refresh = vi.fn();
+    const options = { apply: true, settings: settings(), mainRuns: [],
+      candidates: [{ prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy: 2,
+        comments, exhaustion: facts, mainFailureSignature: null }],
+      readMainTip: () => ({ sha: mainSha, committedAt: later }), checkClaim: () => null, refresh,
+      postComment: (n, { body }) => { comments.push(trusted(body)); throw Error('acknowledgement lost'); } };
+    expect(() => sweepExhaustedRetry(options)).toThrow('acknowledgement lost');
+    expect(countExhaustedRetries(comments)).toBe(1);
+    expect(() => sweepExhaustedRetry(options)).toThrow('acknowledgement lost');
+    expect(refresh).not.toHaveBeenCalled();
+    expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
+  });
+
   const redPr = () => ({ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
     statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] });
   const io = () => ({ exhaustedRetrySettings: settings(), settings: settings(), ciHealCap: 3,
@@ -241,10 +358,10 @@ describe('exhausted retry', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(countExhaustedRetries(comments)).toBe(1);
     expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
-    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(3);
     sweepExhaustedRetry(options);
     expect(refresh).toHaveBeenCalledTimes(1);
-    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(3);
   });
   it('counts failed retry attempts durably, but leaves dry runs and claim holds free', () => {
     const c = { prNumber: 5195, headRefName: 'lane/5195', headSha, aheadBy: 2, failureCompletedAt: at, failingCheckName: 'daemon-soak',
@@ -257,7 +374,8 @@ describe('exhausted retry', () => {
     expect(refresh).not.toHaveBeenCalled();
     expect(sweepExhaustedRetry({ ...options, apply: true }).refusals[0].kind).toBe('exhausted-retry-failed');
     expect(countExhaustedRetries(c.comments)).toBe(1);
-    expect(postComment.mock.calls[0][1].body).toContain('failed');
+    expect(postComment.mock.calls[0][1].body).toContain('retry-result: reserved');
+    expect(postComment.mock.calls[1][1].body).toContain('retry-result: failed');
     expect(sweepExhaustedRetry({ ...options, apply: true }).refusals[0].kind).toBe('needs-you');
     expect(refresh).toHaveBeenCalledOnce();
     c.comments = [...heals];
@@ -316,7 +434,8 @@ describe('exhausted retry', () => {
       readMainRuns: () => [], readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature: () => null,
       refresh, postComment, checkClaim: () => null, reconcileAcceptance: () => ({}) };
     sweepExhaustedRetry(options);
-    expect(comments[1].body).toContain(`retry-head: ${retryHead}`);
+    expect(comments[1].body).toContain('retry-result: reserved');
+    expect(comments[2].body).toContain(`retry-head: ${retryHead}`);
     expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
     expect(refresh).toHaveBeenCalledOnce();
     expect(standDownComments(comments, { headRefOid: retryHead, lapseOnNewHead: 'on' })).toHaveLength(1);
@@ -325,7 +444,7 @@ describe('exhausted retry', () => {
     expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'on' }).exhausted).toBe(false);
     expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'off' }).exhausted).toBe(true);
     expect(sweepExhaustedRetry(options).refusals).toEqual([]);
-    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(3);
     const forged = comments.map(c => c.body.includes(`retry-head: ${retryHead}`) ? { ...c, author: { login: 'outsider' } } : c);
     expect(exhaustionFacts({ comments: forged, headSha: retryHead, lapseOnNewHead: 'on' }).exhausted).toBe(false);
   });

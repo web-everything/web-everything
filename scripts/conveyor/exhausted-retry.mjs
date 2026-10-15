@@ -19,7 +19,8 @@ export const REVIEW_HOLD_LABELS = Object.freeze(['review:human', 'review:pending
 const bodyOf = comment => String(typeof comment === 'string' ? comment : comment?.body ?? '');
 export const hasExhaustedRetryMarker = (comment, marker) => trustedRetryMarkerComments([comment], marker).length > 0;
 const latestMarker = (comments, marker) => trustedRetryMarkerComments(comments, marker)
-  .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+  .reverse().sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+const retryAttemptId = comment => bodyOf(comment).match(/^retry-attempt: (\S+)\r?$/m)?.[1];
 
 function isFixLoopExhaustion(comment) {
   const reason = standDownReason(comment?.body);
@@ -54,19 +55,25 @@ function requiredCompleted(pr, requiredChecks, after = null) {
   return requiredChecks.every(name => {
     const row = rows.find(r => (r.name || r.context) === name);
     if (!row || (row.headSha && row.headSha !== pr.headRefOid)) return false;
-    const completed = String(row.status ?? '').toLowerCase() === 'completed'
-      || (!row.status && ['success', 'failure', 'error'].includes(String(row.state).toLowerCase()));
-    return completed && (after === null || Date.parse(row.completedAt) > after);
+    const statusContext = !row.status && typeof row.context === 'string';
+    const completed = statusContext
+      ? ['success', 'failure', 'error'].includes(String(row.state).toLowerCase())
+      : String(row.status ?? '').toLowerCase() === 'completed';
+    // StatusContext publishes a new row per state change; it has createdAt, never completedAt.
+    return completed && (after === null || Date.parse(statusContext ? row.createdAt : row.completedAt) > after);
   });
 }
 
 export function retryOutcome({ comments = [], pr, requiredChecks } = {}) {
   const retry = latestMarker(comments, EXHAUSTED_RETRY_MARKER);
   if (!retry) return null;
-  // A failed mechanical attempt launched no CI run to wait for.
-  if (retry.body.split(/\r?\n/).includes('retry-result: failed')
+  // An orphan reservation has an unknown outcome: keep it consumed and hand off, never re-dispatch.
+  if (retry.body.split(/\r?\n/).some(line => ['retry-result: failed', 'retry-result: reserved'].includes(line))
     || /; the automatic retry failed \(/.test(retry.body)) return { state: 'failed', failures: [] };
-  if (!requiredCompleted(pr, requiredChecks, Date.parse(retry.createdAt))) return { state: 'pending' };
+  const attemptId = retryAttemptId(retry);
+  const reservation = attemptId && trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_MARKER)
+    .find(c => retryAttemptId(c) === attemptId && c.body.split(/\r?\n/).includes('retry-result: reserved'));
+  if (!requiredCompleted(pr, requiredChecks, Date.parse((reservation || retry).createdAt))) return { state: 'pending' };
   const failures = realRequiredFailures(pr, requiredChecks);
   return failures.length ? { state: 'failed', failures } : { state: 'recovered' };
 }
@@ -142,7 +149,9 @@ export function exhaustionFacts({ comments = [], ciHealBudget = resolveCiHealBud
 }
 
 export function countExhaustedRetries(comments) {
-  return trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_MARKER).length;
+  // Reservation and outcome are two durable observations of one attempt. Legacy markers stand alone.
+  const markers = trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_MARKER);
+  return markers.filter(c => !retryAttemptId(c)).length + new Set(markers.map(retryAttemptId).filter(Boolean)).size;
 }
 
 /** Both retry readers authenticate the author and the marker's header position. */
@@ -180,8 +189,10 @@ export function planExhaustedRetry({ facts, retriesUsed = 0, settings, mainTip, 
     why: `${trigger === 'main-move' ? 'main moved past the exhaustion point' : `${settings.afterHours} hours elapsed since exhaustion`}${infra}` };
 }
 
-export function buildExhaustedRetryComment({ prNumber, kind, trigger, mode, mainSha, headSha, retryHeadSha = headSha, why, ok = true } = {}) {
-  return `${EXHAUSTED_RETRY_MARKER}\nexhaustion-kind: ${kind}\nretry-head: ${retryHeadSha}\nretry-result: ${ok ? 'succeeded' : 'failed'}\n\nPR #${prNumber} exhausted ${kind} on ${headSha}; the automatic retry ${ok ? 'succeeded' : 'failed'} (${trigger}): ${mode === 'rebase' ? `rebase onto main ${mainSha?.slice(0, 7)} then CI` : 'fresh CI re-run'}. ${why}. If it is still red afterwards it goes to the operator.`;
+export function buildExhaustedRetryComment({ prNumber, kind, trigger, mode, mainSha, headSha, retryHeadSha = headSha, why, ok = true,
+  attemptId = null, reserved = false } = {}) {
+  const result = reserved ? 'reserved' : ok ? 'succeeded' : 'failed';
+  return `${EXHAUSTED_RETRY_MARKER}\nexhaustion-kind: ${kind}\nretry-head: ${retryHeadSha}\nretry-result: ${result}${attemptId ? `\nretry-attempt: ${attemptId}` : ''}\n\nPR #${prNumber} exhausted ${kind} on ${headSha}; the automatic retry ${result} (${trigger}): ${mode === 'rebase' ? `rebase onto main ${mainSha?.slice(0, 7)} then CI` : 'fresh CI re-run'}. ${why}. If it is still red afterwards it goes to the operator.`;
 }
 
 export function buildExhaustedRetrySpentComment({ kind, check, failingCheckName = check, headSha } = {}) {
