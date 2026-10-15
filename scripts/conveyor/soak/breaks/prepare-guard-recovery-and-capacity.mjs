@@ -15,7 +15,8 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/prepare-dup-guard', paths: [DAEMON] },
   fixPresent(root) {
     const daemon = readFileSync(resolve(root, DAEMON), 'utf8');
-    return daemon.includes('const stampedOpenPr =') && daemon.includes('PREPARE_REFUSAL_HOLD_MS');
+    return daemon.includes('const stampedOpenPr =') && daemon.includes('PREPARE_REFUSAL_HOLD_MS')
+      && daemon.includes('refusePrepareLaunch(member') && daemon.includes('orphanWithWork');
   },
   async run() {
     const { runBuildDispatchTick, createPrepareStatusReader } = await import(resolve(ROOT, DAEMON));
@@ -76,6 +77,36 @@ export default {
         nowMs += 60_000;
       }
       if (!cleanLaunched) problems.push(`two persistently refused ${kind} cards starved the clean third under the real tick-core`);
+    }
+    // Operator send-back item 1: a group member with its own OPEN prepare PR was claimed under a clean lead.
+    {
+      const effects = fixture(['7201']);
+      const nums = ['7201', '7202', '7203', '7204'];
+      const rows = nums.map((num, i) => ({ num, kind: 'story', size: 1, parent: '7200', locus: 'we',
+        scope: [`we:scripts/prepare/file${i}.mjs`] }));
+      effects.planTick = () => ({ decisions: { spawnPrepareItems: [rows[0]], admission: { queue: rows, cleared: [],
+        held: rows.map(r => ({ num: r.num, reason: 'needs-prepare' })) } }, nextState: {} });
+      effects.loadGroupingCards = () => rows;
+      effects.readPreparedStamp = () => ({ preparedDate: null });
+      const claimed = [];
+      effects.acquirePrepareClaim = ({ num }) => { claimed.push(num); return { ok: true }; };
+      effects.listPreparePrs = ({ num }) => num === '7203'
+        ? [{ number: 93, state: 'OPEN', headRefName: 'lane/7203d-prepare-x' }] : [];
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      if (!tick.prepare.groups.some(g => g.members.includes('7203'))) problems.push('grouped member scenario did not form a group');
+      if (claimed.includes('7203')) problems.push('group member with an OPEN prepare PR was claimed under a clean lead');
+    }
+    // Operator send-back item 2: an untracked card refused for its OPEN, sectioned, unstamped PR was never stamped.
+    {
+      const effects = fixture();
+      effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+      effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+      effects.readPrepareStatus = () => ({ preparedDate: null, pr: { state: 'OPEN', number: 91, preparedDate: null, hasSections: true } });
+      let stamps = 0;
+      effects.stampPrepare = () => { stamps++; return { spawned: true }; };
+      let bookkeeping = {};
+      for (let i = 0; i < 2; i++) bookkeeping = (await runBuildDispatchTick({ live: true, effects, bookkeeping })).nextBookkeeping;
+      if (stamps !== 1) problems.push(`untracked refused card with a sectioned unstamped OPEN PR stamped ${stamps}x (want 1)`);
     }
     const missing = fixture();
     delete missing.listPreparePrs;

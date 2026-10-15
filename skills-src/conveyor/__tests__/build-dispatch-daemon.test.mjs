@@ -1864,6 +1864,33 @@ describe('automatic item preparation', () => {
   });
   // Same class: a card the daemon already knows it will skip after planning (a build backoff, a prepare group
   // member in flight under its lead) is held out of tick-core's two picks before planning.
+  // PR #5366 operator send-back (item 2): a card with NO surviving claim, run row, hold or guard whose OPEN prepare
+  // PR has sections but no stamp was refused at launch forever and never reached the stamp-recovery arm.
+  it.each([
+    [{ hasSections: true, preparedDate: null }, true],
+    [{ hasSections: false, preparedDate: null }, false],
+    [{ hasSections: true, preparedDate: '2026-10-15' }, false],
+  ])('routes an untracked refused card whose open prepare PR is %j to stamp recovery (%s)', async (pr, recovers) => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null, pr: { state: 'OPEN', number: 91, ...pr } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      expect(first.prepare.refused.map(r => r.num)).toEqual(['5028']);
+      expect(effects.stampPrepare).not.toHaveBeenCalled();
+      const second = await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(recovers ? 1 : 0);
+      if (recovers) {
+        expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending' });
+        expect(second.prepare.retired).toEqual([]); // nothing to release: no claim, no worker
+      } else expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      expect(effects.dispatch).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
   it('holds build-backoff cards and in-flight group members out of tick-core\'s prepare picks', async () => {
     const effects = fixture();
     acquireBuildDispatchClaim({ num: '4501', lockRoot, owner: 'host:10', pid: 10 });
@@ -3850,6 +3877,35 @@ describe('grouped PREPARE daemon ticks', () => {
 
   // PR #5366 review round 5 self-review: a card held out of tick-core for a fresh launch refusal (an open prepare
   // PR) must not ride into a clean lead's group either — members are claimed under the lead, never refusal-checked.
+  // PR #5366 operator send-back (item 1): every group member passes the SAME launch refusal as the lead. A member
+  // that was never refused before (so no refusal hold) but has an OPEN prepare PR is dropped, not claimed.
+  it.each([
+    ['open prepare PR', { prs: num => num === '7203' ? [{ number: 93, state: 'OPEN', headRefName: 'lane/7203d-prepare-x' }] : [] },
+      'open prepare PR #93 (lane/7203d-prepare-x)'],
+    ['merged prepare PR', { prs: num => num === '7203' ? [{ number: 94, state: 'MERGED', headRefName: 'lane/7203e-prepare-x',
+      createdAt: '2026-10-15T11:00:00Z' }] : [], failures: [{ num: '7203', recordedAt: '2026-10-15T10:00:00Z' }] },
+    'merged prepare PR #94 after last dispatch (within 24h guard)'],
+    ['needs-you park', { failures: [{ num: '7203', recordedAt: '2026-10-14', held: true, holdReason: 'needs-you: decide scope' }] },
+      'parked needs-you: needs-you: decide scope'],
+    ['listing failure', { prs: num => { if (num === '7203') throw new Error('unavailable'); return []; } },
+      'prepare PR listing unavailable'],
+  ])('refuses a not-yet-refused group member with a(n) %s through the lead\'s launch admission', async (_name, { prs, failures = [] }, reason) => {
+    const effects = fixture({ spawns: [rows[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    if (prs) effects.listPreparePrs = vi.fn(({ num }) => prs(num));
+    effects.listPrepareFailures = () => failures;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204', '7205'] })]);
+      expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
+      expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', groupMembers: ['7202', '7204', '7205'] }));
+      expect(tick.prepare.refused).toEqual([{ num: '7203', reason }]);
+      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7203']);
+    } finally { log.mockRestore(); }
+  });
+
   it('keeps a refusal-held card out of a clean lead\'s prepare group', async () => {
     const effects = fixture({ spawns: [rows[0]] });
     effects.now = () => Date.parse('2026-10-15T12:00:00Z');

@@ -821,7 +821,10 @@ the releases store. Cover each clearing path, and an older park under a newer re
 hand stamp never re-parks the card (the stale-reprepare livelock).
 tick-core offers at most two item prepares and cannot see these launch refusals. The daemon keeps a
 refused card out of the plan, and out of a clean lead's prepare group, for `PREPARE_REFUSAL_HOLD_MS`,
-then checks it again. Build-backoff cards and group members in flight are held out the same way. Test that capacity
+then checks it again. Build-backoff cards and group members in flight are held out the same way.
+Every group member passes the same launch admission as its lead (`refusePrepareLaunch`); test a member
+that was never refused before and has its own open PR. A card refused for an OPEN prepare PR is still
+inspected when nothing else tracks it, so a sectioned, unstamped PR reaches stamp recovery. Test that capacity
 rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
 a clean third, across ticks.
 

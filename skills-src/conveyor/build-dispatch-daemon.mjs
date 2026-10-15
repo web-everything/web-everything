@@ -451,6 +451,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
       && !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num)));
   const refusalHeldNums = new Set(freshRefusals.map(r => normNum(r.num)));
+  // A card refused for its OPEN prepare PR may have no claim, run row, hold or guard left (a restart, a retired
+  // claim). The retirement pass still inspects it, so a finished-but-unstamped PR reaches stamp recovery.
+  const refusedOpenPrNums = new Set(freshRefusals
+    .filter(r => String(r.reason ?? '').startsWith('open prepare PR')).map(r => normNum(r.num)));
   // The same goes for cards the launch loop below is already known to skip: a build backoff (`heldNums`) and a group
   // member in flight under its lead (a member has a claim but no tick-core guard). A lead keeps its own guard.
   let prepareBackoffNums = [];
@@ -962,7 +966,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
-    ...holds.filter(isPrepareHold).map((h) => normNum(h.num))]);
+    ...holds.filter(isPrepareHold).map((h) => normNum(h.num)), ...refusedOpenPrNums]);
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
@@ -986,7 +990,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const tracked = Boolean(claim) || prepareBusy.has(num);
     // A bare candidate (no claim, no in-flight row, no hold, no current settled attempt) has no evidence of a
     // prepare attempt: skip it, so old PRs/rows never place a hold and the per-tick probe stays bounded.
-    if (!tracked && !wasHeld && !currentSettled
+    if (!tracked && !wasHeld && !currentSettled && !refusedOpenPrNums.has(num)
       && !(bookkeeping.prepareGuards ?? []).some((g) => g.kind === 'prepare-item' && normNum(g.num) === num)) continue;
     try {
       if (prepareReadErrors.has(num)) throw prepareReadErrors.get(num);
@@ -1035,8 +1039,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // A dead session that left sections behind is a finished-but-unstamped run: route it to stamp recovery.
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
         && (mainHasResult || (awaitingPr && status.pr.hasSections));
+      // An untracked card refused for its own OPEN PR: no worker or claim is left, so a sectioned, unstamped PR is a
+      // finished run that only needs its stamp. Without sections it stays a plain launch refusal.
+      const orphanWithWork = refusedOpenPrNums.has(num) && !tracked && !wasHeld && awaitingPr
+        && !status.preparedDate && !stampedOpenPr && status.pr.hasSections === true;
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
-        || (why === 'prepare-session-dead' && awaitingPr)
+        || orphanWithWork || (why === 'prepare-session-dead' && awaitingPr)
         || (currentSettled && !prepareBusy.has(num));
       // MERGED is delivered. Ended, unstamped OPEN attempts recover or hold without re-dispatching.
       let unstamped = status && !status.preparedDate && ended && status.pr?.state !== 'MERGED' && !stampedOpenPr;
@@ -1144,6 +1152,34 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // freeze label still holds it. Rule OFF: `freezeHolds` is exactly `plan.freeze.frozen` (today).
   prepare.freezeHeld = freezeHolds('prepare-item', plan.freeze, costSettings);
   const refusedPrepares = new Set();
+  // The ONE launch admission every prepare card passes, a group lead and each of its members alike (PR #5366): an
+  // open or recent merged prepare PR, a live claim or run, a needs-you park, or a failed PR listing refuses it.
+  // A refused card is recorded, so the next ticks hold it out of tick-core (see `prepareRefusals`).
+  const refusePrepareLaunch = async (num, { pickBornAs, cardBornAs } = {}) => {
+    const bornAs = pickBornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
+    const lastDispatchAt = [
+      ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
+      ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
+      ...allSettledPrepares.filter(r => normNum(r.num) === num).map(r => r.startedAt),
+      ...prepareRows.filter(r => normNum(r.num) === num).map(r => r.row?.entry?.startedAt),
+    ].filter(Boolean).sort().at(-1);
+    let refusal;
+    try {
+      if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
+      const prs = await effects.listPreparePrs({ num, bornAs });
+      if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
+      refusal = prepareLaunchRefusal({ num, bornAs, prs,
+        lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
+        claims: prepareClaims, liveRows: prepareRows, ledgerFailures, releases });
+    } catch {
+      refusal = { reason: 'prepare PR listing unavailable' };
+    }
+    if (!refusal) return null;
+    refusedPrepares.add(num);
+    prepare.refused.push({ num, reason: refusal.reason });
+    console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
+    return refusal;
+  };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
     && !refusalHeldNums.has(normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
@@ -1210,30 +1246,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           await failPrepare(num, 'stamp-read', String(e?.message || e));
           continue;
         }
-        const bornAs = pick.bornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
-        const lastDispatchAt = [
-          ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
-          ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
-          ...allSettledPrepares.filter(r => normNum(r.num) === num).map(r => r.startedAt),
-          ...prepareRows.filter(r => normNum(r.num) === num).map(r => r.row?.entry?.startedAt),
-        ].filter(Boolean).sort().at(-1);
-        let refusal;
-        try {
-          if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
-          const prs = await effects.listPreparePrs({ num, bornAs });
-          if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
-          refusal = prepareLaunchRefusal({ num, bornAs, prs,
-            lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
-            claims: prepareClaims, liveRows: prepareRows, ledgerFailures, releases });
-        } catch {
-          refusal = { reason: 'prepare PR listing unavailable' };
-        }
-        if (refusal) {
-          refusedPrepares.add(num);
-          prepare.refused.push({ num, reason: refusal.reason });
-          console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
-          continue;
-        }
+        if (await refusePrepareLaunch(num, { pickBornAs: pick.bornAs, cardBornAs })) continue;
         const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
           ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
         if (!claim.ok) {
@@ -1248,6 +1261,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
             const before = await effects.readPreparedStamp?.({ num: member });
             const memberStamp = before ? (before.preparedDate
               ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null) : undefined;
+            // A member is launched by the lead's worker, so it passes the lead's admission: a duplicate is dropped.
+            if (await refusePrepareLaunch(member, { cardBornAs: before?.bornAs })) continue;
             const memberClaim = effects.acquirePrepareClaim({ num: member, scope: scopeByNum.get(member) ?? [], groupLead: num,
               ...(memberStamp !== undefined ? { replacesStamp: memberStamp } : {}) });
             if (memberClaim.ok) groupMembers.push(member);
