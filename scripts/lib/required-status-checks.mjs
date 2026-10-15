@@ -334,8 +334,11 @@ export function getRequiredStatusChecks({
   const key = `${repo || ''}@${branch}`;
   const declared = DECLARED_REQUIRED_STATUS_CHECKS[repo];
   // A cwd-inferred slug is unknown here: never share an anonymous cache across repositories.
-  const candidate = repo ? readCacheEntries(cachePath)[key] : null;
-  const cache = candidate && Array.isArray(candidate.checks) && Number.isFinite(candidate.fetchedAtMs) ? candidate : null;
+  const validEntry = entry => (entry && Array.isArray(entry.checks) && Number.isFinite(entry.fetchedAtMs) ? entry : null);
+  // The file's entry for this key NOW: another reader may have saved since `cache` was read. Writes rename
+  // atomically, so an unlocked read sees a whole entry.
+  const reread = () => (repo ? validEntry(readCacheEntries(cachePath)[key]) : null);
+  const cache = reread();
   // The classic-protection contexts ride along only on a live entry (a declared/unavailable entry never read them).
   const withClassic = (result, entry) => (Array.isArray(entry?.classic) ? { ...result, classic: entry.classic } : result);
 
@@ -363,12 +366,15 @@ export function getRequiredStatusChecks({
           writeJsonAtomic(cachePath, { entries });
         }, { timeoutMs: 2_000 });
       } catch {
-        /* the cache is an optimisation — never fail a read over a write */
+        // The cache is an optimisation — never fail a read over a write. A lock timeout skipped the merge above, so
+        // re-read without the lock: an entry another reader saved that outranks this write still wins the answer.
+        const current = reread();
+        if (cacheEntryOutranks(current, { source, fetchedAtMs: now })) winner = current;
       }
     }
-    // The entry that outranked this write is what the cache now holds: answer with it, exactly as the next reader
-    // will, so this call never returns a policy (e.g. the declared defaults) the file already superseded. Every
-    // branch keeps this read's partial floor: a fresh winner may predate a check this read just saw required.
+    // The entry that outranked this write is what the cache now holds: answer with it, so this call never returns a
+    // policy (e.g. the declared defaults) the file already superseded. Every branch adds this read's partial floor,
+    // which is never cached: a winner may predate a check this read just saw required.
     if (winner) {
       const checks = withPartial(winner.checks);
       if (!isLiveCacheEntry(winner)) return withClassic({ checks, source: winner.source }, winner);
@@ -400,13 +406,19 @@ export function getRequiredStatusChecks({
       const hasLiveCache = cache && isLiveCacheEntry(cache);
       if (!hasLiveCache) {
         if (declared) return save(withPartial(declared), 'declared');
-        if (!cache) return { checks: [], source: 'fallback' };
+        if (!cache && !reread()) return { checks: [], source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
   }
 
-  if (cache) return withClassic({ checks: withPartial(cache.checks), source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
-    cacheAgeMs: now - cache.fetchedAtMs }, cache);
+  // Answer from the file's current entry, never the pre-read snapshot another reader has since superseded.
+  const latest = reread();
+  const current = latest && !cacheEntryOutranks(cache, latest) ? latest : cache;
+  if (current && (now - current.fetchedAtMs) < ttlMs) {
+    return withClassic({ checks: withPartial(current.checks), source: isLiveCacheEntry(current) ? 'cache' : current.source }, current);
+  }
+  if (current) return withClassic({ checks: withPartial(current.checks), source: current.source === 'unavailable' ? 'unavailable' : 'stale-cache',
+    cacheAgeMs: now - current.fetchedAtMs }, current);
   return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: [], source: 'unavailable' };
 }

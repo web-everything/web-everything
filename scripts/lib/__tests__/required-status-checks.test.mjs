@@ -771,6 +771,32 @@ describe('shared per-repo required-checks cache (xqd4v1o)', () => {
       expect(entryOf(cachePath)).toMatchObject({ checks: ['test'], source: 'live', fetchedAtMs: 1000 });
     });
 
+    it.each([
+      ['a transient failure', () => new Error('HTTP 502: Bad Gateway')],
+      ['a transient failure with a stale snapshot', () => new Error('HTTP 502: Bad Gateway'), true],
+    ])('%s answers from the entry another reader saved meanwhile, never the pre-read snapshot', (_l, makeError, seed) => {
+      const cachePath = join(dir, 'cache.json');
+      if (seed) getRequiredStatusChecks({ repo: WE, cachePath, now: 100, readChecks: () => ['old'] });
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1990, readChecks: () => ['test', 'merge-gate'] });
+        throw Object.assign(makeError(), { partialChecks: ['security-scan'] });
+      };
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, ttlMs: 1000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'merge-gate', 'security-scan'], source: 'cache' });
+    });
+
+    it('a denied reader whose cache write times out on the lock still answers with the newer live entry', () => {
+      const cachePath = join(dir, 'cache.json');
+      const readA = () => {
+        getRequiredStatusChecks({ repo: WE, cachePath, now: 1990, readChecks: () => ['test', 'merge-gate'] });
+        writeFileSync(`${cachePath}.lock`, `${process.pid}\n`); // a live holder: A's own save cannot take the lock
+        throw Object.assign(new Error('Resource not accessible by integration (HTTP 403)'), { partialChecks: ['security-scan'] });
+      };
+      expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 2000, readChecks: readA }))
+        .toEqual({ checks: ['test', 'merge-gate', 'security-scan'], source: 'cache' });
+      expect(entryOf(cachePath)).toMatchObject({ checks: ['test', 'merge-gate'], source: 'live', fetchedAtMs: 1990 });
+    }, 15_000);
+
     it('an older live read never moves a newer live entry backwards', () => {
       const cachePath = join(dir, 'cache.json');
       const readA = () => {
