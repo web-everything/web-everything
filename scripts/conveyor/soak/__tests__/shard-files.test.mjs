@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE } from '../shard-files.mjs';
 import { loadTimings } from '../../../ci/shard-assign.mjs';
 
-describe('soak shard-files — time-balanced split (card 11)', () => {
+describe('soak shard-files — isolated baseline and time-balanced breaks', () => {
   it('every file (baseline + breaks) is assigned to exactly one shard', () => {
     const total = 4;
     const seen = [];
@@ -32,6 +32,26 @@ describe('soak shard-files — time-balanced split (card 11)', () => {
     }
   }
 
+  it('reserves shard 1 for the baseline even when timings make it the cheapest file', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
+        timings: { 'base.soak.test.mjs': 1, 'a.soak.test.mjs': 100, 'b.soak.test.mjs': 100 } };
+      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
+      const breaks = [2, 3].flatMap((shard) => shardFiles({ ...opts, shard }));
+      expect(breaks.sort()).toEqual(['a.soak.test.mjs', 'b.soak.test.mjs']);
+    });
+  });
+
+  it('balances breaks by measured time across the remaining shards', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir,
+        timings: { 'base.soak.test.mjs': 1000, 'a.soak.test.mjs': 20, 'b.soak.test.mjs': 10, 'c.soak.test.mjs': 10 } };
+      expect(shardFiles({ ...opts, shard: 1 })).toEqual(['base.soak.test.mjs']);
+      expect(shardFiles({ ...opts, shard: 2 })).toEqual(['a.soak.test.mjs']);
+      expect(shardFiles({ ...opts, shard: 3 })).toEqual(['b.soak.test.mjs', 'c.soak.test.mjs']);
+    });
+  });
+
   it('balances by the stored timings: the heavy file sits alone, light files fill the rest', () => {
     const names = ['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'];
     withBreaks(names, (dir) => {
@@ -41,6 +61,19 @@ describe('soak shard-files — time-balanced split (card 11)', () => {
       const s2 = shardFiles({ ...opts, shard: 2, timings });
       expect(s1).toEqual(['base.soak.test.mjs']); // 40 vs 4x10 = 40: perfectly balanced
       expect(s2.length).toBe(4);
+    });
+  });
+
+  it('keeps the baseline alone even when its timing is missing or smaller than every break', () => {
+    withBreaks(['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
+      const breaks = { 'a.soak.test.mjs': 40, 'b.soak.test.mjs': 30, 'c.soak.test.mjs': 20, 'd.soak.test.mjs': 10 };
+      for (const timings of [breaks, { ...breaks, 'base.soak.test.mjs': 1 }]) {
+        expect(shardFiles({ ...opts, shard: 1, timings })).toEqual(['base.soak.test.mjs']);
+        const remaining = [2, 3].map((shard) => shardFiles({ ...opts, shard, timings }));
+        expect(remaining.flat().sort()).toEqual(Object.keys(breaks).sort());
+        expect(remaining.map((files) => files.reduce((sum, file) => sum + timings[file], 0))).toEqual([50, 50]);
+      }
     });
   });
 

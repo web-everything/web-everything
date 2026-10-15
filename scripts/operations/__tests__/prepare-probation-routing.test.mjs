@@ -5,18 +5,28 @@ import { routeDispatchProvider } from '../dispatch-lane-io.mjs';
 import { probationWorkerDetachedProvider } from '../dispatch-providers/probation-worker.mjs';
 
 describe('prepare probation routing', () => {
+  it.each(['build', 'ci-heal', 'fix', 'investigate', 'prepare-decision'])('%s refuses grouped probation requests before spawning', launchKind => {
+    const spawnDetached = () => { throw new Error('must not spawn'); };
+    expect(() => probationWorkerDetachedProvider({ launchKind, num: '123', pr: '42', sessionSlug: 'group',
+      groupMembers: ['124', '125'], probationWorker: { id: 'codex', provider: 'codex', model: 'model', taskType: 'doc-fix' },
+    }, { spawnDetached })).toThrow(/group.*prepare/i);
+  });
   it('routes prepare-item to Codex with Sonnet fallback and launches prepare mode', () => {
     const route = decideDispatchRoute({ kind: 'prepare-item', scopePaths: ['we:scripts/lib/example.mjs'] });
     expect(route).toMatchObject({ tier: 'sonnet', probationWorker: { id: 'codex', taskType: 'prepare' } });
-    const request = { launchKind: 'prepare-item', probationWorker: route.probationWorker, num: '123', sessionSlug: 'prepare-123', runId: 'original-run', effectKey: 'original-key' };
+    const request = { launchKind: 'prepare-item', probationWorker: route.probationWorker, num: '123', sessionSlug: 'prepare-123', runId: 'original-run', effectKey: 'original-key', groupMembers: ['124', '125'] };
     expect(routeDispatchProvider(request, { probationLaunch: 'on', scriptExists: () => true, probation: () => 'probation', agent: () => 'claude' })).toBe('probation');
     let argv;
     probationWorkerDetachedProvider(request, { spawnDetached: (a) => { argv = a; return { pid: 123 }; }, logPathFor: () => '/tmp/unused' });
     expect(argv).toContain('--taskType=prepare');
+    expect(argv).toContain('--group-members=124,125');
     expect(argv).toContain('--run-id=original-run');
     expect(argv).toContain('--effect-key=original-key');
     expect(argv[0]).toMatch(/probation-build-run.mjs$/);
-    expect(routeDispatchProvider({ ...request, probationWorker: null }, { agent: () => 'claude' })).toBe('claude');
+    const agent = () => 'claude';
+    expect(() => routeDispatchProvider({ ...request, probationWorker: null }, { agent }))
+      .toThrow(/group-capable worker provider/);
+    expect(routeDispatchProvider({ ...request, probationWorker: null, groupMembers: [] }, { agent })).toBe('claude');
   });
   it('offers Gemini only for simple preparation when Codex is vetoed', () => {
     const codex = selectProbationWorker({ taskType: 'prepare' }).worker;

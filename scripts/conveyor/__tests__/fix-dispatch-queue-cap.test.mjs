@@ -294,14 +294,19 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     const ALWAYS_REFUSE = { tryAdmit: () => ({ admit: false, projectedMinutes: 45, maxWaitMinutes: 30, demandMinutes: 8 }) };
     for (const [repo, slug] of [[undefined, 'web-everything/web-everything'], ['we', 'web-everything/web-everything'], ['web-everything/web-everything', 'web-everything/web-everything']]) {
       const argvs = [];
-      const exec = (_cmd, argv) => { argvs.push(argv); return JSON.stringify({ comments: [] }); };
+      const exec = (_cmd, argv) => { argvs.push(argv); return ''; }; // empty paginated TSV thread
       runFix([1854], ALWAYS_REFUSE, {
         ...(repo === undefined ? {} : { repo }),
         readPrComments: (pr, o) => defaultReadPrComments(pr, { ...o, exec }),
         postQueueCapComment: (o) => postNoteComment({ ...o, exec }),
       });
       expect(argvs).toHaveLength(2); // one read + one marker post
-      for (const argv of argvs) expect(argv.slice(argv.indexOf('--repo'), argv.indexOf('--repo') + 2)).toEqual(['--repo', slug]);
+      const [readArgv, postArgv] = argvs;
+      expect(readArgv[0]).toBe('api');
+      expect(readArgv).toContain('--paginate');
+      expect(readArgv).toContain(`repos/${slug}/issues/1854/comments`);
+      expect(postArgv.slice(0, 3)).toEqual(['pr', 'comment', '1854']);
+      expect(postArgv.slice(postArgv.indexOf('--repo'), postArgv.indexOf('--repo') + 2)).toEqual(['--repo', slug]);
     }
   });
 

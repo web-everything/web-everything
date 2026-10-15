@@ -24,6 +24,11 @@ Cached input is a subset of input; reasoning is a subset of output when reported
 
 > Tier-1 reference. Read when writing or changing tests.
 
+Keep the 50-tick daemon soak baseline alone in shard 1 when splitting the soak suite. Balance break
+scenarios by measured time across the remaining shards; timing estimates must never put a sibling
+scenario beside the baseline. Those scenarios fork real daemon and git children, so concurrent worlds
+can exhaust the baseline's wall-clock timeout while its per-tick invariants continue to hold.
+
 Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test temporary directory:
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
@@ -41,6 +46,15 @@ at high effort so evidence routing, backend holds and fixer escalation remain ef
 Codex retry order through `codex.modelByTask` settings; use an explicit route fixture for launch-boundary tests.
 Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
 per-lens design models still override the helper default.
+
+## Smoke sentinel worker isolation
+
+Daemon rebuild dispatch dry-runs force `WE_WORKER_WRAPPER=off` so injected spawners capture both fix and
+review prompts. Missing or blank captures fail; synthetic review PRs inject an allowed CI gate so the brief
+check cannot silently skip dispatch. Wrapped launches also refuse sentinel PRs (`9xxxxx`) and session slugs
+ending in that sentinel unless `smokeRealWorker.allowSentinel` resolves true through the shared cascade
+(`scripts/settings/smoke-real-worker.json`, env `WE_SMOKE_ALLOW_REAL_WORKER=1|true`). The deliberate overlay
+real-worker smoke sets this opt-in itself. Test refusal with an injected launcher, for every default-on role.
 
 ## Wrapped worker verification waits
 
@@ -65,6 +79,8 @@ Use `isGhDeferred` from `we:scripts/lib/gh-deferred.mjs` before parsing query da
 a deferred response is not an empty PR list. Discovery CLI passes can use `deferGhPass` to skip before
 making decisions. Critical review/drain callers still respect actual exhaustion and secondary backoff.
 Test with a temporary throttle root and injected subprocesses; never spend live GitHub quota to test scarcity.
+The gh holder policy lives in `scripts/settings/gh-throttle.json` and resolves once per process/env object. Holder tests use a temporary lock root and injected clock/sleep; watch calls must remain unslotted. Watch detection and the write/op classifiers read gh argv the way gh's own parser does, so test leading global flags (`--repo o/r run watch`), `--flag=value` booleans and flag values that look like flags (`--body --watch`). Verify timeout fidelity against a real local child, preserving native timeout errors and releasing its slot without signalling the holder process.
+Holder diagnostics persist only allowlisted command labels, omitting endpoints and all argument values. Sanitize old metadata and process-table commands at the output boundary as well as new lock writes. Cover admission with a decision table over caller-capped, pool-full and over-age states. Reaping waits for the greater of policy and the recorded effective timeout plus grace; an explicit zero timeout prevents age-based reaping of that holder. Metric operation labels use the same bounded vocabulary as default call logs.
 Daemon simulator worlds with independent clocks must each override `WE_GH_THROTTLE_LOCK_ROOT`
 and `WE_COORDINATION_ROOT`, even when Vitest already supplies per-file roots. A previous world's
 future-dated exhausted budget can otherwise make a fresh world wait for the production timeout.
@@ -74,6 +90,10 @@ GitHub App shim directories before scanning the host's tool PATH.
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
+Generated shims that embed functions with `Function#toString` must embed every dependency as well.
+Keep the resource classifier and its argv parsers together in `scripts/lib/gh-argv.mjs`: imported
+references inside a stringified function can retain Vite's SSR binding names. Exercise the emitted
+source in an empty VM context and the real shim after its generating checkout is removed.
 For Node subprocess script paths imported by Vitest's browser environment, use
 `join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
 import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.
@@ -647,6 +667,19 @@ pinned to `CONSTELLATION_REPOS` by `scripts/lib/__tests__/review-core.test.mjs`.
 
 ### Operator notification probes
 
+Operator send-back regressions replay the whole PR thread, including a newer mechanical conflict bounce,
+fix-end and advisory accept. `scripts/lib/operator-send-backs.mjs` owns resolution: trusted fix evidence must
+explicitly name the request and a different head (short/full SHA spellings of the same commit do not count).
+Acceptance labels alone never clear it. Evidence comments begin with a standalone `## Fix evidence` heading
+or a standalone addresses marker (optionally preceded by `Head:`). Reviewer prose, blockquotes, fenced and
+indented examples of those formats must never resolve a request, even from a trusted author. Keep evidence
+markers in fixer prompts and replay quoted instructions through queue holds and verdict reduction. Verify the
+complete comment reader retains URLs, and exercise planning, resumed prompts, review reduction, red-team
+input fingerprints and both operator-queue entry paths. Unknown send-back heads remain open conservatively.
+Partial operator-queue CLI copies load the send-back reader optionally, report import errors, and withhold
+all readiness when it is unavailable. Notice retry receipts stay separate from thread-derived `noticedRungs`
+and are scoped to the dispatch target, head and rung; a failed post must remain retryable.
+
 `operator-notify` consumes only `operator-queue`'s `ready` rows. Tests inject the notifier,
 including child CLI probes; never exercise real desktop delivery in this suite. Persisted
 successes deduplicate until an item leaves NEEDS YOU; queue errors preserve all prior keys.
@@ -858,6 +891,19 @@ existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage
 fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
 red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
 
+### Grouped build recovery
+
+Grouped members have no worker run row of their own. Restart adoption must use the lead's
+PID, session liveness or bound resume marker, using the single-card liveness classifier.
+Only the lead resumes or settles that worker; the daemon's grouped retirement path owns
+member cleanup. Probe real member claim files with a dead daemon PID and a live lead,
+including session and resumed-worker evidence. Recovery carries the durable dispatch's
+full member list through resumability, resume argv and wrapper publication; a missing
+original dispatch record refuses publication. Member claim edits are wrapper-owned,
+while unrelated card edits still refuse recovery. Test generated mixed numeric/hash
+`Resolves` lines through the real resolution reader, retaining diff corroboration and
+bornAs alias checks for hashes.
+
 ### Enqueue catch-up ordering
 
 The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
@@ -872,6 +918,14 @@ Confirmed drain gate skips and revalidation aborts also release room; successful
 and ambiguous failures consume it. Give each fake child its actual target PR number.
 Also cover a queue that fills while the window is closed and an unreadable next snapshot:
 retained attempts must stay within the latest room, and cannot use a failed snapshot.
+
+Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
+remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
+reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+A batching deferral stops new starts but lets existing children finish their locked admission checks.
+Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
+scheduling with a full queue or backed-off work. Suppress duplicate event wakes for active PRs;
+shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
 
 ## Referral rulings answering stand-downs
 
@@ -945,3 +999,16 @@ Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the 
 Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
 agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall
 through to the host's live agents or daemon clones.
+
+### Operator repair round replay
+
+Replay round-extension grants after an already over-cap thread, then a completed repair and the
+review of its new head. Fix admission uses `< cap`; the owed review uses `<= cap`.
+`fix.roundExtensionAnchor` defaults to `grant` (env `WE_FIX_ROUND_EXTENSION_ANCHOR`); `off`
+retains additive caps. Each cap anchors to its own counter on the thread prefix before the grant;
+never use the current durable count map as historical evidence. Open send-back allowances use
+trusted fix-end comments after the latest open operator ceremony and `fix.operatorRulingExtraRounds`.
+Set that allowance to zero in tests isolating the older `operatorFixBudget` mechanism.
+An open send-back allowance must preserve the takeover gate predicate: a reviewed head with zero
+open defects and an own-gate hold still goes through cap handling for its advisory or operator note.
+Replay human, awaiting-base, stacked-base, review-gate and merge-gate holds alongside the allowance.

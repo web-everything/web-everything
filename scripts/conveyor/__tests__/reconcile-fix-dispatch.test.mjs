@@ -876,13 +876,18 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
   it('#xu2krte Fork 1 — a conflict-caused entry with a listed, OWNERSHIP-CONFIRMED resume candidate attempts a bare resume first, and returns `resumed: true` with NO lane on success', () => {
     const marker = buildAuthorActorMarker('cand-0000-0000-0000-000000000000');
     const spawnCalls = [];
+    const notices = [];
     const result = tryResumeFix(
       {
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
+        openOperatorSendBacks: [{ id: 'SB1', login: 'chalbert', at: '2026-10-14T20:07:00.000Z',
+          head: 'e5ed9cb74', url: 'https://example.invalid/send-back', body: 'MUST FIX the operator’s original guard.' }],
+        rulingNotAddressed: { source: 'operator-send-back', matches: [{}] },
       },
       {
         root: '/repo',
+        postNotice: notice => notices.push(notice),
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · candxxxx\n'; },
         listAgentsAll: () => [{ sessionId: 'cand-0000-0000-0000-000000000000', id: 'candxxxx', cwd: '/lanes/lane-4', name: 'conveyor-3438' }],
         resolveHead: (cwd) => (cwd === '/lanes/lane-4' ? MATCHING_HEAD : null),
@@ -890,6 +895,10 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
     );
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0]).toEqual(['--bg', '--resume', 'cand-0000-0000-0000-000000000000', expect.stringContaining('PR #1764')]);
+    expect(spawnCalls[0].at(-1)).toContain('MUST FIX the operator’s original guard.');
+    expect(spawnCalls[0].at(-1)).toContain('<!-- addresses-operator-send-back: SB1 -->');
+    expect(notices).toEqual([expect.objectContaining({ pr: 1764,
+      ruling: { source: 'operator-send-back', matches: [{}] } })]);
     expect(result).toEqual({
       resumed: true,
       result: {

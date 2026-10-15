@@ -124,6 +124,8 @@ import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-roun
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
+import { landHumanOnlyOperation, LAND_HUMAN_ONLY_OP, finishLandOutcome } from './land-human-only.mjs';
+import { createLandHumanOnlyReader, createLandHumanOnlySinks } from './land-human-only-io.mjs';
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
@@ -247,6 +249,13 @@ export const OPERATIONS = Object.freeze({
   [RECORD_REFERRAL_RULING_OP]: () => ({
     declaration: recordReferralRulingOperation({ readRulingContext: createRecordReferralRulingReader() }),
     sinks: createRecordReferralRulingSinks(),
+  }),
+  // Card 334 — read → plan → write: the operator lands an approved human-only (workflow-file) PR the drain may not
+  // enqueue. The drain's own gate reads on the exact head, then label → enqueue as the operator → verify → comment.
+  [LAND_HUMAN_ONLY_OP]: () => ({
+    declaration: landHumanOnlyOperation({ readLandContext: createLandHumanOnlyReader() }),
+    sinks: createLandHumanOnlySinks(),
+    finish: finishLandOutcome,
   }),
   [CLEAR_STUCK_SESSION_OP]: () => ({
     declaration: clearStuckSessionOperation({ readStuckFacts: createClearStuckSessionReader() }),

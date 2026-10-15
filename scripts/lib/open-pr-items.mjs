@@ -417,14 +417,16 @@ export function declaredResolvedIdsFromPr(headRefName = '', title = '', { body =
     const t = transitions.get(key);
     return !!t && (t.to === 'active' || t.to === 'resolved') && t.from !== 'resolved';
   };
+  const hashCandidates = new Set();
   // Signal 1 — explicit resolves/Resolves marker LINES (never mid-sentence): "Resolves #4121", "resolves:
   // #4121, #4134", "Resolves #4121 and #4134." — optional leading `-`/`*` bullet, bold decoration and one
-  // trailing `.`/`;`.
+  // trailing `.`/`;`. Hash members use the same bornAs/diff corroboration as signal 2.
   for (const rawLine of String(body || '').split(/\r?\n/)) {
     const line = rawLine.trim();
-    const m = /^(?:[-*]\s+)?\*{0,2}resolve[sd]?:?\*{0,2}\s+((?:#\d{2,5}\b[\s,&]*(?:and\s+)?)+)[.;]?$/i.exec(line);
+    const m = /^(?:[-*]\s+)?\*{0,2}resolve[sd]?:?\*{0,2}\s+((?:#(?:\d{2,5}|x[0-9a-z]{6})\b[\s,&]*(?:and\s+)?)+)[.;]?$/i.exec(line);
     if (!m) continue;
-    for (const n of m[1].matchAll(/#(\d{2,5})/g)) {
+    for (const n of m[1].matchAll(/#(\d{2,5}|x[0-9a-z]{6})\b/gi)) {
+      if (/^x/i.test(n[1])) { hashCandidates.add(n[1].toLowerCase()); continue; }
       const id = n[1].padStart(3, '0');
       if (delivered(id)) ids.add(id);
     }
@@ -432,7 +434,6 @@ export function declaredResolvedIdsFromPr(headRefName = '', title = '', { body =
   // Signal 2 — structured bornAs-hash card markers (title parens holding only hashes; body leading bold span /
   // heading line). On a bold-led line only the text INSIDE the leading bold span counts — prose after it
   // (`**Note:** unlike xg6m4i5, …`) is a citation.
-  const hashCandidates = new Set();
   for (const g of String(title || '').matchAll(/\(([^()]*)\)/g)) {
     if (!/^\s*x[0-9a-z]{6}(?:\s*(?:,|\+|&|\band\b)\s*x[0-9a-z]{6})*\s*$/i.test(g[1])) continue;
     for (const m of g[1].matchAll(/x[0-9a-z]{6}/gi)) hashCandidates.add(m[0].toLowerCase());
