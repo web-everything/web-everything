@@ -14,7 +14,8 @@ export default {
   card: '347 / PR 5366',
   fixedBy: { sha: 'HEAD', where: 'lane/prepare-dup-guard', paths: [DAEMON] },
   fixPresent(root) {
-    return readFileSync(resolve(root, DAEMON), 'utf8').includes('const stampedOpenPr =');
+    const daemon = readFileSync(resolve(root, DAEMON), 'utf8');
+    return daemon.includes('const stampedOpenPr =') && daemon.includes('PREPARE_REFUSAL_HOLD_MS');
   },
   async run() {
     const { runBuildDispatchTick, createPrepareStatusReader } = await import(resolve(ROOT, DAEMON));
@@ -47,12 +48,34 @@ export default {
         problems.push(`dead OPEN unstamped PR stranded (sections=${hasSections})`);
       }
     }
-    const parked = fixture(['5028', '5029', '5030']);
-    parked.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, held: true,
-      recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }));
-    for (let i = 0; i < 2; i++) {
-      const tick = await runBuildDispatchTick({ live: true, effects: parked });
-      if (!tick.prepare.launched.some(r => r.num === '5030')) problems.push('two persistent refusals starved the clean successor');
+    // Round 5: the REAL tick-core offers at most two item prepares, so a stub offering three cannot show starvation.
+    const { planTick } = await import(resolve(ROOT, 'scripts/conveyor/tick-core.mjs'));
+    for (const kind of ['open PR', 'park']) {
+      const effects = fixture();
+      let nowMs = Date.parse('2026-10-15T12:00:00Z');
+      effects.now = () => nowMs;
+      const pending = ['5028', '5029', '5030'];
+      effects.planTick = (bk, { config } = {}) => planTick({
+        state: { queue: pending.map(num => ({ num })), lanes: [], prs: [] },
+        plan: { launch: [], held: pending.map(num => ({ num, reason: 'needs-prepare' })) },
+        freeLanes: [1, 2, 3, 4, 5, 6], bookkeeping: bk, config: { maxConcurrentLanes: 1_000_000, ...config },
+      });
+      if (kind === 'park') {
+        effects.listPrepareFailures = () => ['5028', '5029'].map(num => ({ num, held: true,
+          recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' }));
+      } else {
+        effects.listPreparePrs = ({ num }) => num === '5030' ? []
+          : [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}d-prepare-x` }];
+      }
+      let bookkeeping = {};
+      let cleanLaunched = false;
+      for (let i = 0; i < 3; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        cleanLaunched ||= tick.prepare.launched.some(r => r.num === '5030');
+        bookkeeping = tick.nextBookkeeping;
+        nowMs += 60_000;
+      }
+      if (!cleanLaunched) problems.push(`two persistently refused ${kind} cards starved the clean third under the real tick-core`);
     }
     const missing = fixture();
     delete missing.listPreparePrs;

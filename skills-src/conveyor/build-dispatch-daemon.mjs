@@ -112,6 +112,9 @@ export function prepareRouteFallback(records = [], releases = []) {
 export const BUILD_DISPATCH_DAEMON_LEASE_KEY = '<conveyor:build-dispatch-daemon-lease>';
 export const DEFAULT_INTERVAL_MS = 120_000;
 export const PREPARE_SESSION_DEAD_GRACE_MS = 20 * 60_000;
+// PR #5366 — how long a launch-refused prepare card stays out of tick-core's plan before it is offered (and checked)
+// again. tick-core offers at most two item prepares a tick and cannot see the daemon's launch refusals.
+export const PREPARE_REFUSAL_HOLD_MS = 30 * 60_000;
 // #4517 — bounds cliRetryInfraBlocked's execFileSync so a slow `pr-land --label-on-green` CI wait inside
 // `infra-blocked.mjs retry` can never stall a whole daemon tick past this. Well under DEFAULT_INTERVAL_MS
 // (120_000ms) so the rest of the tick (dispatch, liveness, claims) always keeps real headroom. A retry that
@@ -439,8 +442,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (live) effects.releasePrepareHold({ num: normNum(h.num) });
     return false;
   });
+  // A launch refusal (an open or recent merged prepare PR, a live claim, a needs-you park, a failed PR listing) is
+  // decided here, after planning, so tick-core keeps offering the same refused cards in its two slots. Hold each one
+  // out of the plan while its refusal is fresh, so the slots rotate to clean cards; it is re-checked once it ages out.
+  const tickNowMs = effects.now?.() ?? Date.now();
+  const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
+    .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS && !completedPrepares.has(normNum(r.num)));
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
-  bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
+  bookkeeping = { ...bookkeeping, prepareHeldNums: [...new Set([...holds.map((h) => normNum(h.num)),
+    ...freshRefusals.map(r => normNum(r.num))])] };
   const tickBookkeeping = bookkeeping;
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
   // row owns it from here); a failed one releases its claim and records the failure the same way a blocking launch did.
@@ -904,6 +914,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
+  prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
@@ -1328,6 +1339,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       ...out?.nextState,
       groupDropped: [...groupDropped].slice(-200),
       itemPrepareAttempts,
+      prepareRefusals: [
+        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched].some(x => normNum(x.num) === normNum(r.num))),
+        ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString() })),
+      ].slice(-200),
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),
     }, dispatched.map((x) => x.num), prepare.launched.map((x) => x.num)),
   };

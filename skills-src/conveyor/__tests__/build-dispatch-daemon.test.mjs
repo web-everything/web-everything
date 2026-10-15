@@ -1814,6 +1814,54 @@ describe('automatic item preparation', () => {
       effects.releasePrepareClaim({ num: '5030' });
     }
   });
+  // PR #5366 review round 5: the REAL tick-core offers at most two item prepares. Two cards the daemon refuses at
+  // launch (an OPEN Codex prepare PR tick-core cannot see) must not hold both picks on every later tick.
+  it.each(['open PR', 'park', 'listing failure'])('the real tick-core rotates past two persistently refused %s cards to a clean third', async kind => {
+    const { planTick } = await import('../../../scripts/conveyor/tick-core.mjs');
+    const effects = fixture();
+    let nowMs = Date.parse('2026-10-15T12:00:00Z');
+    effects.now = () => nowMs;
+    let pending = ['5028', '5029', '5030'];
+    effects.planTick = (bk, { config } = {}) => planTick({
+      state: { queue: pending.map(num => ({ num })), lanes: [], prs: [] },
+      plan: { launch: [], held: pending.map(num => ({ num, reason: 'needs-prepare' })) },
+      freeLanes: [1, 2, 3, 4, 5, 6], bookkeeping: bk, config: { maxConcurrentLanes: 1_000_000, ...config },
+    });
+    effects.listPrepareFailures = () => kind === 'park' ? ['5028', '5029'].map(num => ({ num,
+      held: true, recordedAt: '2026-10-14', holdReason: 'needs-you: decide scope' })) : [];
+    let refusing = true;
+    effects.listPreparePrs = ({ num }) => {
+      if (num === '5030' || kind === 'park' || !refusing) return [];
+      if (kind === 'listing failure') throw new Error('unavailable');
+      return [{ number: Number(num), state: 'OPEN', headRefName: `lane/${num}d-prepare-x` }];
+    };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let bookkeeping = {};
+      const ticks = [];
+      for (let i = 0; i < 3; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        ticks.push({ refused: tick.prepare.refused.map(r => r.num), launched: tick.prepare.launched.map(r => r.num) });
+        bookkeeping = tick.nextBookkeeping;
+        nowMs += 60_000;
+      }
+      // Tick 1 spends both picks on the refused cards; afterwards they are held while the refusal is fresh, so the
+      // clean third gets a pick instead of the same two being refused again every tick.
+      expect(ticks).toEqual([
+        { refused: ['5028', '5029'], launched: [] },
+        { refused: [], launched: ['5030'] },
+        { refused: [], launched: [] },
+      ]);
+      if (kind === 'park') return; // a needs-you park is lifted by the operator, not by time
+      // Once the refusal ages out the card is re-checked; with its PR gone it launches. 5030 got prepared meanwhile.
+      refusing = false;
+      pending = ['5028', '5029'];
+      effects.releasePrepareClaim({ num: '5030' });
+      nowMs += 60 * 60_000;
+      const after = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+      expect(after.prepare.launched.map(r => r.num).sort()).toEqual(['5028', '5029']);
+    } finally { log.mockRestore(); }
+  });
   it.each([
     ['listing unavailable', () => { throw new Error('network failed'); }, [], 'prepare PR listing unavailable'],
     ['listing effect absent', undefined, [], 'prepare PR listing unavailable'],

@@ -814,9 +814,15 @@ title as a fallback. Probe OPEN and MERGED PRs without stamps: neither is an uns
 The launch guard must also run without a surviving claim, and refuse when PR listing throws.
 Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
 0 disables only the merged refusal); probe the time boundary with an injected clock.
-A needs-you park in the newest ledger record survives completion by a later stamp; only explicit
-`releasedAt`/`releasedBy` metadata clears that park for the launch guard. Cover that completed record
-separately from an ordinary completed failure, so stamp observation cannot silently authorize a retry.
+A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
+Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
+the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
+the releases store. Cover each clearing path, and an older park under a newer record, so an operator's
+hand stamp never re-parks the card (the stale-reprepare livelock).
+tick-core offers at most two item prepares and cannot see these launch refusals. The daemon keeps a
+refused card out of the plan for `PREPARE_REFUSAL_HOLD_MS`, then checks it again. Test that capacity
+rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
+a clean third, across ticks.
 
 Stamp-recovery reservations do not expire. A terminal recovery error is recorded in its dispatch log,
 classified by the daemon, and cannot spawn again without a remaining transient budget or a cited fix.
