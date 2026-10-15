@@ -74,6 +74,12 @@ describe('evidence IO', () => {
       expect(result.ciHealComments).toBe(4);
       expect(result.refunded).toBeUndefined();
     });
+    it('with no injected policy the environment setting decides (WE_CI_HEAL_RESET_ON_FIX_HEAD)', () => {
+      const comments = [...three(), ...fixPush];
+      expect(evidenceFor(comments)).toMatchObject({ ciHealComments: 0, refunded: 3 });
+      vi.stubEnv('WE_CI_HEAL_RESET_ON_FIX_HEAD', '0');
+      try { expect(evidenceFor(comments)).toMatchObject({ ciHealComments: 3 }); } finally { vi.unstubAllEnvs(); }
+    });
     it('attributed-main refunds still apply without a reset, and restore can be switched off', () => {
       const window = { author: BOT, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' } }) };
       expect(evidenceFor([window, ...three()])).toMatchObject({ ciHealComments: 1, refunded: 2 });
