@@ -1388,12 +1388,21 @@ function candidateBoardRoots() {
  * @returns {string|null}
  */
 export function resolveLedgerBoard(repo, opts = {}, env = process.env) {
+  return resolveLedgerBoardDetail(repo, opts, env).board;
+}
+
+/** {@link resolveLedgerBoard} plus whether a null board is CERTAIN. A candidate checkout that exists but whose
+ *  `origin` could not be read (a failed or timed-out probe, never cached) might be the board, so its null is not
+ *  certain: a caller choosing a store from it must not treat "unknown" as "no board".
+ *  @returns {{board: string|null, certain: boolean}} */
+export function resolveLedgerBoardDetail(repo, opts = {}, env = process.env) {
   const named = String(opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? '').trim();
-  if (named) return named;
-  if (opts.boardRoot === undefined && (isUnderTest(env) || String(env.GITHUB_ACTIONS ?? '').toLowerCase() === 'true')) return null;
+  if (named) return { board: named, certain: true };
+  if (opts.boardRoot === undefined && (isUnderTest(env) || String(env.GITHUB_ACTIONS ?? '').toLowerCase() === 'true')) return { board: null, certain: true };
   const want = canonicalizeSlug(String(repo ?? '').trim()).toLowerCase();
-  if (!want) return null;
+  if (!want) return { board: null, certain: true };
   const roots = opts.boardRoot !== undefined ? [opts.boardRoot].filter(Boolean) : candidateBoardRoots();
+  let certain = true;
   for (const root of roots) {
     let have = '';
     if (opts.originRepo) have = opts.originRepo(root);
@@ -1401,9 +1410,10 @@ export function resolveLedgerBoard(repo, opts = {}, env = process.env) {
       have = originMemo.get(root) ?? '';
       if (!have) { have = originRepoOf(root); if (have) originMemo.set(root, have); }
     }
-    if (have && String(have).toLowerCase() === want) return root;
+    if (have && String(have).toLowerCase() === want) return { board: root, certain: true };
+    if (!have && (opts.originRepo || existsSync(join(root, '.git')))) certain = false;
   }
-  return null;
+  return { board: null, certain };
 }
 
 /** The `verdictLedger.store` setting (declared in `config/platformDefaults.ts`, mirrored here because .mjs cannot

@@ -5,7 +5,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { appendVerdict, buildLedgerEvent, buildVerdictRecord, EVENT_TYPES, foldVerdictLedger,
-  parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoard, resolveLedgerStoreChoice, validateLedgerEvent,
+  parseLedgerEvents, readLedgerEventsFromStore, resolveLedgerBoardDetail, resolveLedgerStoreChoice, validateLedgerEvent,
   VERDICT_LEDGER_STORES, verdictLedgerPath } from './verdict-ledger.mjs';
 
 export const DRAIN_FACTS_SOURCE = 'merge-ai-prs';
@@ -71,19 +71,23 @@ const readHome = repo => {
 
 /** The store the drain's writes land in, resolved as `appendVerdict` resolves it. `dual` and `git` read git: a hold
  *  that missed git spills to home, and a release can reach git but not home, so a home read would hide the miss.
- *  With no board, named or not, git is never written (a hold lands only in home, a release is refused), so home is the
- *  store: reading git would fail every pass, and a failed read records the hold again each pass without end. */
-export function drainLedgerReadStore(repo, env = process.env) {
+ *  With CERTAINLY no board, named or not, git is never written (a hold lands only in home, a release is refused), so
+ *  home is the store: reading git would fail every pass, and a failed read records the hold again each pass without
+ *  end. A board that is only unknown (an origin probe failed) reads git: the write may still find the board, and home
+ *  may lag a release git has, so the read fails and the hold is recorded rather than deduped against home. */
+export function drainLedgerReadStore(repo, env = process.env, { resolveBoard = resolveLedgerBoardDetail } = {}) {
   const { store } = resolveLedgerStoreChoice(undefined, env);
   if (store === 'home') return 'home';
   if (!VERDICT_LEDGER_STORES.includes(store)) return store;
-  return resolveLedgerBoard(repo, {}, env) ? 'git' : 'home';
+  const { board, certain } = resolveBoard(repo, {}, env);
+  return board || !certain ? 'git' : 'home';
 }
 
 /** Read each repo once, before the pass writes, and return a sync reader for the recorders' `read` seam. Keyed by the
  *  exact repo text the writes use (the git path and the store read are case-sensitive). A failed read throws from the
  *  reader: releases then write nothing, and `recordDrainHold` records its hold without deduping it (F4). */
-export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore } = {}) {
+export async function readDrainLedgerSnapshot(repos = [], { env = process.env, readStore = readLedgerEventsFromStore,
+  resolveBoard = resolveLedgerBoardDetail } = {}) {
   const snapshot = new Map();
   const exact = repo => String(repo ?? '').trim();
   for (const repo of repos) {
@@ -91,7 +95,7 @@ export async function readDrainLedgerSnapshot(repos = [], { env = process.env, r
     if (!key || snapshot.has(key)) continue;
     try {
       // Home keeps the whole-file read (the recorders filter by slug); the store read filters by the exact repo text.
-      const store = drainLedgerReadStore(key, env);
+      const store = drainLedgerReadStore(key, env, { resolveBoard });
       const read = store === 'home' ? { status: 'ok', rows: readHome(key) } : await readStore(key, { store, env });
       snapshot.set(key, read?.status === 'ok' && Array.isArray(read.rows) ? { rows: read.rows }
         : { error: `${read?.reason ?? 'unreadable'}: ${read?.error ?? 'no rows'}` });

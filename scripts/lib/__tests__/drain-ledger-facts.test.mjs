@@ -2,10 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { drainLedgerReadStore, drainReviewGateFact, planDrainLedgerFacts, readDrainLedgerSnapshot,
   recordDrainLedgerFacts } from '../drain-ledger-facts.mjs';
 import { decideReviewGate } from '../review-escalation.mjs';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { appendVerdict, buildLedgerEvent, buildVerdictRecord, verdictLedgerPath } from '../verdict-ledger.mjs';
+import { appendVerdict, buildLedgerEvent, buildVerdictRecord, resolveLedgerBoard, resolveLedgerBoardDetail,
+  verdictLedgerPath } from '../verdict-ledger.mjs';
 import { recordDrainHold } from '../../merge-ai-prs.mjs';
 const repo = 'o/r', head = 'a'.repeat(40), old = 'b'.repeat(40), now = '2026-10-13T12:00:00.000Z';
 const base = { repo, pr: 1, at: now, source: 'test', declaredActor: 'test' };
@@ -138,6 +139,20 @@ describe('drain ledger facts — the recorders read the store their writes land 
     // A NAMED store with no board never writes git (holds land in home, releases are refused): home is the store.
     expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'dual' })).toBe('home');
     expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'git' })).toBe('home');
+    // A board that is only UNKNOWN (an origin probe failed) is not "no board": read git, so the read fails, not home.
+    const unknown = { resolveBoard: () => ({ board: null, certain: false }) };
+    expect(drainLedgerReadStore(repo, { WE_VERDICT_LEDGER_STORE: 'dual' }, unknown)).toBe('git');
+    expect(drainLedgerReadStore(repo, {}, unknown)).toBe('git');
+  });
+  it('a failed origin probe leaves the board unknown, never certainly absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'drain-facts-board-'));
+    try {
+      mkdirSync(join(dir, '.git'));
+      expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => '' }, {})).toEqual({ board: null, certain: false });
+      expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => 'x/y' }, {})).toEqual({ board: null, certain: true });
+      expect(resolveLedgerBoardDetail(repo, { boardRoot: dir, originRepo: () => repo }, {})).toEqual({ board: dir, certain: true });
+      expect(resolveLedgerBoard(repo, { boardRoot: dir, originRepo: () => '' }, {})).toBe(null);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('a hold that misses the shared store is reported and recorded again on the next pass', async () => {
     const s = stores();
@@ -237,6 +252,18 @@ describe('drain ledger facts — the recorders read the store their writes land 
     expect(await pass()).toMatchObject({ appended: false, errors: [expect.stringMatching(/ledger-write-miss/)] });
     for (let n = 0; n < 4; n++) expect(await pass()).toMatchObject({ ok: true, appended: false });
     expect(s.home().map(e => e.type)).toEqual(['hold']);
+  }));
+  it('a flaky origin probe during the read never dedups against a home that lags a git release', () => withHome(async s => {
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read: await s.snapshot(true), append: s.append() })).toMatchObject({ ok: true, appended: true });
+    expect(recordDrainLedgerFacts({ verdicts: [{ ...v, reviewGate: {} }], now: () => now, read: await s.snapshot(true), append: s.append({ homeFails: true }) }))
+      .toMatchObject({ ok: false });
+    expect(s.home().map(e => e.type)).toEqual(['hold']);
+    // This pass the origin probe fails during the read; the write then finds the board again.
+    const noBoardEnv = { WE_VERDICT_LEDGER_STORE: 'dual' };
+    const read = await readDrainLedgerSnapshot([repo], { env: noBoardEnv, resolveBoard: () => ({ board: null, certain: false }),
+      readStore: async (_r, { store }) => ({ status: 'unreadable', reason: 'no-board', error: `store ${store}` }) });
+    expect(recordDrainHold({ repo, pr: 1, reason: 'review', read, append: s.append() })).toMatchObject({ ok: true, appended: true });
+    expect(s.git.map(e => e.type)).toEqual(['hold', 'release', 'hold']);
   }));
 });
 
