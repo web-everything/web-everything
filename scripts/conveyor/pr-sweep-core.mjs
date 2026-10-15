@@ -64,7 +64,7 @@ export function resolveOwner(pr, signals = {}) {
   // A healthy live session is current evidence even when its creation timestamp is old.
   const at = session ? now : daemon ? ms(daemon.at) : null;
   const stuck = Boolean(smell) || (at !== null && now - at > stuckAfterMinutes * 60000);
-  if (unread && !smell && (stuck || !owner)) return { ...base, owner, state: 'unknown', why: 'Bound session could not be read' };
+  if (unread && !smell && (stuck || !owner)) return { ...base, state: 'unknown', why: 'Bound session could not be read' };
   return { ...base, owner, ownerLastSeenAt: at === null ? null : new Date(at).toISOString(),
     state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
