@@ -38,10 +38,19 @@ import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindi
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
-  runReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
+  runReviewLoopOnce as driveReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
+
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
+  renderReferralRecord } from '../../lib/jury-core.mjs';
+
+// Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
+// use the production default through driveReviewLoopOnce.
+const runReviewLoopOnce = options => driveReviewLoopOnce({
+  acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: false } }, ...options,
+});
 
 // #4493 converge round-1 (4 of 5 jurors, independently): every existing `runReviewLoopOnce` test injects its own
 // `fileItem`, so nothing ever exercised the PRODUCTION DEFAULT wiring — the exact one-line swap
@@ -1391,5 +1400,79 @@ describe('runReviewLoopOnce — a retry after a queued round-card filing never f
       expect(findRetainedRoundCardsReceipt({ store: flaky, repo: 'o/r', pr: 9, ...want })).toBeNull();
       expect(findRetainedRoundCardsReceipt({ store: { list: () => { throw new Error('x'); }, read: () => null }, repo: 'o/r', pr: 7, ...want })).toBeNull();
     });
+  });
+});
+
+
+describe('unattended acceptance safety boundary', () => {
+  // Undeclared impact still requires prevention capture, without a `broken` finding.
+  const noBroken = { ...PREVENTION_ANSWER,
+    findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...f }) => f) };
+  it('prevention-outstanding with clean referrals and no broken finding files then accepts', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn(async () => {
+      expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      return { code: 0, lines: [] };
+    });
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      makeJudge: cannedJudge(noBroken), mintRunId: () => 'safety-prevention-clean', fileItem });
+    expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('complete');
+    expect(fileItem).toHaveBeenCalledOnce();
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(true);
+  });
+  it('prevention-outstanding with an unruled broken finding cannot accept', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn();
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken', fileItem });
+    expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(fileItem).not.toHaveBeenCalled();
+    expect(out.lines.join('\n')).toMatch(/broken finding is not ruled/);
+  });
+});
+
+
+describe('unattended accept reads the live head', () => {
+  const repo = 'web-everything/web-everything';
+  const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judge';
+  const key = referralFindingKey(seat, original);
+  const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
+    reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
+    attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
+  const comment = body => ({ body, author: { login: 'web-everything' } });
+  it.each(['accept', 'prevention-outstanding'].flatMap(verdict =>
+    [null, 'auto-policy', 'card', 'not-real'].map(result => [verdict, result])))
+  ('%s with live referral ruling %s gates the actual accept effects', async (verdict, result) => {
+    const comments = [comment(renderReferralRecord(record))];
+    if (result) comments.push(comment(buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
+      actor: result === 'auto-policy' ? 'auto-policy' : 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
+      rulings: [{ runId: record.runId, key, result: result === 'auto-policy' ? 'block' : result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] })));
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));
+    const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+    const answer = verdict === 'accept' ? CLEAN_ANSWER : {
+      ...PREVENTION_ANSWER, findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...f }) => f),
+    };
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), readAcceptancePr, cardReadable: () => true,
+      fileItem, makeJudge: cannedJudge(answer), mintRunId: () => `safety-${verdict}-${result}` });
+    const cleared = ['card', 'not-real'].includes(result);
+    expect(out.run.verdict.verdict).toBe(verdict);
+    expect(readAcceptancePr).toHaveBeenCalled();
+    expect(out.stopped).toBe(cleared ? 'complete' : 'confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
+    expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
+    if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
   });
 });

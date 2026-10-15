@@ -74,6 +74,8 @@ import {
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
   roundCardsFindingsMarker, roundCardsHeadMarker,
 } from '../lib/review-loop-policy.mjs';
+import { unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -508,10 +510,10 @@ export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) 
 }
 
 function defaultReadResumePr({ repo, pr }) {
-  const { headRefOid } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid'],
+  const { headRefOid, body, createdAt } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
   // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
-  return { headRefOid, comments: readCompletePrComments(pr, { repo }) };
+  return { headRefOid, body, createdAt, comments: readCompletePrComments(pr, { repo }) };
 }
 
 /**
@@ -551,9 +553,28 @@ export async function runReviewLoopOnce({
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
   parallelJudges = false, seatLanes = null,
+  readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
+  acceptPolicy = unattendedAcceptPolicy(),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
-  const drive = (o) => driveRun({ ...o, parallelJudges, seatLanes });
+  const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
+  const acceptHold = (run) => {
+    if (!requiresCleanReferrals) return null;
+    try {
+      const live = ['accept', 'prevention-outstanding'].includes(run?.verdict?.verdict) ? readAcceptancePr(run.input) : {};
+      return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
+        expectedHead: run.findings?.read?.netBasis?.rev, cardReadable });
+    } catch (error) { return `live referrals unavailable: ${error.message}`; }
+  };
+  const drive = (o) => {
+    const guardedConfirm = (pending, current) => {
+      const answer = o.autoConfirm?.(pending, current);
+      return answer?.value === 'accept' && acceptHold(current) ? null : answer;
+    };
+    // Explicit unattended resumes and the card-filing paths obey the same boundary as auto-confirm.
+    const resume = o.resume?.value === 'accept' && acceptHold(o.run) ? null : o.resume;
+    return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes });
+  };
   if (parsed.control.help) {
     const { buildCliSpec } = await import('./cli-adapter.mjs');
     return { code: 0, lines: [buildCliSpec(declaration).usage], run: null, stopped: 'help' };
@@ -654,6 +675,15 @@ export async function runReviewLoopOnce({
   const outcome = await drive({
     run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
   });
+
+  if (outcome.stopped === 'confirm') {
+    const hold = acceptHold(outcome.run);
+    if (hold) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, lines: parsed.control.json ? rendered.lines
+        : [...rendered.lines, `Unattended accept parked: ${hold}.`], run: outcome.run, stopped: outcome.stopped };
+    }
+  }
 
   // ── THE MECHANIZED PREVENTION-FILING BRANCH (#2749 fix, 2026-09-26 scope ruling) ─────────────────────────
   // `reviewLoopAutoConfirm` DECLINES a `prevention-outstanding` verdict (it must — filing a card is impure

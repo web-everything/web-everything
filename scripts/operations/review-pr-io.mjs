@@ -51,7 +51,7 @@ import { currentActorId, parseAuthorActorId } from '../lib/review-independence.m
 // #xlw02hw — the `advise` step's sink posts a BARE comment (never `we:scripts/review-set-label.mjs`, which
 // always couples a comment with a label swap — #2644 — and this step swaps no label). `createGhProvider`'s
 // `postComment` is the SAME primitive that single home already uses, imported rather than re-implemented.
-import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
@@ -886,6 +886,9 @@ export function createReviewPrSinks({
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
         if (state.headRefOid !== read.netBasis.rev) throw new HeadChangedError('mandatory referral: reviewed head changed; hold retained');
+        if (state.comments?.length >= PR_COMMENTS_PAGE_SIZE && labelProvider.readComments) {
+          state.comments = labelProvider.readComments(read.repo, read.pr);
+        }
         if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
         return state;
       };
@@ -910,7 +913,16 @@ export function createReviewPrSinks({
         // xuxcsw6: never repost a record the thread already carries byte-for-byte (trusted-author read).
         const same = r => JSON.stringify(r) === JSON.stringify(record);
         if (!readReferralRecords(before.comments, context(before)).records.some(same)) {
-          labelProvider.postComment(read.repo, read.pr, body);
+          // One comment per head/key set: update its cumulative snapshot instead of repeating the ask.
+          // Keep runId and all prior rulings intact so operator selections remain matchable.
+          const previous = before.comments.findLast(c => readReferralRecords([c], context(before)).records
+            .some(r => r.repo === record.repo && r.pr === record.pr && r.head === record.head && r.runId === record.runId));
+          if (previous) {
+            if (!previous.id || !labelProvider.editComment) throw new Error('mandatory referral: cannot update existing comment; hold retained');
+            const next = readReferralRecords([...before.comments, { ...previous, body }], context(before));
+            if (next.malformed || !next.records.some(same)) throw new Error('mandatory referral: non-monotonic snapshot; hold retained');
+            labelProvider.editComment(previous.id, body);
+          } else labelProvider.postComment(read.repo, read.pr, body);
         }
         const state = fresh();
         const parsed = readReferralRecords(state.comments, context(state));
