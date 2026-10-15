@@ -179,13 +179,26 @@ it('retries failed alerts while preserving the successful ones', async () => {
   expect(out.errors.join(' ')).toContain('transport failed');
   expect(out.nextState.episodes[`${pr.repo}#12`].alerted).toBe(false);
 });
+it('a failed NEEDS YOU send keeps the previous set so the next sweep alerts again', async () => {
+  const added = { ...pr, number: 13, repo: pr.repo };
+  const tick = (notify) => runPrSweep({ now, config: {}, settings: { value: settings, sources: {} }, readPrevious: () => ({ episodes: {}, needsYou: [] }),
+    readPrs: () => [], readSignals: () => ({}), readQueue: () => ({ ready: [added], rulingNeeded: [] }), notify, flush: () => {}, persist: () => {}, append: () => {} });
+  const failed = await tick(() => ({ ok: false, error: 'transport failed' }));
+  expect(failed.alerts.map((a) => a.kind)).toEqual(['needs-you']); expect(failed.nextState.needsYou).toEqual([]);
+  const sent = await tick(() => ({ ok: true }));
+  expect(sent.alerts.map((a) => a.kind)).toEqual(['needs-you']); expect(sent.nextState.needsYou).toEqual([`${pr.repo}#13`]);
+});
 it('writes an atomic durable report and a single ET handoff line', async () => {
-  const { mkdtempSync, readFileSync, readdirSync, rmSync } = await import('node:fs');
+  const { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } = await import('node:fs');
   const dir = mkdtempSync(join(tmpdir(), 'pr-sweep-report-')); const lines = [];
+  // The sweep never writes health `episodes` or `daemons`: health state.json is left byte-identical.
+  const health = `${JSON.stringify({ episodes: { e: { status: 'open' } }, daemons: { review: {} } })}\n`;
+  writeFileSync(join(dir, 'state.json'), health);
   try {
     const out = await runPrSweep({ dir, config: {}, now, settings: { value: settings, sources: { enabled: 'tool' } }, readPrevious: () => ({}), readPrs: () => [pr], readSignals: () => ({}), readQueue: () => ({ ready: [pr], rulingNeeded: [] }), flush: () => {}, notify: () => { throw new Error('unexpected notification'); }, append: (line) => lines.push(line) });
     expect(JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8'))).toEqual(out);
-    expect(readdirSync(dir)).toEqual(['pr-sweep.json']); expect(lines).toHaveLength(1); expect(lines[0]).toContain('ET idle=1');
+    expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(health);
+    expect(readdirSync(dir).sort()).toEqual(['pr-sweep.json', 'state.json']); expect(lines).toHaveLength(1); expect(lines[0]).toContain('ET idle=1');
     expect(out.idle[0].state).toBe('waiting-operator');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

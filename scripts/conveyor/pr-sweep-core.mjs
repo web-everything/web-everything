@@ -33,7 +33,6 @@ export function sessionActivity(a, now, activeWithinMinutes = 30) {
   if (Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000) return 'yes';
   return a.activityUnknown === true ? 'unknown' : 'no';
 }
-export const isActiveSession = (a, now, activeWithinMinutes) => sessionActivity(a, now, activeWithinMinutes) === 'yes';
 export function resolveOwner(pr, signals = {}) {
   const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [], unreadSessions = [] } = signals;
   const base = { owner: null, state: 'none', why: 'No owner signal', ownerLastSeenAt: null };
