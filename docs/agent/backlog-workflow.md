@@ -1293,7 +1293,8 @@ scope holds, sizing, clearance, stamp staleness and the queue order all apply as
 **Not in this feature: verified operator authority.** An attributed operator instruction record, gating
 operator-task treatment on it, an explicit `priority: P0..P4` that jumps the build queue, and operator-aware
 prepare/queue/probation admission are card #xqqmw6g. Until it lands, `operatorTask: true` is card
-frontmatter any card author can write, so it unlocks nothing beyond the report step below.
+frontmatter any card author can write, so it unlocks nothing beyond the filing stamp above and the report step below (which also forces the full
+delivery-agent route).
 
 `we:scripts/settings/operator-task.json` owns `build.operatorTask`:
 `{ enabled: true, postBuild: { edgeLoad: false, liveProof: false, report: true } }`. Valid leaves cascade independently from
