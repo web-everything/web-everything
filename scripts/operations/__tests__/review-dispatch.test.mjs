@@ -637,6 +637,7 @@ describe('isReviewCodePath (#4387)', () => {
       'scripts/lib/dispatch-contracts.mjs', 'scripts/operations/detached-dispatch.mjs',
       'scripts/operations/dispatch-lane.mjs', 'scripts/lib/github-app-token.mjs', 'scripts/lib/secret-scrub.mjs',
       'scripts/guard-lane.mjs', 'scripts/lib/atomic-json-file.mjs',
+      'scripts/lib/operator-send-backs.mjs', 'scripts/lib/marker-authorship.mjs',
     ].filter((f) => !isReviewCodePath(f))).toEqual([]);
   });
   // A renamed or deleted root would silently drop out of the closure (collectImportClosure skips it).

@@ -58,6 +58,15 @@ let humanReviewOnlyHold, parsePrResultTable;
 let mergeGateVerdictImportError;
 try { ({ humanReviewOnlyHold, parsePrResultTable } = await import('../lib/merge-gate-verdict.mjs')); }
 catch (error) { mergeGateVerdictImportError = String(error?.message ?? error).split('\n')[0]; }
+// Partial CLI copies may lack the send-back reader. Keep the queue runnable, but never
+// declare a PR ready when its operator requests could not be checked.
+let sendBackLedger = null;
+let sendBackLedgerError = null;
+try { sendBackLedger = await import('../lib/operator-send-backs.mjs'); }
+catch (error) { sendBackLedgerError = String(error?.message ?? error).split('\n')[0]; }
+const operatorSendBackHoldReasons = (pr) => sendBackLedger
+  ? sendBackLedger.operatorSendBackHoldReasons(pr)
+  : [`operator send-back check unavailable: ${sendBackLedgerError}`];
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -142,7 +151,7 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
 export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
-  const reasons = [];
+  const reasons = operatorSendBackHoldReasons(pr);
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
   const advisory = latestAdvisory(pr.comments);
@@ -237,7 +246,7 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
 
 /** A non-review:human PR owes clear-human only when the live job proves a human-only acceptance hold. Pure. */
 export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
-  const reasons = [];
+  const reasons = operatorSendBackHoldReasons(pr);
   if (pr.isDraft) reasons.push('draft PR');
   for (const label of ['review:human', 'review:changes', 'review:pending', 'status:sent-back-red-team', 'ci:failed', 'merge-status:conflicting']) {
     if (hasLabel(pr, label)) reasons.push(`${label} label`);
@@ -555,6 +564,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     ready: [], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
+  if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
     readFailures += 1;
@@ -616,6 +626,11 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         else report.notReady.push({ ...row, reasons: result.reasons });
       }
       for (const pr of prs.filter((candidate) => !hasLabel(candidate, 'review:human'))) {
+        const sendBackReasons = operatorSendBackHoldReasons(pr);
+        if (sendBackReasons.length) {
+          report.notReady.push({ repo, number: pr.number, title: pr.title, reasons: sendBackReasons });
+          continue;
+        }
         let result = evaluateCeremonyOwed(pr, { redTeamSetting });
         if (result.needsMergeGateVerdict) {
           const mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });

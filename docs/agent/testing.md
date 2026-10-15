@@ -661,6 +661,19 @@ pinned to `CONSTELLATION_REPOS` by `scripts/lib/__tests__/review-core.test.mjs`.
 
 ### Operator notification probes
 
+Operator send-back regressions replay the whole PR thread, including a newer mechanical conflict bounce,
+fix-end and advisory accept. `scripts/lib/operator-send-backs.mjs` owns resolution: trusted fix evidence must
+explicitly name the request and a different head (short/full SHA spellings of the same commit do not count).
+Acceptance labels alone never clear it. Evidence comments begin with a standalone `## Fix evidence` heading
+or a standalone addresses marker (optionally preceded by `Head:`). Reviewer prose, blockquotes, fenced and
+indented examples of those formats must never resolve a request, even from a trusted author. Keep evidence
+markers in fixer prompts and replay quoted instructions through queue holds and verdict reduction. Verify the
+complete comment reader retains URLs, and exercise planning, resumed prompts, review reduction, red-team
+input fingerprints and both operator-queue entry paths. Unknown send-back heads remain open conservatively.
+Partial operator-queue CLI copies load the send-back reader optionally, report import errors, and withhold
+all readiness when it is unavailable. Notice retry receipts stay separate from thread-derived `noticedRungs`
+and are scoped to the dispatch target, head and rung; a failed post must remain retryable.
+
 `operator-notify` consumes only `operator-queue`'s `ready` rows. Tests inject the notifier,
 including child CLI probes; never exercise real desktop delivery in this suite. Persisted
 successes deduplicate until an item leaves NEEDS YOU; queue errors preserve all prior keys.
