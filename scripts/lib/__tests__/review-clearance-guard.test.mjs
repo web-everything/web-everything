@@ -102,6 +102,10 @@ describe('#5193 review clearance', () => {
       ['a restoration of another head', { comments: [...comments, comment(restoreBody.replaceAll(head, 'c'.repeat(40)), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
       // Self-review: the re-grant is the exact automation note for THIS record, and it skips only the re-arm before it.
       ['an operator paste of the restoration note with a revocation', { comments: [...comments, comment(`${restoreBody}\n\nThis restoration is wrong — I revoke.`, '19:03:31')], events: restoredEvents }],
+      ['an operator paste of the restoration note with an edited line', { comments: [...comments, comment(restoreBody.replace('the original clearance record above stands', 'REVOKED, nothing stands'), '19:03:31')], events: restoredEvents }],
+      ['an operator paste of the restoration note with a revocation in the blank line', { comments: [...comments, comment(restoreBody.replace('\n\n', '\nREVOKED\n'), '19:03:31')], events: restoredEvents }],
+      ['an operator paste of the restoration note with an edited re-arm line', { comments: [...comments, comment(restoreBody.replace('with no push', 'with no push — REVOKED'), '19:03:31')], events: restoredEvents }],
+      ['an untrusted restoration note', { comments: [...comments, comment(restoreBody, '19:03:31', 'mallory')], events: restoredEvents }],
       ['an automation restoration note with text after it', { comments: [...comments, comment(`${restoreBody}\n\nREVOKED`, '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
       ['a restoration of another record', { comments: [...comments, comment(restoreBody.replace(acceptance.url, `${acceptance.url}x`), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
       ['a revocation between the re-arm and the restoration', { comments: [...comments, comment('Hold this PR; I revoke my approval.', '19:03:10'), restoredThread.at(-1)], events: restoredEvents }],
@@ -111,6 +115,8 @@ describe('#5193 review clearance', () => {
     it.each([
       ['machine notes only', { comments: [...facts.comments, comment('🔒 conveyor fix-begin — fix claim held', '18:45:00', 'web-everything[bot]')] }],
       ['a trusted restoration after the undone re-arm', { comments: restoredThread, events: restoredEvents }],
+      // Self-review: the conveyor can post under the operator's credential; its exact restoration note still re-grants.
+      ['the exact restoration note posted under the operator credential', { comments: [...comments, comment(restoreBody, '19:03:31')], events: restoredEvents }],
     ])('still protects the acceptance with %s', (_kind, patch) => {
       expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(true);
     });

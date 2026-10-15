@@ -177,11 +177,16 @@ export function decideClearanceRestore({ setting, labels, comments, reviews, eve
  * its shape (marker line, head, the record's URL and time, ending on the setting line), so an operator's raw paste of
  * a note with a revocation after it is never a re-grant (PR #5237 round 9, self-review).
  */
+const RESTORE_NOTE_LINE_4 = 'No new verdict or acceptance marker is written; the original clearance record above stands.';
 const restoreNote = c => {
-  if (!isAutomationAuthored(c) || typeof c?.body !== 'string') return null;
+  // Trusted, not automation-only: the conveyor can post under the operator's own credential (marker-authorship.mjs
+  // header), and its real note must still re-grant. Every line is matched whole, so a paste with any edit is no note.
+  if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return null;
   const lines = c.body.trimEnd().split(/\r?\n/);
   const m = /^Head: ([0-9a-f]{40})\. Original clearance carried from (\S+) at (\S+)\.$/.exec(lines[2] ?? '');
-  return lines.length === 6 && lines[0] === RESTORE_MARKER && m && lines[3].startsWith('Re-arm: ')
+  return lines.length === 6 && lines[0] === RESTORE_MARKER && lines[1] === '' && m
+    && /^Re-arm: \S+ at \S+ removed `review:accepted` with no push \(the head is still the cleared head\)\.$/.test(lines[3])
+    && lines[4] === RESTORE_NOTE_LINE_4
     && /^reviewClearance\.restoreNoPushRearm=on \(source: [^)\n]*\)\.$/.test(lines[5]) ? { head: m[1], url: m[2], at: m[3] } : null;
 };
 const isRestoreOf = (c, record, url, prHead) => {
