@@ -1870,8 +1870,6 @@ describe('automatic item preparation', () => {
     ['open, sections, unstamped', { state: 'OPEN', hasSections: true, preparedDate: null }, {}, true],
     ['open, no sections', { state: 'OPEN', hasSections: false, preparedDate: null }, {}, false],
     ['open, stamped on the PR branch (awaiting landing)', { state: 'OPEN', hasSections: true, preparedDate: '2026-10-15' }, {}, false],
-    ['merged, sections on main, unstamped', { state: 'MERGED', preparedDate: null, createdAt: '2026-10-15T11:00:00Z' }, { hasSections: true }, true],
-    ['merged, no sections on main', { state: 'MERGED', preparedDate: null, createdAt: '2026-10-15T11:00:00Z' }, { hasSections: false }, false],
     ['a different PR read back', { state: 'OPEN', hasSections: true, preparedDate: null, number: 92 }, {}, false],
   ])('probes an untracked refused card\'s own prepare PR once: %s', async (_name, pr, main, recovers) => {
     const effects = fixture();
@@ -1930,6 +1928,27 @@ describe('automatic item preparation', () => {
       expect(followUps.every(a => a.prNumber === 91 && a.claimedAt === undefined)).toBe(true);
       expect(effects.recordPrepareFailure).not.toHaveBeenCalled();
       expect(effects.placePrepareHold).not.toHaveBeenCalledWith(expect.objectContaining({ reason: 'prepare-unstamped' }));
+    } finally { log.mockRestore(); }
+  });
+  // A re-prepare (`prepare-stale`): main still carries the stamp this attempt replaces. The probe and the hold must
+  // carry that stamp, or the old stamp reads as this PR's result and the open sectioned PR is never stamped.
+  it('recovers an untracked re-prepare\'s open sectioned PR against the stamp it replaces', async () => {
+    const effects = fixture();
+    const old = { preparedDate: '2026-09-01', preparedAgainstSha: 'abc1234' };
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5028' }] }, nextState: {} });
+    effects.readPreparedStamp = () => old;
+    effects.listPreparePrs = () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }];
+    effects.readPrepareStatus = vi.fn(({ replacesStamp }) => ({
+      ...(replacesStamp?.preparedDate === old.preparedDate ? { preparedDate: null, replacedPreparedDate: old.preparedDate } : old),
+      pr: { number: 91, state: 'OPEN', preparedDate: null, hasSections: true } }));
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const first = await runBuildDispatchTick({ live: true, effects });
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+      expect(effects.readPrepareStatus).toHaveBeenCalledWith(expect.objectContaining({ num: '5028', prNumber: 91, replacesStamp: old }));
+      expect(effects.stampPrepare).toHaveBeenCalledTimes(1);
+      expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '5028', reason: 'prepare-stamp-pending', replacesStamp: old });
     } finally { log.mockRestore(); }
   });
   it('never probes a refusal whose PR is not a lane prepare branch (a title-only match)', async () => {

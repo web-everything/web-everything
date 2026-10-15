@@ -462,12 +462,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
       && !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num)));
   const refusalHeldNums = new Set(freshRefusals.map(r => normNum(r.num)));
-  // A card refused for its own lane prepare PR (open, or merged within the guard) may have no claim, run row, hold or
-  // guard left (a restart, a retired claim), so the retirement pass would never look at it. Probe THAT PR once per
-  // refusal: a finished-but-unstamped result (sections, no stamp) goes to stamp recovery instead of being refused
-  // until the refusal ages out. Anything else stays a plain refusal — no slot, no hold.
+  // A card refused for its own OPEN lane prepare PR may have no claim, run row, hold or guard left (a restart, a
+  // retired claim), so the retirement pass would never look at it. Probe THAT PR once per refusal: a finished-but-
+  // unstamped result (sections, no stamp) goes to stamp recovery instead of being refused until the refusal ages out.
+  // Anything else stays a plain refusal — no slot, no hold.
   const refusalProbes = new Map(freshRefusals
-    .filter(r => !r.probed && Number.isInteger(r.pr) && String(r.head ?? '').startsWith('lane/'))
+    .filter(r => !r.probed && Number.isInteger(r.pr) && String(r.head ?? '').startsWith('lane/')
+      && String(r.reason ?? '').startsWith('open prepare PR'))
     .map(r => [normNum(r.num), r]));
   const probedRefusals = new Set();
   // The same goes for cards the launch loop below is already known to skip: a build backoff (`heldNums`) and a group
@@ -984,8 +985,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...holds.filter(isPrepareHold).map((h) => normNum(h.num)), ...refusalProbes.keys()]);
   // Mechanical stamp completion of a finished-but-unstamped prepare: separate from agent capacity, and failures use
   // the same evidence policy. Shared by the retirement pass and the refusal probe.
-  const startStampRecovery = async (num, status) => {
-    if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending', ...holdStamp(num) });
+  // `stamp` overrides the claim's recorded stamp: the refusal probe has no claim, and its hold must still carry the
+  // stamp a re-prepare replaces, or the next tick reads that old stamp as completion.
+  const startStampRecovery = async (num, status, stamp = holdStamp(num)) => {
+    if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending', ...stamp });
     heldNums.add(num);
     finishedPrepares.add(num);
     prepareBusy.delete(num);
@@ -1029,16 +1032,16 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (probe && !tracked && !wasHeld && !currentSettled && !guarded) {
       probedRefusals.add(num);
       let status;
-      try { status = await effects.readPrepareStatus?.({ num, bornAs: probe.bornAs, prNumber: probe.pr }); }
+      // A re-prepare carries the stamp it replaces, so the old stamp on main is not read as this PR's result.
+      const replaces = 'replacesStamp' in probe ? { replacesStamp: probe.replacesStamp } : {};
+      try { status = await effects.readPrepareStatus?.({ num, bornAs: probe.bornAs, prNumber: probe.pr, ...replaces }); }
       catch { continue; } // an unreadable PR stays a plain refusal; the next refusal probes again
       const pr = status?.pr;
-      const samePr = pr?.number === probe.pr;
-      const openWithWork = samePr && pr.state === 'OPEN' && !pr.preparedDate && pr.hasSections === true;
-      const mainWithWork = samePr && pr.state === 'MERGED' && status.hasSections === true && !status.replacedPreparedDate;
+      const openWithWork = pr?.number === probe.pr && pr.state === 'OPEN' && !pr.preparedDate && pr.hasSections === true;
       const priorFailure = failureRecords.some(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
-      if (!status?.preparedDate && (openWithWork || mainWithWork) && !priorFailure) {
+      if (!status?.preparedDate && openWithWork && !priorFailure) {
         recoveryPins.set(num, { num, pr: probe.pr, ...(probe.bornAs ? { bornAs: probe.bornAs } : {}) });
-        await startStampRecovery(num, status);
+        await startStampRecovery(num, status, replaces);
       }
       continue;
     }
@@ -1191,7 +1194,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // The ONE launch admission every prepare card passes, a group lead and each of its members alike (PR #5366): an
   // open or recent merged prepare PR, a live claim or run, a needs-you park, or a failed PR listing refuses it.
   // A refused card is recorded, so the next ticks hold it out of tick-core (see `prepareRefusals`).
-  const refusePrepareLaunch = async (num, { pickBornAs, cardBornAs } = {}) => {
+  const refusePrepareLaunch = async (num, { pickBornAs, cardBornAs, replacesStamp } = {}) => {
     const bornAs = pickBornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
     const lastDispatchAt = [
       ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
@@ -1210,7 +1213,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       // Keep WHICH prepare PR refused the card, so the refusal probe reads that PR and no other.
       const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
       const matched = prs.find(pr => pr?.number === refusingPr);
-      if (refusal && matched) refusalDetail.set(num, { pr: refusingPr, head: matched.headRefName ?? null, ...(bornAs ? { bornAs } : {}) });
+      if (refusal && matched) refusalDetail.set(num, { pr: refusingPr, head: matched.headRefName ?? null,
+        ...(bornAs ? { bornAs } : {}), ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
     } catch {
       refusal = { reason: 'prepare PR listing unavailable' };
     }
@@ -1286,7 +1290,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           await failPrepare(num, 'stamp-read', String(e?.message || e));
           continue;
         }
-        if (await refusePrepareLaunch(num, { pickBornAs: pick.bornAs, cardBornAs })) continue;
+        if (await refusePrepareLaunch(num, { pickBornAs: pick.bornAs, cardBornAs, replacesStamp })) continue;
         const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
           ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
         if (!claim.ok) {
@@ -1302,7 +1306,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
             const memberStamp = before ? (before.preparedDate
               ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null) : undefined;
             // A member is launched by the lead's worker, so it passes the lead's admission: a duplicate is dropped.
-            if (await refusePrepareLaunch(member, { cardBornAs: before?.bornAs })) continue;
+            if (await refusePrepareLaunch(member, { cardBornAs: before?.bornAs, replacesStamp: memberStamp })) continue;
             const memberClaim = effects.acquirePrepareClaim({ num: member, scope: scopeByNum.get(member) ?? [], groupLead: num,
               ...(memberStamp !== undefined ? { replacesStamp: memberStamp } : {}) });
             if (memberClaim.ok) groupMembers.push(member);

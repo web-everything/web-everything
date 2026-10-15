@@ -12,7 +12,8 @@ export default {
   id: 'prepare-guard-recovery-and-capacity',
   title: 'Prepare duplicate guards strand recovery, consume slots and miss alternate PR identities',
   card: '347 / PR 5366',
-  fixedBy: { sha: 'HEAD', where: 'lane/prepare-dup-guard', paths: [DAEMON] },
+  // Round 6 landed in four commits on the daemon; only reverting all of them reproduces the operator's two cases.
+  fixedBy: { sha: 'HEAD,b8bd6f3c2,333315148,05b4e9314', where: 'lane/prepare-dup-guard', paths: [DAEMON] },
   fixPresent(root) {
     const daemon = readFileSync(resolve(root, DAEMON), 'utf8');
     return daemon.includes('const stampedOpenPr =') && daemon.includes('PREPARE_REFUSAL_HOLD_MS')

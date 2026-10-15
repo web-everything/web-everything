@@ -825,7 +825,8 @@ then checks it again. Build-backoff cards and group members in flight are held o
 Every group member passes the same launch admission as its lead (`refusePrepareLaunch`); test a member
 that was never refused before and has its own open PR. When nothing else tracks a card refused for its
 own lane prepare PR, the daemon reads THAT PR once per refusal (`prNumber`). A finished but unstamped
-result (open with sections, or merged with sections on main) goes to stamp recovery; anything else
+result (open, with sections, no stamp, judged against the stamp a re-prepare replaces) goes to stamp
+recovery, and later reads stay on that PR while its hold stands; anything else
 stays a refusal that takes no prepare slot and places no hold. Test that capacity
 rule with the REAL `planTick`, never a stub that offers more picks than the cap: two refused cards and
 a clean third, across ticks.
