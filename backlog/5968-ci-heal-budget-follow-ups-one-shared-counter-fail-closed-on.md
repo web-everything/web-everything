@@ -2,9 +2,11 @@
 bornAs: xwfvby0
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/ci-heal-mark.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/operations/land-advance-io.mjs", "we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs", "we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/tick-core.test.mjs", "we:scripts/operations/__tests__/land-advance-io.test.mjs"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "13d85ca44eb6833d6325a9ff31f7438f8f419d9b"
 tags: []
@@ -21,6 +23,7 @@ Apply the existing fix-head reset rule consistently across reconcile, tick and l
 - Correct the earlier overlay premise: we:scripts/conveyor/tick-core.mjs:896 subtracts durable refunds from a gross in-session tally, then we:scripts/conveyor/tick-core.mjs:906 stores the new tally with refunds added back. Existing repeat-refund coverage is we:scripts/conveyor/__tests__/tick-core.test.mjs:2289. A new reset-identity state machine is unnecessary for durable refunds; extend this existing gross-count invariant. Volatile attempts without dated durable evidence remain charged, even across a proven reset.
 - Scope remains four source files plus five existing matching test files. Reset and cascade tests exist at we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs:59 and we:scripts/conveyor/__tests__/ci-heal-attempts.test.mjs:128; attributed-window tests at we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:589; landing's injected evidence harness at we:scripts/operations/__tests__/land-advance-io.test.mjs:18. No missing test file needs inventing.
 - Retain current size 3 (the prior preparation raised it from 2). Estimate: shared module ~90 changed lines for moved policy/reset helpers and evidence composition; reconcile ~80 for removal/re-exports and two budget branches (we:scripts/conveyor/reconcile-core.mjs:2777 and we:scripts/conveyor/reconcile-core.mjs:3124); tick ~35 and landing ~35 for evidence wiring; five test files ~30–50 lines each. This is a story, so no `estimatedLoc` is added. These are implementation estimates, not measured edits.
+- Built 2026-10-15: `ciHealBudgetEvidence` (we:scripts/conveyor/ci-heal-mark.mjs) now owns the budget policy, reset recognition and the stage-difference refund count; reconcile re-exports the moved names; tick and landing read it. A heal with an unreadable time stays charged (the old filter refunded it). Follow-up: we:scripts/conveyor/exhausted-retry.mjs keeps its own copy of the reset filter and still refunds undated heals; it was outside this card's scope.
 - Preparation used source inspection; implementation replays remain required below. Existing preparation stamps are left for the runner to refresh.
 
 ## Design

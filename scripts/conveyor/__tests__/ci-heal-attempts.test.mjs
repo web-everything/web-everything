@@ -125,6 +125,46 @@ describe('ci-heal heals only REQUIRED checks', () => {
   });
 });
 
+// #5968 — a heal whose time cannot be established is never refunded by the fix-head reset.
+describe('ci-heal budget reset fails closed on malformed times (#5968)', () => {
+  const undated = (createdAt) => ({ ...heal('2026-10-09T00:00:00Z'), createdAt });
+  const withFix = (...extra) => [...threeHeals(), ...extra, ...fixPushAfterHeals()];
+
+  it('three dated heals + one undated before the reset: the undated one stays charged (1 of 3)', () => {
+    for (const bad of [undefined, null, 'not-a-date', '']) {
+      const p = plan(pr4631(withFix(undated(bad))));
+      expect(exhausted(p)).toEqual([]);
+      expect(heals(p)[0]).toMatchObject({ attempts: 1, ciHealBudget: expect.objectContaining({ spentBeforeReset: 3, resetBy: 'fix-4631' }) });
+    }
+  });
+  it('three undated heals before the reset exhaust the budget despite a proven reset', () => {
+    const p = plan(pr4631([undated(undefined), undated('x'), undated(null), ...fixPushAfterHeals()]));
+    expect(heals(p)).toEqual([]);
+    expect(exhausted(p)[0]).toMatchObject({ attempts: 3, cap: CI_HEAL_ROUND_CAP });
+  });
+  it('reset disabled: every heal is charged, malformed or not', () => {
+    const ciHealBudget = resolveCiHealBudget({ env: { WE_CI_HEAL_RESET_ON_FIX_HEAD: '0' } });
+    expect(exhausted(plan(pr4631(withFix(undated(undefined))), { ciHealBudget }))[0]).toMatchObject({ attempts: 4 });
+  });
+  it('a fix-end with no matching begin, an unchanged sha, or a ci-heal session is never a reset', () => {
+    const noBegin = [...threeHeals(), end('fix-4631', '9ae95c851', '2026-10-11T02:06:48Z')];
+    const unchanged = [...threeHeals(), begin('fix-4631', '9ae95c851', '2026-10-11T00:35:09Z'), end('fix-4631', '9ae95c851', '2026-10-11T02:06:48Z')];
+    const ciHealSession = [...threeHeals(), begin('ci-heal-4631', 'e2dc4ed68', '2026-10-11T00:35:09Z'), end('ci-heal-4631', '9ae95c851', '2026-10-11T02:06:48Z')];
+    for (const comments of [noBegin, unchanged, ciHealSession]) expect(exhausted(plan(pr4631(comments)))[0]).toMatchObject({ attempts: 3 });
+  });
+  it('alternating real fixer heads and heals: only the LATEST fixer push resets, so one heal is charged', () => {
+    // The fix-round cap (reconcile-core.test.mjs) is what bounds the alternation; the heal budget just restarts.
+    const rounds = [];
+    for (let i = 0; i < 6; i += 1) {
+      const t = (m) => `2026-10-11T0${i}:${m}:00Z`;
+      rounds.push(begin(`fix-${i}`, `aaaaaaa${i}`, t('00')), end(`fix-${i}`, `bbbbbbb${i}`, t('10')), heal(t('20')));
+    }
+    const p = plan(pr4631(rounds));
+    expect(exhausted(p)).toEqual([]);
+    expect(heals(p)[0]).toMatchObject({ attempts: 1 });
+  });
+});
+
 describe('resolveCiHealBudget cascade', () => {
   it('standard → platform → repo → env, each layer named', () => {
     expect(resolveCiHealBudget()).toEqual({ cap: CI_HEAL_ROUND_CAP, capSource: 'standard', resetOnFixHead: true, resetSource: 'standard' });

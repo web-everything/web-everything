@@ -2130,7 +2130,8 @@ async function main(argv) {
   // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
   // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
   const { countRearmComments } = await import('./rearm-review.mjs');
-  const { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore } = await import('./ci-heal-mark.mjs');
+  const { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } = await import('./ci-heal-mark.mjs');
+  const ciHealPolicy = resolveCiHealBudget({ env: process.env });
   const prRearmCounts = {};
   const prCiHealCounts = {};
   const prCiHealRefunds = {};
@@ -2159,8 +2160,10 @@ async function main(argv) {
       const comments = JSON.parse(raw)?.comments;
       if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments);
       if (wantsCiHeal) {
-        prCiHealCounts[p.prNumber] = countChargeableCiHealComments(comments, { restore: resolveCiHealBudgetRestore(process.env) });
-        prCiHealRefunds[p.prNumber] = countCiHealComments(comments) - prCiHealCounts[p.prNumber];
+        // One shared calculation (#5968): the same reset + attributed-window evidence reconcile and landing read.
+        const evidence = ciHealBudgetEvidence(comments, { resetOnFixHead: ciHealPolicy.resetOnFixHead, restore: resolveCiHealBudgetRestore(process.env) });
+        prCiHealCounts[p.prNumber] = evidence.chargeable;
+        prCiHealRefunds[p.prNumber] = evidence.refunded;
       }
     } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
   }

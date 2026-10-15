@@ -29,7 +29,7 @@
  *   say when.
  */
 import { describe, it, expect } from 'vitest';
-import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
+import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
   planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
@@ -2263,6 +2263,55 @@ describe('main-fixed signature before the heal cap', () => {
       .toMatchObject({ kind: 'cap-exhausted', attempts: 0, refunded: 3 });
     expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: false }).refusals[0])
       .toMatchObject({ kind: 'cap-exhausted', attempts: 3 });
+  });
+});
+
+// #5968 — both budget branches (ci-red and the CodeQL hold) read the shared reset evidence, fail closed on bad times.
+describe('ci-heal budget: shared reset evidence on both reconcile branches (#5968)', () => {
+  const heal = (createdAt, reason = 'red-ci') => ({ body: buildCiHealComment({ reason }), author: AUTOMATION, createdAt });
+  const begin = { author: AUTOMATION, createdAt: '2026-10-11T00:35:09Z', body: buildFixBeginComment({ who: 'fix-1', why: 'x', branch: 'lane/x', headSha: 'e2dc4ed68', ttlMinutes: 60 }) };
+  const fixEnd = { author: AUTOMATION, createdAt: '2026-10-11T02:06:48Z', body: buildFixEndComment({ who: 'fix-1', headSha: '9ae95c851' }) };
+  const before = () => ['2026-10-09T16:00:00Z', '2026-10-09T19:00:00Z', '2026-10-10T21:00:00Z'];
+  const HEAD = '8f74ca569d732a37315b240e046ad035ff5f29c7';
+  const prRed = (over = {}) => pr1563({ number: 2601, labels: [], statusCheckRollup: redRollup, comments: [], ...over });
+  const codeqlPr = (comments) => ({
+    number: 4370, state: 'OPEN', headRefName: 'lane/velocity', headRefOid: HEAD, mergeStateStatus: 'UNSTABLE', mergeable: 'MERGEABLE',
+    labels: lbl('ready-to-merge', 'review:accepted', 'review-round:1'), comments,
+    statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-08T01:55:00Z' }],
+    codeqlFailure: { reason: 'security alert', alerts: [] },
+  });
+  const codeqlPlan = (comments, extra = {}) => planReconcile({ prs: [codeqlPr(comments)], agents: [], now: NOW, requiredChecks: ['test'], ...extra });
+
+  it('CodeQL branch: heals before the fix push are refunded, but an undated codeql heal is still charged', () => {
+    const dated = [...before().map((t) => heal(t, 'codeql')), begin, fixEnd];
+    expect(codeqlPlan(dated).dispatch[0]).toMatchObject({ kind: 'ci-heal', reason: 'codeql', attempts: 0 });
+    const withUndated = [...dated, heal(undefined, 'codeql'), heal('nope', 'codeql')];
+    expect(codeqlPlan(withUndated).dispatch[0]).toMatchObject({ attempts: 2 });
+    expect(codeqlPlan([...dated, heal(undefined, 'codeql'), heal('nope', 'codeql'), heal(null, 'codeql')]).refusals.find((r) => r.kind === 'cap-exhausted')).toMatchObject({ attempts: 3 });
+  });
+  it('CodeQL branch narrows to codeql heals; unattributable ones stay charged, red-ci ones do not', () => {
+    const comments = [heal('2026-10-12T00:00:00Z', 'red-ci'), heal('2026-10-12T00:01:00Z', 'red-ci'), { author: AUTOMATION, createdAt: '2026-10-12T00:02:00Z', body: CI_HEAL_COMMENT_MARKER }];
+    expect(codeqlPlan(comments).dispatch[0]).toMatchObject({ attempts: 1 });
+    // shared count (own-budget off): all three heals are charged, which is the cap
+    expect(codeqlPlan(comments, { codeqlOwnBudget: false }).refusals.find((r) => r.kind === 'cap-exhausted')).toMatchObject({ attempts: 3 });
+  });
+  it('an explicit ciHealCap (including 0) wins over the resolved setting on both branches', () => {
+    const one = [heal('2026-10-12T00:00:00Z')];
+    expect(planReconcile({ prs: [prRed({ comments: one })], agents: [], now: NOW, ciHealCap: 0 }).refusals[0]).toMatchObject({ kind: 'cap-exhausted', cap: 0 });
+    expect(codeqlPlan([], { ciHealCap: 0 }).refusals.find((r) => r.kind === 'cap-exhausted')).toMatchObject({ cap: 0 });
+  });
+  it('ci-red branch: the shared reset leaves an undated heal charged and reports what the reset removed', () => {
+    const comments = [...before().map((t) => heal(t)), heal(undefined), begin, fixEnd];
+    const plan = planReconcile({ prs: [prRed({ comments })], agents: [], now: NOW });
+    expect(plan.dispatch[0]).toMatchObject({ kind: 'ci-heal', attempts: 1, ciHealBudget: expect.objectContaining({ spentBeforeReset: 3, resetBy: 'fix-1' }) });
+  });
+  it('a newer green success still outranks an old failure when choosing what to heal (selection unchanged)', () => {
+    const rollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-11T01:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-11T02:00:00Z' },
+    ];
+    const plan = planReconcile({ prs: [prRed({ statusCheckRollup: rollup, comments: before().map((t) => heal(t)) })], agents: [], now: NOW, requiredChecks: ['test'] });
+    expect(plan.dispatch.filter((d) => d.kind === 'ci-heal')).toEqual([]);
   });
 });
 
