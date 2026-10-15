@@ -1,4 +1,6 @@
 import { it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { URL } from 'node:url';
 import { scanUnauthenticatedCommentMarkerParsers } from '../check-standards-rules.mjs';
 
 it('requires shared authorship for inline comment-marker parsers, accepting aliased gates', () => {
@@ -33,4 +35,32 @@ it('requires shared authorship for inline comment-marker parsers, accepting alia
   expect(reviewed('parseNewThing')).toHaveLength(1);
   // Source-code scanners inspect these spellings; they do not read PR comments.
   expect(scan('export function scanCommentMarkerParsers(docs) { return docs.filter(d => /<!--|\\.body/.test(d.content)); }')).toEqual([]);
+});
+
+it.each([
+  ['!isTrustedMarkerAuthor(c) || typeof c?.body !== "string"', true],
+  ['typeof c?.body !== "string" || !isTrustedMarkerAuthor(c)', true],
+  ['(!isTrustedMarkerAuthor(c)) || !c || typeof c.body !== "string"', true],
+  ['!c || ((!isTrustedMarkerAuthor(c)) || typeof c.body !== "string")', true],
+  ['!(isTrustedMarkerAuthor(c))', true],
+  ['((!isTrustedMarkerAuthor(c)))', true],
+  ['!isTrustedMarkerAuthor(c) && typeof c?.body !== "string"', false],
+  ['!c || (!isTrustedMarkerAuthor(c) && typeof c.body !== "string")', false],
+  ['isTrustedMarkerAuthor(c) || typeof c?.body !== "string"', false],
+  ['!!isTrustedMarkerAuthor(c) || typeof c?.body !== "string"', false],
+  ['!isTrustedMarkerAuthor(c) ?? true', false],
+])('recognizes rejecting guard %s (safe: %s)', (condition, safe) => {
+  const content = `import { isTrustedMarkerAuthor } from "../lib/marker-authorship.mjs";
+    export function parseActions(comments) { return comments.flatMap(c => {
+      if (${condition}) return [];
+      return c.body.match(/<!-- action: (.*?) -->/g);
+    }); }`;
+  expect(scanUnauthenticatedCommentMarkerParsers([{ file: 'scripts/operations/example.mjs', content }]))
+    .toHaveLength(safe ? 0 : 1);
+});
+
+it('accepts the live review ceremony parser with its compound author and body guard', () => {
+  const file = 'scripts/review-set-label.mjs';
+  const content = readFileSync(new URL('../review-set-label.mjs', import.meta.url), 'utf8');
+  expect(scanUnauthenticatedCommentMarkerParsers([{ file, content }])).toEqual([]);
 });

@@ -95,12 +95,22 @@ export function scanUnauthenticatedCommentMarkerParsers(docs) {
                 }
                 // A rejecting guard must leave the untrusted path before parsing. Merely
                 // testing authorship in an if statement does not filter any comments.
-                const rejectsUntrusted = ts.isPrefixUnaryExpression(expression)
-                  && expression.operator === ts.SyntaxKind.ExclamationToken
-                  && expression.operand === child;
-                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && ts.isIfStatement(parent)
-                  && parent.expression === expression && rejectsUntrusted) {
-                  const branch = parent.thenStatement;
+                const unparen = node => ts.isParenthesizedExpression(node) ? unparen(node.expression) : node;
+                const predicate = unparen(expression);
+                const rejectsUntrusted = ts.isPrefixUnaryExpression(predicate)
+                  && predicate.operator === ts.SyntaxKind.ExclamationToken
+                  && unparen(predicate.operand) === child;
+                // An OR of rejection conditions still exits for every untrusted comment.
+                // Do not cross AND/??: those can allow an untrusted comment to reach parsing.
+                let rejection = expression, rejectionParent = parent;
+                while (rejectionParent && (ts.isParenthesizedExpression(rejectionParent)
+                  || (ts.isBinaryExpression(rejectionParent)
+                    && rejectionParent.operatorToken.kind === ts.SyntaxKind.BarBarToken))) {
+                  rejection = rejectionParent; rejectionParent = rejectionParent.parent;
+                }
+                if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && rejectsUntrusted
+                  && ts.isIfStatement(rejectionParent) && rejectionParent.expression === rejection) {
+                  const branch = rejectionParent.thenStatement;
                   const exit = ts.isBlock(branch) ? branch.statements.at(-1) : branch;
                   if (exit && (ts.isContinueStatement(exit) || ts.isReturnStatement(exit) || ts.isThrowStatement(exit))
                     && !/<!--|\.body|bodyOf\(/.test(branch.getText(tree))) guarded = true;
@@ -111,8 +121,6 @@ export function scanUnauthenticatedCommentMarkerParsers(docs) {
                   || (ts.isBinaryExpression(parent) && parent.left === expression
                     && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
                     && /<!--|\.body|bodyOf\(/.test(parent.right.getText(tree))))) guarded = true;
-                let predicate = expression;
-                while (ts.isParenthesizedExpression(predicate)) predicate = predicate.expression;
                 if (gates.get(callee.text) === 'isTrustedMarkerAuthor' && predicate === child
                   && ts.isArrowFunction(parent) && parent.body === expression) {
                   const filter = parent.parent;
