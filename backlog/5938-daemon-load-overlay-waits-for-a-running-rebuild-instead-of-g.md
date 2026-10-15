@@ -2,10 +2,11 @@
 bornAs: x0wgz6d
 kind: story
 size: 1
-status: active
+status: resolved
 scope: ["we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs"]
 dateOpened: "2026-10-12"
 dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "24d9ebca8ca0b935093575ddbcac52f217c0a6d2"
 tags: []
