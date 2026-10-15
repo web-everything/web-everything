@@ -4196,8 +4196,11 @@ accept-worthy — never re-enter the bounce loop over a documentation debt the c
 file-then-accept path above: `prevention-outstanding` still files the named prevention(s), then accepts,
 provided the live head has no open mandatory referrals and no finding in that verdict has impact `broken`
 without a `card` or `not-real` ruling. Open referrals with no operator ruling, including automatic-policy
-blocks, hold acceptance; a later review comment on that head never retires them. `needs-human` and `changes`
-still never auto-accept. Read referrals with
+blocks, hold acceptance; a later review comment on that head never retires them. `needs-human` still never
+auto-accepts, and `changes` auto-accepts only through the existing round-cards rule (cards 5471/5470): one card
+filed for every held finding first, then the same live-head and live-referral gate. The gate fails closed when
+the reviewed head is unknown, and a filing branch whose accept the gate then holds reports it as not accepted.
+Read referrals with
 `we:scripts/operations/record-referral-ruling.mjs#openReferralFindings`, preserving their run and finding keys
 until a ruling or head change. Cumulative referral snapshots update the original comment, retaining prior
 rulings, instead of repeating the operator ask. The boundary lives in

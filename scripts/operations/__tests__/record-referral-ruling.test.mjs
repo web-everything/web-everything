@@ -413,9 +413,22 @@ describe('same-head referral persistence', () => {
 
 
 describe('unattended live-referral gate', () => {
-  const hold = (comments, verdict = 'accept') => unattendedAcceptHold({ ...ctx(), comments, verdict: { verdict } });
+  const hold = (comments, verdict = 'accept', over = {}) => unattendedAcceptHold({ ...ctx(), expectedHead: head, comments,
+    verdict: { verdict }, ...over });
   it.each(['needs-human', 'changes'])('%s cannot accept', verdict => {
     expect(hold([], verdict)).toMatch(/panel verdict/);
+  });
+  it('a changes verdict the round-cards rule turns into cards may accept on clean live referrals', () => {
+    expect(hold([], 'changes', { roundCards: true })).toBeNull();
+    expect(hold([gh(renderReferralRecord(referral()))], 'changes', { roundCards: true })).toMatch(/referrals remain open/);
+    expect(hold([], 'changes', { roundCards: true, expectedHead: newHead })).toMatch(/head/);
+  });
+  it('round-cards never widens a non-changes verdict', () => {
+    expect(hold([], 'needs-human', { roundCards: true })).toMatch(/panel verdict/);
+  });
+  it.each([undefined, null, ''])('a missing reviewed head (%s) cannot accept', expectedHead => {
+    expect(hold([], 'accept', { expectedHead })).toMatch(/head/);
+    expect(unattendedAcceptHold({ ...ctx(), comments: [], verdict: { verdict: 'accept' } })).toMatch(/head/);
   });
   it('prevention-outstanding with clean referrals and no broken finding may file then accept', () => {
     expect(hold([], 'prevention-outstanding')).toBeNull();
@@ -436,14 +449,14 @@ describe('unattended live-referral gate', () => {
     const rec = referral();
     const comments = result ? [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec, { result })))] : [];
     const verdict = { verdict: 'prevention-outstanding', findings: [rec.referrals[0].finding] };
-    const reason = unattendedAcceptHold({ ...ctx(), comments, verdict });
+    const reason = unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict });
     if (result) expect(reason).toBeNull();
     else expect(reason).toMatch(/broken finding is not ruled/);
   });
   it('a clearing ruling for a different finding does not clear a broken finding', () => {
     const rec = referral();
     const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(ruling(rec)))];
-    expect(unattendedAcceptHold({ ...ctx(), comments, verdict: { verdict: 'prevention-outstanding',
+    expect(unattendedAcceptHold({ ...ctx(), expectedHead: head, comments, verdict: { verdict: 'prevention-outstanding',
       findings: [finding('a different broken guard')] } })).toMatch(/broken finding is not ruled/);
   });
   it('a changed live head cannot accept the previous verdict', () => {

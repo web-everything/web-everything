@@ -19,13 +19,22 @@ export function unattendedAcceptPolicy({ env = process.env, tool, platform, log 
   });
 }
 
-/** PURE. A non-null reason parks the run; it must never be used to clear labels or record acceptance. */
+/** The verdicts the loop may accept unattended. `changes` only when the round-cards rule files every finding first. */
+export function unattendedAcceptableVerdict(verdict, { roundCards = false } = {}) {
+  return ['accept', 'prevention-outstanding'].includes(verdict?.verdict) || (roundCards === true && verdict?.verdict === 'changes');
+}
+
+/**
+ * PURE. A non-null reason parks the run; it must never be used to clear labels or record acceptance.
+ * `expectedHead` is the head the verdict was reviewed on and has no default: a missing one parks (fail closed).
+ * `roundCards` is true only when the round-cards rule applies to this run (`roundCardsDecision(run).apply`).
+ */
 export function unattendedAcceptHold({ verdict, comments, repo, pr, head, body = '', createdAt = '', cardReadable,
-  expectedHead = head, requiresCleanReferrals = true }) {
+  expectedHead, roundCards = false, requiresCleanReferrals = true }) {
   if (!requiresCleanReferrals) return null;
-  if (!['accept', 'prevention-outstanding'].includes(verdict?.verdict)) return `panel verdict is ${verdict?.verdict ?? 'unavailable'}`;
+  if (!unattendedAcceptableVerdict(verdict, { roundCards })) return `panel verdict is ${verdict?.verdict ?? 'unavailable'}`;
   if (verdict.pendingReferrals?.length || verdict.blockedReferrals?.length) return 'mandatory referrals remain open';
-  if (!head || head !== expectedHead) return 'live head does not match the reviewed head';
+  if (!head || !expectedHead || head !== expectedHead) return 'live head does not match the reviewed head';
   const state = openReferralFindings({ comments, repo, pr, head, body, createdAt, cardReadable });
   if (state.malformed || state.pending.length || state.blocked.length || state.open.length || state.disputed.length) {
     return 'mandatory referrals remain open on the live head';
