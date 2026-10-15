@@ -872,3 +872,25 @@ Confirmed drain gate skips and revalidation aborts also release room; successful
 and ambiguous failures consume it. Give each fake child its actual target PR number.
 Also cover a queue that fills while the window is closed and an unreadable next snapshot:
 retained attempts must stay within the latest room, and cannot use a failed snapshot.
+
+## Referral rulings answering stand-downs
+
+The ruling pass relays a later trusted operator referral ruling through the existing operator-answer
+builder only when the current head has no pending, blocked or disputed findings and later operator rulings
+cover every explicit `{runId, key}` subject in the stand-down's final trailer. The stand-down CLI accepts
+`--finding-refs='[{"runId":"review run","key":"finding key"}]'` for a referral question; legacy markers and
+non-finding questions require an explicit operator answer. The builder encodes these subjects as base64url
+JSON, so quoted/free-text trailers cannot inject them. Multiple unresolved stand-downs also require an
+explicit answer: the shared answer ceremony supersedes older questions as well as the named question.
+Replay with real referral, ruling and stand-down
+builders; verify comment-before-label order, retry after either write fails, fresh same-head findings,
+head movement during the answer post, and auto-policy exclusion. The fixer brief's referral escalation
+command must pass `--finding-refs`; check that producer/consumer contract directly. Legacy holds,
+including the original #5246 marker, still require an explicit operator answer; do not infer subjects
+from free text. Failed label writes recover only with a complete paged label-event history that
+strictly predates the relay answer (equal-second timestamps are ambiguous). Re-read the head and
+revalidate comments and label history after posting the answer and before editing labels. Keep
+resolution rows under `rulingStandDown`, outside the fix dispatch count. NEEDS YOU lists outstanding
+findings before the first ruling.
+The queue routes needs-judgment questions to NEEDS YOU
+by default; select `WE_REVIEW_STAND_DOWN_QUEUE_SECTION=stood-down` for legacy-layout fixtures.
