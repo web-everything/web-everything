@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs", "we:scripts/conveyor/__tests__/fix-takeover.test.mjs", "we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs"]
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "17242a56dfd230c00de33e1c4db3bfd76049d455"
+preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
 tags: []
 ---
 
@@ -15,6 +15,8 @@ tags: []
 Held finding 233 requested enabled-takeover negative authorization tests, launch-attempt coverage for borrowed and wrapped launchers, and exclusion of mechanical base refreshes from review-round spend. The last behavior is now implemented; finish the two remaining coverage gaps and retain that mechanical regression.
 
 ## Progress
+
+- Current-checkout recheck at 6d77e9169: retain test-only scope and size 2. Some negative cases now use the enabled harness, but the partial/old-head pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:160` and forged/auto-policy pair at `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs:228` still use disabled defaults. Preserve the enabled withdrawn-ruling and truncated-thread regressions already present. Borrowed/wrapped launch-attempt assignments remain at `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1477` and `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1541`; this remains a coverage task, not an implementation rewrite.
 
 - Checked at 17242a56d. Original scope was `we:scripts/conveyor/mechanical-round-cap.mjs` and `we:scripts/conveyor/reconcile-core.mjs`, with no tests. Corrected scope is test-only: the remaining work is in `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs` and `we:scripts/conveyor/__tests__/fix-takeover.test.mjs`; include `we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs` for preservation coverage. No production behavior change is justified by the observed gaps.
 - Mechanical-round delivery is commit 9596b78f1, subsequently hardened by ba1c61683, d152470dc and 6aa1cdfaa. `we:scripts/conveyor/mechanical-round-cap.mjs` now exports `readRoundCommits`; `we:scripts/conveyor/reconcile-core.mjs:507` distinguishes real work from a mechanical merge. Existing real-Git tests at `we:scripts/conveyor/__tests__/mechanical-rebase-rounds.test.mjs:229` cover clean/drain merges versus repair, reverted-upstream and manifest edits. This is partial delivery, not grounds to stop the whole card as already done.

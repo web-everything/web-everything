@@ -6,7 +6,7 @@ status: open
 scope: ["we:scripts/lib/daemon-load-overlay.mjs", "we:scripts/lib/__tests__/daemon-load-overlay.test.mjs"]
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-14"
-preparedAgainstSha: "17242a56dfd230c00de33e1c4db3bfd76049d455"
+preparedAgainstSha: "6d77e9169e764d4787a9348b5fafd81ee04b0fed"
 tags: []
 ---
 
@@ -16,15 +16,17 @@ Held finding 237 reported an immediate rebuild-in-progress result despite an exp
 
 ## Progress
 
+- Current-checkout recheck at 6d77e9169: retain the corrected loader-plus-test scope and size 1. The explicit loader still makes a single initial rebuild call at `we:scripts/lib/daemon-load-overlay.mjs:642`; the live-lease refusal remains at `we:scripts/lib/daemon-rebuild/prepare.mjs:482`. The concrete existing budget override is `lockOpts.waitMs`, merged last at `we:scripts/lib/daemon-rebuild/rebuild.mjs:86`; use that seam rather than inventing a top-level wait option. Existing prepared dates and hashes are left unchanged for the runner.
+
 - Checked at 17242a56d; not delivered. Original scope named only `we:scripts/lib/daemon-load-overlay.mjs`. The early refusal actually comes from the live sibling build lease in `we:scripts/lib/daemon-rebuild/prepare.mjs:482`. The existing wait budget in `we:scripts/lib/daemon-rebuild/rebuild.mjs:72` controls clone-lock acquisition, not that lease refusal. The immediate yield is intentional for ordinary daemon ticks, so the shared rebuild machinery need not change.
-- Corrected scope: the explicit loader and its matching test, `we:scripts/lib/__tests__/daemon-load-overlay.test.mjs`. The loader makes one initial rebuild call at `we:scripts/lib/daemon-load-overlay.mjs:642`; its existing follow-up at line 659 only runs after an adopted build lacks the overlay. Neither retries an initial live-lease refusal. The versioned request/wait path at line 595 is separate and stays intact.
+- Corrected scope: the explicit loader and its matching test, `we:scripts/lib/__tests__/daemon-load-overlay.test.mjs`. The loader makes one initial rebuild call at `we:scripts/lib/daemon-load-overlay.mjs:642`; its existing follow-up rebuild call at line 662 only runs after an adopted build lacks the overlay. Neither retries an initial live-lease refusal. The versioned request/wait path at line 595 is separate and stays intact.
 - Retain size 1: approximately 70 changed loader lines for bounded retry/dependency seams and 110 test lines for timing, installed-tip verification and refusal cases. No production shared-lock or lease changes, no stamps and no dependency changes.
 
 ## Design
 
 In `we:scripts/lib/daemon-load-overlay.mjs`, wrap the legacy explicit-load rebuild attempt in an asynchronous deadline loop. Resolve the positive finite `WE_DAEMON_REBUILD_LOCK_WAIT_MS` budget with the existing default exported by `we:scripts/lib/daemon-rebuild/lease.mjs` (60 seconds); reject non-finite values by falling back to that default. Inject a monotonic clock and asynchronous sleep for tests; do not reuse the existing `now` registration timestamp as a clock.
 
-Start one deadline before the first attempt. Retry only `reason: rebuild-in-progress`, sleeping at most 250 ms or the remaining budget between attempts, without holding a clone lock or build lease while sleeping. Pass the remaining budget as the rebuild's clone-lock wait option; do not reset the deadline on another refusal or on the existing stale-adoption follow-up. At exhaustion return a non-adopted result retaining the rebuild-in-progress cause and elapsed wait. Log the first wait and final outcome, not every poll. The budget bounds waiting/retry admission; a rebuild already admitted still completes its smoke/finalization under the existing safety protocol and can exceed that wall-clock budget.
+Start one deadline before the first attempt. Retry only `reason: rebuild-in-progress`, sleeping at most 250 ms or the remaining budget between attempts, without holding a clone lock or build lease while sleeping. Pass the remaining budget as `lockOpts: { waitMs: remainingMs }` to the rebuild; do not reset the deadline on another refusal or on the existing stale-adoption follow-up. At exhaustion return a non-adopted result retaining the rebuild-in-progress cause and elapsed wait. Log the first wait and final outcome, not every poll. The budget bounds waiting/retry admission; a rebuild already admitted still completes its smoke/finalization under the existing safety protocol and can exceed that wall-clock budget.
 
 A sibling finishing does not itself prove this overlay was included. Retry through the existing rebuild API so current registrations are planned, keep `installedClosed` verification against the requested ref, and preserve dispatch smoke, failed-smoke removal and rollback behavior. If an adopted candidate predates registration, use the existing bounded follow-up rebuild, subject to the same remaining wait budget. Never return adopted merely because the sibling lease disappeared. Exceptions and other refusal reasons keep their existing behavior; do not turn permission, smoke or Git failures into retry loops. Dry-run and versioned request/result waiting remain separate.
 
