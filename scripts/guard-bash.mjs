@@ -2544,9 +2544,10 @@ function shellWords(stmt) {
     if (t.op && (t.text === '<' || t.text === '>') && !tokens[i - 1]?.op && at[i] >= 0
       && tokens[i + 1]?.text.startsWith('(') && at[i + 1] === at[i] + 1) {
       const prev = words[words.length - 1];
-      const glued = i > 0 && at[i - 1] >= 0 && at[i - 1] + tokens[i - 1].text.length === at[i] && prev && !prev.redir;
+      const glued = i > 0 && at[i - 1] >= 0 && at[i - 1] + tokens[i - 1].text.length === at[i] && prev;
       const raw = t.text + tokens[++i].text;
-      if (glued) words[words.length - 1] = { raw: prev.raw + raw, text: prev.text + raw, redir: false };
+      // glued to a redirect's target (`</<(true)`), it is part of that target and is dropped with it
+      if (glued) words[words.length - 1] = { raw: prev.raw + raw, text: prev.text + raw, redir: prev.redir };
       else words.push({ raw, text: raw, redir: false });
       continue;
     }

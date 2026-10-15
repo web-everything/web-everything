@@ -796,6 +796,12 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('X=/etc<(true); cd "$X"')).toBe(REPORTED);
     expect(at('X=/protected/clone; X=/etc<(true); cd "$X"')).toBe(REPORTED);
     expect(at('HOME=/etc<(true) cd')).toBe(REPORTED);
+    // glued to a redirect's target, it goes with that target
+    for (const c of ['X=/tmp; X=/protected/clone </<(true); cd "$X"', 'X=/tmp; X=/protected/clone 2>/>(cat); cd "$X"',
+      'X=/tmp; X=/protected/clone <"/"<(true); cd "$X"', '</<(true) cd /protected/clone', '>/<(true) cd /protected/clone',
+      '</<(true) X=/protected/clone; cd "$X"']) {
+      expect(at(c), c).toBe('/protected/clone');
+    }
     expect(at('X=/protected/clone; X=/etc < <(true); cd "$X"')).toBe('/etc');
     expect(at('X=/protected/clone; X=/etc 2> >(cat); cd "$X"')).toBe('/etc');
     // a redirect inside `${…}` / `$[…]` / `$(…)` is part of the expansion, and `$$` opens nothing
