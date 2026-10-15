@@ -642,8 +642,10 @@ describe('ciHealBudgetEvidence — shared reset + attributed-window accounting (
     // an undated heal alongside three dated ones before the reset: 3 refunded, 1 charged
     expect(ciHealBudgetEvidence([...history().slice(0, 5), heal(undefined)]).chargeable).toBe(1);
   });
-  it('is not reset by an untrusted fix-end, an unchanged sha (ci-heal-attempts.test.mjs), or when the setting is off', () => {
+  it('is not reset by an untrusted fix-end, an unchanged sha, or when the setting is off', () => {
     expect(ciHealBudgetEvidence([begin, fixEnd(RESET, { login: 'outsider' }), ...history().slice(2)]).chargeable).toBe(4);
+    const sameSha = { ...fixEnd(), body: buildFixEndComment({ who: 'fix-1', headSha: 'e2dc4ed68' }) };
+    expect(ciHealBudgetEvidence([begin, sameSha, ...history().slice(2)])).toMatchObject({ chargeable: 4, reset: null });
     expect(ciHealBudgetEvidence(history(), { resetOnFixHead: false })).toMatchObject({ chargeable: 4, reset: null, spentBeforeReset: 0 });
   });
   it('ignores an invalid injected reset, and honours a valid one', () => {

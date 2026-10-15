@@ -8,7 +8,8 @@
  *   2. the three heals were all spent BEFORE that fix push. A new non-mechanical head (a fixer's push) starts a new
  *      heal budget.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { ciHealFloorFromComments } from '../tick-core.mjs';
 import { planReconcile, resolveCiHealBudget, ciHealBudgetResetAt, CI_HEAL_ROUND_CAP } from '../reconcile-core.mjs';
 import { buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
@@ -162,6 +163,22 @@ describe('ci-heal budget reset fails closed on malformed times (#5968)', () => {
     const p = plan(pr4631(rounds));
     expect(exhausted(p)).toEqual([]);
     expect(heals(p)[0]).toMatchObject({ attempts: 1 });
+  });
+});
+
+// Review finding (#5968, converge): production reconcile defaults its policy to the environment cascade, and so do tick
+// and landing. This pins that all three read the SAME setting, so the reset cannot be off for one and on for another.
+describe('reconcile, tick and landing share the environment reset policy (#5968)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const comments = () => [...threeHeals(), ...fixPushAfterHeals()];
+  it('default (reset on): all three refund the three heals before the fixer push', () => {
+    expect(heals(plan(pr4631(comments())))[0]).toMatchObject({ attempts: 0 });
+    expect(ciHealFloorFromComments(comments())).toEqual({ count: 0, refunded: 3 });
+  });
+  it('WE_CI_HEAL_RESET_ON_FIX_HEAD=0: all three charge every heal', () => {
+    vi.stubEnv('WE_CI_HEAL_RESET_ON_FIX_HEAD', '0');
+    expect(exhausted(plan(pr4631(comments())))[0]).toMatchObject({ attempts: 3 });
+    expect(ciHealFloorFromComments(comments())).toEqual({ count: 3, refunded: 0 });
   });
 });
 
