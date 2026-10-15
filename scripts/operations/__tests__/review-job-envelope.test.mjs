@@ -17,7 +17,7 @@ const T1 = () => '2026-10-08T10:05:00.000Z';
 const BOUNCED = { outcome: 'bounced', loopOutcome: 'complete', runId: 'run-1', label: null };
 
 describe('reviewJobResult', () => {
-  it.each(['auto-cleared', 'parked', 'bounced'])('maps a finished %s review to a valid done result', (outcome) => {
+  it.each(['auto-cleared', 'parked', 'bounced', 'carried'])('maps a finished %s review to a valid done result', (outcome) => {
     const result = reviewJobResult({ outcome, verdict: 'accept', loopOutcome: 'complete', runId: 'r1' }, { pr: 5, repo: 'o/r' });
     expect(result).toMatchObject({ outcome: 'done', blocker: null });
     expect(validateWorkerResult(result, { role: 'review' }).ok).toBe(true);
