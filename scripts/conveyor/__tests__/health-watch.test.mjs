@@ -35,6 +35,7 @@ vi.mock('../health-watch-section.mjs', async original => {
   const real = await original();
   return { ...real, healthDir: root => real.healthDir(root ?? sealTestRoot.path ?? undefined) };
 });
+vi.mock('../needs-you-feed-job.mjs', () => ({ superviseNeedsYouFeed: vi.fn(() => ({ enqueued: false })) }));
 const cardBatchSeal = vi.hoisted(() => vi.fn(() => []));
 vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: cardBatchSeal }));
 
@@ -1405,4 +1406,22 @@ describe('quietHours: a red main is wired end to end (real tick, shadow mode →
     await run(0, [{ not: 'a string' }, 'zz; rm -rf', '']);
     expect(redCalls()).toHaveLength(0);
   });
+});
+
+it('attempts needs-you feed supervision through injected deps and contains errors', async () => {
+  sealTestRoot.path = dir;
+  const ensureNeedsYouFeedJob = vi.fn(() => { throw Error('feed launch failed'); });
+  const hd = healthDir(dir); mkdirSync(hd, { recursive: true });
+  writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepEnabled: false, claudeJobsArchiveEnabled: false }));
+  const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
+  const flags = { 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'no-gh': true, 'no-diagnose': true };
+  try {
+    const out = await tick(flags, { ensureNeedsYouFeedJob });
+    expect(ensureNeedsYouFeedJob).toHaveBeenCalledTimes(1);
+    expect(out.probeErrors.needsYouFeed).toBe('feed launch failed');
+    await tick({ ...flags, 'dry-run': true }, { ensureNeedsYouFeedJob });
+    await tick({ ...flags, 'state-root': dir }, { ensureNeedsYouFeedJob });
+    expect(ensureNeedsYouFeedJob).toHaveBeenCalledTimes(1);
+  } finally { sealTestRoot.path = null; }
 });

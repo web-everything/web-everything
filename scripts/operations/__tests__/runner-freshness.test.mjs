@@ -86,6 +86,7 @@ describe('runner freshness policy', () => {
         "maintenance",
         "mutation-check",
         "open-pr",
+        "operator-session-bootstrap",
         "perf-snapshot",
         "pr-ownership",
         "pr-reconcile",
