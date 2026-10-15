@@ -5,7 +5,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo } from '../review-hold-reconcile.mjs';
+import {
+  needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
+} from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
 import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
@@ -660,17 +662,44 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
         numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
       expect(p.calls.readPrState).toHaveLength(2);
     });
-    it('reads again next pass when the formal reviews could not be read', () => {
+    const sweepAt = (p, at, comments = [timedAccept, timedRecord]) => sweepFixture({ repo: 'o/n', provider: p, now: () => at,
+      listPrs: () => [{ ...pr(5025, ['review:changes']), headRefOid: 'a'.repeat(40), comments, commentsComplete: true }],
+      numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
+    it('backs off briefly, not for good, when the formal reviews could not be read', () => {
       const p = provider({ readPrState: () => ({ labels: [{ name: 'review:changes' }], comments: [timedAccept, timedRecord] }) });
       p.readPrReviews = () => { throw Error('rate limited'); };
       p.editComment = vi.fn();
-      const sweep = () => sweepFixture({ repo: 'o/n', provider: p,
-        listPrs: () => [{ ...pr(5025, ['review:changes']), headRefOid: 'a'.repeat(40), comments: [timedAccept, timedRecord], commentsComplete: true }],
-        numberingRestamp: (opts) => restampAfterNumbering({ ...opts, enabled: false }) });
-      sweep();
+      sweepAt(p, 0);
+      sweepAt(p, STRANDED_BACKOFF_MS - 1);
+      expect(p.calls.readPrState).toHaveLength(1);
       p.readPrReviews = () => between;
-      const result = sweep();
+      const result = sweepAt(p, STRANDED_BACKOFF_MS);
+      expect(p.calls.readPrState).toHaveLength(2);
       expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'withdrawn' }));
+    });
+    it('re-checks a clean head once its check expires: an approval can strand a record nothing in the listing shows', () => {
+      // A standing change request hides the review between the root and the record; the reviewer's later approval
+      // lifts it, which strands the record with no new comment or record on the thread.
+      const standing = { state: 'CHANGES_REQUESTED', submittedAt: '2026-10-12T09:00:00Z', user: { login: 'other' } };
+      const p = provider({ readPrState: () => ({ labels: [{ name: 'review:changes' }], comments: [timedAccept, timedRecord] }) });
+      p.readPrReviews = () => [standing, ...between];
+      p.editComment = vi.fn();
+      sweepAt(p, 0);
+      expect(p.editComment).not.toHaveBeenCalled();
+      p.readPrReviews = () => [standing, ...between, { state: 'APPROVED', submittedAt: '2026-10-12T14:00:00Z', user: { login: 'other' } }];
+      sweepAt(p, STRANDED_RECHECK_MS - 1);
+      expect(p.editComment).not.toHaveBeenCalled();
+      const result = sweepAt(p, STRANDED_RECHECK_MS);
+      expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'withdrawn' }));
+      expect(p.editComment).toHaveBeenCalledWith('o/n', 'IC_stranded', expect.stringContaining('numbering-restamp-withdrawn:'), { pr: 5025 });
+    });
+    it('backs off briefly when the live read itself fails', () => {
+      const p = provider({ readPrState: () => { throw Error('rate limited'); } });
+      sweepAt(p, 0);
+      sweepAt(p, 1);
+      expect(p.calls.readPrState).toHaveLength(1);
+      sweepAt(p, STRANDED_BACKOFF_MS);
+      expect(p.calls.readPrState).toHaveLength(2);
     });
   });
   // Self-review (#5233): `gh pr list --json comments` stops at the first page, so a record past it is invisible there.
@@ -700,6 +729,18 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
       sweep({ action: 'error', reason: 'withdrawal failed: offline' });
       sweep(null);
       expect(seen).toEqual([5025, 5025, 5025]);
+    });
+    it('reads a checked capped head again once its check expires (a record may land past the first page)', () => {
+      const p = provider();
+      p.readPrReviews = () => [];
+      const seen = [];
+      const sweep = (at) => sweepFixture({ repo: 'o/n', provider: p, listPrs: () => [capped()], now: () => at,
+        numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
+      sweep(0);
+      sweep(STRANDED_RECHECK_MS - 1);
+      expect(seen).toEqual([5025]);
+      sweep(STRANDED_RECHECK_MS);
+      expect(seen).toEqual([5025, 5025]);
     });
     it('trusts a listing the complete reader marked complete', () => {
       const seen = [];

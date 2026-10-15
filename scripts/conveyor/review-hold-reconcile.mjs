@@ -146,16 +146,25 @@ export function needsReviewHoldCleanup(pr) {
  *   flagged?: string[], flagReason?: string, error?: string, skipped?: string}>} one entry per PR that
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
-/** Heads whose complete live thread a pass found with no stranded numbering re-stamp record (bounds the capped-listing reads). */
-const strandedChecked = new Set();
+/**
+ * Listing views whose live read found no stranded numbering re-stamp record, each with the time it may be read again
+ * (bounds the live reads). The bound is a time, not "forever": the listing shows neither the formal reviews nor a
+ * capped thread's later pages, and either can change (an approval, a dismissal, a record posted past the first page)
+ * with nothing the listing shows changing — so a clean check expires, and an unreadable one backs off briefly.
+ */
+const strandedChecked = new Map();
+export const STRANDED_RECHECK_MS = 30 * 60_000;
+export const STRANDED_BACKOFF_MS = 5 * 60_000;
 export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, exec = execFileSync,
+  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
 } = {}) {
   const prs = listPrs({ repo });
+  const startedAt = now();
+  for (const [k, until] of strandedChecked) if (until <= startedAt) strandedChecked.delete(k);
   const results = [];
   let resolvedRepo = repo;
   const repoOf = () => {
@@ -170,15 +179,22 @@ export function sweepReviewHoldLabels({
       && ![REVIEW_LABELS.human, REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].some((l) => names.includes(l));
     // A re-stamp record written over a hold before it is withdrawn whatever the labels or the settled memo say (the
     // live read below re-checks it, with the formal reviews). A capped listing may hide one past its first page, so it
-    // is read live — once per head, until a pass on that head writes or fails (`strandedChecked`). The listing carries
-    // no formal reviews either, so a listed record the thread alone validates is read live too — once per head and
-    // set of listed records, since only a review submitted BEFORE a record can strand it.
-    let checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`;
+    // is read live. The listing carries no formal reviews either, so a listed record the thread alone validates is
+    // read live too. Each listing view (head and listed records) is then left until its check expires
+    // (`strandedChecked`), or at once after a pass on it writes or fails.
+    // An unreadable listing is thrown by `listedState` below, where each path already handles it.
+    let listed = null;
+    let listingError = null;
+    let records = [];
+    try {
+      listed = Array.isArray(pr.comments) ? pr.comments : null;
+      records = listedNumberingRecords(listed);
+    } catch (e) { listingError = e; }
+    const checkKey = `${repo ?? ''}#${pr.number}@${String(pr.headRefOid || '').toLowerCase()}`
+      + (records.length ? `|${records.map((c) => String(c?.id ?? `${c?.createdAt ?? c?.created_at ?? ''}#${listed.indexOf(c)}`)).join(',')}` : '');
     const listedState = () => {
-      const listed = Array.isArray(pr.comments) ? pr.comments : null;
+      if (listingError) throw listingError;
       const complete = Boolean(listed) && (pr.commentsComplete === true || listed.length < LIST_COMMENTS_CAP);
-      const records = listedNumberingRecords(listed);
-      if (records.length) checkKey += `|${records.map((c, i) => String(c?.id ?? c?.createdAt ?? c?.created_at ?? `#${i}`)).join(',')}`;
       // A withdrawal an earlier pass started and could not finish (a hold the thread cannot show) is owed whatever the
       // listing says.
       const owed = numberingWithdrawalOwed(repo ?? resolvedRepo, pr.number);
@@ -197,7 +213,7 @@ export function sweepReviewHoldLabels({
       try { view = listedState(); } catch { continue; }
       if (!view.stranded) continue;
     }
-    const { listed, complete, stranded } = view;
+    const { complete, stranded } = view;
     // Cheap pre-filter on the listing so the live re-read is spent only on a possible numbering carry: a complete listed
     // thread with no accept on another head (or an accept already bound here by something other than a numbering
     // re-stamp) cannot be one. A capped (possibly truncated) listing is re-read live.
@@ -236,16 +252,17 @@ export function sweepReviewHoldLabels({
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec,
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
-      // A clean pass (nothing withdrawn, posted or failed) settles the stranded check for this head — only when the
-      // formal reviews were read, since without them a record they strand looks like any other.
-      if (!Array.isArray(reviews)
-        || (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action)))) strandedChecked.delete(checkKey);
-      else strandedChecked.add(checkKey);
+      // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
+      // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.
+      if (r && (r.commentPosted || ['error', 'retry', 'withdrawn', 'would-withdraw'].includes(r.action))) strandedChecked.delete(checkKey);
+      else strandedChecked.set(checkKey, now() + (Array.isArray(reviews) ? STRANDED_RECHECK_MS : STRANDED_BACKOFF_MS));
       if (r) {
         results.push({ num: pr.number, numberingRestamp: r.action, detail: r.reason, ...(r.error ? { error: r.error } : {}) });
         if (r.action === 'restamped' || (dryRun && r.action === 'would-restamp')) restamped.add(pr.number);
       }
     } catch (e) {
+      // A failed live read backs off briefly instead of costing a full re-read every pass.
+      strandedChecked.set(checkKey, now() + STRANDED_BACKOFF_MS);
       results.push({ num: pr.number, numberingRestamp: 'error', detail: String(e?.message ?? e).split('\n')[0] });
     }
   }
