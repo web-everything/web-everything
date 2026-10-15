@@ -3,10 +3,10 @@ bornAs: xxanl0v
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs", "we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs", "we:scripts/lib/__tests__/red-main-hold.test.mjs"]
+scope: ["we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs", "we:scripts/conveyor/__tests__/main-ci-red-rerun.test.mjs", "we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs", "we:scripts/lib/__tests__/red-main-hold.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-12"
-preparedAgainstSha: "832e98ade1556aede9cbb9f1ed3c3cc2fb8d1864"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "17242a56dfd230c00de33e1c4db3bfd76049d455"
 tags: []
 ---
 
@@ -16,19 +16,18 @@ Held finding 213 reports that on 2026-10-10 at 19:58Z the drain exempted #4814, 
 
 ## Progress
 
-- Original premise/scope: title-pattern and prefix matching in `we:scripts/conveyor/main-ci-red-core.mjs`, with changes also expected in `we:scripts/lib/red-main-hold.mjs` and tests only in `we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs`.
-- Corrected premise: `we:scripts/conveyor/main-ci-red-core.mjs:284` also accepts a seven-character SHA in a title, a fix/heal verb followed by that SHA in a body, and a configurable alternate branch regex. All are bypasses of exact incident identity; removing only the title regex is insufficient. The existing trusted-author and creation-window checks remain relevant.
-- Corrected scope: the hold consumer already uses the published PR numbers without re-deriving identity (`we:scripts/lib/red-main-hold.mjs:73`), so no production edit there is needed. Add its existing test file for producer-to-consumer regression coverage. Add `we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs`, whose assertions at lines 241, 360 and 530 explicitly depend on the old recognition rules; the originally named core test file primarily tests the owner brief.
-- Owner-record clarification: `we:scripts/conveyor/main-ci-red-io.mjs:271` publishes the matcher output, not an independent PR identity attestation. Its dispatch ledger stores session/handle information (`we:scripts/conveyor/main-ci-red-io.mjs:346`, `we:scripts/conveyor/main-ci-red-io.mjs:362`), not an authoritative PR mapping. Use the card's exact-branch route; do not feed a permissively derived priority record back as proof of ownership.
-- Retain `size: 1`: expected touch set is roughly 40–60 changed lines in `we:scripts/conveyor/main-ci-red-core.mjs:269`, 60–90 in `we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs`, 40–70 in `we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs:241`, and 25–40 in `we:scripts/lib/__tests__/red-main-hold.test.mjs:55`. One recognition invariant, existing publishing path, no new runtime subsystem. This is a story, so no `estimatedLoc` is added.
+- Rechecked at 17242a56d. Original scope covered the core matcher and its core, health-tick and hold-consumer tests. Add the existing rerun test file, whose ownership tests now depend on label/supersession recognition; the goal is not delivered.
+- The prior preparation cited the matcher at line 284 and publisher at line 281. Current sources are `we:scripts/conveyor/main-ci-red-core.mjs:367` and `we:scripts/conveyor/main-ci-red-io.mjs:378`. In addition to title/body/prefix/alternate-regex recognition, the matcher now admits configured labels and body supersession declarations (`we:scripts/conveyor/main-ci-red-core.mjs:398`). Corrected scope includes removing those identity bypasses too, as required by the original exact-branch goal. A repair label or supersession claim alone must not confer exemption.
+- The hold consumer still consumes the published identities (`we:scripts/lib/red-main-hold.mjs:73`); no production change there is needed. The publisher writes the planner result (`we:scripts/conveyor/main-ci-red-io.mjs:387`), so no publisher change is needed either.
+- Retain size 1: approximately 60 changed lines in the matcher, 90 in its core tests, 70 in health-tick tests and 40 in hold-chain tests. Add approximately 40 lines in `we:scripts/conveyor/__tests__/main-ci-red-rerun.test.mjs:224` to convert label/supersession positives to exact-identity negatives while preserving its unrelated rerun cases. All five files are in scope; no new ownership protocol or dispatch path is introduced.
 
 ## Design
 
-In `we:scripts/conveyor/main-ci-red-core.mjs`, make `findOwnerPrs` compare the complete branch string with the configured owner prefix plus the current first-red SHA's first nine hexadecimal characters (default `lane/main-fix-<sha9>`). Require a valid hexadecimal SHA with at least nine characters and a nonempty prefix; do not sanitize malformed input into an accepted identity. Do not accept extra suffixes, a different incident's SHA, shorter abbreviations, title words, title SHA mentions, body claims or the alternate branch regex.
+In `we:scripts/conveyor/main-ci-red-core.mjs`, make `findOwnerPrs` compare the complete branch string with the configured owner prefix plus the current first-red SHA's first nine hexadecimal characters (default `lane/main-fix-<sha9>`). Require a valid hexadecimal SHA with at least nine characters and a nonempty prefix; do not sanitize malformed input into an accepted identity. Do not accept extra suffixes, a different incident's SHA, shorter abbreviations, title words, title SHA mentions, body claims, the alternate branch regex, configured repair labels or supersession markers. Remove the second-pass label/supersession admission path as well as the first-pass alternatives; leave unrelated settings consumers unchanged.
 
-Preserve existing open-state, trusted-author setting and creation-window behavior. Disabling the trusted-author check must not disable exact branch matching. Preserve the array result and ordering, singular owner wrapper, and downstream priority/combine interfaces. Update comments on the matching rules without removing legacy settings still used by other callers such as `we:scripts/pr-land.mjs:360`.
+Preserve existing open-state, trusted-author setting and creation-window behavior. Disabling the trusted-author check must not disable exact branch matching. Preserve the array result and ordering, singular owner wrapper, and downstream priority/combine interfaces. Update comments on the matching rules without removing legacy settings still used by other callers such as `we:scripts/pr-land.mjs`.
 
-Return a stable match-rule field with each recognized PR (for example `exact-owner-branch`) and include that rule and the incident SHA9 in `planPriority`'s reason. The existing publisher in `we:scripts/conveyor/main-ci-red-io.mjs:281` records this diagnostic through `we:scripts/lib/main-red-priority.mjs:35`; no new log writer is needed. Keep support for caller-supplied priority inputs without match metadata, but do not falsely label those as exact matches.
+Return a stable match-rule field with each recognized PR (for example `exact-owner-branch`) and include that rule and the incident SHA9 in `planPriority`'s reason. The existing publisher in `we:scripts/conveyor/main-ci-red-io.mjs:387` records this diagnostic through `we:scripts/lib/main-red-priority.mjs:35`; no new log writer is needed. Keep support for caller-supplied priority inputs without match metadata, but do not falsely label those as exact matches.
 
 ## MVP
 
@@ -44,8 +43,9 @@ Return a stable match-rule field with each recognized PR (for example `exact-own
 
 ## Test plan
 
-- In `we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs`, add a synthetic incident regression using #4812 on `lane/main-fix-2cb94418d` and #4813/#4814 as descriptive/title-only lookalikes. Label reconstructed titles/branches as synthetic rather than historical captures. Cover prefix-only, extra suffix, wrong SHA9, missing/malformed SHA, seven/eight-character SHA, body fix claims, title SHA mentions and an alternate regex configured to match everything.
+- In `we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs`, add a synthetic incident regression using #4812 on `lane/main-fix-2cb94418d` and #4813/#4814 as descriptive/title-only lookalikes. Label reconstructed titles/branches as synthetic rather than historical captures. Cover prefix-only, extra suffix, wrong SHA9, missing/malformed SHA, seven/eight-character SHA, body fix claims, title SHA mentions and an alternate regex configured to match everything, repair-label-only candidates, and body supersession declarations naming either the current SHA or an accepted PR. Each remains rejected without complete branch equality, even from a trusted author.
 - Cover closed and pre-window PRs, absent/untrusted/trusted authors and the explicit trusted-author opt-out with otherwise identical exact branches. Assert priority match diagnostics and first-owner ordering.
+- In `we:scripts/conveyor/__tests__/main-ci-red-rerun.test.mjs:224`, revise label/supersession ownership positives to require the exact branch, retaining the existing CI rerun assertions.
 - In `we:scripts/conveyor/health-smells/__tests__/main-ci-red.test.mjs`, update old positive recognition fixtures explicitly as synthetic exact-branch variants; retain original descriptive fixtures as negatives. Exercise the injected health tick's published priority and green-clear behavior, without dispatching live work. Preserve separate multi-owner planning tests through direct planner inputs.
 - In `we:scripts/lib/__tests__/red-main-hold.test.mjs`, compose `findOwnerPrs` → `planPriority` → `redMainSignal` → `decideRedMainHold` for the three-PR fixture. Assert only #4812 is exempt, and that an empty match set holds every local PR while the published red signal is live. Preserve expiry and cross-repo coverage.
 - Run each affected test file through the host heavy-run queue: invoke Node on `we:scripts/readiness/heavy-admission.mjs` with `run -- npx vitest run` followed by the corresponding test path (strip the documentation-only `we:` prefix when executing). Run `npm run check:standards` through that same queue. No bare test or gate invocations.
@@ -57,7 +57,7 @@ Capture the new regression failing on the old matcher and passing on the impleme
 ## Non-goals
 
 - No new owner-registration protocol, arbitrary alternate-branch exemptions, dispatch-ledger migration, changes to combine policy, hold modes, TTLs or merge gates.
-- No changes to the separate delivery fast-path recognizer in `we:scripts/pr-land.mjs:360`.
+- No changes to the separate delivery fast-path recognizer in `we:scripts/pr-land.mjs`.
 
 ## Edge cases this change must handle
 
@@ -72,4 +72,4 @@ Capture the new regression failing on the old matcher and passing on the impleme
 
 ## Follow-ups
 
-If operators need multiple differently named fix branches admitted in the same incident, pursue an explicit trusted owner-to-PR registration contract separately; the current dispatch ledger cannot supply it. Audit the separate fast-path matcher in `we:scripts/pr-land.mjs:360` independently. Neither extension is required for this exact-branch hold repair.
+If operators need multiple differently named fix branches admitted in the same incident, pursue an explicit trusted owner-to-PR registration contract separately; the current dispatch ledger cannot supply it. Audit the separate fast-path matcher in `we:scripts/pr-land.mjs` independently. Neither extension is required for this exact-branch hold repair.

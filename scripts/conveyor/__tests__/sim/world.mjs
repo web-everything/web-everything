@@ -11,7 +11,7 @@
  * simulator's RED run genuinely red). `frontierui`/`plateau-app` get a tiny fixture repo instead — the daemon
  * iterates all three constellation slugs every tick (`REVIEW_DAEMON_REPOS`), so `gh pr list --repo <slug>`
  * against them must resolve to a REGISTERED, empty repo rather than an unknown-repo throw. Every `createWorld()`
- * call then does a FAST bare-to-bare `git clone` of these cached templates into its own scenario root — the
+ * call then does a shared bare-to-bare `git clone` of these cached templates into its own scenario root — the
  * expensive tree-assembly work happens once, the per-scenario clone is cheap.
  *
  * Every constellation repo, not just the ones a scenario's own `repos:` option names, gets a bare origin +
@@ -197,7 +197,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     const slug = CONSTELLATION_REPOS[key].slug;
     const originPath = join(root, 'github', `${slug}.git`);
     mkdirSync(dirname(originPath), { recursive: true });
-    git(root, ['clone', '--quiet', '--bare', tpl[key], originPath]);
+    // Templates are immutable and outlive every world in this process. Borrow their objects instead of
+    // copying thousands of loose-object directory entries into every origin, daemon and lane clone.
+    // Each world's refs and newly pushed objects remain private; auto-gc stays disabled below.
+    git(root, ['clone', '--quiet', '--bare', '--shared', tpl[key], originPath]);
     noAutoGc(originPath);
     repoEntries[key] = { key, slug, originPath, defaultBranch: 'main' };
   }
@@ -284,9 +287,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     SIM_NPM_MODULES: nodeModulesSrc,
     SIM_NPM_LOCKFILE: join(INVOKING_ROOT, 'package-lock.json'),
     LANE_POOL_ROOT: lanePoolRoot,
-    // vitest.setup.ts supplies a per-FILE throttle root, which takes precedence over LANE_POOL_ROOT.
+    // vitest.setup.ts supplies a per-file throttle root, which takes precedence over LANE_POOL_ROOT.
     // Worlds have independent clocks: an earlier world's +11m budget window must never make a fresh
     // world wait out the 2m admission timeout on every gh call. Keep admission enabled, scoped per world.
+    // Cleanup owns this root.
     WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     // Each world owns a different simulated clock. Sharing the test file's throttle store lets
     // an earlier world's clock advance leave a future points window (and leases) for the next
@@ -347,6 +351,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // owns the shared reader itself.
     WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
+  // This world runs the checkout's policy, not the launching daemon's possibly newer last-good snapshot.
+  // Keep an explicit undefined so agent actions spreading process.env before this env cannot restore it;
+  // Node omits undefined env entries when spawning the child.
+  env.WE_DISPATCH_ROUTING_SNAPSHOT = undefined;
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.

@@ -3,26 +3,24 @@ bornAs: xsvxy4v
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/__tests__/drain-merge-strategy.test.mjs", "we:scripts/conveyor/__tests__/helpers/fake-gh-shim.mjs", "we:scripts/conveyor/soak/breaks/", "we:scripts/__tests__/"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-confirm-merged-before-landed.test.mjs", "we:scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/__tests__/drain-merge-strategy.test.mjs", "we:scripts/conveyor/__tests__/helpers/fake-gh-shim.mjs", "we:scripts/conveyor/__tests__/fake-gh-state.test.mjs", "we:scripts/conveyor/soak/breaks/drain-records-enqueued-pr-as-landed.mjs", "we:scripts/conveyor/soak/breaks/drain-records-enqueued-pr-as-landed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/drain-records-enqueued-pr-as-landed.test.mjs"]
 dateOpened: "2026-10-12"
-preparedDate: "2026-10-13"
-preparedAgainstSha: "829a08272668e533fff88f2dce919849abee6458"
+preparedDate: "2026-10-14"
+preparedAgainstSha: "27e9a188d7605d43cef3ba46e3bf954231ff310c"
 tags: []
 ---
 
 # Drain: confirm a PR is MERGED before recording it as landed
 
-After gh pr merge returns, the drain (we:scripts/merge-ai-prs.mjs, the mergePr write site before merged.push) adds the PR to merged/landedThisPass, posts its landed trace and starts post-land work without checking GitHub actually merged it. Once main has a merge-queue ruleset, a drain-direct pass (a stale drain clone, a lane's /pr or /finish run that reads its own branch's we:scripts/settings/merge-queue.json, a pr-watch fast drain, a manual /drain) gets gh pr merge turned into an enqueue, and the PR is recorded as landed early even if merge-group CI then fails. Fix: re-probe with the existing isPrAlreadyMerged after mergePr; if not MERGED, record it as queued/failed, never landed. Found in the PR #4950 fix round (merge-queue switch runbook); that runbook lists this card as a precondition for the switch. Add a soak break for the live case.
+After gh pr merge returns, the drain (we:scripts/merge-ai-prs.mjs, the mergePr write site before merged.push) adds the PR to merged/landedThisPass, posts its landed trace and starts post-land work without checking GitHub actually merged it. Once main has a merge-queue ruleset, a drain-direct pass (a stale drain clone, a lane's /pr or /finish run that reads its own branch's we:scripts/settings/merge-queue.json, a pr-watch fast drain, a manual /drain) gets gh pr merge turned into an enqueue, and the PR is recorded as landed early even if merge-group CI then fails. Fix: require a fresh, explicitly repo-scoped MERGED response after mergePr; otherwise report an unconfirmed write, never landed, and retain durable follow-up tracking. Found in the PR #4950 fix round (merge-queue switch runbook); that runbook lists this card as a precondition for the switch. Add a soak break for the live case.
 
-## Acceptance
+## Done when
 
 - [A1] **Executable** — a test in `we:scripts/__tests__/` drives the drain's merge write site with a `gh pr merge` stub that exits 0 while the PR stays OPEN (enqueued): before the fix the PR lands in `merged`/`landedThisPass`; after, it does not, and no landed trace or post-land work runs.
 - [A2] A soak break in `we:scripts/conveyor/soak/breaks/` reproduces the live case (drain-direct pass against a queued main) RED before, GREEN after.
 - [A3] A PR that really merged (re-probe says MERGED) is still recorded as landed exactly as today.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+This tightens confirmation for source, docs, config and data PRs equally. No receive endpoint is added; body-size caps, CSRF/origin checks and inbound rate limits are not applicable.
 
 ## Non-goals
 
@@ -35,56 +33,58 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — n/a: the check reads GitHub's PR `state`/`mergedAt` fields, not free text.
 2. **Truncated reads** — a failed or empty re-probe counts as NOT merged (never as landed).
 3. **Shared state files** — the drain's queue follow-up state (`queueStatePath` in `we:scripts/lib/drain-merge-strategy.mjs`) must not get a landed entry for an unconfirmed merge.
-4. **Fail closed** — any re-probe error records the PR as queued/failed, not landed; the next pass re-checks it.
+4. **Fail closed** — any re-probe error records the PR as unconfirmed, not landed; durable pending state allows a later pass to re-check it.
 5. **Identity scoping** — the re-probe names the PR's own repo (`--repo`), never the cwd default.
-6. **State over time** — GitHub may report MERGED a moment late; a short bounded retry is fine, but on timeout the PR is not landed and the next pass picks it up.
+6. **State over time** — GitHub may report MERGED a moment late; use one immediate confirmation read; an unconfirmed PR stays pending for the existing follow-up collector, without sleeping inside the writer lock.
 7. **Who wrote it** — applies to every caller of the drain (resident daemon, lane `/pr` and `/finish`, `pr-watch` fast drain, manual `/drain`), since the check sits at the shared write site.
 
 ## Progress
 
-- Premise check (re-run 2026-10-13 against `main` 829a08272; first prepared at 32312de6d, line citations refreshed after `we:scripts/merge-ai-prs.mjs` drifted by ~26 lines): still true. The plain merge path in `we:scripts/merge-ai-prs.mjs` calls `mergePr(...)` inside `withLandWriteLock` (~line 6548) and returns `{ merged: true }`; the caller then runs `merged.push(...)`, `postMergeTrace()` and `landedThisPass.add(...)` (~lines 6575–6583) with no state check. `git log` for `5919`/`xsvxy4v` shows only the filing and JIT-number commits; nothing delivers the fix. Card citations are accurate; `isPrAlreadyMerged` is at ~line 4656 (reads `state,mergedAt`, returns false on any gh miss).
-- Scope unchanged (`we:scripts/merge-ai-prs.mjs` + tests). The soak break (A2) also needs a small opt-in fake-gh knob (`handlePrMerge` in `we:scripts/conveyor/__tests__/helpers/fake-gh-shim.mjs` has no enqueue mode), so that helper is touched too. Size 3 stands.
+- Rechecked at checkout `27e9a188d7605d43cef3ba46e3bf954231ff310c`. Old premise: a successful direct merge command is credited without a fresh state confirmation. Current source still shows that gap: `we:scripts/merge-ai-prs.mjs:6553` calls the writer, `we:scripts/merge-ai-prs.mjs:6554` returns unconditional success, and `we:scripts/merge-ai-prs.mjs:6584` begins landing bookkeeping. This is source evidence, not a claim that a live GitHub enqueue was reproduced during preparation.
+- Corrected stale citations from the earlier preparation: direct write moved from line 6550 to `we:scripts/merge-ai-prs.mjs:6553`; the permissive pre-check is at `we:scripts/merge-ai-prs.mjs:4647`; collection moved from line 6679 to `we:scripts/merge-ai-prs.mjs:6687`. The pre-check accepts MERGED **or** a truthy mergedAt, so it cannot supply the new strict post-write confirmation unchanged.
+- Old scope already included durable pending recovery, fake-gh support and seven explicit test files. Corrected scope retains those eleven entries; four planned files (the confirmation CLI test, break, sibling soak test and break judge unit test) remain absent and must be created. No production move or extra dependency is required. The existing CLI subprocess seam is `we:scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs:48`, with execution at `we:scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs:66`; it is not the helper-only CI lifecycle test cited by an older preparation.
+- Recovery refinement: `we:scripts/merge-ai-prs.mjs:6129` already supplies a state mutation lock that refuses unlocked fallback. Retain it for pending registration outside the land callback. The collector in `we:scripts/lib/drain-merge-strategy.mjs` currently joins facts by number alone and unconditionally appends to merged; direct sibling intents therefore require repository-aware joining and same-pass deduplication. Persist the revalidated head, not a possibly older candidate head. No implementation or runtime success is claimed here.
+- Size remains 3 → 3. Estimated touch set: about 70 changed lines in `we:scripts/merge-ai-prs.mjs`, 90 in `we:scripts/lib/drain-merge-strategy.mjs`, 15 in `we:scripts/conveyor/__tests__/helpers/fake-gh-shim.mjs:353`, 100 in the planned break, and about 300 across seven scoped test files (roughly 120 CLI, 70 strategy, 30 fake-gh, 40 judge, 25 soak and 15 existing drain regressions). Existing seams bound this work; estimates include additions and adjustments, not file sizes. This is a story, so no estimatedLoc is added. Existing preparation stamps remain untouched for the runner.
 
 ## Design
 
-1. **Confirm helper.** Add an exported, injectable `confirmMergedAfterWrite({ probe, attempts, delayMs, sleep })` in `we:scripts/lib/drain-merge-strategy.mjs`, beside `collectQueueMerged`. It calls `probe()` up to `attempts` times and returns `true` only when a probe returns true; a thrown probe, or false every time, returns `false` (fail closed). The land callback is synchronous (`readGh` is sync), so `sleep` is a synchronous sleep (`Atomics.wait`). To avoid holding the serial-writer mutex, the callback does ONE probe inside the lock; if that is false, the bounded retry (3 probes, ~1s apart, ≤ 3s) runs AFTER the lock is released, since the merge write is already done.
-2. **Call site.** In `we:scripts/merge-ai-prs.mjs`, right after `mergePr(...)` (~line 6548), return `{ merged: true }` only when the in-lock probe `isPrAlreadyMerged(c.repo, c.num)` is true, else `{ merged: false, unconfirmed: true }`; after the lock, an `unconfirmed` result gets the bounded retry and, if it now reads MERGED, flows into the existing merged path. `isPrAlreadyMerged` already passes `--repo` via `repoFlag(repo)`.
-3. **Unconfirmed branch (placed before the `mergeStrategy.enqueues` skip line ~6574).** For a result still unconfirmed after the retry: set `decision = 'skip'` (keeps it blocking its dependents), report it on stderr/JSON as `queued` (not `failed`, not `merged`), and `continue`. No `merged.push`, no `postMergeTrace()`, no `landedThisPass.add`. **Durable follow-up (Must — review round 1):** a merged PR drops off every later pass's open-PR listing, so "the next pass sees it" loses its numbering/resolve/regen forever. So add a strategy method `recordPendingFollowUp(c, headSha)` beside `enqueue()` that adds the PR to the existing pending list (via the existing `mutateState`, same entry shape `enqueue()` writes); `collectQueueMerged` (~line 6675) then runs the post-land follow-up exactly once when GitHub reports MERGED, and drops it if CLOSED. A pending entry is not a landed entry, so edge case 3 holds. The method must work in drain-direct mode (state file absent → created); an unreadable state file refuses the write and logs it, never overwrites.
-4. **Fake gh knob.** `handlePrMerge` gets an opt-in store flag `mergeQueue: true` that exits 0 and records an `enqueued` event but leaves the PR `OPEN`. Default behavior is unchanged.
+1. In `we:scripts/merge-ai-prs.mjs`, add a fresh post-write read of state using the candidate's explicit repository (`c.repo || localSlug`), refusing to write if that identity cannot be resolved. Accept only parsed state MERGED; OPEN, CLOSED, empty/malformed output, contradictory mergedAt-only evidence and read errors are unconfirmed. Do not reuse a cached pre-write read. Use one read, no sleep or polling loop.
+2. In `we:scripts/lib/drain-merge-strategy.mjs`, add pending-intent registration using the existing entry metadata (repo, number, head SHA, item, manifest flag, head ref, title). Register before the direct merge write, outside the already-held land callback, through the existing locked read-modify-write machinery. Use the injected lock that refuses unlocked fallback; never acquire it recursively inside the land callback. Store the revalidated head and canonical repository identity, normalizing legacy local null-repo entries against localSlug when comparing keys. Deduplicate by repo plus number, preserve peer entries, and refuse the merge when the state file is unreadable, the lock is refused or the write fails. An absent file may be created. A pending intent is not evidence of enqueue or land. Retain it on command failure or unknown outcome: subsequent confirmed MERGED/CLOSED determines recovery or retirement.
+3. At the direct write site in `we:scripts/merge-ai-prs.mjs:6553`, replace unconditional success with the confirmation result. Before the existing landing bookkeeping, an unconfirmed result sets the remaining candidate to skip, leaves dependents blocked and appends `{num, repo, headSha, reason}` to an additive JSON `unconfirmed` list. Emit a concise diagnostic without claiming enqueue. Return an unconfirmed result rather than throwing into the permissive existing exception-recovery check. Never call the landed trace or credit this candidate on that branch. Existing independent candidates may continue.
+4. Reuse `collectQueueMerged` and `confirmQueueFollowUps` for durable recovery. The collector already runs before post-land work at `we:scripts/merge-ai-prs.mjs:6687`. For a pending candidate already in this pass's merged list, return it for completion tracking without appending/crediting it again. Carry repository identity through planning (or plan each repository separately), and join facts by repo plus number, not number alone; preserve the existing queue path's behavior. Report recovered direct intents as direct-write recovery rather than asserting GitHub queue provenance. Keep pending entries until post-land completion succeeds; failed work remains subject to the existing retry cap. Confirmed delayed land may run follow-up in the same pass or a later one. Do not promise globally exactly-once execution: post-land work is idempotent and can retry.
+5. Add an opt-in per-repository fake merge-queue flag in `we:scripts/conveyor/__tests__/helpers/fake-gh-shim.mjs:353`: successful command, observable enqueue event, OPEN PR, unchanged base ref. Normal fake merges remain unchanged. The soak judge must prove the command was attempted so a pass that never reaches the write cannot pass vacuously.
 
 ## MVP
 
-Musts only:
-- `confirmMergedAfterWrite` + the single call-site change + the unconfirmed branch + `recordPendingFollowUp` (so the later GitHub merge still gets its follow-up).
-- The test file (A1/A3) and the soak break (A2) below.
-- One stderr line per queued PR: `queued (gh pr merge returned 0 but PR is not MERGED)`.
-
-Out of scope (see Follow-ups): a poller that lands an enqueued PR's post-land work before the next pass; any change to the `github-merge-queue` strategy path (N1).
+- Must: strictly confirm direct writes before landing credit, trace, dependency release or candidate-specific post-land effects, for every PR content kind.
+- Must: persist the explicit repository and revalidated head in recovery intent before writing; errors refuse that write and preserve existing state. Never turn unknown state into landed or positively queued output.
+- Must: recover delayed merges even after they vanish from open listings; prevent duplicate same-pass credit and cross-repository number collisions. Retire only after successful follow-up, retaining existing retry behavior.
+- Must: executable CLI regression, fake-gh regression and daemon soak break with normal-merge control.
+- Could, deferred: bounded fast retries and watcher-triggered follow-up. No queue-policy, ruleset or runbook change; no change to the explicit queue strategy's enqueue decision or clearance behavior.
 
 ## Test plan
 
-`we:scripts/__tests__/merge-ai-prs-confirm-merged-before-landed.test.mjs`:
-1. **Enqueued PR is not landed (A1)** — a `runCli` run against the fake gh shim with `mergeQueue: true` leaves the PR OPEN; asserts `merged` is empty, no id in `landedThisPass`, no merge-trace comment, no follow-up input. RED before the fix: `{ merged: true }` is returned unconditionally.
-2. **Really merged still lands (A3)** — a normal fake-gh merge lands as today (merged entry, trace posted once, follow-up runs); helper returns true on the first probe.
-3. **Late MERGED** — probe false, false, true → true within the bound (injected `sleep`, no real wait).
-4. **Probe throws / garbage** — returns false, never throws (fail closed).
-5. **Retry bound** — probe never true → exactly `attempts` calls, total injected sleep ≤ the cap.
-6. **Repo scoping** — the probe's gh argv carries the PR's own `--repo` (read from the fake shim's call log), not the cwd default.
-7. **Queued, follow-up runs once when GitHub merges it** — test 1 also asserts the follow-up state file gained a `pending` entry (and no `followedUp`/landed entry); then the fake store flips the PR to MERGED AND removes it from the open listing, and the next pass's `collectQueueMerged` records it and runs its follow-up exactly once (a second pass does not repeat it).
-8. **Unreadable state file** — `recordPendingFollowUp` leaves it untouched and reports it; the PR is still not landed.
-9. **Existing source-shape test** — re-run `we:scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs` (it slices the source at `const landLock = withLandWriteLock(` and asserts marker order) and adjust it if the new branch moves its anchors.
+- `we:scripts/__tests__/merge-ai-prs.test.mjs`: retain the existing resolution-basis comments and default-base hold regressions when changing the shared drain entry point.
+- `we:scripts/conveyor/soak/breaks/__tests__/drain-records-enqueued-pr-as-landed.test.mjs` (new): unit-test the planned break judge with synthetic observations. Reject no merge attempt, OPEN with landed effects, and missing pending recovery; accept an observed enqueue with OPEN state, no landed effects and retained pending intent. Cover the delayed-merge and normal-merge control observations separately. Retain the sibling soak test for real daemon execution.
 
-Harness notes: the fake-gh `mergeQueue` knob lands first, so test 1 is RED for the right reason (PR recorded landed), not an import error; `runCli` tests use the same fake-gh harness as `we:scripts/__tests__/merge-ai-prs-ci-lifecycle-and-land-effects.test.mjs`. Test 6 asserts `--repo` on the post-merge `pr view` argv, which only exists once the probe runs after the merge. Tests 3–5 are pure unit cases.
-
-Soak: `we:scripts/conveyor/soak/breaks/drain-records-enqueued-pr-as-landed.mjs` plus its soak test, modelled on `we:scripts/conveyor/soak/breaks/couple-split-by-unrelated-merge.mjs` (`daemons: ['drain']`): fake gh `mergeQueue: true`, a green `ready-to-merge` PR; the judge reports a violation if the PR is recorded landed (merge-trace comment, or its item resolved) while still OPEN.
+- `we:scripts/__tests__/merge-ai-prs-confirm-merged-before-landed.test.mjs` (new): spawn the real CLI using the isolated subprocess pattern in `we:scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs:48`. Stub a successful direct merge that stays OPEN. Assert the write actually ran, JSON merged excludes it, unconfirmed includes it, no landed comment or candidate post-land work occurs, and a dependent remains blocked. Inspect command/event logs and dependency behavior rather than pretending the private landedThisPass set is exported. Include an unrelated confirmed merge as a control.
+- In that CLI test, cover normal MERGED, command failure, malformed/empty/error confirmation, OPEN with a misleading mergedAt, explicit local and sibling repository argv, and source/docs/config/data candidates. Simulate MERGED on the next pass with the PR absent from open listings: pending recovery must still drive follow-up. Verify successful completion retires it, subsequent passes do not repeat it, and failed completion keeps it pending.
+- `we:scripts/lib/__tests__/drain-merge-strategy.test.mjs`: pending registration in direct mode; absent/corrupt state; lock refusal/write failure; preservation of concurrent entries; no nested lock acquisition; same-pass merge deduplication; legacy null-repo normalization; revalidated-head persistence; identical PR numbers in two repos; OPEN/read-error retention; CLOSED retirement; failed completion and retry cap. Assert no merge write is allowed when registration fails via the CLI test too.
+- `we:scripts/conveyor/__tests__/fake-gh-state.test.mjs`: opt-in enqueue leaves PR OPEN and base unchanged, emits its event, and normal merge still updates both. Keep the flag repository-scoped.
+- `we:scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs`: retain existing pre-check and exception-recovery coverage; update source anchors only where required, with the new executable regression supplying behavioral proof.
+- `we:scripts/conveyor/soak/breaks/drain-records-enqueued-pr-as-landed.mjs` plus `we:scripts/conveyor/soak/breaks/drain-records-enqueued-pr-as-landed.soak.test.mjs` (new): follow `we:scripts/conveyor/soak/breaks/couple-split-by-unrelated-merge.mjs:124` and its sibling test. Run the real drain daemon with direct strategy and fake queued merges; judge the observed enqueue attempt, OPEN state, absence of landed trace/resolution and retained pending entry. Include a delayed-merge phase and normal-merge control.
 
 ## Proof plan
 
-- The real before/after is the soak break: fill the break's `fixedBy.sha` after the fix commit, then run the red/green runner `we:scripts/conveyor/soak/red-green.mjs` with `--break=drain-records-enqueued-pr-as-landed` (RED with the fix reverted, GREEN with it); both outputs go in the PR body. The break also needs its soak-test sibling file, as the other breaks have.
-- Regression smoke only (not proof of A2): a `--dry-run --json` pass of `we:scripts/merge-ai-prs.mjs` on the lane shows normal output is unchanged while `we:scripts/settings/merge-queue.json` has the queue off.
+- Implementation proof must execute the real write path, not just inspect source. With the fake enqueue support present, the CLI regression and soak case must fail against the old unconditional-success branch because it claims land while OPEN; capture that observation, including the command attempt, PR state, merged output, trace comments and pending state. Against the fix, capture the same attempted enqueue without land credit, then successful deferred follow-up and the normal-merge control.
+- Run each scoped test through the host heavy-run queue using `we:scripts/readiness/heavy-admission.mjs` with `run -- npx vitest run` and the test's WE-relative path. Run `npm run check:standards` through that same queue. No bare test or soak runner invocation.
+- After a fix commit exists, record its SHA in the break's fixedBy metadata and use `we:scripts/conveyor/soak/red-green.mjs` through heavy admission according to its CLI usage. Preserve the harness addition when reverting the fix so RED proves false landing rather than missing fixture support. Attach red/green command output and state/event evidence to the implementation review. This preparation does not supply an implementation SHA or claim those tests have passed.
+- A dry-run pass is only an output smoke check; it cannot prove merge confirmation. The runner owns this preparation's stamping and checks.
 
 ## Follow-ups
 
-- Run queued PRs' post-land work between passes (from `pr-watch`) rather than at the next full pass.
-- Show the `queued` bucket in the daemon status line and `/queue` table.
-- Drop this card from the merge-queue switch runbook's precondition list once it lands.
+- Keep any broader tightening of the existing pre-write and exception-recovery mergedAt checks separate from this successful-write fix.
+- Add bounded confirmation retries outside the writer lock if measured latency warrants it; retain durable intent and fail-closed behavior.
+- Trigger pending follow-up from the watcher between full passes, preserving completion acknowledgment and retry limits.
+- Surface unconfirmed direct writes in daemon status and the queue UI without labelling unknown outcomes as queued.
+- Remove the merge-queue switch runbook precondition only after this fix's executable proof lands.
