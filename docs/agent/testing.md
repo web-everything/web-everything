@@ -910,7 +910,13 @@ the health `config.json` `prSweep` block, then `WE_PR_SWEEP_*` env values (for e
 Sources are logged and carried into the child report. Diagnosis defaults off and delegates exclusively to
 `stuck-pr-watch.mjs sweep`; alerts use the existing checked desktop/quiet-hours gate.
 
-A failed owner read pauses stuck-alert episode updates. An incomplete operator queue also pauses them,
+A session owns a PR only while it is actively running: every listed `state`/`status` value is
+`working`, `running` or `busy`, its pid probes alive, and its transcript (or its start) is newer than
+`sessionActiveWithinMinutes` (default 30). Finished fixers are listed `idle`, `offline`, `blocked` or
+`waiting`, so those and any unknown state never own a PR.
+
+A failed owner read pauses stuck-alert episode updates. So does an agent listing that reports unreadable
+records (`incomplete`), since a missing session is unknown, not gone. An incomplete operator queue also pauses them,
 since operator-owned PRs cannot safely be distinguished, and preserves the previous NEEDS YOU set.
 A complete first queue sample records the set without alerting. A PR move or head change resets its
 unowned episode; a recovered owner clears it. Failed notification delivery leaves the episode/set due

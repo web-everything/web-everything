@@ -16,12 +16,12 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
 const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
-const DEFAULTS = { enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+const DEFAULTS = { enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
 export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   const errors = []; let tool = {};
   try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
@@ -62,13 +62,26 @@ const isDaemonProgress = (line) => !isDispatchRefusal(line)
 export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
   readAgents = async () => {
     const { defaultReadAgents, enrichAgents } = await import('./reconcile-pass.mjs');
-    return enrichAgents(defaultReadAgents({ env }));
+    const { listWrappedWorkerAgents } = await import('../operations/worker-wrapper-launch.mjs');
+    // The merged listing drops `incomplete` while mapping, so ask the wrapped store directly.
+    const gaps = listWrappedWorkerAgents().incomplete ?? [];
+    const rows = enrichAgents(defaultReadAgents({ env }));
+    return gaps.length ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
+  }, readActivity = async (agent) => {
+    const { readTranscriptTailActivity } = await import('./hung-session.mjs');
+    return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
 }) {
   let sessions = []; let health = {}; const logs = [];
   const guarded = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
-  sessions = await guarded('agents', async () => { const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array'); return rows; }, []);
+  sessions = await guarded('agents', async () => {
+    const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array');
+    // A session missing from a partial listing is unknown, not gone: fail the owner read.
+    if (rows.incomplete?.length) throw new Error(`agent listing incomplete: ${rows.incomplete.map((g) => g?.reason ?? g).join('; ')}`);
+    return Promise.all(rows.map(async (a) => isRunningSession(a)
+      ? { ...a, lastActivityAt: await guarded(`activity ${a.name}`, () => readActivity(a), null) } : a));
+  }, []);
   health = await guarded('health state', async () => { const state = await readHealth(); if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('expected health object'); return state; }, {});
   const roots = await guarded('daemon roots', cloneRoots, []);
   const dirs = [...new Set([...roots.map((r) => join(r, '.conveyor')), ...(env.HEALTH_WATCH_LOGS_DIR ? [env.HEALTH_WATCH_LOGS_DIR] : [])])];

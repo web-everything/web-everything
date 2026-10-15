@@ -21,7 +21,7 @@ export default {
   fixPresent(root) {
     return ['pr-sweep-core.mjs', 'pr-sweep-job.mjs', 'pr-sweep.mjs', 'health-watch.mjs'].every((name) => {
       const source = readFileSync(join(root, 'scripts/conveyor', name), 'utf8');
-      return name === 'pr-sweep-core.mjs' ? source.includes('a.hung !== true') && source.includes('a.pidAlive !== false') && source.includes("d.kind !== 'refusal'")
+      return name === 'pr-sweep-core.mjs' ? source.includes('isActiveSession(a, now') && source.includes('a.pidAlive === true') && source.includes("d.kind !== 'refusal'")
         : source.includes('realpathSync(argv1)') && (name !== 'pr-sweep.mjs' || source.includes('String(text).matchAll'));
     });
   },
@@ -83,13 +83,17 @@ export default {
         violations.push({ invariant: 'diagnostic-hides-real-progress', detail: JSON.stringify(progress.at(-1)) });
       }
     }
-    for (const health of [{ hung: true }, { pidAlive: false }, { hung: true, pidAlive: false }]) {
+    // Operator send-back: finished fixers stay listed idle/offline/blocked with a live (recycled) pid.
+    for (const health of [{ hung: true }, { pidAlive: false }, { hung: true, pidAlive: false },
+      { status: 'idle', pidAlive: true }, { status: 'offline', pidAlive: true }, { state: 'blocked', status: 'idle', pidAlive: true },
+      { state: undefined, status: 'waiting', pidAlive: true }, { status: 'busy' }]) {
       let previous = {}; const samples = []; let alertCount = 0;
       for (const minutes of [0, 30, 60, 90, 120, 240]) {
-        const report = await runPrSweep({ now: now + minutes * 60000, dryRun: true, config: {},
+        const tick = now + minutes * 60000;
+        const report = await runPrSweep({ now: tick, dryRun: true, config: {},
           settings: { value, sources: {} }, readPrevious: () => previous, readPrs: () => [pr],
           readQueue: () => ({ ready: [], rulingNeeded: [] }),
-          readSignals: () => ({ [key]: { sessions: [{ name: 'fix-12', state: 'working', ...health }] } }) });
+          readSignals: () => ({ [key]: { sessions: [{ name: 'fix-12', state: 'working', lastActivityAt: tick - 60000, ...health }] } }) });
         previous = report.nextState; alertCount += report.alerts.length;
         samples.push({ minutes, state: report.idle[0].state, episodes: Object.keys(previous.episodes).length, alerts: report.alerts.length });
       }

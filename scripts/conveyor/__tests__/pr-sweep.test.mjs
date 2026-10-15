@@ -57,7 +57,7 @@ it('ignores refusal evidence without hiding real sessions, daemon progress or he
   expect(resolveOwner(pr, { now, daemons: [refusal] }).state).toBe('none');
   expect(resolveOwner(pr, { now, daemons: [{ ...refusal, kind: 'refusal', reason: undefined }] }).state).toBe('none');
   expect(resolveOwner(pr, { now, daemons: [{ ...refusal, kind: 'diagnostic', reason: undefined }] }).state).toBe('none');
-  expect(resolveOwner(pr, { now, daemons: [refusal], sessions: [{ name: 'fix-12' }] }).owner).toBe('session:fix-12');
+  expect(resolveOwner(pr, { now, daemons: [refusal], sessions: [running()] }).owner).toBe('session:fix-12');
   const progress = { name: 'review', at: now - 1000 };
   expect(resolveOwner(pr, { now, daemons: [refusal, progress] }).owner).toBe('daemon:review');
   expect(resolveOwner(pr, { now, daemons: [refusal, { ...progress, at: now - 100 * 60000 }] }).state).toBe('stuck');
@@ -88,7 +88,7 @@ describe('PR sweep', () => {
     expect(classifyIdlePrs({ prs: [pr, { ...pr, number: 2, updatedAt: new Date(now).toISOString() }, { ...pr, state: 'CLOSED' }, { ...pr, updatedAt: 'bad' }], now, idleMinutes: 45 })).toEqual([{ ...pr, ageMin: 120 }]);
   });
   it('binds sessions, recent daemons, stale owner and smell; operator wins', () => {
-    expect(resolveOwner(pr, { now, ...settings, sessions: [{ name: 'fix-12' }] }).owner).toBe('session:fix-12');
+    expect(resolveOwner(pr, { now, ...settings, sessions: [running()] }).owner).toBe('session:fix-12');
     expect(resolveOwner(pr, { now, ...settings, daemons: [{ name: 'review', at: now - 1000 }] }).state).toBe('active');
     expect(resolveOwner(pr, { now, ...settings, daemons: [{ name: 'review', at: now - 100 * 60000 }] }).state).toBe('stuck');
     expect(resolveOwner(pr, { now, ...settings, smell: 'fixer-stuck' }).smell).toBe('fixer-stuck');
@@ -113,12 +113,13 @@ describe('PR sweep', () => {
       expect(previous.episodes[key].alerted).toBe(true);
     }
   });
-  it('keeps healthy or unknown sessions active and falls back from unhealthy ones to daemon evidence', () => {
-    for (const health of [{}, { hung: false, pidAlive: true }, { pidAlive: null }]) {
-      expect(resolveOwner(pr, { now, ...settings, sessions: [{ name: 'fix-12', state: 'working', ...health }] }).state).toBe('active');
+  it('keeps healthy sessions active, never unknown-pid ones, and falls back from unhealthy ones to daemon evidence', () => {
+    for (const health of [{}, { hung: false, pidAlive: true }]) {
+      expect(resolveOwner(pr, { now, ...settings, sessions: [running(now, health)] }).state).toBe('active');
     }
-    const unhealthy = { name: 'fix-12', state: 'working', hung: true };
-    expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy, { name: 'review-12' }] }).owner).toBe('session:review-12');
+    expect(resolveOwner(pr, { now, ...settings, sessions: [running(now, { pidAlive: null })] }).state).toBe('none');
+    const unhealthy = running(now, { hung: true });
+    expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy, running(now, { name: 'review-12' })] }).owner).toBe('session:review-12');
     expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy], daemons: [{ name: 'review', at: now - 1000 }] }).state).toBe('active');
     expect(resolveOwner(pr, { now, ...settings, sessions: [unhealthy], daemons: [{ name: 'review', at: now - 100 * 60000 }] }).state).toBe('stuck');
   });
@@ -187,4 +188,73 @@ it('writes an atomic durable report and a single ET handoff line', async () => {
     expect(readdirSync(dir)).toEqual(['pr-sweep.json']); expect(lines).toHaveLength(1); expect(lines[0]).toContain('ET idle=1');
     expect(out.idle[0].state).toBe('waiting-operator');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Operator send-back on PR #5323: finished fixers are listed idle/offline/blocked, not done.
+const running = (at = now, o = {}) => ({ name: 'fix-12', state: 'working', status: 'busy', pidAlive: true, lastActivityAt: at - 60000, ...o });
+describe('only an actively running session owns a PR', () => {
+  it.each([
+    ['idle fixer', { status: 'idle' }], ['offline fixer', { status: 'offline' }],
+    ['offline fixer with no state', { state: undefined, status: 'offline' }], ['blocked fixer', { state: 'blocked', status: 'idle' }],
+    ['waiting session', { state: undefined, status: 'waiting' }], ['unknown state', { state: 'mystery', status: undefined }],
+    ['no state at all', { state: undefined, status: undefined }], ['unprobed pid', { pidAlive: undefined }],
+    ['idle-finished', { idleFinished: true }], ['self-reported done', { selfReportedDone: true }], ['auth expired', { authExpired: true }],
+  ])('%s on an idle PR yields a no-owner alert', async (_label, shape) => {
+    for (const repo of [pr.repo, 'plateauapp/plateau-app']) {
+      const key = `${repo}#12`; const tag = repo === pr.repo ? '' : 'pa-';
+      let previous = {}; const alerts = [];
+      for (const minutes of [0, 30, 60, 90, 120, 240]) {
+        const tick = now + minutes * 60000;
+        const out = await runPrSweep({ now: tick, dryRun: true, config: {}, settings: { value: { ...settings, repos: [repo] }, sources: {} },
+          readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+          readSignals: () => ({ [key]: { sessions: [running(tick, { name: `fix-${tag}12`, ...shape })] } }) });
+        expect(out.idle[0].state).toBe('none');
+        previous = out.nextState; alerts.push(...out.alerts);
+      }
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].key).toBe(key);
+    }
+  });
+  it('a busy fixer whose activity is older than the window stops owning and the stall alerts', async () => {
+    let previous = {}; const alerts = []; const started = now - 60000;
+    for (const minutes of [0, 30, 60, 90, 120, 240]) {
+      const tick = now + minutes * 60000;
+      const out = await runPrSweep({ now: tick, dryRun: true, config: {}, settings: { value: { ...settings, sessionActiveWithinMinutes: 20 }, sources: {} },
+        readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+        readSignals: () => ({ [`${pr.repo}#12`]: { sessions: [running(now, { lastActivityAt: started, startedAt: started })] } }) });
+      expect(out.idle[0].state).toBe(minutes === 0 ? 'active' : 'none');
+      previous = out.nextState; alerts.push(...out.alerts);
+    }
+    expect(alerts).toHaveLength(1);
+  });
+  it('owns while busy, alive and recently active; recent start counts as activity', () => {
+    const o = { now, ...settings, sessionActiveWithinMinutes: 30 };
+    expect(resolveOwner(pr, { ...o, sessions: [running()] })).toMatchObject({ owner: 'session:fix-12', state: 'active' });
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { state: undefined })] }).state).toBe('active');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { status: undefined, lastActivityAt: new Date(now - 60000).toISOString() })] }).state).toBe('active');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { lastActivityAt: undefined, startedAt: now - 5 * 60000 })] }).state).toBe('active');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { lastActivityAt: undefined, startedAt: now - 31 * 60000 })] }).state).toBe('none');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { lastActivityAt: now - 31 * 60000 })] }).state).toBe('none');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { lastActivityAt: 'garbage' })] }).state).toBe('none');
+    expect(resolveOwner(pr, { ...o, sessions: [running(now, { status: 'idle' }), running(now, { name: 'review-12' })] }).owner).toBe('session:review-12');
+  });
+  it('reads transcript activity only for busy, live-pid rows', async () => {
+    const seen = []; const errors = [];
+    const rows = [running(now, { lastActivityAt: undefined, sessionId: 'a' }), running(now, { status: 'idle', lastActivityAt: undefined, sessionId: 'b' }),
+      running(now, { pidAlive: false, lastActivityAt: undefined, sessionId: 'c' })];
+    const signals = await collectOwnerSignals({ prs: [pr], dir: tmpdir(), env: {}, errors, readAgents: () => rows,
+      readActivity: (a) => { seen.push(a.sessionId); return now - 2000; }, cloneRoots: () => [], readHealth: () => ({}) });
+    expect(errors).toEqual([]); expect(seen).toEqual(['a']);
+    expect(signals[`${pr.repo}#12`].sessions[0].lastActivityAt).toBe(now - 2000);
+    expect(resolveOwner(pr, { now, ...settings, ...signals[`${pr.repo}#12`] }).state).toBe('active');
+  });
+  it('an incomplete agent listing keeps the previous episode instead of alerting', async () => {
+    const first = plan();
+    const listing = Object.defineProperty([], 'incomplete', { value: [{ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }] });
+    const report = await runPrSweep({ now: now + 100 * 60000, dryRun: true, config: {}, settings: { value: settings, sources: {} },
+      readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => first.nextState,
+      readSignals: (args) => collectOwnerSignals({ ...args, readAgents: () => listing, cloneRoots: () => [], readHealth: () => ({}) }) });
+    expect(report.errors.join(' ')).toContain('incomplete'); expect(report.alerts).toEqual([]);
+    expect(report.nextState.episodes).toEqual(first.nextState.episodes);
+  });
 });

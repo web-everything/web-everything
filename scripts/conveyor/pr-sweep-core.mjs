@@ -11,12 +11,26 @@ export function classifyIdlePrs({ prs, now, idleMinutes }) {
   return prs.filter((p) => (!p.state || p.state.toUpperCase() === 'OPEN') && now - ms(p.updatedAt) > idleMinutes * 60000)
     .map((p) => ({ ...p, ageMin: (now - ms(p.updatedAt)) / 60000 }));
 }
+// Finished sessions stay listed as idle, offline, blocked or waiting, so only an
+// explicit running value counts. Every present field (`state`, `status`) must
+// be one; an absent or unknown value never grants ownership.
+const RUNNING = new Set(['working', 'running', 'busy']);
+const DONE_FLAGS = ['hung', 'idleFinished', 'authExpired', 'selfReportedDone'];
+/** Running state and a live pid; the IO shell reads activity only for these rows. */
+export function isRunningSession(a) {
+  const vals = [a?.state, a?.status].filter((v) => v !== undefined && v !== null && v !== '').map((v) => String(v).toLowerCase());
+  return vals.length > 0 && vals.every((v) => RUNNING.has(v)) && a.pidAlive === true && !DONE_FLAGS.some((f) => a[f] === true);
+}
+/** An owner is running, alive and active within the window; a recent start counts as activity. */
+export function isActiveSession(a, now, activeWithinMinutes = 30) {
+  const seen = Math.max(...[a?.lastActivityAt, a?.startedAt].map(ms).filter(Number.isFinite));
+  return isRunningSession(a) && Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000;
+}
 export function resolveOwner(pr, signals = {}) {
-  const { now, stuckAfterMinutes = 90, operator, smell, daemons = [], sessions = [] } = signals;
+  const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [] } = signals;
   const base = { owner: null, state: 'none', why: 'No owner signal', ownerLastSeenAt: null };
   if (operator) return { ...base, owner: 'operator', state: 'waiting-operator', why: 'NEEDS YOU / RULING NEEDED' };
-  const live = sessions.filter((a) => !['done', 'stopped', 'failed'].includes(a.state)
-    && a.hung !== true && a.pidAlive !== false).filter((a) => {
+  const live = sessions.filter((a) => isActiveSession(a, now, sessionActiveWithinMinutes)).filter((a) => {
     const slug = parseSessionSlug(a.name);
     return slug ? slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number)
       : (a.repo ? repoKeyForSlug(a.repo) === repoKeyForSlug(pr.repo) : repoKeyForSlug(pr.repo) === 'we');
