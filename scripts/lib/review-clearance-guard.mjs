@@ -20,7 +20,9 @@ const SWAP_SKEW_MS = 10_000;
 const enabled = setting => (typeof setting === 'string' ? setting : setting?.value) === 'on';
 const names = labels => Array.isArray(labels) ? labels.map(l => typeof l === 'string' ? l : l?.name) : [];
 const at = c => c?.createdAt ?? c?.created_at;
-const starts = (c, marker) => typeof c?.body === 'string' && c.body.split(/\r?\n/)[0].startsWith(marker);
+// Leading whitespace skipped, as the machine-note shapes skip it (`^\s*`): a restoration heading under a blank first
+// line is still a restoration heading, and gets the exact-shape check (PR #5237 round 10, self-review).
+const starts = (c, marker) => typeof c?.body === 'string' && c.body.trimStart().split(/\r?\n/)[0].startsWith(marker);
 const sameHead = (record, prHead, refHead) => /^[0-9a-f]{40}$/.test(record?.sha ?? '') && record.sha === prHead && record.sha === refHead;
 const jobIdOf = row => Number(/\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const failing = row => FAILING_CONCLUSIONS.includes(String(row?.conclusion ?? row?.state).toLowerCase());

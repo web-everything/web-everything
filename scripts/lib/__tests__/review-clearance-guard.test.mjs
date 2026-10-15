@@ -246,6 +246,10 @@ describe('#5193 review clearance', () => {
     ['a whole re-arm with a revocation in the blank line', rearmBody.replace('\n\n', '\nREVOKED\n')],
     ['a prevention notice marker then revocation', `<!-- approval-prevention-filed:${head} -->\nI revoke approval; do not restore.`],
     ['a whole prevention notice with a revocation after it', `${preventionNote}\n\nI revoke approval; do not restore.`],
+    // Self-review: a leading blank line or space skipped the restoration note's exact-shape check (read as a machine note).
+    ['a restoration heading under a blank first line', '\n🔔 conveyor — review clearance restored (no push since the clearance)\n\nI revoke approval; do not restore.'],
+    ['a restoration heading after a leading space', ' 🔔 conveyor — review clearance restored (no push since the clearance)\n\nI revoke approval; do not restore.'],
+    ['a re-arm heading under a blank first line', `\n${REARM_COMMENT_MARKER}\n\nI revoke approval; do not restore.`],
   ];
   it.each(rearmPastes)('does not restore over a pasted re-arm followed by an operator revocation (%s)', (_kind, body) => {
     for (const login of ['chalbert', 'web-everything[bot]']) {
