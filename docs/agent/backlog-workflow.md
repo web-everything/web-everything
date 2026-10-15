@@ -1292,7 +1292,7 @@ scope holds, sizing, clearance, stamp staleness and the queue order all apply as
 
 **Not in this feature: verified operator authority.** An attributed operator instruction record, gating
 operator-task treatment on it, an explicit `priority: P0..P4` that jumps the build queue, and operator-aware
-prepare/queue/probation admission are card #xqqmw6g. Until it lands, `operatorTask: true` is card
+prepare/queue/probation admission are card #6168. Until it lands, `operatorTask: true` is card
 frontmatter any card author can write, so it unlocks nothing beyond the filing stamp above and the report step below (which also forces the full
 delivery-agent route).
 
@@ -1311,7 +1311,7 @@ now, see above), and `--report`.
 (a step that never runs is not recorded), the standards gate still checks the fields on a hand-edited card,
 and `planOperatorPostBuild` never turns them into brief steps, whatever the card, settings or policy leaves say. They run commands named by card frontmatter, which any card
 author can write. Turning them back on waits on verified operator-task
-authority (#xqqmw6g). Only `--report`
+authority (#6168). Only `--report`
 currently adds a step.
 
 These optional frontmatter fields drive the generated build brief after `open-pr`: load and prove edge
