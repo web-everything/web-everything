@@ -2519,14 +2519,18 @@ function assignmentValue(raw, vars, home) {
 const ODD_BLANK = /[^\S \t\n]/g;
 const OPAQUE_BLANK = String.fromCharCode(0xe000);
 
-// A statement's shell words — `raw` keeps the lexical spelling (for expansion), `text` is after quote removal
-// (what a builtin sees as an option or a name). Redirects and their operands are dropped, and so is a `#`
-// comment (a word that begins with an unquoted `#`) with everything after it.
+// A statement's shell tokens — `raw` keeps the lexical spelling (for expansion), `text` is after quote removal
+// (what a builtin sees as an option or a name). Redirect operators and their operands stay in the stream,
+// marked `redir`, so the substitution scan sees every character (`${Y:-<}`, `$(cat <f)`); `parseStatement`
+// drops the top-level ones. A `#` comment (a word that begins with an unquoted `#`) is cut with everything after.
 function shellWords(stmt) {
-  const words = shellTokens(String(stmt).replace(ODD_BLANK, OPAQUE_BLANK), { preserveQuotes: true })
-    .filter((t, i, tokens) => !t.op && !tokens[i - 1]?.op)
-    .map((t) => ({ raw: t.text, text: shellTokens(t.text)[0]?.text ?? '' }));
-  const comment = words.findIndex((w) => w.raw.startsWith('#'));
+  const tokens = shellTokens(String(stmt).replace(ODD_BLANK, OPAQUE_BLANK), { preserveQuotes: true });
+  const words = tokens.map((t, i) => ({
+    raw: t.text,
+    text: t.op ? t.text : shellTokens(t.text)[0]?.text ?? '',
+    redir: t.op || !!tokens[i - 1]?.op,
+  }));
+  const comment = words.findIndex((w) => !w.redir && w.raw.startsWith('#'));
   return comment < 0 ? words : words.slice(0, comment);
 }
 
@@ -2554,7 +2558,8 @@ const ARITH_ASSIGN_OP = /(?:<<|>>|[-+*/%&^|])?=(?!=)/g;
 function arithmeticOps(expr) {
   if (expr.length > LET_MAX_CHARS) return [CLEAR_ALL];
   if (/[$`]/.test(expr)) {
-    if (/[$}\)`]\w*\s*(?:\+\+|--)|(?:\+\+|--)\s*[$`]/.test(expr)) return [CLEAR_ALL]; // `$N++`, `++${N}`
+    // an increment whose operand is not a plain name: `$N++`, `${N}X++`, `$N[0]++`, `"$N"++`, `++${N}`
+    if (/[$}\])"'`]\w*\s*(?:\+\+|--)|(?:\+\+|--)\s*[$`"']/.test(expr)) return [CLEAR_ALL];
     for (const m of expr.matchAll(ARITH_ASSIGN_OP)) {
       if (m[0] === '=' && /[=!<>]/.test(expr[m.index - 1] ?? '')) continue; // `==`, `!=`, `<=`, `>=` compare
       let j = m.index;
@@ -2586,6 +2591,7 @@ function expandableText(stmt) {
     }
     if (c === '"') dq = !dq;
     else if (!dq && c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;
+    else if (dq && c === '(' && s[i + 1] === '(' && s[i - 1] !== '$') { out += '  '; i++; continue; } // only `$((` expands in quotes
     out += c;
   }
   return out;
@@ -2610,9 +2616,7 @@ function expansionOps(stmt) {
     else if (/^:(?![-+=?])/.test(m[3])) ops.push(...arithmeticOps(m[3].slice(1)));
   }
   count = 0;
-  const head = text.search(/\S/);
   for (let i = text.indexOf('(('); i >= 0; i = text.indexOf('((', i + 2)) {
-    if (text[i - 1] !== '$' && i !== head) continue;            // `$((…))`, or a `((…))` command; else literal
     if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
     let depth = 0;
     let j = i + 2;
@@ -2637,6 +2641,7 @@ function scanSubstitutions(raw, stack) {
     const c = raw[i];
     const top = stack[stack.length - 1];
     if (c === '\\') { i++; continue; }
+    if (c === '$' && raw[i + 1] === '$') { i++; continue; }    // `$$` is the shell's pid, not an opener
     if (c === '$' && EXPANSION_CLOSER[raw[i + 1]]) { stack.push(EXPANSION_CLOSER[raw[i + 1]]); i++; continue; }
     if (top === '"') {
       if (c === '"') stack.pop();
@@ -2662,9 +2667,36 @@ function scanSubstitutions(raw, stack) {
 // that leaves a substitution open, the words cannot be trusted: `opaque` lists the names they could assign, and
 // `cd` says the statement may itself be a cd (a `cd` nested inside the open substitution is not). `invalid`
 // marks a statement bash rejects before running.
+// Is `raw` made only of unquoted expansions (`$N`, `$1`, `$@`, `${…}`, `$(…)`, backticks), so that it can
+// expand to no word at all? Literal text or any quoting means a word survives. Linear; an oversized word is
+// assumed to be able to vanish.
+function mayExpandToNothing(raw) {
+  if (raw.length > LET_MAX_CHARS) return true;
+  for (let i = 0; i < raw.length;) {
+    if (raw[i] === '`') {
+      const close = raw.indexOf('`', i + 1);
+      if (close < 0) return true;
+      i = close + 1;
+    } else if (raw[i] !== '$') return false;
+    else if (/[A-Za-z_]/.test(raw[i + 1] ?? '')) { i += 2; while (/\w/.test(raw[i] ?? '')) i++; }
+    else if (/[0-9@*#?$!-]/.test(raw[i + 1] ?? '')) i += 2;
+    else if (raw[i + 1] === '{' || raw[i + 1] === '(') {
+      const stack = [];
+      const start = i;
+      for (; i < raw.length; i++) {
+        if (raw[i] === '{' || raw[i] === '(') stack.push(raw[i]);
+        else if ((raw[i] === '}' || raw[i] === ')') && stack.pop() && !stack.length) { i++; break; }
+      }
+      if (stack.length || i === start) return true;
+    } else return false;
+  }
+  return true;
+}
+
 function parseStatement(tokens) {
-  // Re-join the words tokenizing split inside a substitution (`X=$(echo a b)` is ONE shell word).
-  const words = [];
+  // Re-join the words tokenizing split inside a substitution (`X=$(echo a b)` is ONE shell word). Redirect
+  // tokens are scanned too (inside a substitution they are part of its text), then dropped at the top level.
+  let words = [];
   const firstToken = [];                                        // words[n] starts at tokens[firstToken[n]]
   const stack = [];
   let open = -1;
@@ -2672,7 +2704,7 @@ function parseStatement(tokens) {
   let cdAfterOpen = false;
   for (const [t, w] of tokens.entries()) {
     if (broken) {
-      if (w.text === 'cd') cdAfterOpen = true;
+      if (w.text === 'cd' && !w.redir) cdAfterOpen = true;
       words.push(w);
       firstToken.push(t);
       continue;
@@ -2681,7 +2713,7 @@ function parseStatement(tokens) {
     if (!scanSubstitutions(w.raw, stack)) broken = true;
     if (inside) {
       const prev = words[words.length - 1];
-      words[words.length - 1] = { raw: `${prev.raw} ${w.raw}`, text: `${prev.text} ${w.text}` };
+      words[words.length - 1] = { raw: `${prev.raw} ${w.raw}`, text: `${prev.text} ${w.text}`, redir: prev.redir };
     } else {
       words.push(w);
       firstToken.push(t);
@@ -2693,12 +2725,14 @@ function parseStatement(tokens) {
   if (open >= 0) {
     const head = parseStatement(words.slice(0, open));
     // every token from the opener on, not the re-joined words: a `Z=…` glued into the open word still counts
-    const opaque = tokens.slice(firstToken[open]).map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
+    const opaque = tokens.slice(firstToken[open]).filter((w) => !w.redir)
+      .map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
     // bare prefix assignments before the open word may be temporary (it is the command) or persist (it expands
     // to nothing): unknown either way
     if (!head.cmd.length) opaque.push(...head.prefix.map((w) => assignmentOp(w).name));
     return { ...head, prefix: head.cmd.length ? head.prefix : [], opaque, cd: head.cmd[0]?.text === 'cd' || cdAfterOpen };
   }
+  words = words.filter((w) => !w.redir);
   let i = 0;
   for (;;) {
     const r = words[i]?.raw;
@@ -2780,8 +2814,8 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
   if (opaque) return [...statementBindings({ invalid, prefix, cmd }), ...opaque.map(forget)];
   if (invalid) return [];
   if (!cmd.length) return prefix.map(assignmentOp);              // bare assignments persist, in order
-  // A command word that is one bare expansion may expand to nothing, and then the prefix assignments persist.
-  if (/^(?:\$[A-Za-z_]\w*|\$\{[^]*\}|\$\([^]*\)|`[^]*`)$/.test(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
+  // A command word made only of unquoted expansions may expand to nothing, and then the prefix assignments persist.
+  if (mayExpandToNothing(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
   const name = cmd[0].text;
   const args = cmd.slice(1);
   const names = (ws) => ws.map((w) => w.text).filter((t) => VALID_NAME.test(t)).map((t) => t.match(NAME_PREFIX)[0]);

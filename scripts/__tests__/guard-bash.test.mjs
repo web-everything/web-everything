@@ -773,14 +773,20 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     for (const c of ['$HOME/bin/tool', "$'true'", '"$CMD"x']) {
       expect(at(`X=/protected/clone; X=/etc ${c} f; cd "$X"`), c).toBe('/protected/clone');
     }
-    for (const c of ['$CMD', '${CMD}', '$(echo true)', '`echo true`']) {
+    for (const c of ['$CMD', '${CMD}', '$(echo true)', '`echo true`', '$@', '$*', '$1', '$!', '$A$B', '$A${B}', '${A}$B', '$A$(true)', '$(true)$A', '`true`$A']) {
       expect(at(`X=/protected/clone; X=/etc ${c} f; cd "$X"`), c).toBe(REPORTED);
+    }
+    // a redirect inside `${…}` / `$[…]` / `$(…)` is part of the expansion, and `$$` opens nothing
+    for (const v of ['${Y:-<}', '${Y:-a<b}', '${Y:->}', '${Y:-<none>}', '${Y:-a >b}', '$[1>0]', '${A[i<2]}', '$(cat <f)', '$$', '$${']) {
+      expect(at(`X=${v} cd /protected/clone; cd sub`), v).toBe('/protected/clone');
     }
   });
   it('arithmetic inside `${…}` and nested `((…))` forgets what it assigns; quoting is read in context', () => {
     for (const stmt of [
       ': ${a[LANE=0]}', 'Z=abc; : ${Z:LANE=1}', '((LANE=(0)))', 'echo "a\'b" $((LANE=0)) "c\'d"', "echo \\' $((LANE=0)) \\'",
       'let ${N:-LANE}=0', 'let "$(echo LANE)=0"', 'let "${!N}=0"', 'let ${N}LANE=0', '(( ${N}X = 0 ))', 'let "$N++"',
+      ': $(( $N[0]++ ))', ': $(( $N[0]-- ))', ': $(( ${N}[0]++ ))', 'let "$N[0]++"', '(( "$N"++ ))',
+      '! ((LANE=0))', 'time ((LANE=0))', '{ ((LANE=0))', 'if ((LANE=0))', 'while ((LANE=0))',
     ]) {
       expect(at(`LANE=/protected/clone; ${stmt}; cd "$LANE"`), stmt).toBe(REPORTED);
     }
