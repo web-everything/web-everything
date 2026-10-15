@@ -8,6 +8,7 @@
  * WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS, WE_FINISHED_CI_CACHE_CHECK_RUNS_REVALIDATE_MS.
  * WE_FINISHED_CI_CACHE_DIR overrides ~/.claude/conveyor/finished-ci-cache (leading ~ expands).
  * All cache IO is best effort and injectable via options.fs; no cache failure reaches a gh caller.
+ * Entries are scoped to a hash of explicit credentials; stored-login and dynamically routed auth stay live.
  */
 import * as nodeFs from 'node:fs';
 import { homedir } from 'node:os';
@@ -42,6 +43,14 @@ export function finishedCiCacheDir(env = process.env) {
   const raw = String(env.WE_FINISHED_CI_CACHE_DIR || '').trim();
   return raw ? resolve(raw.startsWith('~') ? join(home, raw.slice(1)) : raw) : join(home, '.claude', 'conveyor', 'finished-ci-cache');
 }
+/** An irrelevant token must not vouch for a stored login on a different host. Never persist credentials. */
+export function finishedCiAuthScope(env = process.env) {
+  const host = String(env.GH_HOST || 'github.com').toLowerCase();
+  const keys = host === 'github.com' || host.endsWith('.ghe.com')
+    ? ['GH_TOKEN', 'GITHUB_TOKEN'] : ['GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'];
+  const token = env[keys[0]] || env[keys[1]];
+  return token ? createHash('sha256').update(String(token)).digest('hex') : null;
+}
 export function classifyFinishedCiRead(args) {
   if (!Array.isArray(args) || args[0] !== 'api' || typeof args[1] !== 'string') return null;
   const m = /^\/?repos\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?:actions\/jobs\/(\d+)\/logs|actions\/runs\/(\d+)\/jobs(?:\?[^\s]*)?|commits\/([a-fA-F0-9]{40})\/check-runs(?:\?[^\s]*)?)$/.exec(args[1]);
@@ -71,10 +80,11 @@ export function finishedCiProofArgs(cls) {
 function context(o) {
   const env = o.env || process.env;
   return { settings: o.settings || resolveFinishedCiCacheSettings(env), dir: o.dir || finishedCiCacheDir(env),
+    authScope: o.authScope === undefined ? finishedCiAuthScope(env) : o.authScope,
     fs: o.fs || nodeFs, nowMs: o.nowMs ?? Date.now() };
 }
-function filename(cls) {
-  return `${cls.kind}-${cls.id}-${createHash('sha256').update(cls.key).digest('hex').slice(0, 16)}.json.gz`;
+function filename(cls, authScope) {
+  return `${cls.kind}-${cls.id}-${createHash('sha256').update(authScope + '\0' + cls.key).digest('hex').slice(0, 16)}.json.gz`;
 }
 /** Capture before the proof/payload reads. A rerun changes this even if an older reader stores later. */
 export function finishedCiCacheGeneration(o = {}) {
@@ -87,14 +97,14 @@ export function finishedCiCacheGeneration(o = {}) {
 }
 export function lookupFinishedCi(cls, o = {}) {
   try {
-    const { settings, dir, fs, nowMs } = context(o);
-    if (!settings.enabled || !cls || cls.kind === 'check-runs') return null;
+    const { settings, dir, fs, nowMs, authScope } = context(o);
+    if (!settings.enabled || !authScope || !cls || cls.kind === 'check-runs') return null;
     fs.chmodSync(dir, 0o700);
-    const path = join(dir, filename(cls));
+    const path = join(dir, filename(cls, authScope));
     fs.chmodSync(path, 0o600);
     const entry = JSON.parse(gunzipSync(fs.readFileSync(path)).toString('utf8'));
     // Old entries may contain logs captured before completion, or collections without closure proof.
-    if (entry.version !== 2 || entry.key !== cls.key || !Number.isFinite(entry.storedAtMs) || typeof entry.stdout !== 'string') return null;
+    if (entry.version !== 3 || entry.authScope !== authScope || entry.key !== cls.key || !Number.isFinite(entry.storedAtMs) || typeof entry.stdout !== 'string') return null;
     if (cls.kind === 'run-jobs' && (entry.runGeneration == null || entry.runGeneration !== finishedCiCacheGeneration(o))) return null;
     const ttl = cls.kind === 'run-jobs' ? settings.runJobsRevalidateMs : cls.kind === 'check-runs' ? settings.checkRunsRevalidateMs : 0;
     if (ttl > 0 && nowMs - entry.storedAtMs >= ttl) return null;
@@ -125,14 +135,14 @@ export function storeFinishedCi(cls, stdoutBuffer, o = {}) {
   let tmp; let fs;
   try {
     const c = context(o); fs = c.fs;
-    if (!c.settings.enabled || !cls) return;
+    if (!c.settings.enabled || !c.authScope || !cls) return;
     const runGeneration = cls.kind === 'run-jobs'
       ? o.runGeneration === undefined ? finishedCiCacheGeneration(o) : o.runGeneration : null;
     if (cls.kind === 'run-jobs' && (runGeneration == null || runGeneration !== finishedCiCacheGeneration(o))) return;
     fs.mkdirSync(c.dir, { recursive: true, mode: 0o700 });
     fs.chmodSync(c.dir, 0o700);
-    const path = join(c.dir, filename(cls)); tmp = `${path}.${randomUUID()}.tmp`;
-    const data = gzipSync(Buffer.from(JSON.stringify({ version: 2, runGeneration, key: cls.key, storedAtMs: c.nowMs, stdout: Buffer.from(stdoutBuffer).toString('base64') })));
+    const path = join(c.dir, filename(cls, c.authScope)); tmp = `${path}.${randomUUID()}.tmp`;
+    const data = gzipSync(Buffer.from(JSON.stringify({ version: 3, authScope: c.authScope, runGeneration, key: cls.key, storedAtMs: c.nowMs, stdout: Buffer.from(stdoutBuffer).toString('base64') })));
     fs.writeFileSync(tmp, data, { mode: 0o600, flag: 'wx' }); fs.renameSync(tmp, path); fs.utimesSync(path, new Date(c.nowMs), new Date(c.nowMs));
     evict(c);
   } catch { /* Miss/skip only. */ }

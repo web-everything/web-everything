@@ -176,10 +176,10 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 
 import { tryAcquireSlot, releaseOwnedSlot, admissionStatus, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
@@ -195,7 +195,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { resolveFinishedCiCacheSettings, classifyFinishedCiRead, finishedCiStorable, finishedCiProofArgs, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
+import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiStorable, finishedCiProofArgs, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
@@ -1357,26 +1357,34 @@ const shimProbeCache = new Map();
  * Does `bin` (a bare name resolved on `env.PATH`, or a path) run the WE App shim? The shim chooses the credential
  * per call, so a caller without its own token cannot label the bucket (see runGhSync's `shimRouted`). Reads at most
  * 512 bytes once per resolved file per process. Never throws: anything unreadable is "not a shim" (the old gate).
+ * `fresh` is the cache's stricter auth check: follow executable PATH candidates, re-read the marker, and treat
+ * an unknown/unreadable executable as a possible shim, so it cannot authorize a cache hit.
  */
-export function ghBinIsWeShim(bin = 'gh', env = process.env) {
+export function ghBinIsWeShim(bin = 'gh', env = process.env, { fresh = false } = {}) {
   try {
     let file = null;
     if (String(bin).includes('/')) file = String(bin);
     else {
       for (const dir of String((env && env.PATH) || '').split(delimiter)) {
-        if (dir && existsSync(join(dir, bin))) { file = join(dir, bin); break; }
+        if (!dir) continue;
+        const candidate = join(dir, bin);
+        if (fresh) {
+          try { if (!statSync(candidate).isFile()) continue; accessSync(candidate, constants.X_OK); }
+          catch { continue; }
+        } else if (!existsSync(candidate)) continue;
+        file = candidate; break;
       }
     }
-    if (!file) return false;
-    if (shimProbeCache.has(file)) return shimProbeCache.get(file);
+    if (!file) return fresh;
+    if (!fresh && shimProbeCache.has(file)) return shimProbeCache.get(file);
     const fd = openSync(file, 'r');
     let head = '';
     try { const buf = Buffer.alloc(512); head = buf.subarray(0, readSync(fd, buf, 0, 512, 0)).toString('utf8'); } finally { closeSync(fd); }
     const yes = head.includes(WE_GH_SHIM_MARKER);
-    shimProbeCache.set(file, yes);
+    if (!fresh) shimProbeCache.set(file, yes);
     return yes;
   } catch {
-    return false;
+    return fresh;
   }
 }
 
@@ -1712,11 +1720,20 @@ function ghReadMemoHasFileInput(args) {
       && /=@/.test(arg)));
 }
 
-function finishedCiContext(throttle) {
+function finishedCiContext(throttle, childEnv, bin, cwd = process.cwd()) {
   const env = throttle.finishedCiCacheDir
     ? { ...(throttle.env || process.env), WE_FINISHED_CI_CACHE_DIR: throttle.finishedCiCacheDir }
     : throttle.env || process.env;
-  return { env, settings: resolveFinishedCiCacheSettings(env), nowMs: (throttle.now || Date.now)() };
+  const settings = resolveFinishedCiCacheSettings(env);
+  const nowMs = (throttle.now || Date.now)();
+  if (!settings.enabled) return { env, authScope: null, settings, nowMs };
+  const absCwd = resolve(cwd instanceof URL ? fileURLToPath(cwd) : cwd || process.cwd());
+  const probeBin = bin.includes('/') ? resolve(absCwd, bin) : bin;
+  const probeEnv = { ...childEnv, PATH: (childEnv.PATH || '').split(delimiter).map(path => resolve(absCwd, path)).join(delimiter) };
+  // A keychain login, routing fallback, or App shim can change credentials without changing the caller's env.
+  const dynamicAuth = (throttle.personalRoute ?? resolvePersonalRouteEnabled(env))
+    || throttle.shimRouted || (!bin.includes('/') && !childEnv.PATH) || ghBinIsWeShim(probeBin, probeEnv, { fresh: true });
+  return { env, authScope: dynamicAuth ? null : finishedCiAuthScope(childEnv), settings, nowMs };
 }
 function logFinishedCiHit(args, cls, throttle, env) {
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(throttle.repo || process.cwd(), env);
@@ -1763,8 +1780,9 @@ function logFinishedCiHit(args, cls, throttle, env) {
 export function runGhSync(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
-  const cache = finishedCiContext(throttle);
-  const cls = cache.settings.enabled && !throttle.exec && execOpts.input === undefined ? classifyFinishedCiRead(args) : null;
+  const childEnv = execOpts.env || process.env;
+  const cache = finishedCiContext(throttle, childEnv, throttle.bin || 'gh', execOpts.cwd);
+  const cls = cache.settings.enabled && cache.authScope && !throttle.exec && execOpts.input === undefined ? classifyFinishedCiRead(args) : null;
   if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
   if (cls) {
     const hit = lookupFinishedCi(cls, cache);
@@ -2089,8 +2107,9 @@ export function execFileSyncThrottled(file, args, opts = {}) {
  * @returns {{status:number, stdout:Buffer, stderr:Buffer}}
  */
 export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bin = 'gh' } = {}) {
-  const cache = finishedCiContext(throttle);
-  const cls = cache.settings.enabled && !isGhLocalOnly(argv) ? classifyFinishedCiRead(argv) : null;
+  // With routing inactive the passthrough inherits process.env, even when throttle.env configures gates.
+  const cache = finishedCiContext(throttle, process.env, bin);
+  const cls = cache.settings.enabled && cache.authScope && !isGhLocalOnly(argv) ? classifyFinishedCiRead(argv) : null;
   if (cls?.kind === 'run-jobs') cache.runGeneration = finishedCiCacheGeneration(cache);
   if (cls) {
     const hit = lookupFinishedCi(cls, cache);

@@ -3,29 +3,36 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { classifyFinishedCiRead, finishedCiStorable, resolveFinishedCiCacheSettings,
+import { classifyFinishedCiRead, finishedCiAuthScope, finishedCiStorable, resolveFinishedCiCacheSettings,
   lookupFinishedCi, storeFinishedCi, invalidateForWrite, finishedCiCacheDir } from '../finished-ci-cache.mjs';
 import { runGhSync, runGhCliPassthrough } from '../gh-throttle.mjs';
 
 const dirs = [];
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 const jobs = ['api', 'repos/o/r/actions/runs/123/jobs?per_page=100'];
 const checks = ['api', `repos/o/r/commits/${'a'.repeat(40)}/check-runs?per_page=100`];
 const log = ['api', 'repos/o/r/actions/jobs/456/logs'];
 function fixture(output = '{"total_count":1,"jobs":[{"status":"completed"}]}') {
   const dir = mkdtempSync(join(tmpdir(), 'finished-ci-')); dirs.push(dir);
   let time = Date.now();
+  const binDir = join(dir, 'bin'); mkdirSync(binDir);
+  writeFileSync(join(binDir, 'gh'), '#!/bin/sh\n', { mode: 0o700 });
+  vi.stubEnv('GH_TOKEN', 'ghs_ci_cache_fixture');
+  vi.stubEnv('GH_HOST', 'github.com');
+  vi.stubEnv('PATH', binDir);
   const env = { ...process.env, WE_UNDER_TEST: '1', WE_FINISHED_CI_CACHE_DIR: join(dir, 'cache'),
+    GH_TOKEN: 'ghs_ci_cache_fixture', PATH: binDir,
     WE_FINISHED_CI_CACHE: '1', WE_GH_PERSONAL_READS: '0', WE_GH_THROTTLE_COST_HEADERS: '1' };
   delete env.WE_GH_READ_MEMO_DIR;
   const spawn = vi.fn((_bin, args, opts) => {
     const text = /\/(456|123)$/.test(args[1]) ? '{"status":"completed"}' : output;
     return { status: 0, stdout: opts.encoding ? text : Buffer.from(text), stderr: Buffer.alloc(0) };
   });
-  const throttle = { env, spawn, lockRoot: join(dir, 'locks'), logPath: join(dir, 'calls.jsonl'),
+  const throttle = { env, spawn, personalRoute: false, lockRoot: join(dir, 'locks'), logPath: join(dir, 'calls.jsonl'),
     caller: 'ci-cache-test', now: () => time, maxAttempts: 1, cap: 2, budgetPerMin: 10000, writeBudgetPerMin: 10000 };
-  return { dir, env, spawn, throttle, opts: { encoding: 'utf8', throttle },
+  return { dir, env, spawn, throttle, opts: { encoding: 'utf8', env, throttle },
     advance: ms => { time += ms; }, now: () => time,
     cacheOpts: () => ({ env, nowMs: time, settings: resolveFinishedCiCacheSettings(env) }),
     files: () => { try { return readdirSync(env.WE_FINISHED_CI_CACHE_DIR).filter(n => n.endsWith('.gz')); } catch { return []; } },
@@ -92,6 +99,100 @@ describe('finished CI cache (card 309)', () => {
     expect(call()).toBe('log bytes\n'); f.advance(999999999); expect(call()).toBe('log bytes\n');
     expect(f.spawn).toHaveBeenCalledTimes(2); expect(f.spawn.mock.calls[0][1]).toEqual(['api', 'repos/o/r/actions/jobs/456']);
   });
+  it.each([false, true])('never serves another credential its cached CI data (CLI=%s)', cli => {
+    for (const args of [log, jobs]) {
+      const f = fixture(); const original = f.spawn.getMockImplementation();
+      f.spawn.mockImplementation((bin, argv, opts) => argv[1] === args[1]
+        ? { status: 0, stdout: Buffer.from(argv[1] === log[1] ? opts.env.GH_TOKEN
+          : JSON.stringify({ total_count: 1, jobs: [{ status: 'completed', name: opts.env.GH_TOKEN }] })), stderr: Buffer.alloc(0) }
+        : original(bin, argv, opts));
+      const call = () => String(cli ? runGhCliPassthrough(args, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(args, f.opts));
+      const first = call(); expect(call()).toBe(first);
+      f.env.GH_TOKEN = 'ghs_other_installation';
+      if (cli) vi.stubEnv('GH_TOKEN', f.env.GH_TOKEN);
+      const second = call(); expect(second).toContain('ghs_other_installation');
+      expect(second).not.toBe(first); expect(call()).toBe(second);
+      expect(f.files()).toHaveLength(2);
+      f.env.GH_TOKEN = 'ghs_ci_cache_fixture';
+      if (cli) vi.stubEnv('GH_TOKEN', f.env.GH_TOKEN);
+      expect(call()).toBe(first);
+      expect(f.files().join(' ')).not.toContain('ghs_');
+    }
+  });
+  it('scopes synchronous cache entries to the child environment, not throttle configuration', () => {
+    const f = fixture('first identity'); runGhSync(log, f.opts);
+    const opts = { ...f.opts, env: { ...f.env, GH_TOKEN: 'ghs_different_child' } };
+    f.spawn.mockImplementation((_bin, args) => ({ status: 0,
+      stdout: Buffer.from(args[1].endsWith('/456') ? '{"status":"completed"}' : 'second identity'), stderr: Buffer.alloc(0) }));
+    expect(runGhSync(log, opts)).toBe('second identity');
+  });
+  it.each([false, true])('tracks inherited process credentials despite unchanged throttle env (CLI=%s)', cli => {
+    const f = fixture();
+    f.spawn.mockImplementation((_bin, args, opts) => ({ status: 0,
+      stdout: Buffer.from(args[1].endsWith('/456') ? '{"status":"completed"}' : opts.env.GH_TOKEN), stderr: Buffer.alloc(0) }));
+    const call = () => String(cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout
+      : runGhSync(log, { encoding: 'utf8', throttle: f.throttle }));
+    expect(call()).toBe('ghs_ci_cache_fixture');
+    vi.stubEnv('GH_TOKEN', 'ghs_inherited_other');
+    expect(call()).toBe('ghs_inherited_other');
+    expect(call()).toBe('ghs_inherited_other');
+  });
+  it.each([false, true])('keeps stored-login and dynamically routed auth live (CLI=%s)', cli => {
+    for (const dynamic of [false, true]) {
+      const f = fixture('fresh log');
+      if (dynamic) { f.throttle.personalRoute = true; f.throttle.personalToken = 'personal_fixture'; }
+      else for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) {
+        delete f.env[key]; vi.stubEnv(key, undefined);
+      }
+      const call = () => cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(log, f.opts);
+      call(); call(); expect(f.files()).toHaveLength(0);
+    }
+  });
+  it('uses the applicable explicit token and its precedence as the auth scope', () => {
+    const primary = finishedCiAuthScope({ GH_TOKEN: 'first' });
+    expect(finishedCiAuthScope({ GITHUB_TOKEN: 'first' })).toBe(primary);
+    expect(finishedCiAuthScope({ GH_TOKEN: 'first', GITHUB_TOKEN: 'second' })).toBe(primary);
+    expect(finishedCiAuthScope({ GH_TOKEN: 'second' })).not.toBe(primary);
+    expect(finishedCiAuthScope({ GH_ENTERPRISE_TOKEN: 'first' })).toBeNull();
+    expect(finishedCiAuthScope({ GH_HOST: 'enterprise.example', GH_TOKEN: 'first' })).toBeNull();
+    expect(finishedCiAuthScope({ GH_HOST: 'enterprise.example', GH_ENTERPRISE_TOKEN: 'first' })).toBe(primary);
+    expect(finishedCiAuthScope({ GH_HOST: 'tenant.ghe.com', GH_TOKEN: 'first' })).toBe(primary);
+  });
+  it('rejects payloads whose credential scope does not match their filename', () => {
+    const f = fixture(); const cls = classifyFinishedCiRead(log);
+    storeFinishedCi(cls, Buffer.from('old identity'), f.cacheOpts());
+    const path = join(f.env.WE_FINISHED_CI_CACHE_DIR, f.files()[0]);
+    const entry = JSON.parse(gunzipSync(readFileSync(path)));
+    entry.authScope = finishedCiAuthScope({ GH_TOKEN: 'other' });
+    writeFileSync(path, gzipSync(JSON.stringify(entry)));
+    expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
+    expect(JSON.stringify(entry)).not.toContain('ghs_ci_cache_fixture');
+  });
+  it('bypasses a cwd-relative App shim that can select another credential', () => {
+    const f = fixture();
+    writeFileSync(join(f.dir, 'gh'), '# AUTO-GENERATED by we:scripts/lib/gh-app-shim.mjs\n');
+    const opts = { ...f.opts, cwd: f.dir, throttle: { ...f.throttle, bin: './gh' } };
+    runGhSync(log, opts); runGhSync(log, opts); expect(f.files()).toHaveLength(0);
+  });
+  it.each(['1', '0'])('preserves file URL cwd support with cache enabled=%s', enabled => {
+    const f = fixture('log bytes'); f.env.WE_FINISHED_CI_CACHE = enabled;
+    expect(runGhSync(log, { ...f.opts, cwd: pathToFileURL(f.dir + '/') })).toBe('log bytes');
+  });
+  it.each([false, true])('checks the executable PATH candidate and newly installed shims (CLI=%s)', cli => {
+    const f = fixture('original log');
+    const call = () => String(cli ? runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).stdout : runGhSync(log, f.opts));
+    expect(call()).toBe('original log'); expect(f.files()).toHaveLength(1);
+    // Replacing a previously plain executable must not reuse a cached negative shim probe.
+    writeFileSync(join(f.env.PATH, 'gh'), '# AUTO-GENERATED by we:scripts/lib/gh-app-shim.mjs\n');
+    f.spawn.mockImplementation((_bin, args) => ({ status: 0,
+      stdout: Buffer.from(args[1].endsWith('/456') ? '{"status":"completed"}' : 'new identity log'), stderr: Buffer.alloc(0) }));
+    expect(call()).toBe('new identity log');
+    // execvp skips a non-executable namesake ahead of the real shim.
+    const shadow = join(f.dir, 'shadow'); mkdirSync(shadow);
+    writeFileSync(join(shadow, 'gh'), 'not executable', { mode: 0o600 });
+    f.env.PATH = shadow + ':' + f.env.PATH; vi.stubEnv('PATH', f.env.PATH);
+    expect(call()).toBe('new identity log');
+  });
   it.each([false, true])('failed/incomplete proof preserves output without storage (CLI=%s)', cli => {
     for (const failure of ['in_progress', 'failure']) {
       const f = fixture('logs');
@@ -147,7 +248,7 @@ describe('finished CI cache (card 309)', () => {
     ['api', '--field=enable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
     ['api', '-fenable_debug_logging=true', 'repos/o/r/actions/runs/123/rerun'],
     ['run', 'rerun'],
-  ])('invalidates run jobs and check-runs for successful rerun %j', args => {
+  ].map(args => ({ args })))('invalidates run jobs and check-runs for successful rerun $args', ({ args }) => {
     for (const cli of [false, true]) {
       const f = fixture();
       storeFinishedCi(classifyFinishedCiRead(jobs), Buffer.from('jobs'), f.cacheOpts());
@@ -226,7 +327,7 @@ describe('finished CI cache (card 309)', () => {
   it('preserves binary output, misses corrupt gzip, and refreshes LRU mtime', () => {
     const f = fixture(); const cls = classifyFinishedCiRead(log); const bytes = Buffer.from([0, 255, 128, 10]);
     storeFinishedCi(cls, bytes, f.cacheOpts()); f.advance(1000);
-    expect(runGhSync(log, { throttle: f.throttle })).toEqual(bytes);
+    expect(runGhSync(log, { env: f.env, throttle: f.throttle })).toEqual(bytes);
     const path = join(f.env.WE_FINISHED_CI_CACHE_DIR, f.files()[0]);
     expect(statSync(path).mtimeMs).toBeCloseTo(f.now(), 0);
     writeFileSync(path, 'bad gzip'); expect(lookupFinishedCi(cls, f.cacheOpts())).toBeNull();
