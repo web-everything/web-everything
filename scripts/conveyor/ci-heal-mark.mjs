@@ -164,7 +164,7 @@ export function countChargeableCiHealComments(comments, { restore = true, onlyRe
 /**
  * we:scripts/conveyor/ci-heal-mark.mjs#CI_HEAL_ROUND_CAP — the durable CI-heal attempt cap `ci-red` binds on
  * (multi-repo slice 7). Mirrors `we:scripts/conveyor/tick-core.mjs#DEFAULT_CI_HEAL_RETRY_CAP` (3), which stays its own
- * copy; `tick-core.test.mjs` pins that copy so a drift fails loud in CI. Owned here (and re-exported by
+ * copy; `tick-core.test.mjs` pins the two equal so a drift fails loud in CI. Owned here (and re-exported by
  * `reconcile-core.mjs`, which no longer holds a copy) so reconcile, tick and landing read one policy source (#5968).
  */
 export const CI_HEAL_ROUND_CAP = 3;

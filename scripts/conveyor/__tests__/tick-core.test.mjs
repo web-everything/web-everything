@@ -47,7 +47,7 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
-import { buildCiHealComment } from '../ci-heal-mark.mjs';
+import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
@@ -2367,6 +2367,9 @@ describe('CI-heal reset refund through the tick evidence path (#5968)', () => {
     const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush], { policy: { resetOnFixHead: false } }) };
     expect(args).toMatchObject({ prCiHealCounts: { 99: 3 }, prCiHealRefunds: { 99: 0 } });
     expect(planCiHealSpawns({ ...args, ciHealAttempts: {} }).notes[0]).toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3 });
+  });
+  it("tick's own retry cap copy equals the shared reconcile cap", () => {
+    expect(DEFAULT_CI_HEAL_RETRY_CAP).toBe(CI_HEAL_ROUND_CAP);
   });
   it('the helper defaults to the environment policy and ignores non-array input', () => {
     expect(ciHealFloorFromComments([...threeBefore(), ...fixPush])).toEqual({ count: 0, refunded: 3 });
