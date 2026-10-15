@@ -1124,7 +1124,7 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 
 // Card 338: slot holder record, hold reaping and per-caller cap live in their own module (imported here, not
 // in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
-import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, sanitizeGhHolder } from './gh-throttle-holders.mjs';
+import { acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
 
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
@@ -1320,10 +1320,12 @@ export const MAX_BUDGET_BLOCK_MS = 65 * 60_000;
 export function classifyGhResource(args) {
   const a = Array.isArray(args) ? args.map(String) : [];
   // Not led by 'pr': multi-repo-scan reads any `['pr', …]` literal as gh argv and would flag it as repo-less.
-  const [cmd] = ghCommandPath(a);
+  const [first] = ghCommandWords(a);
+  const cmd = first?.word;
   if (['issue', 'pr', 'repo', 'project', 'search'].includes(cmd)) return 'graphql';
   if (cmd === 'api') {
-    const positional = a.slice(1).filter((t, i, arr) => !t.startsWith('-') && !(i > 0 && /^-(X|H|f|F|q|t|p)$|^--(method|header|field|raw-field|jq|template|input|preview|hostname|cache)$/.test(arr[i - 1])));
+    // The endpoint is the first positional past the `api` word itself, so leading flags (`-R o/r api graphql`) cannot shift it.
+    const positional = a.slice(first.at + 1).filter((t, i, arr) => !t.startsWith('-') && !(i > 0 && /^-(X|H|f|F|q|t|p)$|^--(method|header|field|raw-field|jq|template|input|preview|hostname|cache)$/.test(arr[i - 1])));
     return positional[0] === 'graphql' ? 'graphql' : 'core';
   }
   return 'core';

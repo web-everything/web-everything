@@ -31,7 +31,8 @@ const verbs = new Set('add archive cancel checks clone close comment create dele
 // next argument unless the flag is a known boolean, and `--` ends it. Above the leaf only help/version
 // are boolean (`-R/--repo` takes a value).
 const groupBools = { long: new Set(['help', 'version']), short: new Set(['h']) };
-function ghCommandWords(args) {
+/** The first two command words with their argv indices (`[{ word: 'pr', at: 2 }, …]`). */
+export function ghCommandWords(args) {
   const words = [];
   for (let i = 0; Array.isArray(args) && i < args.length && words.length < 2; i++) {
     const s = typeof args[i] === 'string' ? args[i] : '';
@@ -84,7 +85,8 @@ export function ghHolderMeta({ caller, args, pid = process.pid, ppid = process.p
 // The leaf's own flags are parsed by pflag over the args minus the command words: a value flag consumes
 // the next argument even when it starts with `--` (`pr comment --body --watch`), a boolean also takes
 // `--flag=<bool>`, the last occurrence wins, and a short group `-wR` ends at its first value flag.
-const watchLeaves = { 'pr checks': { long: new Set(['help', 'watch', 'fail-fast', 'required', 'web']), short: new Set(['h', 'w']) } };
+// A Map, not an object literal: a command path such as `constructor` or `__proto__` must not resolve to an inherited member.
+const watchLeaves = new Map([['pr checks', { long: new Set(['help', 'watch', 'fail-fast', 'required', 'web']), short: new Set(['h', 'w']) }]]);
 const pflagTrue = new Set(['1', 't', 'T', 'TRUE', 'true', 'True']);
 function pflagLongValue(args, bools, name) {
   let value;
@@ -109,7 +111,7 @@ export function isGhWatch(args) {
   const words = ghCommandWords(args);
   const path = words.map(w => w.word).join(' ');
   if (path === 'run watch') return true;
-  const leaf = watchLeaves[path];
+  const leaf = watchLeaves.get(path);
   if (!leaf) return false;
   const rest = args.filter((_, i) => !words.some(w => w.at === i));
   return pflagTrue.has(pflagLongValue(rest, leaf, 'watch'));

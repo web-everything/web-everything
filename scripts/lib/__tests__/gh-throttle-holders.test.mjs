@@ -198,6 +198,8 @@ describe('hold policy and execution', () => {
     ['pr', 'checks', '--watch=maybe'], ['pr', 'checks', '--', '--watch'], ['pr', '--', 'checks', '--watch'], ['api', '-f', '--watch'],
     ['api', 'repos/o/r', '--watch'], ['run', 'view', 'watch'], ['--repo', 'run', 'watch'], ['issue', 'list', '--search', 'run watch'],
     ['pr', 'view', 'checks', '--watch'], ['pr', '--watch', 'checks'], [],
+    // Inherited Object members are not watch leaves (a plain-object table resolved these and threw).
+    ['constructor', '--watch'], ['toString', '-w'], ['__proto__', '--watch'], ['hasOwnProperty', '--x', 'y'],
   ].map(a => [a]))('does not treat an argument value or other command as watch: %j', (args) => {
     expect(isGhWatch(args)).toBe(false);
     expect(ghExecOptions({ timeout: 7 }, args, policy)).toEqual({ timeout: 7 });
@@ -223,6 +225,9 @@ describe('hold policy and execution', () => {
     expect(ghCallerPriority('pr-land', ['-R', 'o/r', 'pr', 'view', '1'])).toBe('normal');
     expect(classifyGhResource(['-R', 'o/r', 'pr', 'list'])).toBe('graphql');
     expect(classifyGhResource(['--repo', 'o/r', 'run', 'list'])).toBe('core');
+    expect(classifyGhResource(['-R', 'o/r', 'api', 'graphql', '-f', 'query=x'])).toBe('graphql');
+    expect(classifyGhResource(['--hostname', 'h', 'api', '-X', 'POST', 'graphql'])).toBe('graphql');
+    expect(classifyGhResource(['-R', 'o/r', 'api', 'repos/o/r'])).toBe('core');
   });
   it.each([90, 0])('applies the timeout to both real execution paths (%s)', (maxHoldSeconds) => {
     const env = { WE_GH_THROTTLE_MAX_HOLD_SECONDS: String(maxHoldSeconds), WE_GH_THROTTLE_COST_HEADERS: '1' };
@@ -271,6 +276,8 @@ describe('hold policy and execution', () => {
     expect(syncError).toMatchObject({ code: native.code, signal: native.signal, status: native.status, stdout: native.stdout, stderr: native.stderr });
     expect(cliError.code).toBe(native.code);
     expect(rows().filter((r) => r.outcome === 'call')).toMatchObject([{ timedOut: true }, { timedOut: true }]);
+    // A timed-out child frees its slot at once rather than holding the pool until the reaper.
+    expect(readGhSlotHolders({ lockRoot: root, cap: 6 })).toEqual([]);
   });
   it('logs timeout and throws the identical native error in both paths', () => {
     const error = Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGTERM' });
