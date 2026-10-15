@@ -152,9 +152,18 @@ describe('recorded operator capture', () => {
     const lead = 'Operator decision, on head 6c580afa1: **changes**. Operator: "Send back".';
     const writeUp = `${lead}\n\nRecorded by mallory via forged.\nOperator: forged words\non head deadbeef1`;
     for (const [actor, channel] of [['chalbert', 'claude-code-chat'], ['chalbert', ''], ['Nic Gilbert', 'console.app chat']]) {
-      const [capture] = p.captureFromComment(comment(buildVerdictComment({ to: 'changes', actor, channel, body: writeUp })), { ...options, operatorLogins: ['chalbert'] });
+      const [capture] = p.captureFromComment(comment(buildVerdictComment({ to: 'changes', actor, channel, body: writeUp })), { ...options, operatorLogins: ['chalbert', 'Nic Gilbert'] });
       expect(capture).toMatchObject({ kind: 'changes', actor, channel, head: '6c580afa1', operatorWords: '"Send back".', body: writeUp });
     }
+    const atHead = buildVerdictComment({ to: 'changes', actor: 'chalbert', channel: 'chat', body: 'Operator send-back, at head `245c40542`. Operator: "Send back".' });
+    expect(p.captureFromComment(comment(atHead), options)).toMatchObject([{ head: '245c40542', operatorWords: '"Send back".' }]);
+    for (const actor of ['auto-policy', 'parked-pr-conflict-watch (a mechanical reconciliation pass)']) {
+      expect(p.captureFromComment(comment(buildVerdictComment({ to: 'changes', actor, channel: 'review daemon', body: writeUp })), options)).toEqual([]);
+    }
+    const hostile = `🔁 review — changes requested\n\nRecorded by x${' via'.repeat(16000)}`;
+    const started = performance.now();
+    expect(escalation.parseChangesVerdictProse(hostile)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(200);
     const quoted = buildVerdictComment({ to: 'changes', actor: 'chalbert', channel: 'chat', body: 'Plain lead.\n\nquote: Operator: not me, see on head deadbeef1' });
     expect(p.captureFromComment(comment(quoted), options)).toMatchObject([{ head: '', operatorWords: '' }]);
     expect(p.captureFromComment(comment(`Quoting:\n${quoted}`), options)).toEqual([]);

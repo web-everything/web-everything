@@ -1900,8 +1900,9 @@ export function parseClearedHumanProse(body) {
 
 // The `--to=changes` sibling of `CLEARED_HUMAN_PROSE_RE`: the heading and attribution `buildVerdictComment` renders
 // (`Recorded by <actor>[ via <channel>].`), anchored at byte 0 so a caller field, always appended later, cannot
-// satisfy it. The actor may contain spaces and the channel is optional, exactly as the producer allows.
-const CHANGES_VERDICT_PROSE_RE = /^🔁 review — changes requested\n\nRecorded by (.+?)(?: via (.+?))?\.(?=\n\n|$)/;
+// satisfy it. The actor may contain spaces and the channel is optional, exactly as the producer allows. The
+// attribution is matched as one line and split on ` via ` in code, so the match stays linear on hostile input.
+const CHANGES_VERDICT_PROSE_RE = /^🔁 review — changes requested\n\nRecorded by ([^\n]*?)\.(?=\n\n|$)/;
 
 /**
  * The attribution of ONE `--to=changes` verdict comment, for the precedent capture. Pure. `null` unless the body
@@ -1911,8 +1912,10 @@ const CHANGES_VERDICT_PROSE_RE = /^🔁 review — changes requested\n\nRecorded
  */
 export function parseChangesVerdictProse(body) {
   const m = CHANGES_VERDICT_PROSE_RE.exec(typeof body === 'string' ? body : '');
-  const actor = m ? m[1].trim() : '';
-  return actor ? { actor, channel: (m[2] ?? '').trim(), end: m.index + m[0].length } : null;
+  if (!m) return null;
+  const at = m[1].indexOf(' via ');
+  const actor = (at === -1 ? m[1] : m[1].slice(0, at)).trim();
+  return actor ? { actor, channel: at === -1 ? '' : m[1].slice(at + 5).trim(), end: m.index + m[0].length } : null;
 }
 
 /**

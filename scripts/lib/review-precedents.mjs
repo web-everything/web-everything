@@ -343,12 +343,14 @@ export function captureFromComment(comment, { operatorLogins = [], automationLog
   // Both verdict shapes are the producer's own (`parseChangesVerdict` / `parseClearance` are injected, normally
   // review-escalation's `parseChangesVerdictProse` / `parseClearedHumanProse`), so this reader cannot drift from
   // what review-set-label.mjs writes.
-  const recorded = parseChangesVerdict?.(body);
-  if (recorded && trusted(author, operatorLogins)) {
+  // The recorded actor must be an operator too: a mechanical pass (`auto-policy`, a conflict watch) posts send-backs
+  // under the operator's login, and those are not human decisions.
+  const recorded = trusted(author, operatorLogins) ? parseChangesVerdict?.(body) : null;
+  if (recorded && trusted(recorded.actor, operatorLogins)) {
     const text = body.slice(recorded.end).trim();
     // The head and the operator's words come from the write-up's lead paragraph only, never from later text.
     const lead = text.split(/\n(?:[ \t]*\n)+/)[0];
-    return [{ ...base, decision: 'changes', kind: 'changes', head: /\bon head ([0-9a-f]{7,40})\b/i.exec(lead)?.[1] ?? '',
+    return [{ ...base, decision: 'changes', kind: 'changes', head: /\b(?:on|at) head `?([0-9a-f]{7,40})\b/i.exec(lead)?.[1] ?? '',
       operatorWords: /\bOperator: ([^\r\n]+)/.exec(lead)?.[1] ?? '', body: text, actor: recorded.actor, channel: recorded.channel }];
   }
   const cleared = parseClearance?.(body);
