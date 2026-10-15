@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { basename } from 'node:path';
+
 /**
  * Git hardening for a process that runs git inside an AGENT-WRITABLE lane clone (we:backlog/5137 review).
  *
@@ -81,4 +84,69 @@ export function hardenLaneGitArgs(args) {
   if (a[0] === 'diff') return ['diff', ...['--no-ext-diff', '--no-textconv'].filter((f) => !a.includes(f)), ...a.slice(1)];
   if (a[0] === 'hash-object') return ['hash-object', ...(a.includes('--no-filters') ? [] : ['--no-filters']), ...a.slice(1)];
   return a;
+}
+
+/** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
+ *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
+ *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
+export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
+export const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
+export function riskyLaneConfig(listOutput) {
+  const parts = String(listOutput ?? '').split('\0');
+  const found = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const scope = parts[i];
+    if (scope !== 'local' && scope !== 'worktree') continue;
+    const [key, ...rest] = parts[i + 1].split('\n');
+    if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
+    else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
+  }
+  return found;
+}
+
+
+/**
+ * Repair only lane-owned unsafe config before hand-out. Origin is always retained; the
+ * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
+ */
+export function scrubRiskyLaneConfig(dir, {
+  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000 }),
+  log = () => {},
+} = {}) {
+  const removed = [], kept = [];
+  const opts = { cwd: dir };
+  try {
+    const parts = String(run([...LANE_CONFIG_LIST_ARGS], opts)).split('\0');
+    const sections = new Set();
+    for (let i = 0; i + 1 < parts.length; i += 2) {
+      const scope = parts[i], entry = parts[i + 1];
+      const [key] = riskyLaneConfig(`${scope}\0${entry}\0`);
+      if (!key) continue;
+      const remote = /^remote\.(.+)\.[^.]+$/i.exec(key);
+      if (remote?.[1].toLowerCase() === 'origin') { kept.push(key); continue; }
+      try {
+        if (remote) {
+          const section = `remote.${remote[1]}`, id = `${scope}:${section}`;
+          if (!sections.has(id)) {
+            if (scope === 'local') {
+              try { run(['remote', 'remove', remote[1]], opts); }
+              catch { run(['config', '--local', '--remove-section', section], opts); }
+            } else {
+              run(['config', '--worktree', '--remove-section', section], opts);
+            }
+            sections.add(id);
+          }
+        } else {
+          run(['config', `--${scope}`, '--unset-all', key], opts);
+        }
+        removed.push(key);
+      } catch (e) { kept.push(`${key} (${String(e?.message ?? e).split('\n')[0]})`); }
+    }
+  } catch (e) { kept.push(`config list failed (${String(e?.message ?? e).split('\n')[0]})`); }
+  if (removed.length || kept.length) {
+    try {
+      log(`${basename(dir)}: scrubbed unsafe git config keys (${removed.join(', ')}) before hand-out${kept.length ? `; kept (${kept.join(', ')})` : ''}`);
+    } catch { /* diagnostics must not interrupt acquisition */ }
+  }
+  return { removed, kept };
 }

@@ -178,7 +178,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
-import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -1864,8 +1864,14 @@ function logReclaimedAheadCommits(dir, branch, n) {
  *  report HEAD before→after across the whole acquire (one process only ever acquires one lane). */
 const acquireResetSnapshots = new Map();
 
+function scrubClaimedLaneConfig(dir, reason) {
+  const { removed, kept } = scrubRiskyLaneConfig(dir, { log });
+  if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+}
+
 function provisionClaimedLane(repo, chosen, targetWasReserved) {
   const dir = laneDir(repo, chosen);
+  scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
     // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
@@ -4159,6 +4165,7 @@ function cmdReclaim(repo) {
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, ...reproof }, null, 2)}\n`);
     return;
   }
+  scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
@@ -4248,6 +4255,7 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   }
   const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
   const removedWorktrees = removeLitterWorktrees(dir, salvage.worktrees);
+  scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   rmSync(file, { force: true });
