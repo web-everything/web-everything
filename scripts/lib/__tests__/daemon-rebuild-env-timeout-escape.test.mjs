@@ -359,9 +359,13 @@ describe('smokeAndAdopt env-timeout escape wiring', () => {
     ['all measured timeouts', [...failed, dispatchTimeout], true],
     ['only one timeout', failed, false],
     ['fail-fast skipped sibling', [...failed, { ...dispatchTimeout, detail: 'skipped: fail-fast — reconcile-dry-run failed' }], false],
+    ['wrapped fail-fast refusal', [...failed, { ...dispatchTimeout, detail: 'dispatch dry-run child failed: skipped: fail-fast — reconcile-dry-run failed on the overlay build and again on this one' }], false],
+    ['wrapped budget refusal', [...failed, { ...dispatchTimeout, detail: 'dispatch dry-run child failed: skipped: rebuild smoke budget exhausted (0ms left)' }], false],
+    ['flagged skipped sibling', [...failed, { ...dispatchTimeout, skipped: true }], false],
     ['budget skipped sibling', [...failed, { ...dispatchTimeout, budgetSkipped: true }], false],
     ['partially executed check', [interruptedTimeout, dispatchTimeout], false],
     ['ordinary failure on the same check', [...failed, { ...dispatchTimeout, detail: 'dispatch failed: invalid configuration' }], false],
+    ['different timeout kind on the same check', [...failed, { ...dispatchTimeout, detail: `dispatch failed: exited 1: ✗ ${scanText(120_000)}` }], false],
     ['unmeasured timeout on the same check', [...failed, { ...dispatchTimeout, ms: 1 }], false],
   ])('requires every measured timeout through the real ladder: %s', async (_label, controlRows, adopts) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-env-timeout-equivalence-'));
