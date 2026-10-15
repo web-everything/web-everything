@@ -1356,7 +1356,7 @@ describe('#4315 durable referral effects', () => {
     expect(result.pending).toContain(current.referrals[0].key);
   });
 
-  // #5942 — an earlier head's operator BLOCK is evidence for the current-head reviewer, never a copied verdict.
+  // #5942 — an earlier head's operator BLOCK is never a copied verdict: the current-head reviewer rules the finding afresh.
   it('does not carry an earlier operator block over unchanged lines (even an empty changed set): the reviewer is asked', async () => {
     const h = harness({ readChangedLines: () => new Set() });
     const { current } = seedCarry(h, { operatorRuling: { result: 'block' } });

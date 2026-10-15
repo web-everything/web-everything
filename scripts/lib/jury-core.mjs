@@ -3128,7 +3128,7 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     if (!finding || !sameFindingForClearing(finding, target)) continue;
     // A BLOCK is never carried (#5942): unchanged cited lines cannot show the defect still holds on this head (a fixed
     // surrounding dependency leaves them identical). The latest ruling still decides, so a block also ends the search:
-    // the finding stays live for the current-head reviewer, who is asked with the earlier ruling as evidence.
+    // the finding stays live for the current-head reviewer, who rules it afresh (the earlier block is not passed on as evidence).
     if (o.result === 'block') return null;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
