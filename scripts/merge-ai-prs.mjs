@@ -5171,6 +5171,9 @@ async function runCli() {
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
   const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
+    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
+    // still need the drain's rebase/refresh path, regardless of the head's human approval.
+    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
     try {
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');

@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,10 @@ if (a[0] === 'pr' && a[1] === 'view') {
 if (a[0] === 'pr' && a[1] === 'merge') { fs.appendFileSync(F + '.attempts', a[2] + '\\n'); fs.writeFileSync(F + '.merged-' + a[2], ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
 if (a[0] === 'api') {
+  if (process.env.MQ_APPROVED_HEAD && a.some(v => /issues\\/\\d+\\/comments$/.test(v))) {
+    process.stdout.write(prs[0].comments[0].body.split(String.fromCharCode(10)).join(String.fromCharCode(92) + 'n') + '\t2026-10-09T00:00:00Z\tchalbert\tIC_fixture');
+    process.exit(0);
+  }
   const path = a[1];
   fs.appendFileSync(F + '.api', path + '\\n');
   let m;
@@ -67,11 +71,14 @@ if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-p
 if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
 if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-mq.git\\n');
-if (a[0] === 'diff') process.exit(1);
+if (process.env.MQ_APPROVED_HEAD) {
+  if (a[0] === 'merge-base') process.stdout.write('b'.repeat(40));
+  if (a[0] === 'diff' && a.includes('--name-only')) process.stdout.write('.github/workflows/test.yml\\0');
+} else if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', env: extraEnv = {} }) {
+function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', approvedHeadPlan = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
@@ -79,14 +86,22 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
     for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
+    const head = number => approvedHeadPlan ? 'a'.repeat(40) : `sha-${number}`;
+    const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
+    const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
+    if (approvedHeadPlan) {
+      mkdirSync(cwd);
+      // Provision the sibling read surface without creating or modifying any git metadata.
+      symlinkSync(join(dirname(script), '..'), join(dir, 'frontierui'), 'dir');
+    }
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus,
+      baseRefName: 'main', headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-      labels: [{ name: 'ready-to-merge' }], comments: [], passAt: iso(age),
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
-      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
+      labels: [{ name: 'ready-to-merge' }, ...(approvedHeadPlan ? [{ name: 'review:accepted' }] : [])], comments, passAt: iso(age),
+      commits: [{ oid: head(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      files: [{ path: approvedHeadPlan ? '.github/workflows/test.yml' : `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const settings = join(dir, 'merge-queue.json');
     writeFileSync(settings, JSON.stringify({
@@ -101,16 +116,18 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const mainFixFile = join(dir, 'main-red-priority.json');
     if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], firstRedSha: 'red', reason: 'owns the red-main fix', setAt: NOW, expiresAt: NOW + 3_600_000 }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
-    const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
-      '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
-      cwd: dir, encoding: 'utf8', timeout: 30000,
+    const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
+      '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
+      cwd, encoding: 'utf8', timeout: 30000,
       env: { ...process.env, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
-        WE_COORDINATION_ROOT: coord, ...extraEnv },
+        WE_COORDINATION_ROOT: coord,
+        ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
-    const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
+    expect(r.status, r.stderr).toBe(0);
+    const result = approvedHeadPlan ? null : JSON.parse(r.stdout.trim().split('\n').at(-1));
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
     const refreshed = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : null;
     return { result, stderr: r.stderr, attempts: read('.attempts').map(Number), api: read('.api'), refreshed,
@@ -119,24 +136,43 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
 }
 
 describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () => {
+  it.each([
+    ['queue', 'github-merge-queue', null, true],
+    ['direct', 'drain-direct', null, false],
+    ['sibling repo', 'github-merge-queue', 'frontier-ui/frontierui', false],
+  ])('%s: a BEHIND approved human head is held only when the queue owns freshness', (_mode, strategy, repo, held) => {
+    const { stderr } = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', approvedHeadPlan: { strategy, repo } });
+    expect(stderr).not.toContain('approved-head proof unreadable');
+    expect(stderr.includes('approved human-surface head retained; merge queue owns freshness')).toBe(held);
+    expect(stderr.includes('would rebase-drop manifest')).toBe(!held);
+    if (held) expect(stderr).toMatch(/would ENQUEUE .*#3001/);
+  }, 30000);
   const throwingProof = { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', MQ_PROOF_THROWS: '1' };
-  it('an unreadable enabled approval proof still calls the legacy stale refresh', () => {
+  it('an unreadable queue approval proof still reaches legacy rebase-drop', () => {
+    const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND',
+      approvedHeadPlan: { strategy: 'github-merge-queue' }, env: throwingProof });
+    expect(out.proofErrors).toContain('3001');
+    expect(out.stderr).toContain('approved-head proof unreadable');
+    expect(out.stderr).toContain('would rebase-drop manifest');
+    expect(out.stderr).not.toContain('approved human-surface head retained; merge queue owns freshness');
+  }, 30000);
+  it('direct mode bypasses approval proof and still calls the legacy stale refresh', () => {
     const out = runCli({ hookOn: true, ages: [[3002, 120]], env: throwingProof });
-    expect(out.proofErrors).toContain('3002');
+    expect(out.proofErrors).toEqual([]);
     expect(out.refreshPins.some(line => line.includes('lane/leaf-3002'))).toBe(true);
     expect(JSON.stringify(out.result)).toContain('head-moved');
     expect(JSON.stringify(out.result)).not.toContain('approval-proof-unreadable');
   }, 30000);
-  it('an unreadable enabled approval proof still attempts legacy rebase-drop', () => {
+  it('direct mode bypasses approval proof and still attempts legacy rebase-drop', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', env: throwingProof });
-    expect(out.proofErrors).toContain('3001');
+    expect(out.proofErrors).toEqual([]);
     expect(out.rebaseFetches.some(line => line.includes('lane/leaf-3001'))).toBe(true);
     expect(out.rebaseTrees.some(line => line.includes('origin/lane/leaf-3001'))).toBe(true);
     expect(JSON.stringify(out.result)).not.toContain('approved-head proof unreadable');
   }, 30000);
-  it('an unreadable enabled approval proof preserves the fresh PR for legacy revalidation', () => {
+  it('direct mode bypasses approval proof and preserves legacy revalidation', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], env: { ...throwingProof, MQ_FRESH_BEHIND: '1' } });
-    expect(out.proofErrors).toContain('3001');
+    expect(out.proofErrors).toEqual([]);
     expect(out.result.revalidationAborted?.[0]?.reason).toContain('merge state BEHIND');
     expect(out.attempts).toEqual([]);
   }, 30000);

@@ -23,7 +23,7 @@ describe('live approval proof and same-head refresh', () => {
   it('uses trusted live clearance, the tracked manifest and existing human classifier', async () => {
     const { readApprovedHumanSurfaceHold } = await import('../approved-human-surface-hold.mjs');
     const sha = 'a'.repeat(40), base = 'b'.repeat(40);
-    let manifest = '', cleared = sha, workflow = true, broken = false;
+    let manifest = '', cleared = sha, workflow = true, broken = false, author = 'chalbert';
     const exec = (file, args) => {
       if (broken) throw Error('unreadable');
       if (file === 'gh') return JSON.stringify({ headRefOid: sha, labels: ['review:accepted'], mergeable: 'MERGEABLE' });
@@ -33,8 +33,9 @@ describe('live approval proof and same-head refresh', () => {
       return '';
     };
     const read = () => readApprovedHumanSurfaceHold({ setting: 'on', pr: 1, repo: 'owner/repo', expectedHead: sha, exec,
-      readComments: () => [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${cleared} -->\n<!-- cleared-human: operator -->` }] });
+      readComments: () => [{ author: { login: author }, body: `<!-- reviewed-sha: ${cleared} -->\n<!-- cleared-human: operator -->` }] });
     expect(read().hold).toBe(true);
+    author = 'stranger'; expect(read().hold).toBe(false); author = 'chalbert';
     manifest = '.lane-manifest.json'; expect(read().hold).toBe(false); manifest = '';
     cleared = base; expect(read().hold).toBe(false); cleared = sha;
     workflow = false; expect(read().hold).toBe(false); broken = true; expect(read).toThrow();
