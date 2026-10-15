@@ -2866,15 +2866,16 @@ function statementBindings({ opaque, invalid, prefix, cmd }) {
     keepsPrefix = (name === 'export' && !opts.includes('-n')) || name === 'readonly'
       || (name !== 'local' && /-[xr]/.test(opts));
     const freezes = name === 'readonly' || (name !== 'local' && opts.includes('-r'));
-    const prefixOps = new Map(prefix.map(assignmentOp).map((op) => [op.name, op]));
+    const prefixNames = new Set(prefix.map((w) => assignmentOp(w).name));
     for (const w of operands) {
       const op = declarationOperand(w);
       if (!op) continue;
       if (op.bare) {
         if (name === 'local' || (transforms && opts.includes('n'))) out.push(forget(op.name));
-        else if (keepsPrefix && prefixOps.has(op.name)) out.push(prefixOps.get(op.name));
+        else if (keepsPrefix && prefixNames.has(op.name)) out.push({ name: op.name, fromPrefix: true });
       } else {
-        out.push(name === 'local' || transforms ? forget(op.name) : op);
+        // bash expands every operand before the builtin assigns any: `export A=/x L=$A` reads the old A
+        out.push(name === 'local' || transforms ? forget(op.name) : { ...op, snapshot: true });
       }
       if (freezes) out.push({ name: op.name, readonly: true });
     }
@@ -2976,6 +2977,21 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // 'maybe' when it may not have run (a later rebind may or may not take effect, so it becomes unknown).
   const frozen = new Map();
   const valueOf = (op) => (op.raw === null ? null : assignmentValue(op.raw, vars, homeCtx));
+  // The values a statement's prefix assignments take: they chain left to right in a scope over the current
+  // variables (`A=/x L=$A cmd` gives L=/x for that command), without touching them.
+  const prefixValues = (prefix) => {
+    const scope = Object.create(vars);
+    let h = homeCtx;
+    const out = new Map();
+    for (const w of prefix) {
+      const op = assignmentOp(w);
+      const v = op.raw === null ? null : assignmentValue(op.raw, scope, h);
+      if (op.name === 'HOME') h = v;
+      else scope[op.name] = v ?? undefined;                     // an unknown value shadows the outer one
+      out.set(op.name, v);
+    }
+    return out;
+  };
   const apply = (op, sure) => {
     if (op.all) {
       vars = Object.create(pinned);
@@ -2990,7 +3006,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       return;
     }
     if (state === 'sure') return;
-    const val = state === 'maybe' ? null : valueOf(op);
+    const val = state === 'maybe' ? null : 'val' in op ? op.val : valueOf(op);
     if (op.name === 'HOME') homeCtx = val;
     else if (val !== null && !/\s/.test(val)) vars[op.name] = val; // single-token value only
     else delete vars[op.name];
@@ -3015,7 +3031,15 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     if (statement.opaque && statement.cd) return reportedCwd;   // a cd whose words cannot be trusted
     if (!subshell(k)) for (const op of expansionOps(stmt)) apply(op, sure);
     if (cmd[0]?.text !== 'cd' || statement.invalid || statement.opaque) {
-      if (!subshell(k)) for (const op of statementBindings(statement)) apply(op, sure);
+      if (!subshell(k)) {
+        const ops = statementBindings(statement);
+        const kept = ops.some((op) => op.fromPrefix) ? prefixValues(prefix) : null;
+        // a declaration's operands all expand against the variables as they were before the statement, and
+        // a kept prefix value is the one its prefix chain gave it — both computed before anything is applied
+        const resolved = ops.map((op) => (op.snapshot ? { name: op.name, val: valueOf(op) }
+          : op.fromPrefix ? { name: op.name, val: kept.get(op.name) ?? null } : op));
+        for (const op of resolved) apply(op, sure);
+      }
       continue;
     }
     // Options are judged after quote removal and expansion, as bash's cd sees them (`"-P"`, `$OPT`).
@@ -3037,8 +3061,8 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       break;
     }
     if (target === null) {                                      // no directory operand → HOME, as cd runs
-      const tempHome = prefix.map(assignmentOp).findLast((op) => op.name === 'HOME');
-      const h = tempHome ? valueOf(tempHome) : homeCtx;
+      const temp = prefixValues(prefix);
+      const h = temp.has('HOME') ? temp.get('HOME') : homeCtx;
       if (!h) return reportedCwd;                               // unknown, or empty (cd then stays put)
       return h.startsWith('/') ? h : resolvePath(reportedCwd || '.', h);
     }

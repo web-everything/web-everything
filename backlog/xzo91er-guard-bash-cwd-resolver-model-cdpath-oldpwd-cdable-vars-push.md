@@ -20,7 +20,9 @@ Found by the PR 5403 self-reviews. resolveEffectiveCwd (the static first-cd walk
 - ANSI-C quoted command names and escaped `$'…'` targets;
 - `-e` / `-@` options, which bash 3.2 rejects but bash 5 accepts;
 - `let` reading a variable whose value is itself an assigning expression;
-- a cd target that does not exist (bash's cd fails and stays; the hook keeps the unresolved string when realpath fails).
+- a cd target that does not exist (bash's cd fails and stays; the hook keeps the unresolved string when realpath fails);
+- an unquoted `[…]` bracket glob in a cd word (`cd ~/[c]lone`) is resolved as a literal path; any unquoted glob metacharacter (`*`, `?`, `[`) should leave the word unresolved (PR 5403 advisory);
+- a bare `cd` ends the first-cd walk, so `cd && cd <protected clone> && <mutation>` resolves to HOME; more than one cd that could run should make the walk unresolvable (PR 5403 advisory).
 
 Each can resolve to the reported cwd while bash enters a protected daemon clone, or the reverse.
 

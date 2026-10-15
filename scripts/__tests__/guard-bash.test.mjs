@@ -661,6 +661,19 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) {
       expect(at(`LANE=/tmp; ${stmt}; cd "$LANE"`), stmt).toBe('/protected/clone');
     }
+    // a declaration's operands all expand before it assigns any of them (bash expands every word first)
+    for (const b of ['export', 'readonly', 'declare', 'typeset', 'declare -x', 'export -p']) {
+      expect(at(`A=/protected/clone; LANE=/protected/clone; ${b} A=/tmp LANE=$A; cd "$LANE" && git checkout --detach`), b)
+        .toBe('/protected/clone');
+      expect(at(`A=/protected/clone; ${b} A=/tmp LANE="$A/x"; cd "$LANE"`), b).toBe('/protected/clone/x');
+    }
+    // …and before a prefix assignment applies; prefix assignments themselves chain left to right
+    expect(at('A=/protected/clone; A=/tmp export LANE=$A; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A export LANE; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('A=/x; LANE=/x; A=/protected/clone LANE=$A readonly LANE; cd "$LANE"')).toBe('/protected/clone');
+    expect(at('D=/x; D=/protected/clone HOME=$D cd && git checkout --detach')).toBe('/protected/clone');
+    // bare assignments (no command) still bind left to right
+    expect(at('A=/x; A=/protected/clone LANE=$A; cd "$LANE"')).toBe('/protected/clone');
     // a prefix assignment to a declaration that does not export or freeze the name stays temporary
     expect(at('LANE=/protected/clone; LANE=/tmp declare LANE; cd "$LANE"')).toBe('/protected/clone');
     expect(at('LANE=/protected/clone; LANE=/tmp export -n LANE; cd "$LANE"')).toBe('/protected/clone');
