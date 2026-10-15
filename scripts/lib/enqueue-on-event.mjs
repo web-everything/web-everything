@@ -190,6 +190,11 @@ export function summarizeFastDrain(json, num) {
   const outcome = hit(json.enqueueOutcomes);
   if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${outcome.kind}: ${outcome.reason || ''}`.slice(0, 200);
   if (outcome?.outcome === 'enqueued') return `passed every drain gate — enqueued${outcome.already ? ' (already queued)' : ''}`;
+  const deferred = hit(json.deferred);
+  if (deferred && !hit(json.merged)) {
+    const until = deferred.overlapYield?.untilMs;
+    return `deferred: waits on ${(deferred.waitOn ?? []).join(', ')}${until != null ? ` until ${new Date(until).toISOString().slice(11, 16)}Z` : ''} — enqueue not attempted`.slice(0, 200);
+  }
   if (Array.isArray(json.enqueueOutcomes) && hit(json.toMerge)) return 'not enqueued: no enqueue outcome recorded';
   const aborted = hit(json.revalidationAborted);
   if (aborted) return `not enqueued: ${String(aborted.reason || aborted.detail || '').slice(0, 200)}`;

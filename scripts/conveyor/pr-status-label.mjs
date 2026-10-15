@@ -13,6 +13,7 @@ const { evaluatePr, rulingNeededRow } = await import('../operations/operator-que
 import { FALLBACK_REQUIRED_STATUS_CHECKS, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { redTeamQueueReason } from '../lib/red-team-gate.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { latestUnresolvedStandDown } from './stand-down-answer-core.mjs';
 
 export const PR_STATUS_PREFIX = 'status:';
 export const PR_STATUS_STATES = Object.freeze([
@@ -127,12 +128,14 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
     || r.kind === 'ruling-dispute' || r.takeoverNotConverging === true);
   if (escalated || rs === 'needs-human') return 'escalated';
   const stands = standDownComments(comments, { headRefOid: pr?.headRefOid });
-  if (stands.length) {
-    const latestAt = Math.max(...stands.map((c) => Number.isFinite(timeOf(c)) ? timeOf(c) : -Infinity));
+  const unresolved = latestUnresolvedStandDown([...comments].sort((a, b) => (timeOf(a) || 0) - (timeOf(b) || 0)));
+  if (stands.length && unresolved) {
+    const latestAt = timeOf(unresolved);
     const answered = Number.isFinite(latestAt) && comments.some((c) => isHumanComment(c) && timeOf(c) > latestAt);
     return answered ? 'answered-waiting-fixer' : 'stood-down';
   }
-  if (list.some((r) => r.kind === 'stood-down')) return 'stood-down';
+  if (stands.length && l.includes('review:changes')) return 'answered-waiting-fixer';
+  if ((!stands.length || unresolved) && list.some((r) => r.kind === 'stood-down')) return 'stood-down';
   if (redTeamQueueReason(subject)) return 'sent-back-red-team';
   if (list.some((r) => r.mode === 'takeover' || r.takeoverReview?.ok || r.kind === 'cap-exhausted' || r.kind === 'takeover-awaiting-review')) return 'at-round-limit';
   if (rs === 'awaiting-base' || l.includes('review-status:awaiting-base')
