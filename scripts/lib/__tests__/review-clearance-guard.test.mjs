@@ -73,13 +73,55 @@ describe('#5193 review clearance', () => {
     expect(decideStaleGateRerun({ setting: on, labels: ['review:accepted'], record, row: latest, verdict, rows: [{ name: 'merge-gate', status: 'IN_PROGRESS', id: 115424411009 }, latest] }).rerun).toBe(false);
   });
   it('protects acceptance only with two agreeing head reads', () => {
-    const facts = { setting: on, labels: ['review:accepted'], record, reviews: [], prHead: head, refHead: head };
+    const facts = { setting: on, labels: ['review:accepted'], record: { ...record, index: 0 }, comments: comments.slice(0, 2), events: events.slice(0, 2), reviews: [], prHead: head, refHead: head };
     expect(decideRearmGuard(facts).refuse).toBe(true);
-    for (const patch of [{ refHead: null }, { refHead: 'a'.repeat(40) }, { prHead: 'a'.repeat(40) }, { record: { ...record, sha: 'a'.repeat(40) } }, { setting: off },
+    for (const patch of [{ refHead: null }, { refHead: 'a'.repeat(40) }, { prHead: 'a'.repeat(40) }, { record: { ...record, index: 0, sha: 'a'.repeat(40) } }, { setting: off },
       // PR #5237 operator ruling (2026-10-14 ~22:05 ET): an approval is never kept over a standing formal change request.
       { reviews: null }, { reviews: [standingChanges] }]) {
       expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(false);
     }
+  });
+  // PR #5237 round 9 (block): the re-arm guard kept an acceptance the operator had revoked with no head move: a
+  // marker-free hold comment, a changes verdict, or a hold label. Every revocation after the record lets the re-arm through.
+  describe('re-arm guard honours a same-head revocation after the acceptance', () => {
+    const facts = { setting: on, labels: ['review:accepted'], record: { ...record, index: 0 }, comments: comments.slice(0, 2), events: events.slice(0, 2), reviews: [], prHead: head, refHead: head };
+    const restoreBody = buildRestoreComment({ head, record, rearm, setting: on });
+    const restoredThread = [...comments, comment(restoreBody, '19:03:31', 'web-everything[bot]')];
+    const restoredEvents = [...events, event('labeled', 'review:accepted', '19:03:30'), event('unlabeled', 'review:pending', '19:03:30')];
+    it.each([
+      ['a marker-free operator revocation', { comments: [...facts.comments, comment('Hold this PR; I revoke my approval.', '18:45:00')] }],
+      ['a changes verdict comment', { comments: [...facts.comments, comment('🔁 review — changes requested\n\nOne more fix.', '18:45:00')] }],
+      ['a stand-down marker', { comments: [...facts.comments, comment('🛑 conveyor fix — stood down', '18:45:00', 'web-everything[bot]')] }],
+      ['a later hold label event', { events: [...facts.events, event('labeled', 'review:changes', '18:45:00', 'chalbert')] }],
+      ['a later acceptance removal event', { events: [...facts.events, event('unlabeled', 'review:accepted', '18:45:00', 'chalbert')] }],
+      ['a hold label standing now', { labels: ['review:accepted', 'review:changes'] }],
+      ['unreadable comments', { comments: null }],
+      ['unreadable events', { events: null }],
+      ['a revocation after a restoration', { comments: [...restoredThread, comment('Hold this PR; I revoke my approval.', '19:05:00')], events: restoredEvents }],
+      ['a forged restoration (untrusted author)', { comments: [...comments, comment(restoreBody, '19:03:31', 'mallory')], events: restoredEvents }],
+      ['a restoration of another head', { comments: [...comments, comment(restoreBody.replaceAll(head, 'c'.repeat(40)), '19:03:31', 'web-everything[bot]')], events: restoredEvents }],
+    ])('lets a re-arm through after %s', (_kind, patch) => {
+      expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(false);
+    });
+    it.each([
+      ['machine notes only', { comments: [...facts.comments, comment('🔒 conveyor fix-begin — fix claim held', '18:45:00', 'web-everything[bot]')] }],
+      ['a trusted restoration after the undone re-arm', { comments: restoredThread, events: restoredEvents }],
+    ])('still protects the acceptance with %s', (_kind, patch) => {
+      expect(decideRearmGuard({ ...facts, ...patch }).refuse).toBe(true);
+    });
+    it.each([
+      ['a marker-free operator revocation', 'Hold this PR; I revoke my approval.'],
+      ['a changes verdict comment', '🔁 review — changes requested\n\nOne more fix.'],
+    ])('guardRearm (I/O) lets a re-arm through after %s', (_kind, body) => {
+      const { runGh } = fakeGh(['review:accepted'], [acceptance, comments[1], comment(body, '18:45:00')], events.slice(0, 2));
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
+    });
+    it('guardRearm (I/O) protects an unrevoked same-head acceptance', () => {
+      const { runGh } = fakeGh(['review:accepted'], comments.slice(0, 2), events.slice(0, 2));
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      expect(guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: true });
+    });
   });
   it('restores the original clearance without fabricating markers', () => {
     const decision = decideClearanceRestore(restoreFacts);
@@ -276,7 +318,7 @@ describe('settings', () => {
 });
 
 const rest = list => list.map(c => ({ body: c.body, created_at: c.createdAt, user: { login: c.author.login }, html_url: c.url }));
-function fakeGh(initialLabels = ['review:accepted'], thread = comments) {
+function fakeGh(initialLabels = ['review:accepted'], thread = comments, evts = events) {
   const calls = [];
   let labels = [...initialLabels];
   const runGh = args => {
@@ -292,7 +334,7 @@ function fakeGh(initialLabels = ['review:accepted'], thread = comments) {
     const path = args.find(a => a.startsWith('repos/')) ?? '';
     if (path.includes('/comments')) return JSON.stringify([rest(thread)]);
     if (path.includes('/reviews')) return '[[]]';
-    if (path.includes('/events')) return JSON.stringify([events.slice(0, 2), events.slice(2)]);
+    if (path.includes('/events')) return JSON.stringify([evts.slice(0, 2), evts.slice(2)]);
     if (path.includes('/git/ref/')) return JSON.stringify({ object: { sha: head } });
     return '';
   };
@@ -507,6 +549,39 @@ describe('I/O shell', () => {
       expect(fake.calls.filter(a => a[1] === 'edit').at(-1)).toEqual(['pr', 'edit', '5193', '--repo', repo, '--add-label', 'review:pending', '--remove-label', 'review:accepted']);
       expect(fake.calls.filter(a => a[1] === 'comment')).toEqual([]);
     });
+    // PR #5237 round 9 (block): with the head unchanged, a fresh operator clear-human of the SAME head landing between
+    // the approval write and the post-write read changed the thread, read as a revocation, and was rolled back. The
+    // newer acceptance owns `review:accepted`: no rollback and no restore record. Anything that could hold it still rolls back.
+    const clearSame = comment(`✅ review — \`review:human\` cleared via the sanctioned path\n<!-- reviewed-sha: ${head} -->\n<!-- cleared-human: chalbert -->`, '19:10:00');
+    it.each([
+      ['a newer same-head clearance', { added: [clearSame] }, false],
+      ['a newer same-head clearance with a formal approval', { added: [clearSame], reviews: [review('APPROVED', '19:10:01', 'chalbert')] }, false],
+      ['a newer same-head clearance, then a hold comment', { added: [clearSame, comment('Hold: one more look.', '19:11:00')] }, true],
+      ['a newer same-head clearance by an untrusted author', { added: [{ ...clearSame, author: { login: 'mallory' } }] }, true],
+      ['a newer same-head clearance, then a hold label', { added: [clearSame], events: [event('labeled', 'review:changes', '19:11:00', 'chalbert')] }, true],
+      ['a newer same-head clearance over a standing change request', { added: [clearSame], reviews: [standingChanges] }, true],
+      ['a newer same-head clearance quoted inside a revocation', { added: [comment(`${clearSame.body}\n\nREVOKED`, '19:10:00')] }, true],
+    ])('with the head unchanged, rollback honours %s', (_kind, live, rolledBack) => {
+      const fake = fakeGh(restoreFacts.labels);
+      let written = false;
+      const runGh = args => {
+        if (args[0] === 'pr' && args[1] === 'edit') { written = true; return fake.runGh(args); }
+        const result = fake.runGh(args);
+        const path = args.find(a => a.startsWith('repos/')) ?? '';
+        if (written) {
+          if (path.includes('/comments')) return JSON.stringify([rest([...comments, ...live.added])]);
+          if (path.includes('/events')) return JSON.stringify([[...events, ...(live.events ?? [])]]);
+          if (path.includes('/reviews') && live.reviews) return JSON.stringify([live.reviews]);
+        }
+        return result;
+      };
+      const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on, log: () => {} });
+      const result = entryPoint === 'beforeCiHeal' ? guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })
+        : guard.sweep([{ prNumber: 5193, labels: restoreFacts.labels }])[0];
+      expect(result?.restored).not.toBe(true);
+      expect(fake.calls.filter(a => a[1] === 'edit').some(a => a.join(' ') === rollback.join(' '))).toBe(rolledBack);
+      expect(fake.calls.filter(a => a[1] === 'comment')).toEqual([]);
+    });
     it('still checks the head and rolls back when the approval write throws after GitHub applied it', () => {
       const fake = fakeGh(restoreFacts.labels);
       let written = false;
@@ -529,7 +604,11 @@ describe('I/O shell', () => {
     const guard = createReviewClearanceGuard({ repo, runGh, readVerdict: () => verdict, loadSetting: () => on });
     expect(await guard.beforeCiHeal({ prNumber: 5193, reason: 'red-ci' })).toMatchObject({ launch: false, why: expect.stringContaining('no failing CI') });
     expect(calls.filter(a => a.includes('POST'))).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/jobs/115424411010/rerun`]]);
-    expect(await guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: true });
+    // The fixture's thread carries a re-arm (and its swap events) after the acceptance with no restoration: that
+    // re-arm revoked it (PR #5237 round 9), so the guard lets the next re-arm through. An unrevoked thread is protected.
+    expect(await guard.guardRearm({ pr: 5193 })).toMatchObject({ refuse: false });
+    const unrevoked = fakeGh(['review:accepted'], comments.slice(0, 2), events.slice(0, 2));
+    expect(createReviewClearanceGuard({ repo, runGh: unrevoked.runGh, loadSetting: () => on }).guardRearm({ pr: 5193 })).toMatchObject({ refuse: true });
   });
   it('restores then reruns, but preserves CodeQL launches', async () => {
     const { calls, runGh } = fakeGh(restoreFacts.labels);

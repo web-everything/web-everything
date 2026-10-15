@@ -103,10 +103,30 @@ export function decideStaleGateRerun({ setting, labels, record, row, verdict, ro
  */
 const changeRequestStands = (reviews, record) => !Array.isArray(reviews) || laterReviewHold(reviews, record?.at);
 
-export function decideRearmGuard({ setting, labels, record, reviews, prHead, refHead } = {}) {
-  const refuse = enabled(setting) && names(labels).includes('review:accepted') && sameHead(record, prHead, refHead)
-    && !changeRequestStands(reviews, record);
-  return { refuse, why: refuse ? `same-head clearance at ${record.sha}; no push since acceptance` : 'same-head clearance unproven, a formal change request stands, or guard off' };
+/**
+ * PR #5237 round 9: was the clearance in `record` revoked since, with no head move? Any later comment that could hold
+ * it (a marker-free "Hold, I revoke my approval" or a changes verdict included), or a hold label or acceptance removal
+ * since. A trusted restoration of this head re-grants it, so only what follows the latest one counts (the re-arm it
+ * undid lies behind it). Unreadable counts as revoked.
+ */
+const revokedSinceRecord = ({ comments, events, record, prHead }) => {
+  if (!Array.isArray(comments) || !Array.isArray(events) || !Number.isInteger(record?.index)) return true;
+  let from = record.index + 1, since = Date.parse(record.at);
+  comments.forEach((c, i) => {
+    if (i >= from && starts(c, RESTORE_MARKER) && isTrustedMarkerAuthor(c) && c.body.includes(prHead)) { from = i + 1; since = Date.parse(at(c)); }
+  });
+  if (!Number.isFinite(since) || comments.slice(from).some(holdsClearance)) return true;
+  return events.some(e => ((e.event === 'unlabeled' && e.label?.name === 'review:accepted')
+    || (e.event === 'labeled' && holds.includes(e.label?.name))) && !(Date.parse(at(e)) < since));
+};
+
+export function decideRearmGuard({ setting, labels, comments, events, reviews, record, prHead, refHead } = {}) {
+  const ls = names(labels);
+  const refuse = enabled(setting) && ls.includes('review:accepted') && !holds.some(l => ls.includes(l))
+    && sameHead(record, prHead, refHead) && !changeRequestStands(reviews, record)
+    && !revokedSinceRecord({ comments, events, record, prHead });
+  return { refuse, why: refuse ? `same-head clearance at ${record.sha}; no push since acceptance`
+    : 'same-head clearance unproven, revoked since (comment, hold label or formal change request), or guard off' };
 }
 
 export function decideClearanceRestore({ setting, labels, comments, reviews, events, prHead, refHead } = {}) {
@@ -174,8 +194,8 @@ export function readPrComments({ repo, pr, runGh = runGhSync }) {
 }
 
 /**
- * PR #5237 round 5: after a post-write head move, has a NEWER acceptance been recorded for the live head (a push and
- * a fresh clear-human landing during the restoration)? Then `review:accepted` is that acceptance's label, not ours,
+ * PR #5237 round 5: after the approval write, has a NEWER acceptance been recorded for the live head (a fresh
+ * clear-human landing during the restoration, after a push or on the same head, round 9)? Then `review:accepted` is that acceptance's label, not ours,
  * and the rollback must leave it. It must be the latest acceptance record, trusted, name both live heads, be newer
  * than the record we restored from, and have no comment after it that could hold it. A label decision leaves no
  * comment, so no `review:accepted` removal and no hold label may follow it either, and no hold label may stand now
@@ -290,10 +310,11 @@ export function createReviewClearanceGuard({ repo, runGh = runGhSync, readVerdic
       let after = {};
       try { after = readPrClearanceFacts({ repo, pr, runGh, revalidate: true }); } catch { after = {}; }
       const moved = after.headRefName !== facts.headRefName || !sameHead(restoration.record, after.prHead, after.refHead);
-      if (moved && newerAcceptanceOnHead({ ...after, record: restoration.record })) {
-        // The head moved AND a newer acceptance of the live head was recorded meanwhile: the label is its now. A
-        // clearance comment that lands only after this read is still rolled back (no conditional write exists): the
-        // fail-closed side, a re-review owed, never an approval nobody granted.
+      if (newerAcceptanceOnHead({ ...after, record: restoration.record })) {
+        // A newer acceptance of the live head was recorded meanwhile, whether the head moved or not (PR #5237 round 9:
+        // a fresh operator clear-human of the SAME head read as a revocation and was rolled back): the label is its
+        // now, and no restore record is owed. A clearance comment that lands only after this read is still rolled back
+        // (no conditional write exists): the fail-closed side, a re-review owed, never an approval nobody granted.
         log(`review-clearance: PR #${pr} restoration superseded — a newer acceptance of ${after.prHead.slice(0, 9)} owns review:accepted; no rollback`);
         restoration = { restore: false, why: 'a newer acceptance of the live head was recorded during the restoration' };
       } else if (moved || revokedSinceValidation(facts, after)) {
