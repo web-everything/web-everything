@@ -61,7 +61,10 @@ import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { resolveCiHealBudget } from './reconcile-core.mjs';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
-  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, trustedRetryMarkerComments, EXHAUSTED_RETRY_SPENT_MARKER } from './exhausted-retry.mjs';
+  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, trustedRetryMarkerComments, EXHAUSTED_RETRY_SPENT_MARKER,
+  realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
+  buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
+import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -416,8 +419,22 @@ export function defaultPostExhaustedRetryComment(prNumber, { body, repo, exec = 
   });
 }
 
+/** Edit our own erroneous stand-down using the node id returned by gh pr view --json comments. */
+export function defaultEditExhaustedRetryComment(commentId, { body, repo, exec = execFileSyncThrottled } = {}) {
+  const out = exec('gh', ['api', 'graphql', '-f',
+    'query=mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}',
+    '-f', `id=${commentId}`, '-f', `body=${body}`], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  const result = JSON.parse(String(out || '{}'));
+  if (result.errors?.length || result.data?.updateIssueComment?.issueComment?.id !== commentId) {
+    throw new Error('could not resolve exhausted-retry stand-down');
+  }
+}
+
 export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch = 'main', settings = resolveExhaustedRetry(),
   ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap, now = Date.now(), candidates = null, mainRuns = null,
+  excuseHolds = excusePrMergeGateHolds, editComment = defaultEditExhaustedRetryComment,
   readOpenPrs = defaultReadOpenPrs, readAttributedRequiredChecks = defaultReadAttributedRequiredChecks,
   readAheadBy = defaultReadAheadBy, readComments = defaultReadPrComments, readMainRuns = defaultReadMainRuns,
   readMainTip = defaultReadMainTip, readMainFailureSignature = defaultReadMainFailureSignature,
@@ -428,17 +445,45 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
   const dispatch = [], refusals = [], applied = [];
   if (!settings.enabled || settings.maxRetries === 0) return { dispatch, refusals, applied, settings };
   if (candidates === null) {
-    const prs = readOpenPrs({ repo });
-    const red = (Array.isArray(prs) ? prs : []).some(pr => collapseRollupToLatestPerName(pr.statusCheckRollup)
-      .some(c => isRequiredCheckFailed(pr, c.name || c.context)));
-    const checks = red ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : [];
-    candidates = buildCandidates(prs, { requiredChecks: checks ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, readAheadBy, repo, defaultBranch });
+    // live PR #5169: labels for the review-hold test; comments from the same listing (no per-PR read).
+    const raw = readOpenPrs({ repo, extraFields: ['labels', 'comments'] });
+    const prs = excuseHolds(Array.isArray(raw) ? raw : [], { repo });
+    const checks = prs.length ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : [];
+    const requiredChecks = checks ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS;
+    candidates = prs.filter(pr => Number.isInteger(pr.number) && pr.number > 0).map(pr => {
+      const failures = realRequiredFailures(pr, requiredChecks);
+      const candidate = failures.length ? buildCandidates([pr], { requiredChecks: failures, readAheadBy, repo, defaultBranch })[0] : null;
+      return { prNumber: pr.number, headRefName: pr.headRefName, headSha: pr.headRefOid,
+        ...candidate, ...(Array.isArray(pr.comments) ? { comments: pr.comments } : {}), pr, requiredChecks };
+    });
   }
   let mainTip;
   for (const c of candidates) {
     const comments = c.comments ?? readComments(c.prNumber, { repo });
     const facts = c.exhaustion ?? exhaustionFacts({ comments, ciHealBudget, ciHealCap, headSha: c.headSha });
+    const outcome = c.pr ? retryOutcome({ comments, pr: c.pr, requiredChecks: c.requiredChecks }) : null;
+    const wrongSpent = c.pr ? wrongSpentStandDowns({ comments, pr: c.pr, requiredChecks: c.requiredChecks }) : [];
+    if (outcome?.state === 'recovered' || wrongSpent.length) {
+      const recovered = trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_RECOVERED_MARKER)
+        .some(comment => bodyHasExactLine(comment.body, `head: ${c.headSha}`));
+      if (apply) {
+        for (const comment of wrongSpent) {
+          editComment(comment.id, { repo, body: buildResolvedSpentComment(comment, c.headSha) });
+          applied.push({ prNumber: c.prNumber, kind: 'spent-stand-down-resolved', ok: true, commentId: comment.id });
+        }
+        if (!recovered) {
+          postComment(c.prNumber, { repo, body: buildExhaustedRetryRecoveredComment({ kind: facts.kind ?? c.exhaustion?.kind ?? 'exhaustion', headSha: c.headSha }) });
+          applied.push({ prNumber: c.prNumber, kind: 'exhausted-retry-recovered', ok: true });
+        }
+      }
+      continue;
+    }
     if (!facts.exhausted) continue;
+    if (outcome?.state === 'pending') {
+      refusals.push({ ...c, action: 'wait', kind: 'wait', why: `the retried CI run has not finished on ${c.headSha?.slice(0, 7)}` });
+      continue;
+    }
+    if (c.pr && !realRequiredFailures(c.pr, c.requiredChecks).length) continue;
     mainRuns ??= readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME });
     // Existing main attribution keeps its recovery gates and per-head cap, even after heal exhaustion.
     if (c.mainRecoveryOwned ?? existingMainRecoveryOwns({ ...c, comments }, { mainRedWindows: computeMainRedWindows(mainRuns) })) continue;
@@ -447,7 +492,7 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     const signature = Object.hasOwn(c, 'mainFailureSignature') ? c.mainFailureSignature
       : readMainFailureSignature({ repo, detailsUrl: c.detailsUrl, failingCheckName: c.failingCheckName, mainRuns, lookbackHours: settings.lookbackHours });
     const decision = planExhaustedRetry({ facts, retriesUsed: countExhaustedRetries(comments), settings, mainTip,
-      aheadBy: c.aheadBy, now, mainFailureSignature: signature,
+      aheadBy: c.aheadBy, now, mainFailureSignature: signature, outcome, headSha: c.headSha,
       mainRecoveredForCheck: isMainRecoveredForCheck({ checkName: c.failingCheckName, mainRuns, failureCompletedAt: c.failureCompletedAt }) });
     const d = { ...c, ...decision, kind: decision.action, exhaustionKind: facts.kind };
     if (decision.action !== 'retry') {
@@ -1322,7 +1367,7 @@ async function main(argv) {
   const exhaustedRetrySettings = resolveExhaustedRetry();
   const result = sweepCiRedRecovery({ repo: repoFlag, apply: !!flags.apply, exhaustedRetrySettings });
   const exhaustedResult = sweepExhaustedRetry({ repo: repoFlag, apply: !!flags.apply,
-    settings: exhaustedRetrySettings, candidates: result.candidates, mainRuns: result.mainRuns });
+    settings: exhaustedRetrySettings, mainRuns: result.mainRuns });
   // xd1sfms (#4075/#3383) — the hung-run pass runs in the SAME `sweep` invocation, never a separate CLI verb:
   // both watch the same open-PR listing for the same reason (a PR wrongly stuck on `checking`), and a daemon
   // manifest entry that already schedules this script (see `we:skills-src/conveyor/daemon-manifest.mjs`'s own

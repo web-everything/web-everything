@@ -1,12 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
-  buildExhaustedRetryComment, buildExhaustedRetrySpentComment } from '../exhausted-retry.mjs';
+  buildExhaustedRetryComment, buildExhaustedRetrySpentComment, retryOutcome, realRequiredFailures, wrongSpentStandDowns,
+  EXHAUSTED_RETRY_RECOVERED_MARKER, EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER,
+  trustedRetryMarkerComments, buildResolvedSpentComment } from '../exhausted-retry.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
 import { planReconcile, resolveCiHealBudget } from '../reconcile-core.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildStandDownComment, standDownComments } from '../stand-down.mjs';
 import { extractInfraSignatures, planMainRedRebases, classifyMainDefect } from '../main-red-recovery.mjs';
-import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature } from '../ci-red-recovery-watch.mjs';
+import { sweepExhaustedRetry, sweepCiRedRecovery, defaultReadMainFailureSignature, defaultEditExhaustedRetryComment, defaultReadPrComments } from '../ci-red-recovery-watch.mjs';
 
 const at = '2026-10-14T01:00:00Z';
 const later = '2026-10-14T02:00:00Z';
@@ -46,7 +48,9 @@ describe('exhausted retry', () => {
     expect(basePlan()).toMatchObject({ action: 'retry', mode: 'rebase', trigger: 'main-move' });
     expect(basePlan({ aheadBy: 0 })).toMatchObject({ action: 'wait' });
     expect(basePlan({ aheadBy: 0, now: Date.parse(at) + 12 * 3600000 })).toMatchObject({ action: 'retry', mode: 'rerun', trigger: 'after-hours' });
-    expect(basePlan({ retriesUsed: 1 })).toMatchObject({ action: 'needs-you' });
+    expect(basePlan({ retriesUsed: 1, outcome: { state: 'failed' } })).toMatchObject({ action: 'needs-you' });
+    expect(basePlan({ outcome: { state: 'pending' }, headSha })).toMatchObject({ action: 'wait' });
+    expect(basePlan({ retriesUsed: 1, outcome: { state: 'recovered' } })).toMatchObject({ action: 'none' });
     expect(basePlan({ mainFailureSignature: signature, mainRecoveredForCheck: false })).toMatchObject({ action: 'wait', why: expect.stringContaining('test-timeout') });
     expect(basePlan({ mainFailureSignature: { matched: false, signature: 'test-timeout' }, mainRecoveredForCheck: false })).toMatchObject({ action: 'wait' });
     expect(basePlan({ mainTip: { sha: mainSha, committedAt: at } }).action).toBe('wait');
@@ -64,11 +68,11 @@ describe('exhausted retry', () => {
     let currentHead = headSha;
     const refresh = vi.fn(() => { currentHead = 'c'.repeat(40); return { ok: true, action: 'rebased', newCommit: currentHead }; });
     const postComment = vi.fn((n, { body }) => comments.push(trusted(body)));
-    const options = { repo: 'web-everything/web-everything', apply: true, settings: settings(), ciHealCap: 3,
+    const options = { excuseHolds: prs => prs, repo: 'web-everything/web-everything', apply: true, settings: settings(), ciHealCap: 3,
       readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
-        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: currentHead === headSha ? at : '2026-10-14T04:00:00Z' }] }],
       readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
-      readMainRuns: () => [{ ...redRun, updatedAt: '2026-10-14T00:00:00Z' }, greenRun],
+      readMainRuns: () => [redRun, greenRun],
       readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature: () => signature,
       refresh, postComment, checkClaim: () => null, readIsCrossRepository: () => false, reconcileAcceptance: () => ({}) };
     expect(sweepExhaustedRetry(options).applied[0].ok).toBe(true);
@@ -113,8 +117,8 @@ describe('exhausted retry', () => {
   });
   it('avoids readers when disabled or no PR is red', () => {
     const read = vi.fn(() => { throw Error('unexpected read'); });
-    expect(sweepExhaustedRetry({ settings: { ...settings(), enabled: false }, ciHealCap: 3, readOpenPrs: read }).dispatch).toEqual([]);
-    expect(sweepExhaustedRetry({ settings: settings(), ciHealCap: 3, readOpenPrs: () => [], readAttributedRequiredChecks: read,
+    expect(sweepExhaustedRetry({ settings: { ...settings(), enabled: false }, ciHealCap: 3, readOpenPrs: read, excuseHolds: prs => prs }).dispatch).toEqual([]);
+    expect(sweepExhaustedRetry({ settings: settings(), ciHealCap: 3, readOpenPrs: () => [], excuseHolds: prs => prs, readAttributedRequiredChecks: read,
       readAheadBy: read, readComments: read, readMainRuns: read, readMainTip: read, readMainFailureSignature: read }).dispatch).toEqual([]);
     expect(read).not.toHaveBeenCalled();
   });
@@ -144,7 +148,8 @@ describe('exhausted retry', () => {
     const postComment = vi.fn((n, { body }) => comments.push({ ...trusted(body), createdAt: later }));
     const options = { apply: true, settings: settings(), ciHealCap: 3,
       readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
-        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE',
+          completedAt: currentHead === headSha ? at : '2026-10-14T04:00:00Z' }] }],
       readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
       readMainRuns: () => [], readMainTip: () => ({ sha: mainSha, committedAt: later }), readMainFailureSignature: () => null,
       refresh, postComment, checkClaim: () => null, reconcileAcceptance: () => ({}) };
@@ -248,7 +253,7 @@ describe('main failure signatures', () => {
     const result = sweepCiRedRecovery({ apply: true, exhaustedRetrySettings: { ...settings(), ...disabled },
       readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
         statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
-      readMainRuns: () => [{ ...redRun, updatedAt: '2026-10-14T00:00:00Z' }, greenRun], readAheadBy: () => 2,
+      readMainRuns: () => [redRun, greenRun], readAheadBy: () => 2,
       readAttributedRequiredChecks: () => ['daemon-soak'], readMainLatestCheckRuns: () => [], readMainGreenFixFacts: () => ({}),
       readMainFixedSignatureFacts: () => null, readPriority: () => null, readComments: () => heals, readMainFailureSignature, refresh });
     expect(result.refusals[0].kind).toBe('own-failure');
@@ -292,4 +297,167 @@ describe('main failure signatures', () => {
     expect(exec).toHaveBeenCalledTimes(35);
   });
 
+});
+
+// Regression: live PR #5169, 2026-10-14 — green CI plus a human-review HOLD.
+describe('retried CI verdicts', () => {
+  const sha = 'fcf351d' + '0'.repeat(33);
+  const required = ['test', 'smoke', 'daemon-soak', 'integration', 'merge-gate', 'review-gate'];
+  const retry = { ...trusted(buildExhaustedRetryComment({ kind: facts.kind })), createdAt: later };
+  const green = () => ({ number: 5169, headRefName: 'lane/5169', headRefOid: sha, labels: [{ name: 'review:human' }],
+    statusCheckRollup: required.map(name => ({ name, status: 'COMPLETED', completedAt: '2026-10-14T03:00:00Z',
+      conclusion: name.endsWith('gate') ? 'FAILURE' : 'SUCCESS' })) });
+  const fixture = (pr = green(), initial = [...heals, retry]) => {
+    const comments = [...initial];
+    const postComment = vi.fn((n, { body }) => comments.push({ ...trusted(body), createdAt: '2026-10-14T04:00:00Z' }));
+    const editComment = vi.fn((id, { body }) => { comments.find(c => c.id === id).body = body; });
+    const unexpected = () => { throw Error('unexpected IO'); };
+    const options = { apply: true, settings: settings(), ciHealCap: 3, readOpenPrs: () => [pr],
+      excuseHolds: vi.fn(prs => prs.map(p => ({ ...p, statusCheckRollup: p.statusCheckRollup.map(row =>
+        row.name === 'merge-gate' ? { ...row, mergeGateReviewHold: { holds: ['review-acceptance'] } } : row) }))),
+      readAttributedRequiredChecks: () => required, readComments: () => comments, postComment, editComment,
+      readAheadBy: () => 2, readMainRuns: () => [], readMainTip: () => ({ sha: mainSha, committedAt: later }),
+      readMainFailureSignature: () => null, refresh: unexpected, trigger: unexpected, checkClaim: unexpected,
+      reconcileAcceptance: unexpected, readIsCrossRepository: unexpected };
+    return { options, comments, postComment, editComment };
+  };
+  it('clears the exhausted state once for green CI with review holds', () => {
+    const f = fixture();
+    sweepExhaustedRetry(f.options);
+    expect(f.postComment).toHaveBeenCalledOnce();
+    expect(f.comments.at(-1).body).toContain(EXHAUSTED_RETRY_RECOVERED_MARKER);
+    expect(f.comments.at(-1).body).toContain(`head: ${sha}`);
+    sweepExhaustedRetry(f.options);
+    expect(f.postComment).toHaveBeenCalledOnce();
+  });
+  it('excludes human review-gate failures but retains unannotated merge-gate failures', () => {
+    const pr = green();
+    expect(realRequiredFailures(pr, required)).toEqual(['merge-gate']);
+    pr.labels = ['review:pending'];
+    expect(realRequiredFailures(pr, ['review-gate'])).toEqual([]);
+    pr.labels = [];
+    expect(realRequiredFailures(pr, ['review-gate'])).toEqual(['review-gate']);
+  });
+  it('waits for pending, missing and pre-retry rows on the current head', () => {
+    const pr = green();
+    pr.statusCheckRollup[0].status = 'IN_PROGRESS';
+    const f = fixture(pr);
+    expect(sweepExhaustedRetry(f.options).refusals[0]).toMatchObject({ action: 'wait', why: `the retried CI run has not finished on ${sha.slice(0, 7)}` });
+    expect(f.postComment).not.toHaveBeenCalled();
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' });
+    pr.statusCheckRollup.shift();
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' });
+    pr.statusCheckRollup = green().statusCheckRollup.map(row => ({ ...row, completedAt: at }));
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' });
+    expect(retryOutcome({ comments: [], pr, requiredChecks: required })).toBeNull();
+  });
+  it('posts spent once only for completed real failures, with the lapse trailer last', () => {
+    const pr = green();
+    pr.statusCheckRollup.find(row => row.name === 'daemon-soak').conclusion = 'FAILURE';
+    const f = fixture(pr);
+    sweepExhaustedRetry(f.options);
+    expect(f.postComment).toHaveBeenCalledOnce();
+    expect(f.comments.at(-1).body.split('\n').at(-1)).toBe(`<!-- stand-down reason=exhausted-retry-spent head=${sha} -->`);
+    sweepExhaustedRetry(f.options);
+    expect(f.postComment).toHaveBeenCalledOnce();
+  });
+  it('edits its erroneous spent stand-down once and records recovery', () => {
+    const spent = { ...trusted(buildExhaustedRetrySpentComment({ kind: facts.kind, check: 'merge-gate', headSha: sha }).split('\n').slice(0, -1).join('\n')), id: 'IC_spent' };
+    const f = fixture(green(), [...heals, retry, spent]);
+    expect(sweepExhaustedRetry(f.options).applied).toContainEqual(expect.objectContaining({ kind: 'spent-stand-down-resolved' }));
+    expect(f.editComment).toHaveBeenCalledOnce();
+    expect(f.editComment.mock.calls[0][1].body.startsWith(EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER)).toBe(true);
+    expect(f.editComment.mock.calls[0][1].body).toContain('> <!-- we:exhausted-retry-spent -->');
+    expect(standDownComments(f.comments)).toHaveLength(0);
+    expect(f.postComment).toHaveBeenCalledOnce();
+    sweepExhaustedRetry(f.options);
+    expect(f.editComment).toHaveBeenCalledOnce();
+    expect(f.postComment).toHaveBeenCalledOnce();
+    expect(wrongSpentStandDowns({ comments: f.comments, pr: green(), requiredChecks: required })).toEqual([]);
+  });
+  it('never retries a review hold without real required failures', () => {
+    const f = fixture(green(), heals);
+    expect(sweepExhaustedRetry(f.options)).toMatchObject({ dispatch: [], refusals: [], applied: [] });
+    expect(f.postComment).not.toHaveBeenCalled();
+    expect(f.options.excuseHolds).toHaveBeenCalledOnce();
+  });
+  it('uses latest rows and treats excused merge-gate as a hold even if still red', () => {
+    const pr = green();
+    pr.statusCheckRollup.find(row => row.name === 'merge-gate').mergeGateHoldExcused = { kind: 'candidacy' };
+    pr.statusCheckRollup.unshift({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at });
+    expect(realRequiredFailures(pr, required)).toEqual([]);
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'recovered' });
+    pr.statusCheckRollup.find(row => row.name === 'daemon-soak').conclusion = 'FAILURE';
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'failed', failures: ['daemon-soak'] });
+    expect(wrongSpentStandDowns({ comments: [trusted(buildExhaustedRetrySpentComment({ headSha: sha }))], pr, requiredChecks: required })).toEqual([]);
+  });
+  it('preserves the node id in the reader and sends the edit via GraphQL', () => {
+    const comment = { ...trusted('original'), id: 'IC_spent' };
+    expect(defaultReadPrComments(5169, { repo: 'o/r', exec: () => JSON.stringify({ comments: [comment] }) })).toEqual([comment]);
+    const exec = vi.fn(() => JSON.stringify({ data: { updateIssueComment: { issueComment: { id: comment.id } } } }));
+    defaultEditExhaustedRetryComment(comment.id, { repo: 'o/r', body: 'resolved', exec });
+    expect(exec.mock.calls[0][1]).toEqual(['api', 'graphql', '-f',
+      'query=mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}',
+      '-f', 'id=IC_spent', '-f', 'body=resolved']);
+    expect(() => defaultEditExhaustedRetryComment(comment.id, { body: 'resolved', exec: () => '{"errors":[{"message":"denied"}]}' })).toThrow('could not resolve');
+  });
+  it('starts a fresh exhaustion budget after recovery', () => {
+    const recovered = { ...trusted(EXHAUSTED_RETRY_RECOVERED_MARKER), createdAt: '2026-10-14T04:00:00Z' };
+    const stood = trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', head: sha }));
+    const comments = [...heals, stood, retry, recovered];
+    expect(exhaustionFacts({ comments, ciHealCap: 3 }).exhausted).toBe(false);
+    expect(countExhaustedRetries(comments)).toBe(0);
+    expect(countExhaustedRetries([...comments, { ...retry, createdAt: '2026-10-14T05:00:00Z' }])).toBe(1);
+  });
+});
+
+// Every durable retry state uses the same authenticated leading-header reader.
+describe('retry marker trust across recovery', () => {
+  it.each([EXHAUSTED_RETRY_RECOVERED_MARKER, EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER])(
+    'rejects forged, anonymous and quoted %s markers', marker => {
+      const valid = { ...trusted(marker), createdAt: later };
+      const invalid = [
+        { ...valid, author: { login: 'outsider' } },
+        { body: marker, createdAt: later }, marker,
+        { ...valid, body: `quoted\n${marker}` },
+        { ...valid, body: `> ${marker}` },
+      ];
+      expect(trustedRetryMarkerComments(invalid, marker)).toEqual([]);
+      expect(trustedRetryMarkerComments([...invalid, valid], marker)).toEqual([valid]);
+      for (const comment of invalid) {
+        const retry = trusted(buildExhaustedRetryComment({ headSha }));
+        expect(exhaustionFacts({ comments: [...heals, retry, comment], ciHealCap: 3 }).exhausted).toBe(true);
+        expect(countExhaustedRetries([retry, comment])).toBe(1);
+      }
+    });
+
+  it('does not let forged recovery suppress publication or quoted resolution hide our spent record', () => {
+    const requiredChecks = ['test'];
+    const pr = { headRefOid: headSha, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: later }] };
+    const retry = trusted(buildExhaustedRetryComment({ headSha }));
+    const recovered = { ...trusted(`${EXHAUSTED_RETRY_RECOVERED_MARKER}\nhead: ${headSha}`), createdAt: later };
+    for (const bogus of [{ ...recovered, author: { login: 'outsider' } }, { ...recovered, body: `quoted\n${recovered.body}` }]) {
+      const postComment = vi.fn();
+      sweepExhaustedRetry({ apply: true, settings: settings(), candidates: [{ prNumber: 1, headSha, pr, requiredChecks,
+        comments: [...heals, retry, bogus] }], postComment });
+      expect(postComment).toHaveBeenCalledOnce();
+      expect(postComment.mock.calls[0][1].body.startsWith(EXHAUSTED_RETRY_RECOVERED_MARKER)).toBe(true);
+    }
+    const spent = trusted(`${buildExhaustedRetrySpentComment({ headSha })}\nquoted\n${EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER}`);
+    expect(wrongSpentStandDowns({ comments: [spent], pr, requiredChecks })).toEqual([spent]);
+    const resolved = { ...spent, body: buildResolvedSpentComment(spent, headSha) };
+    expect(wrongSpentStandDowns({ comments: [resolved], pr, requiredChecks })).toEqual([]);
+  });
+
+  it('does not reuse an old recovered retry to judge a new exhaustion episode', () => {
+    const retry = trusted(buildExhaustedRetryComment({ headSha }));
+    const recovered = { ...trusted(EXHAUSTED_RETRY_RECOVERED_MARKER), createdAt: later };
+    expect(retryOutcome({ comments: [retry, recovered], pr: { headRefOid: headSha }, requiredChecks: ['test'] })).toBeNull();
+  });
+
+  it('treats a failed mechanical attempt as terminal even though it launched no CI', () => {
+    const retry = trusted(buildExhaustedRetryComment({ headSha, ok: false }));
+    expect(retryOutcome({ comments: [retry], pr: { headRefOid: headSha }, requiredChecks: ['test'] }))
+      .toMatchObject({ state: 'failed' });
+  });
 });

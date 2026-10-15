@@ -56,7 +56,8 @@ export default {
     let attempts = 0;
     const options = { apply: true, settings, ciHealCap: 3, mainRuns: [],
       readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
-        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
+        statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE',
+          completedAt: currentHead === head ? at : '2026-10-14T04:00:00Z' }] }],
       readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
       readMainTip: () => ({ sha: main, committedAt: greenRun.updatedAt }), readMainFailureSignature: () => null,
       refresh: () => { attempts++; currentHead = retryHead; return { ok: true, action: 'rebased', newCommit: retryHead }; },
