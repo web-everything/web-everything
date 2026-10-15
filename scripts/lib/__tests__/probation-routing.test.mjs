@@ -11,6 +11,7 @@ import { decideDispatchRoute as currentRoute } from '../dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
 import { readBuildArgonSettings } from '../build-argon-settings.mjs';
+import { resolvePolicyModel } from '../dispatch-routing-policy.mjs';
 import { taskTypeFor } from '../dispatch-task-type.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
 
@@ -39,6 +40,13 @@ describe('ci-heal is its own taskType, with a bounded envelope', () => {
 });
 
 describe('selectProbationWorker', () => {
+  it('every probation worker model resolves through the runner routing policy', () => {
+    for (const worker of Object.values(PROBATION_WORKERS)) {
+      const models = worker.model === null ? Object.values(AGY_CLAUDE_MODEL_BY_TIER) : [worker.model];
+      for (const model of models) expect(resolvePolicyModel(worker.provider, model)).toBe(model);
+    }
+  });
+
   it('rosters: doc-fix → agy-Claude + Codex; ci-heal → agy-Claude + Codex + agy-Gemini (simple only, Codex-checked); bugfix → Codex + agy Claude + simple Gemini', () => {
     expect(PROBATION_ROSTER['doc-fix']).toEqual(['antigravity-claude', 'codex']);
     expect(PROBATION_ROSTER['ci-heal']).toEqual(['antigravity-claude', 'codex', 'antigravity-gemini']);
@@ -260,6 +268,31 @@ describe('Argon probation builds', () => {
     ...extra,
   });
 
+  it.each([{ availability: null }, { argonSettings: null }, { availability: null, argonSettings: null }])('accepts null routing options: %j', (extra) => {
+    expect(selectProvider(task, context(extra)).probationWorker?.id).toBe('antigravity-argon');
+    expect(selectProbationWorker({ taskType: task.taskType, ...context(extra) }).worker?.id).toBe('antigravity-argon');
+  });
+
+  it.each(['gemini-9-unvetted', '--x', 'gemini-4; id', 'claude-opus-5-5', null, false,
+    { toString: null }, ['gemini-4-argon-high'], [], 42,
+  ].map(model => ({ model })))('skips an invalid injected Argon model: $model', ({ model }) => {
+    const result = selectProvider(task, context({ argonSettings: { value: { enabled: true, model }, sources: {} } }));
+    expect(result.probationWorker?.id).toBe('codex');
+    expect(result.auditTrail).toContainEqual(expect.objectContaining({ criterion: 'probation-candidate:antigravity-argon', result: 'invalid-model' }));
+  });
+
+  it('audits malformed enabled and source leaves without coercing objects', () => {
+    const malformed = { toString: null };
+    const settings = { value: { enabled: malformed, model: malformed }, sources: { enabled: malformed, model: malformed } };
+    expect(selectProvider(task, context({ argonSettings: settings })).probationWorker?.id).toBe('codex');
+    expect(selectProvider(task, context({ argonSettings: { ...settings, value: { enabled: true, model: 'gemini-4-argon-high' } } })).probationWorker?.id).toBe('antigravity-argon');
+  });
+
+  it.each([{}, { value: null }, { value: { enabled: true } }, { value: { enabled: true, model: 'gemini-4-argon-high' }, sources: null }])('handles partial injected settings: %j', (argonSettings) => {
+    const result = selectProvider(task, context({ argonSettings }));
+    expect(result.probationWorker?.id).toBe(argonSettings.value?.model ? 'antigravity-argon' : 'codex');
+  });
+
   it('rotates an opened non-simple build to Argon with a Codex checker and full review', () => {
     expect(PROBATION_WORKERS['antigravity-argon']).toMatchObject({ simpleOnly: false });
     expect(selectProvider(task, context())).toMatchObject({
@@ -305,14 +338,30 @@ describe('build.argon settings cascade', () => {
 
   it('resolves platform and tool independently per leaf, including the model used for routing', () => {
     const result = readBuildArgonSettings({
-      read: () => ({ build: { argon: { model: 'gemini-4-argon-custom' } } }),
+      read: () => ({ build: { argon: { model: 'gemini-3.8-flash-high' } } }),
       platform: { argon: { enabled: false, model: 'gemini-4-argon-high' } }, env: {},
     });
-    expect(result).toEqual({ value: { enabled: false, model: 'gemini-4-argon-custom' }, sources: { enabled: 'platform', model: 'tool' } });
+    expect(result).toEqual({ value: { enabled: false, model: 'gemini-3.8-flash-high' }, sources: { enabled: 'platform', model: 'tool' } });
     const enabled = { ...result, value: { ...result.value, enabled: true } };
     expect(selectProbationWorker({ taskType: 'build-new-feature', argonSettings: enabled,
       scorecards: [row({ provider: 'codex', model: CODEX_MODEL, taskType: 'build-new-feature' })],
-    }).worker.model).toBe('gemini-4-argon-custom');
+    }).worker.model).toBe('gemini-3.8-flash-high');
+  });
+
+  it.each([
+    'gemini-9-unvetted', '--x', 'gemini-4; id', 'claude-opus-5-5',
+    'gemini-4-argon-high\n', 'gemini-4-argon-high\r', 'gemini-4-argon-high\u2028',
+    'gemini-4-argon-high`id`', 'gemini-4-argon-high"', "gemini-4-argon-high'",
+    'gemini-../4', 'ｇｅｍｉｎｉ-4-argon-high', 'gemini-4-argon-\u200bhigh',
+    'gemini-4-argon-high' + '--x',
+  ])('ignores off-catalogue or malformed strings at both cascade layers: %j', (model) => {
+    const fallback = { enabled: true, model: 'gemini-3.8-flash-high' };
+    const tool = readBuildArgonSettings({ read: () => ({ build: { argon: { model } } }), platform: { argon: fallback }, env: {} });
+    expect(tool.value.model).toBe(fallback.model);
+    expect(tool.sources.model).toBe('platform');
+    const platform = readBuildArgonSettings({ read: () => ({}), platform: { argon: { model } }, env: {} });
+    expect(platform.value.model).toBe('gemini-4-argon-high');
+    expect(platform.sources.model).toBe('standard');
   });
 
   it('ignores invalid tool leaves and tolerates unreadable tool settings', () => {

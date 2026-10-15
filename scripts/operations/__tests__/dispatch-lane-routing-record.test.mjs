@@ -37,7 +37,22 @@ import {
 } from '../dispatch-lane-io.mjs';
 import { decideDispatchRoute as currentRoute } from '../../lib/dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from '../../lib/__tests__/inherited-routing-policy.mjs';
+import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS } from '../../lib/provider-routing.mjs';
+import { parseArgs as parseProbationBuildArgs } from '../probation-build-run.mjs';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
+
+describe('probation roster models reach the build runner parser', () => {
+  // Exercise both standalone ids and the JSON hand-off used by the dispatcher. Claude's model is tier-derived.
+  it.each([...new Set(Object.values(PROBATION_ROSTER).flat())])('accepts the %s worker through the real parser', (id) => {
+    const def = PROBATION_WORKERS[id];
+    const standalone = parseProbationBuildArgs([`--worker=${id}`, '--session=roster-parser-check']);
+    expect(standalone.worker).toMatchObject({ id, provider: def.provider, model: def.model ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet });
+    for (const model of def.model ? [def.model] : Object.values(AGY_CLAUDE_MODEL_BY_TIER)) {
+      const parsed = parseProbationBuildArgs([`--worker=${JSON.stringify({ ...def, model })}`, '--session=roster-parser-check']);
+      expect(parsed.worker).toMatchObject({ id, provider: def.provider, model, checker: def.checker });
+    }
+  });
+});
 
 /** A root that is not lane-shaped — `assertNotALaneCheckout` refuses those, and this suite is not about it. */
 const PRIMARY = '/primary/webeverything';

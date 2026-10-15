@@ -66,7 +66,7 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
-import { readBuildArgonSettings } from './build-argon-settings.mjs';
+import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
 import { DEFAULT_ROUTING_POLICY } from './dispatch-routing-policy.mjs';
@@ -381,7 +381,12 @@ export const PROBATION_ROSTER = Object.freeze({
  */
 // @test-only-export-ok: Shared library exported for the probation launcher (agy-launcher-probation) and its own test
 export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, simple = false, filesTouched = [], estimatedSize = 0, scorecards = [], vetoes = [], availability = {}, argonSettings = BUILD_ARGON_SETTINGS } = {}) {
+  availability ??= {};
+  argonSettings ??= BUILD_ARGON_SETTINGS;
   const auditTrail = [];
+  // Settings may be JSON objects: audit malformed leaves without invoking their coercion hooks.
+  const settingLabel = (value) => typeof value === 'string' ? JSON.stringify(value.slice(0, 200))
+    : typeof value === 'boolean' ? String(value) : `<${typeof value}>`;
   const none = (reason) => ({ worker: null, auditTrail, reason });
   const roster = PROBATION_ROSTER[taskType];
   if (!roster) return none(`taskType '${taskType}' has no probation roster`);
@@ -398,8 +403,9 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
   roster.forEach((id, order) => {
     const def = PROBATION_WORKERS[id];
     if (id === 'antigravity-argon') {
-      const { value, sources } = argonSettings;
-      auditTrail.push({ criterion: `probation-candidate:${id}`, result: value.enabled === true ? 'enabled' : 'disabled', dataConsulted: `build.argon.enabled=${value.enabled} (${sources.enabled}), build.argon.model=${value.model} (${sources.model})`, reasoning: 'build probation cascade setting' });
+      const value = argonSettings.value ?? {};
+      const sources = argonSettings.sources ?? {};
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: value.enabled === true ? 'enabled' : 'disabled', dataConsulted: `build.argon.enabled=${settingLabel(value.enabled)} (${settingLabel(sources.enabled)}), build.argon.model=${settingLabel(value.model)} (${settingLabel(sources.model)})`, reasoning: 'build probation cascade setting' });
       if (value.enabled !== true) return;
     }
     const held = availability[id] || availability[def.provider] || (def.checker && availability[def.checker]);
@@ -407,7 +413,13 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
       auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'quota-held', dataConsulted: String(held), reasoning: 'active backend or checker hold; availability otherwise unknown' });
       return;
     }
-    const model = (id === 'antigravity-argon' ? argonSettings.value.model : def.model) ?? AGY_CLAUDE_MODEL_BY_TIER[tier] ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet;
+    const model = id === 'antigravity-argon'
+      ? resolveBuildArgonModel(argonSettings.value?.model)
+      : def.model ?? AGY_CLAUDE_MODEL_BY_TIER[tier] ?? AGY_CLAUDE_MODEL_BY_TIER.sonnet;
+    if (!model) {
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'invalid-model', dataConsulted: settingLabel(argonSettings.value?.model), reasoning: 'build.argon.model must resolve to a catalogued Antigravity Gemini model' });
+      return;
+    }
     if (def.simpleOnly && simple !== true && taskType !== 'test-fix') {
       auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'skipped', dataConsulted: `simple=${simple === true}`, reasoning: 'offered only for a simple task' });
       return;
@@ -940,7 +952,7 @@ export function selectProvider(task, context) {
   if (probationTask) {
     const picked = selectProbationWorker({
       taskType, tier: claudeTier, simple: context?.simple === true, filesTouched, estimatedSize, scorecards, vetoes,
-      availability: context?.availability, argonSettings: context?.argonSettings,
+      availability: context?.availability ?? {}, argonSettings: context?.argonSettings ?? BUILD_ARGON_SETTINGS,
     });
     auditTrail.push(...picked.auditTrail);
     if (!picked.worker) auditTrail.push({ criterion: 'probation-worker', result: 'none', dataConsulted: `taskType='${taskType}'`, reasoning: picked.reason });
