@@ -67,8 +67,8 @@ All test execution goes through Node on `we:scripts/readiness/heavy-admission.mj
 Authorization controls are required at every boundary in the matrix below: require a trusted author and refuse a forged (non-trusted) author with the same leading marker; require a leading marker and refuse a trusted author with a quoted (not leading) marker. Implement and report three separately named test cases: the trusted-author, leading-marker positive control succeeds; the forged-author negative control is refused; and the quoted-marker negative control is refused. Report both negative results independently beside the successful positive result; a combined negative case cannot substitute for either refusal. Keep identities and reproduction evidence valid and identical across the controls:
 
 - Positive control: a trusted author with a leading marker satisfies both authorization requirements.
-- Forged-author negative control: a forged (non-trusted) author with the same leading marker is refused; change only the author.
-- Quoted-marker negative control: a trusted author with a quoted (not leading) marker is refused; change only the marker placement.
+- Trusted-author requirement — forged-author negative control: a forged (non-trusted) author with the same leading marker is refused; change only the author, keeping the marker and valid evidence identical to the positive control.
+- Leading-marker requirement — quoted-marker negative control: a trusted author with a quoted (not leading) marker is refused; change only the marker placement, keeping the trusted author and valid evidence identical to the positive control.
 
 | Authorization requirement | Positive control | Required negative control | Expected negative result |
 | --- | --- | --- | --- |
