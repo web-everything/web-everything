@@ -10,6 +10,7 @@ import {
   MINUTE, HOUR, DEFAULT_HEALTH_CONFIG, BLOCKING_REFUSALS, parseDaemonLog, tickIsUnproductive, foldDaemonMemory,
   emptyHealthState, stepEpisodes, planActions, scrubText, fmtAge, renderEpisodeReport, renderHealthSection,
   runHealthTick, scrubDeep, fenceFor, renderInvestigationSection,
+  foldOperatorHolds, parseOperatorHoldRecords, operatorHoldView, OPERATOR_HOLD_KINDS,
 } from '../health-watch-core.mjs';
 import daemonSilent from '../health-smells/daemon-silent.mjs';
 import daemonOwedNoDispatch from '../health-smells/daemon-owed-no-dispatch.mjs';
@@ -1159,5 +1160,98 @@ describe('recordPrRefusal keeps the owner-state reason', () => {
     expect(m['w#1'].reason).toMatch(/fix-loop-hold/);
     recordPrRefusal(m, { pr: 'w#1', reason: 'reconcile-refused timeout-retry-ineligible' }, 6);
     expect(m['w#1'].at).toBe(6);
+  });
+});
+
+// ── operator-hold memory (card 5653) ─────────────────────────────────────────────────────────────────────────────
+
+describe('foldOperatorHolds / parseOperatorHoldRecords', () => {
+  const WE = 'web-everything/web-everything';
+  const PA = 'plateauapp/plateau-app';
+  const T0 = Date.parse('2026-10-15T10:00:00Z');
+  const rec = (m, holds, over = {}) => `review-daemon: operator-holds ${JSON.stringify({ version: 1, repo: WE, observedAt: T0 + m * MINUTE, intervalMs: 2 * MINUTE, holds, ...over })}\n`;
+  const hold = (prNumber, kind = 'stood-down') => ({ prNumber, kind });
+  const fold = (prev, text, nowMin, extra = {}) => foldOperatorHolds(prev, { available: true, text, ...extra }, T0 + nowMin * MINUTE);
+
+  it('keeps the first observation across repeated rows and across a persisted-state restart', () => {
+    let mem = fold(undefined, rec(0, [hold(1)]) + rec(2, [hold(1)]), 2);
+    mem = JSON.parse(JSON.stringify(fold(mem, rec(4, [hold(1)]), 4)));
+    mem = fold(mem, rec(6, [hold(1)]), 6);
+    expect(mem.repos[WE].keys['1|stood-down']).toMatchObject({ first: T0, last: T0 + 6 * MINUTE });
+  });
+  it('age does not advance when only the watch clock ticks', () => {
+    const mem = fold(undefined, rec(0, [hold(1)]), 0);
+    const later = foldOperatorHolds(mem, { available: true, text: '' }, T0 + 3 * MINUTE);
+    expect(later.repos[WE].keys['1|stood-down']).toMatchObject({ first: T0, last: T0 });
+    expect(operatorHoldView(later).current).toHaveLength(1);
+    const stale = foldOperatorHolds(later, { available: true, text: '' }, T0 + 30 * MINUTE);
+    expect(stale.repos[WE].broken).toBe(true);
+    expect(operatorHoldView(stale).current).toHaveLength(0);
+  });
+  it('ignores duplicate and out-of-order snapshots without mutating state on replay', () => {
+    const base = fold(undefined, rec(0, [hold(1)]) + rec(2, [hold(1)]) + rec(4, [hold(1)]), 4);
+    const frozen = JSON.stringify(base);
+    const replay = fold(base, rec(4, [hold(1)]) + rec(2, []) + rec(0, [hold(9)]), 5);
+    expect(JSON.stringify({ ...replay, repos: { [WE]: { ...replay.repos[WE], broken: false } } })).toBe(frozen);
+    expect(JSON.stringify(base)).toBe(frozen);
+  });
+  it('treats a duplicate row inside one record as one hold and rejects the record atomically on any bad row', () => {
+    const dup = fold(undefined, rec(0, [hold(1), hold(1)]), 0);
+    expect(Object.keys(dup.repos[WE].keys)).toEqual(['1|stood-down']);
+    for (const bad of [hold(0), hold(-1), hold(1.5), { prNumber: '1', kind: 'stood-down' }, hold(2, 'live-process'), { prNumber: 2 }, null, 'x']) {
+      const mem = fold(undefined, rec(0, [hold(1), bad]), 0);
+      expect(mem.repos[WE]).toBeUndefined(); // not even the valid sibling row was applied
+    }
+  });
+  it('validates version, repository, timestamps and interval; a future time is unknown', () => {
+    const cases = [{ version: 2 }, { version: '1' }, { repo: 'evil/repo' }, { repo: 5 }, { observedAt: -1 }, { observedAt: 'x' }, { observedAt: NaN },
+      { observedAt: T0 + 60 * MINUTE }, { intervalMs: 0 }, { intervalMs: -5 }, { intervalMs: '120000' }, { holds: 'no' }, { holds: null }];
+    for (const over of cases) {
+      const events = parseOperatorHoldRecords(rec(0, [hold(1)], over), T0 + 5 * MINUTE);
+      expect(events.map((e) => e.type)).toEqual(['unknown']);
+    }
+    expect(parseOperatorHoldRecords(rec(0, [hold(1)]), T0 + 5 * MINUTE)[0].type).toBe('record');
+    expect(parseOperatorHoldRecords('unrelated line\nreview-daemon: tick (WE) — 0 owed\n', T0)).toEqual([]);
+  });
+  it('a malformed record names its repository only when that repository is a watched slug', () => {
+    expect(parseOperatorHoldRecords(rec(0, 'x', { repo: PA }), T0 + MINUTE)[0]).toEqual({ type: 'unknown', repo: PA });
+    expect(parseOperatorHoldRecords(rec(0, 'x', { repo: 'attacker/x' }), T0 + MINUTE)[0]).toEqual({ type: 'unknown', repo: null });
+    expect(parseOperatorHoldRecords('review-daemon: operator-holds {not json\n', T0)[0]).toEqual({ type: 'unknown', repo: null });
+  });
+  it('unknown input breaks continuity (unnamed => every repository) but never removes a hold; the next valid snapshot restarts onset', () => {
+    let mem = fold(undefined, rec(0, [hold(1)]) + rec(0, [hold(2)], { repo: PA }), 0);
+    mem = fold(mem, 'review-daemon: operator-holds {garbage\n', 1);
+    expect(mem.repos[WE].broken && mem.repos[PA].broken).toBe(true);
+    expect(Object.keys(mem.cleared)).toEqual([]);
+    mem = fold(mem, rec(2, [hold(1)]), 2);
+    expect(mem.repos[WE].keys['1|stood-down']).toMatchObject({ first: T0 + 2 * MINUTE });
+    expect(mem.repos[PA].broken).toBe(true);
+    const named = fold(mem, rec(4, 'x', { repo: WE }), 4);
+    expect(named.repos[WE].broken).toBe(true);
+    expect(named.repos[PA].broken).toBe(true); // still broken from before, untouched here
+  });
+  it('the exact two-interval boundary is continuous; one millisecond over restarts', () => {
+    let mem = fold(undefined, rec(0, [hold(1)]), 0);
+    expect(fold(mem, rec(4, [hold(1)]), 4).repos[WE].keys['1|stood-down'].first).toBe(T0);
+    const over = rec(4, [hold(1)], { observedAt: T0 + 4 * MINUTE + 1 });
+    expect(foldOperatorHolds(mem, { available: true, text: over }, T0 + 5 * MINUTE).repos[WE].keys['1|stood-down'].first).toBe(T0 + 4 * MINUTE + 1);
+  });
+  it('a missing key is positive clearance (cleared only while an episode still needs the clean result), even after an unknown gap', () => {
+    const episodes = { [`operator-hold-aged::${WE}#1:stood-down`]: { smell: 'operator-hold-aged', subject: `${WE}#1:stood-down` } };
+    let mem = foldOperatorHolds(undefined, { available: true, text: rec(0, [hold(1)]) }, T0, { episodes });
+    mem = foldOperatorHolds(mem, { available: false }, T0 + 20 * MINUTE, { episodes });
+    mem = foldOperatorHolds(mem, { available: true, text: rec(30, []) }, T0 + 30 * MINUTE, { episodes });
+    expect(Object.keys(mem.cleared)).toEqual([`${WE}#1:stood-down`]);
+    expect(Object.keys(mem.repos[WE].keys)).toEqual([]);
+    expect(Object.keys(foldOperatorHolds(mem, { available: true, text: '' }, T0 + 31 * MINUTE, { episodes: {} }).cleared)).toEqual([]);
+  });
+  it('legacy state without the field starts unknown; bootstrap labels the first window a lower bound', () => {
+    const mem = foldOperatorHolds(undefined, { available: true, bootstrap: true, text: rec(0, [hold(1)]) + rec(2, [hold(1)]) }, T0 + 2 * MINUTE);
+    expect(mem.repos[WE].keys['1|stood-down']).toMatchObject({ first: T0, lb: 1 });
+    expect(foldOperatorHolds(undefined, { available: true, text: '' }, T0).repos).toEqual({});
+  });
+  it('keeps the daemon-side allowlist identical to the watch-side one', async () => {
+    const mod = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    expect([...mod.OPERATOR_HOLD_KINDS]).toEqual([...OPERATOR_HOLD_KINDS]);
   });
 });

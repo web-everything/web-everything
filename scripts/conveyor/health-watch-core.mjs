@@ -37,6 +37,7 @@ import { foldBuilderTicks } from './health-builder-ticks.mjs';
 import { expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 export const MINUTE = 60_000;
 export const HOUR = 60 * MINUTE;
@@ -90,6 +91,8 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   passFailingMinStreak: 3,
   passFailingNoSuccessMs: 30 * MINUTE,
   passFailingRecoverAfterMs: 15 * MINUTE,
+  // `operator-hold-aged`: an operator-only hold on a PR alerts once it has been continuously observed this long.
+  operatorHoldAgeMinutes: 30,
 });
 
 // ── 1. Daemon log parsing ────────────────────────────────────────────────────────────────────────────────────
@@ -391,6 +394,122 @@ export function foldDaemonMemory(prev, sample, now) {
   mem.recentTicks = mem.recentTicks.filter((e) => e.at >= keepAfter).slice(-300);
   mem.prRefusals = Object.fromEntries(Object.entries(mem.prRefusals).sort((a, b) => b[1].at - a[1].at).slice(0, 200));
   return mem;
+}
+
+// ── 2b. Operator-hold memory (`operator-hold-aged`) ──────────────────────────────────────────────────────────────
+
+export const OPERATOR_HOLD_SMELL_ID = 'operator-hold-aged';
+/** The hold kinds the review daemon reports (mirrors `OPERATOR_HOLD_KINDS` in skills-src/conveyor/review-daemon.mjs;
+ *  a test pins the two together). */
+export const OPERATOR_HOLD_KINDS = Object.freeze(['cap-exhausted', 'stood-down', 'review-referrals-pending', 'ruling-dispute']);
+const OPERATOR_HOLD_RECORD_PREFIX = 'review-daemon: operator-holds ';
+const WATCHED_REPOS = new Set(Object.values(CONSTELLATION_REPOS).map((r) => r.slug));
+const MAX_HOLDS_PER_RECORD = 2000;
+/** A gap between two snapshots of one repository longer than this many of the daemon's own intervals breaks continuity. */
+const HOLD_CONTINUITY_INTERVALS = 2;
+
+/** The stable (repository, PR, kind) subject of an `operator-hold-aged` episode. */
+export function operatorHoldSubject({ repo, prNumber, kind }) { return `${repo}#${prNumber}:${kind}`; }
+
+/** PURE: a validated snapshot record, or null. Only the slug, PR numbers, kinds and times survive — nothing else is copied. */
+function validateOperatorHoldRecord(rec, now) {
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec) || rec.version !== 1) return null;
+  if (typeof rec.repo !== 'string' || !WATCHED_REPOS.has(rec.repo)) return null;
+  if (typeof rec.observedAt !== 'number' || !Number.isFinite(rec.observedAt) || rec.observedAt < 0 || rec.observedAt > now) return null;
+  if (typeof rec.intervalMs !== 'number' || !Number.isFinite(rec.intervalMs) || rec.intervalMs <= 0) return null;
+  if (!Array.isArray(rec.holds) || rec.holds.length > MAX_HOLDS_PER_RECORD) return null;
+  const holds = new Map();
+  for (const h of rec.holds) {
+    if (!h || typeof h !== 'object' || !Number.isInteger(h.prNumber) || h.prNumber <= 0 || !OPERATOR_HOLD_KINDS.includes(h.kind)) return null;
+    holds.set(`${h.prNumber}|${h.kind}`, { prNumber: h.prNumber, kind: h.kind });
+  }
+  return { repo: rec.repo, observedAt: rec.observedAt, intervalMs: rec.intervalMs, holds: [...holds.values()] };
+}
+
+/**
+ * PURE: the operator-hold snapshot records in a chunk of review-daemon log, in file order, as events: a valid
+ * `{type:'record', ...}`, or `{type:'unknown', repo}` for a recognized-but-malformed record (`repo` is the watched
+ * repository it names, or null when it cannot be identified safely — then the whole stream is unknown). A malformed
+ * record is never read as an empty hold set. Unrelated lines are ignored.
+ */
+export function parseOperatorHoldRecords(text, now) {
+  const events = [];
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = stripLogTimestamp(raw.trimEnd());
+    if (!line.startsWith(OPERATOR_HOLD_RECORD_PREFIX)) continue;
+    let rec = null;
+    try { rec = JSON.parse(line.slice(OPERATOR_HOLD_RECORD_PREFIX.length)); } catch { rec = null; }
+    const ok = validateOperatorHoldRecord(rec, now);
+    if (ok) events.push({ type: 'record', ...ok });
+    else events.push({ type: 'unknown', repo: typeof rec?.repo === 'string' && WATCHED_REPOS.has(rec.repo) ? rec.repo : null });
+  }
+  return events;
+}
+
+/**
+ * PURE: fold one sample of the review-daemon log's operator-hold snapshots into the persisted hold memory.
+ * `memory = { v:1, repos:{ [slug]:{at, intervalMs, broken, keys:{ 'pr|kind': {prNumber, kind, first, last, lb?} }} }, cleared:{...} }`.
+ *
+ * - `first` is the first valid observation of the current uninterrupted hold; `last` the latest confirmation. Age is
+ *   `last - first`, so it never advances because the watch clock ticked.
+ * - Continuity breaks (`broken`) on an unavailable log, a malformed record, or a gap past two of the daemon's intervals;
+ *   the next valid snapshot then restarts the onset of every still-present hold. Unknown never clears anything.
+ * - A valid snapshot lacking a key is positive clearance (also for an open episode the memory never saw): the identity
+ *   goes to `cleared` until its episode has closed, so the detector can emit the explicit clean result.
+ * @param {object|undefined} prev
+ * @param {{available?:boolean, text?:string, bootstrap?:boolean}} probe
+ * @param {number} now
+ * @param {{episodes?:object}} [o]
+ */
+export function foldOperatorHolds(prev, probe, now, { episodes = {} } = {}) {
+  const mem = {
+    v: 1,
+    repos: Object.fromEntries(Object.entries(prev?.repos || {}).map(([k, r]) => [k, { ...r, keys: { ...r.keys } }])),
+    cleared: { ...(prev?.cleared || {}) },
+  };
+  const breakRepo = (repo) => { if (mem.repos[repo]) mem.repos[repo].broken = true; };
+  const breakAll = () => { for (const repo of Object.keys(mem.repos)) breakRepo(repo); };
+  const openOnes = Object.values(episodes || {}).filter((e) => e?.smell === OPERATOR_HOLD_SMELL_ID);
+  if (probe?.available === false) breakAll();
+  else for (const ev of parseOperatorHoldRecords(probe?.text, now)) {
+    if (ev.type === 'unknown') { if (ev.repo) breakRepo(ev.repo); else breakAll(); continue; }
+    const prior = mem.repos[ev.repo];
+    if (prior && ev.observedAt <= prior.at) continue; // duplicate or out-of-order
+    const continuous = !!prior && !prior.broken && ev.observedAt - prior.at <= HOLD_CONTINUITY_INTERVALS * ev.intervalMs;
+    const keys = {};
+    for (const h of ev.holds) {
+      const key = `${h.prNumber}|${h.kind}`;
+      const old = prior?.keys[key];
+      keys[key] = old && continuous ? { ...old, last: ev.observedAt }
+        : { prNumber: h.prNumber, kind: h.kind, first: ev.observedAt, last: ev.observedAt, ...(probe.bootstrap && !prior ? { lb: 1 } : {}) };
+    }
+    const gone = [...Object.entries(prior?.keys || {}).filter(([k]) => !(k in keys)).map(([, v]) => v),
+      // An open episode this memory never saw (older state): the same positive clearance.
+      ...openOnes.map((e) => e.measure).filter((m) => m?.repo === ev.repo && Number.isInteger(m.prNumber)
+        && OPERATOR_HOLD_KINDS.includes(m.kind) && !(`${m.prNumber}|${m.kind}` in keys) && !prior?.keys[`${m.prNumber}|${m.kind}`])];
+    for (const g of gone) mem.cleared[operatorHoldSubject({ repo: ev.repo, prNumber: g.prNumber, kind: g.kind })] = { repo: ev.repo, prNumber: g.prNumber, kind: g.kind };
+    mem.repos[ev.repo] = { at: ev.observedAt, intervalMs: ev.intervalMs, broken: false, keys };
+  }
+  // A snapshot stream that went quiet for longer than two intervals cannot prove the holds are still there.
+  for (const r of Object.values(mem.repos)) if (now - r.at > HOLD_CONTINUITY_INTERVALS * r.intervalMs) r.broken = true;
+  const open = new Set(openOnes.map((e) => e.subject));
+  for (const subject of Object.keys(mem.cleared)) if (!open.has(subject)) delete mem.cleared[subject];
+  return mem;
+}
+
+/** PURE: what the `operator-hold-aged` detector reads — only holds whose repository has an intact observation stream. */
+export function operatorHoldView(mem, episodes = {}) {
+  const current = [];
+  for (const [repo, r] of Object.entries(mem?.repos || {})) {
+    if (r.broken) continue;
+    for (const h of Object.values(r.keys)) current.push({ repo, prNumber: h.prNumber, kind: h.kind, first: h.first, last: h.last, lowerBound: !!h.lb });
+  }
+  return {
+    current,
+    cleared: new Set(Object.keys(mem?.cleared || {})),
+    clearedHolds: Object.values(mem?.cleared || {}),
+    openSubjects: new Set(Object.values(episodes || {}).filter((e) => e?.smell === OPERATOR_HOLD_SMELL_ID).map((e) => e.subject)),
+  };
 }
 
 // ── 3. Episodes ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -791,7 +910,13 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
     }
     heavyHeldSince = next;
   }
-  const ctx = { now, config: cfg, daemons, builder, probeErrors: errs, lastTick: state.lastTick, heavyHeldSince };
+  // operator-hold-aged — the review daemon's structured hold snapshots, folded across samples. No probe this tick
+  // leaves the memory as it is (the smell is then skipped, not evaluated as empty).
+  const operatorHolds = probes.operatorHolds ? foldOperatorHolds(state.operatorHolds, probes.operatorHolds, now, { episodes: state.episodes }) : (state.operatorHolds ?? undefined);
+  const ctx = {
+    now, config: cfg, daemons, builder, probeErrors: errs, lastTick: state.lastTick, heavyHeldSince,
+    operatorHolds: operatorHolds ? operatorHoldView(operatorHolds, state.episodes) : null,
+  };
   const evaluations = smells.map((smell) => {
     const needs = smell.probes ?? [];
     const missing = needs.filter((p) => probes[p] === undefined);
@@ -805,7 +930,7 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
       return { smell, results: null, error: String(e?.message || e) };
     }
   });
-  const stepped = stepEpisodes({ ...state, daemons, builder, probeErrors: errs, heavyHeldSince }, evaluations, now, { config: cfg, activeCards });
+  const stepped = stepEpisodes({ ...state, daemons, builder, probeErrors: errs, heavyHeldSince, ...(operatorHolds ? { operatorHolds } : {}) }, evaluations, now, { config: cfg, activeCards });
   const smellsById = Object.fromEntries(smells.map((s) => [s.id, s]));
   const plan = planActions(stepped.transitions, smellsById, { mode: cfg.mode, investigateDispatch: cfg.investigateDispatch, fileDispatch: cfg.fileDispatch });
   return { state: stepped.state, transitions: stepped.transitions, plan, evaluations };

@@ -44,7 +44,7 @@ import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
-  resolveConvertAdvisoryEnabled, sweepReviewHolds,
+  resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { tagReviewStatus } from '../../../scripts/conveyor/review-status-tag.mjs';
@@ -144,14 +144,14 @@ describe('runReviewTick — the per-tick sequence', () => {
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
     const tagRound = vi.fn();
     const tagStatus = vi.fn();
-    const out = runReviewTick({ reconcile, dispatch, tagRound, tagStatus, statusCandidates: () => [] });
+    const out = runReviewTick({ reconcile, dispatch, tagRound, tagStatus, statusCandidates: () => [], now: () => 7 });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'web-everything/web-everything', escalationReason: [], scopePaths: [] });
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
       pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
-      holdReconcile: [], holdReconcileError: null, liveProcessPrs: [],
+      holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
   });
 
@@ -1659,4 +1659,85 @@ it('card 273 forwards only explicitly waived advisory heads to dispatch', () => 
     dispatch, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [], acquirableLanes: () => 1 });
   expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
     advisoryCiWaiver: { head: 'a'.repeat(40), reason: 'human-handoff' } }));
+});
+
+describe('operator-hold snapshots (card 5653)', () => {
+  const WE = 'web-everything/web-everything';
+  const base = { holdReconcile: () => [], statusCandidates: () => [], tagRound: vi.fn(), tagStatus: vi.fn(), dispatch: vi.fn(), now: () => 1_000 };
+
+  it('extracts all four kinds, top-level and nested, deduplicated, ignoring other kinds and bad numbers', () => {
+    const plan = { dispatch: [], refusals: [
+      { kind: 'cap-exhausted', prNumber: 4, why: 'free text is never read' },
+      { kind: 'cap-exhausted', prNumber: 4 },
+      { kind: 'stood-down', prNumber: 5 },
+      { kind: 'owed-ci-rerun', prNumber: 6, reviewRefusal: { kind: 'review-referrals-pending' } },
+      { kind: 'review-referrals-pending', prNumber: 6, referralHold: { kind: 'same-head' } },
+      { kind: 'ruling-dispute', prNumber: 7 },
+      { kind: 'live-process', prNumber: 8 },
+      { kind: 'stood-down', prNumber: '9' }, // numeric string is coerced by Number() and accepted
+      { kind: 'stood-down', prNumber: 0 }, { kind: 'stood-down', prNumber: -2 }, { kind: 'stood-down', prNumber: 1.5 },
+      { kind: 'stood-down', prNumber: null }, { kind: 'bogus', prNumber: 10 }, null,
+    ] };
+    expect(operatorHoldsFromPlan(plan)).toEqual([
+      { prNumber: 4, kind: 'cap-exhausted' }, { prNumber: 5, kind: 'stood-down' },
+      { prNumber: 6, kind: 'review-referrals-pending' }, { prNumber: 7, kind: 'ruling-dispute' },
+      { prNumber: 9, kind: 'stood-down' },
+    ]);
+    expect(operatorHoldsFromPlan({})).toEqual([]);
+    expect(OPERATOR_HOLD_KINDS).toHaveLength(4);
+  });
+
+  it('a successful tick carries the snapshot taken at plan completion, empty list included, without changing dispatch', () => {
+    const plan = { dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 5 }] };
+    const out = runReviewTick({ ...base, repo: WE, reconcile: () => plan });
+    expect(out.operatorHolds).toEqual({ observedAt: 1_000, holds: [{ prNumber: 5, kind: 'stood-down' }] });
+    expect(out.dispatched).toEqual([]);
+    expect(runReviewTick({ ...base, repo: WE, reconcile: () => ({ dispatch: [], refusals: [] }) }).operatorHolds).toEqual({ observedAt: 1_000, holds: [] });
+  });
+
+  it('uses the final replacement plan after promotion', () => {
+    const reconcile = vi.fn().mockReturnValueOnce({ dispatch: [{ kind: 'promote-draft', prNumber: 7 }], refusals: [{ kind: 'stood-down', prNumber: 1 }] })
+      .mockReturnValueOnce({ dispatch: [], refusals: [{ kind: 'ruling-dispute', prNumber: 2 }] });
+    const out = runReviewTick({ ...base, repo: WE, reconcile, readPrs: () => [{ number: 7, isDraft: true, labels: [] }], readAgents: () => [],
+      promoteDrafts: () => ({ rows: [{ pr: 7, action: 'promoted' }] }) });
+    expect(out.operatorHolds.holds).toEqual([{ prNumber: 2, kind: 'ruling-dispute' }]);
+  });
+
+  it('withholds the snapshot when the promotion replan failed, the reconcile threw, or the shared PR read failed', () => {
+    const stale = { dispatch: [{ kind: 'promote-draft', prNumber: 7 }], refusals: [{ kind: 'stood-down', prNumber: 1 }] };
+    const replanFailed = runReviewTick({ ...base, repo: WE, reconcile: vi.fn().mockReturnValueOnce(stale).mockImplementationOnce(() => { throw Error('replan'); }),
+      readPrs: () => [{ number: 7, isDraft: true, labels: [] }], readAgents: () => [], promoteDrafts: () => ({ rows: [{ pr: 7, action: 'promoted' }] }) });
+    expect(replanFailed.operatorHolds).toBeNull();
+    const threw = runReviewTick({ ...base, repo: WE, reconcile: () => { throw Error('claude agents ENOENT'); } });
+    expect(threw.operatorHolds).toBeUndefined();
+    const unreadable = runReviewTick({ ...base, repo: WE, readPrs: () => { throw Error('gh'); }, readAgents: () => [], reconcile: vi.fn() });
+    expect(unreadable.operatorHolds).toBeUndefined();
+  });
+
+  it('aggregates one snapshot per successfully observed repository and skips failed repos', () => {
+    const [a, b, c] = REVIEW_DAEMON_REPOS;
+    const tick = ({ repo }) => {
+      if (repo === b) throw new Error('outage');
+      if (repo === c) return { reconcileError: 'x', reviewsOwed: 0, dispatched: [], failed: [] };
+      return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, operatorHolds: { observedAt: 9, holds: [{ prNumber: 1, kind: 'cap-exhausted' }] } };
+    };
+    const out = runReviewTickAllRepos({ tick, authGateOverride: () => ({ paused: false, reason: null }) });
+    expect(out.operatorHoldSnapshots).toEqual([{ repo: a, observedAt: 9, holds: [{ prNumber: 1, kind: 'cap-exhausted' }] }]);
+  });
+
+  it('onTick emits one parseable single-line record per snapshot with the resolved interval; a skipped tick emits none', () => {
+    const lines = [];
+    const fx = buildCliDaemonEffects({ owner: 'o', intervalMs: 45_000, log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
+    fx.onTick({ repos: [{ repo: WE }], reviewsOwed: 0, dispatched: [], failed: [], authPaused: false,
+      operatorHoldSnapshots: [{ repo: WE, observedAt: 123, holds: [{ prNumber: 3, kind: 'stood-down' }] }, { repo: REVIEW_DAEMON_REPOS[1], observedAt: 124, holds: [] }] });
+    const records = lines.filter((l) => l.startsWith('review-daemon: operator-holds '));
+    expect(records).toHaveLength(2);
+    expect(records[0]).not.toMatch(/\n/);
+    expect(JSON.parse(records[0].slice('review-daemon: operator-holds '.length))).toEqual({ version: 1, repo: WE, observedAt: 123, intervalMs: 45_000, holds: [{ prNumber: 3, kind: 'stood-down' }] });
+    expect(records[1]).toBe(formatOperatorHoldsRecord({ repo: REVIEW_DAEMON_REPOS[1], observedAt: 124, intervalMs: 45_000, holds: [] }));
+    const skipped = [];
+    const fx2 = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => skipped.push(l) }, reapSessions: () => null, runReview: () => ({}) });
+    fx2.onTick({ skipped: true, reason: 'tick-in-progress', repos: [], dispatched: [], failed: [], refusals: [], reconcileFailed: [], reviewsOwed: 0 });
+    expect(skipped.some((l) => l.includes('operator-holds'))).toBe(false);
+  });
 });
