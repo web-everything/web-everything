@@ -2,10 +2,60 @@
 import { describe, expect, it } from 'vitest';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { redTeamGateMarker, redTeamMarker } from '../red-team-gate.mjs';
+import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
+const prior = 'a'.repeat(40);
+const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const hold = (over = {}) => redTeamEnqueueHold({ labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
+const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
+const accept = (sha, cleared = false) => ({ ...bot, body: [buildReviewedShaMarker(sha), ...(cleared ? [buildClearedHumanMarker('operator')] : [])].join('\n') });
+// The exact body review-job.mjs posts when carryAcrossRebase moves a verdict from `from` to `to`.
+const carry = ({ from = prior, to = head, findings = [], gates = [], author = bot.author } = {}) => ({ author, body: [
+  ...gates.map(o => redTeamGateMarker(5283, to, o)),
+  buildVerdictCarriedMarker({ fromSha: from, toSha: to, patchId: 'c'.repeat(40) }),
+  'Review verdict carried across an identical contribution.',
+  clean(from, 'web-everything', findings).body.replace(redTeamMarker(5283, from), redTeamMarker(5283, to))].join('\n') });
+
+describe('carried red-team result (review-job carryAcrossRebase)', () => {
+  it('a trusted carried clean result releases the new head', () => {
+    expect(hold({ comments: [clean(prior), carry()] })).toBeNull();
+  });
+  it('ignores an untrusted carry and a carry keyed to another head', () => {
+    expect(hold({ comments: [carry({ author: { login: 'attacker' } })] })).toMatch(/no recorded result/);
+    expect(hold({ comments: [carry({ to: 'd'.repeat(40) })] })).toMatch(/no recorded result/);
+  });
+  it('a carried confirmed break still holds', () => {
+    expect(hold({ comments: [carry({ findings: broken })] })).toMatch(/requiring send-back/);
+  });
+});
+
+describe('operator ruling at the round cap', () => {
+  it('a clear-human after the round-cap record on this head releases the break', () => {
+    expect(hold({ comments: [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true)] })).toBeNull();
+  });
+  it.each([
+    ['clearance before the result', [accept(head, true), clean(head, 'web-everything', broken), gate(head, 'round-cap')]],
+    ['clearance before the round-cap record', [clean(head, 'web-everything', broken), accept(head, true), gate(head, 'round-cap')]],
+    ['clearance on another head', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(prior, true)]],
+    ['untrusted clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), { ...accept(head, true), author: { login: 'attacker' } }]],
+    ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
+    ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
+    ['a newer result after the ruling', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), clean(head, 'web-everything', broken)]],
+  ])('keeps holding: %s', (_name, comments) => expect(hold({ comments })).toMatch(/requiring send-back/));
+  it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
+    expect(hold({ comments: [...ruledOnPrior, accept(head, true), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+  });
+  it('a carry never invents a ruling the prior head did not have', () => {
+    expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(head, true), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
+});
 
 describe('durable head-bound red-team admission', () => {
   it('waits without a result; ignores stale, foreign-PR and untrusted markers', () => {
