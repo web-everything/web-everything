@@ -5,7 +5,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const hold = (over = {}) => redTeamEnqueueHold({ labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+const hold = (over = {}) => redTeamEnqueueHold({ loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 
 describe('durable head-bound red-team admission', () => {
   it('waits without a result; ignores stale, foreign-PR and untrusted markers', () => {
@@ -22,7 +22,11 @@ describe('durable head-bound red-team admission', () => {
   it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
     expect(hold({ env: { [key]: '0' } })).toBeNull();
   });
-  it('does not owe a pass without a panel accept', () => expect(hold({ labels: ['ready-to-merge'] })).toBeNull());
+  it.each([5439, 5443])('labels alone do not schedule a red team for #%s', pr => {
+    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toBeNull();
+    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } } })).toBeNull();
+  });
+  it('does not owe a pass without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toBeNull());
 });
 
 describe('drain policy cascade', () => {
@@ -32,7 +36,8 @@ describe('drain policy cascade', () => {
     expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true });
     expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'standard', dequeueOnSendBack: 'standard' });
     expect(lines.join('')).toContain('dequeueOnSendBack=true (standard)');
-    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 });
+    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true });
+    expect(lines.join('')).toContain('enqueueWhenRedTeamNeverScheduled=true (standard)');
     expect(lines.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
     expect(lines.join('')).toContain('redTeamPendingMaxMin=45 (standard)');
   });

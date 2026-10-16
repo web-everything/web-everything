@@ -1144,14 +1144,19 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
-Post-accept admission must cover accepted and advisory-accepted panels before speculation starts as well
-as while it runs. Only the trusted red-team result marker for the exact PR and live head releases that
-wait. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
+Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
+the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
+An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
 lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
 through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
 can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
-head past that age must return and log a named health smell without enqueueing. Test restarts,
-head resets, policy provenance and the absence of complete comment re-listing during backoff.
+head past that age must log a named health smell and recheck complete comments and run evidence.
+A recorded or live pass still waits. With neither, request through an available review dispatch hook;
+if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
+“red team never scheduled” note and its source. The current drain has no standalone red-team request
+queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
+comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+in the shared operations sidecar; a pid probe distinguishes an active process from a crashed one.
 A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
 removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
 drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`

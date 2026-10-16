@@ -70,6 +70,17 @@ function jobIo({ verdict = 'accept', setting = { value: 'on', enabled: true, sou
 const kinds = (calls) => calls.filter((c) => c[0] !== 'log').map((c) => c[0]);
 
 describe('runReviewJob under review.speculativeRedTeam', () => {
+  it.each([true, false])('publishes head-bound liveness around the accepted pass (speculative=%s)', enabled => {
+    const events = [];
+    const { io } = jobIo({ setting: { enabled }, over: {
+      redTeamStatus: row => events.push(row),
+      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+    } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(events.map(row => row.status)).toEqual(['running', 'finished']);
+    expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+  });
   it('starts the red team BEFORE the loop, hands the loop the read sink, and logs the layer that set the setting', () => {
     const { io, calls } = jobIo();
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);

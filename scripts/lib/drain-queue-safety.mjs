@@ -1,4 +1,5 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
+import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -11,9 +12,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const numberEnv = key => env[key] === undefined ? undefined : Number(env[key]);
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
+    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   return r;
@@ -26,23 +27,18 @@ export function sendBackReason(labels) {
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
-/** Same accepted-panel shapes as review-extra-seats' redTeamOwedFor, using the published verdict labels. */
-export function postAcceptRedTeamOwed(labels, env = process.env) {
-  const off = key => ['0', 'off', 'false', 'no'].includes(String(env[key] ?? '').trim().toLowerCase());
-  if (off('WE_REVIEW_RED_TEAM') || off('WE_REVIEW_EXTRA_SEATS')) return false;
-  const names = queueLabels(labels);
-  return names.includes('review:accepted') || names.includes('advisory:accepted');
+/** The review scheduler's decision over its actual head-bound payload, never inferred from labels. */
+export function postAcceptRedTeamOwed(loopPayload, env = process.env) {
+  return redTeamEnabled(env) && redTeamOwedFor(loopPayload);
 }
 
-/** Accepted panels owe the post-accept pass even when speculation has not started. No clocks. */
-export function redTeamEnqueueHold({ labels, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
-  if (!postAcceptRedTeamOwed(labels, env)) return null;
+export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
+  // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   const result = redTeamForHead(comments, pr, head);
-  if (!result) return 'post-accept red team has no recorded result on the live head';
-  // The result comment precedes the gate. Do not enqueue in that second race window either.
-  if (planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length)
+  if (result && planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length)
     return 'post-accept red team confirmed a break requiring send-back';
-  return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env) || result) return null;
+  return 'post-accept red team has no recorded result on the live head';
 }
 
 /** Membership is authoritative both before and after the mutation. A retry after success posts no duplicate. */

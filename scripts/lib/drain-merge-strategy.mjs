@@ -30,6 +30,7 @@
  *   operator can preview which PRs `github-merge-queue` would enqueue without flipping the live policy. A live
  *   (non-dry-run) pass ignores the variable and says so.
  */
+import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { execFileSync } from 'node:child_process';
@@ -206,7 +207,7 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
-  env = process.env, queueSafety,
+  env = process.env, queueSafety, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -308,23 +309,44 @@ export function createDrainMergeStrategy({
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
-      if (safety.value.waitForRedTeamBeforeEnqueue && postAcceptRedTeamOwed(live.labels, env)) {
+      if (safety.value.waitForRedTeamBeforeEnqueue) {
+        const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
+        const owed = postAcceptRedTeamOwed(evidence.loopPayload, env);
         const pending = before.redTeamPending?.[key];
         const sameHead = pending?.headSha === headSha;
-        // Preread comments can wake a held head early; otherwise do not re-list until the backoff expires.
+        const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
         const newComment = Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
-        if (sameHead && pending.retryAt > now() && !newComment) return pendingOutcome(c, pending);
+        // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
+        if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
         const pages = JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(c.repo)}/issues/${c.num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ labels: live.labels, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
-            commentCount: pages.flat().length, reason };
+            commentCount: pages.flat().length, reason,
+            ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}) };
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
-          return pendingOutcome(c, wait);
+          const outcome = pendingOutcome(c, wait);
+          // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape.
+          if (!outcome.healthSmell || evidence.inFlight || evidence.recorded || reason.includes('requiring send-back')) return outcome;
+          let requested = false;
+          if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
+          if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
+            try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
+            catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+          }
+          if (requested) {
+            wait.requestedAt = now();
+            writeState(statePath, before);
+            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
+            return { ...outcome, redTeamRequested: true };
+          }
+          const fallback = safety.value.enqueueWhenRedTeamNeverScheduled ?? true;
+          log.write(`  merge-queue: #${c.num} red team never scheduled — enqueueWhenRedTeamNeverScheduled=${fallback} (${safety.sources?.enqueueWhenRedTeamNeverScheduled ?? 'standard'}); no successful red-team request path\n`);
+          if (!fallback) return outcome;
         }
       }
       if (before.redTeamPending?.[key]) {
