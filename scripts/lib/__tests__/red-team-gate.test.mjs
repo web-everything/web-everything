@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
-  redTeamForHead, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
+  resolveRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
 } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
@@ -188,5 +188,24 @@ describe('redTeamRulingNeeded', () => {
       [capped], [bot(BODY_4722)], [bot(BODY_4722), bot(redTeamGateMarker(4722, OTHER, GATE_OUTCOMES.ROUND_CAP))],
       [{ ...bot(BODY_4722), author: { login: 'mallory' } }, capped],
     ]) expect(redTeamRulingNeeded(pr(comments))).toBeNull();
+  });
+});
+
+
+describe('red-team probe policy cascade', () => {
+  it('defaults both controls on', () => {
+    expect(resolveRedTeamProbes()).toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: true },
+      sources: { recheckReadsRepo: 'standard', skipCardOnly: 'standard' } });
+  });
+  it('resolves each key independently through platform, tool and env', () => {
+    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false, skipCardOnly: false },
+      file: { redTeam: { recheckReadsRepo: true } }, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' } }))
+      .toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: true }, sources: { recheckReadsRepo: 'tool', skipCardOnly: 'env' } });
+    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false } }).sources.recheckReadsRepo).toBe('platform');
+  });
+  it('invalid overrides retain the lower layer', () => {
+    expect(resolveRedTeamProbes({ platform: { skipCardOnly: false }, file: { redTeam: { skipCardOnly: 'yes' } },
+      env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'maybe' } })).toMatchObject({ value: { skipCardOnly: false }, sources: { skipCardOnly: 'platform' },
+      invalid: ['tool.skipCardOnly="yes"', 'env.skipCardOnly="maybe"'] });
   });
 });

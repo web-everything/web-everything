@@ -1,5 +1,27 @@
 # Testing — Three-Tier Strategy
 
+## Red-team re-check evidence
+
+The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
+never the released review lane's current HEAD or the red-team probe's working tree. Its Claude
+juror uses `judge-spawn.mjs` with `Read`, `Glob`, and `Grep` only, in an independent lane-shaped
+scratch directory; cleanup runs after success or failure. A configured provider unable to honor
+that tool allow-list fails the re-check rather than silently dropping repository access.
+The mandate requires reading cited files and callers and reporting repo-relative `filesRead`
+per claim. A negative answer with no files read, missing answer, unavailable context, or failed
+re-check is `unverifiable`, not `not confirmed`. That outcome and the files read survive evidence
+storage and comment retries; only confirmed findings count as misses.
+
+`redTeam.recheckReadsRepo` and `redTeam.skipCardOnly` default to true. The cascade is standard
+→ platform (`delivery-platform-preferences.json`'s `redTeam` block) → tool
+(`scripts/settings/red-team.json`'s `redTeam` block) → environment
+(`WE_RED_TEAM_RECHECK_READS_REPO`, `WE_RED_TEAM_SKIP_CARD_ONLY`; true/false, on/off, 1/0).
+Effective values and sources are logged before probes. Card-only detection reuses
+`ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list; unknown/empty lists do not skip.
+The sequential and speculative paths skip before budget reservation and record the reason
+`red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
+negative answers without file reads remain unverifiable.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review

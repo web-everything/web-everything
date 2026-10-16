@@ -4,9 +4,15 @@
  * agy, claude, git or GitHub process: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
+import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 import {
-  runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
+  createRedTeamIo, speculateRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
   buildRedTeamTask, buildRecheckRequest, applyRecheck, buildMissRows, renderRedTeamComment, replayPayload,
   reserveSeatCalls, RED_TEAM_ENV, EXTRA_SEATS_ENV, DAILY_CAP_ENV, PROVIDER_CAP_ENV, RED_TEAM_SEAT, RED_TEAM_MODELS,
   RED_TEAM_MISS_DISPATCH_KIND, ACCEPTING_SEAT_MODEL, DEFAULT_PROBE_INTERVAL_MS,
@@ -484,5 +490,108 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
 
   it('summarizeRedTeam keeps the essentials', () => {
     expect(summarizeRedTeam({ status: 'skipped', reason: 'daily-cap' })).toEqual({ status: 'skipped', reason: 'daily-cap' });
+  });
+});
+
+
+describe('repo-grounded red-team re-check and card-only skips', () => {
+  it.each([true, false])('skips card-only probes before any reservation (speculative=%s)', async speculative => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123-card.md'];
+    const { io, calls, rows } = fakeIo();
+    const r = speculative
+      ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
+      : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
+    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(calls.every(c => c[0] === 'log')).toBe(true);
+    expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
+    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=true.*standard/);
+    expect(rows).toEqual([]);
+  });
+
+  it.each([['backlog/123-card.md', 'code.mjs'], [], ['backlog/../code.mjs']])('does not skip a non-card or unknown diff: %j', async (...files) => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = files;
+    const { io, calls } = fakeIo();
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io)).status).toBe('ran');
+    const request = calls.find(c => c[0] === 'recheck')[1];
+    expect(request).toMatchObject({ lanePath: 'lane', rev: REV, readsRepo: true });
+    expect(request.mandate).toMatch(/open the cited files and their callers/);
+    expect(request.mandate).toMatch(/filesRead/);
+    expect(request.shape.properties.checks.items.required).toContain('filesRead');
+  });
+
+  it('allows the env override to run card-only probes without repository tools', async () => {
+    const p = payload('accept');
+    p.findings.read.netChangedFiles = ['backlog/123.md'];
+    const { io, calls } = fakeIo();
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p,
+      env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false', WE_RED_TEAM_RECHECK_READS_REPO: '0' } }, io)).status).toBe('ran');
+    expect(calls.find(c => c[0] === 'recheck')[1]).toMatchObject({ readsRepo: false, mandate: expect.stringContaining('tools are disabled') });
+    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=false.*env.*skipCardOnly=false.*env/);
+  });
+
+  it.each([undefined, [], [''], ['../outside'], ['/outside']])('a negative without valid files read is unverifiable: %j', filesRead => {
+    const [f] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, reason: 'needs caller context', filesRead }] });
+    expect(f).toMatchObject({ confirmedByRecheck: false, recheckOutcome: 'unverifiable', filesRead: [] });
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: [f], recheckStatus: 'ok', foldedVerdict: 'accept' });
+    expect(body).toContain('[unverifiable]');
+    expect(body).not.toContain('[not confirmed]');
+    expect(parseRedTeamComment(body).findings[0]).toMatchObject({ confirmed: false, recheckOutcome: 'unverifiable' });
+  });
+
+  it('distinguishes a grounded refutation from an unreadable claim', () => {
+    const checks = [{ index: 0, confirmed: false, reason: 'caller guards n', filesRead: ['x.mjs', 'caller.mjs'] }];
+    expect(applyRecheck([BREAK], { checks })[0].recheckOutcome).toBe('not confirmed');
+    expect(applyRecheck([BREAK], { checks: [{ ...checks[0], unverifiable: true }] })[0].recheckOutcome).toBe('unverifiable');
+  });
+
+  it.each([false, true])('persists unverifiable on comment retry, including legacy rows (legacy=%s)', async legacy => {
+    const first = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'no context', filesRead: [] }] }),
+      postComment: () => { throw new Error('offline'); } });
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, first.io);
+    if (legacy) {
+      delete first.rows[0].findings[0].recheckOutcome;
+      delete first.rows[0].findings[0].filesRead;
+    }
+    const again = fakeIo({ readRecords: () => first.rows });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, again.io);
+    expect(result.comment.body).toContain('[unverifiable]');
+    if (!legacy) expect(result.comment.body).toContain('Files read: none');
+  });
+
+  it.each([false, true])('the production re-check uses an independent pinned lane and cleans it (failure=%s)', async fail => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-recheck-test-'));
+    const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+    let cwd;
+    try {
+      git('init', '--quiet');
+      git('config', 'user.name', 'Recheck Test');
+      git('config', 'user.email', 'recheck@example.test');
+      writeFileSync(join(root, 'caller.mjs'), 'export const guard = true;');
+      git('add', '.');
+      git('commit', '--quiet', '-m', 'reviewed head');
+      const rev = git('rev-parse', 'HEAD');
+      writeFileSync(join(root, 'caller.mjs'), 'export const guard = false;');
+      git('commit', '--quiet', '-am', 'later unrelated head');
+      const io = createRedTeamIo({ env: {}, spawnRecheck: async opts => {
+        cwd = opts.cwd;
+        assertLaneCwd(cwd, opts.allowedTools);
+        expect(opts.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
+        const argv = buildJudgeArgv({ ...opts, sessionId: deriveSessionId(opts.runId) });
+        expect(argv).toContain('--allowedTools');
+        expect(argv).not.toContain('Bash');
+        expect(execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(rev);
+        expect(readFileSync(join(cwd, 'caller.mjs'), 'utf8')).toBe('export const guard = true;');
+        expect(existsSync(join(cwd, '.git', 'objects', 'info', 'alternates'))).toBe(false);
+        if (fail) throw new Error('recheck failed');
+        return { value: { checks: [] } };
+      } });
+      const request = { pr: 5, lanePath: root, rev, ...buildRecheckRequest({ pr: 5, repo: REPO, findings: [BREAK] }) };
+      if (fail) await expect(io.runRecheck(request)).rejects.toThrow('recheck failed');
+      else expect(await io.runRecheck(request)).toEqual({ checks: [] });
+      expect(existsSync(cwd)).toBe(false);
+      expect(readFileSync(join(root, 'caller.mjs'), 'utf8')).toBe('export const guard = false;');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
