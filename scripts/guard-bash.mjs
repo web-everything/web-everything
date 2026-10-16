@@ -1053,10 +1053,9 @@ function scanRun(s, i, atWordStart) {
  *     safe, replacing the old end-of-segment anchor that only worked by accident);
  *   • redirect operators are split out as their own `op` tokens even when glued to their neighbours, with
  *     any fd prefix attached: `2>&1` → `2>&` + `1`, `>|file` → `>|` + `file`, `cmd>x` → `cmd` + `>` + `x`.
- * `preserveQuotes` keeps each word's lexical spelling for callers that need expansion provenance.
  * Not a shell parser — no expansion, no command substitution; the #2367 accidental-collision threat model.
  */
-export function shellTokens(segment, { preserveQuotes = false } = {}) {
+export function shellTokens(segment) {
   const s = String(segment || '');
   const out = [];
   let cur = '';
@@ -1074,14 +1073,14 @@ export function shellTokens(segment, { preserveQuotes = false } = {}) {
     if (run && run.kind === 'comment') { inComment = true; }
     else if (run && run.kind === 'continuation') { i = run.end; atWordStart = true; continue; }
     else if (run && run.kind !== 'escape') {                    // 'quote' | 'unterminated'
-      cur += preserveQuotes ? run.raw : run.body;
+      cur += run.body;                                          // body only — the quotes are resolved away
       started = true;
       quoted = true;
       atWordStart = false;
       i = run.end;
       continue;
     } else if (run) {                                           // 'escape'
-      cur += preserveQuotes ? run.raw : run.body; started = true; atWordStart = false; i = run.end; continue;
+      cur += run.body; started = true; atWordStart = false; i = run.end; continue;
     }
     if (ch === '>' || ch === '<') {
       let fd = '';
@@ -1146,11 +1145,6 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   // `||` (logical or, not a pipe) is excluded: its second `|` is what the very next char test below reads.
   const pipedFrom = [];
   let pendingPiped = false;      // segs[0] (the first segment) has no predecessor
-  // #5957 — `separators[i]` is the separator run that ENDS `segs[i]` (`;`, `&&`, `|`, `\n`, …; '' for the last)
-  // and `commented[i]` says `segs[i]` begins inside a `#` comment, for the cwd resolver's statement walk.
-  const separators = [];
-  const commented = [];
-  let segInComment = false;
   let cur = '';
   let unterminated = false;
   let continued = false;
@@ -1158,7 +1152,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   let inComment = false;
   // A comment switches quoting off until END OF LINE — a separator does NOT end it (bash agrees: `# a; b`
   // is all comment). Only a newline clears it.
-  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); commented.push(segInComment); cur = ''; atWordStart = true; };
+  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); cur = ''; atWordStart = true; };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // Inside a `#` comment ONLY quoting is switched off; the comment TEXT and every separator in it are
@@ -1170,7 +1164,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       i = run.end;                                                  // `\`+newline: both characters vanish
       // …unless we're taking the NAIVE per-physical-line reading, which must reproduce the pre-#2994
       // segment text EXACTLY — trailing `\` included — or it is not the superset it claims to be.
-      if (!spliceContinuations) { cur += '\\'; cut(); separators.push('\n'); inComment = false; segInComment = false; }
+      if (!spliceContinuations) { cur += '\\'; cut(); inComment = false; }
       continue;
     } else if (run) {                                               // 'quote' | 'unterminated' | 'escape'
       if (run.kind === 'unterminated') unterminated = true;
@@ -1195,10 +1189,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       // the `cut()` that finalizes THIS next segment.
       pendingPiped = ch === '|' && s[i + 1] !== '|';
       if (ch === '\n') inComment = false;
-      const from = i;
       while (i + 1 < s.length && /[;&|\n]/.test(s[i + 1])) { if (s[i + 1] === '\n') inComment = false; i += 1; }
-      separators.push(s.slice(from, i + 1));
-      segInComment = inComment;
       continue;
     }
     cur += ch;
@@ -1206,9 +1197,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   }
   segs.push(cur);
   pipedFrom.push(pendingPiped);
-  commented.push(segInComment);
-  separators.push('');
-  return { segments: segs, unterminated, continued, pipedFrom, separators, commented };
+  return { segments: segs, unterminated, continued, pipedFrom };
 }
 
 /** The segments-only view of `parseSegments` (the raw text of each `&&`/`||`/`;`/`&`/`|`/newline-separated
@@ -2449,13 +2438,13 @@ export function hasDestructiveLaneOp(command) {
 // literal text, exactly as in a shell. The home source is the hook process's own HOME (`home`; `null` = unset),
 // overridden in command order by a literal `HOME=/abs` assignment. Nothing is ever executed or looked up: an
 // unset/relative HOME, `~user`, an unknown variable, a substitution or an unquoted glob stays unresolved.
-function expandCdTarget(rest, vars, home) {
+function expandCdTarget(rest, home) {
   const s = String(rest);
   const variable = (at) => {
     const m = s.slice(at).match(/^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/);
     if (!m) return null;
     const name = m[1] ?? m[2];
-    const value = name === 'HOME' ? home : vars[name];
+    const value = name === 'HOME' ? home : null;
     return typeof value === 'string' ? { value, end: at + m[0].length - 1 } : null;
   };
   let out = '';
@@ -2481,559 +2470,21 @@ function expandCdTarget(rest, vars, home) {
     } else if (ch === '\\') {
       if (i + 1 >= s.length) return null;
       out += s[++i];
-    } else if (ch === '$' && s[i + 1] === '"') {                           // $"…" is a double-quoted run
-      continue;
-    } else if (ch === '$' && s[i + 1] === "'") {                           // $'…' — only escape-free bodies
-      const close = s.indexOf("'", i + 2);
-      if (close < 0 || s.slice(i + 2, close).includes('\\')) return null;
-      out += s.slice(i + 2, close);
-      i = close;
     } else if (ch === '$') {                                               // unquoted: must not word-split or glob
       const v = variable(i);
-      if (!v || /[\s*?]/.test(v.value)) return null;
+      if (!v || /[\s*?\[]/.test(v.value)) return null;
       out += v.value;
       i = v.end;
     } else if (ch === '~' && i === 0) {                                    // only `~` / `~/…` — never `~user`, `~+`
       if (!/^(?:\/|$|\s|[<>])/.test(s.slice(1)) || !home) return null;
       out += home;
-    } else if (ch === '`' || ch === '*' || ch === '?') {
+    } else if (ch === '`' || ch === '*' || ch === '?' || ch === '[') {
       return null;
     } else {
       out += ch;
     }
   }
   return out || null;
-}
-
-// The value of an assignment spelled `raw`, expanded as bash does (tilde at the start, `$VAR`, quotes, joined
-// pieces; no word splitting) against the walk's current variables. null = unevaluable: the variable becomes
-// unknown rather than silently keeping its previous value.
-function assignmentValue(raw, vars, home) {
-  if (raw === '' || raw === '""' || raw === "''") return '';
-  if (raw.includes(OPAQUE_BLANK) || raw.includes(':~')) return null;  // odd blank / tilde after a colon
-  return expandCdTarget(raw, vars, home);
-}
-
-// Whitespace JavaScript's `\s` splits on but bash treats as an ordinary character (NBSP, CR, U+2028, …). It is
-// swapped for one private-use character before tokenizing, so it never splits a word, and any word carrying it
-// is unevaluable.
-const ODD_BLANK = /[^\S \t\n]/g;
-const OPAQUE_BLANK = String.fromCharCode(0xe000);
-
-// A statement's shell tokens — `raw` keeps the lexical spelling (for expansion), `text` is after quote removal
-// (what a builtin sees as an option or a name). Redirect operators and their operands stay in the stream,
-// marked `redir`, so the substitution scan sees every character (`${Y:-<}`, `$(cat <f)`); `parseStatement`
-// drops the top-level ones. A `#` comment (a word that begins with an unquoted `#`) is cut with everything after.
-function shellWords(stmt) {
-  const s = String(stmt).replace(ODD_BLANK, OPAQUE_BLANK);
-  const tokens = shellTokens(s, { preserveQuotes: true });
-  // Where each token starts in `s` (-1 once one cannot be placed, e.g. across a line continuation: the scan
-  // then stops, so it stays linear).
-  const at = [];
-  for (let i = 0, pos = 0; i < tokens.length; i++) {
-    const idx = pos < 0 ? -1 : s.indexOf(tokens[i].text, pos);
-    at.push(idx);
-    pos = idx < 0 ? -1 : idx + tokens[i].text.length;
-  }
-  const words = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    // `<(…)` / `>(…)` is a process substitution, not a redirect: a word of its own (`/dev/fd/63`) when it starts
-    // one, part of the word it is glued to (`X=/etc<(true)`), and a dropped operand as a redirect's target
-    // (`< <(cmd)`).
-    if (t.op && (t.text === '<' || t.text === '>') && !tokens[i - 1]?.op && at[i] >= 0
-      && tokens[i + 1]?.text.startsWith('(') && at[i + 1] === at[i] + 1) {
-      const prev = words[words.length - 1];
-      const glued = i > 0 && at[i - 1] >= 0 && at[i - 1] + tokens[i - 1].text.length === at[i] && prev;
-      const raw = t.text + tokens[++i].text;
-      // glued to a redirect's target (`</<(true)`), it is part of that target and is dropped with it
-      if (glued) words[words.length - 1] = { raw: prev.raw + raw, text: prev.text + raw, redir: prev.redir };
-      else words.push({ raw, text: raw, redir: false });
-      continue;
-    }
-    words.push({ raw: t.text, text: t.op ? t.text : shellTokens(t.text)[0]?.text ?? '', redir: t.op || !!tokens[i - 1]?.op });
-  }
-  const comment = words.findIndex((w) => !w.redir && w.raw.startsWith('#'));
-  return comment < 0 ? words : words.slice(0, comment);
-}
-
-const ASSIGNMENT_WORD = /^([A-Za-z_]\w*)(\[[^\]]*\])?(\+?)=/;
-const NAME_PREFIX = /^[A-Za-z_]\w*/;
-// Builtins whose operands are `name` / `name=value`. The value-changing option letters (integer, case,
-// nameref) make an assigned name unknown; `-f`/`-F` (functions) and `-p` (print) never touch a variable.
-const DECLARATION_BUILTINS = { declare: /[ilun]/, typeset: /[ilun]/, local: /[ilun]/, readonly: null, export: null };
-// The option letters each declaration builtin accepts in bash 3.2, and the ones only a newer bash adds.
-const DECLARATION_OPTIONS_32 = { declare: 'afFiprtx', typeset: 'afFiprtx', local: 'afFiprtx', export: 'fnp', readonly: 'afp' };
-const DECLARATION_OPTIONS_NEWER = 'AgIlnuc';
-// Option letters that take an argument, for the builtins that read into named variables.
-const OPTION_ARGS = { read: 'adinNptu', mapfile: 'dnOsuCc', readarray: 'dnOsuCc' };
-// Names `let` assigns: `N=`, `N op=`, `N++`/`N--`, `++N`/`--N` (`==`, `<=`, `!=` only compare). The lookbehind
-// starts a match only at the head of a name, so the scan stays linear; LET_MAX_CHARS bounds the subscript scan.
-const LET_ASSIGNED = /(?<![\w$])([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--|(?:[-+*/%&^|]|<<|>>)?=(?!=))|(?:\+\+|--)\s*([A-Za-z_]\w*)/g;
-const LET_MAX_CHARS = 4096;
-// How many `${` / `((` one statement may carry before its expansions are read as unknown (bounds the scan).
-const EXPANSION_SCAN_MAX = 256;
-// The ops a statement's words can make: `{ name, raw }` binds (raw null = unknown), `{ name, readonly: true }`
-// freezes a name, `{ all: true }` makes every variable (and HOME) unknown.
-const CLEAR_ALL = { all: true };
-const ARITH_ASSIGN_OP = /(?:<<|>>|[-+*/%&^|])?=(?!=)/g;
-
-// The names an arithmetic expression assigns, or [CLEAR_ALL] when its targets cannot be read statically: an
-// expression with an expansion in it whose assignment target is not a plain name (`$N=1`, `${N}X=1`,
-// `$(echo X)=1`, `${!N}=1`), or that increments anything (`$N++`).
-function arithmeticOps(expr) {
-  if (expr.length > LET_MAX_CHARS) return [CLEAR_ALL];
-  if (/[$`]/.test(expr)) {
-    // an increment whose operand is not a plain name: `$N++`, `${N}X++`, `$N[0]++`, `"$N"++`, `++${N}`
-    if (/[$}\])"'`]\w*\s*(?:\+\+|--)|(?:\+\+|--)\s*[$`"']/.test(expr)) return [CLEAR_ALL];
-    for (const m of expr.matchAll(ARITH_ASSIGN_OP)) {
-      if (m[0] === '=' && /[=!<>]/.test(expr[m.index - 1] ?? '')) continue; // `==`, `!=`, `<=`, `>=` compare
-      let j = m.index;
-      while (j > 0 && /\s/.test(expr[j - 1])) j--;
-      if (expr[j - 1] === ']') j = expr.lastIndexOf('[', j - 1);
-      let s = j;
-      while (s > 0 && /\w/.test(expr[s - 1])) s--;
-      if (j < 0 || s === j || /^\d/.test(expr[s]) || /[$}\w)`\]]/.test(expr[s - 1] ?? '')) return [CLEAR_ALL];
-    }
-  }
-  return [...expr.matchAll(LET_ASSIGNED)].map((m) => ({ name: m[1] ?? m[2], raw: null }));
-}
-
-// The segment text in which expansions happen: single-quoted runs and escaped characters blanked (a `'` inside
-// double quotes is literal), cut at a word-initial unquoted `#` comment. Linear.
-function expandableText(stmt) {
-  const s = String(stmt);
-  let out = '';
-  let dq = false;
-  let arith = 0;                                                // open parens of a `$((…))`
-  let aq = false;                                               // inside double quotes within it
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '\\') { i++; out += ' '; continue; }
-    if (!dq && !(arith && aq) && c === "'") {
-      const close = s.indexOf("'", i + 1);
-      if (close < 0) break;
-      i = close;
-      out += ' ';
-      continue;
-    }
-    if (arith) {
-      // parens count only outside quotes: `$((echo ")") )` is a command substitution bash also accepts
-      if (c === '"') aq = !aq;
-      else if (!aq && c === '(') arith++;
-      else if (!aq && c === ')') arith--;
-      if (!arith) aq = false;
-    } else if (c === '$' && s[i + 1] === '(' && s[i + 2] === '(') { out += '$(('; i += 2; arith = 2; continue; }
-    else if (c === '"') dq = !dq;
-    else if (!dq && c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;
-    else if (dq && c === '(' && s[i + 1] === '(') { out += '  '; i++; continue; } // a literal `((` in quotes
-    out += c;
-  }
-  return out;
-}
-
-// What expansions inside a statement assign while they expand: `${N=v}` / `${N:=v}`, arithmetic in a `${…}`
-// subscript or substring offset (`${a[N=0]}`, `${Z:N=1}`), and `((…))` / `$((…))` (nested parens included).
-// Read from the segment text, since the word split would take `<<=` for a redirect.
-function expansionOps(stmt) {
-  const text = expandableText(stmt);
-  const ops = [];
-  let count = 0;
-  for (let i = text.indexOf('${'); i >= 0; i = text.indexOf('${', i + 2)) {
-    if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
-    const close = text.indexOf('}', i + 2);
-    const body = text.slice(i + 2, close < 0 ? Math.min(text.length, i + 3 + LET_MAX_CHARS) : close);
-    if (body.length > LET_MAX_CHARS) return [CLEAR_ALL];
-    const m = /^!?([A-Za-z_]\w*|\d+|[@*#?$!-])(?:\[([^\]]*)\])?([^]*)$/.exec(body);
-    if (!m) { if (body.includes('=')) return [CLEAR_ALL]; continue; }
-    if (m[2] !== undefined) ops.push(...arithmeticOps(m[2]));
-    if (/^:?=/.test(m[3])) ops.push({ name: m[1], raw: null });
-    else if (/^:(?![-+=?])/.test(m[3])) ops.push(...arithmeticOps(m[3].slice(1)));
-  }
-  count = 0;
-  for (let i = text.indexOf('(('); i >= 0; i = text.indexOf('((', i + 2)) {
-    if (++count > EXPANSION_SCAN_MAX) return [CLEAR_ALL];
-    let depth = 0;
-    let j = i + 2;
-    for (; j < text.length && j - i <= LET_MAX_CHARS; j++) {
-      if (text[j] === '(') depth++;
-      else if (text[j] === ')') { if (depth === 0) break; depth--; }
-    }
-    if (j - i > LET_MAX_CHARS) return [CLEAR_ALL];
-    ops.push(...arithmeticOps(text.slice(i + 2, j)));
-  }
-  return ops;
-}
-
-// Scan one word's spelling for expansions, carrying the open-context `stack` (the closer each one waits for:
-// `)` for `$(`/`(`, `}` for `${`, `]` for `$[`, `"`, `` ` ``) across the statement's words: tokenizing splits
-// an unquoted `$(echo a b)` or `${A[ (1 + 2) ]}` into several words. Quotes nest the way bash nests them
-// (`"$(echo "a b")"`); inside `${…}` / `$[…]` a bare paren is literal (`${Y//(/a}`). false = a `)` that closes
-// nothing, or an unclosed `'`. Linear.
-const EXPANSION_CLOSER = { '(': ')', '{': '}', '[': ']' };
-// One step of that scan at raw[i]: returns the index of the last character it consumed, or -1 when broken.
-function scanChar(raw, i, stack) {
-  const c = raw[i];
-  const top = stack[stack.length - 1];
-  if (c === '\\') return i + 1;
-  if (c === '$' && raw[i + 1] === '$') return i + 1;            // `$$` is the shell's pid, not an opener
-  if (c === '$' && EXPANSION_CLOSER[raw[i + 1]]) { stack.push(EXPANSION_CLOSER[raw[i + 1]]); return i + 1; }
-  if (top === '"') {
-    if (c === '"') stack.pop();
-    else if (c === '`') stack.push('`');
-    return i;
-  }
-  if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); return i; }
-  if (c === "'") return raw.indexOf("'", i + 1);
-  if (c === '"') stack.push('"');
-  else if (top === '}' || top === ']') { if (c === top) stack.pop(); }
-  else if (c === '(') stack.push(')');
-  else if (c === ')') { if (top !== ')') return -1; stack.pop(); }
-  return i;
-}
-function scanSubstitutions(raw, stack) {
-  for (let i = 0; i < raw.length; i++) {
-    i = scanChar(raw, i, stack);
-    if (i < 0) return false;
-  }
-  return true;
-}
-
-// Split a statement into its persisting-or-temporary prefix assignments and the command words. Reserved words
-// that run the command in this shell (`{`, `!`, `time [-p]` — only when unquoted) and a `builtin` / `command`
-// wrapper are skipped (`command -v`/`-V` only looks a name up, so it stays the command). From the first word
-// that leaves a substitution open, the words cannot be trusted: `opaque` lists the names they could assign, and
-// `cd` says the statement may itself be a cd (a `cd` nested inside the open substitution is not). `invalid`
-// marks a statement bash rejects before running.
-// Is `raw` made only of unquoted expansions (`$N`, `$1`, `$@`, `${…}`, `$(…)`, backticks), so that it can
-// expand to no word at all? Literal text or any quoting means a word survives. Linear; an oversized word is
-// assumed to be able to vanish.
-function mayExpandToNothing(raw) {
-  if (raw.length > LET_MAX_CHARS) return true;
-  const stack = [];
-  for (let i = 0; i < raw.length; i++) {
-    if (!stack.length) {                                        // between expansions: only another may start
-      const c = raw[i];
-      const n = raw[i + 1] ?? '';
-      if (c === '$' && /[A-Za-z_]/.test(n)) { i++; while (/\w/.test(raw[i + 1] ?? '')) i++; continue; }
-      if (c === '$' && /[0-9@*#?$!-]/.test(n)) { i++; continue; }
-      if (c !== '`' && !(c === '$' && EXPANSION_CLOSER[n])) return false;
-    }
-    i = scanChar(raw, i, stack);                                // inside one: bash's own nesting rules
-    if (i < 0) return true;
-  }
-  return true;
-}
-
-function parseStatement(tokens) {
-  // Re-join the words tokenizing split inside a substitution (`X=$(echo a b)` is ONE shell word). Redirect
-  // tokens are scanned too (inside a substitution they are part of its text), then dropped at the top level.
-  let words = [];
-  const firstToken = [];                                        // words[n] starts at tokens[firstToken[n]]
-  const stack = [];
-  let open = -1;
-  let broken = false;
-  let cdAfterOpen = false;
-  for (const [t, w] of tokens.entries()) {
-    if (broken) {
-      if (w.text === 'cd' && !w.redir) cdAfterOpen = true;
-      words.push(w);
-      firstToken.push(t);
-      continue;
-    }
-    const inside = stack.length > 0;
-    if (!scanSubstitutions(w.raw, stack)) broken = true;
-    if (inside) {
-      const prev = words[words.length - 1];
-      words[words.length - 1] = { raw: `${prev.raw} ${w.raw}`, text: `${prev.text} ${w.text}`, redir: prev.redir };
-    } else {
-      words.push(w);
-      firstToken.push(t);
-      if (broken || stack.length) open = words.length - 1;
-    }
-    if (broken && open < 0) open = words.length - 1;
-  }
-  if (!broken && !stack.length) open = -1;                      // every substitution closed
-  if (open >= 0) {
-    const head = parseStatement(words.slice(0, open));
-    // every token from the opener on, not the re-joined words: a `Z=…` glued into the open word still counts
-    const opaque = tokens.slice(firstToken[open]).filter((w) => !w.redir)
-      .map((w) => ASSIGNMENT_WORD.exec(w.raw)?.[1]).filter(Boolean);
-    // bare prefix assignments before the open word may be temporary (it is the command) or persist (it expands
-    // to nothing): unknown either way
-    if (!head.cmd.length) opaque.push(...head.prefix.map((w) => assignmentOp(w).name));
-    return { ...head, prefix: head.cmd.length ? head.prefix : [], opaque, cd: head.cmd[0]?.text === 'cd' || cdAfterOpen };
-  }
-  words = words.filter((w) => !w.redir);
-  let i = 0;
-  for (;;) {
-    const r = words[i]?.raw;
-    if (r === '{' || r === '!') i++;
-    else if (r === 'time') i += words[i + 1]?.raw === '-p' ? 2 : 1;
-    else break;
-  }
-  const start = i;
-  while (i < words.length && ASSIGNMENT_WORD.test(words[i].raw)) i++;
-  const prefix = words.slice(start, i);
-  while (words[i]?.text === 'builtin' || words[i]?.text === 'command') {
-    const wrapper = words[i].text;
-    const { opts, operands } = splitOptions(words.slice(i + 1));
-    const allowed = wrapper === 'builtin' ? '' : 'pvV';
-    if ([...opts.replace(/-/g, '')].some((l) => !allowed.includes(l))) return { opaque: null, invalid: true, prefix, cmd: [] };
-    if (/[vV]/.test(opts)) break;
-    i = words.length - operands.length;
-  }
-  return { opaque: null, prefix, cmd: words.slice(i) };
-}
-
-// A function definition or subshell at the head of a segment (`f() {`, `function f`, `( …`).
-const STRUCTURED_SEGMENT = /^\s*(?:(?:if|then|else|elif|fi|while|until|do|done|for|select|case|esac|function|[{}()])(?:\s|$)|\(|[A-Za-z_][\w.-]*\s*\(\s*\))/;
-
-// PR #5403 review — the regions a cd may sit in without being this shell's own unconditional cd: a subshell
-// `( … )`, an `if`/`while`/`until`/`for`/`case`/`select`, a function body. A `{ … }` group is tracked only to
-// match its `}`. Each segment's leading words open or close them; what follows those words is `rest`.
-const REGION_LEAD = /^\s*(?:(\()(?!\()\s*|(if|while|until|for|case|select)\s+|(?:then|do|else|elif|!|time(?:\s+-p)?|coproc)\s+|(?:function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.-]*\s*\(\s*\))\s*(\{)?\s*|(\{)(?=\s|$)\s*)/;
-const REGION_CLOSE = /^\s*(?:(fi|done|esac)|(\}))(?=[\s;&|)]|$)\s*/;
-
-// Past this many possible directories the walk gives up (`overflow`), and the CLI refuses the command.
-const MAX_MAYBE_CWDS = 32;
-// …and past this much substitution text holding a cd, walked for landings.
-const MAX_SUBSTITUTION_TEXT = 200000;
-const CD_WORD = /(?:^|[^\w.-])cd(?![\w.-])/;
-
-/** Apply `stmt`'s leading region words to `regions` (a stack of 'sub' | 'cond' | 'func' | 'func?' | 'tick' |
- *  'group'; 'func?' is a function header whose `{` is still to come). Returns `rest`, the text after them (a
- *  one-statement subshell's closing `)` removed), and `closeTrailing`, called once the statement itself is
- *  handled: it closes the subshells an unmatched `)` ends, and opens one for each `$(`/`(` or backtick the
- *  segment leaves open (the split cut a substitution at its `&&`/`;`, so the next segments run inside it). A
- *  closer that matches nothing open is ignored: a region that never closes keeps its cds landing-only. */
-function regionStep(stmt, regions) {
-  let rest = stmt;
-  const top = () => regions[regions.length - 1];
-  const pendingFunc = top() === 'func?';
-  for (let m = REGION_CLOSE.exec(rest); m; m = REGION_CLOSE.exec(rest)) {
-    if (m[1] ? top() === 'cond' : top() === 'func' || top() === 'group') regions.pop();
-    rest = rest.slice(m[0].length);
-  }
-  for (let m = REGION_LEAD.exec(rest); m && m[0]; m = REGION_LEAD.exec(rest)) {
-    if (m[1]) regions.push('sub');
-    else if (m[2]) regions.push('cond');
-    else if (m[4] && top() === 'func?') regions[regions.length - 1] = 'func'; // the header's `{` on its own line
-    else if (m[4]) regions.push('group');
-    else if (/\(\s*\)|^\s*function\s/.test(m[0])) regions.push(m[3] ? 'func' : 'func?');
-    rest = rest.slice(m[0].length);
-  }
-  let depth = 0;                                                // one linear pass: parens outside quotes
-  let unmatched = 0;
-  let ticks = 0;
-  for (let i = 0, q = ''; i < rest.length; i++) {
-    const ch = rest[i];
-    if (ch === '\\' && q !== "'") { i++; continue; }
-    if (q) { if (ch === q) q = ''; continue; }
-    if (ch === '$' && (rest[i + 1] === '{' || rest[i + 1] === '[')) {  // a paren inside `${…}`/`$[…]` is literal
-      const [open, close] = rest[i + 1] === '{' ? ['{', '}'] : ['[', ']'];
-      let n = 0;
-      for (i++; i < rest.length; i++) {
-        if (rest[i] === '\\') i++;
-        else if (rest[i] === open) n++;
-        else if (rest[i] === close && --n === 0) break;
-      }
-      if (i >= rest.length) depth++;                            // left open: what follows runs inside it
-      continue;
-    }
-    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(rest[i - 1]))) break; // a comment to the end of the segment
-    if (ch === "'" || ch === '"') q = ch;
-    else if (ch === '`') ticks++;
-    else if (ch === '(') depth++;
-    else if (ch === ')') { if (depth) depth--; else unmatched++; }
-  }
-  let end = rest.length;                                        // drop the closing `)`s, from the end
-  for (let n = unmatched; end > 0 && n > 0; end--) {
-    if (rest[end - 1] === ')') n--;
-    else if (!/\s/.test(rest[end - 1])) break;
-  }
-  rest = rest.slice(0, end);
-  return {
-    rest,
-    closeTrailing: () => {
-      for (let n = 0; n < unmatched && top() === 'sub'; n++) regions.pop();
-      for (let n = 0; n < depth; n++) regions.push('sub');
-      if (ticks % 2) top() === 'tick' ? regions.pop() : regions.push('tick');
-      if (top() === 'func?' && (pendingFunc || rest.trim())) regions.pop(); // a one-command body, now done
-    },
-  };
-}
-
-// Split leading options off `words`: `opts` is each letter prefixed by its sign (`-r+x`), `optArgs` the
-// [letter, argument] pairs.
-function splitOptions(words, argLetters = '', signs = '-') {
-  let opts = '';
-  const optArgs = [];
-  let k = 0;
-  for (; k < words.length; k++) {
-    const t = words[k].text;
-    if (t === '--') { k++; break; }
-    if (t.length < 2 || !signs.includes(t[0])) break;
-    for (let c = 1; c < t.length; c++) {
-      opts += t[0] + t[c];
-      if (argLetters.includes(t[c])) {
-        const glued = t.slice(c + 1);
-        const argWord = glued ? words[k] : words[++k];
-        optArgs.push([t[c], glued || argWord?.text, argWord?.raw ?? '']);
-        break;
-      }
-    }
-  }
-  return { opts, optArgs, operands: words.slice(k) };
-}
-
-// A `name=value` word as `{ name, raw }`, `raw` being the value's spelling — or null (unknown) for an append
-// or a subscript.
-function assignmentOp(word) {
-  const a = ASSIGNMENT_WORD.exec(word.raw);
-  return a && { name: a[1], raw: a[2] || a[3] ? null : word.raw.slice(a[0].length) };
-}
-
-// A declaration builtin operand: an assignment (`N=v`, also a quoted `"N=v"`, whose value is then literal), a
-// bare name (`{ name, bare: true }`), or anything else naming a variable (`N[i]`) as unknown.
-function declarationOperand(w) {
-  const op = assignmentOp(w);
-  if (op) return op;
-  const q = ASSIGNMENT_WORD.exec(w.text);
-  if (q) {
-    const v = w.text.slice(q[0].length);
-    return { name: q[1], raw: q[2] || q[3] || /[`$\\~]/.test(w.raw) || v.includes("'") ? null : `'${v}'` };
-  }
-  if (!VALID_NAME.test(w.text)) return null;                    // bash rejects it and changes nothing
-  const n = w.text.match(NAME_PREFIX)[0];
-  return n === w.text ? { name: n, bare: true } : { name: n, raw: null };
-}
-
-// A variable operand bash accepts: a name, optionally subscripted.
-const VALID_NAME = /^[A-Za-z_]\w*(?:\[[^\]]*\])?$/;
-
-// What a non-cd statement does to the walk's variables, in order (the op shapes are listed at CLEAR_ALL). A name
-// bash leaves unchanged is NOT listed — forgetting a value bash still holds would send a later `cd "$VAR"` to
-// the reported cwd and miss the protected directory it really enters (an attribute-only `readonly LANE`, a
-// command's temporary prefix assignment, a function-only `unset -f`, a name `let` only reads).
-function statementBindings({ opaque, invalid, prefix, cmd }) {
-  const forget = (n) => ({ name: n, raw: null });
-  if (opaque) return [...statementBindings({ invalid, prefix, cmd }), ...opaque.map(forget)];
-  if (invalid) return [];
-  if (!cmd.length) return prefix.map(assignmentOp);              // bare assignments persist, in order
-  // A command word made only of unquoted expansions may expand to nothing, and then the prefix assignments persist.
-  if (mayExpandToNothing(cmd[0].raw)) return prefix.map((w) => forget(assignmentOp(w).name));
-  const name = cmd[0].text;
-  const args = cmd.slice(1);
-  const names = (ws) => ws.map((w) => w.text).filter((t) => VALID_NAME.test(t)).map((t) => t.match(NAME_PREFIX)[0]);
-  // A name spelled through an expansion (`export $N=v`, `read $N`) could be any variable.
-  const dynamic = (ws) => ws.some((w) => /[$`]/.test(w.raw.split('=')[0]));
-  let out = [];
-  // A same-name temporary prefix absorbs what unset/declare do to that name (`L=v unset L`); read, getopts,
-  // printf -v and let assign through it in bash 3.2, so their ops stand.
-  let absorbs = false;
-  if (Object.hasOwn(DECLARATION_BUILTINS, name)) {
-    const { opts, operands } = splitOptions(args, '', '-+');
-    // -f/-F name functions; -p only prints for declare/typeset/local (bash still assigns `export -p N=v`)
-    if (/[fF]/.test(opts) || (opts.includes('p') && name !== 'export' && name !== 'readonly')) return [];
-    if (dynamic(operands)) return [CLEAR_ALL];
-    // An option bash 3.2 rejects assigns nothing there; one only a newer bash knows (`-A`, `-g`, `-l`, …)
-    // leaves the operands version-dependent, so unknown.
-    const letters = (opts.match(/[-+]./g) ?? []).map((p) => p[1]).join(''); // `-x-` keeps its stray `-`
-    if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l))) {
-      if ([...letters].some((l) => !DECLARATION_OPTIONS_32[name].includes(l) && !DECLARATION_OPTIONS_NEWER.includes(l))) return [];
-      return operands.map((w) => declarationOperand(w)?.name).filter(Boolean).map(forget);
-    }
-    const transforms = DECLARATION_BUILTINS[name]?.test(opts) ?? false;
-    // With a same-name temporary prefix (bash 3.2): a bare operand takes the prefix value for export (not -n),
-    // readonly and declare -x/-r, and stays temporary otherwise; an assigned operand persists for export,
-    // readonly and declare -x/-r/-a, and is absorbed by the prefix otherwise (`L=v declare L=w`).
-    const keepsBare = (name === 'export' && !opts.includes('-n')) || name === 'readonly'
-      || (name !== 'local' && /-[xr]/.test(opts));
-    const keepsAssigned = name === 'export' || name === 'readonly' || (name !== 'local' && /-[xra]/.test(opts));
-    const freezes = name === 'readonly' || (name !== 'local' && opts.includes('-r'));
-    // with -a, bash 3.2 freezes the name BEFORE assigning, so the assignment is refused and the old value stays
-    const refusesAssign = freezes && opts.includes('-a');
-    const prefixNames = new Set(prefix.map((w) => assignmentOp(w).name));
-    const assigned = new Set();                                 // names an earlier operand already assigned
-    for (const w of operands) {
-      const op = declarationOperand(w);
-      if (!op) continue;
-      const temporary = prefixNames.has(op.name);
-      if (op.bare) {
-        if (name === 'local' || (transforms && opts.includes('n'))) { if (!temporary) out.push(forget(op.name)); }
-        else if (keepsBare && temporary && !assigned.has(op.name)) out.push({ name: op.name, fromPrefix: true });
-      } else if (refusesAssign) {
-        assigned.add(op.name);
-      } else if (!temporary || keepsAssigned) {
-        // bash expands every operand before the builtin assigns any: `export A=/x L=$A` reads the old A
-        out.push(name === 'local' || transforms ? forget(op.name) : { ...op, snapshot: true });
-        assigned.add(op.name);
-      }
-      if (freezes) out.push({ name: op.name, readonly: true });
-    }
-    return out;
-  } else if (name === 'unset') {
-    absorbs = true;
-    const { opts, operands } = splitOptions(args);
-    if (dynamic(operands)) return [CLEAR_ALL];
-    if (!opts.includes('f') || opts.includes('v')) out = names(operands).map(forget);
-  } else if (name === 'read' || name === 'mapfile' || name === 'readarray') {
-    const { optArgs, operands } = splitOptions(args, OPTION_ARGS[name]);
-    if (dynamic(operands) || optArgs.some(([l, , raw]) => name === 'read' && l === 'a' && /[$`]/.test(raw))) return [CLEAR_ALL];
-    const arr = optArgs.filter(([l]) => name === 'read' && l === 'a').map(([, v]) => v?.match(NAME_PREFIX)?.[0]).filter(Boolean);
-    const targets = name === 'read' ? names(operands) : names(operands).slice(0, 1);
-    const fallback = name === 'read' ? 'REPLY' : 'MAPFILE';
-    out = [...(targets.length || arr.length ? targets : [fallback]), ...arr].map(forget);
-  } else if (name === 'getopts') {
-    if (dynamic(args.slice(1, 2))) return [CLEAR_ALL];
-    out = [...names(args.slice(1, 2)), 'OPTARG', 'OPTIND'].map(forget);
-  } else if (name === 'let') {
-    out = args.flatMap((w) => arithmeticOps(w.text));
-  } else if (name === 'printf') {
-    // a `-v` target spelled through an expansion could be any variable
-    for (let i = 1; cmd[i]?.text.startsWith('-v'); i += cmd[i].text.length > 2 ? 1 : 2) {
-      if (/[$`]/.test((cmd[i].text.length > 2 ? cmd[i] : cmd[i + 1])?.raw ?? '')) return [CLEAR_ALL];
-    }
-    out = printfBindings(cmd).map(forget);
-  }
-  if (!absorbs) return out;
-  const temporary = new Set(prefix.map((w) => assignmentOp(w).name));
-  return out.filter((op) => op.all || !temporary.has(op.name));
-}
-
-function printfBindings(words) {
-  // Shell words so quoted/escaped options agree, ignoring redirects and their operands.
-  if (words[0]?.text !== 'printf') return [];
-  const names = [];
-  let i = 1;
-  let target;
-  while (words[i]?.text.startsWith('-v')) {
-    target = words[i++].text.slice(2) || words[i++]?.text;
-  }
-  if (target) names.push(target); // repeated -v options bind only the last target
-  if (words[i]?.text === '--') i++;
-  const formatWord = words[i++];
-  const format = formatWord?.text ?? '';
-  let dynamic = false;
-  const raw = formatWord?.raw ?? '';
-  for (let j = 0; j < raw.length; j++) {
-    const run = scanRun(raw, j, j === 0);
-    if (run) {
-      if (run.kind === 'quote' && (run.raw[0] === '"' || run.raw.startsWith('$"'))) {
-        dynamic ||= /[`$]/.test(run.body.replace(/\\[$`"\\]/g, ''));
-      }
-      // ANSI-C encoded options/formats cannot be classified from shellTokens' undecoded body.
-      if (run.kind === 'quote' && run.raw.startsWith("$'")) dynamic ||= /\\(?:x[\da-fA-F]|[0-7]|u|U)/.test(run.body);
-      j = run.end;
-    } else if (raw[j] === '$' || raw[j] === '`') dynamic = true;
-  }
-  // %n also writes a variable. For that or a dynamic format, conservatively forget argument names.
-  // Consume %% first so an ordinary format such as '%%n' remains output only.
-  if (dynamic || /%[-+ #0-9.*hlLjzt]*n/.test(format.replace(/%%/g, ''))) {
-    names.push(...words.slice(i).map((t) => t.text));
-  }
-  return names.filter((n) => typeof n === 'string').map((n) => n.match(/^[A-Za-z_]\w*/)?.[0]).filter(Boolean);
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -3047,265 +2498,51 @@ function printfBindings(words) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-// #5957 — `home` is the shell's home source (see `expandCdTarget`); `null` means unset.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
-  return walkCds(command, reportedCwd, resolvePath, home).cwd;
-}
-
-// Past this many protected directories in one command the guard refuses rather than judge each one.
-export const MAX_GUARD_CWDS = 16;
-
-/** The directories the CLI judges a command in: the effective cwd, then each landing that `isProtected` (a
- *  primary checkout, a lane or a daemon clone), without repeats. Unprotected landings (HOME, /tmp) are left
- *  out: an arm that fires when the cwd is NOT a lane must not see them. Null past `MAX_GUARD_CWDS`. Pure. */
-export function guardCwdCandidates(effectiveCwd, landings, isProtected) {
-  const out = [effectiveCwd];
-  for (const d of landings) if (!out.includes(d) && isProtected(d)) out.push(d);
-  return out.length > MAX_GUARD_CWDS ? null : out;
-}
-
-export function tooManyCwdsReason(count = MAX_GUARD_CWDS) {
-  return `this command changes into more than ${count} protected directories (primary checkouts, lanes or ` +
-    'daemon clones); the guard judges a command in each of them and will not judge this many. Split it into ' +
-    'smaller commands.';
-}
-
-/** `decide` once per context — one per candidate directory — and return the first deny as `{ r, ctx }`, or
- *  null. One directory's allow never cancels another's deny. Pure. */
-export function decideAcrossCwds(command, ctxs) {
-  for (const ctx of ctxs) {
-    const r = decide(command, ctx);
-    if (r) return { r, ctx };
-  }
-  return null;
-}
-
-// PR #5403 review — one cwd for the whole command cannot be right for both orders of two cds: the first landing
-// hides a later `cd <protected>`, and any later one hides an earlier. So the CLI judges the command once for
-// each protected directory a `cd` in it may land in (`guardCwdCandidates`), not only the effective cwd. This is
-// every known landing, in order: a cd nested in a subshell, condition or function body included, and a
-// relative target after an unknown landing read from the reported cwd. Pure.
-export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
-  return walkCds(command, reportedCwd, resolvePath, home).landings;
-}
-
-// The effective cwd and every landing, in one walk: `{ cwd, landings }`.
-// `outerVars` is set only for a substitution body: the variables it starts from (it walks no deeper bodies).
-export function walkCds(command, reportedCwd, resolvePath = resolve, home = process.env.HOME, outerVars = null) {
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
   // is the conservative answer (the primary-cwd arms stay armed) — and `decide` denies it outright anyway.
   const cmd = stripHeredocBodies(String(command || ''));
-  if (!cmd) return { cwd: reportedCwd, landings: [] };
+  if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
-  if (parsed.unterminated) return { cwd: reportedCwd, landings: [] };
-  // Walk the statements in command order, as shell words: literal assignments (bare, or through a declaration
-  // builtin) feed the variable table (`statementBindings`), and the FIRST `cd` statement with a directory
-  // operand decides the cwd (that is where the command lands before the mutation runs). An assignment after
-  // the cd never changes it (#5957). A cd with no directory operand goes to HOME and does not decide: a later
-  // `cd <dir>` still does, as on main, where such a cd was skipped (PR #5403 review). The walk goes on past the
-  // deciding cd only to collect every landing for `resolveCdLandings`.
-  // Values of names a readonly surely froze live in `pinned`, the prototype of `vars`: lookups see them, and a
-  // clear-all only has to start a fresh `vars` (constant time, however many names are pinned).
-  const pinned = Object.create(null);
-  let vars = Object.create(pinned);
-  for (const name in outerVars) vars[name] = outerVars[name]; // a substitution body starts from its shell's values
-  // HOME as the shell holds it: a string (possibly relative or empty), or null when unknown. The hook's own
-  // HOME seeds it only when absolute; an in-command assignment is taken as written.
-  let homeCtx = typeof home === 'string' && home.startsWith('/') ? home : null;
-  // readonly names: 'sure' when the readonly ran unconditionally in this shell (bash then refuses every rebind),
-  // 'maybe' when it may not have run (a later rebind may or may not take effect, so it becomes unknown).
-  const frozen = new Map();
-  const valueOf = (op) => (op.raw === null ? null : assignmentValue(op.raw, vars, homeCtx));
-  // The values a statement's prefix assignments take: they chain left to right in a scope over the current
-  // variables (`A=/x L=$A cmd` gives L=/x for that command), without touching them.
-  // A name a readonly surely froze keeps its value (bash refuses the assignment); a maybe-frozen one is unknown.
-  // bash 3.2 chains a builtin's prefixes only once the shell has run a command before it, so a value that differs
-  // between the chained and the unchained reading is unknown.
-  const prefixValues = (prefix) => {
-    const scope = Object.create(vars);
-    let h = homeCtx;
-    const out = new Map();
-    for (const w of prefix) {
-      const op = assignmentOp(w);
-      const state = frozen.get(op.name);
-      let v;
-      if (state === 'sure') v = op.name === 'HOME' ? homeCtx : vars[op.name] ?? null;
-      else if (state === 'maybe' || op.raw === null) v = null;
-      else {
-        const chained = assignmentValue(op.raw, scope, h);
-        v = chained === assignmentValue(op.raw, vars, homeCtx) ? chained : null;
-      }
-      if (op.name === 'HOME') h = v;
-      else scope[op.name] = v ?? undefined;                     // an unknown value shadows the outer one
-      out.set(op.name, v);
-    }
-    return out;
-  };
-  const apply = (op, sure) => {
-    if (op.all) {
-      vars = Object.create(pinned);
-      if (frozen.get('HOME') !== 'sure') homeCtx = null;
-      return;
-    }
-    const state = frozen.get(op.name);
-    if (op.readonly) {
-      if (state === 'sure') return;
-      frozen.set(op.name, sure ? 'sure' : 'maybe');
-      if (sure && op.name !== 'HOME' && Object.hasOwn(vars, op.name)) { pinned[op.name] = vars[op.name]; delete vars[op.name]; }
-      return;
-    }
-    if (state === 'sure') return;
-    const val = state === 'maybe' ? null : 'val' in op ? op.val : valueOf(op);
-    if (op.name === 'HOME') homeCtx = val;
-    else if (val !== null && !/\s/.test(val)) vars[op.name] = val; // single-token value only
-    else delete vars[op.name];
-  };
-  // A segment in a pipeline, or in an and-or list that ends in `&`, runs in a subshell: its bindings never reach
-  // this shell. One after `&&`/`||`, or once a compound command or function definition has appeared (whose body
-  // statements are walked here as if they ran in order), may not run: its readonly is only 'maybe'.
-  const seps = parsed.separators;
-  const background = [];                                        // computed from the end: linear
-  for (let j = seps.length - 1; j >= 0; j--) {
-    background[j] = /^&(?!&)/.test(seps[j]) || (/^(?:&&|\|\|)/.test(seps[j]) && background[j + 1] === true);
+  if (parsed.unterminated) return reportedCwd;
+  // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
+  const vars = Object.create(null);
+  for (const stmt of parsed.segments) {
+    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
+    if (!m) continue;
+    let val = m[2].trim();
+    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
+    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
+    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
   }
-  const subshell = (k) => /^\|(?!\|)/.test(seps[k - 1] ?? '') || /^\|(?!\|)/.test(seps[k] ?? '') || background[k];
-  // `cur` is where the walk has reached: undefined while no cd moved it, null once a cd went somewhere unknown.
-  // `decided` is the effective cwd, fixed by the first cd with a directory operand outside any region.
-  // `maybe` holds the other directories this shell may be in, once a cd ran inside a region (`( … )`, an
-  // `if`/`while`/`for`/`case` or a function body): it never shrinks, and a relative cd lands from each of them.
-  let cur;
-  let decided;
-  let overflow = false;
-  let subBudget = MAX_SUBSTITUTION_TEXT;
-  const landings = new Set();
-  const maybe = new Set();
-  // `maybe` past its cap ends the walk at once (`overflow`): it could otherwise double with each relative cd.
-  const noteMaybe = (dir) => { maybe.add(dir); if (maybe.size > MAX_MAYBE_CWDS) overflow = true; };
-  // A relative path from an unknown place is read from the reported cwd, as main's resolver read it.
-  const from = (p) => (p.startsWith('/') ? p : resolvePath(cur ?? (reportedCwd || '.'), p));
-  // Every place `p` may resolve to: from `cur`, then from each `maybe` directory. All become landings.
-  const reach = (p) => {
-    const all = [from(p), ...(p.startsWith('/') ? [] : [...maybe].map((m) => resolvePath(m, p)))];
-    for (const d of all) landings.add(d);
-    return all;
-  };
-  const land = (dir) => {
-    if (dir === null) { cur = null; return; }
-    const [first, ...rest] = reach(dir);
-    if (maybe.size) for (const d of rest) noteMaybe(d);
-    cur = first;
-  };
-  const landNested = (dir) => { for (const d of reach(dir)) noteMaybe(d); };
-  const regions = [];                                           // open regions and groups, innermost last
-  const inRegion = () => regions.some((r) => r !== 'group');
-  const homeFor = (prefix) => {
-    const temp = prefixValues(prefix);
-    return temp.has('HOME') ? temp.get('HOME') : homeCtx;
-  };
-  // The directory operand of a cd's words: `target` (null when there is none), or `unknown`.
-  // Options are judged after quote removal and expansion, as bash's cd sees them (`"-P"`, `$OPT`).
-  const cdOperand = (cmd) => {
-    let optionsDone = false;
-    for (const w of cmd.slice(1)) {
-      if (w.raw.includes(OPAQUE_BLANK)) return { target: null, unknown: true };
-      const bare = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w.raw);
-      const bareName = bare && (bare[1] ?? bare[2]);
-      if (bare && (bareName === 'HOME' ? homeCtx : vars[bareName]) === '') continue; // unquoted empty: no word at all
-      const v = expandCdTarget(w.raw, vars, homeCtx);
-      if (!v) return { target: null, unknown: true };           // unresolved / globby / unsupported → fail safe
-      if (!optionsDone && v === '--') { optionsDone = true; continue; }
-      if (!optionsDone && v.length > 1 && v.startsWith('-')) {
-        if (!/^-[PLe@]+$/.test(v)) return { target: null, unknown: true }; // invalid option: cd fails, cwd unchanged
-        continue;
-      }
-      return v === '-' ? { target: null, unknown: true } : { target: v, unknown: false }; // `cd -` (OLDPWD) is unknown
+  // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
+  // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
+  // declarations without values and assignments inside subshells must not erase a known parent value.
+  let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
+  for (const stmt of parsed.segments) {
+    const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
+    if (assignment) {
+      const value = expandCdTarget(assignment[1].trim(), currentHome);
+      currentHome = value?.startsWith('/') ? value : null;
     }
-    return { target: null, unknown: false };
-  };
-  // Where a cd's words go (as written: `land`/`landNested` resolve it), or null when unknown or nowhere new.
-  const cdDestination = (cmd, prefix) => {
-    const { target, unknown } = cdOperand(cmd);
-    if (unknown) return null;
-    return target ?? (homeFor(prefix) || null);
-  };
-  let structured = false;
-  for (const [k, stmt] of parsed.segments.entries()) {
-    if (overflow) break;
-    if (parsed.commented[k]) continue;                          // begins inside a `#` comment
-    structured ||= STRUCTURED_SEGMENT.test(stmt);
-    const sure = !structured && !/^(?:&&|\|\|)/.test(seps[k - 1] ?? '');
-    // A cd inside a command substitution runs in a subshell: its landings only, from where the walk is.
-    // `substitutionBodies` already lists the bodies at every depth, so each is walked once, not recursively.
-    // Nested bodies overlap, so their total size can grow with the square of the text: past a budget the walk
-    // gives up (`overflow`) rather than slow the hook.
-    // A body sees this shell's variables, and its landings are also places the commands after it may run in
-    // when the split cut it open (`x=$(cd /a && cd b && …)`).
-    if (!outerVars && CD_WORD.test(stmt)) {
-      for (const body of substitutionBodies(stmt)) {
-        if (!CD_WORD.test(body)) continue;
-        if ((subBudget -= body.length) < 0) { overflow = true; break; }
-        const inner = walkCds(body, cur ?? reportedCwd, resolvePath, homeCtx, vars);
-        if (inner.overflow) overflow = true;
-        for (const d of inner.landings) { landings.add(d); noteMaybe(d); }
-      }
+    const cd = stmt.trim().match(/^cd\s+(.+)$/);
+    if (!cd) continue;
+    // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
+    const raw = cd[1].trim();
+    if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+      const target = expandCdTarget(raw, currentHome);
+      return target ? (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target)) : reportedCwd;
     }
-    if (overflow) break;
-    const { rest, closeTrailing } = regionStep(stmt, regions);
-    const nested = inRegion();
-    const words = shellWords(stmt);
-    const statement = parseStatement(words);
-    const { prefix, cmd } = statement;
-    if (statement.opaque && statement.cd) {                     // a cd whose words cannot be trusted
-      if (!nested) { decided ??= reportedCwd; land(null); }
-      closeTrailing();
-      continue;
-    }
-    if (!subshell(k)) for (const op of expansionOps(stmt)) apply(op, sure);
-    if (cmd[0]?.text !== 'cd' || statement.invalid || statement.opaque) {
-      if (!subshell(k)) {
-        const ops = statementBindings(statement);
-        const kept = ops.some((op) => op.fromPrefix) ? prefixValues(prefix) : null;
-        // a declaration's operands all expand against the variables as they were before the statement, and
-        // a kept prefix value is the one its prefix chain gave it — both computed before anything is applied
-        const resolved = ops.map((op) => (op.snapshot ? { name: op.name, val: valueOf(op) }
-          : op.fromPrefix ? { name: op.name, val: kept.get(op.name) ?? null } : op));
-        for (const op of resolved) apply(op, sure);
-      }
-      // A cd behind `(`, `if`, `then`, `time`, `coproc`, a function header, …: parse what follows those words.
-      // Outside a region that is only a `coproc` or a lost closer, so it is landing-only either way.
-      const inner = rest === stmt ? null : parseStatement(shellWords(rest));
-      if (inner && inner.cmd[0]?.text === 'cd' && !inner.invalid && !inner.opaque) {
-        const dest = cdDestination(inner.cmd, inner.prefix);
-        if (dest) landNested(dest);
-      }
-      closeTrailing();
-      continue;
-    }
-    closeTrailing();
-    if (nested) {                                               // a cd inside a region only adds landings
-      const own = rest === stmt ? statement : parseStatement(shellWords(rest)); // without a closing `)`
-      const dest = cdDestination(own.cmd, own.prefix);
-      if (dest) landNested(dest);
-      continue;
-    }
-    const { target, unknown } = cdOperand(cmd);
-    if (target === null && !unknown) {                          // no directory operand → HOME, as cd runs
-      const h = homeFor(prefix);
-      if (h === null) land(null);                               // unknown HOME
-      else if (h) land(h);                                      // an empty HOME leaves cd where it was
-      continue;
-    }
-    if (unknown) {                                              // unknown target, `cd -` or a cd that fails
-      decided ??= reportedCwd;
-      land(null);
-      continue;
-    }
-    land(target);
-    decided ??= cur;
+    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
+    target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
+    const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
+    if (v) target = vars[v[1]] ?? '';
+    if (!target || /[`$(*?\[]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
+    return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
-  return { cwd: decided ?? cur ?? reportedCwd, landings: [...landings], overflow };
+  return reportedCwd;
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -5143,8 +4380,6 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
-  let extraCwdCtxs = [];
-  let tooManyCwds = false;
   let daemonRoots = [];
   let hookSessionId = null;
   try {
@@ -5179,33 +4414,22 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const walk = walkCds(cmd, ev.cwd || process.cwd());
-    const cwd = rp(walk.cwd);
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
+    primaryCwd = isPrimaryCwd(cwd, primaries);
     // #xpt9fvd — the daemon-clone registry (seed ∪ every clone the overlay state dir has recorded), computed
     // from the same `workspace` the primaries above use. A fault here fails open (empty list ⇒
     // `daemonCloneWriteReason` denies nothing) rather than wedging the agent.
     try { daemonRoots = daemonCloneRoots(workspace); } catch { daemonRoots = []; }
-    // The cwd-keyed context for one directory the command may run in.
-    const dirCtx = (dir) => {
-      const ctx = { cwd: dir, primaryCwd: isPrimaryCwd(dir, primaries), staleBehind: 0, foreignLiveLease: false, markedLeaseSlug: null, contestedHolderSlug: null };
-      // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
-      // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
-      if (!ctx.primaryCwd && isLaneCwd(dir) && isBacklogMutation(cmd)) ctx.staleBehind = commitsBehindUpstream(dir);
-      // #2367/#2413 — only pay for the lease read when it could possibly matter: a lane cwd about to run
-      // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
-      if (!ctx.primaryCwd && isLaneCwd(dir) && hasDestructiveLaneOp(cmd)) Object.assign(ctx, laneLeaseGuardCtx(dir, mySessionId));
-      return ctx;
-    };
-    ({ primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug } = dirCtx(cwd));
-    // PR #5403 review — every protected directory a cd of the command may land in is judged too.
-    const isProtected = (d) => isPrimaryCwd(d, primaries) || isLaneCwd(d) || isDaemonCloneRealpath(d, daemonRoots);
-    const candidates = guardCwdCandidates(cwd, walk.landings.map(rp), isProtected);
-    if (candidates === null || walk.overflow) tooManyCwds = true;
-    else extraCwdCtxs = candidates.slice(1).map(dirCtx);
+    // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
+    // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
+    if (!primaryCwd && isLaneCwd(cwd) && isBacklogMutation(cmd)) staleBehind = commitsBehindUpstream(cwd);
+    // #2367/#2413 — only pay for the lease read when it could possibly matter: a lane cwd about to run
+    // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
+    if (!primaryCwd && isLaneCwd(cwd) && hasDestructiveLaneOp(cmd)) ({ markedLeaseSlug, contestedHolderSlug, foreignLiveLease } = laneLeaseGuardCtx(cwd, mySessionId));
   } catch { process.exit(0); }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names
   // no lane ref, so the gate cannot key on `lane/`). Loaded lazily so every other Bash call keeps this hook's
@@ -5215,16 +4439,14 @@ if (IS_CLI) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
   const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
-  const hit = tooManyCwds ? { r: tooManyCwdsReason(), ctx: guardCtx }
-    : decideAcrossCwds(cmd, [guardCtx, ...extraCwdCtxs.map((c) => ({ ...guardCtx, ...c }))]);
-  const r = hit?.r ?? null;
+  const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
     // OUTSIDE `decide` (which stays byte-stable for the golden corpus) and wrapped in its own try/catch: an
     // exception here would abort before the deny is written, turning a refusal into a SILENT ALLOW — the one
     // way an advisory note could weaken the guard. It cannot, now.
     let collateral = '';
-    try { collateral = collateralStepsNotice(cmd, hit.ctx); } catch { collateral = ''; }
+    try { collateral = collateralStepsNotice(cmd, guardCtx); } catch { collateral = ''; }
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Blocked: ' + r + collateral },
     }));
