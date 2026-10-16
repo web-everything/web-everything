@@ -57,10 +57,12 @@ Review checklist: for each new fail-closed path, does the failure mode scale per
 
 ## Quarantine proof fixtures
 
-Quarantine addition scenarios using `red-main-quarantine-62da75ed3.json` must explicitly supply
-hypothetical same-code group evidence: the recorded group base differs from the failing head and
-must remain a negative replay. Keep proof validation enabled and the recorded fixture unchanged,
-including when exercising the once-per-tick safety net through both health smells.
+Quarantine addition scenarios using `red-main-quarantine-62da75ed3.json` must explicitly supply a
+hypothetical green re-run of the failing commit (attempt 2, latest job attempt `success`): the
+recorded episode had none and must remain a negative replay. A green merge group is never flake
+proof, because it tested its queued PR's changes, which may fix the failure. Keep proof validation
+enabled and the recorded fixture unchanged, including when exercising the once-per-tick safety net
+through both health smells.
 
 ## Soak shard isolation
 

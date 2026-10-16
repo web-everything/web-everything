@@ -49,19 +49,20 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
   it('the live safety net publishes the proof, job and owed card on the ops ref', () => {
     const { board, origin } = repo();
     const fixture = JSON.parse(readFileSync(join('scripts', 'lib', '__tests__', 'fixtures', 'red-main-quarantine-62da75ed3.json'), 'utf8'));
-    // Supply hypothetical same-code coverage; the recorded group run has a different base.
-    fixture.mainCiRuns.failing.groupEvidence.baseSha = fixture.mainCiRuns.runs[0].headSha;
+    // Supply a hypothetical green re-run of the failing commit; the recorded episode had none.
+    fixture.mainCiRuns.runs[0].attempt = 2;
+    const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
     const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
     const result = runSafetyNet({
       mainCiRuns: fixture.mainCiRuns, now: Date.parse(fixture.now), dir: join(board, 'health'), board,
       mode: { value: 'quarantine', source: 'env' },
       settings: resolveQuarantineSettings({ env: {}, platform: null, file: join(board, 'absent.json') }),
-      readJobs: () => ({ failed: fixture.failedJobs }),
+      readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerunJobs } : { failed: fixture.failedJobs }),
       readLog: () => ({ complete: true, files: [file], tests: [{ file, name: 'A3' }] }), log: () => {},
     });
     expect(result.applied).toBe(true);
     const list = readQuarantine({ board }).list;
-    expect(list).toMatchObject({ mode: 'quarantine', entries: [{ test: file, job: 'integration', proof: { kind: 'merge-group-green-on-tip', runId: 38520623968 } }] });
+    expect(list).toMatchObject({ mode: 'quarantine', entries: [{ test: file, job: 'integration', proof: { kind: 'rerun-passed', runId: 38517676708, attempt: 2 } }] });
     const events = g(['show', 'refs/heads/ops/quarantine:events.jsonl'], origin).trim().split('\n').map(JSON.parse);
     expect(events.filter((e) => e.type === 'card-owed')).toEqual([expect.objectContaining(result.plan.cards[0])]);
     expect(g(['for-each-ref', '--format=%(refname)'], origin).trim().split('\n').sort()).toEqual(['refs/heads/main', 'refs/heads/ops/quarantine']);

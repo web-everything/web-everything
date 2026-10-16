@@ -180,9 +180,10 @@ export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
   ttlMin: 360,
 });
 
+/** Only a passing re-run of the failing commit proves a flake; a merge group tested other code (PR #5283). */
 const validFlakeProof = (p) => p && (typeof p.runId === 'string' || typeof p.runId === 'number')
   && /^[1-9]\d*$/.test(String(p.runId))
-  && (p.kind === 'merge-group-green-on-tip' || (p.kind === 'rerun-passed' && Number.isInteger(p.attempt) && p.attempt > 1));
+  && p.kind === 'rerun-passed' && Number.isInteger(p.attempt) && p.attempt > 1;
 
 /**
  * What the red-main safety net should do with the list this tick. PURE.
@@ -225,7 +226,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
     if (unitRe.test(job)) {
       const f = jobFailures?.[job];
       if (!f?.complete) return none(`failing tests of ${job} unknown (not a known-failing-test red)`);
-      if (s.requireProvenFlake && !validFlakeProof(flakeProof?.[job])) return none(`not a proven flake: ${job} (no green re-run or merge-group run on the main tip)`);
+      if (s.requireProvenFlake && !validFlakeProof(flakeProof?.[job])) return none(`not a proven flake: ${job} (no green re-run of the failing commit)`);
       for (const file of f.files) if (!origins.has(file)) origins.set(file, { job, proof: flakeProof?.[job] });
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));

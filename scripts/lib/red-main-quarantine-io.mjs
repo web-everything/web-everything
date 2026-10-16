@@ -157,22 +157,18 @@ export function readFailedJobs(runId, { exec, repoSlug, filter = 'latest' }) {
   return { jobs, failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: String(j.name) })) };
 }
 
-/** Best effort: only the latest attempt of a job can prove it passed. */
+/**
+ * Best effort: only the latest attempt of a job can prove it passed. Only a re-run of the failing commit itself
+ * proves a flake: a green merge group (`failing.groupEvidence`) tested its queued PR's changes on top of main, and
+ * that PR may be the very fix for the failure (PR #5283 red team). It only triggers main-ci-red's re-run, whose
+ * same-commit result is then the proof read here.
+ */
 function readFlakeProof(mainCiRuns, { readJobs, now }) {
   const proof = Object.create(null);
   const runs = mainCiRuns?.runs ?? [];
   const failing = runs.find((r) => r.databaseId === mainCiRuns?.failing?.runId);
   if (!Number.isFinite(now) || typeof failing?.headSha !== 'string' || !/^[0-9a-f]{7,64}$/i.test(failing.headSha)) return proof;
   const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
-  const group = mainCiRuns?.failing?.groupEvidence;
-  const completedAt = timestamp(group?.completedAt);
-  // Coverage alone cannot prove a flake: bind it to the failing code (and the current tip, when known)
-  // before dropping the evidence metadata. Unknown or future completion is never a green run.
-  if (group?.runId && Array.isArray(group.coveredJobs) && group.baseSha === failing.headSha
-    && (mainCiRuns?.tip == null || group.baseSha === mainCiRuns.tip.sha)
-    && Number.isFinite(completedAt) && completedAt <= now) {
-    for (const job of group.coveredJobs) if (typeof job === 'string') proof[job] = { kind: 'merge-group-green-on-tip', runId: group.runId };
-  }
   const failingCreatedAt = timestamp(failing.createdAt);
   for (const run of runs) {
     const createdAt = timestamp(run.createdAt);

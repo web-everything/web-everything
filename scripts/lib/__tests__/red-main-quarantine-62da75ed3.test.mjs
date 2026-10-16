@@ -5,22 +5,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runSafetyNet, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../red-main-quarantine-io.mjs';
 import { QUARANTINE_SAFETY_NET_DEFAULTS, parseVitestFailures } from '../red-main-quarantine.mjs';
+import { findMergeGroupFlakeEvidence } from '../../conveyor/main-ci-red-core.mjs';
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/red-main-quarantine-62da75ed3.json', import.meta.url), 'utf8'));
 const now = Date.parse(fixture.now);
 const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-function replay({ old = false, proof = true, entries = [], mutateRuns = () => {} } = {}) {
+// Hypothetical same-commit proof: the recorded episode had no re-run, so addition scenarios supply one.
+const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
+function replay({ old = false, proof = true, rerun = false, entries = [], mutateRuns = () => {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'quarantine-replay-'));
   dirs.push(dir);
   if (entries.length) writeFileSync(join(dir, SAFETY_NET_LEDGER), JSON.stringify({ version: 1, reds: {}, shadowList: { version: 1, entries } }));
   const mainCiRuns = structuredClone(fixture.mainCiRuns);
   if (!proof) delete mainCiRuns.failing.groupEvidence;
+  if (rerun) mainCiRuns.runs[0].attempt = 2;
   mutateRuns(mainCiRuns);
   const out = runSafetyNet({ mainCiRuns, dir, now, mode: { value: 'stop', source: 'tool' }, live: false,
     settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...(old ? { unitJobPattern: '^test-shard \\(\\d+\\)$', requireProvenFlake: false, fileCardPerEntry: false } : {}) }, sources: {} },
-    readJobs: () => ({ failed: fixture.failedJobs }), readLog: () => parseVitestFailures(fixture.log),
+    readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerun ? rerunJobs : [] } : { failed: fixture.failedJobs }),
+    readLog: () => parseVitestFailures(fixture.log),
     readList: () => ({ ok: true, list: { version: 1, entries } }), log: () => {},
   });
   return { out, line: JSON.parse(readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim()) };
@@ -32,7 +37,7 @@ it('replays the old coverage gap and records its none decision', () => {
 });
 it('requires proof when group evidence is absent', () => {
   const { out } = replay({ proof: false });
-  expect(out.plan).toMatchObject({ action: 'none', why: 'not a proven flake: integration (no green re-run or merge-group run on the main tip)' });
+  expect(out.plan).toMatchObject({ action: 'none', why: 'not a proven flake: integration (no green re-run of the failing commit)' });
 });
 it.each([
   ['unrelated base', (runs) => { runs.failing.groupEvidence.baseSha = 'deadbee'; }],
@@ -65,20 +70,29 @@ it.each([
   expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('not a proven flake: integration') });
   expect(line.wouldDo).toBe('none');
 });
-it('accepts merge-group evidence completed by now on the failing code', () => {
-  const { out } = replay({ mutateRuns: (runs) => {
-    runs.failing.groupEvidence.baseSha = runs.runs[0].headSha;
-    runs.failing.groupEvidence.completedAt = fixture.now;
-    runs.tip = { sha: runs.runs[0].headSha };
+it('never takes a green merge group as flake proof: it tested the queued PR, which may fix the failure', () => {
+  // PR #5283 red team: A fails deterministically; PR #99 fixes it and its merge group (base A) passes.
+  const A = 'a'.repeat(40);
+  const groupRuns = [{ databaseId: 99, status: 'completed', conclusion: 'success', updatedAt: '2026-10-14T06:25:00Z',
+    headBranch: `gh-readonly-queue/main/pr-99-${A}`, headSha: 'b'.repeat(40) }];
+  const groupEvidence = findMergeGroupFlakeEvidence({ groupRuns, tipSha: A, failedJobs: ['integration'],
+    jobsOf: () => [{ name: 'integration', conclusion: 'success' }] });
+  expect(groupEvidence).toMatchObject({ runId: 99, baseSha: A });
+  const { out, line } = replay({ mutateRuns: (runs) => {
+    runs.runs[0].headSha = A;
+    runs.tip = { sha: A };
+    runs.failing.groupEvidence = groupEvidence;
   } });
-  expect(out.plan.action).toBe('add');
+  expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('not a proven flake: integration') });
+  expect(line.wouldDo).toBe('none');
 });
 it('rejects the recorded group coverage because its base differs from the failing code', () => {
   expect(fixture.mainCiRuns.failing.groupEvidence.baseSha).not.toBe(fixture.mainCiRuns.runs[0].headSha);
   expect(replay().out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('not a proven flake: integration') });
 });
-it('replays hypothetical same-code group coverage as a shadow addition with one owed card', () => {
-  const { out, line } = replay({ mutateRuns: (runs) => { runs.failing.groupEvidence.baseSha = runs.runs[0].headSha; } });
+it('replays a hypothetical green re-run of the failing commit as a shadow addition with one owed card', () => {
+  const { out, line } = replay({ rerun: true });
+  expect(out.plan.entries[0].proof).toEqual({ kind: 'rerun-passed', runId: fixture.mainCiRuns.runs[0].databaseId, attempt: 2 });
   expect(out.shadow).toBe(true);
   expect(out.liveEntries).toEqual([]);
   expect(line).toMatchObject({ wouldDo: 'add', tests: [file] });
@@ -88,5 +102,5 @@ it('replays hypothetical same-code group coverage as a shadow addition with one 
 });
 it('caps live entries plus new files', () => {
   const entries = Array.from({ length: 5 }, (_, i) => ({ test: `scripts/old-${i}.test.mjs`, brokenSha: 'abcdef1', owner: 'operator', reason: 'flake', addedAt: now - 1000, expiresAt: now + 100000 }));
-  expect(replay({ entries, mutateRuns: (runs) => { runs.failing.groupEvidence.baseSha = runs.runs[0].headSha; } }).out.plan).toMatchObject({ action: 'none', why: 'quarantine cap 5 reached' });
+  expect(replay({ entries, rerun: true }).out.plan).toMatchObject({ action: 'none', why: 'quarantine cap 5 reached' });
 });

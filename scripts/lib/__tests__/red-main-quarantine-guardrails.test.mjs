@@ -12,7 +12,8 @@ const fixture = JSON.parse(readFileSync(new URL('./fixtures/red-main-quarantine-
 const now = Date.parse(fixture.now);
 const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
 const failure = { files: [file], tests: [{ file, name: 'A3' }], complete: true };
-const proof = { kind: 'merge-group-green-on-tip', runId: 38520623968 };
+const proof = { kind: 'rerun-passed', runId: 38517676708, attempt: 2 };
+const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
 const dirs = [];
 function temp() { const dir = mkdtempSync(join(tmpdir(), 'quarantine-guards-')); dirs.push(dir); return dir; }
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -21,11 +22,11 @@ const entry = (o = {}) => addEntries(null, { tests: [file], job: 'integration', 
 
 function net(o = {}) {
   const mainCiRuns = structuredClone(fixture.mainCiRuns);
-  // Positive guardrail cases use hypothetical same-code proof; the recorded group base is unrelated.
-  mainCiRuns.failing.groupEvidence.baseSha = mainCiRuns.runs[0].headSha;
+  // Positive guardrail cases use a hypothetical green re-run of the failing commit; the episode had none.
+  mainCiRuns.runs[0].attempt = 2;
   return runSafetyNet({ dir: temp(), now, mainCiRuns, live: false,
     mode: { value: 'stop', source: 'tool' }, settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS }, sources: {} },
-    readJobs: () => ({ failed: fixture.failedJobs }), readLog: () => failure,
+    readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerunJobs } : { failed: fixture.failedJobs }), readLog: () => failure,
     readList: () => ({ ok: true, list: { version: 1, entries: [] } }), log: () => {}, ...o });
 }
 
@@ -60,7 +61,8 @@ describe('plan guards', () => {
     expect(plan({ failedJobs: [job, 'daemon-soak'], jobFailures: { [job]: failure }, flakeProof: { [job]: proof } })).toMatchObject({ action: 'add', entries: [{ test: file, job, proof }] });
   });
   it('requires proof for every failing job, rejecting invalid proofs', () => {
-    for (const bad of [null, {}, { ...proof, kind: 'guessed' }, { ...proof, runId: {} }, { kind: 'rerun-passed', runId: 9, attempt: 1 }]) expect(plan({ flakeProof: { integration: bad } }).why).toContain('not a proven flake: integration');
+    // A green merge group tested its queued PR's changes, not the failing commit: never proof (PR #5283).
+    for (const bad of [null, {}, { ...proof, kind: 'guessed' }, { ...proof, runId: {} }, { kind: 'rerun-passed', runId: 9, attempt: 1 }, { kind: 'merge-group-green-on-tip', runId: 38520623968 }]) expect(plan({ flakeProof: { integration: bad } }).why).toContain('not a proven flake: integration');
     expect(plan({ failedJobs: ['integration', 'soak-shard (1)'], jobFailures: { integration: failure, 'soak-shard (1)': failure } }).why).toContain('not a proven flake: soak-shard (1)');
   });
   it('off restores unproven additions; cards can be switched off separately', () => {
@@ -208,7 +210,7 @@ describe('quarantined test health smell', () => {
     const signs = evaluate({ shadow: false, liveEntries: [entry(), entry({ tests: ['scripts/other.test.mjs'] })] });
     expect(signs).toHaveLength(2);
     expect(signs[0]).toMatchObject({ subject: `quarantine:${file}`, breach: true });
-    for (const part of [file, 'integration', '62da75ed3', 'merge-group-green-on-tip', String(proof.runId), new Date(entry().expiresAt).toISOString()]) expect(signs[0].summary).toContain(part);
+    for (const part of [file, 'integration', '62da75ed3', 'rerun-passed', String(proof.runId), new Date(entry().expiresAt).toISOString()]) expect(signs[0].summary).toContain(part);
   });
   it('shadow, expiry, missing result and failed reads produce no sign', () => {
     expect(evaluate({ shadow: true, liveEntries: [entry()] })).toEqual([]);
