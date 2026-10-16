@@ -2633,5 +2633,5 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   const [sub] = process.argv.slice(2);
   if (sub === 'stamp-chat-spawn') runStampChatSpawnHook();
   else if (sub === 'mark-chat-ended') runMarkChatEndedHook();
-  else process.exit(runSessionReaperCli(process.argv.slice(2)));
+  else process.exitCode = runSessionReaperCli(process.argv.slice(2));
 }
