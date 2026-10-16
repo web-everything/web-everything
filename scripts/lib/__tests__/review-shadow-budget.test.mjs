@@ -49,14 +49,14 @@ describe('high-care shadow admission', () => {
 });
 describe('daily session cap', () => {
   it.each(['agy', 'shadow'].flatMap(mode => ['claude', 'skip'].flatMap(onEscape =>
-    ['quota-hold', 'cap'].map(kind => ({ mode, onEscape, kind })))))
+    ['quota-hold', 'quota-exhausted', 'cap'].map(kind => ({ mode, onEscape, kind })))))
   ('$mode with onEscape=$onEscape preserves the Claude answer policy on $kind', async ({ mode, onEscape, kind }) => {
     let claudeCalls = 0;
     const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode, onEscape, model: 'm' } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => { claudeCalls++; return { value: { summary: 'Claude judged', findings: [] } }; },
       agyJuror: async () => kind === 'cap' ? { status: 'skipped', reasons: ['daily cap reached'] }
-        : { status: 'failed', reasons: ['antigravity: skip-quota-hold'] },
+        : { status: 'failed', reasons: [`antigravity: skip-${kind}`] },
       appendRow: () => true, log: () => {},
     });
     const answered = mode === 'shadow' || onEscape === 'claude';

@@ -222,15 +222,13 @@ falls back to Claude on quota or skip results when its `onEscape` policy is `cla
 Use temporary stores and injected admission/providers in tests, never host quota.
 
 Gemini admission settings preserve the caller's requested Codex advisory roster.
-Tests cover primary and shadow modes with each escape policy and both skip kinds,
+Tests cover primary and shadow modes with each escape policy, quota holds, quota exhaustion, and cap skips,
 all runner statuses through the real row builder and both reports, unavailable
 budget storage, and reserving a second slot before a model retry at the cap.
 These settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
 Test the actual judge request and panel reduction with injected providers, including
 zero agy calls when disabled and failed Codex answers, through heavy-admission.
-Historical optional-roster fixtures explicitly use a zero declaration minimum; the
-operational settings never accept zero.
 
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader
