@@ -8,7 +8,7 @@
  * resume spawn itself, the pid probe) injected — so this suite never spawns a real detached process, never
  * shells `lane-pool.mjs`, and never depends on a real delivery-report sidecar on disk.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1012,19 +1012,31 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
   });
   it.each(['pr-open', 'pr-merged', 'card-resolved'])('clears the card\'s failure history on observed delivery (%s), before releasing the claim', async (outcome) => {
     const order = [];
-    const result = await adoptOrphanedBuildClaims(dead('4413', {
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
       readDelivery: () => ({ outcome, reason: outcome }), settleDelivered: () => {},
       clearFailure: (o) => order.push(['clear', o.num]), releaseClaim: (o) => order.push(['release', o.num]),
-    }));
+    });
     expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
     expect(order).toEqual([['clear', '4413'], ['release', '4413']]);
   });
   it('keeps #4413 claimed when clearing its failure history fails, so a later pass retries the clear', async () => {
     const releaseClaim = vi.fn();
-    const result = await adoptOrphanedBuildClaims(dead('4413', {
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
       readDelivery: () => ({ outcome: 'pr-open', reason: 'PR #9001 is open' }), settleDelivered: () => {},
       clearFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim,
-    }));
+    });
     expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
     expect(releaseClaim).not.toHaveBeenCalled();
   });
