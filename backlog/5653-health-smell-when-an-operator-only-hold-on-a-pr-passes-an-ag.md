@@ -3,10 +3,11 @@ bornAs: xbxx07q
 kind: story
 size: 5
 priority: high
-status: active
+status: resolved
 scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:skills-src/conveyor/__tests__/review-daemon-shared-plan.test.mjs", "we:scripts/conveyor/health-watch-core.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/__tests__/health-watch-core.test.mjs", "we:scripts/conveyor/health-smells/operator-hold-aged.mjs", "we:scripts/conveyor/health-smells/__tests__/operator-hold-aged.test.mjs", "we:scripts/conveyor/health-smells-notify-list.mjs", "we:scripts/conveyor/__tests__/health-smells-notify-list.test.mjs", "we:scripts/conveyor/health-smells/__tests__/notify-list.test.mjs"]
 dateOpened: "2026-10-09"
 dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "4e7914456dc4199144b7e050f86d27fa7d0f1186"
 tags: []
