@@ -608,6 +608,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(lands('x=$(cd /ws && cd webeverything && ls)')).toContain('/ws/webeverything');
     expect(lands('D=/abs/clone; echo $(cd $D && ls)')).toEqual(['/abs/clone']);
     expect(lands('D=/abs/clone; x="$(cd "$D" && ls)"')).toEqual(['/abs/clone']);
+    expect(at('y=${x:-$(cd /a; cd /tmp; pwd)}; ls')).not.toBe('/tmp');
+    // a paren or backtick in a comment opens nothing
+    for (const line of ['git status # (wip', 'git status # it`s', 'echo hi # :(']) {
+      expect(at(`${line}\ncd /lane && ls`), line).toBe('/lane');
+    }
     // too many possible directories gives up at once, and the CLI refuses
     const chain = Array.from({ length: 40 }, (_, i) => `if cd /d${i}; then :; fi; cd s`).join('; ');
     expect(walkCds(chain, REPORTED, undefined, HOME).overflow).toBe(true);

@@ -2838,8 +2838,10 @@ function regionStep(stmt, regions) {
         else if (rest[i] === open) n++;
         else if (rest[i] === close && --n === 0) break;
       }
+      if (i >= rest.length) depth++;                            // left open: what follows runs inside it
       continue;
     }
+    if (ch === '#' && (i === 0 || /[\s;&|()]/.test(rest[i - 1]))) break; // a comment to the end of the segment
     if (ch === "'" || ch === '"') q = ch;
     else if (ch === '`') ticks++;
     else if (ch === '(') depth++;
