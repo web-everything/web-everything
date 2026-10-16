@@ -12,7 +12,7 @@ const fixture = JSON.parse(readFileSync(new URL('./fixtures/red-main-quarantine-
 const now = Date.parse(fixture.now);
 const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
 const failure = { files: [file], tests: [{ file, name: 'A3' }], complete: true };
-const proof = { kind: 'rerun-passed', runId: 38517676708, attempt: 2 };
+const proof = { kind: 'rerun-passed', runId: 7, attempt: 2 };
 const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
 const dirs = [];
 function temp() { const dir = mkdtempSync(join(tmpdir(), 'quarantine-guards-')); dirs.push(dir); return dir; }
@@ -22,11 +22,11 @@ const entry = (o = {}) => addEntries(null, { tests: [file], job: 'integration', 
 
 function net(o = {}) {
   const mainCiRuns = structuredClone(fixture.mainCiRuns);
-  // Positive guardrail cases use a hypothetical green re-run of the failing commit; the episode had none.
-  mainCiRuns.runs[0].attempt = 2;
+  // Positive guardrail cases use a hypothetical earlier run of the failing sha whose re-run passed; the episode had none.
+  mainCiRuns.runs.push({ ...mainCiRuns.runs[0], databaseId: proof.runId, createdAt: '2026-10-14T06:08:00Z', updatedAt: '2026-10-14T06:15:00Z', attempt: 2 });
   return runSafetyNet({ dir: temp(), now, mainCiRuns, live: false,
     mode: { value: 'stop', source: 'tool' }, settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS }, sources: {} },
-    readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerunJobs } : { failed: fixture.failedJobs }), readLog: () => failure,
+    readJobs: (id, opts) => (opts?.filter === 'all' ? { jobs: id === proof.runId ? rerunJobs : [] } : { failed: fixture.failedJobs }), readLog: () => failure,
     readList: () => ({ ok: true, list: { version: 1, entries: [] } }), log: () => {}, ...o });
 }
 

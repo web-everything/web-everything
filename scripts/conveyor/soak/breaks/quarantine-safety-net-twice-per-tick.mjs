@@ -23,9 +23,9 @@ export default {
     const { default: main } = await load(MAIN);
     const { default: cards } = await load(CARDS);
     const fixture = JSON.parse(readFileSync(join(root, 'scripts/lib/__tests__/fixtures/red-main-quarantine-62da75ed3.json'), 'utf8'));
-    // Exercise an eligible addition: the recorded episode had no re-run of the failing commit.
-    // Keep that negative replay intact and supply a hypothetical green re-run only in this scenario.
-    fixture.mainCiRuns.runs[0].attempt = 2;
+    // Exercise an eligible addition: the recorded episode had no re-run of the failing commit. Keep that
+    // negative replay intact and supply, only here, an earlier run of the failing sha whose re-run passed.
+    fixture.mainCiRuns.runs.push({ ...fixture.mainCiRuns.runs[0], databaseId: 7, createdAt: '2026-10-14T06:08:00Z', updatedAt: '2026-10-14T06:15:00Z', attempt: 2 });
     const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
     const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
     const now = Date.parse(fixture.now);
@@ -40,7 +40,7 @@ export default {
           return runSafetyNet({ dir, now: options.now, mainCiRuns, live,
             mode: { value: live ? 'quarantine' : 'stop', source: 'test' },
             settings: { value: QUARANTINE_SAFETY_NET_DEFAULTS, sources: {} },
-            readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerunJobs } : { failed: fixture.failedJobs }),
+            readJobs: (id, opts) => (opts?.filter === 'all' ? { jobs: id === 7 ? rerunJobs : [] } : { failed: fixture.failedJobs }),
             readLog: () => ({ files: [file], tests: [], complete: true }),
             readList: () => ({ ok: true, list }),
             write: ({ change }) => { const result = change(list); if (!result.ok) throw new Error(result.error); list = result.list; return result; },

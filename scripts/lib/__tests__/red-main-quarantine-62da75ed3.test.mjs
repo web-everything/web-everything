@@ -12,7 +12,9 @@ const now = Date.parse(fixture.now);
 const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-// Hypothetical same-commit proof: the recorded episode had no re-run, so addition scenarios supply one.
+// Hypothetical same-commit proof: the recorded episode had no re-run, so addition scenarios supply an earlier
+// run of the failing sha whose re-run passed integration (the failing run's own latest attempt still failed it).
+const PROOF_RUN = 7;
 const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
 function replay({ old = false, proof = true, rerun = false, entries = [], mutateRuns = () => {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'quarantine-replay-'));
@@ -20,11 +22,11 @@ function replay({ old = false, proof = true, rerun = false, entries = [], mutate
   if (entries.length) writeFileSync(join(dir, SAFETY_NET_LEDGER), JSON.stringify({ version: 1, reds: {}, shadowList: { version: 1, entries } }));
   const mainCiRuns = structuredClone(fixture.mainCiRuns);
   if (!proof) delete mainCiRuns.failing.groupEvidence;
-  if (rerun) mainCiRuns.runs[0].attempt = 2;
+  if (rerun) mainCiRuns.runs.push({ ...mainCiRuns.runs[0], databaseId: PROOF_RUN, createdAt: '2026-10-14T06:08:00Z', updatedAt: '2026-10-14T06:15:00Z', attempt: 2 });
   mutateRuns(mainCiRuns);
   const out = runSafetyNet({ mainCiRuns, dir, now, mode: { value: 'stop', source: 'tool' }, live: false,
     settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...(old ? { unitJobPattern: '^test-shard \\(\\d+\\)$', requireProvenFlake: false, fileCardPerEntry: false } : {}) }, sources: {} },
-    readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerun ? rerunJobs : [] } : { failed: fixture.failedJobs }),
+    readJobs: (id, opts) => (opts?.filter === 'all' ? { jobs: id === PROOF_RUN ? rerunJobs : [] } : { failed: fixture.failedJobs }),
     readLog: () => parseVitestFailures(fixture.log),
     readList: () => ({ ok: true, list: { version: 1, entries } }), log: () => {},
   });
@@ -92,7 +94,7 @@ it('rejects the recorded group coverage because its base differs from the failin
 });
 it('replays a hypothetical green re-run of the failing commit as a shadow addition with one owed card', () => {
   const { out, line } = replay({ rerun: true });
-  expect(out.plan.entries[0].proof).toEqual({ kind: 'rerun-passed', runId: fixture.mainCiRuns.runs[0].databaseId, attempt: 2 });
+  expect(out.plan.entries[0].proof).toEqual({ kind: 'rerun-passed', runId: PROOF_RUN, attempt: 2 });
   expect(out.shadow).toBe(true);
   expect(out.liveEntries).toEqual([]);
   expect(line).toMatchObject({ wouldDo: 'add', tests: [file] });

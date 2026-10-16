@@ -158,10 +158,11 @@ export function readFailedJobs(runId, { exec, repoSlug, filter = 'latest' }) {
 }
 
 /**
- * Best effort: only the latest attempt of a job can prove it passed. Only a re-run of the failing commit itself
- * proves a flake: a green merge group (`failing.groupEvidence`) tested its queued PR's changes on top of main, and
- * that PR may be the very fix for the failure (PR #5283 red team). It only triggers main-ci-red's re-run, whose
- * same-commit result is then the proof read here.
+ * Best effort: only the latest attempt of a job can prove it passed. Only a green re-run on the failing commit
+ * itself proves a flake — another, earlier run of the same sha whose latest attempt of the job passed (a job that
+ * passes on a re-run of the failing run leaves `failedJobs` instead). A green merge group (`failing.groupEvidence`)
+ * is never proof: it tested its queued PR's changes on top of main, and that PR may be the very fix for the
+ * failure (PR #5283 red team).
  */
 function readFlakeProof(mainCiRuns, { readJobs, now }) {
   const proof = Object.create(null);

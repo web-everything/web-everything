@@ -49,20 +49,20 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
   it('the live safety net publishes the proof, job and owed card on the ops ref', () => {
     const { board, origin } = repo();
     const fixture = JSON.parse(readFileSync(join('scripts', 'lib', '__tests__', 'fixtures', 'red-main-quarantine-62da75ed3.json'), 'utf8'));
-    // Supply a hypothetical green re-run of the failing commit; the recorded episode had none.
-    fixture.mainCiRuns.runs[0].attempt = 2;
+    // Supply a hypothetical earlier run of the failing sha whose re-run passed; the recorded episode had none.
+    fixture.mainCiRuns.runs.push({ ...fixture.mainCiRuns.runs[0], databaseId: 7, createdAt: '2026-10-14T06:08:00Z', updatedAt: '2026-10-14T06:15:00Z', attempt: 2 });
     const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
     const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
     const result = runSafetyNet({
       mainCiRuns: fixture.mainCiRuns, now: Date.parse(fixture.now), dir: join(board, 'health'), board,
       mode: { value: 'quarantine', source: 'env' },
       settings: resolveQuarantineSettings({ env: {}, platform: null, file: join(board, 'absent.json') }),
-      readJobs: (_, opts) => (opts?.filter === 'all' ? { jobs: rerunJobs } : { failed: fixture.failedJobs }),
+      readJobs: (id, opts) => (opts?.filter === 'all' ? { jobs: id === 7 ? rerunJobs : [] } : { failed: fixture.failedJobs }),
       readLog: () => ({ complete: true, files: [file], tests: [{ file, name: 'A3' }] }), log: () => {},
     });
     expect(result.applied).toBe(true);
     const list = readQuarantine({ board }).list;
-    expect(list).toMatchObject({ mode: 'quarantine', entries: [{ test: file, job: 'integration', proof: { kind: 'rerun-passed', runId: 38517676708, attempt: 2 } }] });
+    expect(list).toMatchObject({ mode: 'quarantine', entries: [{ test: file, job: 'integration', proof: { kind: 'rerun-passed', runId: 7, attempt: 2 } }] });
     const events = g(['show', 'refs/heads/ops/quarantine:events.jsonl'], origin).trim().split('\n').map(JSON.parse);
     expect(events.filter((e) => e.type === 'card-owed')).toEqual([expect.objectContaining(result.plan.cards[0])]);
     expect(g(['for-each-ref', '--format=%(refname)'], origin).trim().split('\n').sort()).toEqual(['refs/heads/main', 'refs/heads/ops/quarantine']);
