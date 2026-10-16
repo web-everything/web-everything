@@ -2429,7 +2429,13 @@ export function hasDestructiveLaneOp(command) {
   const segments = parsed.segments.concat(
     parsed.continued ? parseSegments(command, { spliceContinuations: false }).segments : [],
   );
-  return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
+  // PR #5403 review r7 — …and the text bash re-executes (`sh -c "git reset --hard"`, `eval …`, a group body),
+  // which `decide` judges too. A walk that cannot finish answers YES, as above.
+  try {
+    return withNestedCommands(segments, command).some((seg) => isDestructiveLaneGitOp(String(seg).trim()));
+  } catch {
+    return true;
+  }
 }
 
 // #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
@@ -2697,30 +2703,44 @@ function daemonCloneLandings(command, cwd, home, roots, real = (p) => p) {
 // lane, yet the single effective cwd (rightly) never moves for a grouped `cd`. Each landing that is a primary
 // or a lane clone gets its own guard context (`laneCtx(at)` supplies a lane's `staleBehind` / lease fields; the
 // CLI reads them from disk), and only a landing whose context can deny something is returned, so `decide`
-// re-judges the command there. `cwd` is the effective cwd (judged already, so skipped) or a list whose first
-// entry is; the rest are extra bases a relative `cd` may start from. Only armed landings count toward `cap`, so
-// unarmed ones never crowd an armed one out; at most 256 realpaths and 64 `laneCtx` reads. Never throws.
-export function cdLandingGuards(command, cwd, { home = process.env.HOME ?? null, primaries = [], laneCtx = () => ({}), real = (p) => p, cap = 8 } = {}) {
+// re-judges the command there. `cwd` is the effective cwd, or a list whose first entry is; the rest are extra
+// bases a relative `cd` may start from (the CLI passes the effective cwd alone: once a leading `cd` moved it, a
+// relative `cd` never starts from the reported cwd again). A landing judged with the effective cwd's own context
+// (any primary when that is a primary, the same lane clone) is skipped, and every primary landing shares ONE
+// guard, as every landing in one lane clone does (its lease and staleness are the clone's) — so `laneCtx` runs
+// once per lane clone. No `laneCtx` (the CLI's answer when no lane arm could fire) leaves lanes unarmed. Only armed landings count toward `cap`, so unarmed ones never crowd an armed one out.
+// Past `cap` armed landings or 64 lane clones, the list ends in `{ overflow: true }` and `decide` denies:
+// a budget never turns into a silent allow. Never throws (a fault returns []).
+export const LANDING_OVERFLOW = { overflow: true };
+export function cdLandingGuards(command, cwd, { home = process.env.HOME ?? null, primaries = [], laneCtx = null, real = (p) => p, cap = 8 } = {}) {
   try {
     const bases = [cwd].flat().filter(Boolean);
-    const skip = bases[0] ?? null;
+    const here = bases[0] ?? null;
+    const hereRoot = laneRootFromCwd(here);
+    const herePrimary = isPrimaryCwd(here, primaries);
     const reals = new Map();
-    const toReal = (p) => { if (!reals.has(p)) reals.set(p, reals.size < 256 ? real(p) : p); return reals.get(p); };
-    const guards = new Map();
-    let reads = 0;
+    // past 256 realpaths a landing is still normalised (`lane-3/../lane-9` → `lane-9`), just not realpath'd
+    const toReal = (p) => { if (!reals.has(p)) reals.set(p, reals.size < 256 ? real(p) : resolve(p)); return reals.get(p); };
+    const byKey = new Map();
+    let overflow = false;
     const guardAt = (at) => {
-      if (guards.has(at)) return guards.get(at);
-      let g = null;
       const primaryCwd = isPrimaryCwd(at, primaries);
-      if (at !== skip && (primaryCwd || (isLaneCwd(at) && reads++ < 64))) {
-        g = { at, primaryCwd, staleBehind: 0, ...NO_LEASE_CTX, ...(primaryCwd ? {} : laneCtx(at)) };
-        if (!(g.primaryCwd || g.staleBehind > 0 || g.foreignLiveLease || g.markedLeaseSlug || g.contestedHolderSlug)) g = null;
+      const root = primaryCwd ? null : laneRootFromCwd(at);
+      if (primaryCwd ? herePrimary : !laneCtx || !root || root === hereRoot) return null;
+      const key = primaryCwd ? '\0primary' : root;
+      if (!byKey.has(key)) {
+        if (!primaryCwd && byKey.size >= 64) { overflow = true; return null; }
+        const g = { at, primaryCwd, staleBehind: 0, ...NO_LEASE_CTX, ...(primaryCwd ? {} : laneCtx(at)) };
+        byKey.set(key, g.primaryCwd || g.staleBehind > 0 || g.foreignLiveLease || g.markedLeaseSlug || g.contestedHolderSlug ? g : null);
       }
-      guards.set(at, g);
-      return g;
+      return byKey.get(key);
     };
-    const landed = cdLandings(command, bases, home, { keep: (p) => !!guardAt(toReal(p)), cap });
-    return [...new Set(landed.map(toReal))].map(guardAt);
+    // a landing in an already-armed group adds nothing new, so only the first of each is kept
+    const armed = new Set();
+    const keep = (p) => { const g = guardAt(toReal(p)); if (!g || armed.has(g)) return false; armed.add(g); return true; };
+    cdLandings(command, bases, home, { keep, cap: cap + 1 });
+    const out = [...armed].slice(0, cap);
+    return armed.size > cap || overflow ? [...out, LANDING_OVERFLOW] : out;
   } catch {
     return [];
   }
@@ -4461,6 +4481,7 @@ export function decide(command, ctx = {}) {
   // that is a primary or an armed lane (`cdLandingGuards`, computed by the caller). Runs only after the
   // reported-cwd pass allowed, so it can add a deny and never remove one.
   for (const g of ctx.landingGuards || []) {
+    if (g.overflow) return 'This command `cd`s into more primary checkouts or leased lane clones than this guard judges in one call, so it cannot place every step. Split it: run each protected-directory `cd` and its commands as their own Bash call (PR #5403).';
     const at = { ...armed, ...g, cwd: g.at, cdLandings: [] };
     for (const seg of withNestedCommands(segments, command)) {
       const r = reason(seg, at);
@@ -4478,7 +4499,7 @@ export function decide(command, ctx = {}) {
 // informative, we don't fetch here) — a guard bug or an unusual checkout must never wedge the agent.
 function commitsBehindUpstream(cwd) {
   try {
-    return Number(execFileSync('git', ['rev-list', '--count', 'HEAD..@{u}'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
+    return Number(execFileSync('git', ['rev-list', '--count', 'HEAD..@{u}'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).trim()) || 0;
   } catch {
     return 0;
   }
@@ -4634,12 +4655,13 @@ if (IS_CLI) {
     // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && hasDestructiveLaneOp(cmd)) ({ markedLeaseSlug, contestedHolderSlug, foreignLiveLease } = laneLeaseGuardCtx(cwd, mySessionId));
     // PR #5403 review r7 — the primary / lane-lease context of every other `cd` landing, paid for only when the
-    // command could trip one of those arms (the same two triggers as above, plus a primary tree write).
+    // command could trip one of those arms (the same two triggers as above). A relative grouped `cd` starts from
+    // the effective cwd only: once a leading `cd` moved it, the reported cwd is behind the command.
     const backlogOp = isBacklogMutation(cmd), destructiveOp = hasDestructiveLaneOp(cmd);
-    landingGuards = cdLandingGuards(cmd, [cwd, ev.cwd || process.cwd()], { primaries, real: rp, laneCtx: (at) => ({
+    landingGuards = cdLandingGuards(cmd, cwd, { primaries, real: rp, laneCtx: backlogOp || destructiveOp ? (at) => ({
       ...(backlogOp ? { staleBehind: commitsBehindUpstream(at) } : {}),
       ...(destructiveOp ? laneLeaseGuardCtx(at, mySessionId) : {}),
-    }) });
+    }) : null });
   } catch { process.exit(0); }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names
   // no lane ref, so the gate cannot key on `lane/`). Loaded lazily so every other Bash call keeps this hook's

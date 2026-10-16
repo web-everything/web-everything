@@ -856,16 +856,38 @@ describe('guard-bash — a grouped cd landing reaches the primary-checkout and l
     ]) expect(judge(cmd), cmd).toBeNull();
     expect(cdLandingGuards(`cd ${MINE} && git reset --hard`, MINE, { primaries: [PRIMARY], laneCtx: () => ({ foreignLiveLease: true }) })).toEqual([]);
   });
-  it('lists only armed landings, at most 8, and never throws', () => {
+  it('lists only armed landings, one per primary or lane clone, and never throws', () => {
     expect(cdLandingGuards(`((cd ${PRIMARY}; ls) ); (cd /tmp; ls)`, MINE, { primaries: [PRIMARY] }))
       .toEqual([expect.objectContaining({ at: PRIMARY, primaryCwd: true })]);
     const many = Array.from({ length: 20 }, (_, i) => `(cd ${PRIMARY}/d${i})`).join('; ');
-    expect(cdLandingGuards(many, MINE, { primaries: [PRIMARY] })).toHaveLength(8);
+    expect(cdLandingGuards(many, MINE, { primaries: [PRIMARY] })).toHaveLength(1);
+    // primary landings never crowd a lane landing out
+    expect(judge(`${many}; (cd ${FOREIGN}; git reset --hard)`, PRIMARY, { primaryCwd: true })).toMatch(/LIVE lease held by ANOTHER session/);
+    // from a primary, a primary landing adds nothing; without a `laneCtx` no lane is armed
+    expect(cdLandingGuards(`(cd ${PRIMARY}/docs; ls)`, PRIMARY, { primaries: [PRIMARY] })).toEqual([]);
+    expect(cdLandingGuards(`(cd ${FOREIGN}; git reset --hard)`, MINE, { primaries: [PRIMARY] })).toEqual([]);
     expect(cdLandingGuards(`((cd ${FOREIGN}; ls) )`, MINE, { laneCtx: () => { throw new Error('x'); } })).toEqual([]);
     expect(cdLandingGuards(`((cd ${PRIMARY}; ls) )`, MINE, { primaries: [PRIMARY], real: () => { throw new Error('x'); } })).toEqual([]);
     // unarmed lane landings never crowd an armed one out
     const lanes = Array.from({ length: 40 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${100 + i})`).join('; ');
     expect(cdLandingGuards(`${lanes}; ((cd ${FOREIGN}; ls) )`, MINE, { laneCtx })).toEqual([expect.objectContaining({ at: FOREIGN })]);
+    // past 256 realpaths a `..` landing is still normalised, so it reaches the right lane's lease
+    const cds = Array.from({ length: 300 }, (_, i) => `(cd /tmp/x${i})`).join('; ');
+    expect(judge(`${cds}; (cd ${MINE}/../lane-7; git reset --hard)`, PRIMARY, { primaryCwd: true })).toMatch(/LIVE lease held by ANOTHER session/);
+  });
+  it('a budget never becomes a silent allow: too many armed landings or lane clones deny', () => {
+    const armedAll = () => ({ foreignLiveLease: true });
+    const nine = Array.from({ length: 9 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${200 + i}; ls)`).join('; ');
+    expect(cdLandingGuards(nine, MINE, { laneCtx: armedAll }).at(-1)).toEqual({ overflow: true });
+    expect(decide(nine, { cwd: MINE, landingGuards: cdLandingGuards(nine, MINE, { laneCtx: armedAll }) })).toMatch(/Split it/);
+    const wide = Array.from({ length: 70 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${300 + i})`).join('; ');
+    expect(cdLandingGuards(`${wide}; (cd ${FOREIGN}; git reset --hard)`, MINE, { laneCtx }).at(-1)).toEqual({ overflow: true });
+    expect(cdLandingGuards(nine.replace(/; ls/g, ''), MINE, { laneCtx })).toEqual([]);
+  });
+  it('the lease pre-filter sees a destructive op inside text bash re-executes', () => {
+    for (const cmd of ['sh -c "git reset --hard"', 'bash -c "cd x; git clean -fdx"', 'eval "git reset --hard"', '(git checkout -- .)'])
+      expect(hasDestructiveLaneOp(cmd), cmd).toBe(true);
+    expect(hasDestructiveLaneOp('sh -c "git status"')).toBe(false);
   });
 });
 
@@ -3811,6 +3833,8 @@ describe('guard-bash CLI — a grouped cd into a lane leased by another session 
     ['`((` nested-subshell fallback', `((cd ${foreign}; git reset --hard) )`],
     ['a subshell', `(cd ${foreign} && git clean -fd)`],
     ['a later statement', `git status; cd ${foreign} && git reset --hard`],
+    ['an `sh -c` string', `sh -c "cd ${foreign} && git reset --hard"`],
+    ['an `eval` string', `eval "cd ${foreign}; git reset --hard"`],
   ])('DENIES through %s', (_name, command) => {
     const out = runHook(command, elsewhere);
     expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
@@ -3819,6 +3843,11 @@ describe('guard-bash CLI — a grouped cd into a lane leased by another session 
   it('keeps allowing a read in that lane, and the same reset somewhere unleased', () => {
     expect(runHook(`((cd ${foreign}; git status) )`, elsewhere)).toBeNull();
     expect(runHook(`((cd ${elsewhere}; git reset --hard) )`, elsewhere)).toBeNull();
+  });
+  it('once a leading cd moved the cwd, a relative grouped cd never starts from the reported cwd', () => {
+    // bash lands in `scratch/lane-7`, not the leased `.lanes/web-everything/lane-7` next to the reported cwd
+    expect(runHook(`cd ${elsewhere} && (cd lane-7; git reset --hard)`, join(root, '.lanes', 'web-everything'))).toBeNull();
+    expect(runHook('(cd lane-7; git reset --hard)', join(root, '.lanes', 'web-everything'))?.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 });
 
