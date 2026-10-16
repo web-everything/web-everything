@@ -23,6 +23,7 @@ import {
   retireFixGuards,
   clearTerminalFixAttempts,
   planCiHealSpawns,
+  ciHealFloorFromComments,
   retireCiHealGuards,
   clearTerminalCiHealAttempts,
   armWatchers,
@@ -46,6 +47,9 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
+import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
+import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
+import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
@@ -2296,6 +2300,102 @@ it('refunds the durable and in-session heal floor without refunding again on the
   expect(next.ciHealAttempts[99]).toBe(5);
   expect(planCiHealSpawns({ ...args, ciHealAttempts: { 99: 6 } }).notes[0])
     .toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3, refunded: 3 });
+});
+
+// #5968 — tick feeds the SAME shared reset + window evidence into the gross-tally arithmetic.
+describe('CI-heal reset refund through the tick evidence path (#5968)', () => {
+  const BOT = { login: 'web-everything' };
+  const heal = (createdAt) => ({ author: BOT, createdAt, body: buildCiHealComment({ reason: 'red-ci' }) });
+  const fixPush = [
+    { author: BOT, createdAt: '2026-10-11T00:35:09Z', body: buildFixBeginComment({ who: 'fix-99', why: 'x', branch: 'lane/x', headSha: 'e2dc4ed68', ttlMinutes: 60 }) },
+    { author: BOT, createdAt: '2026-10-11T02:06:48Z', body: buildFixEndComment({ who: 'fix-99', headSha: '9ae95c851' }) },
+  ];
+  const threeBefore = () => [heal('2026-10-09T16:00:00Z'), heal('2026-10-09T19:00:00Z'), heal('2026-10-10T21:00:00Z')];
+  // What the tick's durable comment read hands the planner for one PR.
+  // The production helper `main()` calls for each PR's durable comment read.
+  const evidenceFor = (comments, o = {}) => {
+    const floor = ciHealFloorFromComments(comments, { policy: { resetOnFixHead: true }, restore: true, ...o });
+    return { prCiHealCounts: { 99: floor.count }, prCiHealRefunds: { 99: floor.refunded } };
+  };
+  const base = { prs: [{ num: 40, prNumber: 99, state: 'OPEN', ci: 'fail', labels: ['ready-to-merge'] }], launchedNums: [40], availableLanes: [5] };
+
+  it('two polls after one reset: the first launch costs one, the second poll keeps that charge', () => {
+    const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush]) };
+    expect(args).toMatchObject({ prCiHealCounts: { 99: 0 }, prCiHealRefunds: { 99: 3 } });
+    const first = planCiHealSpawns({ ...args, ciHealAttempts: { 99: 3 } });
+    expect(first.spawns[0]).toMatchObject({ pr: 99, refunded: 3 });
+    expect(first.ciHealAttempts[99]).toBe(4); // gross: 3 refunded + 1 new
+    // second poll, same durable history, the new heal's comment not yet posted, no guard left
+    const second = planCiHealSpawns({ ...args, ciHealAttempts: first.ciHealAttempts });
+    expect(second.spawns[0]).toMatchObject({ pr: 99, refunded: 3 });
+    expect(second.ciHealAttempts[99]).toBe(5); // effective 1 (kept) + 3 + 1
+    // third poll: effective 2 → still below the cap; fourth would be 3 → exhausted
+    const third = planCiHealSpawns({ ...args, ciHealAttempts: second.ciHealAttempts });
+    expect(third.ciHealAttempts[99]).toBe(6);
+    expect(planCiHealSpawns({ ...args, ciHealAttempts: third.ciHealAttempts }).notes[0]).toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3 });
+  });
+  it('a live worker holds the PR: no spawn and the gross tally is untouched', () => {
+    const out = planCiHealSpawns({ ...base, ...evidenceFor([...threeBefore(), ...fixPush]), ciHealAttempts: { 99: 4 }, liveCiHealGuards: [{ pr: 99 }] });
+    expect(out.spawns).toEqual([]);
+    expect(out.ciHealAttempts).toEqual({ 99: 4 });
+  });
+  it('restart (empty tally) on durable evidence: the post-reset heal is kept, the reset ones stay refunded', () => {
+    const out = planCiHealSpawns({ ...base, ...evidenceFor([...threeBefore(), ...fixPush, heal('2026-10-11T03:00:00Z')]), ciHealAttempts: {} });
+    expect(out.spawns[0]).toMatchObject({ refunded: 3 });
+    expect(out.ciHealAttempts[99]).toBe(1 + 3 + 1);
+  });
+  it('a heal with no readable time is not refunded, even after restart', () => {
+    const undated = { author: BOT, body: buildCiHealComment({ reason: 'red-ci' }) };
+    const args = { ...base, ...evidenceFor([...threeBefore(), undated, ...fixPush]) };
+    expect(args).toMatchObject({ prCiHealCounts: { 99: 1 }, prCiHealRefunds: { 99: 3 } });
+    expect(planCiHealSpawns({ ...args, ciHealAttempts: {} }).ciHealAttempts[99]).toBe(1 + 3 + 1);
+  });
+  it('an unrecorded volatile attempt (no durable comment) is never refunded by the reset', () => {
+    // gross 4 = three refunded durable heals + one that died before posting its comment
+    const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush]) };
+    const out = planCiHealSpawns({ ...args, ciHealAttempts: { 99: 4 } });
+    expect(out.ciHealAttempts[99]).toBe(1 + 3 + 1);
+    // two more such volatile attempts reach the cap
+    expect(planCiHealSpawns({ ...args, ciHealAttempts: { 99: 6 } }).notes[0]).toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3, refunded: 3 });
+  });
+  it('overlapping reset and window evidence refunds each attempt once', () => {
+    const window = { author: BOT, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' } }) };
+    const args = { ...base, ...evidenceFor([window, ...threeBefore(), ...fixPush]) };
+    expect(args).toMatchObject({ prCiHealCounts: { 99: 0 }, prCiHealRefunds: { 99: 3 } }); // not 3 + 2
+  });
+  it('reset disabled: durable heals all count and nothing is refunded', () => {
+    const args = { ...base, ...evidenceFor([...threeBefore(), ...fixPush], { policy: { resetOnFixHead: false } }) };
+    expect(args).toMatchObject({ prCiHealCounts: { 99: 3 }, prCiHealRefunds: { 99: 0 } });
+    expect(planCiHealSpawns({ ...args, ciHealAttempts: {} }).notes[0]).toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3 });
+  });
+  it("tick's own retry cap copy equals the shared reconcile cap", () => {
+    expect(DEFAULT_CI_HEAL_RETRY_CAP).toBe(CI_HEAL_ROUND_CAP);
+  });
+  it('the helper defaults to the environment policy and ignores non-array input', () => {
+    expect(ciHealFloorFromComments([...threeBefore(), ...fixPush])).toEqual({ count: 0, refunded: 3 });
+    expect(ciHealFloorFromComments(null)).toEqual({ count: 0, refunded: 0 });
+  });
+  it('through planTick: a queue-held launch rolls the gross tally back to its prior value', () => {
+    const args = evidenceFor([...threeBefore(), ...fixPush]);
+    const out = planTick({
+      state: { queue: [], prs: base.prs, lanes: [], needsSlice: [], decisions: [] },
+      plan: { launch: [] }, freeLanes: [5],
+      bookkeeping: { tick: 0, launchedNums: [40], ciHealAttempts: { 99: 3 } },
+      ...args,
+      queueAdmission: { slots: 2, backlogMinutes: 58, maxWaitMinutes: 30, arrivalWindowMinutes: 10,
+        standardMinutes: { selected: 3, FULL: 18, standards: 0.25, files: 1.5, other: 5 } },
+    });
+    expect(out.decisions.spawnCiHeals).toEqual([]);
+    expect(out.nextState.ciHealAttempts).toEqual({ 99: 3 });
+    // and when admitted, the same inputs spawn with the refund and store the gross count
+    const admitted = planTick({
+      state: { queue: [], prs: base.prs, lanes: [], needsSlice: [], decisions: [] },
+      plan: { launch: [] }, freeLanes: [5],
+      bookkeeping: { tick: 0, launchedNums: [40], ciHealAttempts: { 99: 3 } }, ...args,
+    });
+    expect(admitted.decisions.spawnCiHeals[0]).toMatchObject({ pr: 99, refunded: 3 });
+    expect(admitted.nextState.ciHealAttempts).toEqual({ 99: 4 });
+  });
 });
 
 describe('card 80 — prepare just in time', () => {

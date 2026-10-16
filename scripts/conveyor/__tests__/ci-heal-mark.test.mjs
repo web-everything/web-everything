@@ -15,7 +15,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, readAttributedWindows, buildCiHealComment, CI_HEAL_COMMENT_MARKER, spawnCiHealRearm, sanitizeForPublicComment, redactSecrets, spawnCiHealRestamp, postOrOweCiHealComment, resolveHealHead,
+  ciHealBudgetEvidence, resolveCiHealBudget, ciHealBudgetResetAt, CI_HEAL_ROUND_CAP,
 } from '../ci-heal-mark.mjs';
+import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readOwedWrites, owedWriteAlreadyLive } from '../ci-heal-owed.mjs';
 import { budgetBlockedMessage } from '../../lib/gh-throttle.mjs';
@@ -614,4 +616,72 @@ describe('attributed main-bug refunds', () => {
 it('enables budget restoration unless the environment explicitly disables it', () => {
   for (const value of [undefined, '', '1', 'true', 'anything']) expect(resolveCiHealBudgetRestore({ WE_CI_HEAL_BUDGET_RESTORE: value })).toBe(true);
   for (const value of ['0', 'false', 'FALSE']) expect(resolveCiHealBudgetRestore({ WE_CI_HEAL_BUDGET_RESTORE: value })).toBe(false);
+});
+
+// #5968 — the ONE budget calculation reconcile, tick and landing share.
+describe('ciHealBudgetEvidence — shared reset + attributed-window accounting (#5968)', () => {
+  const RESET = '2026-10-11T02:06:48Z';
+  const heal = (createdAt, extra = '') => ({ author: AUTOMATION, body: `${CI_HEAL_COMMENT_MARKER}${extra}`, createdAt });
+  const begin = { author: AUTOMATION, createdAt: '2026-10-11T00:35:09Z', body: buildFixBeginComment({ who: 'fix-1', why: 'x', branch: 'lane/x', headSha: 'e2dc4ed68', ttlMinutes: 60 }) };
+  const fixEnd = (createdAt = RESET, author = AUTOMATION) => ({ author, createdAt, body: buildFixEndComment({ who: 'fix-1', headSha: '9ae95c851' }) });
+  const history = () => [begin, fixEnd(), heal('2026-10-09T16:00:00Z'), heal('2026-10-09T19:00:00Z'), heal('2026-10-10T21:00:00Z'), heal('2026-10-11T03:00:00Z')];
+
+  it('refunds only heals at or before the reset, keeping the one after', () => {
+    expect(ciHealBudgetEvidence(history())).toMatchObject({ chargeable: 1, spentBeforeReset: 3, windowRefunded: 0, refunded: 3, reset: { at: RESET, by: 'fix-1' } });
+  });
+  it('treats a heal exactly at the reset time as before it, one a second later as after', () => {
+    expect(ciHealBudgetEvidence([begin, fixEnd(), heal(RESET)]).chargeable).toBe(0);
+    expect(ciHealBudgetEvidence([begin, fixEnd(), heal('2026-10-11T02:06:49Z')]).chargeable).toBe(1);
+  });
+  it('charges a heal whose time cannot be established (missing, invalid) — fail closed', () => {
+    for (const odd of [heal(undefined), heal('not-a-date'), heal(null)]) {
+      expect(ciHealBudgetEvidence([begin, fixEnd(), heal('2026-10-09T16:00:00Z'), odd])).toMatchObject({ chargeable: 1, spentBeforeReset: 1 });
+    }
+    // a bare-string comment carries no author, so it is never counted — charged or refunded
+    expect(ciHealBudgetEvidence([begin, fixEnd(), `${CI_HEAL_COMMENT_MARKER}\nbare`])).toMatchObject({ chargeable: 0, spentBeforeReset: 0 });
+    // an undated heal alongside three dated ones before the reset: 3 refunded, 1 charged
+    expect(ciHealBudgetEvidence([...history().slice(0, 5), heal(undefined)]).chargeable).toBe(1);
+  });
+  it('is not reset by an untrusted fix-end, an unchanged sha, or when the setting is off', () => {
+    expect(ciHealBudgetEvidence([begin, fixEnd(RESET, { login: 'outsider' }), ...history().slice(2)]).chargeable).toBe(4);
+    const sameSha = { ...fixEnd(), body: buildFixEndComment({ who: 'fix-1', headSha: 'e2dc4ed68' }) };
+    expect(ciHealBudgetEvidence([begin, sameSha, ...history().slice(2)])).toMatchObject({ chargeable: 4, reset: null });
+    expect(ciHealBudgetEvidence(history(), { resetOnFixHead: false })).toMatchObject({ chargeable: 4, reset: null, spentBeforeReset: 0 });
+  });
+  it('a fix-end whose own time is unreadable is no reset (the reset time must be provable)', () => {
+    expect(ciHealBudgetEvidence([begin, { ...fixEnd(), createdAt: 'garbage' }, ...history().slice(2)])).toMatchObject({ chargeable: 4, reset: null });
+  });
+  it('refunds an attempt covered by both the reset and a window once, and keeps restore independent of reset', () => {
+    const window = { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' };
+    const marker = { author: AUTOMATION, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: window }) };
+    const all = [marker, ...history(), heal('2026-10-11T03:30:00Z')];
+    // 5 heals: 3 before reset (2 of them also inside the window), 2 after the reset (none in the window)
+    expect(ciHealBudgetEvidence(all)).toMatchObject({ chargeable: 2, spentBeforeReset: 3, windowRefunded: 0, refunded: 3 });
+    const inWindowAfterReset = [marker, begin, fixEnd(), heal('2026-10-09T16:00:00Z'), heal('2026-10-11T03:00:00Z')];
+    expect(ciHealBudgetEvidence(inWindowAfterReset)).toMatchObject({ chargeable: 1, spentBeforeReset: 1 });
+    const windowAfter = { author: AUTOMATION, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: { from: '2026-10-11T02:30:00Z', to: '2026-10-11T04:00:00Z' } }) };
+    const mixed = [windowAfter, begin, fixEnd(), heal('2026-10-09T16:00:00Z'), heal('2026-10-11T03:00:00Z'), heal('2026-10-11T05:00:00Z')];
+    expect(ciHealBudgetEvidence(mixed)).toMatchObject({ chargeable: 1, spentBeforeReset: 1, windowRefunded: 1, refunded: 2 });
+    expect(ciHealBudgetEvidence(mixed, { restore: false })).toMatchObject({ chargeable: 2, spentBeforeReset: 1, windowRefunded: 0 });
+  });
+  it('dedupes attempt ids across stages and applies reason filtering with unknown reasons charged', () => {
+    const withAttempt = (createdAt, id, reason) => ({ author: AUTOMATION, createdAt, body: buildCiHealComment({ attemptId: id, reason }) });
+    const comments = [begin, fixEnd(), withAttempt('2026-10-09T16:00:00Z', 'a1', 'codeql'), withAttempt('2026-10-11T03:00:00Z', 'a2', 'codeql'),
+      withAttempt('2026-10-11T03:01:00Z', 'a2', 'codeql'), withAttempt('2026-10-11T03:02:00Z', 'a3', 'red-ci'), heal('2026-10-11T03:03:00Z')];
+    expect(ciHealBudgetEvidence(comments)).toMatchObject({ chargeable: 3, spentBeforeReset: 1 });
+    // codeql-only: a1 (refunded by reset), a2 (deduped once), the unattributable bare heal charged; red-ci a3 not charged
+    expect(ciHealBudgetEvidence(comments, { onlyReason: 'codeql' })).toMatchObject({ chargeable: 2, spentBeforeReset: 1 });
+  });
+  it('is safe on non-array input', () => {
+    expect(ciHealBudgetEvidence(null)).toMatchObject({ chargeable: 0, refunded: 0, reset: null });
+  });
+});
+
+describe('resolveCiHealBudget lives with the shared calculation (#5968)', () => {
+  it('is owned here and re-exported by reconcile-core with the same identity', async () => {
+    const reconcile = await import('../reconcile-core.mjs');
+    expect(reconcile.resolveCiHealBudget).toBe(resolveCiHealBudget);
+    expect(reconcile.ciHealBudgetResetAt).toBe(ciHealBudgetResetAt);
+    expect(reconcile.CI_HEAL_ROUND_CAP).toBe(CI_HEAL_ROUND_CAP);
+  });
 });

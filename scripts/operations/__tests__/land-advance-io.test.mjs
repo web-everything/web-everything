@@ -6,6 +6,9 @@ import { createLandAdvanceReader, createLandAdvanceApplier, readLiveSessions, re
 import { planLandAdvance } from '../land-advance.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { buildEscalationPacket, writeEscalationPacket, listUnresolvedEscalations, renderEscalationsSection } from '../land-advance-escalations.mjs';
+import { buildCiHealComment } from '../../conveyor/ci-heal-mark.mjs';
+import { buildFixBeginComment, buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
+import { buildRebaseOntoMainComment } from '../../conveyor/main-red-recovery.mjs';
 import { allowedToolsArg, ALLOWED_TOOLS_BY_KIND } from '../land-advance-tools.mjs';
 const now = Date.parse('2026-09-20T00:00:00Z');
 const dirs = [];
@@ -45,6 +48,48 @@ describe('evidence IO', () => {
   });
   it.each(['Provider used: CODEX-direct-task', '## Authorship\nGemini wrote it', '**Provider used:** Codex'])('parses section %s', (text) => expect(resultProvider(text)).toMatch(/Codex|Gemini/));
   it('does not treat an incidental mention as authorship', () => expect(resultProvider('Maybe use codex tomorrow')).toBeNull());
+  // #5968 — landing reads the SAME shared reset + window evidence as reconcile and tick.
+  describe('repair evidence uses the shared CI-heal budget evidence', () => {
+    const BOT = { login: 'web-everything' };
+    const heal = (createdAt) => ({ author: BOT, createdAt, body: buildCiHealComment({ reason: 'red-ci' }) });
+    const fixPush = [
+      { author: BOT, createdAt: '2026-10-11T00:35:09Z', body: buildFixBeginComment({ who: 'fix-1', why: 'x', branch: 'lane/x', headSha: 'e2dc4ed68', ttlMinutes: 60 }) },
+      { author: BOT, createdAt: '2026-10-11T02:06:48Z', body: buildFixEndComment({ who: 'fix-1', headSha: '9ae95c851' }) },
+    ];
+    const three = () => [heal('2026-10-09T16:00:00Z'), heal('2026-10-09T19:00:00Z'), heal('2026-10-10T21:00:00Z')];
+    const run = (cmd, args) => cmd === 'gh' ? (args.includes('web-everything/web-everything')
+      ? JSON.stringify([{ number: 77, labels: ['ci:failed'], headRefName: 'lane/x' }]) : '[]') : cmd === 'git' ? '0 1' : '/lane-1';
+    const evidenceFor = (comments, overrides = {}) => createLandAdvanceReader(readerPorts({
+      run, readPrComments: () => comments, findItemFn: () => null, loadItems: () => [], resolveFallbackScope: () => [], ...overrides,
+    }))().repairEvidence['we#77'];
+
+    it('three dated heals before a trusted fix push and one after count one; refunds are reported', () => {
+      expect(evidenceFor([...three(), ...fixPush, heal('2026-10-11T03:00:00Z')])).toMatchObject({ ciHealComments: 1, refunded: 3 });
+    });
+    it('an undated heal stays charged (two), and reset disabled charges every heal', () => {
+      const undated = { author: BOT, body: buildCiHealComment({ reason: 'red-ci' }) };
+      expect(evidenceFor([...three(), undated, ...fixPush, heal('2026-10-11T03:00:00Z')])).toMatchObject({ ciHealComments: 2, refunded: 3 });
+      const off = { resetOnFixHead: false, cap: 3 };
+      const result = evidenceFor([...three(), ...fixPush, heal('2026-10-11T03:00:00Z')], { ciHealBudget: off });
+      expect(result.ciHealComments).toBe(4);
+      expect(result.refunded).toBeUndefined();
+    });
+    it('with no injected policy the environment setting decides (WE_CI_HEAL_RESET_ON_FIX_HEAD)', () => {
+      const comments = [...three(), ...fixPush];
+      expect(evidenceFor(comments)).toMatchObject({ ciHealComments: 0, refunded: 3 });
+      vi.stubEnv('WE_CI_HEAL_RESET_ON_FIX_HEAD', '0');
+      try { expect(evidenceFor(comments)).toMatchObject({ ciHealComments: 3 }); } finally { vi.unstubAllEnvs(); }
+    });
+    it('attributed-main refunds still apply without a reset, and restore can be switched off', () => {
+      const window = { author: BOT, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' } }) };
+      expect(evidenceFor([window, ...three()])).toMatchObject({ ciHealComments: 1, refunded: 2 });
+      expect(evidenceFor([window, ...three()], { ciHealBudgetRestore: false })).toMatchObject({ ciHealComments: 3 });
+    });
+    it('a heal and a window covering the same attempt as the reset are refunded once', () => {
+      const window = { author: BOT, body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: { from: '2026-10-09T15:00:00Z', to: '2026-10-09T20:00:00Z' } }) };
+      expect(evidenceFor([window, ...three(), ...fixPush])).toMatchObject({ ciHealComments: 0, refunded: 3 });
+    });
+  });
   it('calls the existing fix planner and retains no-scope refusals', () => {
     const run = (cmd, args) => cmd === 'gh' ? (args.includes('web-everything/web-everything') ? JSON.stringify([
       { number: 2170, labels: ['review:changes'], headRefName: 'lane/stuck-session-op-docs' },
