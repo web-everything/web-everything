@@ -20,7 +20,7 @@ Found by the PR 5403 self-reviews. resolveEffectiveCwd (the static first-cd walk
 - assignments after then/do/else (walked as if they ran);
 - top-level `local` (bash errors and keeps the value; the walk forgets it);
 - ANSI-C quoted command names and escaped `$'…'` targets;
-- `-e` / `-@` options, which bash 3.2 rejects but bash 5 accepts;
+- `cd` options before the operand: `-L`, `-P` (quoted, escaped or combined) and `--` are read as the target today (`cd -P ~/clone` resolves to `<cwd>/-P`, as on main); `-e` / `-@`, which bash 3.2 rejects but bash 5 accepts;
 - `let` reading a variable whose value is itself an assigning expression;
 - a cd target that does not exist (bash's cd fails and stays; the hook keeps the unresolved string when realpath fails);
 

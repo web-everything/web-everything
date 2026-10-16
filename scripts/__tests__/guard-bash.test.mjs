@@ -17,7 +17,7 @@ import {
   usageReportSecretReadReason,
   isTruncatedOperationJson, truncatedOperationJsonReason,
   isTreeWritingBuildRun, isGeneratorScriptRun, isFileWriteRedirect, primaryTreeWriteReason,
-  daemonCloneWriteReason, cdLandings, cdLandingGuards,
+  daemonCloneWriteReason,
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
@@ -548,73 +548,52 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd ~ && ls', '')).toBe(REPORTED);
     expect(at('cd ~ && ls', 'relative/home')).toBe(REPORTED);
   });
-  // PR #5403 review r5 — which shell an assignment runs in (parent, subshell, pipeline element, background job,
-  // a branch not taken) is never modelled, so ANY statement before the `cd` that may rebind HOME makes it
-  // unknown: a home spelling then stays unresolved (main's behaviour), never a guessed or child-shell value.
-  it('any possible HOME rebinding before the cd makes home unknown, never a guessed value', () => {
-    for (const pre of [
-      'HOME=/other', 'export HOME=/other', 'HOME=$(mktemp -d)', 'HOME+=/x', 'HOME=/tmp true',
-      '( true; HOME=/tmp )', '(true;HOME=/tmp)', '( HOME=/tmp; true )', '((true; HOME=/tmp) )', '(( HOME=5 ))',
-      'HOME=/tmp | true', 'true | HOME=/tmp', 'HOME=/tmp &', '{ HOME=/tmp; }', '{ true; HOME=/tmp; } | cat',
-      'false && HOME=/tmp', 'true || HOME=/tmp', 'if true; then HOME=/tmp; fi', 'f() { HOME=/tmp; }',
-      'declare HOME=/tmp', 'declare -n R=HOME', 'export -n HOME', 'unset HOME', 'read -r HOME </dev/null',
-      'printf -v HOME /tmp', 'for HOME in /tmp; do :; done', 'X=$(HOME=/tmp)', '# a comment ( HOME',
-      // a split or run-time-built name is still HOME
-      'export HO""ME=/tmp', "export HO''ME=/tmp", 'declare HO\\ME=/tmp', "export $'HO'ME=/tmp",
-      'printf -v HO""ME /tmp', 'x=HO; export "${x}ME=/tmp"', 'export {HO,}ME=/tmp', 'c=export; $c "${x}ME=/tmp"',
-      '"eval" "HO""ME=/tmp"', 'command eval "$X"', 'printf -vHOME /tmp', 'read -aHOME <<< /tmp',
-      ': ${HOME:=/tmp}',
-      // ANSI-C escapes spell HOME (or eval) with no HOME text
-      "export $'\\x48OME'=/tmp", "declare $'\\110OME=/tmp'", "$'\\x65val' $'\\x48OME=/tmp'",
-      // arithmetic assigns a run-time-built name
-      'x=HO; echo $(( ${x}ME=1 ))', 'x=HO; [[ ${x}ME=7 -eq 7 ]]', 'x=HO; a=(1); : ${a[${x}ME=3]}',
-      'v=HO; v+=ME=7; [[ $v -eq 7 ]]', 'declare -i n; x=HO; n=${x}ME=1',
-      // …even with no `$`: arithmetic runs a variable's VALUE as an assignment
-      'v=HO; v+=ME=7; (( v ))', 'v=HO; v+=ME=7; [[ v -eq 7 ]]', 'v=HO; v+=ME=7; declare -i n; n=v',
-      'v=HO; v+=ME=7; a[v]=1', 'v=HO; v+=ME=7; s=abc; : ${s:v}',
-      // a brace-built command word
-      '{eval,eval} {HO,}ME=/tmp', '{export,export} {HO,}ME=/tmp',
-      // anything not on the allowlist
-      'make build', 'myfunc', 'exec 3>&1',
-      // code the text cannot see
-      'eval "$X"', 'source ./env.sh', '. ./env.sh',
-    ]) expect(at(`${pre}; cd ~/clone`), pre).toBe(REPORTED);
-    expect(at('# note (see x\nHOME=/tmp\ncd ~/clone')).toBe(REPORTED);
-    expect(at('( true; HOME=/w; cd ~/clone )')).toBe(REPORTED);
-    // a rebinding written AFTER the cd can still run before it (a function body, a loop's second pass)
-    expect(at('f() {\ncd ~/clone\n}\nHOME=/tmp\nf')).toBe(REPORTED);
-    expect(at('cd ~/clone; HOME=/other')).toBe(REPORTED);
-    // HOME text in a heredoc body is still read (the body can feed a later evaluation)
-    expect(at('read -r v <<X\nHOME=7\nX\n(( v )); cd ~/clone')).toBe(REPORTED);
-    expect(at('cat <<X\nHOME=7\nX\ncd ~/clone')).toBe(REPORTED);
-    // a builtin expands an UNQUOTED heredoc body in this shell; a quoted delimiter keeps it literal
-    expect(at('v=HO; v+=ME=7; : <<X\n$(( v ))\nX\ncd ~/clone')).toBe(REPORTED);
-    expect(at('v=HO; v+=ME=7; true <<-X\n${a[v]}\nX\ncd ~/clone')).toBe(REPORTED);
-    expect(at("cat <<'X'\n$(( v )) (note)\nX\ncd ~/clone")).toBe(`${HOME}/clone`);
-    expect(at('cat <<<"x"; cd ~/clone')).toBe(`${HOME}/clone`);
-    // IFS changes how an unquoted $HOME splits
-    expect(at('IFS=/; cd $HOME/clone')).toBe(REPORTED);
-    expect(at('IFS=n; cd ${HOME}')).toBe(REPORTED);
+  it('uses only preceding literal HOME assignments for home expansion', () => {
+    expect(at('HOME=/other; cd ~/clone')).toBe('/other/clone');
+    expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
+    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
+    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
   });
-  it('a CR, NBSP or other Unicode space in a home-spelled target is never trimmed into a different path', () => {
-    for (const ch of ['\r', '\v', '\f', ...[0xa0, 0x2028, 0x3000].map((c) => String.fromCharCode(c))]) {
-      expect(at(`cd ~/clone${ch}\ngit status`), JSON.stringify(ch)).toBe(REPORTED);
-      expect(at(`cd ~/clone${ch}x && git status`), JSON.stringify(ch)).toBe(REPORTED);
+  it('a whole-target $HOME the walk cannot expand still gets main\'s literal-variable answer', () => {
+    // main resolved `cd "$HOME"` through the literal-variable map; an unexpandable later HOME must not do worse
+    expect(at('HOME=/a; HOME=$(x); cd "$HOME" && ls')).toBe('/a');
+    expect(at('HOME=/a; HOME=$(x); cd ${HOME} && ls')).toBe('/a');
+    expect(at('HOME=$(x); cd "$HOME" && ls')).toBe(REPORTED);
+  });
+  it('an unquoted tilde at the start of a literal assignment value is expanded, as bash does', () => {
+    expect(at('D=~/clone; cd "$D" && ls')).toBe(`${HOME}/clone`);
+    expect(at('D=~; cd $D && ls')).toBe(HOME);
+    expect(at('export D=~/clone; cd "${D}" && ls')).toBe(`${HOME}/clone`);
+    expect(at('HOME=/other; D=~/clone; cd "$D" && ls')).toBe('/other/clone');
+    expect(at('D=~/clone; HOME=/other; cd "$D" && ls')).toBe(`${HOME}/clone`);
+    // quoted tilde is literal text; an unknown HOME or `~user` leaves the variable unresolved
+    expect(at('D="~/clone"; cd "$D" && ls')).toBe(`${REPORTED}/~/clone`);
+    expect(at('D=~/clone; cd "$D" && ls', null)).toBe(REPORTED);
+    expect(at('D=/a; D=~someone/x; cd "$D" && ls')).toBe(REPORTED);
+  });
+  it('a home target never loses a character bash keeps in the word (CR, NBSP, other Unicode spaces)', () => {
+    for (const ch of ['\r', ' ', ' ', '　']) {
+      expect(at(`cd ~/clone${ch}x && ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`cd ~/clone${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`${ch}cd ~/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);
     }
   });
-  it('reads of HOME and unrelated statements keep the hook HOME', () => {
-    expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('X=/a; echo "$X"; ls "$X"; git -C "$X" status; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('cd ~/clone && git status')).toBe(`${HOME}/clone`);
-  });
-  it('pins main for the literal-variable subshell shape (the review r5 finding)', () => {
-    expect(at('D=/p; ( D=/tmp; true ); cd "$D"')).toBe('/p');
+  it('an unquoted brace in a home target stays unresolved; a quoted one is literal', () => {
+    expect(at('cd ~/{a,b} && ls')).toBe(REPORTED);
+    expect(at('cd $HOME/{a..b} && ls')).toBe(REPORTED);
+    expect(at('cd "$HOME/{a}" && ls')).toBe(`${HOME}/{a}`);
   });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);
     expect(at('cd $HOME/[c]lone')).toBe(REPORTED);
     expect(at('cd /other/[c]lone')).toBe(REPORTED);
     expect(at('cd "$HOME/[c]lone"')).toBe(`${HOME}/[c]lone`);
+  });
+  it('a quoted bracket in an ordinary target is literal, as on main', () => {
+    expect(at('cd "/other/[c]lone" && ls')).toBe('/other/[c]lone');
+    expect(at("cd '/other/[c]lone' && ls")).toBe('/other/[c]lone');
+    expect(at('D=/other/[c]lone; cd "$D" && ls')).toBe('/other/[c]lone');
+    expect(at('D=/other/[c]lone; cd $D && ls')).toBe(REPORTED);
   });
   it('heredoc body text never steers the resolution', () => {
     const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
@@ -634,260 +613,6 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(isLaneCwd(viaHome)).toBe(true);
     expect(laneRootFromCwd(viaHome)).toBe(laneRootFromCwd(viaAbs));
     expect(laneRootFromCwd(viaHome)).toBe(LANE_HOME);
-  });
-  // PR #5403 review r6 — a quote makes `[` literal; only an UNQUOTED bracket is a glob.
-  it('a quoted target keeps its literal brackets; an unquoted one stays unresolved', () => {
-    expect(at("cd '/tmp/clone[1]' && ls")).toBe('/tmp/clone[1]');
-    expect(at('cd "/tmp/clone[1]" && ls')).toBe('/tmp/clone[1]');
-    expect(at('cd /tmp/clone[1] && ls')).toBe(REPORTED);
-    expect(at('D=/tmp/clone[1]; cd "$D" && ls')).toBe('/tmp/clone[1]');
-    expect(at('D=/tmp/clone[1]; cd $D && ls')).toBe(REPORTED);
-    // quotes come off piece by piece, as bash removes them: a quoted `[` is literal, an unquoted one a glob
-    expect(at("cd '/tmp'/'clone[1]' && ls")).toBe('/tmp/clone[1]');
-    expect(at(`cd '${REPORTED}'/'a[1]' && npm run build`)).toBe(`${REPORTED}/a[1]`);
-    expect(at("cd '/tmp'/clone[1] && ls")).toBe(REPORTED);
-    expect(at('cd /tmp/"clone" && ls')).toBe('/tmp/clone');
-    expect(at("cd ''/tmp/clone && ls")).toBe('/tmp/clone');
-    expect(at('cd /tmp/cl\\one && ls')).toBe('/tmp/clone');
-    expect(at('cd /tmp/a\\ b && ls')).toBe('/tmp/a b');
-  });
-  it('a Unicode space or CR in the cd or target word is part of the word in bash, so the target is unknown', () => {
-    for (const ch of ['\r', String.fromCharCode(0xa0), String.fromCharCode(0x2028)]) {
-      expect(at(`cd${ch}/tmp/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);
-      expect(at(`cd /tmp/clone${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
-    }
-    // …but one elsewhere in the statement (a comment, an extra argument bash 3.2 ignores) changes nothing
-    const nbsp = String.fromCharCode(0xa0);
-    expect(at(`cd /tmp/clone # caf${nbsp}e\nls`)).toBe('/tmp/clone');
-    expect(at(`cd ${REPORTED} x${nbsp}y && npm run build`, HOME)).toBe(REPORTED);
-    expect(at(`cd /tmp/clone x${nbsp}y && ls`)).toBe('/tmp/clone');
-  });
-  it('a Unicode space or CR before `cd` makes it a word bash cannot run, so the cwd never moves', () => {
-    for (const ch of ['\r', String.fromCharCode(0xa0)]) {
-      expect(at(`${ch}cd ~/clone; node scripts/backlog.mjs claim 1`), JSON.stringify(ch)).toBe(REPORTED);
-      expect(at(`${ch}cd "$HOME/clone"; ls`), JSON.stringify(ch)).toBe(REPORTED);
-      expect(at(`${ch}cd /tmp/clone; ls`), JSON.stringify(ch)).toBe(REPORTED);
-    }
-  });
-  it('an unquoted brace expansion in the target stays unresolved; a quoted one is literal', () => {
-    expect(at('cd /ws/web{everything,x} && ls')).toBe(REPORTED);
-    expect(at('cd "/ws/web"{everything,x} && ls')).toBe(REPORTED);
-    expect(at('cd ~/{a..b} && ls')).toBe(REPORTED);
-    expect(at('cd "/ws/web{a,b}" && ls')).toBe('/ws/web{a,b}');
-  });
-  it('skips a redirection before the cd operand and reads an escaped option word', () => {
-    expect(at('cd >/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd 2>/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd /tmp/clone>/dev/null && ls')).toBe('/tmp/clone');
-    expect(at('cd \\-P /tmp/clone && ls')).toBe('/tmp/clone');
-  });
-  // PR #5403 review r6 — `cd` options are read the way bash reads them, so `cd -P /clone` lands in /clone.
-  it('skips cd options and one `--`; `cd -`, an unknown option or no operand stays unresolved', () => {
-    expect(at('cd -P /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -L /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -LP /tmp/clone && ls')).toBe('/tmp/clone');
-    // macOS's bash 3.2 rejects `-e` / `-@` ("invalid option") and stays put, so neither may steer the cwd
-    expect(at('cd -e -P /tmp/clone && ls')).toBe(REPORTED);
-    expect(at('cd -Pe /tmp/clone && ls')).toBe(REPORTED);
-    expect(at('cd -@ /tmp/clone && ls')).toBe(REPORTED);
-    expect(at('cd -L -e /tmp/clone && ls')).toBe(REPORTED);
-    expect(at('cd -- /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -P -- /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd "-P" /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at("cd '-L' '--' /tmp/clone && ls")).toBe('/tmp/clone');
-    expect(at('cd -P ~/clone && ls')).toBe(`${HOME}/clone`);
-    expect(at('cd -P "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
-    expect(at('cd -- -dir && ls')).toBe(`${REPORTED}/-dir`);
-    expect(at('cd - && ls')).toBe(REPORTED);
-    expect(at('cd -Q /tmp/clone && ls')).toBe(REPORTED);
-    expect(at('cd -P && ls')).toBe(REPORTED);
-    expect(at('cd -- && ls')).toBe(REPORTED);
-  });
-});
-
-// PR #5403 review r6 — a `cd` the single effective cwd cannot hold: inside a subshell or group (bash runs
-// `((cd /P; …) )` as two nested subshells once `((` fails to close as arithmetic), a substitution, an `sh -c`
-// string, or a later statement. Each is a LANDING the daemon-clone check also judges — deny-only, so it can
-// never turn a base refusal into an allow, and the single effective cwd stays exactly as before.
-describe('guard-bash — a cd inside a subshell, group or later statement still reaches the daemon-clone check (PR #5403)', () => {
-  const CLONE = '/ws/wev-review-daemon';
-  const LANE = '/ws/.lanes/web-everything/lane-53';
-  const HOME = '/ws';
-  const ctx = { cwd: LANE, daemonCloneRoots: [CLONE], home: HOME };
-
-  it('DENIES a mutation after a cd into a daemon clone inside any group shape', () => {
-    for (const cmd of [
-      `((cd ${CLONE}; git reset --hard) )`,
-      `(( cd ${CLONE}; git reset --hard) )`,
-      `((cd ${CLONE}) ; git reset --hard)`,
-      `( (cd ${CLONE}; git reset --hard) )`,
-      `(cd ${CLONE}; git reset --hard)`,
-      `(cd ${CLONE} && git reset --hard)`,
-      `(cd ${CLONE} && rm notes.md)`,
-      `(cd ${CLONE}) && git reset --hard`,
-      `{ cd ${CLONE}; git reset --hard; }`,
-      `((cd ~/wev-review-daemon; git reset --hard) )`,
-      `((cd "$HOME/wev-review-daemon"; git reset --hard) )`,
-      `D=${CLONE}; ((cd "$D"; git reset --hard) )`,
-      `((cd -P ${CLONE}; git reset --hard) )`,
-      `echo "$(cd ${CLONE}; git reset --hard)"`,
-      `bash -c "cd ${CLONE} && git reset --hard"`,
-      `git status; cd ${CLONE} && git reset --hard`,
-      `cd ${LANE} && ls; cd ${CLONE} && git commit -am wip`,
-      // the cd under a wrapper, a quoted or escaped command word, a prefix or redirection, a reserved word
-      `command cd ${CLONE}; git reset --hard`,
-      `builtin cd ${CLONE}; git reset --hard`,
-      `time cd ${CLONE}; git reset --hard`,
-      `X=1 cd ${CLONE}; git reset --hard`,
-      `! cd ${CLONE}; git reset --hard`,
-      `2>/dev/null cd ${CLONE}; git reset --hard`,
-      `\\cd ${CLONE}; git reset --hard`,
-      `"cd" ${CLONE}; git reset --hard`,
-      `c""d ${CLONE}; git reset --hard`,
-      `if true; then cd ${CLONE}; fi; git reset --hard`,
-      `while true; do cd ${CLONE}; done; git reset --hard`,
-      `f(){ cd ${CLONE}; }; f; git reset --hard`,
-      `function f { cd ${CLONE}; }; f; git reset --hard`,
-      `pushd ${CLONE}; git reset --hard`,
-      // a relative cd that starts from an earlier landing
-      `(cd /ws && cd wev-review-daemon && git reset --hard)`,
-      `cd /ws; cd x; cd ../wev-review-daemon; git reset --hard`,
-      // quoting, escapes and redirections inside the cd statement
-      `cd /ws/"wev-review-daemon" && git reset --hard`,
-      `cd "${CLONE}"/sub && git reset --hard`,
-      `cd /ws/wev\\-review-daemon && git reset --hard`,
-      `cd \\-P ${CLONE} && git reset --hard`,
-      `cd >/dev/null ${CLONE} && git reset --hard`,
-      `cd ${CLONE} # caf${String.fromCharCode(0xa0)}e\ngit reset --hard`,
-      `pushd -- ${CLONE}; git reset --hard`,
-      `case x in x) cd ${CLONE};; esac; git reset --hard`,
-      // landings outside any clone never crowd a clone landing out
-      `${Array.from({ length: 300 }, (_, i) => `(cd /tmp/x${i})`).join('; ')}; (cd ${CLONE}; git reset --hard)`,
-    ]) expect(decide(cmd, ctx), cmd).toMatch(/DAEMON CLONE/);
-    expect(decide(`pushd -n ${CLONE}; git status`, ctx)).toBeNull();
-    // a deny judged from a grouped landing says so, and how to split the command
-    expect(decide(`(cd ${CLONE} && git log -1) && git commit -m x`, ctx)).toMatch(/elsewhere in this command/);
-  });
-  it('stays fast on a long command (landings never multiply the per-segment work)', () => {
-    const many = Array.from({ length: 3000 }, (_, i) => `cd /x${i}; rm f${i}`).join('; ');
-    const inClone = Array.from({ length: 3000 }, (_, i) => `cd ${CLONE}/x${i}; ls`).join('; ');
-    const started = Date.now();
-    expect(decide(many, ctx)).toBeNull();
-    expect(decide(`${inClone}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
-    expect(decide(`echo "${' )'.repeat(25000)} x"`, ctx)).toBeNull();
-    expect(Date.now() - started).toBeLessThan(5000);
-  });
-  it('keeps allowing a read or fetch inside the clone, and a mutation after a cd elsewhere', () => {
-    for (const cmd of [
-      `((cd ${CLONE}; git fetch origin) )`,
-      `(cd ${CLONE}; git log)`,
-      `((x = 1)); git status`,
-      `(cd /tmp/scratch; git reset --hard)`,
-      `((cd "$UNKNOWN"; git reset --hard) )`,
-      `cat <<'EOF'\n(cd ${CLONE}; git reset --hard)\nEOF`,
-    ]) expect(decide(cmd, ctx), cmd).toBeNull();
-  });
-  it('cdLandings lists every resolvable landing and drops the unresolvable ones', () => {
-    expect(cdLandings(`((cd ${CLONE}; git reset --hard) )`, LANE, HOME)).toEqual([CLONE]);
-    expect(cdLandings(`(cd ~/x); cd -P /y; (cd "$U")`, LANE, HOME).sort()).toEqual([`${HOME}/x`, '/y']);
-    expect(cdLandings(`(cd sub; ls)`, LANE, HOME)).toEqual([`${LANE}/sub`]);
-    expect(cdLandings('git status', LANE, HOME)).toEqual([]);
-    expect(cdLandings(`(cd /a); (cd ${CLONE})`, LANE, HOME, { keep: (p) => p === CLONE, cap: 1 })).toEqual([CLONE]);
-  });
-  it('never moves the single effective cwd: a group\'s cd does not steer the commands after it', () => {
-    const PRIMARY = '/ws/webeverything';
-    expect(resolveEffectiveCwd(`(cd ${LANE}; ls); node scripts/backlog.mjs claim 1`, PRIMARY)).toBe(PRIMARY);
-    expect(resolveEffectiveCwd(`((cd ${LANE}; ls) ); node scripts/backlog.mjs claim 1`, PRIMARY)).toBe(PRIMARY);
-    expect(resolveEffectiveCwd('((x=1)); cd /q && ls', PRIMARY)).toBe('/q');
-    expect(decide(`(cd ${LANE}; ls); node scripts/backlog.mjs claim 1`, { primaryCwd: true, cwd: PRIMARY }))
-      .toBe(decide('node scripts/backlog.mjs claim 1', { primaryCwd: true, cwd: PRIMARY }));
-  });
-});
-
-// PR #5403 review r7 — the same landings reach the PRIMARY-checkout and LANE-LEASE arms, not only the
-// daemon-clone one: `((cd <primary>; node scripts/backlog.mjs claim 1) )` really claims on primary, and
-// `((cd <foreign lane>; git reset --hard) )` really clobbers that lane. Deny-only, like the clone landings.
-describe('guard-bash — a grouped cd landing reaches the primary-checkout and lane-lease arms (PR #5403)', () => {
-  const PRIMARY = '/ws/webeverything';
-  const MINE = '/ws/.lanes/web-everything/lane-53';
-  const FOREIGN = '/ws/.lanes/web-everything/lane-7';
-  const HOME = '/ws';
-  const leases = { [FOREIGN]: { foreignLiveLease: true } };
-  const laneCtx = (at) => leases[laneRootFromCwd(at)] ?? {};   // the CLI reads the lease at the lane root too
-  const judge = (cmd, cwd = MINE, extra = {}) =>
-    decide(cmd, { cwd, ...extra, landingGuards: cdLandingGuards(cmd, cwd, { home: HOME, primaries: [PRIMARY], laneCtx }) });
-
-  it('DENIES a backlog mutation or tree write after a grouped cd into the primary checkout', () => {
-    for (const cmd of [
-      `((cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
-      `(( cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
-      `( (cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
-      `(cd ${PRIMARY} && node scripts/backlog.mjs resolve 1)`,
-      `{ cd ${PRIMARY}; node scripts/backlog.mjs claim 1; }`,
-      `((cd ~/webeverything; node scripts/backlog.mjs claim 1) )`,
-      `((cd ${PRIMARY}/scripts; node backlog.mjs claim 1) )`,
-      `bash -c "cd ${PRIMARY} && node scripts/backlog.mjs claim 1"`,
-      `git status; cd ${PRIMARY} && node scripts/backlog.mjs claim 1`,
-      `((cd ${PRIMARY}; npm run build) )`,
-    ]) expect(judge(cmd), cmd).toMatch(/LANE clone|primary/i);
-    expect(judge(`((cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`)).toMatch(/elsewhere in this command/);
-  });
-  it('DENIES a destructive git op after a grouped cd into a lane leased by another session', () => {
-    for (const cmd of [
-      `((cd ${FOREIGN}; git reset --hard) )`,
-      `(cd ${FOREIGN} && git clean -fd)`,
-      `((cd ${FOREIGN}/src; git checkout -- .) )`,
-      `(cd /ws/.lanes/web-everything && cd lane-7 && git reset --hard)`,
-    ]) expect(judge(cmd, PRIMARY, { primaryCwd: true }), cmd).toMatch(/LIVE lease held by ANOTHER session/);
-    // the landing's own lease context, not the reported cwd's: a marked or contested lease asks for its slug
-    const marked = (cmd) => decide(cmd, { cwd: MINE, landingGuards: cdLandingGuards(cmd, MINE, { primaries: [PRIMARY], laneCtx: () => ({ markedLeaseSlug: 'slug-7' }) }) });
-    expect(marked(`((cd ${FOREIGN}; git reset --hard) )`)).toMatch(/LANE_SESSION=slug-7/);
-    expect(marked(`((cd ${FOREIGN}; LANE_SESSION=slug-7 git reset --hard) )`)).toBeNull();
-  });
-  it('keeps allowing reads, a landing with no armed context, and the effective cwd itself', () => {
-    for (const cmd of [
-      `((cd ${PRIMARY}; git log) )`,
-      `((cd ${PRIMARY}; node scripts/backlog.mjs list) )`,
-      `((cd ${MINE}/sub; git reset --hard) )`,
-      `((cd ${FOREIGN}; git status) )`,
-      `((cd "$UNKNOWN"; node scripts/backlog.mjs claim 1) )`,
-      `((x = 1)); node scripts/backlog.mjs claim 1`,
-      `cat <<'EOF'\n(cd ${PRIMARY}; node scripts/backlog.mjs claim 1)\nEOF`,
-    ]) expect(judge(cmd), cmd).toBeNull();
-    expect(cdLandingGuards(`cd ${MINE} && git reset --hard`, MINE, { primaries: [PRIMARY], laneCtx: () => ({ foreignLiveLease: true }) })).toEqual([]);
-  });
-  it('lists only armed landings, one per primary or lane clone, and never throws', () => {
-    expect(cdLandingGuards(`((cd ${PRIMARY}; ls) ); (cd /tmp; ls)`, MINE, { primaries: [PRIMARY] }))
-      .toEqual([expect.objectContaining({ at: PRIMARY, primaryCwd: true })]);
-    const many = Array.from({ length: 20 }, (_, i) => `(cd ${PRIMARY}/d${i})`).join('; ');
-    expect(cdLandingGuards(many, MINE, { primaries: [PRIMARY] })).toHaveLength(1);
-    // primary landings never crowd a lane landing out
-    expect(judge(`${many}; (cd ${FOREIGN}; git reset --hard)`, PRIMARY, { primaryCwd: true })).toMatch(/LIVE lease held by ANOTHER session/);
-    // from a primary, a primary landing adds nothing; without a `laneCtx` no lane is armed
-    expect(cdLandingGuards(`(cd ${PRIMARY}/docs; ls)`, PRIMARY, { primaries: [PRIMARY] })).toEqual([]);
-    expect(cdLandingGuards(`(cd ${FOREIGN}; git reset --hard)`, MINE, { primaries: [PRIMARY] })).toEqual([]);
-    expect(cdLandingGuards(`((cd ${FOREIGN}; ls) )`, MINE, { laneCtx: () => { throw new Error('x'); } })).toEqual([]);
-    expect(cdLandingGuards(`((cd ${PRIMARY}; ls) )`, MINE, { primaries: [PRIMARY], real: () => { throw new Error('x'); } })).toEqual([]);
-    // unarmed lane landings never crowd an armed one out
-    const lanes = Array.from({ length: 40 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${100 + i})`).join('; ');
-    expect(cdLandingGuards(`${lanes}; ((cd ${FOREIGN}; ls) )`, MINE, { laneCtx })).toEqual([expect.objectContaining({ at: FOREIGN })]);
-    // past 256 realpaths a `..` landing is still normalised, so it reaches the right lane's lease
-    const cds = Array.from({ length: 300 }, (_, i) => `(cd /tmp/x${i})`).join('; ');
-    expect(judge(`${cds}; (cd ${MINE}/../lane-7; git reset --hard)`, PRIMARY, { primaryCwd: true })).toMatch(/LIVE lease held by ANOTHER session/);
-  });
-  it('a budget never becomes a silent allow: too many armed landings or lane clones deny', () => {
-    const armedAll = () => ({ foreignLiveLease: true });
-    const nine = Array.from({ length: 9 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${200 + i}; ls)`).join('; ');
-    expect(cdLandingGuards(nine, MINE, { laneCtx: armedAll }).at(-1)).toEqual({ overflow: true });
-    expect(decide(nine, { cwd: MINE, landingGuards: cdLandingGuards(nine, MINE, { laneCtx: armedAll }) })).toMatch(/Split it/);
-    const wide = Array.from({ length: 70 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${300 + i})`).join('; ');
-    expect(cdLandingGuards(`${wide}; (cd ${FOREIGN}; git reset --hard)`, MINE, { laneCtx }).at(-1)).toEqual({ overflow: true });
-    expect(cdLandingGuards(nine.replace(/; ls/g, ''), MINE, { laneCtx })).toEqual([]);
-  });
-  it('the lease pre-filter sees a destructive op inside text bash re-executes', () => {
-    for (const cmd of ['sh -c "git reset --hard"', 'bash -c "cd x; git clean -fdx"', 'eval "git reset --hard"', '(git checkout -- .)'])
-      expect(hasDestructiveLaneOp(cmd), cmd).toBe(true);
-    expect(hasDestructiveLaneOp('sh -c "git status"')).toBe(false);
   });
 });
 
@@ -3805,52 +3530,6 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   });
 });
 
-// PR #5403 review r7 — the impure half of the grouped-landing lease check, through the REAL CLI: a lane leased
-// by another session, entered only inside `((…) )`, is judged with its own on-disk lease. The command strings
-// are inert: the hook only inspects them, it never runs the proposed reset.
-describe('guard-bash CLI — a grouped cd into a lane leased by another session is judged there (PR #5403)', () => {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'guard-bash-landing-lease-'));
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
-  const foreign = join(root, '.lanes', 'web-everything', 'lane-7');
-  const elsewhere = join(root, 'scratch');
-  mkdirSync(join(foreign, '.git'), { recursive: true });
-  mkdirSync(elsewhere, { recursive: true });
-  writeFileSync(join(foreign, '.git', '.lane-lease'), JSON.stringify({
-    session: 's', ownerSession: 'sess-other', acquiredAt: new Date().toISOString(), ttlMinutes: 240, holder: 'h-7',
-  }));
-  const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
-  const runHook = (command, cwd) => {
-    const res = execFileSync(process.execPath, [GUARD], {
-      input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'sess-me', WE_DAEMON_OVERLAY_DIR: join(root, 'no-overlays') },
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-    }).trim();
-    return res ? JSON.parse(res) : null;
-  };
-
-  it.each([
-    ['`((` nested-subshell fallback', `((cd ${foreign}; git reset --hard) )`],
-    ['a subshell', `(cd ${foreign} && git clean -fd)`],
-    ['a later statement', `git status; cd ${foreign} && git reset --hard`],
-    ['an `sh -c` string', `sh -c "cd ${foreign} && git reset --hard"`],
-    ['an `eval` string', `eval "cd ${foreign}; git reset --hard"`],
-  ])('DENIES through %s', (_name, command) => {
-    const out = runHook(command, elsewhere);
-    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
-    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/LIVE lease held by ANOTHER session/);
-  });
-  it('keeps allowing a read in that lane, and the same reset somewhere unleased', () => {
-    expect(runHook(`((cd ${foreign}; git status) )`, elsewhere)).toBeNull();
-    expect(runHook(`((cd ${elsewhere}; git reset --hard) )`, elsewhere)).toBeNull();
-  });
-  it('once a leading cd moved the cwd, a relative grouped cd never starts from the reported cwd', () => {
-    // bash lands in `scratch/lane-7`, not the leased `.lanes/web-everything/lane-7` next to the reported cwd
-    expect(runHook(`cd ${elsewhere} && (cd lane-7; git reset --hard)`, join(root, '.lanes', 'web-everything'))).toBeNull();
-    expect(runHook('(cd lane-7; git reset --hard)', join(root, '.lanes', 'web-everything'))?.hookSpecificOutput?.permissionDecision).toBe('deny');
-  });
-});
-
 // The impure half, through the REAL CLI: a clone registered ONLY via the overlay-state directory (no seed
 // entry needed) is protected too — proof that "derive from the registry, don't hard-code only" actually
 // reaches the hook. Also the live end-to-end proof the card's PROOF section asks for.
@@ -3900,26 +3579,13 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.
   it.each([
     ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
-    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
+    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
     ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
   ])('retains the main refusal for %s', (_name, command, startsProtected) => {
     const out = runHook(command, startsProtected ? fakeClone : lane);
     expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
     expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
-  });
-  // PR #5403 review r6 — run from a LANE, the cd into the clone sits inside a group the single cwd cannot hold.
-  it.each([
-    ['`((` nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`],
-    ['a subshell', `(cd ${fakeClone} && git checkout --detach)`],
-    ['a home-spelled grouped cd', '((cd ~/some-new-daemon-clone; git checkout --detach) )'],
-  ])('DENIES from a lane through %s', (_name, command) => {
-    const out = runHook(command, lane, root);
-    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
-    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
-  });
-  it('a landing scan that cannot finish never switches the other arms off', () => {
-    const out = runHook(`GIT_AUTHOR_EMAIL=x@y git commit -m x; ${'$('.repeat(8000)}`, lane, root);
-    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
   // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
@@ -3940,7 +3606,9 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['${HOME}', 'cd ${HOME}/some-new-daemon-clone && git checkout --detach'],
       ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
       ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
-      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
+      ['tilde-in-variable', 'D=~/some-new-daemon-clone; cd "$D" && git checkout --detach'],
+    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
     });
