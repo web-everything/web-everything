@@ -1,5 +1,6 @@
 import { it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from '../nightly-coroner-job.mjs';
@@ -72,10 +73,45 @@ it('refuses corrupt records and suppresses fixture/dry-run execution', async () 
 });
 function extraction(root) {
   const home = join(root, 'handoff'), dir = join(root, 'state'), lane = { lane: 7, holder: 'coroner-test', path: join(root, 'lane') };
-  mkdirSync(lane.path, { recursive: true });
+  const ops = join(lane.path, 'scripts/operations');
+  mkdirSync(ops, { recursive: true });
+  writeFileSync(join(ops, 'coroner-extract.mjs'), '');
   return { input: { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir, sourceRoot: root },
     io: { root, home, statusFeed: join(home, 'needs-you-events.jsonl'), acquire: vi.fn(async () => lane), release: vi.fn(async () => {}), run: vi.fn(async () => JSON.stringify({ changeRequests: { rounds: 2 } })) } };
 }
+it.each(['lane-directory', 'script-file'])('executes both extractor CLIs through a symlinked %s path', async (kind) => {
+  const root = temp(); const { input, io } = extraction(root);
+  const lane = await io.acquire(); io.acquire.mockClear();
+  const script = `import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+if (resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  console.log(JSON.stringify({ sessions: { count: 3 }, cli: true }));
+}
+`;
+  const ops = join(lane.path, 'scripts/operations');
+  for (const name of ['coroner-extract.mjs', 'coroner-false-findings.mjs']) {
+    const path = join(ops, name);
+    if (kind === 'script-file') {
+      const physical = join(root, `physical ${name}`);
+      writeFileSync(physical, script);
+      rmSync(path, { force: true });
+      symlinkSync(physical, path);
+    } else writeFileSync(path, script);
+  }
+  if (kind === 'lane-directory') {
+    const alias = join(root, 'lane alias');
+    symlinkSync(lane.path, alias, 'dir');
+    lane.path = alias;
+  }
+  io.run = vi.fn(async (args, cwd) => execFileSync(process.execPath, args, { cwd, encoding: 'utf8', timeout: 5000 }));
+  const result = await extractNightlyCoroner(input, io);
+  const report = readFileSync(join(io.home, result.report), 'utf8');
+  expect(report).toContain('Sessions observed: 3');
+  expect(report.match(/"cli": true/g)).toHaveLength(2);
+  expect(io.run).toHaveBeenCalledTimes(2);
+  expect(io.release).toHaveBeenCalledOnce();
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
+});
 it('leases/releases, publishes a report and feed line, and persists cursor across independent runs', async () => {
   const root = temp(); const { input, io } = extraction(root);
   const first = await extractNightlyCoroner(input, io);

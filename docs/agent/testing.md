@@ -1172,6 +1172,10 @@ extraction for the same night. Never prune daily job records without preserving 
 The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
 `coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in
 `finally`. If present, `coroner-false-findings.mjs` is invoked with the same window and `--json`.
+Resolve both extractor filenames to physical paths before invoking Node: CLI entry guards may
+compare argv with Node's canonical module URL, so a symlinked lane or script can otherwise exit
+successfully without output. The `nightly-coroner-symlinked-lane` soak break exercises both CLIs
+through real subprocesses, including report publication, lane release, and receipt recovery.
 The first window is 24 hours; subsequent windows begin at `nightly-coroner-cursor.json`'s `lastEnd`
 beside health `state.json`. Cursor writes are atomic and follow atomic publication of the dated
 `coroner-YYYY-MM-DD.md` in `handoffHome()`. The report carries a recovery receipt, so direct re-entry

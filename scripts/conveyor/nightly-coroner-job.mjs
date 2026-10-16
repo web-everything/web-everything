@@ -115,10 +115,11 @@ export async function extractNightlyCoroner({ night, until, dir, settings, sourc
     try {
       // The extractor imports coroner-rounds.mjs itself; --no-save leaves cursor publication to this job.
       const args = ['--since', since, '--until', until, '--json'];
-      const metrics = JSON.parse(await run([join(lane.path, 'scripts/operations/coroner-extract.mjs'), ...args, '--no-save'], lane.path));
+      // Node resolves main-module symlinks; pass the same physical path to the CLI entry guard.
+      const metrics = JSON.parse(await run([realpathSync(join(lane.path, 'scripts/operations/coroner-extract.mjs')), ...args, '--no-save'], lane.path));
       let falseFindings = null;
       const optional = join(lane.path, 'scripts/operations/coroner-false-findings.mjs');
-      if (existsSync(optional)) falseFindings = JSON.parse(await run([optional, ...args], lane.path));
+      if (existsSync(optional)) falseFindings = JSON.parse(await run([realpathSync(optional), ...args], lane.path));
       window = { since, until };
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';
