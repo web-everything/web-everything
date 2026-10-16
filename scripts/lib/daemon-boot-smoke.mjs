@@ -29,8 +29,8 @@
  * via B's particular cycle (not A's), then checking A FIRST in a shared child would warm X into the cache
  * successfully — and B's later `import()` of X would return the CACHED module without re-evaluating it,
  * silently masking exactly the class of bug this check exists to catch. A fresh child per entry means each
- * entry gets its own, cold module graph, with no cross-entry contamination possible. The entries run in
- * PARALLEL (`Promise.all`), so this costs wall-time only up to the SLOWEST entry, not the sum of all six.
+ * entry gets its own, cold module graph, with no cross-entry contamination possible. Initial entries run
+ * with bounded parallelism (default three); native signal deaths are retried serially after they drain.
  *
  * A dynamic `import()` that throws (a `ReferenceError`, a `SyntaxError`, a missing module) is caught PER ENTRY —
  * one broken entry is reported by name, and every OTHER entry still gets its own independent child, so a caller
@@ -53,6 +53,24 @@
  */
 
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
+
+/** Initial boots are bounded; only native signal deaths get serial retries. */
+export function resolveBootSettings(env = process.env) {
+  const integer = v => /^\d+$/.test(String(v ?? '')) ? Number(v) : undefined;
+  const r = cascadePolicy('rebuildSmoke', readDeclaredSettings().settings?.rebuildSmoke, {
+    env, standard: { bootSignalRetries: 1, bootConcurrency: 3 },
+    envValues: { bootSignalRetries: integer(env.WE_SMOKE_BOOT_SIGNAL_RETRIES), bootConcurrency: integer(env.WE_SMOKE_BOOT_CONCURRENCY) },
+    valid: {
+      bootSignalRetries: v => Number.isSafeInteger(v) && v >= 0,
+      bootConcurrency: v => Number.isSafeInteger(v) && v > 0,
+    },
+  });
+  return { ...r.value, sources: r.sources };
+}
+
+const RETRY_SIGNALS = new Set(['SIGTRAP', 'SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL']);
 
 /** Env override: a comma-separated list of repo-relative paths, in place of {@link DAEMON_ENTRY_MODULES} — for
  *  a test/soak scenario to point the check at a fixture entry without needing a real production daemon file to
@@ -162,7 +180,11 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
   try {
     out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
   } catch (e) {
-    return { entry, ok: false, error: `child failed: ${firstLine(e)}` };
+    const signal = e?.signal ?? null;
+    const exitCode = e?.status ?? e?.code ?? null;
+    const stderrTail = String(e?.stderr ?? '').trimEnd().split(/\r?\n/).slice(-30).join('\n');
+    return { entry, ok: false, signal, exitCode, stderrTail,
+      error: `child failed: ${firstLine(e)} (signal=${signal}, exitCode=${exitCode})${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
   }
   let parsed;
   try {
@@ -175,10 +197,16 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
 
 /**
  * THE CHECK — same `(ctx) -> {ok, detail}` contract as every row in `daemon-live-smoke.mjs#SMOKE_CHECKS`.
- * @param {{root:string, budgets?:Record<string,number>, runChild?:typeof runBounded, env?:NodeJS.ProcessEnv}} ctx
- * @returns {Promise<{ok:boolean, detail:string}>}
+ * @param {{root:string, budgets?:Record<string,number>, runChild?:typeof runBounded, env?:NodeJS.ProcessEnv, log?:Console}} ctx
+ * @returns {Promise<{ok:boolean, detail:string, entries?:Array<object>}>}
  */
-export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = runBounded, env = process.env }) {
+export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = runBounded, env = process.env, log = console }) {
+  const settings = resolveBootSettings(env);
+  try {
+    if (!process.env.VITEST || log !== console) {
+      log.error?.(`daemon-boot-smoke: rebuildSmoke ${JSON.stringify(settings)}`);
+    }
+  } catch { /* diagnostics only */ }
   const { entries, overridden } = resolveDaemonEntries(env);
   // #4468 review — never silently trust an override-or-real entry's shape; a traversal/absolute/scheme
   // specifier resolves OUTSIDE the candidate tree via `new URL(rel, 'file://' + cwd + '/')`. Refuse loud,
@@ -189,15 +217,33 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
   }
   const overrideMarker = overridden ? `⚠ WE_SMOKE_DAEMON_ENTRIES override active (${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}, real list bypassed) — ` : '';
   const timeoutMs = budgets.daemonBootMs ?? resolveChildTimeoutMs(env);
-  // One child PER entry, run in PARALLEL — see the file header for why a shared child risks a cross-entry
-  // module-cache false negative. Wall time is bounded by the slowest entry, not the sum of all of them.
-  const results = await Promise.all(entries.map((entry) => bootOneEntry(entry, { root, timeoutMs, runChild, env })));
+  const options = { root, timeoutMs, runChild, env };
+  const results = new Array(entries.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(settings.bootConcurrency, entries.length) }, async () => {
+    while (next < entries.length) {
+      const index = next++;
+      results[index] = await bootOneEntry(entries[index], options);
+    }
+  }));
+  // Drain all initial children before retrying, one at a time, to avoid repeating the pressure spike.
+  for (let index = 0; index < results.length; index++) {
+    const attempts = [results[index]];
+    while (!results[index].ok && RETRY_SIGNALS.has(results[index].signal) && attempts.length <= settings.bootSignalRetries) {
+      results[index] = await bootOneEntry(entries[index], options);
+      attempts.push(results[index]);
+    }
+    results[index] = { ...results[index], attempts };
+  }
+  const retryNotes = results.filter(r => r.attempts.length > 1)
+    .map(r => `${r.entry}: retried after ${r.attempts.slice(0, -1).map(a => a.signal).join(', ')}`).join('; ');
+  const notes = retryNotes ? ` — ${retryNotes}` : '';
   const failures = results.filter((r) => !r.ok);
   if (failures.length) {
     const detail = failures.map((f) => `${f.entry}: ${f.error}`).join('; ');
-    return { ok: false, detail: `${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot: ${detail}` };
+    return { ok: false, entries: results, detail: `${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot: ${detail}${notes}` };
   }
-  return { ok: true, detail: `${overrideMarker}all ${results.length} daemon entries booted clean: ${results.map((r) => r.entry).join(', ')}` };
+  return { ok: true, entries: results, detail: `${overrideMarker}all ${results.length} daemon entries booted clean: ${results.map((r) => r.entry).join(', ')}${notes}` };
 }
 
 /** The `SMOKE_CHECKS` row `daemon-live-smoke.mjs` appends. */

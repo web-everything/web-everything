@@ -583,7 +583,7 @@ export async function smokeAndAdopt({
         since,
         reason,
         failed: failed.map((r) => r.name).join(','),
-        details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })).slice(0, 10),
+        details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })).slice(0, 10),
         lastGood: prevHead,
         target: plan.finalSha,
         mainSha: plan.mainSha,
@@ -592,6 +592,7 @@ export async function smokeAndAdopt({
       };
     }, { release: true })) ?? readRebuildState(root, stEnv);
     alert('daemon-held-on-last-good', {
+      details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       reason, failed: failed.map((r) => r.name).join(','), since: since ?? state.held?.since ?? null, lastGood: prevHead, target: plan.finalSha,
       message: 'the new build failed its live smoke — staying on the last working build and still dispatching from it (x5wbsbc)',
     });
@@ -667,7 +668,7 @@ export async function smokeAndAdopt({
     });
     alert('smoke-rejected', {
       failed: failedNames,
-      details: failedA.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })),
+      details: failedA.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       ...(rejected?.retryAt ? { retryAt: rejected.retryAt, attempts: rejected.attempts } : {}),
       ...(rejected ? {} : { recorded: false }),
     });
@@ -698,7 +699,7 @@ export async function smokeAndAdopt({
   };
   const envLoadAlert = (extra) => alert('smoke-env-load', {
     failed: failedA.map((r) => r.name).join(','),
-    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail) })),
+    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail, r.name) })),
     suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr })),
     ...extra,
     message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
@@ -860,7 +861,7 @@ export async function smokeAndAdopt({
     const retryAt = new Date(now() + rejectRetryDelayMs(env, attempts)).toISOString();
     alert('smoke-harness-broken', {
       failed: failedA.map((r) => r.name).join(','),
-      details: cFailed.map((r) => ({ name: r.name, detail: redactDetail(r.detail) })),
+      details: cFailed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
       alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
       retryAt,
       attempts,

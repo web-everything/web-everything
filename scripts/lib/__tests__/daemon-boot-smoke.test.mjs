@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   buildEntryBootScript, checkDaemonEntriesBoot, DAEMON_BOOT_SMOKE_CHECK, DAEMON_ENTRIES_ENV, DAEMON_ENTRY_MODULES,
-  isSafeRelativeEntry, resolveDaemonEntries,
+  isSafeRelativeEntry, resolveDaemonEntries, resolveBootSettings,
 } from '../daemon-boot-smoke.mjs';
 
 describe('resolveDaemonEntries', () => {
@@ -104,6 +104,96 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).toContain('2/');
     expect(r.detail).toContain(DAEMON_ENTRY_MODULES[0]);
     expect(r.detail).toContain(DAEMON_ENTRY_MODULES[1]);
+  });
+
+  it.each(['SIGTRAP', 'SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL'])('retries %s once after initial boots drain', async (signal) => {
+    const calls = [];
+    const broken = DAEMON_ENTRY_MODULES[0];
+    const r = await checkDaemonEntriesBoot(ctx(async (cmd, args) => {
+      const entry = scriptedEntry(args);
+      calls.push(entry);
+      if (entry === broken && calls.length === 1) {
+        throw Object.assign(new Error('native abort'), { signal, status: null, stderr: 'native stack' });
+      }
+      return '{"ok":true}';
+    }));
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual([...DAEMON_ENTRY_MODULES, broken]);
+    expect(r.detail).toContain(`retried after ${signal}`);
+    expect(r.entries[0].attempts[0]).toMatchObject({ signal, exitCode: null, stderrTail: 'native stack' });
+  });
+
+  it('rejects a second signal death and retains the last 30 stderr lines', async () => {
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      throw Object.assign(new Error('native abort'), { signal: 'SIGTRAP', status: null,
+        stderr: Array.from({ length: 40 }, (_, i) => `stack line ${i}`).join('\n') + '\n' });
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' } });
+    expect(calls).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('signal=SIGTRAP, exitCode=null');
+    expect(r.detail).toContain('stack line 39');
+    expect(r.entries[0].stderrTail.split('\n')).toHaveLength(30);
+    expect(r.entries[0].stderrTail).toMatch(/^stack line 10\n/);
+  });
+
+  it.each([
+    Object.assign(new Error('exit failure'), { status: 1, signal: null, stderr: 'real failure' }),
+    Object.assign(new Error('timeout'), { status: null, signal: 'SIGKILL' }),
+    '{"ok":false,"error":"bad import"}',
+  ])('does not retry non-native failures', async (failure) => {
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      if (failure instanceof Error) throw failure;
+      return failure;
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' } });
+    expect(r.ok).toBe(false);
+    expect(calls).toBe(1);
+    if (failure.status === 1) expect(r.detail).toContain('exitCode=1');
+  });
+
+  it('bounds initial concurrency and retries failed entries serially', async () => {
+    const pending = [];
+    const calls = [];
+    const promise = checkDaemonEntriesBoot(ctx((cmd, args) => new Promise((resolve, reject) => {
+      calls.push(scriptedEntry(args));
+      pending.push({ resolve, reject });
+    })));
+    expect(calls).toHaveLength(3);
+    pending[0].reject(Object.assign(new Error('native abort'), { signal: 'SIGTRAP' }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(4);
+    pending[1].reject(Object.assign(new Error('native abort'), { signal: 'SIGABRT' }));
+    pending[2].resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(6);
+    for (const child of pending.slice(3)) child.resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(7);
+    pending[6].resolve('{"ok":true}');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(calls).toHaveLength(8);
+    pending[7].resolve('{"ok":true}');
+    expect((await promise).ok).toBe(true);
+  });
+
+  it('resolves settings with provenance, supports disabling retries, and logs sources', async () => {
+    const env = { WE_SMOKE_BOOT_SIGNAL_RETRIES: '0', WE_SMOKE_BOOT_CONCURRENCY: '1', [DAEMON_ENTRIES_ENV]: 'fixture.mjs' };
+    expect(resolveBootSettings(env)).toMatchObject({ bootSignalRetries: 0, bootConcurrency: 1,
+      sources: { bootSignalRetries: 'env', bootConcurrency: 'env' } });
+    expect(resolveBootSettings({ WE_SMOKE_BOOT_CONCURRENCY: '0', WE_SMOKE_BOOT_SIGNAL_RETRIES: '-1' }))
+      .toMatchObject({ bootSignalRetries: 1, bootConcurrency: 3 });
+    const lines = [];
+    let calls = 0;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      calls++;
+      throw Object.assign(new Error('abort'), { signal: 'SIGTRAP' });
+    }), env, log: { error: line => lines.push(line) } });
+    expect(r.ok).toBe(false);
+    expect(calls).toBe(1);
+    expect(lines[0]).toContain('"bootSignalRetries":"env"');
   });
 
   it('fails when ONE entry\'s own child throws (killed / crashed before it could report) — the other entries still get judged', async () => {

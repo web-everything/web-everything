@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
 import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
+import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -91,6 +92,33 @@ afterEach(() => {
 });
 
 describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
+  it('preserves signal diagnostics and stderr tails in held state and self-sync alerts', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const tail = Array.from({ length: 30 }, (_, i) => `native stack frame ${i}: ${'x'.repeat(40)}`).join('\n');
+    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir,
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' },
+      runChild: async () => { throw Object.assign(new Error('native abort'), {
+        signal: 'SIGTRAP', status: null, stderr: `warning\n${tail}\nghp_secret`,
+      }); },
+    });
+    const result = await rebuildClone({ root: f.cloneDir,
+      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+      runSmoke: async () => ({ verdict: 'code', smoke: { results: [
+        { name: 'daemon-entries-boot', ...boot },
+      ] } }),
+    });
+    expect(result.adopted).toBeFalsy();
+    const held = readRebuildState(f.cloneDir, f.env).held;
+    expect(held.details[0].detail).toContain('signal=SIGTRAP, exitCode=null');
+    expect(held.details[0].detail).toContain('native stack frame 29');
+    expect(held.details[0].detail).not.toContain('ghp_secret');
+    const alert = result.alerts.find(a => a.kind === 'daemon-held-on-last-good');
+    expect(alert.detail.details).toEqual(held.details);
+    const stale = result.alerts.find(a => a.kind === 'clone-held-stale');
+    expect(stale.detail.broken.details).toEqual(held.details);
+  });
   it('a candidate whose new overlay fails the dispatch smoke is never adopted; the clone stays on last-good', async () => {
     const f = makeFixture();
     const lastGood = head(f);

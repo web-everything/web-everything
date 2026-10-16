@@ -1,5 +1,18 @@
 # Testing — Three-Tier Strategy
 
+## Daemon entry boot smoke
+
+Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
+(default 3) bounds initial boots; after those children drain, `rebuildSmoke.bootSignalRetries`
+(default 1; zero disables) retries only SIGTRAP/SIGSEGV/SIGABRT/SIGBUS/SIGILL deaths, serially.
+Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
+`scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
+`WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Retain per-attempt signal,
+exit code and the last 30 stderr lines in the smoke result. Rebuild rejection/held/stale alerts
+must preserve boot tails beyond the ordinary detail caps while still redacting tokens.
+Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
+exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
+
 ## Codex usage accounting
 
 Every direct task, Codex delivery/fix worker, wrapped Codex dispatch worker, and Codex review
