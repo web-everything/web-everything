@@ -16,7 +16,8 @@ function execFor(graphql = false) {
   return (cmd, args) => {
     if (cmd === 'git') return args[0] === 'diff' ? 'src/a.js\0' : '';
     if (args[1] === 'comment') return '';
-    if (args[1] === 'view') return JSON.stringify({ id: 'PR_ID', headRefOid: HEAD });
+    // Pass live admission so the strategy reaches the required-workflows refusal under test.
+    if (args[1] === 'view') return JSON.stringify({ id: 'PR_ID', headRefOid: HEAD, labels: ['ready-to-merge'] });
     if (args[1] === 'graphql') {
       if (graphql) return JSON.stringify({ errors: [{ message: LIVE, type: 'UNPROCESSABLE', code: 'RULESET' }] });
       throw Object.assign(new Error('gh failed'), { stderr: LIVE });
