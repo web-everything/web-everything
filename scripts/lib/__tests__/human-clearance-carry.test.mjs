@@ -257,10 +257,14 @@ describe('proveMechanicalMove (real git)', () => {
 /** A recorded commit graph: `parents[sha]`, and `main` = the set of shas reachable from the main ref. */
 const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = view?.headRefOid }) => vi.fn((cmd, args) => {
   if (cmd === 'gh' && args[1] === 'view') return JSON.stringify(view);
-  if (cmd === 'git' && args[0] === 'rev-parse') return `${tip}\n`; // the sha the branch tip (the net diff's rev) resolves to
+  if (cmd === 'git' && args[0] === 'rev-parse') {
+    if (args.at(-1).endsWith('^{tree}')) throw Error('tree not recorded in fixture');
+    return `${tip}\n`;
+  } // the sha the branch tip (the net diff's rev) resolves to
   if (cmd === 'gh' && args[1] === 'comment') { onComment(args[args.indexOf('--body') + 1]); return ''; }
   // PR #4631 round 11: a moved head's coverage reads the PR's formal reviews (`gh api …/reviews`); none stand here.
-  if (cmd === 'gh' && args[0] === 'api') return '';
+  if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
+    ? view.comments.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert'].join('\t')).join('\n') : '';
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
@@ -669,7 +673,8 @@ it('#5414 recorded heads: carries chalbert and updates acceptance as well as cle
   const posted = []; const logs = []; const proofs = [];
   const exec = (cmd, args) => {
     if (cmd === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: [comment] });
-    if (cmd === 'gh' && args[0] === 'api') return '';
+    if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
+      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert'].join('\t') : '';
     if (cmd === 'gh' && args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
     throw Error('unexpected command');
   };

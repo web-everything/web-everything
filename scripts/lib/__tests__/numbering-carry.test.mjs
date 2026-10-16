@@ -1137,7 +1137,9 @@ describe('#5414 human clearance through the drain gate', () => {
     let views = 0;
     const exec = (cmd, args, opts) => {
       if (cmd === 'git') return execFileSync(cmd, args, { ...opts, cwd: r.cwd });
-      if (args[0] === 'api') return '';
+      if (args[0] === 'api') return args.some(a => a.includes('/comments'))
+        ? (liveHold ? [...comments, { author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments)
+          .map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author.login].join('\t')).join('\n') : '';
       if (args[1] === 'view') {
         views++;
         return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: views > 1 && liveHold

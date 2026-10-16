@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -845,11 +846,12 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
 function readLiveDrainCarryEvidence({ pr, repo, exec = execFileSync, readReviews } = {}) {
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 };
   const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
-    '--json', 'headRefOid,comments'], opts));
-  if (!d?.headRefOid || !Array.isArray(d.comments)) throw Error('incomplete live head/comments');
+    '--json', 'headRefOid'], opts));
+  if (!d?.headRefOid) throw Error('incomplete live head');
+  const comments = readCompletePrComments(pr, { repo, exec });
   const slug = repo || '{owner}/{repo}';
-  return { headSha: d.headRefOid, ...readDrainCarryEvidence({ comments: d.comments,
-    readComments: () => parseJsonLines(exec('gh', GH_ARGV.readComments(slug, pr), opts)),
+  return { headSha: d.headRefOid, ...readDrainCarryEvidence({ comments,
+    readComments: () => readCompletePrComments(pr, { repo, exec }),
     readReviews: readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(slug, pr), opts))),
   }) };
 }
@@ -895,12 +897,12 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   let workflow = decideDrainWorkflowEditHold({ files, filesComplete,
     headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
-  // A workflow clearance may move ONLY over proven numbering here. General refresh equivalence does not
+  // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
   // waive the exact-head workflow ceremony. Record the carry before any gate can honour it.
   const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
     cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun,
     readNumberingLiveEvidence: () => readLiveDrainCarryEvidence(readOptions), ...readOptions?.carry,
-    numberingOnly: workflow.hold === true });
+    numberingOnly: workflow.hold === true || (!!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution) });
   if (carry?.action === 'defer') return carry;
   if (carry?.carried) {
     evidence = { ...evidence, humanClearedSha: evidence.headSha, acceptedSha: evidence.headSha };

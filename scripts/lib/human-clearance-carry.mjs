@@ -197,7 +197,9 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
 
 /**
  * IO: shared carry proof for the drain and CI. Check the pinned diff before touching git;
- * unreadable evidence or history never grants a carry. No record is posted and nothing is logged.
+ * unreadable evidence or history never grants a carry. A fingerprinted exact tree match also permits an
+ * empty recovery commit; SHA-only evidence is restricted to explicit numberingOnly callers.
+ * No record is posted and nothing is logged.
  * @returns {{carry:boolean, applicable:boolean, reason:string, fromSha?:string, toSha?:string,
  *   fingerprint?:string, actor?:string, tier?:string, mechanicalReason?:string}}
  */
@@ -214,9 +216,32 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
       return { carry: false, applicable: true,
         reason: `the live net diff was read from ${evidence.headDiffSha ? String(evidence.headDiffSha).slice(0, 9) : 'an unresolved tip'}, not the live head` };
     }
+    if (enabled !== true || !['strict', 'contribution'].includes(equivalence)
+      || !/^[0-9a-f]{40}$/i.test(clearance.sha ?? '') || !/^[0-9a-f]{40}$/i.test(evidence.headSha)
+      || !clearance.actor || !liveCarryFingerprints(evidence.headDiff).diff) {
+      return { carry: false, applicable: true, reason: 'unknown or disabled carry evidence' };
+    }
     const inputs = { enabled, equivalence, clearance, headSha: evidence.headSha, headDiff: evidence.headDiff };
     const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
     const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
+    // SHA-only records belong exclusively to the explicit numbering proof. General carry
+    // never consults git (or reaches the writer) without a recorded fingerprint.
+    const hasFingerprint = [clearance.diff, clearance.contribution].some(v => typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v));
+    if (!hasFingerprint && !numberingOnly) return { ...pre, carry: false, applicable: true };
+    if (pre.carry) {
+      // Exact root tree identity includes every blob, path and mode, including the manifest.
+      // Empty commits need no merge/replay exception. Never equate missing/invalid git output.
+      try {
+        const tree = sha => String(gitExec('git', ['rev-parse', '--verify', `${sha}^{tree}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+        const fromTree = tree(clearance.sha), toTree = tree(evidence.headSha);
+        if (/^[0-9a-f]{40}$/.test(fromTree) && fromTree === toTree) {
+          return { ...pre, applicable: true, tier: 'tree', mechanicalReason: 'identical cleared and live head trees',
+            reason: 'identical cleared and live head trees' };
+        }
+      } catch { /* No tree proof; the existing mechanical/numbering proofs must stand on their own. */ }
+    }
+
     if (!pre.carry || numberingOnly) {
       // SHA-bound clearance plus exact git bytes is sufficient even when the ceremony could not read a diff.
       // A scored, pinned live diff is still required to write the new record.
@@ -244,7 +269,7 @@ export function buildCarryMarker({ fromSha, toSha, fingerprint }) {
 /**
  * PURE: the durable record the drain posts. Binds `reviewed-sha` + `cleared-human` to the new head in ONE comment
  * (what `parseLatestHumanClearedSha` requires), with the reviewed diff/contribution of the live net diff text.
- * @param {{fromSha:string, toSha:string, fingerprint:string, actor:string, headDiffText:string, mechanicalReason?:string, tier?:'strict'|'contribution'}} o
+ * @param {{fromSha:string, toSha:string, fingerprint:string, actor:string, headDiffText:string, mechanicalReason?:string, tier?:'strict'|'contribution'|'numbering'|'tree'}} o
  */
 export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '', tier = 'strict' }) {
   const actor = sanitizeActor(rawActor);
@@ -253,7 +278,9 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     '',
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
-      + (tier === 'numbering'
+      + (tier === 'tree'
+        ? 'the live head has exactly the cleared head’s tree (all paths, modes and blob bytes)'
+        : tier === 'numbering'
         ? `the head moved only by the drain's own card-numbering commit(s), verified mechanically (${mechanicalReason})`
         : tier === 'contribution'
         ? "the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree"
@@ -340,12 +367,12 @@ export function applyHumanClearanceCarry({
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };
   // The proof is slow (fetches, blob reads): a hold posted meanwhile would sit BEFORE this record and read as
-  // superseded. The numbering tier (new with #5233) never records without a live re-read — checked before the dry
+  // superseded. Numbering and tree identity never record without a live re-read — checked before the dry
   // run so a preview never reports a carry the real pass refuses; the older tiers re-read whenever the caller
   // supplies one.
-  if (d.tier === 'numbering' && readLiveEvidence == null) readLiveEvidence = readNumberingLiveEvidence;
-  if (d.tier === 'numbering' && typeof readLiveEvidence !== 'function') {
-    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the numbering tier records only after a live re-read\n`);
+  if (['numbering', 'tree'].includes(d.tier) && readLiveEvidence == null) readLiveEvidence = readNumberingLiveEvidence;
+  if (['numbering', 'tree'].includes(d.tier) && typeof readLiveEvidence !== 'function') {
+    log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the ${d.tier} tier records only after a live re-read\n`);
     return null;
   }
   if (dryRun) {
