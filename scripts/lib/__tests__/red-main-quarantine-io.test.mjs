@@ -49,6 +49,8 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
   it('the live safety net publishes the proof, job and owed card on the ops ref', () => {
     const { board, origin } = repo();
     const fixture = JSON.parse(readFileSync(join('scripts', 'lib', '__tests__', 'fixtures', 'red-main-quarantine-62da75ed3.json'), 'utf8'));
+    // Supply hypothetical same-code coverage; the recorded group run has a different base.
+    fixture.mainCiRuns.failing.groupEvidence.baseSha = fixture.mainCiRuns.runs[0].headSha;
     const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
     const result = runSafetyNet({
       mainCiRuns: fixture.mainCiRuns, now: Date.parse(fixture.now), dir: join(board, 'health'), board,

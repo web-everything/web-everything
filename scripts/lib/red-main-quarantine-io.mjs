@@ -160,15 +160,26 @@ export function readFailedJobs(runId, { exec, repoSlug, filter = 'latest' }) {
 /** Best effort: only the latest attempt of a job can prove it passed. */
 function readFlakeProof(mainCiRuns, { readJobs, now }) {
   const proof = Object.create(null);
-  const group = mainCiRuns?.failing?.groupEvidence;
-  if (group && group.runId && Array.isArray(group.coveredJobs)) {
-    for (const job of group.coveredJobs) if (typeof job === 'string') proof[job] = { kind: 'merge-group-green-on-tip', runId: group.runId };
-  }
   const runs = mainCiRuns?.runs ?? [];
   const failing = runs.find((r) => r.databaseId === mainCiRuns?.failing?.runId);
-  if (!failing?.headSha) return proof;
+  if (!Number.isFinite(now) || typeof failing?.headSha !== 'string' || !/^[0-9a-f]{7,64}$/i.test(failing.headSha)) return proof;
+  const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
+  const group = mainCiRuns?.failing?.groupEvidence;
+  const completedAt = timestamp(group?.completedAt);
+  // Coverage alone cannot prove a flake: bind it to the failing code (and the current tip, when known)
+  // before dropping the evidence metadata. Unknown or future completion is never a green run.
+  if (group?.runId && Array.isArray(group.coveredJobs) && group.baseSha === failing.headSha
+    && (mainCiRuns?.tip == null || group.baseSha === mainCiRuns.tip.sha)
+    && Number.isFinite(completedAt) && completedAt <= now) {
+    for (const job of group.coveredJobs) if (typeof job === 'string') proof[job] = { kind: 'merge-group-green-on-tip', runId: group.runId };
+  }
+  const failingCreatedAt = timestamp(failing.createdAt);
   for (const run of runs) {
-    if (run.headSha !== failing.headSha || (run.attempt !== undefined && !(run.attempt > 1)) || Date.parse(run.createdAt) > Date.parse(failing.createdAt) || Date.parse(run.updatedAt) > now) continue;
+    const createdAt = timestamp(run.createdAt);
+    const updatedAt = timestamp(run.updatedAt);
+    if (run.headSha !== failing.headSha || (run.attempt !== undefined && !(run.attempt > 1))
+      || !Number.isFinite(failingCreatedAt) || !Number.isFinite(createdAt) || !Number.isFinite(updatedAt)
+      || createdAt > failingCreatedAt || updatedAt < createdAt || updatedAt > now) continue;
     try {
       const result = readJobs(run.databaseId, { filter: 'all' });
       const latest = new Map();

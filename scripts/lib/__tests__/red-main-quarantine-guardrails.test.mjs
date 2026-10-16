@@ -20,7 +20,10 @@ const plan = (o = {}) => planSafetyNet({ status: 'red', firstRedSha: '62da75ed3'
 const entry = (o = {}) => addEntries(null, { tests: [file], job: 'integration', proof, brokenSha: '62da75ed3', owner: 'operator', reason: 'flake', actor: 'operator', now, ...o }).list.entries[0];
 
 function net(o = {}) {
-  return runSafetyNet({ dir: temp(), now, mainCiRuns: structuredClone(fixture.mainCiRuns), live: false,
+  const mainCiRuns = structuredClone(fixture.mainCiRuns);
+  // Positive guardrail cases use hypothetical same-code proof; the recorded group base is unrelated.
+  mainCiRuns.failing.groupEvidence.baseSha = mainCiRuns.runs[0].headSha;
+  return runSafetyNet({ dir: temp(), now, mainCiRuns, live: false,
     mode: { value: 'stop', source: 'tool' }, settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS }, sources: {} },
     readJobs: () => ({ failed: fixture.failedJobs }), readLog: () => failure,
     readList: () => ({ ok: true, list: { version: 1, entries: [] } }), log: () => {}, ...o });
@@ -118,6 +121,18 @@ describe('rerun proof IO', () => {
   it('unreadable jobs and absent evidence never prove a flake', () => {
     expect(probe(new Error('unreadable')).out.plan.action).toBe('none');
     expect(probe(undefined).out.plan.action).toBe('none');
+  });
+  it.each([
+    ['missing update', (run) => { delete run.updatedAt; }],
+    ['invalid update', (run) => { run.updatedAt = 'unknown'; }],
+    ['future update', (run) => { run.updatedAt = '2099-01-01T00:00:00Z'; }],
+    ['update before creation', (run) => { run.updatedAt = '2026-10-14T06:00:00Z'; }],
+  ])('rejects rerun proof with %s', (_, mutate) => {
+    const mainCiRuns = structuredClone(fixture.mainCiRuns);
+    delete mainCiRuns.failing.groupEvidence;
+    mainCiRuns.runs[0].attempt = 2;
+    mutate(mainCiRuns.runs[0]);
+    expect(net({ mainCiRuns, readJobs: (_, opts) => opts?.filter === 'all' ? { jobs: passed } : { failed: fixture.failedJobs } }).plan.action).toBe('none');
   });
   it('does not read all attempts when off or main is green', () => {
     const { readJobs } = probe(passed, { settings: { requireProvenFlake: false } });
