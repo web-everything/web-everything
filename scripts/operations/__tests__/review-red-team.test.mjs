@@ -3,16 +3,16 @@
  * Claude re-checks its claims; a confirmed break is a miss for the accepting seat and the builder. No real codex,
  * agy, claude, git or GitHub process: every effect is a fake.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
 import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 import {
-  createRedTeamIo, speculateRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
+  createRedTeamIo, speculateRedTeam, completeRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
   buildRedTeamTask, buildRecheckRequest, applyRecheck, buildMissRows, renderRedTeamComment, replayPayload,
   reserveSeatCalls, RED_TEAM_ENV, EXTRA_SEATS_ENV, DAILY_CAP_ENV, PROVIDER_CAP_ENV, RED_TEAM_SEAT, RED_TEAM_MODELS,
   RED_TEAM_MISS_DISPATCH_KIND, ACCEPTING_SEAT_MODEL, DEFAULT_PROBE_INTERVAL_MS,
@@ -22,6 +22,12 @@ import { JUDGE_MODEL } from '../review-pr.mjs';
 import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
+import { resolveOperationRoute } from '../../lib/dispatch-routing-policy-io.mjs';
+
+vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => ({
+  ...await importOriginal(),
+  resolveOperationRoute: vi.fn(() => null),
+}));
 
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
@@ -495,6 +501,84 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
 
 
 describe('repo-grounded red-team re-check and card-only skips', () => {
+  it.each(['codex', 'antigravity'])('rejects incompatible providers when repository reads are enabled: %s', async provider => {
+    vi.mocked(resolveOperationRoute).mockReturnValue({ provider, model: 'test-model', effort: 'high' });
+    const spawnRecheck = vi.fn(async () => ({ value: { checks: [] } }));
+    try {
+      const io = createRedTeamIo({ env: {}, spawnRecheck });
+      const request = { pr: 5, lanePath: '/unused', rev: REV, readsRepo: true };
+      await expect(io.runRecheck(request)).rejects.toThrow('repo re-check requires the Claude read-only tool allow-list');
+      expect(spawnRecheck).not.toHaveBeenCalled();
+      await expect(io.runRecheck({ ...request, readsRepo: false })).resolves.toEqual({ checks: [] });
+      expect(spawnRecheck).toHaveBeenCalledTimes(1);
+      expect(spawnRecheck.mock.calls[0][0]).not.toHaveProperty('allowedTools');
+      expect(resolveOperationRoute).toHaveBeenCalledWith({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+    } finally { vi.mocked(resolveOperationRoute).mockReset().mockReturnValue(null); }
+  });
+
+  const unsafeFilesRead = [
+    'AKIA' + '1234567890ABCDEF', 'src/AKIA' + '1234567890ABCDEF.mjs',
+    '![x](https://evil.example/beacon)', '[x](https://evil.example/beacon)',
+    '../outside', '/outside', 'a/../outside', 'a\\outside', 'a\nforged', 'a\rb', 'a\u2028b',
+    '`file`', '"file"', '--option', '\uff0e\uff0e/outside', 'a\u200bb', 'a%2fb',
+    'a\nb\n', 'a//b', './file', 'a/./b', '.git/config', 'a/'.repeat(301) + 'b',
+  ];
+
+  it.each(unsafeFilesRead)('scrubs unsafe filesRead at the comment and evidence sinks: %j', async unsafe => {
+    const { io, rows } = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'refuted', filesRead: [unsafe] }] }) });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].findings[0].filesRead).toEqual([]);
+    expect(result.comment.body).not.toContain(unsafe);
+    expect(JSON.stringify(rows)).not.toContain(unsafe);
+    // Direct rendering also covers retrying a legacy, unsanitized evidence row.
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: [{ ...BREAK, filesRead: [unsafe] }], recheckStatus: 'ok', foldedVerdict: 'accept' });
+    expect(body).toContain('Files read: none');
+    expect(body).not.toContain(unsafe);
+  });
+
+  it('scrubs filesRead when completing speculative evidence and retrying legacy rows', async () => {
+    const first = fakeIo({ postComment: () => { throw new Error('offline'); } });
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    const unsafe = 'AKIA' + '1234567890ABCDEF';
+    pass.findings[0] = { ...pass.findings[0], confirmedByRecheck: false, recheckOutcome: 'not confirmed', filesRead: [unsafe] };
+    await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
+    expect(first.rows[0].findings[0]).toMatchObject({ filesRead: [], recheckOutcome: 'unverifiable' });
+    first.rows[0].findings[0].filesRead = [unsafe];
+    first.rows[0].findings[0].recheckOutcome = 'not confirmed';
+    const again = fakeIo({ readRecords: () => first.rows });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, again.io);
+    expect(result.comment.body).toContain('[unverifiable]');
+    expect(result.comment.body).toContain('Files read: none');
+    expect(result.comment.body).not.toContain(unsafe);
+    expect(again.calls.some(c => c[0] === 'recheck')).toBe(false);
+  });
+
+  it('preserves safe relative filesRead and bounds evidence without truncating paths', () => {
+    const filesRead = ['src/a-b.mjs', 'packages/@scope/a+b.mjs', 'docs/.hidden_file.md'];
+    const [f] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, filesRead: [...filesRead, ...filesRead] }] });
+    expect(f.filesRead).toEqual(filesRead);
+    expect(f.recheckOutcome).toBe('not confirmed');
+    const [bounded] = applyRecheck([BREAK], { checks: [{ index: 0, confirmed: false, filesRead: Array.from({ length: 101 }, (_, i) => `file-${i}.mjs`) }] });
+    expect(bounded.filesRead).toHaveLength(100);
+  });
+
+  it.each(['summary', 'file', 'category', 'impactIfUnfixed', 'failure_scenario', 'recheckReason'])('scrubs model-controlled %s in rendered and stored findings', async field => {
+    const { io, rows } = fakeIo();
+    const p = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    const secret = 'AKIA' + '1234567890ABCDEF';
+    pass.findings[0][field] = secret;
+    pass.parsed[RED_TEAM_SEAT.key].findings[0][field] = secret;
+    const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, io);
+    expect(rows).toHaveLength(3); // Seat plus both accepting-review and builder miss rows.
+    expect(JSON.stringify(rows)).not.toContain(secret);
+    expect(result.comment.body).not.toContain(secret);
+    const body = renderRedTeamComment({ pr: 5, rev: REV, findings: pass.findings, recheckStatus: 'ok', foldedVerdict: 'changes' });
+    expect(body).not.toContain(secret);
+  });
+
   it.each([true, false])('skips card-only probes before any reservation (speculative=%s)', async speculative => {
     const p = payload('accept');
     p.findings.read.netChangedFiles = ['backlog/123-card.md'];
@@ -584,12 +668,14 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
         expect(execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(rev);
         expect(readFileSync(join(cwd, 'caller.mjs'), 'utf8')).toBe('export const guard = true;');
         expect(existsSync(join(cwd, '.git', 'objects', 'info', 'alternates'))).toBe(false);
+        symlinkSync(join(root, 'caller.mjs'), join(cwd, 'outside.mjs'));
+        symlinkSync('caller.mjs', join(cwd, 'inside.mjs'));
         if (fail) throw new Error('recheck failed');
-        return { value: { checks: [] } };
+        return { value: { checks: [{ index: 0, confirmed: false, filesRead: ['caller.mjs', 'missing.mjs', 'outside.mjs', 'inside.mjs', '.git', '.git/config'] }] } };
       } });
       const request = { pr: 5, lanePath: root, rev, ...buildRecheckRequest({ pr: 5, repo: REPO, findings: [BREAK] }) };
       if (fail) await expect(io.runRecheck(request)).rejects.toThrow('recheck failed');
-      else expect(await io.runRecheck(request)).toEqual({ checks: [] });
+      else expect(await io.runRecheck(request)).toEqual({ checks: [{ index: 0, confirmed: false, filesRead: ['caller.mjs', 'inside.mjs'] }] });
       expect(existsSync(cwd)).toBe(false);
       expect(readFileSync(join(root, 'caller.mjs'), 'utf8')).toBe('export const guard = false;');
     } finally { rmSync(root, { recursive: true, force: true }); }

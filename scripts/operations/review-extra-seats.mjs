@@ -52,11 +52,11 @@ import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync,
+  closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS } from './review-dispatch.mjs';
@@ -440,9 +440,9 @@ export function buildSeatRows({
       const hit = claudeFindings ? findingCorroboratedBy(f, claudeFindings) : null;
       return {
         summary: publishable(f.summary),
-        file: f.file ?? null,
+        file: publishable(f.file),
         line: f.line ?? null,
-        impactIfUnfixed: f.impactIfUnfixed ?? null,
+        impactIfUnfixed: publishable(f.impactIfUnfixed),
         confirmedByClaude: claudeFindings ? Boolean(hit) : null,
       };
     });
@@ -1074,6 +1074,30 @@ export function buildRecheckRequest({ pr, repo, title, diffText, findings, reads
   return { mandate, input, shape: RECHECK_SHAPE };
 }
 
+/** One policy for model-reported paths, including legacy rows at publication sinks.
+ * With a live clone, also require a regular file whose real path stays inside that clone.
+ * Reject unsafe entries whole: scrubbing or truncating a path would invent read evidence.
+ */
+function publishableFilesRead(files, clone = null) {
+  const root = clone ? realpathSync(clone) : null;
+  return [...new Set((Array.isArray(files) ? files : []).slice(0, 100).filter(p => {
+    if (typeof p !== 'string' || !p || p.length > MAX_TEXT || /[^\w./@+-]/u.test(p) || p.startsWith('/')) return false;
+    if (p.split('/').some(part => !part || part === '.' || part === '..' || part === '.git' || part.startsWith('--'))) return false;
+    if (publishable(p) !== p) return false;
+    if (!root) return true;
+    try {
+      const actual = realpathSync(join(root, p));
+      return actual.startsWith(root + sep) && !actual.startsWith(join(root, '.git') + sep) && statSync(actual).isFile();
+    } catch { return false; }
+  }))];
+}
+
+function withFileReadEvidence(f) {
+  const filesRead = Array.isArray(f.filesRead) ? publishableFilesRead(f.filesRead) : undefined;
+  return { ...f, filesRead,
+    recheckOutcome: !f.confirmedByRecheck && !filesRead?.length ? 'unverifiable' : f.recheckOutcome };
+}
+
 /** The re-check's answer → one `{confirmed, reason}` per finding index; anything missing or malformed is NOT confirmed. PURE. */
 export function applyRecheck(findings, value) {
   const byIndex = new Map();
@@ -1082,8 +1106,7 @@ export function applyRecheck(findings, value) {
   }
   return findings.map((f, i) => {
     const c = byIndex.get(i);
-    const filesRead = (Array.isArray(c?.filesRead) ? c.filesRead : []).filter(p =>
-      typeof p === 'string' && p.trim() && !p.startsWith('/') && !p.includes('\\') && !p.split('/').includes('..'));
+    const filesRead = publishableFilesRead(c?.filesRead);
     const unverifiable = !c || c.unverifiable === true || (c.confirmed !== true && filesRead.length === 0);
     return { ...f, confirmedByRecheck: !unverifiable && c?.confirmed === true,
       recheckOutcome: unverifiable ? 'unverifiable' : c.confirmed ? 'confirmed' : 'not confirmed',
@@ -1111,7 +1134,7 @@ export function buildMissRows({ pr, repo, rev, runCallId, redTeamProvider, redTe
     // `read.netChangedFiles` the seat row for this pass already stamped; see buildSeatRows's own note.
     changedFiles: Array.isArray(changedFiles) ? changedFiles : null,
   };
-  const summarize = (list) => list.map((f) => ({ summary: publishable(f.summary), category: f.category ?? null, file: f.file ?? null, line: f.line ?? null, impactIfUnfixed: f.impactIfUnfixed ?? null }));
+  const summarize = (list) => list.map((f) => ({ summary: publishable(f.summary), category: publishable(f.category), file: publishable(f.file), line: f.line ?? null, impactIfUnfixed: publishable(f.impactIfUnfixed) }));
   const rows = [];
   const bySeat = new Map();
   for (const f of confirmed) bySeat.set(claudeSeatForFinding(f), [...(bySeat.get(claudeSeatForFinding(f)) ?? []), f]);
@@ -1148,16 +1171,17 @@ export function renderRedTeamComment({ pr, rev, provider, model, findings, reche
   // Card x1b8hlo — every field is ONE line: the red-team gate parses this comment, and a model-written field carrying a
   // newline could otherwise forge a `[**confirmed**]` finding line of its own (each field is untrusted model text).
   const one = (v) => String(v ?? '').replace(WHITESPACE_RUN, ' ').trim();
-  const lines = findings.map((f, i) => {
+  const lines = findings.map((finding, i) => {
+    const f = withFileReadEvidence(finding);
     const tag = f.confirmedByRecheck ? RED_TEAM_CONFIRMED_TAG : (f.recheckOutcome === 'unverifiable' || !f.filesRead?.length) ? RED_TEAM_UNVERIFIABLE_TAG : RED_TEAM_UNCONFIRMED_TAG;
-    const file = one(f.file).replaceAll(String.fromCharCode(96), String.fromCharCode(39));
+    const file = one(publishable(f.file)).replaceAll(String.fromCharCode(96), String.fromCharCode(39));
     const at = Number.isInteger(f.line) ? ':' + f.line : '';
     const where = f.file ? ' ' + BT + file + at + BT : '';
-    const cls = (v, fallback) => one(v).replace(CLASS_UNSAFE, ' ').trim() || fallback;
+    const cls = (v, fallback) => one(publishable(v)).replace(CLASS_UNSAFE, ' ').trim() || fallback;
     return `${i + 1}. [${tag}] (${cls(f.category, 'uncategorised')}, ${cls(f.impactIfUnfixed, 'impact?')})${where} — ${one(publishable(f.summary))}`
       + `${f.failure_scenario ? `\n   - Scenario: ${one(publishable(f.failure_scenario))}` : ''}`
       + `${f.recheckReason ? `\n   - Re-check: ${one(publishable(f.recheckReason))}` : ''}`
-      + `${Array.isArray(f.filesRead) ? `\n   - Files read: ${one(f.filesRead.join(', ')) || 'none'}` : ''}`;
+      + `${Array.isArray(f.filesRead) ? `\n   - Files read: ${one(f.filesRead.map(publishable).join(', ')) || 'none'}` : ''}`;
   });
   return [...head, '', ...lines, '', 'A confirmed break is recorded as a miss for the accepting review and for the builder\'s model.'].join('\n');
 }
@@ -1235,7 +1259,7 @@ async function finishRedTeamEffects({
  * `builder` were recorded still resume; they just render without the scenario / count the builder as unknown.
  */
 async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, record }, io) {
-  const findings = (Array.isArray(prior.findings) ? prior.findings : []).map((f) => ({
+  const findings = (Array.isArray(prior.findings) ? prior.findings : []).map((f) => withFileReadEvidence({
     summary: f.summary, category: f.category ?? null, file: f.file ?? null, line: f.line ?? null, impactIfUnfixed: f.impactIfUnfixed ?? null,
     recheckOutcome: f.recheckOutcome ?? (f.confirmedByRecheck ? 'confirmed' : f.filesRead?.length ? 'not confirmed' : 'unverifiable'), filesRead: f.filesRead,
     failure_scenario: f.failure_scenario ?? null, confirmedByRecheck: f.confirmedByRecheck === true, recheckReason: f.recheckReason ?? null,
@@ -1439,7 +1463,8 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
   try {
     const verdict = loopPayload?.verdict?.verdict ?? null;
     const claudeFindings = claudeFindingsFromLoop(loopPayload);
-    const { rev, provider, model, effort, callId, call, parsed, evidence, quota, durationMs, findings, recheckStatus } = pass;
+    const { rev, provider, model, effort, callId, call, parsed, evidence, quota, durationMs, recheckStatus } = pass;
+    const findings = pass.findings.map(withFileReadEvidence);
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
     const [seatRow] = buildSeatRows({
@@ -1461,7 +1486,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       foldedVerdict,
       builder: { provider: builder.provider, model: builder.model, taskType: builder.taskType, source: builder.source },
       findings: seatRow.findings.map((f, i) => ({
-        ...f, category: findings[i]?.category ?? null, failure_scenario: publishable(findings[i]?.failure_scenario),
+        ...f, category: publishable(findings[i]?.category), failure_scenario: publishable(findings[i]?.failure_scenario),
         recheckOutcome: findings[i]?.recheckOutcome, filesRead: findings[i]?.filesRead,
         confirmedByRecheck: findings[i]?.confirmedByRecheck ?? false, recheckReason: publishable(findings[i]?.recheckReason),
       })),
@@ -1601,7 +1626,11 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           ...(readsRepo ? { cwd, allowedTools: ['Read', 'Glob', 'Grep'] } : {}),
           runId: `red-team-recheck-${pr}-${randomUUID()}`, lens: 'red-team-recheck', env, timeoutMs: 10 * 60 * 1000,
         });
-        return out.value;
+        // Validate while the pinned checkout still exists; callers retain only safe relative paths.
+        const value = out.value;
+        if (!Array.isArray(value?.checks)) return value;
+        return { ...value, checks: value.checks.map(c => c && typeof c === 'object'
+          ? { ...c, filesRead: publishableFilesRead(c.filesRead, readsRepo ? cwd : null) } : c) };
       } finally {
         if (scratch) base.removeScratch(scratch);
         if (parent) rmSync(parent, { recursive: true, force: true });
