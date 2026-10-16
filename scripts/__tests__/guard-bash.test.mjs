@@ -642,14 +642,26 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd /tmp/clone[1] && ls')).toBe(REPORTED);
     expect(at('D=/tmp/clone[1]; cd "$D" && ls')).toBe('/tmp/clone[1]');
     expect(at('D=/tmp/clone[1]; cd $D && ls')).toBe(REPORTED);
+    // several quoted pieces are not one quoted word: the `[` between them is still a glob
+    expect(at("cd '/tmp'/'clone[1]' && ls")).toBe(REPORTED);
+    expect(at(`cd '${REPORTED}'/'a[1]' && npm run build`)).toBe(REPORTED);
+  });
+  it('a Unicode space or CR next to the cd target is part of the word in bash, so the target is unknown', () => {
+    for (const ch of ['\r', String.fromCharCode(0xa0), String.fromCharCode(0x2028)]) {
+      expect(at(`cd${ch}/tmp/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`cd /tmp/clone${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
+    }
   });
   // PR #5403 review r6 — `cd` options are read the way bash reads them, so `cd -P /clone` lands in /clone.
   it('skips cd options and one `--`; `cd -`, an unknown option or no operand stays unresolved', () => {
     expect(at('cd -P /tmp/clone && ls')).toBe('/tmp/clone');
     expect(at('cd -L /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -e -P /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -Pe /tmp/clone && ls')).toBe('/tmp/clone');
-    expect(at('cd -@ /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -LP /tmp/clone && ls')).toBe('/tmp/clone');
+    // macOS's bash 3.2 rejects `-e` / `-@` ("invalid option") and stays put, so neither may steer the cwd
+    expect(at('cd -e -P /tmp/clone && ls')).toBe(REPORTED);
+    expect(at('cd -Pe /tmp/clone && ls')).toBe(REPORTED);
+    expect(at('cd -@ /tmp/clone && ls')).toBe(REPORTED);
+    expect(at('cd -L -e /tmp/clone && ls')).toBe(REPORTED);
     expect(at('cd -- /tmp/clone && ls')).toBe('/tmp/clone');
     expect(at('cd -P -- /tmp/clone && ls')).toBe('/tmp/clone');
     expect(at('cd "-P" /tmp/clone && ls')).toBe('/tmp/clone');
@@ -693,7 +705,35 @@ describe('guard-bash — a cd inside a subshell, group or later statement still 
       `bash -c "cd ${CLONE} && git reset --hard"`,
       `git status; cd ${CLONE} && git reset --hard`,
       `cd ${LANE} && ls; cd ${CLONE} && git commit -am wip`,
+      // the cd under a wrapper, a quoted or escaped command word, a prefix or redirection, a reserved word
+      `command cd ${CLONE}; git reset --hard`,
+      `builtin cd ${CLONE}; git reset --hard`,
+      `time cd ${CLONE}; git reset --hard`,
+      `X=1 cd ${CLONE}; git reset --hard`,
+      `! cd ${CLONE}; git reset --hard`,
+      `2>/dev/null cd ${CLONE}; git reset --hard`,
+      `\\cd ${CLONE}; git reset --hard`,
+      `"cd" ${CLONE}; git reset --hard`,
+      `c""d ${CLONE}; git reset --hard`,
+      `if true; then cd ${CLONE}; fi; git reset --hard`,
+      `while true; do cd ${CLONE}; done; git reset --hard`,
+      `f(){ cd ${CLONE}; }; f; git reset --hard`,
+      `function f { cd ${CLONE}; }; f; git reset --hard`,
+      `pushd ${CLONE}; git reset --hard`,
+      // a relative cd that starts from an earlier landing
+      `(cd /ws && cd wev-review-daemon && git reset --hard)`,
+      `cd /ws; cd x; cd ../wev-review-daemon; git reset --hard`,
     ]) expect(decide(cmd, ctx), cmd).toMatch(/DAEMON CLONE/);
+    expect(decide(`pushd -n ${CLONE}; git status`, ctx)).toBeNull();
+  });
+  it('stays fast on a long command (landings never multiply the per-segment work)', () => {
+    const many = Array.from({ length: 3000 }, (_, i) => `cd /x${i}; rm f${i}`).join('; ');
+    const inClone = Array.from({ length: 3000 }, (_, i) => `cd ${CLONE}/x${i}; ls`).join('; ');
+    const started = Date.now();
+    expect(decide(many, ctx)).toBeNull();
+    expect(decide(`${inClone}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`echo "${' )'.repeat(25000)} x"`, ctx)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(5000);
   });
   it('keeps allowing a read or fetch inside the clone, and a mutation after a cd elsewhere', () => {
     for (const cmd of [
