@@ -43,17 +43,17 @@ const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sa
 
 /**
  * A verdict carry (review-job carryAcrossRebase) posts ONE comment: its gate markers, the carried marker, prose,
- * then the re-keyed red-team body, so the anchored readers see none of it. Split only that exact layout, carried to
- * the live head: gate lines are taken only from before the carried line. `at` keeps the thread position and `from`
- * names the head the records were carried from. PURE.
+ * then the re-keyed red-team body, so the anchored readers see none of it. Split only that exact layout: gate lines
+ * are taken only from before the carried line and must name the head carried to (a chain of carries splits at each
+ * link). `at` keeps the thread position and `from` names the head the records were carried from. PURE.
  */
-function threadRecords(comments, head) {
+function threadRecords(comments) {
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
     const carried = k < 0 ? null : parseVerdictCarriedMarker(lines[k]);
-    if (!carried || carried.toSha !== head || !lines.slice(0, k).every(line => parseRedTeamGateMarker(line)?.rev === head)) return [{ c, at }];
+    if (!carried || !lines.slice(0, k).every(line => parseRedTeamGateMarker(line)?.rev === carried.toSha)) return [{ c, at }];
     const j = lines.findIndex((line, i) => i > k && line.startsWith(RED_TEAM_COMMENT_MARKER));
     const parts = [...lines.slice(0, k), ...(j < 0 ? [] : [lines.slice(j).join('\n')])];
     return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
@@ -89,7 +89,7 @@ function operatorRuled(records, pr, head) {
 export function redTeamEnqueueHold({ labels, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
   if (!postAcceptRedTeamOwed(labels, env)) return null;
   const live = String(head ?? '').toLowerCase();
-  const records = threadRecords(comments, live);
+  const records = threadRecords(comments);
   const result = redTeamForHead(records.map(r => r.c), pr, live);
   if (!result) return 'post-accept red team has no recorded result on the live head';
   // The result comment precedes the gate. Do not enqueue in that second race window either.

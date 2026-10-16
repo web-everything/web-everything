@@ -62,6 +62,13 @@ describe('operator ruling at the round cap', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
     expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
   });
+  it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
+    const h0 = 'e'.repeat(40);
+    const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];
+    const toPrior = [restamp(prior), carry({ from: h0, to: prior, findings: broken, gates: ['round-cap'] })];
+    expect(hold({ comments: [...ruledOnH0, ...toPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+    expect(hold({ comments: [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), ...toPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
   it('a carry never invents a ruling the prior head did not have', () => {
     expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
     expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
