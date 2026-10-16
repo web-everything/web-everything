@@ -968,7 +968,9 @@ allow-case fixtures must use admitted commands.
 ### Orchestrator responsiveness hook probes
 
 `session.orchestratorMode` defaults to false and resolves through the shared policy cascade;
-`WE_ORCHESTRATOR_SESSION=1` opts in. The Bash hook logs the effective value and source to stderr.
+`WE_ORCHESTRATOR_SESSION=1` opts in. The Bash hook keeps policy diagnostics silent by default;
+`WE_POLICY_CASCADE_LOG=1` logs the final effective value and source to stderr through the shared
+cascade logger, and `WE_POLICY_CASCADE_LOG=0` silences it.
 Subagent hook payloads (`agent_id`), dispatched agents, and marked daemon workers always resolve
 false, even with inherited opt-in settings. `operator-session-bootstrap` currently records no
 session ID, so it does not automatically enable this policy.

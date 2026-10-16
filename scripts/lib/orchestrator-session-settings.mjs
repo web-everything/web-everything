@@ -1,5 +1,5 @@
 /** Opt-in responsiveness policy for the operator-facing session. */
-import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { resolveCascade, platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { classifySession } from '../operations/session-role.mjs';
 
@@ -20,10 +20,10 @@ export const ORCHESTRATOR_DELEGATE_COMMANDS = Object.freeze([
 ]);
 
 export function loadOrchestratorSessionSettings({ env = process.env, tool = readSettings().session,
-  platform, agentSession = false, log = () => {} } = {}) {
+  platform, agentSession = false, log } = {}) {
   const flag = env.WE_ORCHESTRATOR_SESSION;
-  const resolved = cascadePolicy('session', tool, {
-    env, platform,
+  const resolved = resolveCascade({
+    tool, platform: platform === undefined ? platformPreference('session', { env }) : platform,
     standard: { orchestratorMode: false, orchestratorDelegateCommands: ORCHESTRATOR_DELEGATE_COMMANDS },
     envValues: { orchestratorMode: flag === undefined ? undefined
       : flag === '1' || flag === 'true' ? true : flag === '0' || flag === 'false' ? false : flag },
@@ -37,6 +37,7 @@ export function loadOrchestratorSessionSettings({ env = process.env, tool = read
     resolved.sources.orchestratorMode = 'worker/subagent';
     resolved.leafValues.orchestratorMode = false;
   }
-  log(formatCascadeSourcesLine('session', resolved));
+  // Log only the final effective policy, using the shared opt-in/daemon logging rules.
+  logCascadeSources('session', resolved, { env, ...(log ? { log } : {}) });
   return resolved;
 }
