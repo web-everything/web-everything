@@ -19,7 +19,8 @@
  *
  * PURE apart from {@link loadReviewSeatSettings}, which reads the live (last-good, validated) policy.
  */
-import { resolveShadowSeatModel } from './review-seat-settings.mjs';
+import { createHash } from 'node:crypto';
+import { resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
 import { readRoutingPolicy } from './dispatch-routing-policy-io.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy.mjs';
 
@@ -88,16 +89,18 @@ export function logReviewSeat(log, message) {
 }
 
 /** The live routing settings plus the advisory shadow model cascade; log each distinct selection once. */
-export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), log = (m) => console.error(m) } = {}) {
-  const settings = settingsFromRoutingPolicy(policy, { shadowModel });
+export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
+  const resolved = safeguards ?? resolveReviewSeatSafeguards({ log });
+  const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel }),
+    shadowPolicy: resolved.value, minNonClaudeSeats: resolved.value.minNonClaudeSeats });
   const lenses = SEAT_PROVIDER_LENSES.filter((lens) => settings.seatProvider[lens] === 'shadow');
   if (lenses.length) {
     const sources = { env: 'env WE_REVIEW_SHADOW_AGY_MODEL', settings: 'settings scripts/settings/review.json key shadowSeats.antigravity.model' };
     // Group identical directives; a policy may give the two seats different routing models.
     const groups = new Map();
     for (const lens of lenses) {
-      const d = seatProviderDirective(settings, lens);
-      const description = `model ${d.model} (source: ${sources[d.modelSource] ?? 'routing-policy'}${d.fallbackModel ? `; fallback ${d.fallbackModel} from routing-policy` : ''})`;
+      const d = seatProviderDirective({ ...settings, shadowPolicy: undefined }, lens);
+      const description = `${settings.shadowPolicy.shadowEnabled ? 'enabled (PR sample)' : 'off (setting)'}; model ${d.model} (source: ${sources[d.modelSource] ?? 'routing-policy'}${d.fallbackModel ? `; fallback ${d.fallbackModel} from routing-policy` : ''})`;
       groups.set(description, [...(groups.get(description) ?? []), lens]);
     }
     for (const [description, seats] of groups) {
@@ -116,9 +119,10 @@ export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowMod
  * @param {object} settings - from {@link settingsFromRoutingPolicy}.
  * @param {string} lens
  */
-export function seatProviderDirective(settings, lens) {
+export function seatProviderDirective(settings, lens, context) {
   const mode = settings?.seatProvider?.[lens];
   if (!mode || mode === 'claude') return null;
+  if (mode === 'shadow' && shadowSeatStatus(settings, context) !== 'sampled') return null;
   if (!SEAT_PROVIDERS.includes(mode)) throw new TypeError(`review-seat-provider: unknown seat provider ${JSON.stringify(mode)}`);
   const model = settings.seatModel?.[lens] ?? settings.agyModel;
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
@@ -128,4 +132,20 @@ export function seatProviderDirective(settings, lens) {
   }
   // No override: today's directive, unchanged. The runner reads an absent `modelSource` as `routing-policy`.
   return Object.freeze({ mode, model, onEscape: 'claude' });
+}
+
+/** Stable PR-level sampling, shared across both mandatory lenses and all review rounds.
+ * Missing identity refuses sampling. Rates at or above 1 are never eligible.
+ * Pure routing-policy projections have no operational policy; live settings always carry one.
+ */
+export function shadowSeatStatus(settings, { repo, pr } = {}) {
+  const policy = settings?.shadowPolicy;
+  if (!policy) return 'sampled';
+  if (!policy.shadowEnabled) return 'off (setting)';
+  if (typeof repo !== 'string' || !repo.trim() || !Number.isSafeInteger(Number(pr)) || Number(pr) < 1) return 'off (missing PR identity)';
+  const rate = policy.sampleRate;
+  if (typeof rate !== 'number' || rate < 0 || rate >= 1) return 'off (invalid sample rate)';
+  const bucket = createHash('sha256').update(`${repo.trim().toLowerCase()}#${Number(pr)}`).digest().readUInt32BE(0);
+  // Integer threshold always leaves at least one hash bucket out, even for a rate just below 1.
+  return bucket < Math.floor(rate * 2 ** 32) ? 'sampled' : 'off (sample)';
 }

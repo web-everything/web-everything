@@ -195,6 +195,28 @@ writes, so they do not replace a sibling process's records.
 
 ## Shadow reviewer agreement evidence
 
+The agy mandatory-seat shadows are off by default (operator 2026-10-16).
+`review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables only a
+PR sample, with `sampleRate` / `WE_REVIEW_SHADOW_AGY_SAMPLE_RATE` defaulting to 0.1.
+Rates must be finite numbers in `[0, 1)`; 1 is refused and the invalid layer is logged.
+Selection uses SHA-256 of lowercase `owner/repo#pr` (first unsigned 32 bits below
+`floor(sampleRate * 2^32)`; at least one bucket always excluded), shared across lenses and rounds. Missing PR identity does not seat a shadow.
+Disabled panel rows say `agy shadow off (setting)`; unsampled rows say `off (sample)`.
+Routing-policy declarations and model/trial settings alone do not enable live shadows.
+
+`review.minNonClaudeSeats` / `WE_REVIEW_MIN_NON_CLAUDE_SEATS` defaults to 1, accepts
+positive integers, and adds the Codex simplicity and then correctness advisory seats
+as needed. These answers stay advisory. A skipped/unavailable answer does not count;
+a shortfall (including a minimum above the two available Codex lenses) is recorded on
+the verdict and printed in both the verdict write-up and human advisory note. Saved
+runs retain their original roster, with the same explicit shortfall reporting.
+These three settings resolve through standard → platform `review` → tool
+`scripts/settings/review.json` → env, logging effective values and sources.
+Test the actual judge request and panel reduction with injected providers, including
+zero agy calls when disabled and failed Codex answers, through heavy-admission.
+Historical optional-roster fixtures explicitly use a zero declaration minimum; the
+operational settings never accept zero.
+
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader
 reject shadow metadata on bearing verdicts. The existing non-bearing fold keeps these rows in history
