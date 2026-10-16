@@ -569,10 +569,65 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
     expect(h.calls.some(c => c[2] === 'comment')).toBe(false);
   });
-  it('enqueues after a trusted clean result for the live head', () => {
-    const result = { author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+  it.each([{ author: { login: 'web-everything' } }, { user: { login: 'web-everything[bot]' } }])('enqueues after a trusted clean result for the live head (%j)', identity => {
+    const result = { ...identity, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result] });
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+  });
+  it('keeps an untrusted REST clean marker pending without enqueue or clearance', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      liveComments: [{ user: { login: 'mallory[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+  });
+  it('backs off complete comment reads across restarts, then retries at 300 seconds', () => {
+    let clock = 1_000;
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock };
+    const first = harness(options);
+    first.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const next = harness({ ...options, initial: first.state() });
+    clock += 180_000;
+    expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: false });
+    expect(next.calls.filter(c => c.includes('--slurp'))).toHaveLength(0);
+    clock += 120_000;
+    next.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    expect(next.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
+    expect(next.state().redTeamPending['cwd#5283'].firstPendingAt).toBe(1_000);
+    expect(next.logs.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
+  });
+  it('a new observed comment wakes the held head before backoff and clears pending on success', () => {
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => 1_000 };
+    const first = harness(options);
+    first.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const result = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const next = harness({ ...options, initial: first.state(), liveComments: [result] });
+    expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+    expect(next.state().redTeamPending['cwd#5283']).toBeUndefined();
+  });
+  it('raises a named health smell during backoff past the maximum and never enqueues', () => {
+    let clock = 1_000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '7200', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '45' } });
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock += 45 * 60_000 - 1;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ healthSmell: false });
+    clock += 1;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending', healthSmell: true });
+    expect(h.logs.join('')).toContain(`health smell: ${LOCAL}#5283 red-team-pending on ${HEAD}`);
+    expect(h.logs.join('')).toContain('redTeamPendingMaxMin=45, env');
+    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+  });
+  it('a new live head resets the pending age and backoff', () => {
+    const initial = { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': {
+      headSha: 'a'.repeat(40), firstPendingAt: 0, retryAt: 99_000_000, commentCount: 0, reason: 'pending' } } };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], initial, now: () => 5_000_000 });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ healthSmell: false });
+    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
+    expect(h.state().redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD, firstPendingAt: 5_000_000 });
+    h.s.confirmQueueFollowUps([{ num: 999, repo: null }]);
+    expect(h.state().followedUp).toContain('cwd#999');
+    expect(h.state().redTeamPending['cwd#5283'].firstPendingAt).toBe(5_000_000);
   });
   it('keeps enqueue unchanged when no accepted panel owes a red team', () => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge'] });

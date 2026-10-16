@@ -1146,7 +1146,13 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 Post-accept admission must cover accepted and advisory-accepted panels before speculation starts as well
 as while it runs. Only the trusted red-team result marker for the exact PR and live head releases that
-wait; a confirmed send-back finding still holds during the result-comment → gate-label race. Queue
+wait. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
+lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
+through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
+can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
+head past that age must return and log a named health smell without enqueueing. Test restarts,
+head resets, policy provenance and the absence of complete comment re-listing during backoff.
+A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
 removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
 drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
 from the unfiltered open listing, without a durable follow-up entry. Both safeguards resolve through

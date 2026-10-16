@@ -29,14 +29,29 @@ describe('drain policy cascade', () => {
   it('defaults both safeguards on and logs their sources', () => {
     const lines = [];
     const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
-    expect(r.value).toEqual({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true });
-    expect(r.sources).toEqual({ waitForRedTeamBeforeEnqueue: 'standard', dequeueOnSendBack: 'standard' });
+    expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true });
+    expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'standard', dequeueOnSendBack: 'standard' });
     expect(lines.join('')).toContain('dequeueOnSendBack=true (standard)');
+    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 });
+    expect(lines.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
+    expect(lines.join('')).toContain('redTeamPendingMaxMin=45 (standard)');
+  });
+  it('resolves pending timing and provenance independently, rejecting invalid timings', () => {
+    const r = readDrainQueueSafety({ env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '600', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: 'NaN' },
+      platform: { redTeamPendingBackoffSec: 120, redTeamPendingMaxMin: 90 },
+      tool: { redTeamPendingBackoffSec: 180, redTeamPendingMaxMin: 60 } });
+    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 600, redTeamPendingMaxMin: 60 });
+    expect(r.sources).toMatchObject({ redTeamPendingBackoffSec: 'env', redTeamPendingMaxMin: 'tool' });
+    expect(r.invalid).toHaveLength(1);
+    const invalid = readDrainQueueSafety({ env: {}, tool: { redTeamPendingBackoffSec: 0, redTeamPendingMaxMin: -1 }, platform: {} });
+    expect(invalid.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 });
+    expect(invalid.invalid).toHaveLength(2);
+    expect(readDrainQueueSafety({ env: {}, tool: {}, platform: { redTeamPendingMaxMin: 90 } }).sources.redTeamPendingMaxMin).toBe('platform');
   });
   it('resolves platform then tool then env independently, rejecting invalid values', () => {
     const r = readDrainQueueSafety({ env: { WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'off', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'typo' }, platform: { waitForRedTeamBeforeEnqueue: false }, tool: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: 'invalid' } });
-    expect(r.value).toEqual({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: false });
-    expect(r.sources).toEqual({ waitForRedTeamBeforeEnqueue: 'tool', dequeueOnSendBack: 'env' });
+    expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: false });
+    expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'tool', dequeueOnSendBack: 'env' });
     expect(r.invalid).toHaveLength(2);
     expect(readDrainQueueSafety({ env: {}, tool: {}, platform: { dequeueOnSendBack: false } }).sources.dequeueOnSendBack).toBe('platform');
   });
