@@ -23,6 +23,9 @@ export default {
     const { default: main } = await load(MAIN);
     const { default: cards } = await load(CARDS);
     const fixture = JSON.parse(readFileSync(join(root, 'scripts/lib/__tests__/fixtures/red-main-quarantine-62da75ed3.json'), 'utf8'));
+    // Exercise an eligible addition: the recorded episode's group base is unrelated to the failing code.
+    // Keep that negative replay intact and supply hypothetical same-code proof only in this scenario.
+    fixture.mainCiRuns.failing.groupEvidence.baseSha = fixture.mainCiRuns.runs[0].headSha;
     const file = 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs';
     const now = Date.parse(fixture.now);
     const violations = [];
