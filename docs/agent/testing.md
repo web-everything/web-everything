@@ -82,6 +82,16 @@ net and fallback lists with the same check. Deterministic reader tests must reje
 real-git fixtures must preserve HEAD, branch, index, status and dirty file contents around each read.
 Review checklist: for each new fail-closed path, does the failure mode scale per PR or per sweep?
 
+## Quarantine proof fixtures
+
+Quarantine addition scenarios using `red-main-quarantine-62da75ed3.json` must explicitly supply a
+hypothetical earlier run of the failing sha whose re-run passed the job (run attempt 2, latest job
+attempt `success`), never a passing attempt on the failing run itself (a job that passes there is no
+longer failing): the recorded episode had none and must remain a negative replay. A green merge group is never flake
+proof, because it tested its queued PR's changes, which may fix the failure. Keep proof validation
+enabled and the recorded fixture unchanged, including when exercising the once-per-tick safety net
+through both health smells.
+
 ## Soak shard isolation
 
 Keep the 50-tick baseline alone in CI shard 1; balance break scenarios by measured time across the other
@@ -880,8 +890,12 @@ An ended attempt frees its prepare slot even while its PR is OPEN (that PR refus
 test cap-many ended OPEN-PR cards and assert a clean card still launches.
 Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
 The launch guard must also run without a surviving claim, and refuse when PR listing throws.
-Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
-0 disables only the merged refusal); probe the time boundary with an injected clock.
+Merged launch refusals measure age from `mergedAt`, falling back to `closedAt`, then `createdAt`,
+under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal). They apply even
+without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
+created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
+records a "scope moved after prepare" note for the build step in the refusal and its persisted
+bookkeeping; it must never dispatch another prepare within the window.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
@@ -1153,6 +1167,38 @@ membership, with trusted live comments plus the shared follow-up state's `cleara
 Failure counts/backoff live in that same state file; preserve them during follow-up writes. Exercise false
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
+
+### Nightly coroner health job
+
+`nightly-coroner` is a detached health-watch job, independent of chat sessions and accounts.
+`coroner.nightly.at` defaults to `22:17` in `America/New_York`; `coroner.nightly.enabled` defaults true.
+Both resolve through standard → platform `coroner.nightly` → `scripts/settings/coroner.json`
+(and health `config.json`'s `coroner.nightly`) → `WE_CORONER_NIGHTLY_AT` / `WE_CORONER_NIGHTLY_ENABLED`.
+The health log records each effective value and source. Fixture and dry-run ticks never enqueue it.
+
+A stable `nightly-coroner-YYYY-MM-DD` job ID and retained daily records enforce one job per ET night
+without depending on health `state.json`. The next live tick catches up the most recent due night,
+including before tonight's deadline after a restart; multiple missed nights coalesce into one extraction.
+There is one attempt per night: a failed/crashed attempt is exposed as a health probe failure, and the
+next night's extraction still starts at the last successfully published cursor. This avoids a second
+extraction for the same night. Never prune daily job records without preserving the once-per-night ledger.
+
+The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
+`coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in
+`finally`. If present, `coroner-false-findings.mjs` is invoked with the same window and `--json`.
+Resolve both extractor filenames to physical paths before invoking Node: CLI entry guards may
+compare argv with Node's canonical module URL, so a symlinked lane or script can otherwise exit
+successfully without output. The `nightly-coroner-symlinked-lane` soak break exercises both CLIs
+through real subprocesses, including report publication, lane release, and receipt recovery.
+The first window is 24 hours; subsequent windows begin at `nightly-coroner-cursor.json`'s `lastEnd`
+beside health `state.json`. Cursor writes are atomic and follow atomic publication of the dated
+`coroner-YYYY-MM-DD.md` in `handoffHome()`. The report carries a recovery receipt, so direct re-entry
+can recover publication without extracting again. One `coroner-ready` line is appended to the existing
+needs-you feed (honoring `WE_NEEDS_YOU_FEED`). No Claude session or judgment step is launched.
+
+Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through heavy admission.
+Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
+publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
 ## Referral re-checks on the live head
 
