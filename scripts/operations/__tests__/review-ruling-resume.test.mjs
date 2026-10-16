@@ -135,7 +135,8 @@ const stubReader = () => ({ pr, repo }) => ({
   diff: { text: '--- a/x\n+++ b/x\n+one line\n', scored: true },
 });
 const setup = () => {
-  const declaration = reviewPrOperation({ readPr: stubReader() });
+  // Replay the original two-seat run without adding today's default Codex advisory seat.
+  const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry };
@@ -351,7 +352,8 @@ describe('review-pr reduce — a later panel on an unchanged head adds no mandat
   const thread = [{ body: renderReferralRecord(recordFor(HEAD_1, firstFinding, ['not-real'])), createdAt: '2026-10-08T12:00:00Z', author: { login: 'web-everything' } }];
   const reduceWith = async (answerFindings, { comments = thread, rev = HEAD_1, latestFix, correctnessAdvisory = false } = {}) => {
     const base = stubReader();
-    const declaration = reviewPrOperation({ correctnessAdvisory,
+    // This replay opts into the correctness advisory seat explicitly; no implicit simplicity seat.
+    const declaration = reviewPrOperation({ correctnessAdvisory, minNonClaudeSeats: 0,
       readPr: (a) => ({ ...base(a), comments, ...(latestFix ? { latestFix } : {}), net: { ...base(a).net, rev } }) });
     const registry = createRegistry();
     registry.register(declaration);
