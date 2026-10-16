@@ -102,7 +102,8 @@ const CARD_REFUSAL_RE = new RegExp(
   '^step-refused at `[^`]+`: dispatch-lane(?:: (?:no value for the brief placeholder|the value for) '
   + `\\{\\{(?:${CARD_PLACEHOLDERS})\\}\\}|\\.read: #\\S+ has no \`scope:\`)`,
 );
-export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''));
+export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''))
+  || /^build card #\S+ unavailable on origin\/main$/.test(String(text ?? ''));
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;

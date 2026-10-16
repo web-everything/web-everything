@@ -1184,3 +1184,21 @@ planner's prepare exclusions and re-plan the same tick so the next candidate get
 slot. Log the elapsed minutes and PR number. Keep the launch guard as the final race
 check. Replay a merge 20 minutes ago with one slot and a clean second candidate;
 include grouped members, hash aliases, guard-off, and older merges in the touched suites.
+
+### Build dispatch launch lifetime and prepare discovery
+
+Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
+both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
+orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
+pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
+Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+
+Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
+unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
+`maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
+source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the
+same budget, including failed commands. A component at its result cap or a spent budget refuses only
+that card. Test with over 500 unrelated PRs, all three identity forms, concurrency, repeated reads and
+budget exhaustion. GitHub calls use the shared throttle in both synchronous and asynchronous paths.

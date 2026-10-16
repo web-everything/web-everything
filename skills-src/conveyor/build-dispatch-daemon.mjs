@@ -46,6 +46,7 @@ import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -497,7 +498,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
-        if (st.outcome?.dispatching) { if (!isPrepare && live) effects.clearBuildFailure?.({ num }); continue; }
+        if (st.outcome?.dispatching) continue;
         // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
         // `failPrepare`/`failures`, declared further down.
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
@@ -689,7 +690,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           memberStillQueued: scopeByNum.has(num), groupMemberFailure: groupingSettings.groupMemberFailure })
           : doneWhy(num, { claimedAt: c.meta?.claimedAt || null });
     if (why) {
-      if (live) effects.releaseClaim({ num });
+      if (live) {
+        if (openPrs.some(pr => prDeliversNum(pr, num))) effects.clearBuildFailure?.({ num });
+        effects.releaseClaim({ num });
+      }
       retired.push({ num, why, released: live });
       continue;
     }
@@ -893,6 +897,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         groupMembers = [];
       };
       try {
+        if (effects.resolveBuildCard) {
+          try { await effects.resolveBuildCard({ num: pick.num }); }
+          catch (error) {
+            const reason = error.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
+            effects.recordBuildFailure?.({ num: pick.num, reason });
+            failures.push({ num: pick.num, stage: 'card', reason });
+            continue;
+          }
+        }
         if (!(await cloneGate('build', pick.num))) continue;
         const gate = loadGateFor('build', pick.num);
         if (!gate.admit) continue;
@@ -920,7 +933,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: [...new Set([...pick.scope, ...groupMembers.flatMap(num => scopeByNum.get(num) || [])])] });
           dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null, ...(groupMembers.length ? { groupMembers: [...groupMembers] } : {}) });
           if (groupMembers.length) console.error(`build-dispatch-daemon: grouped build #${pick.num} members ${groupMembers.map(num => `#${num}`).join(',')} (related: ${groupMembers.map(num => `${num}=${group.related[num]}`).join(',')})`);
-          if (!res.pending) effects.clearBuildFailure?.({ num: pick.num });
+          // Launch confirmation is not delivery: retain prior failures until a PR is observed.
         } else {
           claimed = false;
           effects.releaseClaim({ num: pick.num });
@@ -2044,25 +2057,31 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
 }
 
 const defaultExecAsync = (cmd, args, opts) => new Promise((resolveExec, rejectExec) => {
-  execFile(cmd, args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
+  execFile(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
 });
 
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.
 const prepareBlobStatuses = new Map();
 
 /** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
-export function createPrepareStatusReader({ exec = execFileSync, execAsync = null, prefetchConcurrency = 8 } = {}) {
+export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAsync = null, prefetchConcurrency = 8, maxPrListingCalls = 128 } = {}) {
   // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
   const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
   const ITEM_PR_LIMIT = 100;
-  let tree, treeError, listing, prError, minClaimedAt;
+  let tree, treeError;
+  let listingCalls = 0;
+  const queryResults = new Map();
+  function reserveListingCall() {
+    if (listingCalls >= maxPrListingCalls) throw new Error(`prepare PR listing call budget exhausted (${maxPrListingCalls})`);
+    listingCalls++;
+  }
   const itemListings = new Map();
   function readTree() {
     retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {
-      const match = line.match(/^\d+ blob ([0-9a-f]+)\t(backlog\/(\d+)-.*\.md)$/);
+      const match = line.match(/^\d+ blob ([0-9a-f]+)\t(backlog\/(\d+|x[a-z0-9]{6})-.*\.md)$/);
       if (match && !cards.has(normNum(match[3]))) cards.set(normNum(match[3]), { sha: match[1], path: match[2] });
     }
     return cards;
@@ -2097,23 +2116,20 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
   const prListArgs = (search, limit) => ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
     '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', String(limit)];
   function ghPrList(search, limit) {
-    const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
-    if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
-    return list;
+    if (!queryResults.has(search)) {
+      try {
+        reserveListingCall();
+        const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
+        if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
+        queryResults.set(search, { list });
+      } catch (error) { queryResults.set(search, { error }); }
+    }
+    const result = queryResults.get(search);
+    if (result.error) throw result.error;
+    if (!Array.isArray(result.list)) throw new Error('prepare PR listing unavailable');
+    return result.list;
   }
-  /** The shared listing, with the date floor and limit it was actually fetched with. */
-  function listPrs() {
-    if (prError) throw prError;
-    if (listing) return listing;
-    try {
-      const floor = minClaimedAt?.slice(0, 10);
-      const limit = floor ? 500 : 1000;
-      // Title-only identities can live on ANY branch, not just lane/.
-      const prs = ghPrList(floor ? `created:>=${floor}` : '', limit);
-      return (listing = { prs, floor, complete: prs.length < limit });
-    } catch (error) { prError = error; throw error; }
-  }
-  /** One item's own listing: the fallback when the shared one cannot be trusted. Saturation fails closed. */
+  /** Per-card branch and title searches. Every component must be complete; saturation fails closed. */
   function itemQuery(num, bornAs) {
     const ids = [...new Set([normNum(num), normNum(bornAs)].filter(Boolean))];
     if (!ids.length || ids.some(id => !/^[a-z0-9._-]+$/.test(id))) throw new Error('invalid prepare PR search identity');
@@ -2134,34 +2150,10 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
     }
     return itemListings.get(key);
   }
-  /**
-   * The shared listing answers only when it is provably complete for this read: not capped (a truncated listing is
-   * indistinguishable from "no PR"), and dated no later than this read's claim (a read with an earlier or missing
-   * claim date can have its PR outside the date window). Otherwise fall back to the item's own search.
-   */
-  function prsFor(num, claimedAt, bornAs) {
-    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
-    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
-      const shared = listPrs();
-      if (shared.complete) return shared.prs;
-    }
-    return itemPrs(num, bornAs);
-  }
-  /** Would `prsFor` fall back to this item's own listing? Mirrors its completeness test. */
-  function needsItemListing(num, claimedAt, bornAs) {
-    if (itemListings.has(itemQuery(num, bornAs).key)) return false;
-    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
-    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
-      try { if (listPrs().complete) return false; } catch { return false; } // the lazy read rethrows the cached error
-    }
-    return true;
-  }
-  /**
-   * Item 94 — when the shared listing cannot answer (a held card with no claim date leaves the date floor unset, so
-   * the 1000-PR cap saturates it), every read paid one sequential `gh pr list` (~0.5 s). Fetch exactly those same
-   * per-item listings concurrently instead, up front. Same commands, same results, same saturation check; a failed
-   * prefetch is dropped so the lazy read hits (and reports) the same failure it always did.
-   */
+  // Every identity component must be complete; unrelated repository PR volume never enters this read.
+  const prsFor = (num, claimedAt, bornAs) => itemPrs(num, bornAs);
+  const needsItemListing = (num, claimedAt, bornAs) => !itemListings.has(itemQuery(num, bornAs).key);
+  /** Prefetch independent card searches concurrently, sharing the tick's budget and cached failures. */
   async function prefetchItemListings(entries) {
     const todo = [...new Map(entries.flatMap(e => {
       const card = tree?.get(normNum(e.num));
@@ -2181,21 +2173,33 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
         try {
           const prs = [];
           for (const search of searches) {
-            const found = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+            if (!queryResults.has(search)) {
+              reserveListingCall();
+              try {
+                const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+                queryResults.set(search, { list });
+              } catch (error) { queryResults.set(search, { error }); }
+            }
+            const result = queryResults.get(search);
+            if (result.error) throw result.error;
+            const found = result.list;
             if (!Array.isArray(found) || found.length >= ITEM_PR_LIMIT) throw new Error('prepare PR listing unavailable or saturated');
             prs.push(...found);
           }
           itemListings.set(key, uniquePrs(prs));
-        } catch { /* the lazy read repeats this call and reports its own failure */ }
+        } catch { /* the lazy read reports the cached component error or exhausted budget */ }
       }
     };
     await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));
   }
   return {
+    resolveCard({ num }) {
+      const card = loadTree().get(normNum(num));
+      if (!card) throw Object.assign(new Error(`build card #${num} unavailable on origin/main`), { code: 'card-not-found' });
+      return card;
+    },
     prime(items) {
       const entries = items.map(item => typeof item === 'object' ? item : { num: item });
-      minClaimedAt = entries.length && entries.every(item => item.claimedAt)
-        ? entries.map(item => item.claimedAt).sort()[0] : undefined;
       if (entries.length) loadBlobs(entries.map(item => loadTree().get(normNum(item.num))).filter(Boolean));
       return execAsync && entries.length ? prefetchItemListings(entries) : undefined;
     },
@@ -2498,6 +2502,8 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
 /** Real IO adapters; exported for isolated tests against a temporary coordination root. */
 export function cliEffects() {
   let prepareReader;
+  const reader = () => createPrepareStatusReader({ execAsync: defaultExecAsync,
+    maxPrListingCalls: readPreparePolicy().maxPrListingCallsPerTick });
   return {
     loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
     completePrepareFailures,
@@ -2542,14 +2548,15 @@ export function cliEffects() {
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
     primePrepareStatus: ({ nums, claims }) => {
-      prepareReader = createPrepareStatusReader({ execAsync: defaultExecAsync });
+      prepareReader = reader();
       return prepareReader.prime(nums.map(num => ({ num,
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
-    listPreparePrs: args => (prepareReader ??= createPrepareStatusReader()).listPrs(args),
-    readPrepareStatus: args => (prepareReader ??= createPrepareStatusReader()).read(args),
+    listPreparePrs: args => (prepareReader ??= reader()).listPrs(args),
+    readPrepareStatus: args => (prepareReader ??= reader()).read(args),
     // The card's stamp as it stands at spawn, recorded on the claim.
-    readPreparedStamp: args => (prepareReader ??= createPrepareStatusReader()).stamp(args),
+    readPreparedStamp: args => (prepareReader ??= reader()).stamp(args),
+    resolveBuildCard: args => (prepareReader ??= reader()).resolveCard(args),
     readPrepareEvidence: cliPrepareFailureEvidence,
     stampPrepare: cliStampPrepare,
     placePrepareHold: (o) => placeBuildDispatchHold(o),
