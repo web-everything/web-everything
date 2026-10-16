@@ -955,6 +955,22 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
 
+### Orchestrator responsiveness hook probes
+
+`session.orchestratorMode` defaults to false and resolves through the shared policy cascade;
+`WE_ORCHESTRATOR_SESSION=1` opts in. The Bash hook logs the effective value and source to stderr.
+Subagent hook payloads (`agent_id`), dispatched agents, and marked daemon workers always resolve
+false, even with inherited opt-in settings. `operator-session-bootstrap` currently records no
+session ID, so it does not automatically enable this policy.
+
+`session.orchestratorDelegateCommands` replaces the executable-prefix array declared in
+`scripts/lib/orchestrator-session-settings.mjs`. Configure it in
+`scripts/settings/orchestrator-session.json` (or platform preferences); an empty array disables
+this delegation check. Match executable positions, never quoted mentions or heredoc data.
+Probe hook stdin with both an interactive payload and a subagent payload sharing the same env.
+The existing background-verification denial must still win in every session: delegate the work
+to a background agent, which runs the command in its own foreground.
+
 ### Prepare queue admission
 
 Operator decision 2026-10-06: prepare-family dispatches (`prepare`, `prepare-scope`, `prepare-decision`,
