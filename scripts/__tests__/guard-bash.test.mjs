@@ -596,9 +596,25 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       expect(lands(cmd), cmd).toEqual(['/abs/clone']);
       expect(at(cmd), cmd).toBe(REPORTED);
     }
-    // too many possible directories gives up, and the CLI refuses
+    // a function body whose `{` is on the next line is a region too; a one-command body closes at once
+    for (const cmd of ['f()\n{ cd /tmp; }; ls', 'f()\n{\n  cd /tmp\n}\nls', 'function f\n{\n cd /tmp\n}\nls']) {
+      expect(at(cmd), cmd).toBe(REPORTED);
+      expect(lands(cmd), cmd).toEqual(['/tmp']);
+    }
+    expect(at('f() ( cd /c ); cd /lane && ls')).toBe('/lane');
+    // a substitution the split cut open keeps its later cds nested; its body sees the shell's variables
+    expect(at('x=$(cd /tmp && cd /tmp/x && pwd); ls')).not.toBe('/tmp/x');
+    expect(at('echo `cd /tmp && cd /tmp/x && pwd`; ls')).toBe(REPORTED);
+    expect(lands('x=$(cd /ws && cd webeverything && ls)')).toContain('/ws/webeverything');
+    expect(lands('D=/abs/clone; echo $(cd $D && ls)')).toEqual(['/abs/clone']);
+    expect(lands('D=/abs/clone; x="$(cd "$D" && ls)"')).toEqual(['/abs/clone']);
+    // too many possible directories gives up at once, and the CLI refuses
     const chain = Array.from({ length: 40 }, (_, i) => `if cd /d${i}; then :; fi; cd s`).join('; ');
     expect(walkCds(chain, REPORTED, undefined, HOME).overflow).toBe(true);
+    const t0 = Date.now();
+    expect(walkCds(`(cd /a); ${Array.from({ length: 40 }, (_, i) => `cd b${i}`).join('; ')}`, REPORTED).overflow).toBe(true);
+    walkCds(`(cd /a; echo ${') '.repeat(80000)}x`, REPORTED);
+    expect(Date.now() - t0).toBeLessThan(3000);
   });
   it('the CLI judges a command in each protected landing: one deny is enough', () => {
     const PRIMARY = '/ws/webeverything';

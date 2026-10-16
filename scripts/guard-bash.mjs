@@ -2792,7 +2792,7 @@ const STRUCTURED_SEGMENT = /^\s*(?:(?:if|then|else|elif|fi|while|until|do|done|f
 // PR #5403 review — the regions a cd may sit in without being this shell's own unconditional cd: a subshell
 // `( … )`, an `if`/`while`/`until`/`for`/`case`/`select`, a function body. A `{ … }` group is tracked only to
 // match its `}`. Each segment's leading words open or close them; what follows those words is `rest`.
-const REGION_LEAD = /^\s*(?:(\()(?!\()\s*|(if|while|until|for|case|select)\s+|(?:then|do|else|elif|!|time(?:\s+-p)?|coproc)\s+|(?:function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.-]*\s*\(\s*\))\s*(\{)?\s*|(\{)\s+)/;
+const REGION_LEAD = /^\s*(?:(\()(?!\()\s*|(if|while|until|for|case|select)\s+|(?:then|do|else|elif|!|time(?:\s+-p)?|coproc)\s+|(?:function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.-]*\s*\(\s*\))\s*(\{)?\s*|(\{)(?=\s|$)\s*)/;
 const REGION_CLOSE = /^\s*(?:(fi|done|esac)|(\}))(?=[\s;&|)]|$)\s*/;
 
 // Past this many possible directories the walk gives up (`overflow`), and the CLI refuses the command.
@@ -2801,39 +2801,63 @@ const MAX_MAYBE_CWDS = 32;
 const MAX_SUBSTITUTION_TEXT = 200000;
 const CD_WORD = /(?:^|[^\w.-])cd(?![\w.-])/;
 
-/** Apply `stmt`'s leading region words to `regions` (a stack of 'sub' | 'cond' | 'func' | 'group'). Returns
- *  `rest`, the text after them (a one-statement subshell's closing `)` removed), and `closeTrailing`, which
- *  closes the subshells its unmatched trailing `)` end — called once the statement itself is handled. A closer
- *  that matches nothing open is ignored: a region that never closes keeps its cds landing-only (more denies). */
+/** Apply `stmt`'s leading region words to `regions` (a stack of 'sub' | 'cond' | 'func' | 'func?' | 'tick' |
+ *  'group'; 'func?' is a function header whose `{` is still to come). Returns `rest`, the text after them (a
+ *  one-statement subshell's closing `)` removed), and `closeTrailing`, called once the statement itself is
+ *  handled: it closes the subshells an unmatched `)` ends, and opens one for each `$(`/`(` or backtick the
+ *  segment leaves open (the split cut a substitution at its `&&`/`;`, so the next segments run inside it). A
+ *  closer that matches nothing open is ignored: a region that never closes keeps its cds landing-only. */
 function regionStep(stmt, regions) {
   let rest = stmt;
+  const top = () => regions[regions.length - 1];
+  const pendingFunc = top() === 'func?';
   for (let m = REGION_CLOSE.exec(rest); m; m = REGION_CLOSE.exec(rest)) {
-    const top = regions[regions.length - 1];
-    if (m[1] ? top === 'cond' : top === 'func' || top === 'group') regions.pop();
+    if (m[1] ? top() === 'cond' : top() === 'func' || top() === 'group') regions.pop();
     rest = rest.slice(m[0].length);
   }
   for (let m = REGION_LEAD.exec(rest); m && m[0]; m = REGION_LEAD.exec(rest)) {
     if (m[1]) regions.push('sub');
     else if (m[2]) regions.push('cond');
-    else if (m[3]) regions.push('func');                        // a header whose `{` comes later opens nothing
+    else if (m[4] && top() === 'func?') regions[regions.length - 1] = 'func'; // the header's `{` on its own line
     else if (m[4]) regions.push('group');
+    else if (/\(\s*\)|^\s*function\s/.test(m[0])) regions.push(m[3] ? 'func' : 'func?');
     rest = rest.slice(m[0].length);
   }
   let depth = 0;                                                // one linear pass: parens outside quotes
   let unmatched = 0;
+  let ticks = 0;
   for (let i = 0, q = ''; i < rest.length; i++) {
     const ch = rest[i];
     if (ch === '\\' && q !== "'") { i++; continue; }
     if (q) { if (ch === q) q = ''; continue; }
+    if (ch === '$' && (rest[i + 1] === '{' || rest[i + 1] === '[')) {  // a paren inside `${…}`/`$[…]` is literal
+      const [open, close] = rest[i + 1] === '{' ? ['{', '}'] : ['[', ']'];
+      let n = 0;
+      for (i++; i < rest.length; i++) {
+        if (rest[i] === '\\') i++;
+        else if (rest[i] === open) n++;
+        else if (rest[i] === close && --n === 0) break;
+      }
+      continue;
+    }
     if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '`') ticks++;
     else if (ch === '(') depth++;
     else if (ch === ')') { if (depth) depth--; else unmatched++; }
   }
-  if (unmatched) rest = rest.replace(/\)[\s)]*$/, '');
+  let end = rest.length;                                        // drop the closing `)`s, from the end
+  for (let n = unmatched; end > 0 && n > 0; end--) {
+    if (rest[end - 1] === ')') n--;
+    else if (!/\s/.test(rest[end - 1])) break;
+  }
+  rest = rest.slice(0, end);
   return {
     rest,
     closeTrailing: () => {
-      for (let n = 0; n < unmatched && regions[regions.length - 1] === 'sub'; n++) regions.pop();
+      for (let n = 0; n < unmatched && top() === 'sub'; n++) regions.pop();
+      for (let n = 0; n < depth; n++) regions.push('sub');
+      if (ticks % 2) top() === 'tick' ? regions.pop() : regions.push('tick');
+      if (top() === 'func?' && (pendingFunc || rest.trim())) regions.pop(); // a one-command body, now done
     },
   };
 }
@@ -3064,7 +3088,8 @@ export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, h
 }
 
 // The effective cwd and every landing, in one walk: `{ cwd, landings }`.
-export function walkCds(command, reportedCwd, resolvePath = resolve, home = process.env.HOME, intoSubstitutions = true) {
+// `outerVars` is set only for a substitution body: the variables it starts from (it walks no deeper bodies).
+export function walkCds(command, reportedCwd, resolvePath = resolve, home = process.env.HOME, outerVars = null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -3083,6 +3108,7 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
   // clear-all only has to start a fresh `vars` (constant time, however many names are pinned).
   const pinned = Object.create(null);
   let vars = Object.create(pinned);
+  for (const name in outerVars) vars[name] = outerVars[name]; // a substitution body starts from its shell's values
   // HOME as the shell holds it: a string (possibly relative or empty), or null when unknown. The hook's own
   // HOME seeds it only when absolute; an in-command assignment is taken as written.
   let homeCtx = typeof home === 'string' && home.startsWith('/') ? home : null;
@@ -3151,27 +3177,25 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
   let decided;
   let overflow = false;
   let subBudget = MAX_SUBSTITUTION_TEXT;
-  const landings = [];
-  const maybe = [];
-  const note = (list, dir) => { if (!list.includes(dir)) list.push(dir); };
+  const landings = new Set();
+  const maybe = new Set();
+  // `maybe` past its cap ends the walk at once (`overflow`): it could otherwise double with each relative cd.
+  const noteMaybe = (dir) => { maybe.add(dir); if (maybe.size > MAX_MAYBE_CWDS) overflow = true; };
   // A relative path from an unknown place is read from the reported cwd, as main's resolver read it.
   const from = (p) => (p.startsWith('/') ? p : resolvePath(cur ?? (reportedCwd || '.'), p));
   // Every place `p` may resolve to: from `cur`, then from each `maybe` directory. All become landings.
   const reach = (p) => {
-    const all = [from(p), ...(p.startsWith('/') ? [] : maybe.map((m) => resolvePath(m, p)))];
-    for (const d of all) note(landings, d);
+    const all = [from(p), ...(p.startsWith('/') ? [] : [...maybe].map((m) => resolvePath(m, p)))];
+    for (const d of all) landings.add(d);
     return all;
   };
   const land = (dir) => {
     if (dir === null) { cur = null; return; }
     const [first, ...rest] = reach(dir);
-    if (maybe.length) for (const d of rest) note(maybe, d);
+    if (maybe.size) for (const d of rest) noteMaybe(d);
     cur = first;
   };
-  const landNested = (dir) => {
-    for (const d of reach(dir)) note(maybe, d);
-    if (maybe.length > MAX_MAYBE_CWDS) overflow = true;
-  };
+  const landNested = (dir) => { for (const d of reach(dir)) noteMaybe(d); };
   const regions = [];                                           // open regions and groups, innermost last
   const inRegion = () => regions.some((r) => r !== 'group');
   const homeFor = (prefix) => {
@@ -3206,6 +3230,7 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
   };
   let structured = false;
   for (const [k, stmt] of parsed.segments.entries()) {
+    if (overflow) break;
     if (parsed.commented[k]) continue;                          // begins inside a `#` comment
     structured ||= STRUCTURED_SEGMENT.test(stmt);
     const sure = !structured && !/^(?:&&|\|\|)/.test(seps[k - 1] ?? '');
@@ -3213,13 +3238,18 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
     // `substitutionBodies` already lists the bodies at every depth, so each is walked once, not recursively.
     // Nested bodies overlap, so their total size can grow with the square of the text: past a budget the walk
     // gives up (`overflow`) rather than slow the hook.
-    if (intoSubstitutions && CD_WORD.test(stmt)) {
+    // A body sees this shell's variables, and its landings are also places the commands after it may run in
+    // when the split cut it open (`x=$(cd /a && cd b && …)`).
+    if (!outerVars && CD_WORD.test(stmt)) {
       for (const body of substitutionBodies(stmt)) {
         if (!CD_WORD.test(body)) continue;
         if ((subBudget -= body.length) < 0) { overflow = true; break; }
-        for (const d of walkCds(body, cur ?? reportedCwd, resolvePath, homeCtx, false).landings) note(landings, d);
+        const inner = walkCds(body, cur ?? reportedCwd, resolvePath, homeCtx, vars);
+        if (inner.overflow) overflow = true;
+        for (const d of inner.landings) { landings.add(d); noteMaybe(d); }
       }
     }
+    if (overflow) break;
     const { rest, closeTrailing } = regionStep(stmt, regions);
     const nested = inRegion();
     const words = shellWords(stmt);
@@ -3273,7 +3303,7 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
     land(target);
     decided ??= cur;
   }
-  return { cwd: decided ?? cur ?? reportedCwd, landings, overflow };
+  return { cwd: decided ?? cur ?? reportedCwd, landings: [...landings], overflow };
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────

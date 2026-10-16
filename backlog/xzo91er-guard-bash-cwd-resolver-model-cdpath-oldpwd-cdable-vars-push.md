@@ -14,7 +14,9 @@ tags: []
 Found by the PR 5403 self-reviews. resolveEffectiveCwd (the static first-cd walk) still differs from bash in structural ways the PR did not change:
 
 - a set or prefix CDPATH, OLDPWD with `cd -`, `shopt -s cdable_vars`, `set -o posix` (prefix assignments then persist), and `pushd`;
-- `eval cd …`, and a `cd` inside if/then, while/do, a subshell, a pipe, a background job or a function body (the walk honours the first cd it sees as if it ran);
+- `eval cd …`, `bash -c "cd …"`, a process substitution `<(cd …)` and a `cd` in a pipe or a background job (a cd inside a subshell, an if/while/for/case or a function body, or a command substitution now adds a landing the CLI judges; these shapes are not recognised as a cd at all);
+- a segment led by a keyword or a `case` pattern (`then git reset --hard`, `x) cd D && …`) is not judged by the per-segment arms, whatever its cwd;
+- the commands before the first cd run in the reported cwd, but the hook judges them in the effective cwd only (`git reset --hard; cd <lane>` from a daemon clone); judging the reported cwd too would deny the `cd <lane> && claim` idiom from a primary;
 - assignments after then/do/else (walked as if they ran);
 - top-level `local` (bash errors and keeps the value; the walk forgets it);
 - ANSI-C quoted command names and escaped `$'…'` targets;
@@ -22,7 +24,7 @@ Found by the PR 5403 self-reviews. resolveEffectiveCwd (the static first-cd walk
 - `let` reading a variable whose value is itself an assigning expression;
 - a cd target that does not exist (bash's cd fails and stays; the hook keeps the unresolved string when realpath fails);
 - an unquoted `[…]` bracket glob in a cd word (`cd ~/[c]lone`) is resolved as a literal path; any unquoted glob metacharacter (`*`, `?`, `[`) should leave the word unresolved (PR 5403 advisory);
-- a bare `cd` ends the first-cd walk, so `cd && cd <protected clone> && <mutation>` resolves to HOME; more than one cd that could run should make the walk unresolvable (PR 5403 advisory).
+- the CLI judges a command in its effective cwd and in every protected cd landing, so a command that passes through a protected directory is judged there in full: `cd <lane> && claim && cd <primary>`, a read in a stale or foreign-leased lane before a write in another, and more than 16 protected landings (subfolders of one lane count apart) are denied. A per-segment cwd would remove these extra denies.
 
 Each can resolve to the reported cwd while bash enters a protected daemon clone, or the reverse.
 
