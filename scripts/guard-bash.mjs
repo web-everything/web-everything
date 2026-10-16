@@ -2487,43 +2487,33 @@ function expandCdTarget(rest, home) {
   return out || null;
 }
 
-// PR #5403 review r5 — could anything in this command rebind HOME? Deliberately over-inclusive, because a wrong
-// YES only leaves a home spelling unresolved (main's behaviour) while a wrong NO steers the `cd` somewhere bash
-// does not go. Which shell (parent, subshell, pipeline, background job, branch not taken) a statement runs in,
-// and whether it runs before the `cd` (a function body, a loop), is never modelled — that is exactly where text
-// counting gets it wrong — so the WHOLE command is read, in any order. Read after quote removal, so a split
-// name (`HO""ME`, `HO\ME`, `$'HO'ME`, `-vHOME`) is still HOME. YES for:
-//   • any `HOME` text other than a plain read (`$HOME`, `${HOME}`) — an assignment, an option or operand
-//     (`printf -vHOME`, `read`, `unset`, `for`), a nameref target, an `eval` string, `${HOME:=…}`;
-//   • a `$'…'` run with a backslash escape (`$'\x48OME'` spells HOME with no `HOME` text);
-//   • `eval`/`source`/`.`, or a run-time command name (`$c …`), at command position — code the text cannot see;
-//   • a run-time-built word (`$`, backtick, brace, glob) in arithmetic (`((`, `[[`, `[` subscript, `let`),
-//     which assigns (`$(( ${x}ME=1 ))`);
-//   • a run-time-built word anywhere in a command that also uses a binding builtin anywhere
-//     (`export "${x}ME=/tmp"`, `export {HO,}ME=/tmp`, `declare -i n; n=${x}ME=1`).
-const HOME_BINDERS = new Set(['declare', 'typeset', 'export', 'local', 'readonly', 'read', 'printf', 'mapfile',
-  'readarray', 'unset', 'let', 'getopts', 'trap', 'builtin', 'command', 'exec', 'coproc', 'for', 'select',
-  'alias', 'shopt', 'enable', 'eval', 'source', '.']);
-const COMMAND_PREFIXES = new Set(['time', '!', 'command', 'builtin', 'then', 'do', 'else', 'elif', 'if',
-  'while', 'until', 'coproc', 'exec', '{', '(', '((']);
-function homeMayBeRebound(segments) {
-  let dynamic = false;
-  let binder = false;
-  for (const raw of segments) {
-    if (/\$'[^']*\\/.test(raw)) return true;
-    const t = raw.replace(/\$(?=['"])/g, '').replace(/["'\\]/g, '');
-    const rest = t.replace(/\$\{HOME\}|\$HOME(?!\w)/g, '');
-    if (rest.includes('HOME')) return true;
-    const words = t.split(/[\s;(){}]+/).filter(Boolean);
-    const cmd = words.find((w) => !COMMAND_PREFIXES.has(w) && !/^[A-Za-z_]\w*\+?=/.test(w));
-    if (cmd === 'eval' || cmd === 'source' || cmd === '.' || /[`$]/.test(cmd ?? '')) return true;
-    const built = /[`$*?[{]/.test(rest);
-    if (/[`$]/.test(rest) && /\(\(|\[|\blet\b/.test(rest)) return true;
-    dynamic ||= built;
-    binder ||= words.some((w) => HOME_BINDERS.has(w));
-    if (dynamic && binder) return true;
+// PR #5403 review r5 — is HOME certainly still the hook's own HOME when the `cd` runs? An ALLOWLIST, because
+// bash has too many ways to turn text into the name HOME to list them (three review rounds each found more: a
+// child shell's or a skipped branch's assignment, a quote-split or ANSI-C-escaped name, arithmetic that runs a
+// variable's value as an assignment, a brace-built command word, a function body run after the `cd` text). A
+// wrong NO only leaves a home spelling unresolved (main's behaviour); a wrong YES steers the `cd` somewhere bash
+// does not go. So YES only when the WHOLE command (any order, heredoc bodies included) has:
+//   • no `HOME` text other than a plain read (`$HOME`, `${HOME}`), after quote removal (`HO""ME`, `-vHOME`);
+//   • no expansion beyond a plain `$NAME` / `${NAME}` read — no `$(`, `$((`, `${…:…}`, `$'…'`, backtick;
+//   • no `(`, `)`, `{`, `}` (subshells, groups, functions, arithmetic, brace expansion) and no `NAME[` subscript;
+//   • and, in every statement, a command word (after literal `NAME=value` prefixes) from HOME_SAFE_COMMANDS —
+//     external programs and inert builtins, none of which can bind a variable in this shell.
+const HOME_SAFE_COMMANDS = new Set(['cd', 'pwd', 'echo', 'true', 'false', ':', 'git', 'gh', 'node', 'npm', 'npx',
+  'pnpm', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'jq', 'diff', 'sort', 'uniq', 'mkdir', 'touch', 'tee',
+  'date', 'which']);
+function homeIsStable(rawCommand, segments) {
+  const unquote = (s) => s.replace(/["'\\]/g, '');
+  if (unquote(rawCommand).replace(/\$\{HOME\}|\$HOME(?!\w)/g, '').includes('HOME')) return false;
+  for (const seg of segments) {
+    if (/\$['"]/.test(seg)) return false;
+    const t = unquote(seg).replace(/\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*/g, 'v');
+    if (/[$`(){}]/.test(t)) return false;
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.some((w) => /^[A-Za-z_]\w*\[/.test(w))) return false;
+    const cmd = words.find((w) => !/^[A-Za-z_]\w*\+?=/.test(w));
+    if (cmd !== undefined && !HOME_SAFE_COMMANDS.has(cmd)) return false;
   }
-  return false;
+  return true;
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -2559,9 +2549,9 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
-  // HOME is the hook's own HOME unless anything in the command might rebind it (`homeMayBeRebound`); then it
+  // HOME is the hook's own HOME only while nothing in the command can rebind it (`homeIsStable`); otherwise it
   // is unknown and a home spelling stays unresolved. No new HOME value is ever adopted.
-  const currentHome = typeof home === 'string' && home.startsWith('/') && !homeMayBeRebound(parsed.segments)
+  const currentHome = typeof home === 'string' && home.startsWith('/') && homeIsStable(String(command), parsed.segments)
     ? home : null;
   for (const stmt of parsed.segments) {
     const cd = stmt.trim().match(/^cd\s+(.+)$/);

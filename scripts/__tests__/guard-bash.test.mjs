@@ -569,6 +569,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       // arithmetic assigns a run-time-built name
       'x=HO; echo $(( ${x}ME=1 ))', 'x=HO; [[ ${x}ME=7 -eq 7 ]]', 'x=HO; a=(1); : ${a[${x}ME=3]}',
       'v=HO; v+=ME=7; [[ $v -eq 7 ]]', 'declare -i n; x=HO; n=${x}ME=1',
+      // …even with no `$`: arithmetic runs a variable's VALUE as an assignment
+      'v=HO; v+=ME=7; (( v ))', 'v=HO; v+=ME=7; [[ v -eq 7 ]]', 'v=HO; v+=ME=7; declare -i n; n=v',
+      'v=HO; v+=ME=7; a[v]=1', 'v=HO; v+=ME=7; s=abc; : ${s:v}',
+      // a brace-built command word
+      '{eval,eval} {HO,}ME=/tmp', '{export,export} {HO,}ME=/tmp',
+      // anything not on the allowlist
+      'make build', 'myfunc', 'exec 3>&1',
       // code the text cannot see
       'eval "$X"', 'source ./env.sh', '. ./env.sh',
     ]) expect(at(`${pre}; cd ~/clone`), pre).toBe(REPORTED);
@@ -577,6 +584,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // a rebinding written AFTER the cd can still run before it (a function body, a loop's second pass)
     expect(at('f() {\ncd ~/clone\n}\nHOME=/tmp\nf')).toBe(REPORTED);
     expect(at('cd ~/clone; HOME=/other')).toBe(REPORTED);
+    // HOME text in a heredoc body is still read (the body can feed a later evaluation)
+    expect(at('read -r v <<X\nHOME=7\nX\n(( v )); cd ~/clone')).toBe(REPORTED);
+    expect(at('cat <<X\nHOME=7\nX\ncd ~/clone')).toBe(REPORTED);
   });
   it('reads of HOME and unrelated statements keep the hook HOME', () => {
     expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
