@@ -10,6 +10,8 @@
  *   rewritten. The parent acceptance looked stale despite no author change. This proof permits callers
  *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
  */
+import { readSettings } from './settings-files.mjs';
+import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
 import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
@@ -19,6 +21,19 @@ import {
   REVIEW_LABELS, buildStaleAcceptHealComment, buildReviewedShaMarker, buildReviewedDiffMarker,
   buildReviewedContributionMarker, buildClearedHumanMarker,
 } from './review-escalation.mjs';
+
+/** Resolve the numbering-specific human policy through standard → platform → tool → env. */
+export function resolveNumberingHumanClearanceSetting({ env = process.env, platform, tool = readSettings()?.review } = {}) {
+  const raw = env?.WE_REVIEW_CARRY_HUMAN_CLEARANCE_ACROSS_NUMBERING;
+  const parsed = ['true', 'on', '1'].includes(raw) ? true : ['false', 'off', '0'].includes(raw) ? false : raw;
+  const key = 'carryHumanClearanceAcrossNumbering';
+  const preference = platform === undefined ? platformPreference('review', { env }) : platform;
+  const resolved = cascadePolicy('review', tool && { [key]: tool[key] }, {
+    standard: { [key]: true }, platform: { [key]: preference?.[key] }, env,
+    envValues: { [key]: parsed }, valid: v => typeof v === 'boolean',
+  });
+  return { value: resolved.value[key], source: resolved.sources[key] };
+}
 
 export const NUMBERING_SUBJECT_RE = /^drain: JIT-number (.+) at land \(#2288\)$/;
 export const MAX_NUMBERING_COMMITS = 5;
@@ -583,6 +598,7 @@ function refuseWithoutReferralGuard() { throw Error('no mandatory-referral guard
 /** IO: prove first, re-read before every write, record before labels; only settled proof outcomes are memoized. */
 export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFileSync, cwd, provider,
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
+  numberingSetting = resolveNumberingHumanClearanceSetting(),
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
   guardReferrals = refuseWithoutReferralGuard } = {}) {
   const key = `${repo}#${pr}@${state?.headRefOid}`;
@@ -604,6 +620,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (!enabled || acceptCarry !== 'on') return null;
   if (settledRestamps.has(key)) return null;
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
+  if (plan.human && !numberingSetting.value) return null;
   // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
   // A guard read failure is retryable and never settles the head or grants an acceptance.
   try { guardReferrals(state, { repo, pr }); }

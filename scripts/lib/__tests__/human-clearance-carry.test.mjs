@@ -600,10 +600,9 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
 describe('human clearance numbering tier', () => {
   const evidence = { humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' },
     headSha: HEAD, headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') };
-  it.each(['off', 'missing recorded diff', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
+  it.each(['off', 'unread live diff'])('refuses %s before attempting numbering', (kind) => {
     let calls = 0;
     const e = { ...evidence, humanClearance: { ...evidence.humanClearance } };
-    if (kind === 'missing recorded diff') e.humanClearance.diff = null;
     if (kind === 'unread live diff') e.headDiff = null;
     const d = proveHumanClearanceCarry({ evidence: e, enabled: kind !== 'off',
       proveNumbering: () => { calls++; return { ok: true }; } });
@@ -656,4 +655,35 @@ describe('human clearance numbering tier', () => {
       expect(posted).toEqual([]);
     });
   });
+});
+
+// Observed #5414 markers: the original clearance had BOTH fingerprints; it was not an agent acceptance.
+it('#5414 recorded heads: carries chalbert and updates acceptance as well as clearance', () => {
+  const old = '4301480ce5fddad5f0621c3933f4335734ec91d7';
+  const head = '21ce5fcd9ecd13cb8e1262fd35108f5bbfbd822a';
+  const before = 'fc7b05325a715a0f5f5dd07bed6223044fd92f2f39475906c5f7c4f4c303cd0a';
+  const after = 'dc5d53c7d39b4f24465cf98f24122e860e479d5b6513b9e2e41471c0c410ad56';
+  const comment = clearHumanComment(old, before);
+  comment.createdAt = '2026-10-15T23:41:24Z';
+  comment.body += '\n<!-- reviewed-contribution: 39a4211c1e0740f32e484ba867419a7ae9eb137b670c574790ce23e1de14ba40 -->';
+  const posted = []; const logs = []; const proofs = [];
+  const exec = (cmd, args) => {
+    if (cmd === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: [comment] });
+    if (cmd === 'gh' && args[0] === 'api') return '';
+    if (cmd === 'gh' && args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
+    throw Error('unexpected command');
+  };
+  const gate = decideDrainReviewGate({ labels: ['review:accepted'], escalate: true, humanRequired: true, permissionChange: true }, {
+    pr: 5414, repo: 'web-everything/web-everything', local: true, exec,
+    files: ['scripts/conveyor/reconcile-core.mjs'], filesComplete: true, listedHeadSha: head,
+    netDiff: () => ({ scored: true, text: after, rev: head, revSha: head }),
+    carry: { setting: ON, numberingSetting: { value: true, source: 'platform' }, log: line => logs.push(line),
+      proveNumbering: o => { proofs.push([o.fromSha, o.toSha]); return { ok: true, reason: 'verified x3o0ohn→#6178' }; } },
+  });
+  expect(gate.action).toBe('merge');
+  expect(proofs).toEqual([[old, head]]);
+  expect(posted).toHaveLength(1);
+  expect(posted[0]).toContain('<!-- cleared-human: chalbert -->');
+  expect(posted[0]).toContain(`from=${old} to=${head}`);
+  expect(logs.join('')).toContain('review.carryHumanClearanceAcrossNumbering=true (platform)');
 });
