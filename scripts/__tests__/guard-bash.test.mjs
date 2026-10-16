@@ -17,7 +17,7 @@ import {
   usageReportSecretReadReason,
   isTruncatedOperationJson, truncatedOperationJsonReason,
   isTreeWritingBuildRun, isGeneratorScriptRun, isFileWriteRedirect, primaryTreeWriteReason,
-  daemonCloneWriteReason,
+  daemonCloneWriteReason, cdLandings,
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
@@ -634,6 +634,90 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(isLaneCwd(viaHome)).toBe(true);
     expect(laneRootFromCwd(viaHome)).toBe(laneRootFromCwd(viaAbs));
     expect(laneRootFromCwd(viaHome)).toBe(LANE_HOME);
+  });
+  // PR #5403 review r6 — a quote makes `[` literal; only an UNQUOTED bracket is a glob.
+  it('a quoted target keeps its literal brackets; an unquoted one stays unresolved', () => {
+    expect(at("cd '/tmp/clone[1]' && ls")).toBe('/tmp/clone[1]');
+    expect(at('cd "/tmp/clone[1]" && ls')).toBe('/tmp/clone[1]');
+    expect(at('cd /tmp/clone[1] && ls')).toBe(REPORTED);
+    expect(at('D=/tmp/clone[1]; cd "$D" && ls')).toBe('/tmp/clone[1]');
+    expect(at('D=/tmp/clone[1]; cd $D && ls')).toBe(REPORTED);
+  });
+  // PR #5403 review r6 — `cd` options are read the way bash reads them, so `cd -P /clone` lands in /clone.
+  it('skips cd options and one `--`; `cd -`, an unknown option or no operand stays unresolved', () => {
+    expect(at('cd -P /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -L /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -e -P /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -Pe /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -@ /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -- /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd -P -- /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd "-P" /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at("cd '-L' '--' /tmp/clone && ls")).toBe('/tmp/clone');
+    expect(at('cd -P ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -P "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd -- -dir && ls')).toBe(`${REPORTED}/-dir`);
+    expect(at('cd - && ls')).toBe(REPORTED);
+    expect(at('cd -Q /tmp/clone && ls')).toBe(REPORTED);
+    expect(at('cd -P && ls')).toBe(REPORTED);
+    expect(at('cd -- && ls')).toBe(REPORTED);
+  });
+});
+
+// PR #5403 review r6 — a `cd` the single effective cwd cannot hold: inside a subshell or group (bash runs
+// `((cd /P; …) )` as two nested subshells once `((` fails to close as arithmetic), a substitution, an `sh -c`
+// string, or a later statement. Each is a LANDING the daemon-clone check also judges — deny-only, so it can
+// never turn a base refusal into an allow, and the single effective cwd stays exactly as before.
+describe('guard-bash — a cd inside a subshell, group or later statement still reaches the daemon-clone check (PR #5403)', () => {
+  const CLONE = '/ws/wev-review-daemon';
+  const LANE = '/ws/.lanes/web-everything/lane-53';
+  const HOME = '/ws';
+  const ctx = { cwd: LANE, daemonCloneRoots: [CLONE], home: HOME };
+
+  it('DENIES a mutation after a cd into a daemon clone inside any group shape', () => {
+    for (const cmd of [
+      `((cd ${CLONE}; git reset --hard) )`,
+      `(( cd ${CLONE}; git reset --hard) )`,
+      `((cd ${CLONE}) ; git reset --hard)`,
+      `( (cd ${CLONE}; git reset --hard) )`,
+      `(cd ${CLONE}; git reset --hard)`,
+      `(cd ${CLONE} && git reset --hard)`,
+      `(cd ${CLONE} && rm notes.md)`,
+      `(cd ${CLONE}) && git reset --hard`,
+      `{ cd ${CLONE}; git reset --hard; }`,
+      `((cd ~/wev-review-daemon; git reset --hard) )`,
+      `((cd "$HOME/wev-review-daemon"; git reset --hard) )`,
+      `D=${CLONE}; ((cd "$D"; git reset --hard) )`,
+      `((cd -P ${CLONE}; git reset --hard) )`,
+      `echo "$(cd ${CLONE}; git reset --hard)"`,
+      `bash -c "cd ${CLONE} && git reset --hard"`,
+      `git status; cd ${CLONE} && git reset --hard`,
+      `cd ${LANE} && ls; cd ${CLONE} && git commit -am wip`,
+    ]) expect(decide(cmd, ctx), cmd).toMatch(/DAEMON CLONE/);
+  });
+  it('keeps allowing a read or fetch inside the clone, and a mutation after a cd elsewhere', () => {
+    for (const cmd of [
+      `((cd ${CLONE}; git fetch origin) )`,
+      `(cd ${CLONE}; git log)`,
+      `((x = 1)); git status`,
+      `(cd /tmp/scratch; git reset --hard)`,
+      `((cd "$UNKNOWN"; git reset --hard) )`,
+      `cat <<'EOF'\n(cd ${CLONE}; git reset --hard)\nEOF`,
+    ]) expect(decide(cmd, ctx), cmd).toBeNull();
+  });
+  it('cdLandings lists every resolvable landing and drops the unresolvable ones', () => {
+    expect(cdLandings(`((cd ${CLONE}; git reset --hard) )`, LANE, HOME)).toEqual([CLONE]);
+    expect(cdLandings(`(cd ~/x); cd -P /y; (cd "$U")`, LANE, HOME).sort()).toEqual([`${HOME}/x`, '/y']);
+    expect(cdLandings(`(cd sub; ls)`, LANE, HOME)).toEqual([`${LANE}/sub`]);
+    expect(cdLandings('git status', LANE, HOME)).toEqual([]);
+  });
+  it('never moves the single effective cwd: a group\'s cd does not steer the commands after it', () => {
+    const PRIMARY = '/ws/webeverything';
+    expect(resolveEffectiveCwd(`(cd ${LANE}; ls); node scripts/backlog.mjs claim 1`, PRIMARY)).toBe(PRIMARY);
+    expect(resolveEffectiveCwd(`((cd ${LANE}; ls) ); node scripts/backlog.mjs claim 1`, PRIMARY)).toBe(PRIMARY);
+    expect(resolveEffectiveCwd('((x=1)); cd /q && ls', PRIMARY)).toBe('/q');
+    expect(decide(`(cd ${LANE}; ls); node scripts/backlog.mjs claim 1`, { primaryCwd: true, cwd: PRIMARY }))
+      .toBe(decide('node scripts/backlog.mjs claim 1', { primaryCwd: true, cwd: PRIMARY }));
   });
 });
 

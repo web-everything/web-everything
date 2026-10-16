@@ -2542,16 +2542,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
-  // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
-  const vars = Object.create(null);
-  for (const stmt of parsed.segments) {
-    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
-    if (!m) continue;
-    let val = m[2].trim();
-    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
-    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
-    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
-  }
+  const vars = literalAssignments(parsed.segments);
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
@@ -2560,24 +2551,83 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const currentHome = typeof home === 'string' && home.startsWith('/') && homeIsStable(String(command), parsed.segments)
     ? home : null;
   for (const stmt of parsed.segments) {
-    const cd = stmt.trim().match(/^cd\s+(.+)$/);
-    if (!cd) continue;
-    // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
-    const raw = cd[1].trim();
-    if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
-      // bash keeps CR / NBSP / other Unicode spaces IN the word (`cd ~/clone\r` fails), but trim() drops them
-      if (/[^\S \t\n]/.test(stmt)) return reportedCwd;
-      const target = expandCdTarget(raw, currentHome);
-      return target ? (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target)) : reportedCwd;
-    }
-    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
-    target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
-    const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-    if (v) target = vars[v[1]] ?? '';
-    if (!target || /[`$(*?\[]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
-    return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
+    if (!/^cd\s+(.+)$/.test(stmt.trim())) continue;
+    return cdStatementTarget(stmt, { vars, home: currentHome, base: reportedCwd, resolvePath }) ?? reportedCwd;
   }
   return reportedCwd;
+}
+
+// Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
+function literalAssignments(segments) {
+  const vars = Object.create(null);
+  for (const stmt of segments) {
+    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
+    if (!m) continue;
+    let val = m[2].trim();
+    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
+    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
+    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
+  }
+  return vars;
+}
+
+// Where one `cd …` statement lands, or null when that is not statically known. Shared by the leading-cd
+// resolver above and `cdLandings` below, so both read options, home spellings and quoting alike.
+// PR #5403 review r6 — options are skipped the way bash's `cd` reads them: `-L`/`-P`/`-e`/`-@` words (quoted
+// or not), then one `--`. `cd -` (OLDPWD), an option `cd` rejects, or no operand left is unknown.
+function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
+  const cd = stmt.trim().match(/^cd\s+(.+)$/);
+  if (!cd) return null;
+  let raw = cd[1].trim();
+  for (;;) {
+    const w = raw.match(/^(?:[^\s'"]|'[^']*'|"[^"\\$`]*")+/);
+    const word = w ? w[0].replace(/['"]/g, '') : '';
+    if (!word.startsWith('-')) break;
+    if (word !== '--' && !/^-[LPe@]+$/.test(word)) return null;
+    raw = raw.slice(w[0].length).trim();
+    if (word === '--') break;
+  }
+  if (!raw) return null;
+  // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
+  if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+    // bash keeps CR / NBSP / other Unicode spaces IN the word (`cd ~/clone\r` fails), but trim() drops them
+    if (/[^\S \t\n]/.test(stmt)) return null;
+    const target = expandCdTarget(raw, home);
+    return target ? (target.startsWith('/') ? target : resolvePath(base || '.', target)) : null;
+  }
+  let target = raw.split(/\s+/)[0];                         // first arg only (ignore trailing redirs/opts)
+  const quoted = /^(['"])(.*)\1$/.test(target);
+  target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
+  const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
+  if (v) target = vars[v[1]] ?? '';
+  // still unexpanded / globby → fail safe. A `[` is a glob only UNQUOTED (`cd '/tmp/clone[1]'` is literal).
+  if (!target || /[`$(*?]/.test(target) || (!quoted && target.includes('['))) return null;
+  return target.startsWith('/') ? target : resolvePath(base || '.', target);
+}
+
+// PR #5403 review r6 — every OTHER place a `cd` can land: inside a subshell or group (`(cd /P; …)`, and
+// `((cd /P; …) )`, which bash runs as two nested subshells once `((` fails to close as arithmetic), a
+// `$( … )` / `sh -c` / `eval` string, or a later statement. The single effective cwd above cannot hold them
+// (the commands after a group's closer run back in the reported cwd), so they never steer it. They are only
+// ADDED to the daemon-clone check (`reason`), which can turn an allow into a deny and never the reverse: an
+// unresolvable landing is dropped (main's behaviour), and an over-approximation (an arithmetic `(( cd /P ))`,
+// a command that runs after the group closed, the hook's HOME where a rebinding is possible) can only cost a
+// false deny. Bounded by `withNestedCommands`' own depth and node caps.
+export function cdLandings(command, cwd, home = process.env.HOME ?? null, resolvePath = resolve) {
+  const cmd = stripHeredocBodies(String(command || ''));
+  const parsed = parseSegments(cmd);
+  if (!cmd || parsed.unterminated) return [];
+  const vars = literalAssignments(parsed.segments);
+  const h = typeof home === 'string' && home.startsWith('/') ? home : null;
+  const out = new Set();
+  for (const seg of withNestedCommands(parsed.segments, cmd)) {
+    // peel group openers (`(`, `((`, `( (`, `{ `) and the closers glued to the last word (`cd /P)`)
+    const stmt = String(seg).replace(/^(?:\s|\(|\{(?=\s))+/, '').replace(/(?:\s|\)|(?<=\s)\})+$/, '');
+    if (!/^cd\s+(.+)$/.test(stmt)) continue;
+    const target = cdStatementTarget(stmt, { vars, home: h, base: cwd, resolvePath });
+    if (target) out.add(target);
+  }
+  return [...out];
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -3409,7 +3459,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], cdLandings = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3421,8 +3471,11 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
-  if (daemonWrite) return daemonWrite;
+  // PR #5403 review r6 — and from every other `cd` landing in the command (deny-only; see `cdLandings`).
+  for (const at of [cwd, ...cdLandings]) {
+    const daemonWrite = daemonCloneWriteReason(s, { cwd: at, roots: daemonCloneRoots });
+    if (daemonWrite) return daemonWrite;
+  }
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
   // names the selected gate) rather than one steering to `npm run test:unit`, itself now denied here.
@@ -4300,8 +4353,12 @@ export function decide(command, ctx = {}) {
   // quote-CORRECT (r1–r4) lost the coverage the quote-BLIND split had by accident, because a nested
   // command stopped being torn open at its separators. Recursing into those positions restores it
   // structurally — and covers the `bash -c "npm run build"` shape base never caught at all.
+  // PR #5403 review r6 — the daemon-clone arm also judges every `cd` landing the single cwd cannot hold. The
+  // CLI passes them realpath'd; a pure caller gets them computed here. Only paid for when a clone is registered.
+  const armed = ctx.daemonCloneRoots?.length && !ctx.cdLandings
+    ? { ...ctx, cdLandings: cdLandings(command, ctx.cwd, ctx.home) } : ctx;
   for (const seg of withNestedCommands(segments, command)) {
-    const r = reason(seg, ctx);
+    const r = reason(seg, armed);
     if (r) return r;
   }
   return null;
@@ -4416,6 +4473,7 @@ if (IS_CLI) {
   let agentSession = false;
   let effectiveCwd = null;
   let daemonRoots = [];
+  let landings = [];
   let hookSessionId = null;
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
@@ -4459,6 +4517,9 @@ if (IS_CLI) {
     // from the same `workspace` the primaries above use. A fault here fails open (empty list ⇒
     // `daemonCloneWriteReason` denies nothing) rather than wedging the agent.
     try { daemonRoots = daemonCloneRoots(workspace); } catch { daemonRoots = []; }
+    // PR #5403 review r6 — every other `cd` landing (a subshell / group / substitution / later statement),
+    // realpath'd like `cwd` so the daemon-clone match agrees with it. Deny-only (see `cdLandings`).
+    if (daemonRoots.length) landings = cdLandings(cmd, cwd).map(rp);
     // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
     // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && isBacklogMutation(cmd)) staleBehind = commitsBehindUpstream(cwd);
@@ -4473,7 +4534,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, cdLandings: landings, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
