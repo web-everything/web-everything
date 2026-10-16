@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
+  orchestratorDelegateReason,
   decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
@@ -3558,5 +3559,69 @@ describe('admitted vitest must be one-shot (#4449)', () => {
     expect(line).toBeTruthy();
     const mutated = line.replace(' --run', '');
     for (const k of KINDS) expect(dispatchedAgentVerificationReason(mutated, k)).not.toBeNull();
+  });
+});
+
+
+describe('orchestrator foreground delegation', () => {
+  const commands = [
+    'node scripts/operations/run.mjs verify',
+    'node scripts/operations/run.mjs verify-lane',
+    'node scripts/verify-lane.mjs run',
+    'node scripts/operations/run.mjs open-pr',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/example.test.mjs',
+    'npx vitest run scripts/example.test.mjs',
+    'npm run check:standards', 'npm run test:unit -- scripts/example.test.mjs',
+    'node scripts/daemon-rebuild.mjs', 'node scripts/daemon-load-overlay.mjs',
+    'node scripts/daemon-overlay.mjs add example',
+    'node scripts/codex-direct-task.mjs', 'node scripts/gemini-direct-task.mjs',
+  ];
+  it.each(commands)('delegates %s only in orchestrator mode', command => {
+    expect(decide(command, { orchestratorMode: true })).toContain(
+      'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground');
+    expect(orchestratorDelegateReason(command)).toBeNull();
+    expect(String(decide(command) || '')).not.toMatch(/orchestrator session/);
+    expect(orchestratorDelegateReason(command, { orchestratorMode: true, agentSession: true })).toBeNull();
+    expect(orchestratorDelegateReason(command, { orchestratorMode: true, dispatchKind: 'build' })).toBeNull();
+  });
+  it('uses the configured prefix list, including an empty replacement', () => {
+    const ctx = { orchestratorMode: true, orchestratorDelegateCommands: ['node scripts/custom-slow.mjs run'] };
+    expect(decide('node scripts/custom-slow.mjs run', ctx)).toMatch(/orchestrator session/);
+    expect(decide('node scripts/daemon-rebuild.mjs', ctx)).toBeNull();
+    expect(decide('node scripts/daemon-rebuild.mjs', { ...ctx, orchestratorDelegateCommands: [] })).toBeNull();
+  });
+  it('recognizes executable positions and wrappers without matching mentions', () => {
+    const ctx = { orchestratorMode: true };
+    for (const command of [
+      'cd scripts && node daemon-rebuild.mjs',
+      'env EXAMPLE=1 node scripts/daemon-rebuild.mjs',
+      'timeout 600 node scripts/daemon-rebuild.mjs',
+      "bash -c 'node scripts/daemon-rebuild.mjs'",
+      'node "scripts/daemon-rebuild.mjs"',
+    ]) expect(decide(command, ctx), command).toMatch(/orchestrator session/);
+    for (const command of [
+      'echo "node scripts/daemon-rebuild.mjs"',
+      'node scripts/daemon-rebuild.mjs.bak',
+      'node scripts/other.mjs scripts/daemon-rebuild.mjs',
+      'node scripts/daemon-overlay.mjs status',
+      'node scripts/operations/run.mjs status',
+      "cat <<'EOF'\nnode scripts/daemon-rebuild.mjs\nEOF",
+    ]) expect(orchestratorDelegateReason(command, ctx), command).toBeNull();
+  });
+  it('preserves the existing background verification ban in every session', () => {
+    for (const orchestratorMode of [false, true]) {
+      expect(decide('node scripts/operations/run.mjs verify', { orchestratorMode, runInBackground: true })).toMatch(/#2833/);
+    }
+  });
+  it('wires env detection, source logging and subagent exclusion through hook stdin', () => {
+    const invoke = (event, extraEnv = {}) => execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
+      input: JSON.stringify({ tool_input: { command: 'node scripts/daemon-rebuild.mjs' }, ...event }),
+      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '1', WE_CONVEYOR_WORKER: undefined,
+        WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0', ...extraEnv }, encoding: 'utf8',
+    });
+    expect(invoke({})).toMatch(/orchestrator session/);
+    expect(invoke({ agent_id: 'delegated-agent' })).not.toMatch(/orchestrator session/);
+    expect(invoke({}, { WE_CONVEYOR_WORKER: '1' })).not.toMatch(/orchestrator session/);
+    expect(invoke({}, { WE_ORCHESTRATOR_SESSION: '0' })).not.toMatch(/orchestrator session/);
   });
 });

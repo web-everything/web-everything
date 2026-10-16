@@ -177,6 +177,7 @@ import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedL
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
 import { classifySession } from './operations/session-role.mjs';
+import { loadOrchestratorSessionSettings, ORCHESTRATOR_DELEGATE_COMMANDS } from './lib/orchestrator-session-settings.mjs';
 // #xpt9fvd — the shared daemon-clone registry `guard-lane.mjs`'s Edit/Write arm also reads, so the two guards
 // can never disagree about which paths are a resident daemon's OWN clone.
 import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-registry.mjs';
@@ -435,6 +436,28 @@ export function isDirectTaskInvocation(command) {
     const script = words[1] === '--' ? words[2] : words[1];
     return /(?:^|\/)(?:codex|gemini)-direct-task\.mjs$/.test(script || '');
   });
+}
+
+/** Match executable prefixes, including shell re-execution; quoted mentions remain data. */
+export function orchestratorDelegateReason(command, ctx = {}) {
+  if (!ctx.orchestratorMode || ctx.agentSession || ctx.dispatchKind) return null;
+  const normalize = (text) => {
+    const words = headWords(canonicalCommand(peelPollingSegment(text))).map(w => w.text);
+    if (words[0] === 'node') {
+      if (words[1] === '--') words.splice(1, 1);
+      if (words[1]) words[1] = words[1].split('/').at(-1);
+    }
+    return words;
+  };
+  const prefixes = (ctx.orchestratorDelegateCommands ?? ORCHESTRATOR_DELEGATE_COMMANDS).map(normalize);
+  const raw = heredocScan(String(command || '')).text;
+  for (const segment of withNestedCommands(parseSegments(raw).segments, raw)) {
+    const words = normalize(segment);
+    if (prefixes.some(prefix => prefix.length && prefix.every((word, i) => word === words[i]))) {
+      return 'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground';
+    }
+  }
+  return null;
 }
 
 /** Whole-command check: retain both the shell background operator and the Bash tool parameter. Pure. */
@@ -4152,6 +4175,8 @@ export function decide(command, ctx = {}) {
   if (bg) return bg;
   const directTask = backgroundedDirectTaskReason(command, ctx.runInBackground);
   if (directTask) return directTask;
+  const delegate = orchestratorDelegateReason(command, ctx);
+  if (delegate) return delegate;
   // #3105 — same whole-command timing as the check above: a dispatched agent's own gate call must be caught
   // before the per-segment split, since the property being checked (is this a verification-set invocation at
   // all) does not depend on which segment of a chained command it sits in.
@@ -4313,6 +4338,7 @@ if (IS_CLI) {
   let effectiveCwd = null;
   let daemonRoots = [];
   let hookSessionId = null;
+  let orchestratorSettings = {};
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
     cmd = (ev.tool_input || {}).command || '';
@@ -4333,6 +4359,8 @@ if (IS_CLI) {
     // blocks the `verify-lane.mjs run` gate the fix/ci-heal briefs tell the agent to run.
     agentSession = (typeof ev.agent_id === 'string' && ev.agent_id !== '') || !!dispatchKind
       || classifySession(process.env).role === 'worker';
+    orchestratorSettings = loadOrchestratorSessionSettings({ agentSession,
+      log: line => process.stderr.write(`guard-bash: ${line}\n`) }).value;
     // #2367 — the DURABLE session identity. Key on `CLAUDE_CODE_SESSION_ID` (env) FIRST — the SAME source
     // `lane-pool.mjs acquire` stamps into the lease's `ownerSession`, so my own lease can never read as foreign
     // due to a string-source mismatch (r2 correctness fix). The hook payload's `session_id` is only a secondary
@@ -4369,7 +4397,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
