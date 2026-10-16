@@ -2582,7 +2582,8 @@ function literalAssignments(segments) {
 const CD_WORD = /^(?:[^ \t'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")+/;
 const CD_REDIRECT = /^\d*(?:&>>?|<>|[<>]{1,2}&?)[ \t]*(?:[^ \t'"<>]|'[^']*'|"[^"]*")+/;
 function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
-  const t = String(stmt).replace(/^\s+/, '');
+  // only space / tab / newline may precede `cd`: `<NBSP>cd` or `\rcd` is one word bash cannot run
+  const t = String(stmt).replace(/^[ \t\n]+/, '');
   if (!/^cd[ \t]/.test(t)) return null;
   let raw = t.slice(2).replace(/^[ \t]+/, '');
   let word = null;
@@ -2598,6 +2599,8 @@ function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
     word = opt;
   }
   const resolved = (target) => (target ? (target.startsWith('/') ? target : resolvePath(base || '.', target)) : null);
+  // an UNQUOTED brace expansion (`/ws/web{everything,x}`) names a word this resolver does not build
+  if (/\{[^{}]*(?:,|\.\.)[^{}]*\}/.test(word.replace(/'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g, ''))) return null;
   // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
   if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(word)) return resolved(expandCdTarget(word, home));
   // whole target is $VAR / ${VAR} / "$VAR": a literal `NAME=value` from earlier in the command, or unknown
@@ -2673,8 +2676,10 @@ export function cdLandings(command, cwd, home = process.env.HOME ?? null, { reso
 // that fails (a pathological nest) adds nothing, and every other arm still runs.
 function daemonCloneLandings(command, cwd, home, roots, real = (p) => p) {
   try {
+    // at most 256 distinct `real` lookups (a realpath each in the CLI); past that a landing is matched as
+    // spelled, so a long command of out-of-clone `cd`s stays cheap
     const seen = new Map();
-    const toReal = (p) => { if (!seen.has(p)) seen.set(p, real(p)); return seen.get(p); };
+    const toReal = (p) => { if (!seen.has(p)) seen.set(p, seen.size < 256 ? real(p) : p); return seen.get(p); };
     return cdLandings(command, cwd, home, { keep: (p) => isDaemonCloneRealpath(toReal(p), roots), cap: 8 }).map(toReal);
   } catch {
     return [];

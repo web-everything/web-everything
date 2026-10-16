@@ -662,6 +662,19 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at(`cd ${REPORTED} x${nbsp}y && npm run build`, HOME)).toBe(REPORTED);
     expect(at(`cd /tmp/clone x${nbsp}y && ls`)).toBe('/tmp/clone');
   });
+  it('a Unicode space or CR before `cd` makes it a word bash cannot run, so the cwd never moves', () => {
+    for (const ch of ['\r', String.fromCharCode(0xa0)]) {
+      expect(at(`${ch}cd ~/clone; node scripts/backlog.mjs claim 1`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`${ch}cd "$HOME/clone"; ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`${ch}cd /tmp/clone; ls`), JSON.stringify(ch)).toBe(REPORTED);
+    }
+  });
+  it('an unquoted brace expansion in the target stays unresolved; a quoted one is literal', () => {
+    expect(at('cd /ws/web{everything,x} && ls')).toBe(REPORTED);
+    expect(at('cd "/ws/web"{everything,x} && ls')).toBe(REPORTED);
+    expect(at('cd ~/{a..b} && ls')).toBe(REPORTED);
+    expect(at('cd "/ws/web{a,b}" && ls')).toBe('/ws/web{a,b}');
+  });
   it('skips a redirection before the cd operand and reads an escaped option word', () => {
     expect(at('cd >/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
     expect(at('cd 2>/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
