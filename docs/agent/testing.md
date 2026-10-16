@@ -212,6 +212,10 @@ the verdict and printed in both the verdict write-up and human advisory note. Sa
 runs retain their original roster, with the same explicit shortfall reporting.
 These three settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
+Validate each complete scalar before cascading: nested and empty objects, arrays,
+and null must be logged as invalid and fall through. Cover all three settings at
+both platform and tool layers, including platform `{value:false}` against tool
+`enabled:false` through directive selection: neither lens may launch a shadow.
 Test the actual judge request and panel reduction with injected providers, including
 zero agy calls when disabled and failed Codex answers, through heavy-admission.
 Historical optional-roster fixtures explicitly use a zero declaration minimum; the
