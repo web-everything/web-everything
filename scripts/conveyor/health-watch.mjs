@@ -107,6 +107,7 @@ import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
+import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed } from './nightly-coroner-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -1121,6 +1122,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       if (out.failures?.length) probeErrors.prSweepJob = scrubText(out.failures.join('; '));
       return out;
     }) : null;
+
+  const coronerSettings = resolveNightlyCoronerSettings({ config });
+  if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
+    await attempt('nightlyCoronerJob', async () => {
+      const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
+      const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
+      if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
+      return out;
+    });
+  }
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
