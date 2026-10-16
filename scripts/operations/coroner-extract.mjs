@@ -12,6 +12,9 @@
  * real result of each build dispatch run; WE_CORONER_FRICTION_TAIL (bytes of each transcript tail), WE_CORONER_OPS_ROOTS (colon list of .operations dirs).
  */
 import fs from 'node:fs';
+import { collectFalseFindings } from './coroner-false-findings.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readShadowRows, resolveShadowAgreementPath } from '../lib/review-shadow-agreement.mjs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -540,7 +543,7 @@ export function fetchPrKinds(numbers, gh, { repo = CONSTELLATION_REPOS.we.slug, 
 }
 
 /** gh runner: JSON or null on any failure. Stderr is dropped so no credential text can leak into a report. */
-export function makeGh({ home = homedir(), env = process.env, exec = execFileSync } = {}) {
+export function makeGh({ home = homedir(), env = process.env, exec = execFileSyncThrottled } = {}) {
   const shim = join(home, '.claude/github-app-token/gh-shim');
   const PATH = fs.existsSync(shim) ? `${shim}:${env.PATH ?? ''}` : env.PATH;
   return (args) => { try { return JSON.parse(exec('gh', args, { env: { ...env, PATH }, encoding: 'utf8', timeout: 45000, maxBuffer: 32 * MiB, stdio: ['ignore', 'pipe', 'ignore'] })); } catch { return null; } };
@@ -566,7 +569,7 @@ export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, ma
 }
 
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, executorRuns = null, frictionRuns = [], dispatchRuns = [], sources = {} }) {
+export function extractMetrics({ window, falseFindings = null, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, executorRuns = null, frictionRuns = [], dispatchRuns = [], sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
@@ -647,7 +650,7 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
   const errorRates = buildErrorRates({ window, prsOpened, prKinds, cardNames, cutoff: sources.scopingCutoff, notes: { ciRunsTruncated: sources.ci?.truncated, verifyUnstamped: stampedVerify.unattributed, verifyUnstampedSuperseded: stampedVerify.unanchored.filter((l) => /superseded by a newer request/.test(l)).length }, gateRuns, killed, waitTimeouts: waitTimeoutItems.filter((w) => inWindow(w.at, window)), fixSessions, ciRuns, buildTicks, daemonEntries });
   return {
     window: { since: window.since, until: window.until },
-    errorRates,
+    errorRates: { ...errorRates, ...(falseFindings ? { falseFindings } : {}) },
     ...(changeRequests ? { changeRequests } : {}),
     frictions: buildFrictions([...frictionRecords, ...frictionRuns], { prKinds, sources: sources.frictions ?? {} }),
     buildOutcomes: summarizeBuildOutcomes(dispatchRuns, { prKinds }),
@@ -874,7 +877,8 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   }
   const exec = env.WE_CORONER_NO_EXECUTORS ? null : collectExecutorLogs(window, { env, home, io });
   if (exec) Object.assign(sources, { codexSessions: exec.sources.codex, agySessions: exec.sources.agy, codexPilot: exec.sources.pilot });
-  return { window, changeRequests, executorRuns: exec?.runs ?? null, frictionRuns, dispatchRuns: dispatch.rows, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
+  const falseFindings = gh && !env.WE_CORONER_NO_FALSE_FINDINGS ? collectFalseFindings(window, { gh, shadowRows: readShadowRows({ path: resolveShadowAgreementPath(env), read: io.readFileSync.bind(io) }) }) : null;
+  return { window, falseFindings, changeRequests, executorRuns: exec?.runs ?? null, frictionRuns, dispatchRuns: dispatch.rows, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */

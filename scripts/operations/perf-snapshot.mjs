@@ -136,6 +136,16 @@ const FIX_OUTCOMES = ['pushed', 'stopped-without-outcome', 'pushed-by-harness', 
  */
 export function deriveFromCoroner(c) {
   const out = {};
+  const ff = c?.errorRates?.falseFindings;
+  if (ff) {
+    put(out, 'falseFindings.count', ff.count, 'count');
+    put(out, 'falseFindings.unconfirmed', ff.unconfirmed.count, 'count');
+    put(out, 'falseFindings.readFailures', ff.reads?.failed, 'count');
+    put(out, 'falseFindings.truncated', ff.reads?.truncated === undefined ? null : Number(ff.reads.truncated), 'count');
+    for (const field of ['byCause', 'bySource', 'byLens', 'bySeat', 'byPrType']) {
+      for (const [key, value] of Object.entries(ff[field] ?? {})) put(out, `falseFindings.${field}.${key}`, value.count, 'count');
+    }
+  }
   const s = c?.sessions ?? {};
   put(out, 'sessions.count', num(s.count), 'sessions');
   put(out, 'sessions.minutes', num(s.minutes), 'min');
