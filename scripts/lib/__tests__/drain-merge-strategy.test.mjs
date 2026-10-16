@@ -17,11 +17,12 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, env = process.env } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
   let mutated = false;
+  let removed = false;
   const exec = (cmd, args) => {
     calls.push([cmd, ...args]);
     if (args.includes('--slurp')) return JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
@@ -29,11 +30,12 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
-    if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN' }); }
+    if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
-      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: mutated && (inQueue ?? true), headRefOid: HEAD } } } });
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
+      if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
       mutated = true;
       if (mutation) return JSON.stringify(mutation);
       if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
@@ -44,7 +46,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -306,7 +308,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     const exec = (cmd, args) => {
       if (args[0] === 'pr' && args[1] === 'comment') return '';
       if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
       if (args[0] === 'api' && args[1] === 'graphql') {
       if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: broken, headRefOid: HEAD } } } });
       broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
@@ -556,5 +558,55 @@ describe('merge-ai-prs hook wiring', () => {
     expect(block).toContain('mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}');
     expect(block).toContain('if (landLock.ran === false)');
     expect(src.slice(src.indexOf('if (landLock.ran === false)'), src.indexOf('if (landLock.contended', at))).toMatch(/decision = 'skip'; continue;/);
+  });
+});
+
+
+describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it.each(['speculative running', 'required but not started'])('does not enqueue or stamp while %s', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    expect(h.calls.some(c => c[2] === 'comment')).toBe(false);
+  });
+  it('enqueues after a trusted clean result for the live head', () => {
+    const result = { author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [result] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
+  });
+  it('keeps enqueue unchanged when no accepted panel owes a red team', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge'] });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it.each([[[]], [['review:changes']], [['review:human']], [['review:pending']]])('the follow-up backstop dequeues a queued sent-back PR (%j) once', labels => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels, initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.filter(c => c[2] === 'comment')).toHaveLength(1);
+  });
+});
+
+
+describe('queue safeguard overrides and untracked queue entries', () => {
+  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off preserves enqueue without a red-team result', key => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it('dequeueOnSendBack off leaves queued send-backs untouched', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [], initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] }, env: { ...process.env, WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'false' } });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+  it('sweeps open rows before ready filtering even without a follow-up record', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [] });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+  });
+  it('revalidates labels so an old listing cannot dequeue a newly ready PR', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true });
+    h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
 });

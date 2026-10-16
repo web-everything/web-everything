@@ -5040,6 +5040,7 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  for (const listing of listings) mergeStrategy.dequeueSendBacks(listing.rows, listing.repo);
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
