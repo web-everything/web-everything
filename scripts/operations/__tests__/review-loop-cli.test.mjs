@@ -38,13 +38,19 @@ import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindi
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
-  runReviewLoopOnce as driveReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
+  runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
   renderReferralRecord } from '../../lib/jury-core.mjs';
+
+// #5725 — ordinary orchestration cases never enumerate the checkout backlog: the filed-card lookups default to an
+// explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
+// lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
+const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.

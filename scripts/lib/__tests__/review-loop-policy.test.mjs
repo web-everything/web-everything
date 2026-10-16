@@ -5,7 +5,7 @@ import {
   isPreventionOutstandingParked, buildPreventionFilingInput, preventionHeadMarker, preventionGuardAnchor,
   cleanFindingFile, cardCoversGuard,
 } from '../review-loop-policy.mjs';
-import { CONFIRM_ACTORS } from '../../operations/review-pr.mjs';
+import { CONFIRM_ACTORS } from '../../operations/review-pr-constants.mjs';
 import { VERDICTS } from '../jury-core.mjs';
 import { FIELD_CAPS, KINDS, validateEntry } from '../../conveyor/learnings-drop.mjs';
 import { findUnmarkedLocusRefs } from '../../check-standards-rules.mjs';
@@ -648,7 +648,7 @@ describe('cards 5471 + 5470: round budget and binding prior round', async () => 
     roundBudgetDecision, bindingPriorRoundDecision, roundCardsDecision, isRoundCardsParked,
     buildRoundCardsFilingInput, roundCardsAcceptReason, ROUND_CARD_RULES, sanitizeCardField,
   } = await import('../review-loop-policy.mjs');
-  const { REVIEW_EFFECTS } = await import('../../operations/review-pr.mjs');
+  const { REVIEW_EFFECTS } = await import('../../operations/review-pr-constants.mjs');
   const degraded = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness', summary: 'late degraded nit', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' };
   const cosmetic = { file: 'scripts/b.mjs', line: 9, category: 'security/untrusted-text', summary: 'cosmetic `x` text', verdict: 'CONFIRMED', impactIfUnfixed: 'cosmetic' };
   const confirmedBroken = { file: 'scripts/a.mjs', line: 12, category: 'correctness/correctness', summary: 'loses work', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
