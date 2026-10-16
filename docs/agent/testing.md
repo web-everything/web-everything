@@ -890,8 +890,12 @@ An ended attempt frees its prepare slot even while its PR is OPEN (that PR refus
 test cap-many ended OPEN-PR cards and assert a clean card still launches.
 Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
 The launch guard must also run without a surviving claim, and refuse when PR listing throws.
-Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
-0 disables only the merged refusal); probe the time boundary with an injected clock.
+Merged launch refusals measure age from `mergedAt`, falling back to `closedAt`, then `createdAt`,
+under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal). They apply even
+without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
+created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
+records a "scope moved after prepare" note for the build step in the refusal and its persisted
+bookkeeping; it must never dispatch another prepare within the window.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in

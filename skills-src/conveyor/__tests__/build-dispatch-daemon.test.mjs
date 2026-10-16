@@ -274,7 +274,7 @@ describe('prepare status batched', () => {
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
     expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', '500']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -2034,7 +2034,7 @@ describe('automatic item preparation', () => {
     ['listing result absent', () => undefined, [], 'prepare PR listing unavailable'],
     ['listing result invalid', () => ({}), [], 'prepare PR listing unavailable'],
     ['merged after dispatch', () => [{ number: 92, state: 'MERGED', headRefName: 'lane/5028e-prepare-x',
-      createdAt: '2026-10-15' }], [{ num: '5028', recordedAt: '2026-10-14' }], 'merged prepare PR #92 after last dispatch (within 24h guard)'],
+      createdAt: '2026-10-15' }], [{ num: '5028', recordedAt: '2026-10-14' }], 'merged prepare PR #92 (within 24h guard)'],
     ['held needs-you park', () => [], [{ num: '5028', recordedAt: '2026-10-14',
       held: true, holdReason: 'needs-you: decide scope' }], 'parked needs-you: needs-you: decide scope'],
   ])('fails closed at launch: %s', async (_name, list, records, reason) => {
@@ -2100,6 +2100,36 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
       expect(tick.prepare.refused).toHaveLength(launches ? 0 : 1);
     });
+  it.each([
+    ['2026-10-16T20:32:38Z', false],
+    ['2026-10-15T20:53:35Z', true],
+  ])('scope drift after #5399 merged at %s never duplicates prepare within the guard (launches=%s)', async (mergedAt, launches) => {
+    const effects = fixture();
+    const detail = 'scope changed since 37d55ee6: tests/a.test.mjs, tests/b.test.mjs, tests/c.test.mjs';
+    effects.now = () => Date.parse('2026-10-16T20:53:36Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966', preparedDate: '2026-10-15', preparedAgainstSha: '37d55ee6' }],
+      held: [{ num: '5966', reason: 'prepare-stale', detail }],
+    } }, nextState: {} });
+    effects.readPreparedStamp = () => ({ preparedDate: '2026-10-15', preparedAgainstSha: '37d55ee6' });
+    effects.listPreparePrs = () => [{ number: 5399, state: 'MERGED', headRefName: 'lane/5966-prepare-stand-down',
+      createdAt: '2026-10-15T17:18:00Z', mergedAt }];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
+      expect(effects.listPrepareClaims()).toHaveLength(launches ? 1 : 0);
+      if (launches) {
+        expect(tick.prepare.refused).toEqual([]);
+      } else {
+        const note = `scope moved after prepare: ${detail}; build step must reconcile scope`;
+        expect(tick.prepare.refused).toEqual([{ num: '5966', reason: 'merged prepare PR #5399 (within 24h guard)', note }]);
+        expect(tick.nextBookkeeping.prepareRefusals).toEqual([expect.objectContaining({ num: '5966', pr: 5399, note })]);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
+      }
+    } finally { log.mockRestore(); }
+  });
   it('retires a merged unstamped PR without recording an unstamped failure', async () => {
     const effects = fixture();
     claimed(effects);
@@ -4008,7 +4038,7 @@ describe('grouped PREPARE daemon ticks', () => {
       'open prepare PR #93 (lane/7203d-prepare-x)'],
     ['merged prepare PR', { prs: num => num === '7203' ? [{ number: 94, state: 'MERGED', headRefName: 'lane/7203e-prepare-x',
       createdAt: '2026-10-15T11:00:00Z' }] : [], failures: [{ num: '7203', recordedAt: '2026-10-15T10:00:00Z' }] },
-    'merged prepare PR #94 after last dispatch (within 24h guard)'],
+    'merged prepare PR #94 (within 24h guard)'],
     ['needs-you park', { failures: [{ num: '7203', recordedAt: '2026-10-14', held: true, holdReason: 'needs-you: decide scope' }] },
       'parked needs-you: needs-you: decide scope'],
     ['listing failure', { prs: num => { if (num === '7203') throw new Error('unavailable'); return []; } },
