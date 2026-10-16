@@ -37,37 +37,45 @@ export function postAcceptRedTeamOwed(labels, env = process.env) {
   return names.includes('review:accepted') || names.includes('advisory:accepted');
 }
 
+const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
+/** The heading only `review-set-label --to=clear-human` renders, at the very start of its comment (CLEARED_HUMAN_PROSE_RE). */
+const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sanctioned path\n\nCleared by .+? via `review-set-label\.mjs --to=clear-human`/;
+
 /**
- * A verdict carry (review-job carryAcrossRebase) posts its gate markers and the carried marker BEFORE the re-keyed
- * red-team body, so the anchored readers see none of them. Split each carried record into its own entry; `at` keeps
- * the thread position and `from` names the head the record was carried from. PURE.
+ * A verdict carry (review-job carryAcrossRebase) posts ONE comment: its gate markers, the carried marker, prose,
+ * then the re-keyed red-team body, so the anchored readers see none of it. Split only that exact layout, carried to
+ * the live head: gate lines are taken only from before the carried line. `at` keeps the thread position and `from`
+ * names the head the records were carried from. PURE.
  */
-function threadRecords(comments) {
+function threadRecords(comments, head) {
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     const body = typeof c === 'string' ? c : c?.body;
-    const carried = typeof body === 'string' ? parseVerdictCarriedMarker(body) : null;
-    if (!carried) return [{ c, at }];
-    const cut = body.indexOf(RED_TEAM_COMMENT_MARKER);
-    const split = (cut < 0 ? body : body.slice(0, cut)).split('\n').filter(line => parseRedTeamGateMarker(line));
-    if (cut >= 0) split.push(body.slice(cut));
-    return [{ c, at }, ...split.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
+    const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
+    const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
+    const carried = k < 0 ? null : parseVerdictCarriedMarker(lines[k]);
+    if (!carried || carried.toSha !== head || !lines.slice(0, k).every(line => parseRedTeamGateMarker(line)?.rev === head)) return [{ c, at }];
+    const j = lines.findIndex((line, i) => i > k && line.startsWith(RED_TEAM_COMMENT_MARKER));
+    const parts = [...lines.slice(0, k), ...(j < 0 ? [] : [lines.slice(j).join('\n')])];
+    return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
   });
 }
 
 /**
  * Did the operator rule on the head's confirmed breaks? The gate handed them over (`round-cap`), and a trusted
- * clear-human for that head came after both the round-cap record and the result. A carried result defers to the
- * ruling on the head it was carried from, read from the thread before the carry. PURE.
+ * clear-human ceremony for that head came after both the round-cap record and the result. Only the ceremony's own
+ * comment counts: a restamp repeats the cleared-human marker for a ruling made on another head. A carried result
+ * defers to the ruling on the head it was carried from, read from the thread before the carry. PURE.
  */
 function operatorRuled(records, pr, head) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
-  if (parseLatestHumanClearedSha(trusted.map(r => r.c)) !== head) return false;
+  if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   const body = r => (typeof r.c === 'string' ? r.c : r.c?.body);
   for (let sha = head, rs = trusted, depth = 0; sha && depth < 16; depth++) {
     const result = lastAt(rs, r => { const p = parseRedTeamComment(body(r)); return p?.pr === Number(pr) && p.rev === sha; });
     const cap = lastAt(rs, r => { const g = parseRedTeamGateMarker(body(r)); return g?.pr === Number(pr) && g.rev === sha && g.outcome === GATE_OUTCOMES.ROUND_CAP; });
-    const cleared = lastAt(rs, r => parseLatestHumanClearedSha([r.c]) === sha);
+    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(String(body(r) ?? '').replace(/\r\n/g, '\n').trimStart())
+      && parseLatestHumanClearedSha([r.c]) === sha);
     if (!result) return false;
     if (cap && cleared && cleared.at > cap.at && cleared.at > result.at) return true;
     if (!result.from) return false;
@@ -81,7 +89,7 @@ function operatorRuled(records, pr, head) {
 export function redTeamEnqueueHold({ labels, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
   if (!postAcceptRedTeamOwed(labels, env)) return null;
   const live = String(head ?? '').toLowerCase();
-  const records = threadRecords(comments);
+  const records = threadRecords(comments, live);
   const result = redTeamForHead(records.map(r => r.c), pr, live);
   if (!result) return 'post-accept red team has no recorded result on the live head';
   // The result comment precedes the gate. Do not enqueue in that second race window either.

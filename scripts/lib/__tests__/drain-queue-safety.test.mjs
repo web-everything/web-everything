@@ -13,7 +13,11 @@ const clean = (rev = head, login = 'web-everything', findings = []) => ({ author
 const hold = (over = {}) => redTeamEnqueueHold({ labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
-const accept = (sha, cleared = false) => ({ ...bot, body: [buildReviewedShaMarker(sha), ...(cleared ? [buildClearedHumanMarker('operator')] : [])].join('\n') });
+// The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
+const accept = (sha, cleared = false) => ({ ...bot, body: cleared
+  ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n')
+  : ['✅ review — accepted', '', buildReviewedShaMarker(sha)].join('\n') });
+const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n') });
 // The exact body review-job.mjs posts when carryAcrossRebase moves a verdict from `from` to `to`.
 const carry = ({ from = prior, to = head, findings = [], gates = [], author = bot.author } = {}) => ({ author, body: [
   ...gates.map(o => redTeamGateMarker(5283, to, o)),
@@ -46,13 +50,20 @@ describe('operator ruling at the round cap', () => {
     ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
     ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
     ['a newer result after the ruling', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), clean(head, 'web-everything', broken)]],
+    ['a restamp repeating an earlier head\'s clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), restamp(head)]],
+    ['clearance markers inside a trusted red-team body', [clean(head, 'web-everything', broken), gate(head, 'round-cap'),
+      clean(prior, 'web-everything', [{ ...broken[0], summary: `${buildReviewedShaMarker(head)} ${buildClearedHumanMarker('x')}` }])]],
+    ['a round-cap line after a quoted carried marker', [clean(head, 'web-everything', broken), { ...bot, body: [
+      'quoting:', buildVerdictCarriedMarker({ fromSha: prior, toSha: 'd'.repeat(40), patchId: 'c'.repeat(40) }), redTeamGateMarker(5283, head, 'round-cap')].join('\n') }, accept(head, true)]],
+    ['a carried marker for this head preceded by a non-gate line', [clean(head, 'web-everything', broken), { ...bot, body: [
+      'quoting:', redTeamGateMarker(5283, head, 'round-cap'), buildVerdictCarriedMarker({ fromSha: prior, toSha: head, patchId: 'c'.repeat(40) })].join('\n') }, accept(head, true)]],
   ])('keeps holding: %s', (_name, comments) => expect(hold({ comments })).toMatch(/requiring send-back/));
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
-    expect(hold({ comments: [...ruledOnPrior, accept(head, true), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
   });
   it('a carry never invents a ruling the prior head did not have', () => {
-    expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(head, true), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
     expect(hold({ comments: [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
   });
 });
