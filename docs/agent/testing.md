@@ -1144,6 +1144,14 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
+Post-accept admission must cover accepted and advisory-accepted panels before speculation starts as well
+as while it runs. Only the trusted red-team result marker for the exact PR and live head releases that
+wait; a confirmed send-back finding still holds during the result-comment → gate-label race. Queue
+removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
+drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
+from the unfiltered open listing, without a durable follow-up entry. Both safeguards resolve through
+the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.
+
 Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
 followed by GraphQL `isInMergeQueue` plus the judged head. The installed `gh pr view --json` does not
 expose `isInMergeQueue`; use `readMergeQueueState`, not an invented CLI field. GraphQL errors (including

@@ -1,0 +1,62 @@
+/** Queue admission and removal share this policy and head-bound red-team evidence. */
+import { execFileSync } from 'node:child_process';
+import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { readSettings } from './settings-files.mjs';
+import { readMergeQueueState } from './merge-queue-enqueue.mjs';
+import { redTeamForHead, planRedTeamActions, readConfirmedBreaks } from './red-team-gate.mjs';
+
+export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
+  const booleanEnv = key => env[key] === undefined ? undefined
+    : /^(true|1|on)$/i.test(env[key]) ? true : /^(false|0|off)$/i.test(env[key]) ? false : env[key];
+  const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
+    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true },
+    valid: { waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean' },
+    envValues: { waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK') },
+  });
+  log(formatCascadeSourcesLine('drain', r));
+  return r;
+}
+
+export const queueLabels = labels => (labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+export function sendBackReason(labels) {
+  const names = queueLabels(labels);
+  const hold = ['review:changes', 'review:human', 'review:pending'].find(l => names.includes(l));
+  return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
+}
+
+/** Same accepted-panel shapes as review-extra-seats' redTeamOwedFor, using the published verdict labels. */
+export function postAcceptRedTeamOwed(labels, env = process.env) {
+  const off = key => ['0', 'off', 'false', 'no'].includes(String(env[key] ?? '').trim().toLowerCase());
+  if (off('WE_REVIEW_RED_TEAM') || off('WE_REVIEW_EXTRA_SEATS')) return false;
+  const names = queueLabels(labels);
+  return names.includes('review:accepted') || names.includes('advisory:accepted');
+}
+
+/** Accepted panels owe the post-accept pass even when speculation has not started. No clocks. */
+export function redTeamEnqueueHold({ labels, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
+  if (!postAcceptRedTeamOwed(labels, env)) return null;
+  const result = redTeamForHead(comments, pr, head);
+  if (!result) return 'post-accept red team has no recorded result on the live head';
+  // The result comment precedes the gate. Do not enqueue in that second race window either.
+  if (planRedTeamActions(result, confirmedBreaks ?? readConfirmedBreaks({ env }).value).sendBack.length)
+    return 'post-accept red team confirmed a break requiring send-back';
+  return null;
+}
+
+/** Membership is authoritative both before and after the mutation. A retry after success posts no duplicate. */
+export function dequeueSentBack({ repo, pr, reason, exec = execFileSync, log = () => {} } = {}) {
+  const readJson = args => JSON.parse(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  const before = readMergeQueueState({ repo, pr, readJson });
+  if (before.error) throw new Error(before.error);
+  if (!before.inQueue) return { dequeued: false };
+  const { id } = readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'id']);
+  if (!id) throw new Error('dequeue: missing PR node id');
+  const query = 'mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}';
+  const r = readJson(['api', 'graphql', '-f', `query=${query}`, '-f', `id=${id}`]);
+  if (r.errors?.length || !r.data?.dequeuePullRequest) throw new Error(`dequeue refused: ${JSON.stringify(r.errors ?? r)}`);
+  const after = readMergeQueueState({ repo, pr, readJson });
+  if (after.error || after.inQueue !== false) throw new Error(`dequeue unconfirmed: ${after.error ?? 'isInMergeQueue is still true'}`);
+  log(`merge-queue: dequeued ${repo}#${pr}: ${reason} (isInMergeQueue=false)`);
+  exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', `Removed from the merge queue: ${reason}.`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return { dequeued: true };
+}

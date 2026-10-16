@@ -30,6 +30,7 @@
  *   operator can preview which PRs `github-merge-queue` would enqueue without flipping the live policy. A live
  *   (non-dry-run) pass ignores the variable and says so.
  */
+import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -205,6 +206,7 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
+  env = process.env, queueSafety,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
@@ -234,6 +236,13 @@ export function createDrainMergeStrategy({
   };
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
+  const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
+  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const removeSentBack = (repo, num, labels) => {
+    if (dryRun || !safety.value.dequeueOnSendBack || !Array.isArray(labels)) return;
+    const reason = sendBackReason(labels);
+    if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
+  };
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
@@ -245,6 +254,16 @@ export function createDrainMergeStrategy({
     enqueues,
     /** GitHub's queue re-tests every entry against the queue tip, so the drain's freshness refresh is skipped. */
     queueOwnsFreshness: (repo) => enqueues(repo),
+
+    /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
+    dequeueSendBacks(rows = [], repo = null) {
+      if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
+      for (const row of rows) {
+        if (!Array.isArray(row.labels) || !sendBackReason(row.labels)) continue;
+        try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }
+        catch (e) { say(`  ⚠ merge-queue dequeue #${row.number} failed (${firstLine(e)}) — retried next pass`); }
+      }
+    },
 
     /** Dry run: name exactly what this strategy would do with the ordered ready set. Calls no GitHub API. */
     reportDryRun(ordered = []) {
@@ -274,6 +293,22 @@ export function createDrainMergeStrategy({
       const previous = before.enqueueFailures?.[key];
       if (previous?.headSha === headSha && previous.retryAt > now()) {
         return { enqueued: false, deferred: true, kind: 'enqueue-backoff', reason: previous.error, healthSmell: !!previous.healthSmell };
+      }
+      const live = readLive(c.repo, c.num);
+      if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'live head or labels do not match the judged state' };
+      const held = sendBackReason(live.labels);
+      if (held) {
+        removeSentBack(c.repo, c.num, live.labels);
+        return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
+      }
+      if (safety.value.waitForRedTeamBeforeEnqueue && postAcceptRedTeamOwed(live.labels, env)) {
+        const pages = JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(c.repo)}/issues/${c.num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+        if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
+        const reason = redTeamEnqueueHold({ labels: live.labels, comments: pages.flat(), pr: c.num, head: headSha, env });
+        if (reason) {
+          say(`  merge-queue: defer #${c.num}: ${reason}`);
+          return { enqueued: false, deferred: true, kind: 'red-team-pending', reason };
+        }
       }
       let batchingGroupId;
       try {
@@ -374,8 +409,12 @@ export function createDrainMergeStrategy({
       const followedUpKeys = new Set(state.followedUp);
       for (const p of state.pending) {
         let v;
-        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
+        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
+        if (v?.state === 'OPEN') {
+          try { removeSentBack(p.repo, p.num, v.labels); }
+          catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} dequeue failed (${firstLine(e)}) — retried next pass`); }
+        }
         if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num))) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
         else if (v?.state === 'CLOSED') { drop.add(keyOf(p.repo, p.num)); say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`); }
       }

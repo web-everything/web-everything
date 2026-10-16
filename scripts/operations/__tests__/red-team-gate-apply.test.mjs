@@ -27,6 +27,7 @@ function fakeIo({ comments, labels = ['review:accepted'], head = HEAD, liveHead 
     readHead: () => liveHead,
     readSetting: () => ({ value: setting }),
     readRound: () => round,
+    dequeueSentBack: () => ({ dequeued: false }),
     sendBack: (a) => { calls.push(['sendBack', a]); return { ok: true }; },
     appendSendBackEvent: async (a) => { calls.push(['ledger', a]); },
     fileCard: (input) => { calls.push(['card', input]); return { ok: true, session: 'red-team-card-x' }; },
@@ -313,5 +314,17 @@ describe('review-job runs the gate right after the red team', () => {
     const { io } = jobIo('accept', { runRedTeamGate: () => { throw new Error('boom'); } });
     const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
     expect(out.redTeamGate).toMatchObject({ status: 'error', reason: expect.stringMatching(/boom/) });
+  });
+});
+
+
+describe('red-team send-back queue removal (#5283)', () => {
+  it('dequeues at send-back once, including retry of an already recorded send-back', async () => {
+    let queued = true;
+    let removals = 0;
+    const { io } = fakeIo({ comments: [comment([F()])], dequeueSentBack: () => { if (queued) { queued = false; removals++; } } });
+    await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(removals).toBe(1);
   });
 });
