@@ -2497,13 +2497,19 @@ function expandCdTarget(rest, home) {
 //   • no expansion beyond a plain `$NAME` / `${NAME}` read — no `$(`, `$((`, `${…:…}`, `$'…'`, backtick;
 //   • no `(`, `)`, `{`, `}` (subshells, groups, functions, arithmetic, brace expansion) and no `NAME[` subscript;
 //   • and, in every statement, a command word (after literal `NAME=value` prefixes) from HOME_SAFE_COMMANDS —
-//     external programs and inert builtins, none of which can bind a variable in this shell.
+//     external programs and inert builtins, none of which can bind a variable in this shell;
+//   • no `IFS` text (it changes how an unquoted `$HOME` splits) and no heredoc with an UNQUOTED delimiter (a
+//     builtin such as `:` expands that body in this shell, so `$(( v ))` in it can assign HOME).
 const HOME_SAFE_COMMANDS = new Set(['cd', 'pwd', 'echo', 'true', 'false', ':', 'git', 'gh', 'node', 'npm', 'npx',
   'pnpm', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'jq', 'diff', 'sort', 'uniq', 'mkdir', 'touch', 'tee',
   'date', 'which']);
 function homeIsStable(rawCommand, segments) {
   const unquote = (s) => s.replace(/["'\\]/g, '');
   if (unquote(rawCommand).replace(/\$\{HOME\}|\$HOME(?!\w)/g, '').includes('HOME')) return false;
+  if (unquote(rawCommand).includes('IFS')) return false;
+  for (const m of rawCommand.matchAll(/(?<!<)<<(?!<)-?[ \t]*([^\s;&|<>()]+)/g)) {
+    if (!/['"\\]/.test(m[1])) return false;
+  }
   for (const seg of segments) {
     if (/\$['"]/.test(seg)) return false;
     const t = unquote(seg).replace(/\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*/g, 'v');
@@ -2559,6 +2565,8 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+      // bash keeps CR / NBSP / other Unicode spaces IN the word (`cd ~/clone\r` fails), but trim() drops them
+      if (/[^\S \t\n]/.test(stmt)) return reportedCwd;
       const target = expandCdTarget(raw, currentHome);
       return target ? (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target)) : reportedCwd;
     }

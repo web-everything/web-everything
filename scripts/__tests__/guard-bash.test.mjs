@@ -587,6 +587,20 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // HOME text in a heredoc body is still read (the body can feed a later evaluation)
     expect(at('read -r v <<X\nHOME=7\nX\n(( v )); cd ~/clone')).toBe(REPORTED);
     expect(at('cat <<X\nHOME=7\nX\ncd ~/clone')).toBe(REPORTED);
+    // a builtin expands an UNQUOTED heredoc body in this shell; a quoted delimiter keeps it literal
+    expect(at('v=HO; v+=ME=7; : <<X\n$(( v ))\nX\ncd ~/clone')).toBe(REPORTED);
+    expect(at('v=HO; v+=ME=7; true <<-X\n${a[v]}\nX\ncd ~/clone')).toBe(REPORTED);
+    expect(at("cat <<'X'\n$(( v )) (note)\nX\ncd ~/clone")).toBe(`${HOME}/clone`);
+    expect(at('cat <<<"x"; cd ~/clone')).toBe(`${HOME}/clone`);
+    // IFS changes how an unquoted $HOME splits
+    expect(at('IFS=/; cd $HOME/clone')).toBe(REPORTED);
+    expect(at('IFS=n; cd ${HOME}')).toBe(REPORTED);
+  });
+  it('a CR, NBSP or other Unicode space in a home-spelled target is never trimmed into a different path', () => {
+    for (const ch of ['\r', ' ', ' ', '　', '\v', '\f']) {
+      expect(at(`cd ~/clone${ch}\ngit status`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`cd ~/clone${ch}x && git status`), JSON.stringify(ch)).toBe(REPORTED);
+    }
   });
   it('reads of HOME and unrelated statements keep the hook HOME', () => {
     expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
