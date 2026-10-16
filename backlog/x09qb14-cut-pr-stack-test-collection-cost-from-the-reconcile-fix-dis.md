@@ -9,7 +9,7 @@ tags: []
 
 # Cut pr-stack test collection cost from the reconcile-fix-dispatch import closure
 
-The `we:scripts/conveyor/__tests__/pr-stack.test.mjs` suite spends ~0.8 s executing its 118 cases and ~4-5 s collecting. Collection is dominated by the import closure of `we:scripts/conveyor/reconcile-fix-dispatch.mjs` (about 0.44 s to import standalone, several seconds under Vitest's transform), which the suite pulls in for just `filterFixesByInFlightScope` and `runReconcileFixDispatch`. Follow-up from card 5725, whose scope lease did not include that module, so it could not show a wall-time gain for this suite.
+The `we:scripts/conveyor/__tests__/pr-stack.test.mjs` suite spends roughly 0.5-0.8 s executing its 118 cases and ~4-5 s collecting. Collection is dominated by the import closure of `we:scripts/conveyor/reconcile-fix-dispatch.mjs` (about 0.44 s to import standalone, several seconds under Vitest's transform), which the suite pulls in for just `filterFixesByInFlightScope` and `runReconcileFixDispatch`. Follow-up from card 5725, whose scope lease did not include that module, so it could not show a wall-time gain for this suite.
 
 Profile the closure, then either split the two needed functions behind a small module or make the heavy edges lazy, without changing dispatch behavior. Re-export from the old module so every existing import keeps working.
 

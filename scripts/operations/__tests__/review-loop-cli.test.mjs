@@ -403,7 +403,9 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.lines.join('\n')).not.toMatch(/QUEUED for a human/);
   });
 
-  it('#5725 — with NO lookup injected (explicit `undefined` restores the production defaults) the real checkout-backlog lookups still run, find nothing, and the card is filed', async () => {
+  // The production-default lookup path (the checkout backlog scan) is not observable from here — only that it runs without
+  // breaking the flow; the real lookups' hit/miss/idempotency behavior is pinned against temp backlogs further down.
+  it('#5725 — with NO lookup injected (explicit `undefined` restores the production defaults) the default lookup path runs to completion and the card is filed', async () => {
     const { declaration, registry } = registryFor({});
     const fileItemCalls = [];
     const out = await runReviewLoopOnce({
