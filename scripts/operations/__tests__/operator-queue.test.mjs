@@ -434,3 +434,13 @@ it.each([false, true])('shows outstanding findings with subsequent operator ruli
   expect(section).toContain('still needs your ruling: scripts/third.mjs:12  finding 2');
   if (!ruled) expect(section).toContain('still needs your ruling: scripts/first.mjs  finding 0');
 });
+
+it('routes scope-increase requests to NEEDS YOU even with the legacy stood-down setting', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'scope-increase', detail: 'scope-increase request: re-adds cdLandings' }) };
+  execFileSync.mockReturnValue(JSON.stringify([pr(7, [held])]));
+  run(['--json']);
+  expect(JSON.parse(stdout())).toMatchObject({ stoodDown: [], needsYouStandDowns: [
+    { number: 7, question: 'scope-increase request: re-adds cdLandings', remaining: [] },
+  ] });
+});

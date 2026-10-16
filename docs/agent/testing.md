@@ -1199,3 +1199,21 @@ needs-you feed (honoring `WE_NEEDS_YOU_FEED`). No Claude session or judgment ste
 Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through heavy admission.
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
+
+### Fixer scope fence
+
+Repair scope comes from the card's `scope:` paths (the existing PR-diff fallback remains for item-less
+work), never the fixer's proposed diff. Operator-authored sanctioned changes-requested comments retain
+`Out of scope:`, `scopeNotes:` and `x<id> carries` lines verbatim in the brief. Explicit
+`scope-removed: identifier, functionName` markers in these comments or PR removal commit messages
+prohibit added lines containing those identifier tokens. This is a lexical fence; renaming a subsystem
+is still forbidden by the scope brief even when the marker cannot identify it mechanically.
+
+The harness checks before early, green and saved-commit pushes. Unreadable scope/diff evidence withholds
+the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+`fix.scopeFence.enabled` (true) and `fix.scopeFence.mode` (`stand-down` or `warn`, default `stand-down`)
+resolve independently through standard → platform `fix.scopeFence` → tool settings →
+`WE_FIX_SCOPE_FENCE_ENABLED` / `WE_FIX_SCOPE_FENCE_MODE`; push logs name each source. Warn mode posts a
+PR note before pushing. Replay #5403 with a real temporary git removal/re-addition diff and injected
+push/comment sinks in `fix-scope-fence.test.mjs`; existing push-port tests isolate the fence via its
+explicit seam. Run these and the await-verify, round-history and operator-queue suites through heavy admission.

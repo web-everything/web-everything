@@ -255,7 +255,7 @@ describe('runAwaitVerifyPass', () => {
     it('end to end through the default IO: a throwing `claude agents` listing keeps the await record and pushes nothing', async () => {
       const h = harness();
       h.state.marker = marker('green');
-      const real = await defaultAwaitVerifyIo({
+      const real = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
         dispatchIo: { defaultListAgents: () => { throw new Error('claude agents timed out'); } },
         listWrappedWorkers: () => [],
       });
@@ -349,7 +349,7 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
     return { exec, calls };
   };
   const pushArg = (over = {}) => ({ lane: '/lanes/lane-5', sha: SHA, ref: PR_HEAD, repo: 'web-everything/web-everything', pr: 4115, who: 'fix-4115', sessionId: 'S', ...over });
-  const build = async (exec, over = {}) => (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({
+  const build = async (exec, over = {}) => (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
     weRoot: '/we', exec, env: {}, poolRoot: '/lanes', realpath: (p) => p, pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: PR_HEAD } }), ...over,
   });
   const gitPushes = (calls) => calls.filter((c) => c[0] === 'git' && c.includes('push'));
@@ -561,7 +561,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
     expect(expected).toMatch(/^[0-9a-f]{64}$/);
     // (the lane is dirty because of new.txt; commit it so laneState computes a hash)
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     expect(io.laneState(L.lane)).toMatchObject({ dirty: true, treeHash: null });
     git(L.lane, ['add', 'new.txt']); git(L.lane, [...identity, 'commit', '-m', 'three']);
     const committed = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
@@ -572,7 +572,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
 
   it('no lane-config driver (diff.external, filter clean/smudge, textconv, via an in-repo .gitattributes) ever runs in the daemon, clean OR dirty lane, and the hash is unchanged', async () => {
     const L = mkLane(); dirs.push(L.root);
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     writeFileSync(join(L.lane, '.gitattributes'), 'a.txt filter=ev diff=ev\n');
     git(L.lane, ['add', '.gitattributes']); git(L.lane, [...identity, 'commit', '-m', 'attrs']);
     const before = io.laneState(L.lane).treeHash;
@@ -596,7 +596,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     writeFileSync(join(L.lane, '.git', 'info', 'exclude'), '*.tmp\n');
     const verifyLaneRunner = (a) => git(L.lane, a).trim();
     const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     expect(io.laneState(L.lane)).toMatchObject({ dirty: false, treeHash: expected });
   });
 
@@ -635,7 +635,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     for (const k of ['core.fsmonitor', 'diff.external']) git(L.lane, ['config', k, driver]);
     const weRoot = process.cwd(); // vitest runs from the repo root; the child is the checkout's own verify-lane.mjs
     expect(existsSync(join(weRoot, 'scripts', 'verify-lane.mjs'))).toBe(true);
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     const result = io.rerequest(L.lane);
     expect(result.status, JSON.stringify(result)).toBeTruthy(); // verify-lane really ran against the lane (requested, refused or blocked — all after its git reads)
     expect(readdirSync(L.root).filter((f) => f.startsWith('ran-'))).toEqual([]);
@@ -651,7 +651,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     writeFileSync(join(L.lane, 'a.txt'), 'one\ntwo\nthree\n');
     const spawned = [];
     const exec = (cmd, args, opts) => { spawned.push(args.join(' ')); return execFileSync(cmd, args, opts); };
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: process.cwd(), exec, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot: process.cwd(), exec, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     expect(io.rerequest(L.lane)).toMatchObject({ ok: false, status: 'lane-refused', reason: expect.stringMatching(/filter\.x\.clean/) });
     expect(spawned.some((a) => a.includes('verify-lane.mjs'))).toBe(false);
     expect(readdirSync(L.root).filter((f) => f.startsWith('ran-'))).toEqual([]);
@@ -659,7 +659,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
 
   it('every port refuses a lane path outside the lane pool (a record\'s lane is agent-typed)', async () => {
     const L = mkLane(); dirs.push(L.root);
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
       weRoot: process.cwd(), poolRoot: join(L.root, 'somewhere-else'), pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: 'lane/x' } }),
       env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
     });
@@ -735,7 +735,7 @@ describe('push binds the record to a constellation repo and a fix claim this ses
   it('the push port refuses an unclaimed other-PR record before any gh or git call, whatever the PR head says', async () => {
     const calls = [];
     const exec = (cmd, args) => { calls.push([cmd, ...args]); return ''; };
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', exec, env: {}, pushRefusalFn: () => null, readClaimFn: () => null, poolRoot: '/lanes', realpath: (p) => p });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), weRoot: '/we', exec, env: {}, pushRefusalFn: () => null, readClaimFn: () => null, poolRoot: '/lanes', realpath: (p) => p });
     const result = io.push({ lane: '/lanes/lane-5', sha: SHA, ref: 'lane/someone-elses-pr', repo: 'web-everything/web-everything', pr: 9999, who: 'fix-4115', sessionId: 'S' });
     expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/no fix claim/) });
     expect(result.transient).toBeUndefined();
@@ -819,7 +819,7 @@ it('isSessionBusy reads the live turn signal: a turn-ended bg session is state w
 it('resume stops the idle live process by its SHORT job id first, then resumes the same session id (live 2026-10-07)', async () => {
   const calls = [];
   const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
-  const io = await defaultAwaitVerifyIo({
+  const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
     sleep: () => {},
     pidAliveFn: () => false,
     stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return { stopped: true }; },
@@ -844,7 +844,7 @@ describe('resume port: stop-before-resume guards', () => {
     const calls = [];
     return {
       calls,
-      ioPromise: defaultAwaitVerifyIo({
+      ioPromise: defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
         sleep: (ms) => { calls.push(['sleep', ms]); onSleep(ms); },
         pidAliveFn,
         stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return stop({ handle }); },
@@ -988,7 +988,7 @@ describe('resume port: stop-before-resume guards', () => {
   it('reads the live row UNCACHED: the 20s agents cache would return the row the pass already judged', async () => {
     const seen = [];
     const calls = [];
-    const io = await defaultAwaitVerifyIo({
+    const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
       sleep: () => {}, pidAliveFn: () => false, env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '20000' },
       stopSessionFn: () => ({ stopped: true }),
       dispatchIo: {
@@ -1048,7 +1048,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   it('delegates wrapped resumes before any Claude stop or background spawn', async () => {
     const calls = [];
     const session = { kind: 'wrapped-worker', state: 'working', status: 'idle', name: 'fix-4115', sessionId: rec().sessionId };
-    const io = await defaultAwaitVerifyIo({
+    const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
       dispatchIo: {}, stopSessionFn: () => { throw new Error('must not stop'); },
       requestWrappedResumeFn: (args) => { calls.push(args); return { resumed: true }; },
     });
@@ -1058,7 +1058,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   it.each(['neither', 'claude', 'wrapped'])('keeps the other listing when %s fails, and says the merged listing is incomplete', async (failure) => {
     const claude = { kind: 'background', name: 'fix-1' };
     const wrapped = { kind: 'wrapped-worker', name: 'fix-2' };
-    const io = await defaultAwaitVerifyIo({
+    const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
       dispatchIo: { defaultListAgents: () => { if (failure === 'claude') throw new Error('unreadable'); return [claude]; } },
       listWrappedWorkers: () => { if (failure === 'wrapped') throw new Error('unreadable'); return [wrapped]; },
     });
@@ -1071,7 +1071,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   it.each([['claude', 'a string', 'abc'], ['claude', 'null', null], ['claude', 'an object', {}], ['wrapped', 'a string', 'abc'], ['wrapped', 'null', null]])(
     'treats a non-array %s listing (%s) as an incomplete listing, not as rows',
     async (which, _what, value) => {
-      const io = await defaultAwaitVerifyIo({
+      const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(),
         dispatchIo: { defaultListAgents: () => (which === 'claude' ? value : []) },
         listWrappedWorkers: () => (which === 'wrapped' ? value : []),
       });
@@ -1084,7 +1084,7 @@ describe('default IO includes and resumes wrapped workers', () => {
   it('carries a wrapped listing\'s own incompleteness (an unreadable record) into the merged listing', async () => {
     const gap = { reason: 'wrapped record fix-9 unreadable', session: 'fix-9' };
     const wrapped = Object.defineProperty([], 'incomplete', { value: [gap] });
-    const io = await defaultAwaitVerifyIo({ dispatchIo: { defaultListAgents: () => [] }, listWrappedWorkers: () => wrapped });
+    const io = await defaultAwaitVerifyIo({ scopeFencePush: ({ push }) => push(), dispatchIo: { defaultListAgents: () => [] }, listWrappedWorkers: () => wrapped });
     expect(io.listSessions().incomplete).toEqual([gap]);
   });
 });

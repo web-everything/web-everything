@@ -1,3 +1,4 @@
+import { operatorScope, scopeBrief } from './fix-scope-fence.mjs';
 /**
  * @file scripts/conveyor/reconcile-fix-dispatch.mjs
  * @description #3438 — DISPATCH THE FIX AGENT `we:scripts/conveyor/reconcile-pass.mjs` DECIDES IS OWED.
@@ -1095,7 +1096,7 @@ export function tryResumeRoundFix(planned, {
   const history = historyInputs ? renderRoundHistory(buildRoundHistory(historyInputs), { previousOnly: false, title: 'All rounds so far' }) : '';
   // The durable ruling notice first, exactly as a fresh launch does (once per head and rung; a failed post throws).
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
-  const prompt = withPlannedContext(buildRoundResumePrompt({
+  const prompt = scopeBrief(planned.scope ?? [], operatorScope(historyInputs?.comments ?? [])) + withPlannedContext(buildRoundResumePrompt({
     pr: planned.pr, itemNum: planned.itemNum, round: decision.round, cap: planned.cap ?? null,
     lane: decision.lane, headRefOid: planned.headRefOid, history,
   }), planned);
@@ -1174,6 +1175,9 @@ export function fixerTableFor(ruling) {
 
 /** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
 export function withPlannedContext(prompt, planned) {
+  const fence = operatorScope(planned.operatorSendBack ? [{ body: planned.operatorSendBack.body, author: { login: planned.operatorSendBack.login } }] : []);
+  if (planned.scopeNotes) fence.notes.push(...(Array.isArray(planned.scopeNotes) ? planned.scopeNotes : [String(planned.scopeNotes)]));
+  if (!prompt.includes('## Declared repair scope\n')) prompt = scopeBrief(planned.scope ?? [], fence) + prompt;
   return renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
 }
 
@@ -1233,8 +1237,11 @@ export function launchTableFor(planned, roundEscalation, { fixSettings = resolve
 export function briefWithRoundContext(prompt, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff = () => null }) {
   const wantHistory = planned.takeover || fixSettings?.roundHistory !== 'off';
   let inputs = null;
-  if (wantHistory) { try { inputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { inputs = null; } }
-  const history = inputs ? buildRoundHistory(inputs) : null;
+  try { inputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { inputs = null; }
+  const fence = operatorScope(inputs?.comments ?? []);
+  if (planned.scopeNotes) fence.notes.push(...(Array.isArray(planned.scopeNotes) ? planned.scopeNotes : [String(planned.scopeNotes)]));
+  prompt = scopeBrief(planned.scope ?? [], fence) + prompt;
+  const history = wantHistory && inputs ? buildRoundHistory(inputs) : null;
   if (planned.takeover) {
     const previous = planned.takeover.previous ?? null;
     let diffText = null;
