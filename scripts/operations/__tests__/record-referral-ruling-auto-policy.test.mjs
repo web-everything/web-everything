@@ -35,7 +35,7 @@ function harness(initial, { changedLines, compare = { status: 'identical', files
   const readJson = (args) => args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
     : args[1].includes('/compare/') ? (compare instanceof Error ? (() => { throw compare; })() : compare) : { type: fileExists ? 'file' : 'dir' };
   const reader = createRecordReferralRulingReader({ readJson, changedLines, assertFresh: () => {},
-    readable: () => true, now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session' } });
+    readable: () => true, log: () => {}, now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session' } });
   const operation = recordReferralRulingOperation({ readRulingContext: reader });
   const inputFor = (extra) => ({ repo, pr, finding: 'all-open', actor: 'auto-policy', ruling: 'block', channel: 'policy', reason: 'Policy', ...extra });
   const sinks = createRecordReferralRulingSinks({ readJson, changedLines, readable: () => true,
@@ -165,14 +165,58 @@ describe('automatic policy respects authenticated operator decisions', () => {
     const h = harness([...thread(source), ruling(source), ...thread(target), ruling(target)], { compare: new Error('unavailable') });
     expect(h.plan().verdict.noop).toBe(true);
   });
-  it('never turns a reviewer-only carry into operator protection', () => {
+  it('protects a counted reviewer not-real behind a reviewer-only carry', () => {
     const source = record({ h: oldHead, reviewerResult: 'not-real' }), carried = record({ runId: 'review-pr-carried' });
     carried.carried = [{ key: carried.referrals[0].key, result: 'not-real', reason: REFERRAL_CARRY_REASON,
       from: { head: oldHead, runId: source.runId, key: source.referrals[0].key, rulingId: source.rulings[0].id } }];
     const fresh = record({ runId: 'review-pr-fresh', line: 21 });
     const planned = harness(thread(source, carried, fresh)).plan({ finding: fresh.referrals[0].key });
-    expect(planned.verdict.skipped).toEqual([]);
-    expect(planned.verdict.record.rulings).toEqual([{ runId: fresh.runId, key: fresh.referrals[0].key, result: 'block' }]);
+    expect(planned.verdict.skipped).toHaveLength(1);
+    expect(planned.verdict.noop).toBe(true);
+    expect(planned.effects).toEqual([]);
+  });
+  it.each(['', '(no file)'])('does not auto-block the %j copy of a reviewer or operator not-real', async (file) => {
+    for (const actor of ['reviewer', 'operator']) for (const sourceHead of [head, oldHead]) {
+      const source = record({ h: sourceHead, reviewerResult: actor === 'reviewer' ? 'not-real' : undefined });
+      const target = record({ runId: 'review-pr-copy', file });
+      const h = harness([...thread(source), ...(actor === 'operator' ? [ruling(source)] : []), ...thread(target)]);
+      const planned = h.plan({ finding: target.referrals[0].key });
+      expect(planned.verdict.noop).toBe(true);
+      await h.execute(planned);
+      expect(h.trace).toEqual([]);
+    }
+  });
+  it('only renewed citation changes allow auto-block after an older reviewer not-real (#5399)', async () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real', summary: 'forged-author and quoted-marker controls absent' });
+    const target = record({ runId: 'review-pr-copy', summary: source.referrals[0].finding.summary });
+    const comments = thread(source, target);
+    const unchanged = harness(comments);
+    expect(unchanged.plan().effects).toEqual([]);
+    const changed = new Set([20]); changed.old = new Set([20]);
+    const renewed = harness(comments, { changedLines: () => changed });
+    expect(renewed.plan().verdict.record.rulings).toHaveLength(1);
+    expect(() => harness(comments, { compare: new Error('unavailable') }).plan()).toThrow(/protection.*unknown/i);
+  });
+  it('an old auto-block cannot erase the reviewer not-real that should have prevented it', () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' });
+    const target = record({ runId: 'review-pr-copy' });
+    const h = harness([...thread(source), ruling(source, 'block', { actor: 'auto-policy' }), ...thread(target)]);
+    expect(h.plan().effects).toEqual([]);
+  });
+  it('refuses to auto-block an interrupted historical re-check', () => {
+    const target = record();
+    target.referrals[0].recheck = { status: 'needs re-check on live head', fromHead: oldHead, head };
+    expect(() => harness(thread(target)).plan()).toThrow(/needs re-check on live head/);
+    const ruled = record({ reviewerResult: 'block' });
+    ruled.referrals[0].recheck = target.referrals[0].recheck;
+    expect(harness(thread(ruled)).plan().verdict.record.rulings).toHaveLength(1);
+  });
+  it('a late reviewer not-real stops the writer before any mutation', async () => {
+    const target = record(), h = harness(thread(target));
+    const planned = h.plan();
+    h.comments.push(...thread(record({ runId: 'review-pr-late', reviewerResult: 'not-real' })));
+    await expect(h.execute(planned)).rejects.toThrow(/protection.*changed/i);
+    expect(h.trace).toEqual([]);
   });
   it('skips an operator-backed carried block without implicitly superseding it', () => {
     const source = record({ h: oldHead }), target = record({ runId: 'review-pr-target' });

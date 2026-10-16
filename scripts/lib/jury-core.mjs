@@ -522,6 +522,18 @@ export function sameFindingForClearing(a, b) {
   return CARRY_SEVERITY_FIELDS.every((k) => a[k] === b[k]);
 }
 
+/** Exact key identity with only a missing path erased. Used to REFUSE policy writes, never to clear a gate. */
+export function sameReferralForPolicy(a, b) {
+  if (a.key === b.key) return true;
+  try {
+    const left = JSON.parse(a.key), right = JSON.parse(b.key);
+    const missing = path => path == null || path === '' || path === '(no file)';
+    return left.length === 4 && right.length === 4
+      && (missing(left[1]) || missing(right[1]))
+      && left[0] === right[0] && left[2] === right[2] && left[3] === right[3];
+  } catch { return false; }
+}
+
 // ── #76a FINDING IDENTITY ──────────────────────────────────────────────────────────────────────────────────────
 // ONE identity for "the same finding" across records, re-wordings and heads. Measured on #4017: five wordings of one
 // finding scored 0.05–0.73 word Jaccard, and an unrelated finding scored 0.50 against one of them, so TEXT SIMILARITY
@@ -3260,6 +3272,8 @@ export function validateReferralRecord(r) {
         || JSON.stringify(normalizeFinding(f.original)) !== JSON.stringify(f.finding)
         || f.key !== referralFindingKey(f.seat, f.original) || keys.has(f.key)
         // #76a — optional identity fields; a record without them (every record before #76) stays valid.
+        || (f.recheck !== undefined && (f.recheck?.status !== 'needs re-check on live head'
+          || !/^[a-f0-9]{40}$/.test(f.recheck.fromHead) || f.recheck.fromHead === r.head || f.recheck.head !== r.head))
         || (f.findingId !== undefined && !FINDING_ID_PATTERN.test(f.findingId))
         || (f.sameAs !== undefined && f.sameAs !== FINDING_SAME_AS_NEW && !FINDING_ID_PATTERN.test(f.sameAs))) return false;
       keys.add(f.key);
@@ -3485,7 +3499,7 @@ export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
-    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
+    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${f.recheck && !record.rulings.some(r => r.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${carriedReasonText(c, { operatorRulings })} (${carriedActor(c, { operatorRulings })} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')

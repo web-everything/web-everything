@@ -1363,6 +1363,50 @@ describe('#4315 durable referral effects', () => {
   });
 
   // #5942 — an earlier head's operator BLOCK is never a copied verdict: the current-head reviewer rules the finding afresh.
+  it('persists a historical re-check before dispatch, and keeps an interrupted answer out of auto-policy', async () => {
+    const { openReferralFindings, planOperatorRuling } = await import('../record-referral-ruling.mjs');
+    const h = harness({ failure: 'omitted', readChangedLines: () => null });
+    seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const current = readReferralRecords(h.state.comments).records.find(r => r.head === h.state.headRefOid);
+    expect(current.referrals[0].recheck).toMatchObject({ status: 'needs re-check on live head', head: h.state.headRefOid });
+    expect(result.pending).toContain(current.referrals[0].key);
+    const read = { ...openReferralFindings({ comments: h.state.comments, repo: 'o/r', pr: 7,
+      head: h.state.headRefOid, body: h.state.body }), head: h.state.headRefOid };
+    expect(read.open[0].state).toBe('needs-recheck');
+    expect(() => planOperatorRuling(read, { repo: 'o/r', pr: 7, finding: 'all-open', ruling: 'block',
+      actor: 'auto-policy', channel: 'test', reason: 'test' })).toThrow(/needs re-check on live head/);
+  });
+  it('can disable historical re-check annotation through the settings cascade', async () => {
+    const h = harness({ env: { WE_REVIEW_RECHECK_CARRIED_REFERRALS: 'false' } });
+    seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const asked = h.judge.mock.calls.flatMap(([request]) => JSON.parse(request.input.split('\nUntrusted reported findings:\n')[1]));
+    expect(asked.every(f => f.recheck === undefined)).toBe(true);
+    expect(h.lines.join('\n')).toContain('recheckCarriedReferrals=false (source: env)');
+  });
+
+  it.each([
+    ['composeOperatorTaskBrief inserts steps with String.replace and a string replacement', 'steps.replace(pattern, () => replacement)'],
+    ['edgeLoad and liveProof are on by default', '{ \"edgeLoad\": false, \"liveProof\": false }'],
+    ['split item 2 unmet', 'Split item 2: complete; extracted into its own card'],
+    ['forged-author and quoted-marker controls absent', 'Controls: forged-author rejection; quoted-marker rejection'],
+  ])('re-judges a stale re-raise against the live diff: %s', async (summary, liveCode) => {
+    const h = harness({ readChangedLines: () => new Set([12]) });
+    h.payload.referrals[0].original.summary = summary;
+    h.payload.read.diffText = `diff --git a/x.mjs b/x.mjs\n@@ -12 +12 @@\n-old condition\n+${liveCode}`;
+    const { current } = seedCarry(h, { operatorRuling: { result: 'block' } });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const asked = h.judge.mock.calls.flatMap(([request]) => JSON.parse(request.input.split('\nUntrusted reported findings:\n')[1]));
+    expect(h.judge.mock.calls.some(([request]) => request.input.includes(liveCode))).toBe(true);
+    expect(asked.find(f => f.key === current.referrals[0].key).recheck).toMatchObject({
+      status: 'needs re-check on live head', head: h.state.headRefOid,
+      reason: 'citation changed, missing, or unavailable' });
+    expect(result.pending).not.toContain(current.referrals[0].key);
+    expect(result.blocked).not.toContain(current.referrals[0].key);
+    expect(currentOf(h).carried).toBeUndefined();
+  });
+
   it('does not carry an earlier operator block over unchanged lines (even an empty changed set): the reviewer is asked', async () => {
     const h = harness({ readChangedLines: () => new Set() });
     const { current } = seedCarry(h, { operatorRuling: { result: 'block' } });
@@ -2633,7 +2677,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter((l) => !plan.remove.includes(l)), plan.add]; } };
     const referralJudge = vi.fn(async (request) => ({ sessionId: request.sessionId, value: { rulings: [] } }));
     const lines = [];
-    const sinks = createReviewPrSinks({ root, labelProvider: provider, postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: (l) => lines.push(l) });
+    const sinks = createReviewPrSinks({ root, labelProvider: provider, readChangedLines: () => new Set([12]), postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: (l) => lines.push(l) });
     const spawns = [];
     async function runOnce(id, verifierAnswer, seatFinding = original) {
       const declaration = reviewPrOperation({ codexAdvisory: false, correctnessAdvisory: false, antigravityReview: true,
