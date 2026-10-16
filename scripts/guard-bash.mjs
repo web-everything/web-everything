@@ -2641,6 +2641,7 @@ export function cdLandings(command, cwd, home = process.env.HOME ?? null, { reso
   const bases = [...new Set([cwd].flat().filter((b) => typeof b === 'string' && b))];
   if (!bases.length) bases.push(null);
   const out = new Set();
+  const seenStmts = new Set();
   for (const seg of withNestedCommands(parsed.segments, cmd)) {
     if (out.size >= cap) break;
     const s = String(seg);
@@ -2659,6 +2660,10 @@ export function cdLandings(command, cwd, home = process.env.HOME ?? null, { reso
       else if (/^[-+]/.test(rest)) continue;                               // `-n` / `+N` / `-N`: no new dir
       else stmt = 'cd -- ' + rest;
     }
+    // the nested scan reaches one statement several times (the group body, then its segment); chaining a
+    // relative target onto its own landing would invent `sub/sub/…`
+    if (seenStmts.has(stmt)) continue;
+    seenStmts.add(stmt);
     for (const base of bases.slice()) {
       const target = cdStatementTarget(stmt, { vars, home: h, base, resolvePath });
       if (!target) continue;
