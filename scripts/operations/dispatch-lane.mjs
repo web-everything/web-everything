@@ -1243,6 +1243,9 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // The records this dispatch went PAST. They are still `in-flight` on disk and still need closing out; the
     // verdict says so rather than letting an aged-out guard disappear silently.
     agedOutRuns,
+    // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
+    // card-influenced text can reach. A build only: no other kind composes post-build steps.
+    operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
     prompt: brief.prompt,
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
@@ -1399,6 +1402,8 @@ export function dispatchLaneOperation({ readTick } = {}) {
             // The filled brief, verbatim. It is what the agent is told, so a run record read after a restart
             // says exactly what was dispatched rather than "a brief was filled from a template that has since
             // been edited".
+            // Operator post-build route flag for the sink; pinned end to end in operator-task.test.mjs.
+            operatorPostBuild: read.operatorPostBuild,
             prompt: read.prompt,
             expectedWithinMinutes: read.expectedWithinMinutes,
             // NOT BUILD/PREPARE-SHAPED ONLY (#3332): a `fix`/`ci-heal` payload also needs the PR it repairs —

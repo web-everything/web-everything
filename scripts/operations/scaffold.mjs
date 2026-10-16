@@ -31,6 +31,7 @@
  *
  * PURE. No fs, no clock, no process. `./scaffold-io.mjs` is the only place it touches the world.
  */
+import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS, operatorTaskFields } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -149,6 +150,8 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const name = `${num}-${slug}.md`;
   const content = renderItem({
+    // Only the file-item reader supplies a session role, so a bare scaffold cannot file an operator task.
+    ...operatorTaskFields(input, { role: read.sessionRole }),
     kind,
     size: Number.isFinite(size) ? size : undefined,
     slug,
@@ -187,6 +190,7 @@ export function scaffoldOperation({ readScaffoldContext } = {}) {
   return op(SCAFFOLD_OP, {
     input: {
       title: 'string',
+      ...OPERATOR_TASK_INPUT,
       // The three kind shapes, all optional: `resolveKind` replays the CLI's precedence over them.
       kind: { type: 'string', required: false, default: '' },
       type: { type: 'string', required: false, default: '' },
@@ -213,7 +217,7 @@ export function scaffoldOperation({ readScaffoldContext } = {}) {
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
       fn: (view) => planScaffold(view.findings.read, view.input),
     }),

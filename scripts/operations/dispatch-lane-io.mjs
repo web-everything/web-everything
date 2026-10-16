@@ -2,6 +2,7 @@ import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { composeOperatorTaskBrief, planOperatorPostBuild } from './operator-task-brief.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
 import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -563,6 +564,15 @@ export function readTick({
     });
   }
 
+  // One decision from the card (operatorTask + settings) feeds both the brief and the route flag.
+  const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
+  const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
+  const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
+  // A grouped build runs from the lead's brief alone, so an operator member's post-build steps would be dropped
+  // silently (and an operator lead cannot launch grouped). Refuse the group rather than lose the guarantee.
+  if (groupItems.length && [{ steps: operatorSteps }, ...groupItems.map(member => ({ steps: planOperatorPostBuild(member ?? {}, operatorOptions) }))].some(({ steps }) => steps.length)) {
+    throw new Error('dispatch-lane: an operator task with post-build steps cannot run in a grouped build');
+  }
   return {
     resolvedNum: key,
     admission: tick.decisions?.admission ? {
@@ -581,8 +591,10 @@ export function readTick({
     suppressed: match(decisions.suppressedBuilds),
     dispatchedGuard,
     item,
-    groupItems: parseGroupMembers(groupMembers).map(member => findItem(member, loadItems)),
-    briefTemplate: String(readText(briefPath(root, launchKind))),
+    groupItems,
+    briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+    // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
+    operatorPostBuild: operatorSteps.length > 0,
     nextState,
     statusLine: String(decisions.statusLine || ''),
     notes: Array.isArray(decisions.notes) ? decisions.notes : [],
@@ -1047,6 +1059,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
   if (!it || !it.slug) return null;
   const rawTarget = typeof it.deliveryTarget === 'string' && it.deliveryTarget.trim() ? it.deliveryTarget.trim() : null;
   return {
+    ...Object.fromEntries(['operatorTask', 'edgeClone', 'liveProof', 'report'].filter(k => it[k] !== undefined).map(k => [k, it[k]])),
     num: String(it.num),
     status: it.status ?? null,
     deliveryAgent: it.deliveryAgent ?? null,
@@ -1571,6 +1584,8 @@ export function createDispatchSinks({
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
+          // Operator post-build route flag; pinned by the createDispatchSinks tests in operator-task.test.mjs.
+          operatorPostBuild: payload?.operatorPostBuild === true,
           headRefOid: payload?.headRefOid,
           claimOwner: payload?.claimOwner,
           claimRoot: payload?.claimRoot,
@@ -1785,6 +1800,9 @@ export function routeDispatchProvider(request, {
     if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
     return agent(r);
   };
+  if (kind === 'build' && request.operatorPostBuild) {
+    return launchAgent({ ...request, probationWorker: null, policyRoute: null });
+  }
   // A probation worker's checker runs inside the same detached arc, so its executable is owed before launch too.
   const checkerAvailable = worker => !worker?.checker || providerAvailable(worker.checker, { provider: worker.checker });
   // An operator's reasoned `--model` pin is a Claude pin on every route, policy or inherited.

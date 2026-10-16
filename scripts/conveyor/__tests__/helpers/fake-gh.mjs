@@ -697,14 +697,21 @@ function mergeBaseOf(originPath, base, head) {
   try { return runGit(['merge-base', base, head], originPath).trim(); } catch { return base; }
 }
 
-/** `--json files` shape: `{path, additions, deletions}` (gh's own GraphQL-backed shape — see this file's
- *  header on why this differs from {@link listChangedFilesRest}'s REST shape). */
-export function listChangedFilesNative(originPath, base, head) {
-  const mb = mergeBaseOf(originPath, base, head);
-  const out = runGit(['diff', '--numstat', mb, head], originPath);
-  return out.split('\n').filter(Boolean).map((line) => {
-    const [add, del, path] = line.split('\t');
-    return { path, additions: add === '-' ? 0 : Number(add), deletions: del === '-' ? 0 : Number(del) };
+/** `--json files` shape: `{path, additions, deletions, changeType}`. Disable rename detection so both
+ *  sides of a move remain visible, including a workflow removed by a rename. */
+export function listChangedFilesNative(originPath, base, head, { run = runGit } = {}) {
+  let mb;
+  try { mb = run(['merge-base', base, head], originPath).trim(); } catch { mb = base; }
+  const statusRows = run(['diff', '--name-status', '--no-renames', '-z', mb, head], originPath).split('\0');
+  const types = new Map();
+  for (let i = 0; i + 1 < statusRows.length; i += 2) {
+    types.set(statusRows[i + 1], { A: 'ADDED', M: 'MODIFIED', D: 'DELETED', T: 'MODIFIED' }[statusRows[i]]);
+  }
+  const out = run(['diff', '--numstat', '--no-renames', '-z', mb, head], originPath);
+  return out.split('\0').filter(Boolean).map((line) => {
+    const [, add, del, path] = line.match(/^([^\t]+)\t([^\t]+)\t([\s\S]*)$/);
+    return { path, additions: add === '-' ? 0 : Number(add), deletions: del === '-' ? 0 : Number(del),
+      changeType: types.get(path) };
   });
 }
 

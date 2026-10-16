@@ -93,7 +93,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     // this planner sees (`dispatch-plan.mjs` holds it `needs-prepare` before it ever reaches `spawnBuilds`), so
     // this row is DOCUMENTATION PARITY (every operator rule visible here, per this file's own header) — no
     // logic in this planner changes for it.
-    { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is never built — held for a prepare pass first', enforcedBy: 'readiness/dispatch-plan.mjs' },
+    { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is held for prepare; complete operatorTask briefs may be validated and stamped at filing under build.operatorTask.enabled, without bypassing readiness holds', enforcedBy: 'readiness/dispatch-plan.mjs' },
     { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (highest delivery class first, preserving classified queue order) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
     { id: 'prepare-stale', text: 'a stamp older than preparedMaxAgeDays, or whose scope files changed since preparedAgainstSha, is re-prepared before build', enforcedBy: 'readiness/dispatch-plan.mjs' },
   ]),
