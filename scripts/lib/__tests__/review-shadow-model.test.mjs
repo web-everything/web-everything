@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { resolveShadowSeatModel, SHADOW_AGY_MODEL_ENV } from '../review-seat-settings.mjs';
-import { settingsFromRoutingPolicy, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
+import { resolveReviewSeatSafeguards, resolveShadowSeatModel, SHADOW_AGY_MODEL_ENV } from '../review-seat-settings.mjs';
+import { settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement } from '../review-shadow-agreement.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
@@ -58,7 +58,7 @@ describe('shadow directives', () => {
   });
   it('logs the cascade once per distinct message', () => {
     const logs = [];
-    const options = { policy: DEFAULT_ROUTING_POLICY, shadowModel: { value: 'unique-trial-model', source: 'env' }, log: (m) => logs.push(m) };
+    const options = { safeguards: { value: { shadowEnabled: true, sampleRate: 0.1, minNonClaudeSeats: 1 } }, policy: DEFAULT_ROUTING_POLICY, shadowModel: { value: 'unique-trial-model', source: 'env' }, log: (m) => logs.push(m) };
     loadReviewSeatSettings(options); loadReviewSeatSettings(options);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('env WE_REVIEW_SHADOW_AGY_MODEL');
@@ -66,7 +66,7 @@ describe('shadow directives', () => {
   });
   it('sanitizes the selection log through the shared log boundary', () => {
     const logs = [];
-    loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY,
+    loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: true, sampleRate: 0.1, minNonClaudeSeats: 1 } }, policy: DEFAULT_ROUTING_POLICY,
       shadowModel: { value: 'unique\nmodel\u001b\u200b', source: 'env' }, log: (message) => logs.push(message) });
     expect(logs).toHaveLength(1);
     expect(logs[0]).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
@@ -126,5 +126,49 @@ describe('shadow rows', () => {
     expect(row.agyFindings[0]).toEqual({ path: finding.file, line: 12, defectClass: 'fail-open', severity: 'blocker', matched: true });
     expect(JSON.stringify(row)).not.toMatch(/private finding text|secret|"claim"|"summary"|"message"/);
     expect(row.fallbackFrom.reasons).toEqual(Array(3).fill('x'.repeat(300)));
+  });
+});
+
+describe('shadow operational safeguards', () => {
+  const resolve = (options = {}) => resolveReviewSeatSafeguards({ env: {}, platform: {}, readFile: () => '{}', log: () => {}, ...options });
+  it('defaults off and logs each source through all four cascade layers', () => {
+    const logs = [];
+    expect(resolve().value).toEqual({ shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1, minNonClaudeSeats: 1 });
+    const result = resolve({ platform: { shadowSeats: { antigravity: { enabled: true, sampleRate: 0.2 } }, minNonClaudeSeats: 2 },
+      readFile: () => JSON.stringify({ shadowSeats: { antigravity: { enabled: false } } }),
+      env: { WE_REVIEW_MIN_NON_CLAUDE_SEATS: '3' }, log: m => logs.push(m) });
+    expect(result.sources).toEqual({ shadowEnabled: 'tool', sampleRate: 'platform', scope: 'standard', dailyCap: 'standard', minNonClaudeSeats: 'env' });
+    expect(logs.join(' ')).toContain('shadowEnabled=false (tool)');
+    expect(logs.join(' ')).toContain('sampleRate=0.2 (platform)');
+    expect(logs.join(' ')).toContain('minNonClaudeSeats=3 (env)');
+  });
+  it('refuses 100% and invalid minima with a logged warning', () => {
+    const logs = [];
+    const result = resolve({ env: { WE_REVIEW_SHADOW_AGY_SAMPLE_RATE: '1', WE_REVIEW_MIN_NON_CLAUDE_SEATS: '0' }, log: m => logs.push(m) });
+    expect(result.value.sampleRate).toBe(0.1);
+    expect(result.value.minNonClaudeSeats).toBe(1);
+    expect(logs.join(' ')).toContain('ignored invalid: env.sampleRate=1');
+  });
+  it('disabled settings produce no shadow directive on either lens (no agy launch)', () => {
+    const settings = loadReviewSeatSettings({ safeguards: resolve(), log: () => {} });
+    for (const lens of ['correctness', 'security']) {
+      expect(seatProviderDirective(settings, lens, { repo: 'o/r', pr: 7 })).toBeNull();
+      expect(shadowSeatStatus(settings, { repo: 'o/r', pr: 7 })).toBe('off (setting)');
+    }
+  });
+  it('samples a stable subset by repo#pr, shares selection across lenses, and refuses missing identity', () => {
+    const settings = loadReviewSeatSettings({ safeguards: resolve({ env: { WE_REVIEW_SHADOW_AGY_ENABLED: 'true', WE_REVIEW_SHADOW_AGY_SCOPE: 'sampled' } }), log: () => {} });
+    const sample = () => Array.from({ length: 1000 }, (_, i) => {
+      const context = { repo: 'o/r', pr: i + 1 };
+      const first = seatProviderDirective(settings, 'correctness', context);
+      expect(Boolean(seatProviderDirective(settings, 'security', context))).toBe(Boolean(first));
+      return Boolean(first);
+    });
+    const first = sample();
+    expect(sample()).toEqual(first);
+    expect(first.filter(Boolean).length).toBeGreaterThan(20);
+    expect(first.filter(Boolean).length).toBeLessThan(200);
+    expect(seatProviderDirective(settings, 'correctness')).toBeNull();
+    expect(shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate: 1 } }, { repo: 'o/r', pr: 1 })).toBe('off (invalid sample rate)');
   });
 });
