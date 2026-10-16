@@ -5,6 +5,7 @@ size: 5
 parent: "5767"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-clone-lock.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/number-pending-hashes-before-push.mjs", "we:scripts/__tests__/merge-ai-prs-lock-refusal.test.mjs", "we:scripts/__tests__/merge-ai-prs-ci-lifecycle-and-land-effects.test.mjs", "we:scripts/readiness/__tests__/drain-lock.test.mjs", "we:scripts/lib/__tests__/daemon-self-sync.test.mjs", "we:scripts/lib/__tests__/daemon-clone-lock.test.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/lib/__tests__/number-pending-hashes-before-push.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/push-if-green-numbers-pending-hashes.test.mjs"]
+scopeRationale: "The former monolithic we:scripts/__tests__/merge-ai-prs.test.mjs now covers resolution-basis behavior. Lock-refusal regressions belong in the planned we:scripts/__tests__/merge-ai-prs-lock-refusal.test.mjs, and synchronization regressions belong in we:scripts/__tests__/merge-ai-prs-ci-lifecycle-and-land-effects.test.mjs; both are explicitly scoped instead of the historical sibling test."
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-16"
 preparedAgainstSha: "46b9880e86929783bfd477c59f33188b4f4f9913"
