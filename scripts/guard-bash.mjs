@@ -2487,28 +2487,43 @@ function expandCdTarget(rest, home) {
   return out || null;
 }
 
-// PR #5403 review r5 — could this statement rebind HOME? Deliberately over-inclusive, because a wrong YES only
-// leaves a home spelling unresolved (main's behaviour) while a wrong NO steers the `cd` somewhere bash does not
-// go. Which shell (parent, subshell, pipeline, background job, branch not taken) an assignment runs in is
-// never modelled — that is exactly where text counting gets it wrong. Read after quote removal, so a split
-// name (`HO""ME`, `HO\ME`, `$'HO'ME`) is still the name HOME. YES for: any bare `HOME` word (an assignment, a
-// `read`/`declare`/`unset`/`printf -v`/`for` operand, a nameref target, an `eval` string, a function body);
-// `eval`/`source`/`.` at command position (code the text cannot see); and a statement that builds words at
-// run time (`$`, backtick, brace or glob) where a binding builtin, or a run-time command name, could turn
-// them into the name HOME (`export "${x}ME=/tmp"`, `export {HO,}ME=/tmp`, `$c …`). Reads (`$HOME`, `${HOME}`)
-// are not rebindings.
+// PR #5403 review r5 — could anything in this command rebind HOME? Deliberately over-inclusive, because a wrong
+// YES only leaves a home spelling unresolved (main's behaviour) while a wrong NO steers the `cd` somewhere bash
+// does not go. Which shell (parent, subshell, pipeline, background job, branch not taken) a statement runs in,
+// and whether it runs before the `cd` (a function body, a loop), is never modelled — that is exactly where text
+// counting gets it wrong — so the WHOLE command is read, in any order. Read after quote removal, so a split
+// name (`HO""ME`, `HO\ME`, `$'HO'ME`, `-vHOME`) is still HOME. YES for:
+//   • any `HOME` text other than a plain read (`$HOME`, `${HOME}`) — an assignment, an option or operand
+//     (`printf -vHOME`, `read`, `unset`, `for`), a nameref target, an `eval` string, `${HOME:=…}`;
+//   • a `$'…'` run with a backslash escape (`$'\x48OME'` spells HOME with no `HOME` text);
+//   • `eval`/`source`/`.`, or a run-time command name (`$c …`), at command position — code the text cannot see;
+//   • a run-time-built word (`$`, backtick, brace, glob) in arithmetic (`((`, `[[`, `[` subscript, `let`),
+//     which assigns (`$(( ${x}ME=1 ))`);
+//   • a run-time-built word anywhere in a command that also uses a binding builtin anywhere
+//     (`export "${x}ME=/tmp"`, `export {HO,}ME=/tmp`, `declare -i n; n=${x}ME=1`).
 const HOME_BINDERS = new Set(['declare', 'typeset', 'export', 'local', 'readonly', 'read', 'printf', 'mapfile',
-  'readarray', 'unset', 'let', 'getopts', 'trap', 'builtin', 'command', 'exec', 'coproc', 'for', 'select']);
+  'readarray', 'unset', 'let', 'getopts', 'trap', 'builtin', 'command', 'exec', 'coproc', 'for', 'select',
+  'alias', 'shopt', 'enable', 'eval', 'source', '.']);
 const COMMAND_PREFIXES = new Set(['time', '!', 'command', 'builtin', 'then', 'do', 'else', 'elif', 'if',
   'while', 'until', 'coproc', 'exec', '{', '(', '((']);
-function mayRebindHome(segment) {
-  const t = segment.replace(/\$(?=['"])/g, '').replace(/["'\\]/g, '');
-  if (/(?:^|[^\w$])HOME(?!\w)/.test(t.replace(/\$\{HOME/g, ''))) return true;
-  const words = t.split(/[\s;(){}]+/).filter(Boolean);
-  const cmd = words.find((w) => !COMMAND_PREFIXES.has(w) && !/^[A-Za-z_]\w*\+?=/.test(w));
-  if (cmd === 'eval' || cmd === 'source' || cmd === '.') return true;
-  if (!/[`$*?[{]/.test(t.replace(/\$\{HOME\}|\$HOME(?!\w)/g, ''))) return false;
-  return words.some((w) => HOME_BINDERS.has(w)) || /[`$]/.test(cmd ?? '');
+function homeMayBeRebound(segments) {
+  let dynamic = false;
+  let binder = false;
+  for (const raw of segments) {
+    if (/\$'[^']*\\/.test(raw)) return true;
+    const t = raw.replace(/\$(?=['"])/g, '').replace(/["'\\]/g, '');
+    const rest = t.replace(/\$\{HOME\}|\$HOME(?!\w)/g, '');
+    if (rest.includes('HOME')) return true;
+    const words = t.split(/[\s;(){}]+/).filter(Boolean);
+    const cmd = words.find((w) => !COMMAND_PREFIXES.has(w) && !/^[A-Za-z_]\w*\+?=/.test(w));
+    if (cmd === 'eval' || cmd === 'source' || cmd === '.' || /[`$]/.test(cmd ?? '')) return true;
+    const built = /[`$*?[{]/.test(rest);
+    if (/[`$]/.test(rest) && /\(\(|\[|\blet\b/.test(rest)) return true;
+    dynamic ||= built;
+    binder ||= words.some((w) => HOME_BINDERS.has(w));
+    if (dynamic && binder) return true;
+  }
+  return false;
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -2544,15 +2559,13 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
-  // HOME is the hook's own HOME until a statement before the `cd` might rebind it (`mayRebindHome`); from
-  // then on it is unknown and a home spelling stays unresolved. No new HOME value is ever adopted.
-  let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
+  // HOME is the hook's own HOME unless anything in the command might rebind it (`homeMayBeRebound`); then it
+  // is unknown and a home spelling stays unresolved. No new HOME value is ever adopted.
+  const currentHome = typeof home === 'string' && home.startsWith('/') && !homeMayBeRebound(parsed.segments)
+    ? home : null;
   for (const stmt of parsed.segments) {
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
-    if (!cd) {
-      if (currentHome && mayRebindHome(stmt)) currentHome = null;
-      continue;
-    }
+    if (!cd) continue;
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {

@@ -562,18 +562,26 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       // a split or run-time-built name is still HOME
       'export HO""ME=/tmp', "export HO''ME=/tmp", 'declare HO\\ME=/tmp', "export $'HO'ME=/tmp",
       'printf -v HO""ME /tmp', 'x=HO; export "${x}ME=/tmp"', 'export {HO,}ME=/tmp', 'c=export; $c "${x}ME=/tmp"',
-      '"eval" "HO""ME=/tmp"', 'command eval "$X"',
+      '"eval" "HO""ME=/tmp"', 'command eval "$X"', 'printf -vHOME /tmp', 'read -aHOME <<< /tmp',
+      ': ${HOME:=/tmp}',
+      // ANSI-C escapes spell HOME (or eval) with no HOME text
+      "export $'\\x48OME'=/tmp", "declare $'\\110OME=/tmp'", "$'\\x65val' $'\\x48OME=/tmp'",
+      // arithmetic assigns a run-time-built name
+      'x=HO; echo $(( ${x}ME=1 ))', 'x=HO; [[ ${x}ME=7 -eq 7 ]]', 'x=HO; a=(1); : ${a[${x}ME=3]}',
+      'v=HO; v+=ME=7; [[ $v -eq 7 ]]', 'declare -i n; x=HO; n=${x}ME=1',
       // code the text cannot see
       'eval "$X"', 'source ./env.sh', '. ./env.sh',
     ]) expect(at(`${pre}; cd ~/clone`), pre).toBe(REPORTED);
     expect(at('# note (see x\nHOME=/tmp\ncd ~/clone')).toBe(REPORTED);
     expect(at('( true; HOME=/w; cd ~/clone )')).toBe(REPORTED);
+    // a rebinding written AFTER the cd can still run before it (a function body, a loop's second pass)
+    expect(at('f() {\ncd ~/clone\n}\nHOME=/tmp\nf')).toBe(REPORTED);
+    expect(at('cd ~/clone; HOME=/other')).toBe(REPORTED);
   });
   it('reads of HOME and unrelated statements keep the hook HOME', () => {
     expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('X=/a; echo "$X"; ls . "$X"; git -C "$X" status; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
-    expect(at('cd ~/HOME && ls')).toBe(`${HOME}/HOME`);
+    expect(at('X=/a; echo "$X"; ls "$X"; git -C "$X" status; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('cd ~/clone && git status')).toBe(`${HOME}/clone`);
   });
   it('pins main for the literal-variable subshell shape (the review r5 finding)', () => {
     expect(at('D=/p; ( D=/tmp; true ); cd "$D"')).toBe('/p');
