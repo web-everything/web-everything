@@ -2451,7 +2451,8 @@ function expandCdTarget(rest, home) {
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if ((ch === '<' || ch === '>') && s[i + 1] === '(') return null;      // a process substitution's path
-    if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
+    if (/[ \t\n]/.test(ch) || ch === '<' || ch === '>') break;             // first argument only
+    if (/\s/.test(ch)) return null;                  // bash keeps CR / NBSP / Unicode spaces IN the word
     if (ch === "'") {                                                      // single quotes: all literal
       const close = s.indexOf("'", i + 1);
       if (close < 0) return null;
@@ -2507,26 +2508,34 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   if (!cmd) return reportedCwd;
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
+  // bash splits words on space, tab and newline only; trim() and \s also drop CR, NBSP and other Unicode
+  // spaces, which bash keeps inside the word (` cd` is no cd, `D=~/x\r` keeps the CR).
+  const oddSpace = (s) => /[^\S \t\n]/.test(s);
   // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable).
   const initialHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   const homeAfter = (stmt, h) => {
     const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
     if (!assignment) return h;
-    const value = expandCdTarget(assignment[1].trim(), h);
+    const value = oddSpace(stmt) ? null : expandCdTarget(assignment[1].trim(), h);
     return value?.startsWith('/') ? value : null;
   };
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
+  const lastAt = Object.create(null);                         // statement index of each name's last assignment
+  const homeVars = new Set();                                 // names whose value came from a home expansion
   let assignHome = initialHome;
-  for (const stmt of parsed.segments) {
+  parsed.segments.forEach((stmt, at) => {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m) {
       let val = m[2].trim();
-      if (val.startsWith('~')) {
-        // #5957 — bash expands an unquoted leading `~` in an assignment value (`D=~/clone`). Only `~` / `~/…`
-        // against a known home resolve; `~user`, a later `:~` or an unknown home leaves the variable unknown.
-        const expanded = /^~(?:\/|$)/.test(val) && !/\s|:~/.test(val) ? expandCdTarget(val, assignHome) : null;
-        if (expanded) vars[m[1]] = expanded;
+      lastAt[m[1]] = at;
+      homeVars.delete(m[1]);
+      if (val.startsWith('~') || /\$(?:HOME(?!\w)|\{HOME\})/.test(val)) {
+        // #5957 — bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value
+        // (`D=~/clone`, `D="$HOME/clone"`), against the home known at that statement. Anything it cannot
+        // expand exactly (`~user`, a `:~`, another variable, whitespace, an unknown home) leaves it unknown.
+        const expanded = oddSpace(stmt) || /\s|:~|[<>]/.test(val) ? null : expandCdTarget(val, assignHome);
+        if (expanded && !/\s/.test(expanded)) { vars[m[1]] = expanded; homeVars.add(m[1]); }
         else delete vars[m[1]];
       } else if (!/[`$(]/.test(val)) {                        // command-subst / nested expansion → skip
         val = val.replace(/^(['"])(.*)\1$/, '$2');            // strip matching surrounding quotes
@@ -2534,27 +2543,35 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       }
     }
     assignHome = homeAfter(stmt, assignHome);
-  }
+  });
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
   let currentHome = initialHome;
-  for (const stmt of parsed.segments) {
+  for (const [at, stmt] of parsed.segments.entries()) {
     currentHome = homeAfter(stmt, currentHome);
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
+    const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
-      // bash keeps CR / NBSP / other Unicode spaces IN the word (and ` cd` is no cd), but trim() drops them
-      if (/[^\S \t\n]/.test(stmt)) return reportedCwd;
-      const target = expandCdTarget(raw, currentHome);
+      if (!bashCd) return reportedCwd;
+      const target = expandCdTarget(bashCd[1], currentHome);
       if (target) return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
-      // never answer less than main: a whole-target `$HOME` still resolves through the literal-variable map
-      if (!/^"?\$(?:HOME|\{HOME\})"?(?:\s|$)/.test(raw) || vars.HOME === undefined) return reportedCwd;
+      // never answer less than main: with HOME unknown, a whole-target `$HOME` still resolves through the
+      // literal-variable map as it did there
+      if (currentHome !== null || !/^"?\$(?:HOME|\{HOME\})"?(?:\s|$)/.test(raw) || vars.HOME === undefined) {
+        return reportedCwd;
+      }
     }
     const word = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
-    const quoted = /^(['"]).*\1$/.test(word);
+    const homeVar = word.match(/^"?\$\{?([A-Za-z_]\w*)\}?"?$/)?.[1];
+    if (homeVar && homeVars.has(homeVar)) {
+      // a home-expanded value only counts when it was assigned before this cd, in a word bash reads as one
+      if (lastAt[homeVar] > at || !bashCd || oddSpace(bashCd[1].match(/^[^ \t\n]*/)[0])) return reportedCwd;
+    }
+    const quoted = /^'[^']*'$|^"[^"]*"$/.test(word);          // one quoted run, nothing glued on
     let target = word.replace(/^(['"])(.*)\1$/, '$2');        // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
     if (v) target = vars[v[1]] ?? '';

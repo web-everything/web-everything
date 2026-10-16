@@ -571,6 +571,35 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('D=~/clone; cd "$D" && ls', null)).toBe(REPORTED);
     expect(at('D=/a; D=~someone/x; cd "$D" && ls')).toBe(REPORTED);
   });
+  it('$HOME / ${HOME} inside a literal assignment value is expanded the same way', () => {
+    expect(at('D="$HOME/clone"; cd "$D" && ls')).toBe(`${HOME}/clone`);
+    expect(at('D=$HOME/clone; cd $D && ls')).toBe(`${HOME}/clone`);
+    expect(at('D=${HOME}/clone; cd "${D}" && ls')).toBe(`${HOME}/clone`);
+    expect(at('HOME=/other; D="$HOME/clone"; cd "$D" && ls')).toBe('/other/clone');
+    expect(at("D='$HOME/clone'; cd \"$D\" && ls")).toBe(REPORTED);
+    expect(at('D=/a; D=$HOME$X; cd "$D" && ls')).toBe(REPORTED);
+    expect(at('D="$HOME/a b"; cd "$D" && ls')).toBe(REPORTED);
+    expect(at('D="$HOME/clone"; cd "$D" && ls', SPACED)).toBe(REPORTED);
+  });
+  it('a home-expanded variable counts only when assigned before the cd', () => {
+    expect(at('cd "$D" && ls; D=~/clone')).toBe(REPORTED);
+    expect(at('cd "$D" && ls\nexport D="$HOME/clone"')).toBe(REPORTED);
+    expect(at('D=~/a; cd "$D" && ls; D=~/b')).toBe(REPORTED);
+  });
+  it('a home-expanded variable never loses a character bash keeps (CR, NBSP, other Unicode spaces)', () => {
+    for (const ch of ['\r', ' ', ' ', '　', '﻿']) {
+      expect(at(`D=~/clone${ch}; cd "$D" && ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`D=~/clone;${ch}cd "$D" && ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`D=~/clone; cd "$D"${ch} && ls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`D=~/clone; cd $D${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
+      expect(at(`HOME=/other${ch}; cd ~/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);
+    }
+  });
+  it('a Unicode space after the home cd word (a later word or a comment) does not unresolve it', () => {
+    expect(at('HOME=/other; cd $HOME # a b\nls')).toBe('/other');
+    expect(at('cd "$HOME"  && ls')).toBe(HOME);
+    expect(at('cd "$HOME/a b" && ls')).toBe(`${HOME}/a b`);
+  });
   it('a home target never loses a character bash keeps in the word (CR, NBSP, other Unicode spaces)', () => {
     for (const ch of ['\r', ' ', ' ', '　']) {
       expect(at(`cd ~/clone${ch}x && ls`), JSON.stringify(ch)).toBe(REPORTED);
@@ -594,6 +623,8 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at("cd '/other/[c]lone' && ls")).toBe('/other/[c]lone');
     expect(at('D=/other/[c]lone; cd "$D" && ls')).toBe('/other/[c]lone');
     expect(at('D=/other/[c]lone; cd $D && ls')).toBe(REPORTED);
+    // two quoted runs glued around an unquoted `[` are not one quoted word
+    expect(at('cd "/other/x"[e]"y" && ls')).toBe(REPORTED);
   });
   it('heredoc body text never steers the resolution', () => {
     const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
@@ -3608,6 +3639,7 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
       ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
       ['tilde-in-variable', 'D=~/some-new-daemon-clone; cd "$D" && git checkout --detach'],
+      ['$HOME-in-variable', 'D="$HOME/some-new-daemon-clone"; cd "$D" && git checkout --detach'],
     ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
