@@ -22,15 +22,9 @@ import { runRecordVerdictSelfSufficient } from '../record-verdict-cli.mjs';
 import { recordVerdictOperation, STAGE_REQUEST_EFFECT } from '../record-verdict.mjs';
 import { validateRequest, APPLIABLE_TARGETS } from '../../apply-review-request.mjs';
 
-// #3383 — PIN the advisory-seat default for this whole file. `reviewPrOperation({readPr})` below (no
-// `codexAdvisory` passed) always seats the seat's hardcoded `false` default; `record-verdict-io.mjs`'s own
-// registration (which `advanceReviewPrToWriteUp`/`runRecordVerdictSelfSufficient` drive) instead calls
-// `codexAdvisoryFromEnv()`, which now defaults to the LIVE `{provider:'codex', model:CODEX_MODEL}` probation
-// status when the env var is unset. Two runs of the SAME operation started/resumed with different seat
-// counts throw ("the declaration changed under a suspended run") — a REAL cross-registration invariant
-// (`codexAdvisoryFromEnv`'s own header), not a bug in either half. This suite is not testing the advisory
-// seat at all, so it pins the env explicitly to keep both halves in agreement regardless of the registry's
-// live contents (today or after a future probation/graduation change).
+// Pin optional-seat requests independently of live probation defaults. Historical runs below use a zero
+// declaration minimum so the saved two-seat roster remains representable; production resumes preserve
+// that saved roster even though new reviews now require a non-Claude advisory seat.
 process.env.REVIEW_PR_CODEX_ADVISORY = '0';
 // #x8n4crp — the fourth seat's own env var needs the identical pin, for the identical reason.
 process.env.REVIEW_PR_CODEX_CORRECTNESS_ADVISORY = '0';
@@ -68,7 +62,7 @@ function stubReader({ labels = ['review:pending'] } = {}) {
  */
 async function runAtConfirm({ id = 'run-3540', labels = ['review:pending'], codexAdvisory = false } = {}) {
   const registry = createRegistry();
-  registry.register(reviewPrOperation({ readPr: stubReader({ labels }), codexAdvisory }));
+  registry.register(reviewPrOperation({ readPr: stubReader({ labels }), codexAdvisory, minNonClaudeSeats: 0 }));
   const store = createMemoryRunStore();
   let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id, input: BASE_INPUT, registry }), { registry });
   for (;;) {

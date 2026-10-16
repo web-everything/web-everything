@@ -144,11 +144,12 @@ function idMinter() {
 }
 
 /** Build the two declarations and a `resolve`/`names` pair over them — the adapter's whole per-repo wiring. */
-function wiring({ readerOptions, sinks: given = {}, board = BOARD } = {}) {
+function wiring({ readerOptions, sinks: given = {}, board = BOARD, reviewOptions = { minNonClaudeSeats: 0 } } = {}) {
   // E2: every review-pr run ends at the additive ledger-events step; a no-op sink keeps these runs complete.
   const sinks = types.isProxy(given) ? given : { [REVIEW_EFFECTS.LEDGER_EVENTS]: async () => ({ written: [], missed: [] }), ...given };
   const table = {
-    [REVIEW_PR_OP]: () => ({ declaration: reviewPrOperation({ readPr: stubReader(readerOptions) }), sinks }),
+    // Historical route/driver assertions use two seats; pass reviewOptions: {} to exercise production defaults.
+    [REVIEW_PR_OP]: () => ({ declaration: reviewPrOperation({ readPr: stubReader(readerOptions), ...reviewOptions }), sinks }),
     [SUGGEST_NEXT_OP]: () => ({
       declaration: suggestNextOperation({
         loadBoard: () => ({ items: board }),
@@ -172,7 +173,7 @@ function wiring({ readerOptions, sinks: given = {}, board = BOARD } = {}) {
 /** A canned juror, so `awaiting-judge` resolves without a spawn. */
 const stubJudge = async () => judgeOutcome({ summary: 'nothing blocking', findings: [] }, { costUsd: 0.01, wallMs: 10 });
 
-const REVIEW_PR_DECL = () => reviewPrOperation({ readPr: stubReader() });
+const REVIEW_PR_DECL = () => reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
 const SUGGEST_DECL = () => suggestNextOperation({ loadBoard: () => ({ items: BOARD }) });
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -636,6 +637,22 @@ describe('errors come from the generated validation', () => {
 // ── 4. genericity: the same adapter drives review-pr, executing nothing ─────────────────────────────────────
 
 describe('genericity — the adapter knows nothing about either operation', () => {
+  it('drives the default non-Claude advisory seat and verifier through the same HTTP adapter', async () => {
+    const store = createMemoryRunStore();
+    const deps = { ...wiring({ reviewOptions: {} }), store, judge: stubJudge, newRunId: idMinter() };
+    const started = await handleOperationRequest(
+      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 7, repo: 'a/b' } }, deps,
+    );
+    expect(started.status).toBe(201);
+    expect(started.body.stopped).toBe('confirm');
+    expect(started.body.spend.jurors).toBe(4);
+    const run = store.read(started.body.runId);
+    expect(run.findings.judgeAdvisory).toEqual({ summary: 'nothing blocking', findings: [] });
+    expect(run.findings.reduce.nonClaudeSeats).toBe(1);
+    expect(run.findings.reduce.nonClaudeSeatShortfall).toBeNull();
+    expect(run.effects).toEqual([]);
+  });
+
   it('drives review-pr to its `confirm` suspend over HTTP and applies no effect', async () => {
     const store = createMemoryRunStore();
     const applied = [];
