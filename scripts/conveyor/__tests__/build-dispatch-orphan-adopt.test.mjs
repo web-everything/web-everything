@@ -20,7 +20,7 @@ import {
 
 // The real pass reads GitHub and the harness job records by default; these tests inject everything else, so the
 // two new evidence reads default to "nothing found" and each xykwe0h test overrides them explicitly.
-const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, releaseLaneLease: () => {}, ...o });
+const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, clearFailure: () => {}, releaseLaneLease: () => {}, ...o });
 import {
   acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim,
   markBuildDispatchResume, readBuildDispatchResume, releaseBuildDispatchResume,
@@ -1009,5 +1009,23 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
       recordFailure: (o) => failures.push(o),
     }));
     expect(failures).toEqual([]);
+  });
+  it.each(['pr-open', 'pr-merged', 'card-resolved'])('clears the card\'s failure history on observed delivery (%s), before releasing the claim', async (outcome) => {
+    const order = [];
+    const result = await adoptOrphanedBuildClaims(dead('4413', {
+      readDelivery: () => ({ outcome, reason: outcome }), settleDelivered: () => {},
+      clearFailure: (o) => order.push(['clear', o.num]), releaseClaim: (o) => order.push(['release', o.num]),
+    }));
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
+    expect(order).toEqual([['clear', '4413'], ['release', '4413']]);
+  });
+  it('keeps #4413 claimed when clearing its failure history fails, so a later pass retries the clear', async () => {
+    const releaseClaim = vi.fn();
+    const result = await adoptOrphanedBuildClaims(dead('4413', {
+      readDelivery: () => ({ outcome: 'pr-open', reason: 'PR #9001 is open' }), settleDelivered: () => {},
+      clearFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim,
+    }));
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
   });
 });

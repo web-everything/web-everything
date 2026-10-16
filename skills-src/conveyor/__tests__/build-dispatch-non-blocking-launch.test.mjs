@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
+import { adoptOrphanedBuildClaims } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
 
 const scope = ['plateau-app:src/a.ts'];
 const tickOut = () => ({
@@ -162,5 +163,38 @@ it.each([true, false])('retains #4413 retry history across launch confirmation a
     clock = 1000000;
     await tick();
     expect(dispatch).toHaveBeenCalledTimes(2);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+// Red-team (PR #5453): orphan adoption can release a delivered claim BEFORE the claim-retire loop, so the
+// observed-delivery clear must live on that path too, or the next failure after the PR closes exhausts the card.
+it('clears #4413 retry history when orphan adoption observes the dead worker\'s PR first', async () => {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-4413-adopt-'));
+  const path = join(lockRoot, 'failures.json');
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+  const failure = () => recordBuildFailure({ num: '4413', reason: 'build-not-started: orphan-released' }, { path, now: 0, settings });
+  const pr = { number: 9001, headRefName: 'lane/4413-fix' };
+  try {
+    failure(); failure();
+    acquireBuildDispatchClaim({ num: '4413', scope, owner: 'h:1', pid: 98761, lockRoot });
+    const out = tickOut();
+    out.decisions.spawnBuilds = [];
+    const r = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      planTick: () => out,
+      fetchOpenPrs: () => [{ repo: 'we', prs: [pr] }],
+      clearBuildFailure: ({ num }) => clearBuildFailure(num, { path }),
+      adoptOrphans: () => adoptOrphanedBuildClaims({
+        listClaims: () => listBuildDispatchClaims({ lockRoot }),
+        isPidAlive: () => false, findRow: () => null, readResumeMarker: () => null, sessionLivenessFor: () => null,
+        readDelivery: () => ({ outcome: 'pr-open', pr: 9001, reason: 'PR #9001 is open' }), settleDelivered: () => {},
+        releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }), releaseResumeMarker: () => {},
+        clearFailure: ({ num }) => clearBuildFailure(num, { path }),
+      }),
+    }) });
+    expect(r.orphanAdoption).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
+    expect(listBuildDispatchClaims({ lockRoot })).toEqual([]);
+    expect(listBuildBackoffs({ path, now: 0 })).toEqual([]);
+    // The PR then closes unmerged and the next dispatch fails: a fresh first attempt, not an exhausted card.
+    expect(failure()).toMatchObject({ attempts: 1, exhausted: false });
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });

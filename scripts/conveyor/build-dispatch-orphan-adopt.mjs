@@ -77,7 +77,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { readGit } from '../lib/proc-read.mjs';
 import { readBuildDelivery } from './build-delivery-evidence.mjs';
-import { recordBuildFailure } from './build-dispatch-failures.mjs';
+import { recordBuildFailure, clearBuildFailure } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
@@ -528,6 +528,9 @@ export async function adoptOrphanedBuildClaims({
   // does not relaunch it at once (14 of 25 launches on 2026-10-07 repeated a card), and hand back a lane lease the
   // dispatch reserved for a worker that never used it. Both best-effort.
   recordFailure = (o) => recordBuildFailure(o),
+  // Observed delivery clears the card's retry history. This pass releases a delivered claim before the daemon's
+  // claim-retire loop (its other clear site) can see it, so it must clear here too (PR #5453 red team).
+  clearFailure = ({ num }) => clearBuildFailure(num),
   releaseLaneLease = (o) => releaseReservedLaneLease(o),
 } = {}) {
   let runsCache = null;
@@ -565,6 +568,8 @@ export async function adoptOrphanedBuildClaims({
       // card is resolved) settles as that real outcome. It is neither resumed nor called `orphan-released`.
       const delivery = readDelivery(num);
       if (delivery?.outcome) {
+        // Clear BEFORE release: if the write throws, the claim stays and the next pass retries the clear.
+        clearFailure({ num });
         releaseClaim({ num });
         clearMarker(num);
         settleDelivered({ runId: liveness.row?.runId, key: liveness.row?.entry?.key, delivery });
