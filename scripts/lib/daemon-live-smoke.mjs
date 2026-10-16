@@ -790,7 +790,7 @@ export const SMOKE_CHECKS = Object.freeze([
   // The row itself is `DAEMON_BOOT_SMOKE_CHECK` — imported whole, never re-declared here, so `mayBeTransient`/
   // `codeEntries` have exactly one definition (a #4468 review finding: a hand-copied literal here previously
   // drifted from the exported object the tests actually assert on).
-  { ...DAEMON_BOOT_SMOKE_CHECK, kind: 'env' },
+  DAEMON_BOOT_SMOKE_CHECK,
   // ALWAYS LAST, NEVER SKIPPED: no `codeEntries`, so `checkCodeUnchanged` never short-circuits it.
   { name: 'tree-stays-clean', kind: 'env', run: checkTreeStaysClean, mayBeTransient: false },
 ]);
