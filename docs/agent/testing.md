@@ -978,7 +978,11 @@ session ID, so it does not automatically enable this policy.
 `session.orchestratorDelegateCommands` replaces the executable-prefix array declared in
 `scripts/lib/orchestrator-session-settings.mjs`. Configure it in
 `scripts/settings/orchestrator-session.json` (or platform preferences); an empty array disables
-this delegation check. Match executable positions, never quoted mentions or heredoc data.
+this delegation check. Match executable positions, including Node options before the script and
+npm options before `run` or its script name. Heredocs fed to a shell (including `cat <<EOF | bash`)
+are executable scripts and must be checked, as are shell here-strings. Unquoted heredoc bodies can
+execute command substitutions even when used as data; quoted delimiters suppress those expansions.
+Plain mentions and literal heredoc data stay opaque.
 Probe hook stdin with both an interactive payload and a subagent payload sharing the same env.
 The existing background-verification denial must still win in every session: delegate the work
 to a background agent, which runs the command in its own foreground.
