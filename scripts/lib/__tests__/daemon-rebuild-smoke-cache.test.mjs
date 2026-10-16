@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-rebuild.mjs';
 import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
-import { addOverlay } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
 
@@ -99,6 +99,39 @@ function repeatTree(f, base) {
 }
 
 describe('durable smoke pass cache', () => {
+  it.each([false, true])('keeps healthy overlays when a cached fallback shares the broken harness (already running: %s)', async (alreadyRunning) => {
+    const f = makeFixture();
+    const base = head(f);
+    advanceMain(f.originDir, dir => writeFile(dir, 'main.txt', 'm'));
+    await rebuild(f, async () => PASS);
+    if (!alreadyRunning) gitOk(f.cloneDir, ['reset', '--hard', base]);
+    pushBranch(f.originDir, 'lane/healthy', dir => writeFile(dir, 'overlay.txt', 'healthy'));
+    addOverlay(f.cloneDir, { ref: 'lane/healthy' }, { env: f.env });
+    const calls = [];
+    const smoke = async (options) => {
+      const result = await runLiveSmoke({ ...options, runChild: async (cmd, args, opts) => {
+        if (opts.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') return 'malformed JSON';
+        if (args[1] === 'list') return '[]';
+        if (args[1] === 'acquire') return JSON.stringify({ lane: 2 });
+        if (cmd === 'node') return JSON.stringify({ ok: true });
+        return '';
+      } });
+      calls.push({ options, result });
+      return { verdict: result.pass ? 'pass' : 'code', smoke: result };
+    };
+    const result = await rebuild(f, smoke);
+    expect(result.reason).toBe('harness-broken-adopted-not-worse');
+    expect(readOverlays(f.cloneDir, { env: f.env }).map(row => row.ref)).toContain('lane/healthy');
+    expect(calls).toHaveLength(3);
+    for (const { options, result: checked } of calls) {
+      expect(options.reuseCode).toBe(false);
+      expect(checked.results.find(row => row.name === 'dispatch-dry-run')).toMatchObject({ ok: false,
+        detail: expect.stringContaining('unparsable output') });
+      expect(checked.results.filter(row => SMOKE_CHECKS.find(check => check.name === row.name)?.kind === 'env').every(row => row.ok)).toBe(true);
+    }
+    expect(calls.slice(1).every(({ options }) => options.changedFiles === null)).toBe(true);
+  });
+
   it('reuses code proof for an identical tree while materializing and re-running env checks', async () => {
     const f = makeFixture();
     const base = head(f);

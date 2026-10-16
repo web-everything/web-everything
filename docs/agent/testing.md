@@ -115,6 +115,9 @@ On reuse, materialize the candidate and skip only table rows declaring `kind: co
 row runs again, including lane lease/release, daemon boot and tree cleanliness. A failed env
 check refuses adoption. Reused passes never refresh the original proof timestamp; missing rows,
 failures, disabled gates, busy-pool skips and other partial runs never establish a proof.
+After a candidate failure, set-aside, plain-main, confirmation and last-good smokes run fresh
+code checks, without cached proofs or unchanged-code skips. Even a fallback already running
+must pass a fresh comparison before the rebuild blames and removes an overlay.
 Probe identical-content commits, changed trees, expiry, disabled reuse, failure and partial
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.

@@ -448,9 +448,13 @@ export async function smokeAndAdopt({
 
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
+    // Recovery compares failures in this run. Historical passes (including unchanged-code skips)
+    // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
+    const freshComparison = label != null;
+    if (freshComparison) changedFiles = null;
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
@@ -788,13 +792,7 @@ export async function smokeAndAdopt({
         // itself did not (matchReadyCandidate's `fallback-main-moved`).
         kind: 'fallback', forInputsKey: plan.inputsKey, dropRefs: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, sha: ap.sha })), failed: failedNames,
       };
-      // Plain main IS the build already running (an overlay was just added onto an otherwise-current clone) and
-      // that build is the smoke-verified one: nothing to smoke, just drop the suspect(s).
-      // A load-shaped failure never takes this shortcut: an earlier pass is not a SAME-RUN differential.
-      if (!loadOnly && planB.finalSha === prevHead && adoptedHead === prevHead) {
-        const fin = await finalize(planB, dropSuspects, fallbackReady);
-        return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
-      }
+      // Even the currently adopted head needs a fresh comparison before blaming an overlay.
       // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.
       const b = budgetAllows('plain-main')
         ? await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied), { failFast: failedA.map((r) => r.name) })
