@@ -982,27 +982,34 @@ export function defaultReadAttributedRequiredChecks({
 // marker comment, and clearing the stale `checking` label this card's own scope names.
 
 /**
- * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadRequiredContexts — the LIVE required-check-name set
- * this pass watches, read off branch protection rather than hardcoded (`GET /repos/{repo}/branches/{branch}/
- * protection`'s own `required_status_checks.contexts`) — per this card's own scope ("read the required contexts
- * from branch protection"). Returns `null` (UNKNOWN) on a read failure (e.g. a token without the scope branch
- * protection needs) or with no `repo` to read — never a substituted default: a guessed set like `['test']` would
- * classify a PR that has already reported a DIFFERENT required context (`smoke`) as "missing every run" and
- * trigger CI it does not need (PR #2740 review). An explicitly empty/absent contexts list is preserved as `[]`
- * (no required context → nothing can be missing). On `null`, {@link buildMissingRunCandidates} falls back to its
- * narrower name-free "no CI-workflow check at all" test.
- * @param {{repo?:string|null, branch?:string, exec?:Function}} [o]
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadRequiredContexts — the LIVE classic-branch-protection
+ * required-check-name set this pass watches, read through the one shared per-repo cache
+ * (`we:scripts/lib/required-status-checks.mjs#getRequiredStatusChecks`) rather than a direct `gh api …/protection`
+ * on every call. It returns the shared entry's `classic` subset, NEVER the rules ∪ classic union: this set feeds the
+ * all-absent test and the declared fallback in {@link sweepMissingRunRecovery}, and ruleset-only checks (e.g.
+ * `merge-gate`) enter only through {@link defaultReadAttributedRequiredChecks} (#5060).
+ * Returns `null` (UNKNOWN) with no `repo`, on a read failure, or whenever the classic set was not read live —
+ * a `declared`/`fallback`/`unavailable` result, or a stale entry that was declared — never a substituted default:
+ * a guessed set like `['test']` would classify a PR that has already reported a DIFFERENT required context
+ * (`smoke`) as "missing every run" and trigger CI it does not need (PR #2740 review). A classic set that was read
+ * and is empty is preserved as `[]` only when the full required set is also empty. An empty classic subset
+ * beside ruleset requirements returns `null`, keeping ruleset-only missing-run recovery enabled. On `null`,
+ * {@link buildMissingRunCandidates} falls back to its narrower name-free "no CI-workflow check at all" test.
+ * @param {{repo?:string|null, branch?:string, readRequiredChecks?:Function}} [o]
  * @returns {string[]|null}
  */
-export function defaultReadRequiredContexts({ repo = null, branch = 'main', exec = execFileSyncThrottled } = {}) {
+export function defaultReadRequiredContexts({
+  repo = null, branch = 'main', readRequiredChecks = getRequiredStatusChecks,
+} = {}) {
   if (!repo) return null;
   try {
-    const out = exec('gh', ['api', `repos/${repo}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    });
-    const parsed = JSON.parse(String(out || '').trim() || 'null');
-    if (parsed === null) return [];
-    return Array.isArray(parsed) ? parsed.filter((n) => typeof n === 'string' && n) : null;
+    const result = readRequiredChecks({ repo, branch });
+    if (result?.source === 'declared' || result?.source === 'fallback' || result?.source === 'unavailable') return null;
+    if (!Array.isArray(result?.classic)) return null;
+    const classic = result.classic.filter((n) => typeof n === 'string' && n);
+    // Ruleset-only protection is not an empty required set: allow the attributed partial-rollup test.
+    if (!classic.length && result.checks?.length) return null;
+    return classic;
   } catch {
     return null;
   }

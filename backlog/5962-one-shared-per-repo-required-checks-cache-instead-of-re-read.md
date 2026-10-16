@@ -2,9 +2,11 @@
 bornAs: xqd4v1o
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/required-status-checks.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/lib/pr-state-io.mjs", "we:scripts/lib/__tests__/required-status-checks.test.mjs", "we:scripts/lib/__tests__/pr-state-io.test.mjs", "we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs", "we:scripts/settings/required-checks-cache.json"]
 dateOpened: "2026-10-12"
+dateStarted: "2026-10-15"
+dateResolved: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "1c90699ccd450bd394358c3c4f7dce1a3a674a43"
 tags: []
@@ -88,3 +90,4 @@ Before/after on the live fleet: count `branches/main/protection` and `rules/bran
 
 - 2026-10-13 prepare: premise check — goal not delivered. Old premise: no shared cache exists. Corrected: a per-cwd cache exists; remaining causes are the cwd-relative path and two direct readers. Scope corrected to the four files listed in the frontmatter. Size 2 → 3: four files plus tests (evidence: `defaultCachePath` in we:scripts/lib/required-status-checks.mjs, we:scripts/conveyor/ci-red-recovery-watch.mjs:783, we:scripts/lib/pr-state-io.mjs:108).
 - 2026-10-15 re-prepare: scope files changed on main since preparedAgainstSha c6f9247d (we:scripts/conveyor/ci-red-recovery-watch.mjs +342 lines). Premise re-checked: still undelivered (defaultCachePath still cwd-relative at we:scripts/lib/required-status-checks.mjs:82; we:scripts/lib/pr-state-io.mjs:108 and we:scripts/conveyor/ci-red-recovery-watch.mjs:997 still shell the protection endpoint). Updated citations (783 → 997) and the null-mapping rule (declared → null too). Size and scope unchanged.
+- 2026-10-15 build: shared cwd-independent cache path (coordination root), read-merge-write under a lock, a `classic` subset stored per entry, TTL from `we:scripts/settings/required-checks-cache.json`, ETag-conditional reads via `ghRestGetJson` (`restGet` seam), and both direct readers (`defaultReadRequiredContexts`, classic-only with its null/`[]` contract kept; the pr-state-io probe) routed through `getRequiredStatusChecks`. Not done here: the live before/after call-volume proof. The gh call log records a plain `gh api` as op `api` with no path, so the old protection reads cannot be counted per endpoint; after this lands the reads carry op `required-checks` and can be counted per caller. The post-land measurement is filed as 6177.

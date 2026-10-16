@@ -38,9 +38,13 @@
  */
 import { spawnSync } from 'node:child_process';
 import { readGh } from './proc-read.mjs';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { looksLikePersonalAccessDenial, resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.mjs';
+import { ghRestGetJson } from './gh-rest-read.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
+import { readSettings } from './settings-files.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
@@ -77,9 +81,46 @@ function protectionAccessDenied(error) {
   return looksLikePersonalAccessDenial(`${error?.message ?? ''}\n${error?.stderr ?? ''}`);
 }
 
-/** Where the cache sidecar lives — mirrors `we:scripts/progress-board.mjs#cachePathFor`'s own convention. */
-export function defaultCachePath() {
-  return join(process.cwd(), 'reports', '.required-status-checks-cache.json');
+/**
+ * The ONE cache file every daemon and lane clone shares: under the operator's coordination root, never the
+ * working directory (a per-cwd file gave every clone its own cold cache — 5,470 protection reads in 12 h).
+ * Entries are keyed `repo@branch`, so one file holds every repo.
+ */
+export function defaultCachePath({ env = process.env } = {}) {
+  return join(resolveCoordinationRoot({ env }), 'required-status-checks-cache.json');
+}
+
+const TTL_SETTINGS_MEMO_MS = 60_000;
+let ttlSettingsMemo = null;
+
+/**
+ * Pure: the cache TTL a settings object asks for (`requiredChecksCache.ttlMinutes`), else the 15 min default.
+ * A non-positive or non-numeric value is ignored, never a zero TTL that would revalidate on every call.
+ */
+export function cacheTtlMsFromSettings(settings) {
+  const minutes = settings?.requiredChecksCache?.ttlMinutes;
+  return typeof minutes === 'number' && Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : DEFAULT_CACHE_TTL_MS;
+}
+
+/** The TTL from `scripts/settings/required-checks-cache.json`; the merged settings read is memoized for a minute. */
+export function resolveCacheTtlMs({ settings, now = Date.now() } = {}) {
+  if (settings !== undefined) return cacheTtlMsFromSettings(settings);
+  if (!ttlSettingsMemo || now - ttlSettingsMemo.atMs >= TTL_SETTINGS_MEMO_MS || now < ttlSettingsMemo.atMs) {
+    ttlSettingsMemo = { atMs: now, ttlMs: cacheTtlMsFromSettings(readSettings()) };
+  }
+  return ttlSettingsMemo.ttlMs;
+}
+
+/** Parse a cache file into its `entries` map. Unreadable, corrupt or foreign-shaped means "no cache" ({}), never an error. */
+function readCacheEntries(cachePath) {
+  try {
+    const parsed = JSON.parse(readFileSync(cachePath, 'utf8'));
+    if (parsed?.entries && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries)) return parsed.entries;
+    if (typeof parsed?.key === 'string') return { [parsed.key]: parsed }; // legacy single-entry sidecar
+  } catch {
+    /* no cache, or unreadable */
+  }
+  return {};
 }
 
 /** Pure projection of branch rules into the union of required status-check contexts. */
@@ -148,19 +189,57 @@ function readRequiredChecksGh(args) {
  * the CURRENT directory's git remote — the same "let gh infer it" convention this repo's other readers use
  * (e.g. `we:scripts/conveyor/reconcile-pass.mjs#defaultReadAheadBy`) — rather than failing a caller that never
  * had a repo slug to pass.
- * @param {{repo?: string, branch?: string, gh?: Function}} o
+ * @param {{repo?: string, branch?: string, gh?: Function, restGet?: Function}} o
  * @returns {string[]}
  */
-export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = readRequiredChecksGh } = {}) {
+export function defaultReadRequiredStatusChecks(options = {}) {
+  return readRequiredStatusChecksDetailed(options).checks;
+}
+
+const RULES_PAGE_SIZE = 100;
+const RULES_MAX_PAGES = 10;
+
+/**
+ * The rules list via one conditional GET per page (an unchanged page is a free `304`). A non-array body — a blank
+ * 200 included — is a failed read, never "no rules"; hitting the page cap is an error, never a partial list.
+ */
+function readRulesPaged(restGet, path, o) {
+  const rules = [];
+  for (let page = 1; page <= RULES_MAX_PAGES; page += 1) {
+    const { json } = restGet(`${path}?per_page=${RULES_PAGE_SIZE}&page=${page}`, o);
+    if (!Array.isArray(json)) throw new Error('required-status-checks: unexpected shape from branch rules');
+    rules.push(...json);
+    if (json.length < RULES_PAGE_SIZE) return rules;
+  }
+  throw new Error('required-status-checks: branch rules exceed the page cap');
+}
+
+/**
+ * Same read as {@link defaultReadRequiredStatusChecks}, returning `{checks, classic}`: `checks` is the rules ∪
+ * classic union every caller needs, `classic` the classic-branch-protection contexts alone (the main-red
+ * missing-run pass must not see ruleset-only checks such as `merge-gate`, #5060).
+ *
+ * Reads go through `restGet` (default `ghRestGetJson`, ETag-conditional: after the cache TTL an unchanged answer is
+ * a free 304). An injected `gh` text reader, or the personal-routed CLI path, keeps the plain `gh api` calls.
+ * @param {{repo?: string, branch?: string, gh?: Function, restGet?: Function}} o
+ * @returns {{checks: string[], classic: string[]}}
+ */
+export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, restGet = ghRestGetJson } = {}) {
   const base = `repos/${repo || '{owner}/{repo}'}`;
+  const useRest = !gh && !resolvePersonalRouteEnabled();
+  const text = gh ?? readRequiredChecksGh;
+  // `{owner}/{repo}` placeholders resolve from the cwd's remote, so the ETag cache key must carry the cwd.
+  const restOpts = { op: 'required-checks', context: repo ? '' : process.cwd() };
   let rulesChecks = [];
   let rulesError;
   let rulesFailed = false; // a flag, not `rulesError`'s truthiness: a `throw undefined` is still a failed read
   try {
-    // The rules endpoint pages at 30: read every page (`--slurp` → one array of pages) so a required check on a
-    // later page is never dropped. A blank body is a failed read, not "no rules" (JSON.parse('') throws).
-    const out = gh(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]);
-    rulesChecks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
+    // The rules endpoint pages at 30: read every page so a required check on a later page is never dropped.
+    // A blank body is a failed read, not "no rules" (JSON.parse('') throws; a non-array body throws).
+    const rules = useRest
+      ? readRulesPaged(restGet, `${base}/rules/branches/${branch}`, restOpts)
+      : flattenRulePages(JSON.parse(text(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]).trim()));
+    rulesChecks = requiredChecksFromRules(rules);
   } catch (error) {
     rulesError = error;
     rulesFailed = true;
@@ -172,8 +251,10 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
   // the latter (live 2026-10-11) but can read the former. Any classic failure throws — never a ruleset-only set.
   let checks;
   try {
-    const out = gh(['api', `${base}/branches/${branch}`]);
-    checks = requiredChecksFromBranch(JSON.parse(out.trim())); // blank body = failed read, same as the rules read
+    const branchJson = useRest
+      ? restGet(`${base}/branches/${branch}`, restOpts).json // a blank body parses to null → shape error below
+      : JSON.parse(text(['api', `${base}/branches/${branch}`]).trim()); // blank body = failed read, same as the rules read
+    checks = requiredChecksFromBranch(branchJson);
   } catch (error) {
     // The ruleset read fine: its set is partial, never live, but stays required on whatever the caller falls back to.
     if (!rulesFailed) throw withPartialChecks(error, rulesChecks);
@@ -185,13 +266,33 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     // Both sources read fine and neither requires a check: an authoritative "nothing required", which selects the
     // repo's declared policy exactly as a protection denial does — never the untrusted `fallback`.
     if (!union.length) throw Object.assign(new Error('required-status-checks: no required checks in rules or branch protection'), { noRequiredChecks: true });
-    return union;
+    return { checks: union, classic: checks };
   }
   // Rulesets can require checks classic protection lacks, and an unreadable ruleset does not mean its requirements
   // disappeared — so after ANY rules failure the classic set is partial and never returned as live: throw the rules
   // error (its denial/transient classification intact) so the caller keeps a live cache or the declared policy. It
   // carries the classic set as `partialChecks`, a floor the caller still requires (PR #4924 red team).
   throw withPartialChecks(rulesError, checks);
+}
+
+/** A usable cache entry holds real branch-protection data: source `live`, or a legacy source-less entry. */
+function isLiveCacheEntry(entry) {
+  return entry.source !== 'declared' && entry.source !== 'unavailable';
+}
+
+/**
+ * Does the cache's CURRENT entry for a key outrank a write about to replace it? Readers overlap, so the entry
+ * can be one another reader saved after this read began (PR #5404 red team). A live entry outranks a declared or
+ * unavailable write at any age — the same rule as a denial never clobbering a live cache. Otherwise, of two
+ * entries of the same kind, the newer `fetchedAtMs` wins, so a slower reader never moves the entry backwards.
+ * A live write always replaces a non-live entry. An invalid or missing entry never outranks anything.
+ */
+function cacheEntryOutranks(current, incoming) {
+  if (!current || !Array.isArray(current.checks) || !Number.isFinite(current.fetchedAtMs)) return false;
+  const currentLive = isLiveCacheEntry(current);
+  const incomingLive = isLiveCacheEntry(incoming);
+  if (currentLive !== incomingLive) return currentLive;
+  return current.fetchedAtMs > incoming.fetchedAtMs;
 }
 
 /**
@@ -216,55 +317,72 @@ function withPartialChecks(error, partialChecks) {
  * @param {string} [o.cachePath] - defaults to {@link defaultCachePath}.
  * @param {number} [o.now] - epoch ms; defaults to `Date.now()`.
  * @param {number} [o.ttlMs] - how long a cached read is trusted before a fresh live fetch is attempted again;
- *   defaults to 15 minutes. A stale-but-only-option cache is still preferred over the hardcoded fallback (see
+ *   defaults to the `requiredChecksCache.ttlMinutes` setting (15 minutes). A stale-but-only-option cache is still preferred over the hardcoded fallback (see
  *   header), so this bounds re-FETCH frequency, not cache USABILITY.
- * @param {Function} [o.readChecks] - defaults to {@link defaultReadRequiredStatusChecks}.
- * @returns {{checks: string[], source: 'live'|'cache'|'stale-cache'|'fallback'|'declared'|'unavailable', cacheAgeMs?: number}}
+ * @param {Function} [o.readChecks] - defaults to {@link readRequiredStatusChecksDetailed}.
+ * @returns {{checks: string[], classic?: string[], source: 'live'|'cache'|'stale-cache'|'fallback'|'declared'|'unavailable', cacheAgeMs?: number}}
+ *   `classic` (live/cache/stale-cache only) is the classic-protection subset of `checks`.
  */
 export function getRequiredStatusChecks({
   repo,
   branch = 'main',
   cachePath = defaultCachePath(),
   now = Date.now(),
-  ttlMs = DEFAULT_CACHE_TTL_MS,
-  readChecks = defaultReadRequiredStatusChecks,
+  ttlMs = resolveCacheTtlMs({ now }),
+  readChecks = readRequiredStatusChecksDetailed,
 } = {}) {
   const key = `${repo || ''}@${branch}`;
   const declared = DECLARED_REQUIRED_STATUS_CHECKS[repo];
-  let entries = {};
-  let cache = null;
-  try {
-    const parsed = JSON.parse(readFileSync(cachePath, 'utf8'));
-    if (parsed?.entries && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries)) {
-      entries = parsed.entries;
-    } else if (typeof parsed?.key === 'string') {
-      entries = { [parsed.key]: parsed };
-    }
-    // A cwd-inferred slug is unknown here: never share an anonymous cache across repositories.
-    const candidate = repo ? entries[key] : null;
-    if (candidate && Array.isArray(candidate.checks) && Number.isFinite(candidate.fetchedAtMs)) {
-      cache = candidate;
-    }
-  } catch {
-    /* no cache, or unreadable — a fresh live fetch (or the hardcoded fallback) is next */
-  }
+  // A cwd-inferred slug is unknown here: never share an anonymous cache across repositories.
+  const validEntry = entry => (entry && Array.isArray(entry.checks) && Number.isFinite(entry.fetchedAtMs) ? entry : null);
+  // The file's entry for this key NOW: another reader may have saved since `cache` was read. Writes rename
+  // atomically, so an unlocked read sees a whole entry.
+  const reread = () => (repo ? validEntry(readCacheEntries(cachePath)[key]) : null);
+  const cache = reread();
+  // The classic-protection contexts ride along only on a live entry (a declared/unavailable entry never read them).
+  const withClassic = (result, entry) => (Array.isArray(entry?.classic) ? { ...result, classic: entry.classic } : result);
 
   if (cache && (now - cache.fetchedAtMs) < ttlMs) {
-    return { checks: cache.checks, source: cache.source === 'declared' || cache.source === 'unavailable'
-      ? cache.source : 'cache' };
+    return withClassic({ checks: cache.checks, source: cache.source === 'declared' || cache.source === 'unavailable'
+      ? cache.source : 'cache' }, cache);
   }
 
-  const save = (checks, source) => {
+  const save = (checks, source, classic) => {
+    let winner = null;
     if (repo) {
       try {
         mkdirSync(dirname(cachePath), { recursive: true });
-        entries[key] = { checks, source, fetchedAtMs: now };
-        writeFileSync(cachePath, JSON.stringify({ entries }, null, 2) + '\n');
+        // Many daemons share this file: re-read inside the lock and merge, so two repos' writes never clobber each
+        // other. A lock timeout throws and skips the write — the read itself never fails over it.
+        withFileLock(`${cachePath}.lock`, () => {
+          const entries = readCacheEntries(cachePath);
+          // The same key may have changed since this read began (`cache` is a pre-read snapshot): keep the
+          // current entry if it outranks this write — see cacheEntryOutranks.
+          if (cacheEntryOutranks(entries[key], { source, fetchedAtMs: now })) {
+            winner = entries[key];
+            return;
+          }
+          entries[key] = { checks, source, fetchedAtMs: now, ...(Array.isArray(classic) ? { classic } : {}) };
+          writeJsonAtomic(cachePath, { entries });
+        }, { timeoutMs: 2_000 });
       } catch {
-        /* the cache is an optimisation — never fail a read over a write */
+        // The cache is an optimisation — never fail a read over a write. A lock timeout skipped the merge above, so
+        // re-read without the lock: an entry another reader saved that outranks this write still wins the answer.
+        const current = reread();
+        if (cacheEntryOutranks(current, { source, fetchedAtMs: now })) winner = current;
       }
     }
-    return { checks, source };
+    // The entry that outranked this write is what the cache now holds: answer with it, so this call never returns a
+    // policy (e.g. the declared defaults) the file already superseded. Every branch adds this read's partial floor,
+    // which is never cached: a winner may predate a check this read just saw required.
+    if (winner) {
+      const checks = withPartial(winner.checks);
+      if (!isLiveCacheEntry(winner)) return withClassic({ checks, source: winner.source }, winner);
+      return (now - winner.fetchedAtMs) < ttlMs
+        ? withClassic({ checks, source: 'cache' }, winner)
+        : withClassic({ checks, source: 'stale-cache', cacheAgeMs: now - winner.fetchedAtMs }, winner);
+    }
+    return withClassic({ checks, source }, { classic });
   };
 
   // Checks a source that DID read still requires (the other source failed): never live, but added to every degraded
@@ -273,9 +391,11 @@ export function getRequiredStatusChecks({
   let partial = [];
   const withPartial = checks => (checks.length ? [...new Set([...checks, ...partial])] : checks);
   try {
-    const checks = readChecks({ repo, branch });
+    // A reader returns the union array, or `{checks, classic}` when it also knows the classic-protection subset.
+    const read = readChecks({ repo, branch });
+    const checks = Array.isArray(read) ? read : read?.checks;
     if (Array.isArray(checks) && checks.length) {
-      return save(checks, 'live');
+      return save(checks, 'live', Array.isArray(read) ? undefined : read.classic);
     }
   } catch (error) {
     if (Array.isArray(error?.partialChecks)) partial = error.partialChecks;
@@ -283,16 +403,22 @@ export function getRequiredStatusChecks({
       // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
-      const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
+      const hasLiveCache = cache && isLiveCacheEntry(cache);
       if (!hasLiveCache) {
         if (declared) return save(withPartial(declared), 'declared');
-        if (!cache) return { checks: [], source: 'fallback' };
+        if (!cache && !reread()) return { checks: [], source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
   }
 
-  if (cache) return { checks: withPartial(cache.checks), source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
-    cacheAgeMs: now - cache.fetchedAtMs };
+  // Answer from the file's current entry, never the pre-read snapshot another reader has since superseded.
+  const latest = reread();
+  const current = latest && !cacheEntryOutranks(cache, latest) ? latest : cache;
+  if (current && (now - current.fetchedAtMs) < ttlMs) {
+    return withClassic({ checks: withPartial(current.checks), source: isLiveCacheEntry(current) ? 'cache' : current.source }, current);
+  }
+  if (current) return withClassic({ checks: withPartial(current.checks), source: current.source === 'unavailable' ? 'unavailable' : 'stale-cache',
+    cacheAgeMs: now - current.fetchedAtMs }, current);
   return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: [], source: 'unavailable' };
 }
