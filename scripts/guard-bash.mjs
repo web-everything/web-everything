@@ -1144,9 +1144,6 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   // callers only ask "where does one command end"), so it rides as an extra field rather than a second parser.
   // `||` (logical or, not a pipe) is excluded: its second `|` is what the very next char test below reads.
   const pipedFrom = [];
-  // `sepAfter[i]` — the separator run that ENDED `segs[i]` (`;`, `&&`, `&`, `|`, `\n`…; '' for the last). PR
-  // #5403 — `resolveEffectiveCwd` needs it to tell a background job (`a &`) and a conditional (`a && b`) apart.
-  const sepAfter = [];
   let pendingPiped = false;      // segs[0] (the first segment) has no predecessor
   let cur = '';
   let unterminated = false;
@@ -1155,7 +1152,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   let inComment = false;
   // A comment switches quoting off until END OF LINE — a separator does NOT end it (bash agrees: `# a; b`
   // is all comment). Only a newline clears it.
-  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); sepAfter.push(''); cur = ''; atWordStart = true; };
+  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); cur = ''; atWordStart = true; };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // Inside a `#` comment ONLY quoting is switched off; the comment TEXT and every separator in it are
@@ -1192,9 +1189,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       // the `cut()` that finalizes THIS next segment.
       pendingPiped = ch === '|' && s[i + 1] !== '|';
       if (ch === '\n') inComment = false;
-      const from = i;
       while (i + 1 < s.length && /[;&|\n]/.test(s[i + 1])) { if (s[i + 1] === '\n') inComment = false; i += 1; }
-      sepAfter[segs.length - 1] = s.slice(from, i + 1);
       continue;
     }
     cur += ch;
@@ -1202,8 +1197,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   }
   segs.push(cur);
   pipedFrom.push(pendingPiped);
-  sepAfter.push('');
-  return { segments: segs, unterminated, continued, pipedFrom, sepAfter };
+  return { segments: segs, unterminated, continued, pipedFrom };
 }
 
 /** The segments-only view of `parseSegments` (the raw text of each `&&`/`||`/`;`/`&`/`|`/newline-separated
@@ -2493,52 +2487,28 @@ function expandCdTarget(rest, home) {
   return out || null;
 }
 
-// PR #5403 review r5 — WHERE each segment's assignments land, so a child shell's assignment never steers the
-// parent's `cd`. Per segment: `child` — provably a child shell (inside an earlier `(`/`$(`, opening a `(` group,
-// a pipeline element, a background job): nothing it assigns reaches the parent. `parent` — provably the parent
-// shell, unconditionally (top level: no open group, compound body or `{ … }`, not after `&&`/`||`). Neither
-// means unknown. Approximate counting only ever loses certainty: a stray `)` (a `case` pattern) stops every
-// later segment from being classified at all.
-const COMPOUND_OPEN = /^(?:if|while|until|case|for|select)(?:\s|$)/;
-const COMPOUND_CLOSE = /^(?:fi|done|esac)(?:\s|;|$)/;
-function segmentScopes({ segments, pipedFrom = [], sepAfter = [] }) {
-  let paren = 0;
-  let brace = 0;
-  let compound = 0;
-  let lost = false;
-  return segments.map((seg, k) => {
-    const t = seg.trim();
-    const parenBefore = paren;
-    const nested = paren > 0 || brace > 0 || compound > 0;
-    if (COMPOUND_OPEN.test(t)) compound += 1;
-    if (COMPOUND_CLOSE.test(t)) compound -= 1;
-    for (let i = 0; i < t.length; i++) {
-      const ch = t[i];
-      if (ch === '\\') { i += 1; continue; }
-      if (quoteStartsAt(t, i)) { const e = quotedRunEnd(t, i); if (e < 0) break; i = e; continue; }
-      const wordStart = i === 0 || /[\s;(]/.test(t[i - 1]);
-      if (ch === '(') paren += 1;
-      else if (ch === ')') paren -= 1;
-      else if (ch === '{' && wordStart && /^(?:\s|$)/.test(t.slice(i + 1, i + 2))) brace += 1;
-      else if (ch === '}' && wordStart) brace -= 1;
-    }
-    if (paren < 0 || brace < 0 || compound < 0) lost = true;
-    const background = /^&(?!&)/.test(sepAfter[k] || '');
-    const piped = Boolean(pipedFrom[k] || pipedFrom[k + 1]);
-    const subshell = parenBefore > 0 || (t.startsWith('(') && !t.startsWith('(('));
-    const child = !lost && (subshell || piped || background);
-    const conditional = k > 0 && /^(?:&&|\|\|)/.test(sepAfter[k - 1] || '');
-    return { child, parent: !lost && !child && !nested && !conditional };
-  });
-}
-
-// Does this segment possibly rebind HOME? Any bare `HOME` name (an assignment, `read`/`declare`/`unset`/
-// `printf -v` operand, an `eval` string) or code the text cannot see (`eval`, `source`, `.`). An expansion
-// (`$HOME`, `${HOME}`) only reads it.
+// PR #5403 review r5 — could this statement rebind HOME? Deliberately over-inclusive, because a wrong YES only
+// leaves a home spelling unresolved (main's behaviour) while a wrong NO steers the `cd` somewhere bash does not
+// go. Which shell (parent, subshell, pipeline, background job, branch not taken) an assignment runs in is
+// never modelled — that is exactly where text counting gets it wrong. Read after quote removal, so a split
+// name (`HO""ME`, `HO\ME`, `$'HO'ME`) is still the name HOME. YES for: any bare `HOME` word (an assignment, a
+// `read`/`declare`/`unset`/`printf -v`/`for` operand, a nameref target, an `eval` string, a function body);
+// `eval`/`source`/`.` at command position (code the text cannot see); and a statement that builds words at
+// run time (`$`, backtick, brace or glob) where a binding builtin, or a run-time command name, could turn
+// them into the name HOME (`export "${x}ME=/tmp"`, `export {HO,}ME=/tmp`, `$c …`). Reads (`$HOME`, `${HOME}`)
+// are not rebindings.
+const HOME_BINDERS = new Set(['declare', 'typeset', 'export', 'local', 'readonly', 'read', 'printf', 'mapfile',
+  'readarray', 'unset', 'let', 'getopts', 'trap', 'builtin', 'command', 'exec', 'coproc', 'for', 'select']);
+const COMMAND_PREFIXES = new Set(['time', '!', 'command', 'builtin', 'then', 'do', 'else', 'elif', 'if',
+  'while', 'until', 'coproc', 'exec', '{', '(', '((']);
 function mayRebindHome(segment) {
-  const t = segment.trim();
-  return /(?:^|[^\w$])HOME(?!\w)/.test(t.replace(/\$\{HOME/g, ''))
-    || /^(?:(?:builtin|command)\s+)?(?:source|\.|eval)(?:\s|$)/.test(t);
+  const t = segment.replace(/\$(?=['"])/g, '').replace(/["'\\]/g, '');
+  if (/(?:^|[^\w$])HOME(?!\w)/.test(t.replace(/\$\{HOME/g, ''))) return true;
+  const words = t.split(/[\s;(){}]+/).filter(Boolean);
+  const cmd = words.find((w) => !COMMAND_PREFIXES.has(w) && !/^[A-Za-z_]\w*\+?=/.test(w));
+  if (cmd === 'eval' || cmd === 'source' || cmd === '.') return true;
+  if (!/[`$*?[{]/.test(t.replace(/\$\{HOME\}|\$HOME(?!\w)/g, ''))) return false;
+  return words.some((w) => HOME_BINDERS.has(w)) || /[`$]/.test(cmd ?? '');
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -2562,11 +2532,8 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
-  // A child shell's assignment (subshell, pipeline element, background job) never reaches the parent: skip it.
-  const scopes = segmentScopes(parsed);
   const vars = Object.create(null);
-  for (const [k, stmt] of parsed.segments.entries()) {
-    if (scopes[k].child) continue;
+  for (const stmt of parsed.segments) {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (!m) continue;
     let val = m[2].trim();
@@ -2577,19 +2544,15 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
-  // HOME follows a lone `HOME=word` / `export HOME=word` proven to run in the parent shell; a child shell's
-  // rebinding changes nothing, and any other rebinding makes HOME unknown (home spellings then stay unresolved).
+  // HOME is the hook's own HOME until a statement before the `cd` might rebind it (`mayRebindHome`); from
+  // then on it is unknown and a home spelling stays unresolved. No new HOME value is ever adopted.
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
-  for (const [k, stmt] of parsed.segments.entries()) {
-    if (!scopes[k].child && !/^cd\s/.test(stmt.trim()) && mayRebindHome(stmt)) {
-      const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
-      const words = shellTokens(stmt).length;
-      const lone = assignment && words === (/^export\s/.test(stmt.trim()) ? 2 : 1);
-      const value = lone && scopes[k].parent ? expandCdTarget(assignment[1].trim(), currentHome) : null;
-      currentHome = value?.startsWith('/') ? value : null;
-    }
+  for (const stmt of parsed.segments) {
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
-    if (!cd) continue;
+    if (!cd) {
+      if (currentHome && mayRebindHome(stmt)) currentHome = null;
+      continue;
+    }
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {

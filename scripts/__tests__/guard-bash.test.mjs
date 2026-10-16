@@ -548,41 +548,35 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd ~ && ls', '')).toBe(REPORTED);
     expect(at('cd ~ && ls', 'relative/home')).toBe(REPORTED);
   });
-  it('uses only preceding literal HOME assignments for home expansion', () => {
-    expect(at('HOME=/other; cd ~/clone')).toBe('/other/clone');
-    expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
-    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
-    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
-    expect(at('HOME=/other && cd ~/clone')).toBe('/other/clone');
-    expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
-  });
-  // PR #5403 review r5 — an assignment that runs in a CHILD shell never changes the parent's HOME, so it must
-  // not steer the parent's `cd ~` (a subshell, a pipeline element, a background job, a prefix assignment).
-  it('a HOME assignment in a subshell, pipeline or background job keeps the parent HOME', () => {
-    expect(at('( true; HOME=/tmp ); cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('(true;HOME=/tmp); cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('( HOME=/tmp; true ); cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('((true; HOME=/tmp) ); cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('HOME=/tmp | true; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('true | HOME=/tmp; cd ~/clone')).toBe(`${HOME}/clone`);
-    expect(at('HOME=/tmp & cd ~/clone')).toBe(`${HOME}/clone`);
-  });
-  it('a HOME rebinding it cannot place in the parent shell makes home unknown, never a guessed value', () => {
+  // PR #5403 review r5 — which shell an assignment runs in (parent, subshell, pipeline element, background job,
+  // a branch not taken) is never modelled, so ANY statement before the `cd` that may rebind HOME makes it
+  // unknown: a home spelling then stays unresolved (main's behaviour), never a guessed or child-shell value.
+  it('any possible HOME rebinding before the cd makes home unknown, never a guessed value', () => {
     for (const pre of [
-      'HOME=/tmp true', '{ HOME=/tmp; }', '{ true; HOME=/tmp; }', 'false && HOME=/tmp', 'true || HOME=/tmp',
-      'if true; then HOME=/tmp; fi', 'f() { HOME=/tmp; }', 'declare HOME=/tmp', 'export -n HOME', 'unset HOME',
-      'read -r HOME </dev/null', 'printf -v HOME /tmp', 'eval "HOME=/tmp"', 'eval "$X"', 'source ./env.sh',
-      '. ./env.sh', 'X=$(HOME=/tmp)', 'HOME+=/x', '(( HOME=5 ))', 'export HOME=/tmp OTHER=/x',
+      'HOME=/other', 'export HOME=/other', 'HOME=$(mktemp -d)', 'HOME+=/x', 'HOME=/tmp true',
+      '( true; HOME=/tmp )', '(true;HOME=/tmp)', '( HOME=/tmp; true )', '((true; HOME=/tmp) )', '(( HOME=5 ))',
+      'HOME=/tmp | true', 'true | HOME=/tmp', 'HOME=/tmp &', '{ HOME=/tmp; }', '{ true; HOME=/tmp; } | cat',
+      'false && HOME=/tmp', 'true || HOME=/tmp', 'if true; then HOME=/tmp; fi', 'f() { HOME=/tmp; }',
+      'declare HOME=/tmp', 'declare -n R=HOME', 'export -n HOME', 'unset HOME', 'read -r HOME </dev/null',
+      'printf -v HOME /tmp', 'for HOME in /tmp; do :; done', 'X=$(HOME=/tmp)', '# a comment ( HOME',
+      // a split or run-time-built name is still HOME
+      'export HO""ME=/tmp', "export HO''ME=/tmp", 'declare HO\\ME=/tmp', "export $'HO'ME=/tmp",
+      'printf -v HO""ME /tmp', 'x=HO; export "${x}ME=/tmp"', 'export {HO,}ME=/tmp', 'c=export; $c "${x}ME=/tmp"',
+      '"eval" "HO""ME=/tmp"', 'command eval "$X"',
+      // code the text cannot see
+      'eval "$X"', 'source ./env.sh', '. ./env.sh',
     ]) expect(at(`${pre}; cd ~/clone`), pre).toBe(REPORTED);
-    expect(at("HOME='/tmp' && true; cd ~/clone")).toBe('/tmp/clone');
+    expect(at('# note (see x\nHOME=/tmp\ncd ~/clone')).toBe(REPORTED);
+    expect(at('( true; HOME=/w; cd ~/clone )')).toBe(REPORTED);
+  });
+  it('reads of HOME and unrelated statements keep the hook HOME', () => {
+    expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('X=/a; echo "$X"; ls . "$X"; git -C "$X" status; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
     expect(at('cd ~/HOME && ls')).toBe(`${HOME}/HOME`);
   });
-  it('a lane-variable assignment in a subshell, pipeline or background job keeps the parent value', () => {
-    expect(at('D=/p; (true;D=/tmp); cd "$D"')).toBe('/p');
-    expect(at('D=/p; ( true; D=/tmp ); cd "$D"')).toBe('/p');
-    expect(at('D=/p; D=/tmp | true; cd "$D"')).toBe('/p');
-    expect(at('D=/p; D=/tmp & cd "$D"')).toBe('/p');
-    expect(at('D=/p; D=/q; cd "$D"')).toBe('/q');
+  it('pins main for the literal-variable subshell shape (the review r5 finding)', () => {
+    expect(at('D=/p; ( D=/tmp; true ); cd "$D"')).toBe('/p');
   });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);
@@ -3574,10 +3568,7 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.
   it.each([
     ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
-    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
-    ['unspaced subshell assignment', `D=${fakeClone}; (true;D=/tmp); cd "$D" && git checkout --detach`, false],
-    ['pipeline assignment', `D=${fakeClone}; D=/tmp | true; cd "$D" && git checkout --detach`, false],
-    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
+    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
     ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
   ])('retains the main refusal for %s', (_name, command, startsProtected) => {
     const out = runHook(command, startsProtected ? fakeClone : lane);
@@ -3603,11 +3594,7 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['${HOME}', 'cd ${HOME}/some-new-daemon-clone && git checkout --detach'],
       ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
       ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
-      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
-      ['subshell HOME assignment', '( true; HOME=/tmp ); cd ~/some-new-daemon-clone && git checkout --detach'],
-      ['pipeline HOME assignment', 'HOME=/tmp | true; cd ~/some-new-daemon-clone && git checkout --detach'],
-      ['background HOME assignment', 'HOME=/tmp & cd ~/some-new-daemon-clone && git checkout --detach'],
-    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
     });
