@@ -3,9 +3,10 @@ bornAs: xbxx07q
 kind: story
 size: 5
 priority: high
-status: open
+status: active
 scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:skills-src/conveyor/__tests__/review-daemon-shared-plan.test.mjs", "we:scripts/conveyor/health-watch-core.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/__tests__/health-watch-core.test.mjs", "we:scripts/conveyor/health-smells/operator-hold-aged.mjs", "we:scripts/conveyor/health-smells/__tests__/operator-hold-aged.test.mjs", "we:scripts/conveyor/health-smells-notify-list.mjs", "we:scripts/conveyor/__tests__/health-smells-notify-list.test.mjs", "we:scripts/conveyor/health-smells/__tests__/notify-list.test.mjs"]
 dateOpened: "2026-10-09"
+dateStarted: "2026-10-15"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "4e7914456dc4199144b7e050f86d27fa7d0f1186"
 tags: []
@@ -48,6 +49,7 @@ The four operator-action hold kinds need a per-hold observed-age alarm; some can
 - Existing unknown-subject support removes the need for a new generic episode mechanism: `missingSubjectsUnknown` prevents omitted subjects being cleaned (`we:scripts/conveyor/health-watch-core.mjs:482-485`), as used by `we:scripts/conveyor/health-smells/review-label-missing.mjs:6-16`. Explicit clean results must still be emitted for confirmed removals. Global missing probes already skip evaluation (`we:scripts/conveyor/health-watch-core.mjs:795-798`).
 - Notification correction: medium severity would not meet the requested alarm; `we:scripts/conveyor/health-watch-core.mjs:554-556` only plans an opening notification at high severity, even for a listed smell. Use high severity and list membership, following the existing notification boundary in [we:docs/agent/platform-decisions.md#automated-health-daemon](../docs/agent/platform-decisions.md#automated-health-daemon). Delivery already uses the quiet-hours transport (`we:scripts/conveyor/health-watch.mjs:1443-1455`) and digest (`we:scripts/conveyor/health-watch.mjs:1497-1500`). Retain the ordinary four-hour reminder and flap rules (`we:scripts/conveyor/health-watch-core.mjs:490-491`, `we:scripts/conveyor/health-watch-core.mjs:514-517`); this item adds no reminder policy.
 - **Size remains 5 → 5** (the earlier preparation recorded 2 → 5). The five implementation files still span producer result propagation (`we:skills-src/conveyor/review-daemon.mjs:565-584`, `we:skills-src/conveyor/review-daemon.mjs:679-687`), persisted folding and evaluation (`we:scripts/conveyor/health-watch-core.mjs:768-808`), log availability (`we:scripts/conveyor/health-watch.mjs:1125-1126`), a new detector, and notification opt-in (`we:scripts/conveyor/health-smells-notify-list.mjs:28`). Seven existing/planned test files cover those seams. The new detector suite and focused notification suite are planned; all other scoped tests exist. As a story, this card retains `size` and gets no `estimatedLoc`. No dependency-edge change is proposed. Preparation stamps are left for the runner.
+- **Implemented (delivery agent):** producer (`operatorHoldsFromPlan`/`formatOperatorHoldsRecord`, snapshot withheld on discovery/reconcile/shared-read/promotion-replan failure, one `operator-holds` record per observed repository per tick); core (`foldOperatorHolds` + `operatorHoldView` + `parseOperatorHoldRecords`, memory in existing `state.operatorHolds`, new `operatorHoldAgeMinutes` default 30); shell (`probes.operatorHolds` with explicit availability from the review-daemon sample); detector `operator-hold-aged` (high, every-tick, `missingSubjectsUnknown`) and notify-list membership (list test now 26 entries). Also: the responder-catalogue coverage test lists the smell as alert-only (no responder authority). A4 live proof and the proof-plan deployment observations are NOT done here — pending after deployment.
 
 ## Design
 

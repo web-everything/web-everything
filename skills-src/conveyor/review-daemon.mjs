@@ -187,6 +187,34 @@ export async function runDaemonLoop({
  *  independent review, `review-escalation.mjs`), `ci:failed` (a required check is red — owed a ci-heal) and
  *  `review:human` (a human gate; its refusal reason is the only trace of why no advisory is coming). */
 export const EXPLAINED_HOLD_LABELS = ['review:pending', 'ci:failed', 'review:human'];
+/** The four hold kinds that wait on a person. The health watch ages them (`operator-hold-aged`). */
+export const OPERATOR_HOLD_KINDS = Object.freeze(['cap-exhausted', 'stood-down', 'review-referrals-pending', 'ruling-dispute']);
+
+/**
+ * Pure: the operator-only holds in a reconcile plan, from top-level refusals and their nested `reviewRefusal`.
+ * Only an allowlisted kind and a positive integer PR number are read; one entry per (PR, kind), sorted. Does not
+ * look at labels or the human-readable explanation, so omitted referral explanations never hide a hold.
+ * @param {{refusals?:Array<object>}} plan
+ * @returns {Array<{prNumber:number, kind:string}>}
+ */
+export function operatorHoldsFromPlan(plan) {
+  const seen = new Map();
+  for (const row of Array.isArray(plan?.refusals) ? plan.refusals : []) {
+    const prNumber = Number(row?.prNumber);
+    if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
+    for (const kind of [row?.kind, row?.reviewRefusal?.kind]) {
+      if (OPERATOR_HOLD_KINDS.includes(kind)) seen.set(`${prNumber}|${kind}`, { prNumber, kind });
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.prNumber - b.prNumber || a.kind.localeCompare(b.kind));
+}
+
+/** Pure: the one-line log record the health watch reads — `review-daemon: operator-holds {json}`. An empty
+ *  `holds` list is affirmative clearance evidence for that repository. */
+export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds }) {
+  return `review-daemon: operator-holds ${JSON.stringify({ version: 1, repo, observedAt, intervalMs, holds })}`;
+}
+
 /** `review:human` PRs are explained EVERY tick, including a referral hold (live #4271, 2026-10-07: a ruled PR went
  *  unlogged for hours because its refusal was dropped here and the notice that excuses the silence is posted once). */
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
@@ -299,7 +327,7 @@ export function sweepReviewHolds(opts) {
  * is a real read (`defaultAcquirableLaneCount`, wired in by `buildCliDaemonEffects` for the actual daemon) that
  * this tick caps its own dispatch batch by; it defaults to an unbounded `() => Infinity` here so every
  * pre-existing caller/test of this pure function is unaffected unless it opts in.
- * @returns {{reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null}}
+ * @returns {{reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null, operatorHolds:({observedAt:number, holds:Array<{prNumber:number, kind:string}>}|null)}}
  */
 export function runReviewTick({
   defaultBranch = 'main',
@@ -348,6 +376,8 @@ export function runReviewTick({
   promoteDrafts = null,
   notePromotions = null,
   onPlan = null,
+  // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
+  now = Date.now,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
@@ -405,6 +435,8 @@ export function runReviewTick({
       holdReconcile: holdReconcileResults, holdReconcileError,
     };
   }
+  // A failed promotion replan keeps the earlier plan, so it is not an authoritative post-promotion snapshot.
+  let replanError = null;
   if (typeof promoteDrafts === 'function') {
     const out = promoteDraftsThenReplan({
       plan, rawPrs, repo, promote: promoteDrafts,
@@ -413,9 +445,12 @@ export function runReviewTick({
         : reconcile({ repo, defaultBranch })),
     });
     ({ plan, rawPrs } = out);
+    replanError = out.replanError ?? null;
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
   }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
+  // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
+  const operatorHolds = replanError ? null : { observedAt: now(), holds: operatorHoldsFromPlan(plan) };
   // Keyed by PR number so `tagRound`/`tagStatus` below can look up EACH PR's own already-fetched labels rather
   // than asking `gh` again — `undefined` (a PR the tick's own listing somehow missed, a rare open-PR-appeared-
   // mid-tick race) falls through to each helper's own fresh-read default, never a hard failure.
@@ -567,7 +602,7 @@ export function runReviewTick({
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused,
     }),
-    reconcileError: null, deferredForLanes, deferredForAuth,
+    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -658,6 +693,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   let deferredForLanes = 0;
   let deferredForAuth = 0;
   const liveProcessPrs = [];
+  const operatorHoldSnapshots = [];
   for (const entry of perRepo) {
     if (entry.error) {
       failed.push({ prNumber: null, repo: entry.repo, error: entry.error });
@@ -679,11 +715,13 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     for (const p of (result.pendingNotDispatched ?? [])) pendingNotDispatched.push({ ...p, repo });
     for (const f of result.failed) failed.push({ ...f, repo });
     for (const prNumber of (result.liveProcessPrs ?? [])) liveProcessPrs.push({ repo, prNumber });
+    if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
   }
   return {
     repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
+    operatorHoldSnapshots,
     liveProcessPrs, // #3383 follow-up — see `runReviewTick`'s own field for the why; consumed by `buildCliDaemonEffects`
   };
 }
@@ -1111,6 +1149,11 @@ export function buildCliDaemonEffects({
       log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
+      // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads
+      // these, never the human-readable lines below.
+      for (const snap of (Array.isArray(result.operatorHoldSnapshots) ? result.operatorHoldSnapshots : [])) {
+        log.error(formatOperatorHoldsRecord({ repo: snap.repo, observedAt: snap.observedAt, intervalMs, holds: snap.holds }));
+      }
       if (result.authPaused) log.error(`review-daemon: ${result.authPauseReason ?? 'paused: Claude login expired — run /login'}`);
       for (const k of (Array.isArray(result.notStarted) ? result.notStarted : [])) log.error(`review-daemon: ${k.repo}#${k.prNumber} not dispatched — ${k.reason}`);
       for (const d of (Array.isArray(result.dispatched) ? result.dispatched : [])) log.error(`review-daemon: ${d.repo}#${d.prNumber} dispatched as ${d.mode ?? 'session'}${d.jobPid ? ` (job pid ${d.jobPid})` : ''}${d.agentId ? ` (agent ${d.agentId})` : ''}`);

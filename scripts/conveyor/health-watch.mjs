@@ -1124,6 +1124,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
+  // operator-hold-aged — the review daemon's structured hold snapshots ride the same newline-bounded sample. Availability
+  // is explicit every tick: a successful read (even an empty append) is `available`, a missing review log or a failed
+  // log read is not, and the core treats that as unknown — never as an empty hold set.
+  const reviewLog = logs?.samples.find((x) => x.name === 'review-daemon');
+  probes.operatorHolds = reviewLog ? { available: true, text: reviewLog.text, bootstrap: reviewLog.bootstrap } : { available: false };
   // builder-starved — the build-dispatch daemon's JSON tick log lives in the coordination root, not `logsDir`.
   const builderLogs = attempt('builderLog', () => probeDaemonLogs(flags['builder-log-dir'] || defaultBuilderLogDir(), prev.builderCursors || {}, { only: ['build-dispatch-daemon'] }));
   if (builderLogs) probes.builderLog = builderLogs.samples[0] ?? { name: 'build-dispatch-daemon', text: '' };
