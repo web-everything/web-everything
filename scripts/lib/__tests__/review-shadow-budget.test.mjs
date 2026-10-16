@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reserveShadowSession, shadowBudgetDay } from '../review-shadow-budget.mjs';
@@ -21,6 +21,10 @@ describe('high-care shadow admission', () => {
   it('does not seat a routine PR', () => {
     const earnedShape = buildShapePlan({ changedFiles: ['backlog/123-example.md'] });
     expect(seatProviderDirective(settings, 'correctness', { repo: 'o/r', pr: 1, earnedShape })).toBeNull();
+  });
+  it('does not seat a shadow without an explicit operational policy', () => {
+    expect(seatProviderDirective({ seatProvider: { correctness: 'shadow' }, agyModel: 'gemini-4-argon-high' },
+      'correctness', { repo: 'o/r', pr: 1, careLevel: 'high' })).toBeNull();
   });
   it('honors sensitive escalation reasons even below elevated', () => {
     expect(seatProviderDirective(settings, 'correctness', { repo: 'o/r', pr: 1,
@@ -44,6 +48,60 @@ describe('high-care shadow admission', () => {
   });
 });
 describe('daily session cap', () => {
+  it.each(['agy', 'shadow'].flatMap(mode => ['claude', 'skip'].flatMap(onEscape =>
+    ['quota-hold', 'cap'].map(kind => ({ mode, onEscape, kind })))))
+  ('$mode with onEscape=$onEscape preserves the Claude answer policy on $kind', async ({ mode, onEscape, kind }) => {
+    let claudeCalls = 0;
+    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode, onEscape, model: 'm' } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => { claudeCalls++; return { value: { summary: 'Claude judged', findings: [] } }; },
+      agyJuror: async () => kind === 'cap' ? { status: 'skipped', reasons: ['daily cap reached'] }
+        : { status: 'failed', reasons: ['antigravity: skip-quota-hold'] },
+      appendRow: () => true, log: () => {},
+    });
+    const answered = mode === 'shadow' || onEscape === 'claude';
+    expect(claudeCalls).toBe(Number(answered));
+    if (answered) {
+      expect(result.summary).toBe('Claude judged');
+      expect(result.skipped).toBeUndefined();
+    } else expect(result.skipped).toBeDefined();
+  });
+  it('refuses admission when the budget store is unavailable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shadow-budget-unavailable-'));
+    try {
+      const path = join(dir, 'not-a-directory');
+      writeFileSync(path, 'occupied');
+      const models = [];
+      const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
+        mode: 'shadow', model: 'gemini', fallbackModel: 'opus', dailyCap: 1,
+      } }, {
+        cwd: '.', unwrap: x => x, wrap: value => value,
+        claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
+        agyJuror: async ({ model }) => { models.push(model); return { status: 'ok' }; },
+        reserveSession: options => reserveShadowSession({ ...options, path: join(path, 'budget') }),
+        appendRow: () => true, log: () => {},
+      });
+      expect(models).toEqual([]);
+      expect(result.summary).toBe('Claude judged');
+      expect(result.shadow).toMatchObject({ status: 'skipped', reasons: ['daily cap store unavailable'] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('reserves another slot before model fallback and skips when exhausted', async () => {
+    const events = [];
+    let reservations = 0;
+    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
+      mode: 'shadow', model: 'gemini', fallbackModel: 'opus', dailyCap: 1,
+    } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
+      agyJuror: async ({ model }) => { events.push(model); return { status: 'failed', reasons: ['model failed'] }; },
+      reserveSession: () => { events.push('reserve'); return { allowed: ++reservations === 1, reason: 'daily cap reached' }; },
+      appendRow: () => true, log: () => {},
+    });
+    expect(events).toEqual(['reserve', 'gemini', 'reserve']);
+    expect(result.summary).toBe('Claude judged');
+    expect(result.shadow).toMatchObject({ status: 'skipped', reasons: ['daily cap reached'] });
+  });
   it('persists reservations across callers and resets at New York midnight, including DST', () => {
     const dir = mkdtempSync(join(tmpdir(), 'shadow-budget-'));
     try {

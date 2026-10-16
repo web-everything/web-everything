@@ -123,7 +123,7 @@ export async function runSeatWithProvider(request, {
   }
   const why = agyRun.status === 'ok' ? ['agy juror reported no session id'] : (agyRun.reasons ?? []);
   const fellBack = { provider: 'agy', model, status: agyRun.status === 'ok' ? 'voided' : agyRun.status, reasons: why };
-  if (directive.onEscape === 'skip' || isQuotaHeldShadow(agyRun) || agyRun.status === 'skipped') {
+  if (directive.onEscape === 'skip') {
     const reason = `agy seat ${fellBack.status}: ${why.join('; ') || 'no reason given'}`.slice(0, 600);
     return wrap({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: 'agy', reason }, seatProvider: fellBack });
   }

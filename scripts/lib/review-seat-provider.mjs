@@ -92,14 +92,14 @@ export function logReviewSeat(log, message) {
 export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
   const resolved = safeguards ?? resolveReviewSeatSafeguards({ log });
   const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel }),
-    shadowPolicy: resolved.value, minNonClaudeSeats: resolved.value.minNonClaudeSeats });
+    shadowPolicy: resolved.value });
   const lenses = SEAT_PROVIDER_LENSES.filter((lens) => settings.seatProvider[lens] === 'shadow');
   if (lenses.length) {
     const sources = { env: 'env WE_REVIEW_SHADOW_AGY_MODEL', settings: 'settings scripts/settings/review.json key shadowSeats.antigravity.model' };
     // Group identical directives; a policy may give the two seats different routing models.
     const groups = new Map();
     for (const lens of lenses) {
-      const d = seatProviderDirective({ ...settings, shadowPolicy: undefined }, lens);
+      const d = modelDirective(settings, lens, 'shadow');
       const description = `${settings.shadowPolicy.shadowEnabled ? 'enabled (scope selection)' : 'off (setting)'}; model ${d.model} (source: ${sources[d.modelSource] ?? 'routing-policy'}${d.fallbackModel ? `; fallback ${d.fallbackModel} from routing-policy` : ''})`;
       groups.set(description, [...(groups.get(description) ?? []), lens]);
     }
@@ -124,6 +124,11 @@ export function seatProviderDirective(settings, lens, context) {
   if (!mode || mode === 'claude') return null;
   if (mode === 'shadow' && shadowSeatStatus(settings, context) !== 'sampled') return null;
   if (!SEAT_PROVIDERS.includes(mode)) throw new TypeError(`review-seat-provider: unknown seat provider ${JSON.stringify(mode)}`);
+  return modelDirective(settings, lens, mode);
+}
+
+// Model selection is also used for logging disabled seats; it does not grant admission.
+function modelDirective(settings, lens, mode) {
   const model = settings.seatModel?.[lens] ?? settings.agyModel;
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
   const budget = mode === 'shadow' && settings.shadowPolicy ? { dailyCap: settings.shadowPolicy.dailyCap ?? 100 } : {};
@@ -137,11 +142,11 @@ export function seatProviderDirective(settings, lens, context) {
 
 /** Stable PR-level sampling, shared across both mandatory lenses and all review rounds.
  * Missing identity refuses sampling. Rates at or above 1 are never eligible.
- * Pure routing-policy projections have no operational policy; live settings always carry one.
+ * A routing-policy projection alone does not enable shadows; operational policy is required.
  */
 export function shadowSeatStatus(settings, { repo, pr, earnedShape, careLevel, reasons = [], humanRequired } = {}) {
   const policy = settings?.shadowPolicy;
-  if (!policy) return 'sampled';
+  if (!policy) return 'off (setting)';
   if (!policy.shadowEnabled) return 'off (setting)';
   if (typeof repo !== 'string' || !repo.trim() || !Number.isSafeInteger(Number(pr)) || Number(pr) < 1) return 'off (missing PR identity)';
   if ((policy.scope ?? 'high-care') === 'high-care') {

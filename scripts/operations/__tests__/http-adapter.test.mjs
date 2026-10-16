@@ -148,8 +148,7 @@ function wiring({ readerOptions, sinks: given = {}, board = BOARD } = {}) {
   // E2: every review-pr run ends at the additive ledger-events step; a no-op sink keeps these runs complete.
   const sinks = types.isProxy(given) ? given : { [REVIEW_EFFECTS.LEDGER_EVENTS]: async () => ({ written: [], missed: [] }), ...given };
   const table = {
-    // Pin the historical two-seat fixture; live diversity defaults are covered by review-pr.test.mjs.
-    [REVIEW_PR_OP]: () => ({ declaration: reviewPrOperation({ readPr: stubReader(readerOptions), minNonClaudeSeats: 0 }), sinks }),
+    [REVIEW_PR_OP]: () => ({ declaration: reviewPrOperation({ readPr: stubReader(readerOptions) }), sinks }),
     [SUGGEST_NEXT_OP]: () => ({
       declaration: suggestNextOperation({
         loadBoard: () => ({ items: board }),
@@ -173,8 +172,7 @@ function wiring({ readerOptions, sinks: given = {}, board = BOARD } = {}) {
 /** A canned juror, so `awaiting-judge` resolves without a spawn. */
 const stubJudge = async () => judgeOutcome({ summary: 'nothing blocking', findings: [] }, { costUsd: 0.01, wallMs: 10 });
 
-// Describe the same two-seat roster used by wiring(), independent of live diversity settings.
-const REVIEW_PR_DECL = () => reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
+const REVIEW_PR_DECL = () => reviewPrOperation({ readPr: stubReader() });
 const SUGGEST_DECL = () => suggestNextOperation({ loadBoard: () => ({ items: BOARD }) });
 
 const HERE = dirname(fileURLToPath(import.meta.url));

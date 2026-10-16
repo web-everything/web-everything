@@ -216,14 +216,15 @@ lanes and survive process restarts; local midnight, including DST, selects a new
 A full budget logs `daily cap reached` and records a skipped shadow. An unreadable
 counter refuses admission. Neither a cap skip nor a quota hold retries on the
 routing model or adds a Claude fallback; the original mandatory Claude answer remains.
+Skipped shadows have their own count in agreement and trial reports; they are neither
+failures nor comparisons and do not advance the trial. A primary `agy` seat still
+falls back to Claude on quota or skip results when its `onEscape` policy is `claude`.
 Use temporary stores and injected admission/providers in tests, never host quota.
 
-`review.minNonClaudeSeats` / `WE_REVIEW_MIN_NON_CLAUDE_SEATS` defaults to 1, accepts
-positive integers, and adds the Codex simplicity and then correctness advisory seats
-as needed. These answers stay advisory. A skipped/unavailable answer does not count;
-a shortfall (including a minimum above the two available Codex lenses) is recorded on
-the verdict and printed in both the verdict write-up and human advisory note. Saved
-runs retain their original roster, with the same explicit shortfall reporting.
+Gemini admission settings preserve the caller's requested Codex advisory roster.
+Tests cover primary and shadow modes with each escape policy and both skip kinds,
+all runner statuses through the real row builder and both reports, unavailable
+budget storage, and reserving a second slot before a model retry at the cap.
 These settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
 Test the actual judge request and panel reduction with injected providers, including

@@ -22,8 +22,8 @@ import { runRecordVerdictSelfSufficient } from '../record-verdict-cli.mjs';
 import { recordVerdictOperation, STAGE_REQUEST_EFFECT } from '../record-verdict.mjs';
 import { validateRequest, APPLIABLE_TARGETS } from '../../apply-review-request.mjs';
 
-// #3383 — PIN the advisory-seat default for this whole file. `runAtConfirm` below pins the diversity
-// minimum to zero so `codexAdvisory` alone chooses the historical roster; `record-verdict-io.mjs`'s own
+// #3383 — PIN the advisory-seat default for this whole file. `reviewPrOperation({readPr})` below (no
+// `codexAdvisory` passed) always seats the seat's hardcoded `false` default; `record-verdict-io.mjs`'s own
 // registration (which `advanceReviewPrToWriteUp`/`runRecordVerdictSelfSufficient` drive) instead calls
 // `codexAdvisoryFromEnv()`, which now defaults to the LIVE `{provider:'codex', model:CODEX_MODEL}` probation
 // status when the env var is unset. Two runs of the SAME operation started/resumed with different seat
@@ -68,7 +68,7 @@ function stubReader({ labels = ['review:pending'] } = {}) {
  */
 async function runAtConfirm({ id = 'run-3540', labels = ['review:pending'], codexAdvisory = false } = {}) {
   const registry = createRegistry();
-  registry.register(reviewPrOperation({ readPr: stubReader({ labels }), codexAdvisory, minNonClaudeSeats: 0 }));
+  registry.register(reviewPrOperation({ readPr: stubReader({ labels }), codexAdvisory }));
   const store = createMemoryRunStore();
   let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id, input: BASE_INPUT, registry }), { registry });
   for (;;) {

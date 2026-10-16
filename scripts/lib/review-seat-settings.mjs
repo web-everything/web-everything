@@ -114,7 +114,7 @@ export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SET
 }
 
 /** Operational panel safeguards. Standard → platform review → tool review.json → env.
- * enabled: false; scope: high-care; dailyCap: 100 (New York day); sampleRate: 0.1 in [0,1) (1 is refused); minNonClaudeSeats: positive integer, default 1.
+ * enabled: false; scope: high-care; dailyCap: 100 (New York day); sampleRate: 0.1 in [0,1) (1 is refused).
  * Invalid layers fall through and are logged. Sources are logged even in the short review CLI.
  */
 const loggedSafeguards = new Set();
@@ -127,12 +127,11 @@ export function resolveReviewSeatSafeguards({ env = process.env, file = REVIEW_S
     ...(v?.shadowSeats?.antigravity?.sampleRate !== undefined ? { sampleRate: v.shadowSeats.antigravity.sampleRate } : {}),
     ...(v?.shadowSeats?.antigravity?.scope !== undefined ? { scope: v.shadowSeats.antigravity.scope } : {}),
     ...(v?.shadowSeats?.antigravity?.dailyCap !== undefined ? { dailyCap: v.shadowSeats.antigravity.dailyCap } : {}),
-    ...(v?.minNonClaudeSeats !== undefined ? { minNonClaudeSeats: v.minNonClaudeSeats } : {}),
   });
   const plat = platform ?? platformPreference('review', { env });
   const numeric = (v) => typeof v === 'string' && v.trim() ? Number(v) : v;
   const result = cascadePolicy('review.seatSafeguards', project(tool), {
-    standard: { shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1, minNonClaudeSeats: 1 },
+    standard: { shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1 },
     platform: project(plat), env,
     envValues: {
       shadowEnabled: env.WE_REVIEW_SHADOW_AGY_ENABLED === undefined ? undefined : normOnOff(env.WE_REVIEW_SHADOW_AGY_ENABLED) === 'on'
@@ -140,14 +139,12 @@ export function resolveReviewSeatSafeguards({ env = process.env, file = REVIEW_S
       sampleRate: numeric(env.WE_REVIEW_SHADOW_AGY_SAMPLE_RATE),
       scope: env.WE_REVIEW_SHADOW_AGY_SCOPE,
       dailyCap: numeric(env.WE_REVIEW_SHADOW_AGY_DAILY_CAP),
-      minNonClaudeSeats: numeric(env.WE_REVIEW_MIN_NON_CLAUDE_SEATS),
     },
     valid: {
       scope: (v) => ['high-care', 'sampled'].includes(v),
       dailyCap: (v) => Number.isSafeInteger(v) && v >= 0,
       shadowEnabled: (v) => typeof v === 'boolean',
       sampleRate: (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1,
-      minNonClaudeSeats: (v) => Number.isSafeInteger(v) && v >= 1,
     },
   });
   const line = formatCascadeSourcesLine('review.seatSafeguards', result).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
