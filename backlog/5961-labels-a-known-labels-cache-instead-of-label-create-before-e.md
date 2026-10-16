@@ -4,6 +4,7 @@ kind: story
 size: 2
 status: open
 scope: ["we:scripts/lib/ensure-label.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/lib/forge-land-provider.mjs", "we:scripts/lib/__tests__/ensure-label.test.mjs", "we:scripts/__tests__/merge-ai-prs-known-labels.test.mjs", "we:scripts/lib/__tests__/review-label-provider.test.mjs", "we:scripts/lib/__tests__/forge-land-provider.test.mjs"]
+scopeRationale: "The tracked we:scripts/__tests__/merge-ai-prs.test.mjs covers resolution-basis and base-branch classification after the monolithic drain tests were split. Label-cache coverage belongs in the planned, scoped we:scripts/__tests__/merge-ai-prs-known-labels.test.mjs; the existing general test needs no edits."
 dateOpened: "2026-10-12"
 preparedDate: "2026-10-16"
 preparedAgainstSha: "4f198df3a8bb4dc18d227e20a896fefa499d234d"
