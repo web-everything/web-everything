@@ -605,10 +605,10 @@ export async function adoptOrphanedBuildClaims({
         // Hold BEFORE release (the wrapper's own `settleTerminal` order): a crash between the two must never
         // leave the item unheld and free to re-dispatch into the same failure.
         if (exhausted) placeHold({ num, reason: `orphan-adopt: ${attempts} resume attempt(s) died without settling` });
+        recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off` });
         releaseClaim({ num });
         clearMarker(num);
         settleRow({ runId: row?.runId, key: row?.entry?.key, outcome: exhausted ? 'orphan-resume-exhausted' : 'orphan-released' });
-        try { recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off` }); } catch { /* the release above already happened */ }
         if (payload.lane != null && payload.sessionSlug) { try { releaseLaneLease({ lane: payload.lane, sessionSlug: payload.sessionSlug }); } catch { /* best-effort */ } }
         results.push({ num, action: decision.action, reason: exhausted ? decision.reason : `${decision.reason} (${resumability.reason})` });
       }

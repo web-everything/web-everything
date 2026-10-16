@@ -985,6 +985,18 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
     expect(leases).toHaveLength(1);
     expect(leases[0].sessionSlug).toBeTruthy();
   });
+  it('keeps #4413 claimed and unsettled when the durable failure write fails', async () => {
+    const releaseClaim = vi.fn();
+    const settleRow = vi.fn();
+    const releaseLaneLease = vi.fn();
+    const result = await adoptOrphanedBuildClaims(dead('4413', {
+      recordFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim, settleRow, releaseLaneLease,
+    }));
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
+    expect(settleRow).not.toHaveBeenCalled();
+    expect(releaseLaneLease).not.toHaveBeenCalled();
+  });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
     await adoptOrphanedBuildClaims(dead('4388', {

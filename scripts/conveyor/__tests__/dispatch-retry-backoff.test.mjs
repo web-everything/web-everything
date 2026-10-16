@@ -12,6 +12,11 @@ import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatc
 const S = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
 const NOT_CONFIRMED = 'dispatch launch not confirmed (missing effect; no running session)';
 
+it('an unresolved build identity is a permanent card refusal', () => {
+  expect(buildEvidenceReasonCode({ reason: 'build card #4413 unavailable on origin/main' })).toBe('card-refused');
+  expect(buildEvidenceReasonCode({ reason: 'build card lookup unavailable' })).not.toBe('card-refused');
+});
+
 describe('card-level refusal (#4701)', () => {
   const CARD = 'step-refused at `read`: dispatch-lane: the value for {{SCOPE}} ("we:a/prepare*.test.mjs") has characters the brief cannot carry safely';
   it('classifies a refusal about what the card says, not the clone or the tick', () => {

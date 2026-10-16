@@ -273,8 +273,8 @@ describe('prepare status batched', () => {
     expect(calls.filter(([, args]) => args.some(a => a.includes('contents/')))).toHaveLength(0);
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
-    expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
+    expect(listings).toHaveLength(unstamped ? 100 : 0);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/6000', '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '100']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -340,8 +340,8 @@ describe('prepare status batched', () => {
     expect(reader.read({ num: 7100 }).pr).toBeNull();
     expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
     const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
-    expect(args[args.indexOf('--search') + 1]).toBe('');
-    expect(args[args.indexOf('--limit') + 1]).toBe('1000');
+    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/7100');
+    expect(args[args.indexOf('--limit') + 1]).toBe('100');
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
     expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
   });
@@ -2691,7 +2691,7 @@ describe('automatic item preparation', () => {
       expect(effects.listPrepareClaims().map(c => c.meta.num)).toContain('4501');
       expect(effects.placePrepareHold).not.toHaveBeenCalled();
       expect(effects.primePrepareStatus).toHaveBeenCalledTimes(1);
-      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(1);
+      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(2);
     });
     it('falls back to individual reads after a failed prime', async () => {
       const effects = fixture();
@@ -4171,5 +4171,60 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.planned[0].groupMembers).toEqual(['7202', '7203', '7204']);
     expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
     expect(effects.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('prepare discovery under repository PR volume', () => {
+  it.each([false, true])('is complete above 500 PRs and bounds all listing calls (async=%s)', async prefetch => {
+    const nums = ['5694', '5919', '5745', '5940'];
+    const cards = Object.fromEntries(nums.map(num => [num, `---\nbornAs: xabc${num.slice(-3)}\nstatus: open\n---\nvolume ${num}`]));
+    const population = Array.from({ length: 750 }, (_, number) => ({ number, state: 'MERGED',
+      title: `unrelated ${number}`, headRefName: `feature/${number}`, isCrossRepository: false }));
+    for (const [i, num] of nums.entries()) population.push({ number: 9000 + i, state: 'OPEN',
+      title: i === 2 ? `WE #${num}: prepare scope` : 'prepare',
+      headRefName: i === 2 ? 'feature/title-only' : `lane/${i === 1 ? 'xabc919' : num}-prepare-volume`,
+      isCrossRepository: false });
+    const git = prepareGitFixture(cards);
+    const searches = [];
+    const answer = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const head = /^head:(.+)$/.exec(search)?.[1];
+      const title = /^in:title "(.+)"$/.exec(search)?.[1];
+      expect(Boolean(head || title)).toBe(true);
+      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes(title))
+        .slice(0, Number(args[args.indexOf('--limit') + 1])));
+    };
+    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,
+      ...(prefetch ? { execAsync: async (...args) => answer(...args) } : {}) });
+    await reader.prime(nums.map(num => ({ num })));
+    for (const [i, num] of nums.entries()) expect(reader.listPrs({ num }).map(pr => pr.number)).toEqual([9000 + i]);
+    expect(searches).toHaveLength(12);
+    // A second read uses the same complete observations; a new identity fails closed without another gh call.
+    for (const num of nums) reader.listPrs({ num });
+    expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
+    expect(searches).toHaveLength(12);
+  });
+
+  it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {
+    const reader = createPrepareStatusReader({ exec: prepareGitFixture({ 4413: '---\nbornAs: x56mcj7\n---\nlease reaper guard' }) });
+    expect(reader.resolveCard({ num: 4413 }).path).toBe('backlog/4413-card.md');
+    const dispatch = vi.fn();
+    const acquireClaim = vi.fn();
+    const recordBuildFailure = vi.fn();
+    const tick = () => runBuildDispatchTick({ live: true, effects: {
+      planTick: () => ({ decisions: { spawnBuilds: [{ num: '99999', lane: 1 }], admission: {
+        queue: [{ num: '99999', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '99999', ready: true }],
+      } }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+      dispatch, acquireClaim, recordBuildFailure,
+    } });
+    for (let i = 0; i < 2; i++) expect((await tick()).failures).toContainEqual({ num: '99999', stage: 'card', reason: 'build card #99999 unavailable on origin/main' });
+    expect(acquireClaim).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(recordBuildFailure).toHaveBeenCalledWith({ num: '99999', reason: 'build card #99999 unavailable on origin/main' });
   });
 });

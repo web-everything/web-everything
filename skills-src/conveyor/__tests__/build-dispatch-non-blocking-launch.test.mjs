@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { recordBuildFailure, clearBuildFailure, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { runBuildDispatchTick, cliHostLoadGate, cliSettleLaunches, cliLaunchConfirmed } from '../build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../../../scripts/conveyor/build-dispatch-claim.mjs';
 
@@ -119,4 +120,47 @@ describe('one detached launch at a time (78b)', () => {
       expect(r.dispatched).toHaveLength(1);
     } finally { rmSync(lockRoot, { recursive: true, force: true }); }
   });
+});
+
+
+it.each([true, false])('retains #4413 retry history across launch confirmation and daemon restarts (pending=%s)', async pending => {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-4413-'));
+  const path = join(lockRoot, 'failures.json');
+  let clock = 0;
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+  const failure = () => recordBuildFailure({ num: '4413', reason: 'build-not-started: orphan-released' }, { path, now: clock, settings });
+  const dispatch = vi.fn(() => ({ dispatching: true, pending }));
+  const tick = (settleLaunches = async () => ({ pending: [], settled: [] }), fetchOpenPrs) => {
+    const out = tickOut();
+    out.decisions.spawnBuilds[0].num = '4413';
+    out.decisions.admission.queue[0].num = '4413';
+    out.decisions.admission.cleared[0].num = '4413';
+    // Recreate the effects every tick, using only disk for claim and failure history.
+    return runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      planTick: () => out, dispatch, settleLaunches,
+      listBuildBackoffs: () => listBuildBackoffs({ path, now: clock }),
+      clearBuildFailure: ({ num }) => clearBuildFailure(num, { path }),
+      ...(fetchOpenPrs ? { fetchOpenPrs } : {}),
+    }) });
+  };
+  try {
+    failure();
+    clock = 10000;
+    await tick();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    await tick(async () => ({ pending: [{ num: '4413', kind: 'build' }], settled: [] }));
+    await tick(async () => ({ pending: [], settled: [{ num: '4413', kind: 'build', outcome: { dispatching: true } }] }));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(listBuildDispatchClaims({ lockRoot }).map(c => c.meta.num)).toEqual(['4413']);
+    releaseBuildDispatchClaim({ num: '4413', lockRoot }); // observed dead worker
+    expect(failure().attempts).toBe(2);
+    clock = 20000;
+    await tick();
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    releaseBuildDispatchClaim({ num: '4413', lockRoot });
+    expect(failure()).toMatchObject({ attempts: 3, exhausted: true });
+    clock = 1000000;
+    await tick();
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
