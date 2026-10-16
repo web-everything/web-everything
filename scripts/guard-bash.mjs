@@ -2620,7 +2620,8 @@ function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
 // `((cd /P; …) )`, which bash runs as two nested subshells once `((` fails to close as arithmetic), a
 // `$( … )` / `sh -c` / `eval` string, or a later statement. The single effective cwd above cannot hold them
 // (the commands after a group's closer run back in the reported cwd), so they never steer it. They are only
-// ADDED to the daemon-clone check (`reason`), which can turn an allow into a deny and never the reverse: an
+// ADDED to the daemon-clone check (`reason`) and, through `cdLandingGuards`, to the primary-checkout and
+// lane-lease arms (`decide`), which can turn an allow into a deny and never the reverse: an
 // unresolvable landing is dropped (main's behaviour), and an over-approximation (an arithmetic `(( cd /P ))`,
 // a command that runs after the group closed, the hook's HOME where a rebinding is possible) can only cost a
 // false deny. The `cd` is found under the shell grammar around it (`LANDING_HEAD`: group openers, reserved
@@ -2686,6 +2687,40 @@ function daemonCloneLandings(command, cwd, home, roots, real = (p) => p) {
     const seen = new Map();
     const toReal = (p) => { if (!seen.has(p)) seen.set(p, seen.size < 256 ? real(p) : p); return seen.get(p); };
     return cdLandings(command, cwd, home, { keep: (p) => isDaemonCloneRealpath(toReal(p), roots), cap: 8 }).map(toReal);
+  } catch {
+    return [];
+  }
+}
+
+// PR #5403 review r7 — the same landings for the PRIMARY-checkout and LANE-LEASE arms: `((cd <primary>; node
+// scripts/backlog.mjs claim 1) )` claims on primary, `((cd <foreign lane>; git reset --hard) )` clobbers that
+// lane, yet the single effective cwd (rightly) never moves for a grouped `cd`. Each landing that is a primary
+// or a lane clone gets its own guard context (`laneCtx(at)` supplies a lane's `staleBehind` / lease fields; the
+// CLI reads them from disk), and only a landing whose context can deny something is returned, so `decide`
+// re-judges the command there. `cwd` is the effective cwd (judged already, so skipped) or a list whose first
+// entry is; the rest are extra bases a relative `cd` may start from. Only armed landings count toward `cap`, so
+// unarmed ones never crowd an armed one out; at most 256 realpaths and 64 `laneCtx` reads. Never throws.
+export function cdLandingGuards(command, cwd, { home = process.env.HOME ?? null, primaries = [], laneCtx = () => ({}), real = (p) => p, cap = 8 } = {}) {
+  try {
+    const bases = [cwd].flat().filter(Boolean);
+    const skip = bases[0] ?? null;
+    const reals = new Map();
+    const toReal = (p) => { if (!reals.has(p)) reals.set(p, reals.size < 256 ? real(p) : p); return reals.get(p); };
+    const guards = new Map();
+    let reads = 0;
+    const guardAt = (at) => {
+      if (guards.has(at)) return guards.get(at);
+      let g = null;
+      const primaryCwd = isPrimaryCwd(at, primaries);
+      if (at !== skip && (primaryCwd || (isLaneCwd(at) && reads++ < 64))) {
+        g = { at, primaryCwd, staleBehind: 0, ...NO_LEASE_CTX, ...(primaryCwd ? {} : laneCtx(at)) };
+        if (!(g.primaryCwd || g.staleBehind > 0 || g.foreignLiveLease || g.markedLeaseSlug || g.contestedHolderSlug)) g = null;
+      }
+      guards.set(at, g);
+      return g;
+    };
+    const landed = cdLandings(command, bases, home, { keep: (p) => !!guardAt(toReal(p)), cap });
+    return [...new Set(landed.map(toReal))].map(guardAt);
   } catch {
     return [];
   }
@@ -4422,6 +4457,16 @@ export function decide(command, ctx = {}) {
     const r = reason(seg, armed);
     if (r) return r;
   }
+  // PR #5403 review r7 — …and the primary-checkout and lane-lease arms judge the command again from each landing
+  // that is a primary or an armed lane (`cdLandingGuards`, computed by the caller). Runs only after the
+  // reported-cwd pass allowed, so it can add a deny and never remove one.
+  for (const g of ctx.landingGuards || []) {
+    const at = { ...armed, ...g, cwd: g.at, cdLandings: [] };
+    for (const seg of withNestedCommands(segments, command)) {
+      const r = reason(seg, at);
+      if (r) return r + ` (Judged from a \`cd ${g.at}\` elsewhere in this command — a subshell, group or later statement this guard cannot place. If this really runs somewhere else, run that \`cd\` as its own Bash call.)`;
+    }
+  }
   return null;
 }
 
@@ -4535,6 +4580,7 @@ if (IS_CLI) {
   let effectiveCwd = null;
   let daemonRoots = [];
   let landings = [];
+  let landingGuards = [];
   let hookSessionId = null;
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
@@ -4587,6 +4633,13 @@ if (IS_CLI) {
     // #2367/#2413 — only pay for the lease read when it could possibly matter: a lane cwd about to run
     // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && hasDestructiveLaneOp(cmd)) ({ markedLeaseSlug, contestedHolderSlug, foreignLiveLease } = laneLeaseGuardCtx(cwd, mySessionId));
+    // PR #5403 review r7 — the primary / lane-lease context of every other `cd` landing, paid for only when the
+    // command could trip one of those arms (the same two triggers as above, plus a primary tree write).
+    const backlogOp = isBacklogMutation(cmd), destructiveOp = hasDestructiveLaneOp(cmd);
+    landingGuards = cdLandingGuards(cmd, [cwd, ev.cwd || process.cwd()], { primaries, real: rp, laneCtx: (at) => ({
+      ...(backlogOp ? { staleBehind: commitsBehindUpstream(at) } : {}),
+      ...(destructiveOp ? laneLeaseGuardCtx(at, mySessionId) : {}),
+    }) });
   } catch { process.exit(0); }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names
   // no lane ref, so the gate cannot key on `lane/`). Loaded lazily so every other Bash call keeps this hook's
@@ -4595,7 +4648,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, cdLandings: landings, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, cdLandings: landings, landingGuards, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

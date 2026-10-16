@@ -17,7 +17,7 @@ import {
   usageReportSecretReadReason,
   isTruncatedOperationJson, truncatedOperationJsonReason,
   isTreeWritingBuildRun, isGeneratorScriptRun, isFileWriteRedirect, primaryTreeWriteReason,
-  daemonCloneWriteReason, cdLandings,
+  daemonCloneWriteReason, cdLandings, cdLandingGuards,
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
@@ -801,6 +801,71 @@ describe('guard-bash — a cd inside a subshell, group or later statement still 
     expect(resolveEffectiveCwd('((x=1)); cd /q && ls', PRIMARY)).toBe('/q');
     expect(decide(`(cd ${LANE}; ls); node scripts/backlog.mjs claim 1`, { primaryCwd: true, cwd: PRIMARY }))
       .toBe(decide('node scripts/backlog.mjs claim 1', { primaryCwd: true, cwd: PRIMARY }));
+  });
+});
+
+// PR #5403 review r7 — the same landings reach the PRIMARY-checkout and LANE-LEASE arms, not only the
+// daemon-clone one: `((cd <primary>; node scripts/backlog.mjs claim 1) )` really claims on primary, and
+// `((cd <foreign lane>; git reset --hard) )` really clobbers that lane. Deny-only, like the clone landings.
+describe('guard-bash — a grouped cd landing reaches the primary-checkout and lane-lease arms (PR #5403)', () => {
+  const PRIMARY = '/ws/webeverything';
+  const MINE = '/ws/.lanes/web-everything/lane-53';
+  const FOREIGN = '/ws/.lanes/web-everything/lane-7';
+  const HOME = '/ws';
+  const leases = { [FOREIGN]: { foreignLiveLease: true } };
+  const laneCtx = (at) => leases[laneRootFromCwd(at)] ?? {};   // the CLI reads the lease at the lane root too
+  const judge = (cmd, cwd = MINE, extra = {}) =>
+    decide(cmd, { cwd, ...extra, landingGuards: cdLandingGuards(cmd, cwd, { home: HOME, primaries: [PRIMARY], laneCtx }) });
+
+  it('DENIES a backlog mutation or tree write after a grouped cd into the primary checkout', () => {
+    for (const cmd of [
+      `((cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
+      `(( cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
+      `( (cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`,
+      `(cd ${PRIMARY} && node scripts/backlog.mjs resolve 1)`,
+      `{ cd ${PRIMARY}; node scripts/backlog.mjs claim 1; }`,
+      `((cd ~/webeverything; node scripts/backlog.mjs claim 1) )`,
+      `((cd ${PRIMARY}/scripts; node backlog.mjs claim 1) )`,
+      `bash -c "cd ${PRIMARY} && node scripts/backlog.mjs claim 1"`,
+      `git status; cd ${PRIMARY} && node scripts/backlog.mjs claim 1`,
+      `((cd ${PRIMARY}; npm run build) )`,
+    ]) expect(judge(cmd), cmd).toMatch(/LANE clone|primary/i);
+    expect(judge(`((cd ${PRIMARY}; node scripts/backlog.mjs claim 1) )`)).toMatch(/elsewhere in this command/);
+  });
+  it('DENIES a destructive git op after a grouped cd into a lane leased by another session', () => {
+    for (const cmd of [
+      `((cd ${FOREIGN}; git reset --hard) )`,
+      `(cd ${FOREIGN} && git clean -fd)`,
+      `((cd ${FOREIGN}/src; git checkout -- .) )`,
+      `(cd /ws/.lanes/web-everything && cd lane-7 && git reset --hard)`,
+    ]) expect(judge(cmd, PRIMARY, { primaryCwd: true }), cmd).toMatch(/LIVE lease held by ANOTHER session/);
+    // the landing's own lease context, not the reported cwd's: a marked or contested lease asks for its slug
+    const marked = (cmd) => decide(cmd, { cwd: MINE, landingGuards: cdLandingGuards(cmd, MINE, { primaries: [PRIMARY], laneCtx: () => ({ markedLeaseSlug: 'slug-7' }) }) });
+    expect(marked(`((cd ${FOREIGN}; git reset --hard) )`)).toMatch(/LANE_SESSION=slug-7/);
+    expect(marked(`((cd ${FOREIGN}; LANE_SESSION=slug-7 git reset --hard) )`)).toBeNull();
+  });
+  it('keeps allowing reads, a landing with no armed context, and the effective cwd itself', () => {
+    for (const cmd of [
+      `((cd ${PRIMARY}; git log) )`,
+      `((cd ${PRIMARY}; node scripts/backlog.mjs list) )`,
+      `((cd ${MINE}/sub; git reset --hard) )`,
+      `((cd ${FOREIGN}; git status) )`,
+      `((cd "$UNKNOWN"; node scripts/backlog.mjs claim 1) )`,
+      `((x = 1)); node scripts/backlog.mjs claim 1`,
+      `cat <<'EOF'\n(cd ${PRIMARY}; node scripts/backlog.mjs claim 1)\nEOF`,
+    ]) expect(judge(cmd), cmd).toBeNull();
+    expect(cdLandingGuards(`cd ${MINE} && git reset --hard`, MINE, { primaries: [PRIMARY], laneCtx: () => ({ foreignLiveLease: true }) })).toEqual([]);
+  });
+  it('lists only armed landings, at most 8, and never throws', () => {
+    expect(cdLandingGuards(`((cd ${PRIMARY}; ls) ); (cd /tmp; ls)`, MINE, { primaries: [PRIMARY] }))
+      .toEqual([expect.objectContaining({ at: PRIMARY, primaryCwd: true })]);
+    const many = Array.from({ length: 20 }, (_, i) => `(cd ${PRIMARY}/d${i})`).join('; ');
+    expect(cdLandingGuards(many, MINE, { primaries: [PRIMARY] })).toHaveLength(8);
+    expect(cdLandingGuards(`((cd ${FOREIGN}; ls) )`, MINE, { laneCtx: () => { throw new Error('x'); } })).toEqual([]);
+    expect(cdLandingGuards(`((cd ${PRIMARY}; ls) )`, MINE, { primaries: [PRIMARY], real: () => { throw new Error('x'); } })).toEqual([]);
+    // unarmed lane landings never crowd an armed one out
+    const lanes = Array.from({ length: 40 }, (_, i) => `(cd /ws/.lanes/web-everything/lane-${100 + i})`).join('; ');
+    expect(cdLandingGuards(`${lanes}; ((cd ${FOREIGN}; ls) )`, MINE, { laneCtx })).toEqual([expect.objectContaining({ at: FOREIGN })]);
   });
 });
 
@@ -3715,6 +3780,45 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(real).toContain('/ws/wev-merge-daemon');
     expect(real).toContain('/ws/wev-health-watch');
     expect(real).toContain('/ws/.lanes/we-drain-daemon/lane-1');
+  });
+});
+
+// PR #5403 review r7 — the impure half of the grouped-landing lease check, through the REAL CLI: a lane leased
+// by another session, entered only inside `((…) )`, is judged with its own on-disk lease. The command strings
+// are inert: the hook only inspects them, it never runs the proposed reset.
+describe('guard-bash CLI — a grouped cd into a lane leased by another session is judged there (PR #5403)', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'guard-bash-landing-lease-'));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const foreign = join(root, '.lanes', 'web-everything', 'lane-7');
+  const elsewhere = join(root, 'scratch');
+  mkdirSync(join(foreign, '.git'), { recursive: true });
+  mkdirSync(elsewhere, { recursive: true });
+  writeFileSync(join(foreign, '.git', '.lane-lease'), JSON.stringify({
+    session: 's', ownerSession: 'sess-other', acquiredAt: new Date().toISOString(), ttlMinutes: 240, holder: 'h-7',
+  }));
+  const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
+  const runHook = (command, cwd) => {
+    const res = execFileSync(process.execPath, [GUARD], {
+      input: JSON.stringify({ tool_input: { command }, cwd }),
+      env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'sess-me', WE_DAEMON_OVERLAY_DIR: join(root, 'no-overlays') },
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    }).trim();
+    return res ? JSON.parse(res) : null;
+  };
+
+  it.each([
+    ['`((` nested-subshell fallback', `((cd ${foreign}; git reset --hard) )`],
+    ['a subshell', `(cd ${foreign} && git clean -fd)`],
+    ['a later statement', `git status; cd ${foreign} && git reset --hard`],
+  ])('DENIES through %s', (_name, command) => {
+    const out = runHook(command, elsewhere);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/LIVE lease held by ANOTHER session/);
+  });
+  it('keeps allowing a read in that lane, and the same reset somewhere unleased', () => {
+    expect(runHook(`((cd ${foreign}; git status) )`, elsewhere)).toBeNull();
+    expect(runHook(`((cd ${elsewhere}; git reset --hard) )`, elsewhere)).toBeNull();
   });
 });
 
