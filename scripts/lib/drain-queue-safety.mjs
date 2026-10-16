@@ -48,7 +48,8 @@ const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sa
  * link). `at` keeps the thread position and `from` names the head the records were carried from. PURE.
  */
 function threadRecords(comments) {
-  return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
+  // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
+  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c, at) => {
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
