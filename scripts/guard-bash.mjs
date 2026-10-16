@@ -2575,37 +2575,42 @@ function literalAssignments(segments) {
 // resolver above and `cdLandings` below, so both read options, home spellings and quoting alike.
 // PR #5403 review r6 — options are skipped the way bash's `cd` reads them: `-L`/`-P` words (quoted or not),
 // then one `--`. `cd -` (OLDPWD), an option some bash rejects (`-e`/`-@` fail on macOS's bash 3.2 and leave
-// the cwd unchanged), or no operand left is unknown.
+// the cwd unchanged), or no operand left is unknown. A redirection before the operand (`cd 2>/dev/null /x`)
+// is skipped, as bash skips it. Words split on space and tab only: bash keeps CR / NBSP / other Unicode spaces
+// IN a word (`cd ~/clone\r`, `cd<NBSP>/lane` fail), so a target or option word holding one is unknown — but
+// one elsewhere in the statement (a comment, an extra argument bash 3.2 ignores) changes nothing.
+const CD_WORD = /^(?:[^ \t'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")+/;
+const CD_REDIRECT = /^\d*(?:&>>?|<>|[<>]{1,2}&?)[ \t]*(?:[^ \t'"<>]|'[^']*'|"[^"]*")+/;
 function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
-  const t = String(stmt).trim();
-  if (!/^cd\s/.test(t)) return null;
-  // bash keeps CR / NBSP / other Unicode spaces IN a word (`cd ~/clone\r`, `cd<NBSP>/lane` fail), but `\s`
-  // and trim() read them as blanks; a newline inside one statement is a quoted one. Unknown either way.
-  if (/[^\S \t\n]/.test(stmt) || t.includes('\n')) return null;
-  let raw = t.slice(2).trim();
+  const t = String(stmt).replace(/^\s+/, '');
+  if (!/^cd[ \t]/.test(t)) return null;
+  let raw = t.slice(2).replace(/^[ \t]+/, '');
+  let word = null;
   for (;;) {
-    const w = raw.match(/^(?:[^\s'"]|'[^']*'|"[^"\\$`]*")+/);
-    const word = w ? w[0].replace(/['"]/g, '') : '';
-    if (!word.startsWith('-')) break;
-    if (word !== '--' && !/^-[LP]+$/.test(word)) return null;
-    raw = raw.slice(w[0].length).trim();
-    if (word === '--') break;
+    const r = raw.match(CD_REDIRECT);
+    if (r) { raw = raw.slice(r[0].length).replace(/^[ \t]+/, ''); continue; }
+    const w = raw.match(CD_WORD);
+    if (!w || `'"`.includes(raw[w[0].length] ?? ' ') || /[^\S \t]/.test(w[0])) return null;
+    const opt = w[0].replace(/['"\\]/g, '');
+    if (!opt.startsWith('-') || word === '--') { word = w[0]; break; }
+    if (opt !== '--' && !/^-[LP]+$/.test(opt)) return null;
+    raw = raw.slice(w[0].length).replace(/^[ \t]+/, '');
+    word = opt;
   }
-  if (!raw) return null;
+  const resolved = (target) => (target ? (target.startsWith('/') ? target : resolvePath(base || '.', target)) : null);
   // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
-  if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
-    const target = expandCdTarget(raw, home);
-    return target ? (target.startsWith('/') ? target : resolvePath(base || '.', target)) : null;
+  if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(word)) return resolved(expandCdTarget(word, home));
+  // whole target is $VAR / ${VAR} / "$VAR": a literal `NAME=value` from earlier in the command, or unknown
+  const v = word.match(/^(?:\$\{?([A-Za-z_]\w*)\}?|"\$\{?([A-Za-z_]\w*)\}?")$/);
+  if (v) {
+    const val = vars[v[1] ?? v[2]];
+    if (!val || /[*?]/.test(val) || (v[1] && val.includes('['))) return null;   // unquoted `[` is a glob
+    return resolved(val);
   }
-  let target = raw.split(/\s+/)[0];                         // first arg only (ignore trailing redirs/opts)
-  // ONE quoted word, no quote inside it: `'/a'/'b[1]'` is several pieces, and its `[` stays a glob
-  const quoted = /^(?:'[^']*'|"[^"]*")$/.test(target);
-  target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
-  const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-  if (v) target = vars[v[1]] ?? '';
-  // still unexpanded / globby → fail safe. A `[` is a glob only UNQUOTED (`cd '/tmp/clone[1]'` is literal).
-  if (!target || /[`$(*?]/.test(target) || (!quoted && target.includes('['))) return null;
-  return target.startsWith('/') ? target : resolvePath(base || '.', target);
+  // still unexpanded / a substitution → fail safe. Otherwise quotes and backslashes come off the way bash
+  // removes them (`/ws/"clone"`, `/ws/cl\one`, `'/tmp/clone[1]'`), and an UNQUOTED glob stays unknown.
+  if (/[`$()]/.test(word)) return null;
+  return resolved(expandCdTarget(word, home));
 }
 
 // PR #5403 review r6 — every OTHER place a `cd` can land: inside a subshell or group (`(cd /P; …)`, and
@@ -2616,15 +2621,15 @@ function cdStatementTarget(stmt, { vars, home, base, resolvePath }) {
 // unresolvable landing is dropped (main's behaviour), and an over-approximation (an arithmetic `(( cd /P ))`,
 // a command that runs after the group closed, the hook's HOME where a rebinding is possible) can only cost a
 // false deny. The `cd` is found under the shell grammar around it (`LANDING_HEAD`: group openers, reserved
-// words, `!`, a function header, a leading redirection) and the wrappers / quoted program word
-// `canonicalCommand` peels (`command cd`, `X=1 cd`, `\cd`, `"cd"`); `pushd <dir>` lands like `cd`. A relative
-// target is resolved against every base it could start from: `cwd` (one path or several) and each earlier
-// absolute landing (`(cd /ws && cd clone && …)`). Bounded: `withNestedCommands`' depth and node caps, at most
-// LANDING_BASES bases and LANDING_CAP landings (past the cap a landing is dropped — main's behaviour).
-const LANDING_HEAD = /(?:\s+|\(|\{(?=\s)|!(?=\s)|(?:then|do|else|elif|if|while|until)(?=\s)|function\s+[^\s(){}]+(?:\s*\(\))?|[A-Za-z_][\w-]*\s*\(\)|\d*(?:<|>{1,2})&?\s*[^\s;&|()<>]+)/y;
+// words, `!`, a function header, a `case` head or pattern, a leading redirection) and the wrappers / quoted
+// program word `canonicalCommand` peels (`command cd`, `X=1 cd`, `\cd`, `"cd"`); `pushd <dir>` lands like
+// `cd`. A relative target is resolved against every base it could start from: `cwd` (one path or several) and
+// each earlier absolute landing (`(cd /ws && cd clone && …)`). `keep` filters what is returned (only landings
+// it keeps count toward the cap, so out-of-clone landings can never crowd a clone landing out). Bounded:
+// `withNestedCommands`' depth and node caps, at most LANDING_BASES bases and `cap` kept landings.
+const LANDING_HEAD = /(?:\s+|\(|\{(?=\s)|!(?=\s)|(?:then|do|else|elif|if|while|until)(?=\s)|case\s+[^\s;&|()]+\s+in(?=\s)|\(?[^\s;&|()]+(?:\|[^\s;&|()]+)*\)|function\s+[^\s(){}]+(?:\s*\(\))?|[A-Za-z_][\w-]*\s*\(\)|\d*(?:<|>{1,2})&?\s*[^\s;&|()<>]+)/y;
 const LANDING_BASES = 16;
-const LANDING_CAP = 256;
-export function cdLandings(command, cwd, home = process.env.HOME ?? null, resolvePath = resolve) {
+export function cdLandings(command, cwd, home = process.env.HOME ?? null, { resolvePath = resolve, keep = null, cap = 256 } = {}) {
   const cmd = stripHeredocBodies(String(command || ''));
   const parsed = parseSegments(cmd);
   if (!cmd || parsed.unterminated) return [];
@@ -2634,7 +2639,7 @@ export function cdLandings(command, cwd, home = process.env.HOME ?? null, resolv
   if (!bases.length) bases.push(null);
   const out = new Set();
   for (const seg of withNestedCommands(parsed.segments, cmd)) {
-    if (out.size >= LANDING_CAP) break;
+    if (out.size >= cap) break;
     const s = String(seg);
     if (!/\b(?:cd|pushd)\b/.test(s.replace(/["'\\]/g, ''))) continue;     // cheap filter before any peel
     let i = 0;
@@ -2645,25 +2650,35 @@ export function cdLandings(command, cwd, home = process.env.HOME ?? null, resolv
       i = LANDING_HEAD.lastIndex;
     }
     let stmt = canonicalCommand(s.slice(i));
-    if (/^pushd\s/.test(stmt)) {
-      if (/^pushd\s+[-+]/.test(stmt)) continue;                            // `-n` / `+N` / `-N`: no new dir
-      stmt = 'cd -- ' + stmt.slice(5).trim();
+    if (/^pushd[ \t]/.test(stmt)) {
+      const rest = stmt.slice(5).replace(/^[ \t]+/, '');
+      if (/^--(?:[ \t]|$)/.test(rest)) stmt = 'cd ' + rest;
+      else if (/^[-+]/.test(rest)) continue;                               // `-n` / `+N` / `-N`: no new dir
+      else stmt = 'cd -- ' + rest;
     }
     for (const base of bases.slice()) {
       const target = cdStatementTarget(stmt, { vars, home: h, base, resolvePath });
       if (!target) continue;
-      out.add(target);
+      if (!keep || keep(target)) out.add(target);
       if (bases.length < LANDING_BASES && !bases.includes(target)) bases.push(target);
     }
   }
-  return [...out].slice(0, LANDING_CAP);
+  return [...out].slice(0, cap);
 }
 
 // Only a landing inside a registered clone can change the daemon-clone verdict of a git-state op or an
-// operand-less write, so only those reach `reason` — capped, so a long command never multiplies its
-// per-segment work (review r6: thousands of `cd` landings each re-ran the arm for every segment).
-function daemonCloneLandings(landings, roots) {
-  return landings.filter((p) => isDaemonCloneRealpath(p, roots)).slice(0, 8);
+// operand-less write, so only those reach `reason` — at most 8, so a long command never multiplies its
+// per-segment work (review r6: thousands of `cd` landings each re-ran the arm for every segment). `real`
+// maps a landing to the form the roots are kept in (the CLI realpaths both). Never throws: a landing scan
+// that fails (a pathological nest) adds nothing, and every other arm still runs.
+function daemonCloneLandings(command, cwd, home, roots, real = (p) => p) {
+  try {
+    const seen = new Map();
+    const toReal = (p) => { if (!seen.has(p)) seen.set(p, real(p)); return seen.get(p); };
+    return cdLandings(command, cwd, home, { keep: (p) => isDaemonCloneRealpath(toReal(p), roots), cap: 8 }).map(toReal);
+  } catch {
+    return [];
+  }
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -3510,7 +3525,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // PR #5403 review r6 — and from every other `cd` landing in the command (deny-only; see `cdLandings`).
   for (const at of [cwd, ...cdLandings]) {
     const daemonWrite = daemonCloneWriteReason(s, { cwd: at, roots: daemonCloneRoots });
-    if (daemonWrite) return daemonWrite;
+    if (daemonWrite) return at === cwd ? daemonWrite : daemonWrite + ` (Judged from a \`cd ${at}\` elsewhere in this command — a subshell, group or later statement this guard cannot place. If this write really runs outside the clone, run the clone \`cd\` as its own Bash call.)`;
   }
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4392,7 +4407,7 @@ export function decide(command, ctx = {}) {
   // PR #5403 review r6 — the daemon-clone arm also judges every `cd` landing the single cwd cannot hold. The
   // CLI passes them realpath'd; a pure caller gets them computed here. Only paid for when a clone is registered.
   const armed = ctx.daemonCloneRoots?.length && !ctx.cdLandings
-    ? { ...ctx, cdLandings: daemonCloneLandings(cdLandings(command, ctx.cwd, ctx.home), ctx.daemonCloneRoots) } : ctx;
+    ? { ...ctx, cdLandings: daemonCloneLandings(command, ctx.cwd, ctx.home, ctx.daemonCloneRoots) } : ctx;
   for (const seg of withNestedCommands(segments, command)) {
     const r = reason(seg, armed);
     if (r) return r;
@@ -4555,7 +4570,7 @@ if (IS_CLI) {
     try { daemonRoots = daemonCloneRoots(workspace); } catch { daemonRoots = []; }
     // PR #5403 review r6 — every other `cd` landing (a subshell / group / substitution / later statement),
     // realpath'd like `cwd` so the daemon-clone match agrees with it. Deny-only (see `cdLandings`).
-    if (daemonRoots.length) landings = daemonCloneLandings(cdLandings(cmd, [ev.cwd || process.cwd(), cwd]).map(rp), daemonRoots);
+    if (daemonRoots.length) landings = daemonCloneLandings(cmd, [ev.cwd || process.cwd(), cwd], undefined, daemonRoots, rp);
     // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
     // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && isBacklogMutation(cmd)) staleBehind = commitsBehindUpstream(cwd);

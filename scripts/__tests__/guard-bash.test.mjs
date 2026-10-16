@@ -642,15 +642,31 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd /tmp/clone[1] && ls')).toBe(REPORTED);
     expect(at('D=/tmp/clone[1]; cd "$D" && ls')).toBe('/tmp/clone[1]');
     expect(at('D=/tmp/clone[1]; cd $D && ls')).toBe(REPORTED);
-    // several quoted pieces are not one quoted word: the `[` between them is still a glob
-    expect(at("cd '/tmp'/'clone[1]' && ls")).toBe(REPORTED);
-    expect(at(`cd '${REPORTED}'/'a[1]' && npm run build`)).toBe(REPORTED);
+    // quotes come off piece by piece, as bash removes them: a quoted `[` is literal, an unquoted one a glob
+    expect(at("cd '/tmp'/'clone[1]' && ls")).toBe('/tmp/clone[1]');
+    expect(at(`cd '${REPORTED}'/'a[1]' && npm run build`)).toBe(`${REPORTED}/a[1]`);
+    expect(at("cd '/tmp'/clone[1] && ls")).toBe(REPORTED);
+    expect(at('cd /tmp/"clone" && ls')).toBe('/tmp/clone');
+    expect(at("cd ''/tmp/clone && ls")).toBe('/tmp/clone');
+    expect(at('cd /tmp/cl\\one && ls')).toBe('/tmp/clone');
+    expect(at('cd /tmp/a\\ b && ls')).toBe('/tmp/a b');
   });
-  it('a Unicode space or CR next to the cd target is part of the word in bash, so the target is unknown', () => {
+  it('a Unicode space or CR in the cd or target word is part of the word in bash, so the target is unknown', () => {
     for (const ch of ['\r', String.fromCharCode(0xa0), String.fromCharCode(0x2028)]) {
       expect(at(`cd${ch}/tmp/clone && ls`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`cd /tmp/clone${ch}\nls`), JSON.stringify(ch)).toBe(REPORTED);
     }
+    // …but one elsewhere in the statement (a comment, an extra argument bash 3.2 ignores) changes nothing
+    const nbsp = String.fromCharCode(0xa0);
+    expect(at(`cd /tmp/clone # caf${nbsp}e\nls`)).toBe('/tmp/clone');
+    expect(at(`cd ${REPORTED} x${nbsp}y && npm run build`, HOME)).toBe(REPORTED);
+    expect(at(`cd /tmp/clone x${nbsp}y && ls`)).toBe('/tmp/clone');
+  });
+  it('skips a redirection before the cd operand and reads an escaped option word', () => {
+    expect(at('cd >/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd 2>/dev/null /tmp/clone && ls')).toBe('/tmp/clone');
+    expect(at('cd /tmp/clone>/dev/null && ls')).toBe('/tmp/clone');
+    expect(at('cd \\-P /tmp/clone && ls')).toBe('/tmp/clone');
   });
   // PR #5403 review r6 — `cd` options are read the way bash reads them, so `cd -P /clone` lands in /clone.
   it('skips cd options and one `--`; `cd -`, an unknown option or no operand stays unresolved', () => {
@@ -723,8 +739,21 @@ describe('guard-bash — a cd inside a subshell, group or later statement still 
       // a relative cd that starts from an earlier landing
       `(cd /ws && cd wev-review-daemon && git reset --hard)`,
       `cd /ws; cd x; cd ../wev-review-daemon; git reset --hard`,
+      // quoting, escapes and redirections inside the cd statement
+      `cd /ws/"wev-review-daemon" && git reset --hard`,
+      `cd "${CLONE}"/sub && git reset --hard`,
+      `cd /ws/wev\\-review-daemon && git reset --hard`,
+      `cd \\-P ${CLONE} && git reset --hard`,
+      `cd >/dev/null ${CLONE} && git reset --hard`,
+      `cd ${CLONE} # caf${String.fromCharCode(0xa0)}e\ngit reset --hard`,
+      `pushd -- ${CLONE}; git reset --hard`,
+      `case x in x) cd ${CLONE};; esac; git reset --hard`,
+      // landings outside any clone never crowd a clone landing out
+      `${Array.from({ length: 300 }, (_, i) => `(cd /tmp/x${i})`).join('; ')}; (cd ${CLONE}; git reset --hard)`,
     ]) expect(decide(cmd, ctx), cmd).toMatch(/DAEMON CLONE/);
     expect(decide(`pushd -n ${CLONE}; git status`, ctx)).toBeNull();
+    // a deny judged from a grouped landing says so, and how to split the command
+    expect(decide(`(cd ${CLONE} && git log -1) && git commit -m x`, ctx)).toMatch(/elsewhere in this command/);
   });
   it('stays fast on a long command (landings never multiply the per-segment work)', () => {
     const many = Array.from({ length: 3000 }, (_, i) => `cd /x${i}; rm f${i}`).join('; ');
@@ -750,6 +779,7 @@ describe('guard-bash — a cd inside a subshell, group or later statement still 
     expect(cdLandings(`(cd ~/x); cd -P /y; (cd "$U")`, LANE, HOME).sort()).toEqual([`${HOME}/x`, '/y']);
     expect(cdLandings(`(cd sub; ls)`, LANE, HOME)).toEqual([`${LANE}/sub`]);
     expect(cdLandings('git status', LANE, HOME)).toEqual([]);
+    expect(cdLandings(`(cd /a); (cd ${CLONE})`, LANE, HOME, { keep: (p) => p === CLONE, cap: 1 })).toEqual([CLONE]);
   });
   it('never moves the single effective cwd: a group\'s cd does not steer the commands after it', () => {
     const PRIMARY = '/ws/webeverything';
@@ -3730,6 +3760,20 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     const out = runHook(command, startsProtected ? fakeClone : lane);
     expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
     expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+  // PR #5403 review r6 — run from a LANE, the cd into the clone sits inside a group the single cwd cannot hold.
+  it.each([
+    ['`((` nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`],
+    ['a subshell', `(cd ${fakeClone} && git checkout --detach)`],
+    ['a home-spelled grouped cd', '((cd ~/some-new-daemon-clone; git checkout --detach) )'],
+  ])('DENIES from a lane through %s', (_name, command) => {
+    const out = runHook(command, lane, root);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+  it('a landing scan that cannot finish never switches the other arms off', () => {
+    const out = runHook(`GIT_AUTHOR_EMAIL=x@y git commit -m x; ${'$('.repeat(8000)}`, lane, root);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
   // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
