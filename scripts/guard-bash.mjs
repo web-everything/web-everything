@@ -2789,19 +2789,53 @@ function parseStatement(tokens) {
 // A function definition or subshell at the head of a segment (`f() {`, `function f`, `( …`).
 const STRUCTURED_SEGMENT = /^\s*(?:(?:if|then|else|elif|fi|while|until|do|done|for|select|case|esac|function|[{}()])(?:\s|$)|\(|[A-Za-z_][\w.-]*\s*\(\s*\))/;
 
-// PR #5403 review — the words that may stand before a cd whose following commands run where it lands although
-// it is not this shell's own cd: a subshell `(`, a condition or body keyword, a function header.
-const NESTED_CD_LEAD = /^\s*(?:\(\s*|(?:if|then|elif|else|while|until|do|!)\s+|function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?\s*\{?\s*|[A-Za-z_][\w.-]*\s*\(\s*\)\s*\{?\s*)/;
+// PR #5403 review — the regions a cd may sit in without being this shell's own unconditional cd: a subshell
+// `( … )`, an `if`/`while`/`until`/`for`/`case`/`select`, a function body. A `{ … }` group is tracked only to
+// match its `}`. Each segment's leading words open or close them; what follows those words is `rest`.
+const REGION_LEAD = /^\s*(?:(\()(?!\()\s*|(if|while|until|for|case|select)\s+|(?:then|do|else|elif|!|time(?:\s+-p)?|coproc)\s+|(?:function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.-]*\s*\(\s*\))\s*(\{)?\s*|(\{)\s+)/;
+const REGION_CLOSE = /^\s*(?:(fi|done|esac)|(\}))(?=[\s;&|)]|$)\s*/;
 
-// The parsed cd statement `stmt` holds behind such words, or null.
-function nestedCd(stmt) {
+// Past this many possible directories the walk gives up (`overflow`), and the CLI refuses the command.
+const MAX_MAYBE_CWDS = 32;
+// …and past this much substitution text holding a cd, walked for landings.
+const MAX_SUBSTITUTION_TEXT = 200000;
+const CD_WORD = /(?:^|[^\w.-])cd(?![\w.-])/;
+
+/** Apply `stmt`'s leading region words to `regions` (a stack of 'sub' | 'cond' | 'func' | 'group'). Returns
+ *  `rest`, the text after them (a one-statement subshell's closing `)` removed), and `closeTrailing`, which
+ *  closes the subshells its unmatched trailing `)` end — called once the statement itself is handled. A closer
+ *  that matches nothing open is ignored: a region that never closes keeps its cds landing-only (more denies). */
+function regionStep(stmt, regions) {
   let rest = stmt;
-  for (let m = NESTED_CD_LEAD.exec(rest); m && m[0]; m = NESTED_CD_LEAD.exec(rest)) rest = rest.slice(m[0].length);
-  if (rest === stmt) return null;
-  // the `)` closing a one-statement subshell (`(cd /x)`) is not part of the cd's operand
-  if ((rest.match(/\)/g) || []).length > (rest.match(/\(/g) || []).length) rest = rest.replace(/\)\s*$/, '');
-  const statement = parseStatement(shellWords(rest));
-  return statement.cmd[0]?.text === 'cd' && !statement.invalid && !statement.opaque ? statement : null;
+  for (let m = REGION_CLOSE.exec(rest); m; m = REGION_CLOSE.exec(rest)) {
+    const top = regions[regions.length - 1];
+    if (m[1] ? top === 'cond' : top === 'func' || top === 'group') regions.pop();
+    rest = rest.slice(m[0].length);
+  }
+  for (let m = REGION_LEAD.exec(rest); m && m[0]; m = REGION_LEAD.exec(rest)) {
+    if (m[1]) regions.push('sub');
+    else if (m[2]) regions.push('cond');
+    else if (m[3]) regions.push('func');                        // a header whose `{` comes later opens nothing
+    else if (m[4]) regions.push('group');
+    rest = rest.slice(m[0].length);
+  }
+  let depth = 0;                                                // one linear pass: parens outside quotes
+  let unmatched = 0;
+  for (let i = 0, q = ''; i < rest.length; i++) {
+    const ch = rest[i];
+    if (ch === '\\' && q !== "'") { i++; continue; }
+    if (q) { if (ch === q) q = ''; continue; }
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '(') depth++;
+    else if (ch === ')') { if (depth) depth--; else unmatched++; }
+  }
+  if (unmatched) rest = rest.replace(/\)[\s)]*$/, '');
+  return {
+    rest,
+    closeTrailing: () => {
+      for (let n = 0; n < unmatched && regions[regions.length - 1] === 'sub'; n++) regions.pop();
+    },
+  };
 }
 
 // Split leading options off `words`: `opts` is each letter prefixed by its sign (`-r+x`), `optArgs` the
@@ -3030,7 +3064,7 @@ export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, h
 }
 
 // The effective cwd and every landing, in one walk: `{ cwd, landings }`.
-export function walkCds(command, reportedCwd, resolvePath = resolve, home = process.env.HOME) {
+export function walkCds(command, reportedCwd, resolvePath = resolve, home = process.env.HOME, intoSubstitutions = true) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -3110,16 +3144,36 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
   }
   const subshell = (k) => /^\|(?!\|)/.test(seps[k - 1] ?? '') || /^\|(?!\|)/.test(seps[k] ?? '') || background[k];
   // `cur` is where the walk has reached: undefined while no cd moved it, null once a cd went somewhere unknown.
-  // `decided` is the effective cwd, fixed by the first cd with a directory operand.
+  // `decided` is the effective cwd, fixed by the first cd with a directory operand outside any region.
+  // `maybe` holds the other directories this shell may be in, once a cd ran inside a region (`( … )`, an
+  // `if`/`while`/`for`/`case` or a function body): it never shrinks, and a relative cd lands from each of them.
   let cur;
   let decided;
+  let overflow = false;
+  let subBudget = MAX_SUBSTITUTION_TEXT;
   const landings = [];
-  const land = (dir) => {
-    cur = dir;
-    if (dir !== null && !landings.includes(dir)) landings.push(dir);
-  };
+  const maybe = [];
+  const note = (list, dir) => { if (!list.includes(dir)) list.push(dir); };
   // A relative path from an unknown place is read from the reported cwd, as main's resolver read it.
   const from = (p) => (p.startsWith('/') ? p : resolvePath(cur ?? (reportedCwd || '.'), p));
+  // Every place `p` may resolve to: from `cur`, then from each `maybe` directory. All become landings.
+  const reach = (p) => {
+    const all = [from(p), ...(p.startsWith('/') ? [] : maybe.map((m) => resolvePath(m, p)))];
+    for (const d of all) note(landings, d);
+    return all;
+  };
+  const land = (dir) => {
+    if (dir === null) { cur = null; return; }
+    const [first, ...rest] = reach(dir);
+    if (maybe.length) for (const d of rest) note(maybe, d);
+    cur = first;
+  };
+  const landNested = (dir) => {
+    for (const d of reach(dir)) note(maybe, d);
+    if (maybe.length > MAX_MAYBE_CWDS) overflow = true;
+  };
+  const regions = [];                                           // open regions and groups, innermost last
+  const inRegion = () => regions.some((r) => r !== 'group');
   const homeFor = (prefix) => {
     const temp = prefixValues(prefix);
     return temp.has('HOME') ? temp.get('HOME') : homeCtx;
@@ -3144,24 +3198,36 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
     }
     return { target: null, unknown: false };
   };
-  // Where a cd's words go, or null when that is unknown or nowhere new.
+  // Where a cd's words go (as written: `land`/`landNested` resolve it), or null when unknown or nowhere new.
   const cdDestination = (cmd, prefix) => {
     const { target, unknown } = cdOperand(cmd);
     if (unknown) return null;
-    const dest = target ?? homeFor(prefix);
-    return dest ? from(dest) : null;
+    return target ?? (homeFor(prefix) || null);
   };
   let structured = false;
   for (const [k, stmt] of parsed.segments.entries()) {
     if (parsed.commented[k]) continue;                          // begins inside a `#` comment
     structured ||= STRUCTURED_SEGMENT.test(stmt);
     const sure = !structured && !/^(?:&&|\|\|)/.test(seps[k - 1] ?? '');
+    // A cd inside a command substitution runs in a subshell: its landings only, from where the walk is.
+    // `substitutionBodies` already lists the bodies at every depth, so each is walked once, not recursively.
+    // Nested bodies overlap, so their total size can grow with the square of the text: past a budget the walk
+    // gives up (`overflow`) rather than slow the hook.
+    if (intoSubstitutions && CD_WORD.test(stmt)) {
+      for (const body of substitutionBodies(stmt)) {
+        if (!CD_WORD.test(body)) continue;
+        if ((subBudget -= body.length) < 0) { overflow = true; break; }
+        for (const d of walkCds(body, cur ?? reportedCwd, resolvePath, homeCtx, false).landings) note(landings, d);
+      }
+    }
+    const { rest, closeTrailing } = regionStep(stmt, regions);
+    const nested = inRegion();
     const words = shellWords(stmt);
     const statement = parseStatement(words);
     const { prefix, cmd } = statement;
     if (statement.opaque && statement.cd) {                     // a cd whose words cannot be trusted
-      decided ??= reportedCwd;
-      land(null);
+      if (!nested) { decided ??= reportedCwd; land(null); }
+      closeTrailing();
       continue;
     }
     if (!subshell(k)) for (const op of expansionOps(stmt)) apply(op, sure);
@@ -3175,20 +3241,28 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
           : op.fromPrefix ? { name: op.name, val: kept.get(op.name) ?? null } : op));
         for (const op of resolved) apply(op, sure);
       }
-      // A cd inside `( … )`, after `if`/`while`/`then`/…, or in a function body: the commands after it run
-      // there, but it neither moves nor decides this shell's cwd. It only adds a landing.
-      const nested = nestedCd(stmt);
-      if (nested) {
-        const dest = cdDestination(nested.cmd, nested.prefix);
-        if (dest) landings.includes(dest) || landings.push(dest);
+      // A cd behind `(`, `if`, `then`, `time`, `coproc`, a function header, …: parse what follows those words.
+      // Outside a region that is only a `coproc` or a lost closer, so it is landing-only either way.
+      const inner = rest === stmt ? null : parseStatement(shellWords(rest));
+      if (inner && inner.cmd[0]?.text === 'cd' && !inner.invalid && !inner.opaque) {
+        const dest = cdDestination(inner.cmd, inner.prefix);
+        if (dest) landNested(dest);
       }
+      closeTrailing();
+      continue;
+    }
+    closeTrailing();
+    if (nested) {                                               // a cd inside a region only adds landings
+      const own = rest === stmt ? statement : parseStatement(shellWords(rest)); // without a closing `)`
+      const dest = cdDestination(own.cmd, own.prefix);
+      if (dest) landNested(dest);
       continue;
     }
     const { target, unknown } = cdOperand(cmd);
     if (target === null && !unknown) {                          // no directory operand → HOME, as cd runs
       const h = homeFor(prefix);
       if (h === null) land(null);                               // unknown HOME
-      else if (h) land(from(h));                                // an empty HOME leaves cd where it was
+      else if (h) land(h);                                      // an empty HOME leaves cd where it was
       continue;
     }
     if (unknown) {                                              // unknown target, `cd -` or a cd that fails
@@ -3196,10 +3270,10 @@ export function walkCds(command, reportedCwd, resolvePath = resolve, home = proc
       land(null);
       continue;
     }
-    land(from(target));
+    land(target);
     decided ??= cur;
   }
-  return { cwd: decided ?? cur ?? reportedCwd, landings };
+  return { cwd: decided ?? cur ?? reportedCwd, landings, overflow };
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -5098,7 +5172,7 @@ if (IS_CLI) {
     // PR #5403 review — every protected directory a cd of the command may land in is judged too.
     const isProtected = (d) => isPrimaryCwd(d, primaries) || isLaneCwd(d) || isDaemonCloneRealpath(d, daemonRoots);
     const candidates = guardCwdCandidates(cwd, walk.landings.map(rp), isProtected);
-    if (candidates === null) tooManyCwds = true;
+    if (candidates === null || walk.overflow) tooManyCwds = true;
     else extraCwdCtxs = candidates.slice(1).map(dirCtx);
   } catch { process.exit(0); }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names

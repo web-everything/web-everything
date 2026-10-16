@@ -9,7 +9,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd, resolveCdLandings,
-  guardCwdCandidates, decideAcrossCwds, MAX_GUARD_CWDS,
+  guardCwdCandidates, decideAcrossCwds, MAX_GUARD_CWDS, walkCds,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
   isVerificationRun, isBackgrounded, backgroundedVerificationReason, dispatchedAgentVerificationReason,
@@ -580,6 +580,25 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(lands('cd /tmp && (cd clone && ls)')).toEqual(['/tmp', '/tmp/clone']);
     expect(at('cd /tmp && (cd clone && ls)')).toBe('/tmp');
     expect(lands('(cd "$UNKNOWN") && ls')).toEqual([]);
+    // every cd until the region closes is nested, and a relative cd lands from each directory the shell may be in
+    expect(at('(cd /tmp && cd /tmp/sub && make); ls')).toBe(REPORTED);
+    expect(lands('(cd /tmp && cd /tmp/sub && make); ls')).toEqual(['/tmp', '/tmp/sub']);
+    expect(lands('(cd /ws && cd webeverything && ls)')).toEqual(['/ws', `${REPORTED}/webeverything`, '/ws/webeverything']);
+    for (const cmd of ['if cd /ws; then :; fi; cd webeverything && ls', 'while cd /ws; do break; done; cd webeverything && ls']) {
+      expect(lands(cmd), cmd).toContain('/ws/webeverything');
+    }
+    expect(lands('cd /l/a && (cd .. && cd ../../webeverything && ls)')).toContain('/webeverything');
+    // after the region closes, a plain cd decides again
+    expect(at('(cd /tmp && make); cd /lane && ls')).toBe('/lane');
+    expect(at('{ cd /abs/clone; }; ls')).toBe('/abs/clone');
+    // a cd behind `time`/`coproc` or in a substitution lands too
+    for (const cmd of ['time (cd /abs/clone && ls)', 'echo $(cd /abs/clone && ls)', 'echo `cd /abs/clone && ls`', 'coproc cd /abs/clone']) {
+      expect(lands(cmd), cmd).toEqual(['/abs/clone']);
+      expect(at(cmd), cmd).toBe(REPORTED);
+    }
+    // too many possible directories gives up, and the CLI refuses
+    const chain = Array.from({ length: 40 }, (_, i) => `if cd /d${i}; then :; fi; cd s`).join('; ');
+    expect(walkCds(chain, REPORTED, undefined, HOME).overflow).toBe(true);
   });
   it('the CLI judges a command in each protected landing: one deny is enough', () => {
     const PRIMARY = '/ws/webeverything';
@@ -4013,9 +4032,13 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['subshell cd', `(cd ${fakeClone} && git reset --hard)`],
       ['subshell cd after a plain cd', `cd /tmp && (cd ${fakeClone} && git reset --hard)`],
       ['condition cd', `if cd ${fakeClone}; then echo in; fi; git reset --hard`],
+      ['timed subshell cd', `time (cd ${fakeClone} && git reset --hard)`],
+      ['substitution cd', `echo $(cd ${fakeClone} && git reset --hard)`],
+      ['second cd in a subshell', `(cd /tmp && cd ${fakeClone} && git reset --hard)`],
     ])('DENIES a write when an earlier cd lands in the clone: %s', (_n, cmd) => denies(cmd));
     it('keeps a read in the clone followed by a lane listing allowed', () => {
       expect(runHook(`cd ${fakeClone} && git status; cd ${lane} && ls`, lane, root)).toBeNull();
+      expect(runHook(`(cd /tmp && make); cd ${lane} && ls`, lane, root)).toBeNull();
     });
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
