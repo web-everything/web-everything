@@ -151,12 +151,12 @@ const STORE_ENV = ['OPERATION_COMPLETIONS_DIR', 'OPERATION_DELIVERY_REPORTS_DIR'
  * canned `gh pr view` JSON; `stopFailTimes` fails the first N `claude stop` calls per id; `live` (default true) puts
  * every fixture session's full id in the `ps aux` snapshot, so the pid-dead axis runs and reads each session as ALIVE.
  */
-function runReaperInProcess(args = [], { agents = '[]', ghPrs = {}, stopFailTimes = 0, live = true, backlogDir, stores = {} } = {}) {
-  const claudeCalls = []; const ghCalls = []; const sleeps = []; const unexpected = [];
+function runReaperInProcess(args = [], { agents = '[]', ghPrs = {}, stopFailTimes = 0, live = true, backlogDir, stores = {}, execOverride } = {}) {
+  const claudeCalls = []; const ghCalls = []; const psCalls = []; const sleeps = []; const unexpected = [];
   const stopCounts = new Map();
   let stdout = ''; let stderr = '';
   const rows = JSON.parse(agents);
-  const exec = (cmd, argv) => {
+  const recording = (cmd, argv) => {
     const line = argv.join(' ');
     if (cmd === 'claude' && line === 'agents --json --all') { claudeCalls.push(line); return agents; }
     if (cmd === 'claude' && argv[0] === 'stop') {
@@ -166,10 +166,15 @@ function runReaperInProcess(args = [], { agents = '[]', ghPrs = {}, stopFailTime
       return '';
     }
     if (cmd === 'gh' && argv[0] === 'pr' && argv[1] === 'view') { ghCalls.push(line); return ghPrs[argv[2]] ?? '{}'; }
-    if (cmd === 'ps' && line === 'aux') return live ? rows.map((r) => `user 1 0.0 0.0 0 0 ? S 0:00 claude --resume=${r.sessionId}`).join('\n') : '';
+    if (cmd === 'ps' && line === 'aux') {
+      psCalls.push(line);
+      const alive = Array.isArray(live) ? live : live ? rows.map((r) => r.sessionId) : [];
+      return alive.map((sid) => `user 1 0.0 0.0 0 0 ? S 0:00 claude --resume=${sid}`).join('\n');
+    }
     unexpected.push(`${cmd} ${line}`);
     throw new Error(`unexpected command: ${cmd} ${line}`);
   };
+  const exec = execOverride ?? recording;
   const saved = Object.fromEntries(STORE_ENV.map((k) => [k, process.env[k]]));
   const root = mkdtempSync(join(tmpdir(), 'we-session-reaper-inproc-'));
   try {
@@ -182,7 +187,7 @@ function runReaperInProcess(args = [], { agents = '[]', ghPrs = {}, stopFailTime
     const code = runSessionReaperCli(['--no-run-rating', ...args], {
       exec, sleep: (ms) => sleeps.push(ms), stdout: (s) => { stdout += s; }, stderr: (s) => { stderr += s; }, backlogDir,
     });
-    return { code, stdout, stderr, claudeCalls, ghCalls, sleeps, unexpected };
+    return { code, stdout, stderr, claudeCalls, ghCalls, psCalls, sleeps, unexpected };
   } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(root, { recursive: true, force: true });
@@ -257,8 +262,9 @@ describe('the stop loop retries a transient `claude stop` failure — WE #3479, 
   }, EXEC_TIMEOUT_MS);
 
   // #5725 — "a failure that never clears is still a real failure after exhausting the retry budget — bounded, not silent"
-  // moved to the in-process driver below (same assertions, the 300/900 ms waits injected instead of slept). This
-  // real-child case above keeps the retry wiring (real `sleepSyncMs` default, real executor) covered end to end.
+  // moved to the in-process driver below (same assertions, the 300/900 ms waits injected instead of slept). The real-child
+  // case above keeps the retry wiring (real `sleepSyncMs` default, real executor) covered end to end, and the real-child
+  // "missing `id`" anomaly case above pins that the executable turns the driver's non-zero return into the process exit status.
 });
 
 describe('the ground-truth axis, end to end through the real CLI wiring — the conveyor-3451 shape', () => {
@@ -411,21 +417,11 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
 describe('the in-process driver — #5725 wiring the real-child suite cannot cheaply pin', () => {
   it('an unreadable listing exits 0 with an empty stdout and the warning on stderr — nothing safe to act on', () => {
-    const exec = () => { throw new Error('claude: not logged in'); };
-    let stdout = ''; let stderr = '';
-    const saved = process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS;
-    process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS = '0';
-    try {
-      const code = runSessionReaperCli(['--json', '--no-run-rating', '--no-pid-dead-detection'], {
-        exec, sleep: () => {}, stdout: (s) => { stdout += s; }, stderr: (s) => { stderr += s; },
-      });
-      expect(code).toBe(0);
-    } finally {
-      if (saved === undefined) delete process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS; else process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS = saved;
-    }
-    expect(stdout).toBe('');
-    expect(stderr).toMatch(/unreadable/);
-    expect(stderr).toMatch(/not logged in/);
+    const run = runReaperInProcess(['--json', '--no-pid-dead-detection'], { execOverride: () => { throw new Error('claude: not logged in'); } });
+    expect(run.code).toBe(0);
+    expect(run.stdout).toBe('');
+    expect(run.stderr).toMatch(/unreadable/);
+    expect(run.stderr).toMatch(/not logged in/);
   });
 
   it('a failure that never clears is still a real failure after exhausting the retry budget — bounded, not silent (injected executor, 300/900 ms waits requested in order)', () => {
@@ -468,26 +464,11 @@ describe('the in-process driver — #5725 wiring the real-child suite cannot che
       { id: 'gone1', sessionId: 'gone-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-9' },
       { id: 'live1', sessionId: 'live-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-10' },
     ]);
-    const ps = [];
-    const exec = (cmd, argv) => {
-      if (cmd === 'claude' && argv.join(' ') === 'agents --json --all') return agents;
-      if (cmd === 'ps') { ps.push(argv.join(' ')); return 'user 1 0.0 0.0 0 0 ? S 0:00 claude --resume=live-1-full-uuid\n'; }
-      throw new Error(`unexpected command: ${cmd} ${argv.join(' ')}`);
-    };
-    let stdout = '';
-    const saved = process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS;
-    process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS = '0';
-    try {
-      const code = runSessionReaperCli(['--dry-run', '--json', '--no-run-rating', '--no-ground-truth', '--no-stall-detection'], {
-        exec, sleep: () => {}, stdout: (s) => { stdout += s; }, stderr: () => {},
-      });
-      expect(code).toBe(0);
-    } finally {
-      if (saved === undefined) delete process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS; else process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS = saved;
-    }
-    const report = JSON.parse(stdout);
-    expect(report.wouldStop.map((r) => r.id)).toEqual(['gone1']);
-    expect(ps).toEqual(['aux']); // one snapshot per pass
+    const run = runReaperInProcess(['--dry-run', '--json', '--no-ground-truth', '--no-stall-detection'], { agents, live: ['live-1-full-uuid'] });
+    expect(run.code).toBe(0);
+    expect(JSON.parse(run.stdout).wouldStop.map((r) => r.id)).toEqual(['gone1']);
+    expect(run.psCalls).toEqual(['aux']); // one snapshot per pass
+    expect(run.unexpected).toEqual([]);
   });
 });
 

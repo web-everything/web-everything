@@ -15,7 +15,7 @@ Profile the closure, then either split the two needed functions behind a small m
 
 ## Acceptance
 
-- [A1] **Executable** — matched before/after runs of `we:scripts/conveyor/__tests__/pr-stack.test.mjs` through the admitted `npm run test:unit` entrypoint (at least five alternating rounds, same worker count and Node version, queue wait reported separately) show a lower median wall time, with all 118 original cases still passing and no case skipped or deleted.
+- [A1] **Executable** — matched before/after runs of `we:scripts/conveyor/__tests__/pr-stack.test.mjs` through the admitted `npm run test:unit` entrypoint (at least five alternating rounds, same worker count and Node version, queue wait reported separately) show a lower median wall time, with all 118 cases present after card 5725 (its 117 plus the one it added) still passing and no case skipped or deleted.
 - [A2] Export identity holds: the old and new import paths return the same functions with the same behavior; the existing reconcile-fix-dispatch suites pass unchanged.
 
 ## Non-goals

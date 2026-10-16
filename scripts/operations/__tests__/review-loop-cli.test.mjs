@@ -403,6 +403,19 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.lines.join('\n')).not.toMatch(/QUEUED for a human/);
   });
 
+  it('#5725 — with NO lookup injected (explicit `undefined` restores the production defaults) the real checkout-backlog lookups still run, find nothing, and the card is filed', async () => {
+    const { declaration, registry } = registryFor({});
+    const fileItemCalls = [];
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-prevention-default-lookup',
+      findFiledPrevention: undefined, findFiledRoundCards: undefined,
+      fileItem: async (input) => { fileItemCalls.push(input); return stubFileItem()(); },
+    });
+    expect(out.stopped).toBe('complete');
+    expect(fileItemCalls).toHaveLength(1);
+  });
+
   it('carries `preventionFiled` (num + path) in --json, with no `queued`/`resumeCommand`/`outstandingGuards` fields', async () => {
     const { declaration, registry } = registryFor({});
     const store = createMemoryRunStore();

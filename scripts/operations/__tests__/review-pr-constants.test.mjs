@@ -2,6 +2,9 @@
  * #5725 — `review-pr-constants.mjs` is the extracted home of `CONFIRM_ACTORS` / `CONFIRM_OPTIONS` / `REVIEW_EFFECTS`.
  * The old import path (`review-pr.mjs`) must keep exporting the SAME frozen objects, with the same values.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as constants from '../review-pr-constants.mjs';
 import * as operation from '../review-pr.mjs';
@@ -38,6 +41,12 @@ describe('review-pr-constants — values', () => {
       STACK_HOLD: 'review.stack-hold',
     });
     expect(constants.REVIEW_EFFECTS.LEDGER).toBe('verdict-ledger.append');
+  });
+
+  it('the constants module imports only the ledger type owner — never the full operation back (the cheap-import property)', () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'review-pr-constants.mjs'), 'utf8');
+    const specifiers = [...source.matchAll(/^\s*import\s[^;]*?from\s+['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+    expect(specifiers).toEqual(['./effect-executor.mjs']);
   });
 
   it('effect types are unique, so a sink lookup keyed on type can never confuse two effects', () => {
