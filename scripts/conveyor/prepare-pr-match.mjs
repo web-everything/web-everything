@@ -31,15 +31,19 @@ export function preparePrGuard({ num, bornAs, prs = [], lastDispatchAt }) {
     .sort(newestFirst)[0] ?? null;
 }
 
-export function prepareLaunchRefusal({ num, bornAs, prs = [], lastDispatchAt,
+export function prepareLaunchRefusal({ num, bornAs, prs = [],
   now = Date.now(), mergedGuardHours = 24, claims = [], liveRows = [], ledgerFailures = [], releases = [] }) {
   const matching = prs.filter(pr => isPreparePrFor(pr, { num, bornAs })).sort(newestFirst);
   const open = matching.find(pr => pr.state === 'OPEN');
   if (open) return { reason: `open prepare PR #${open.number} (${open.headRefName})` };
-  const merged = lastDispatchAt && preparePrGuard({ num, bornAs, prs: matching, lastDispatchAt });
-  const mergedAge = merged ? now - Date.parse(merged.createdAt) : NaN;
-  if (mergedGuardHours > 0 && mergedAge >= 0 && mergedAge <= mergedGuardHours * 3_600_000) {
-    return { reason: `merged prepare PR #${merged.number} after last dispatch (within ${mergedGuardHours}h guard)` };
+  // A slow review does not consume the post-merge guard. Inspect every matching merge:
+  // creation order need not match merge order, and dispatch history may not survive a restart.
+  const merged = matching.filter(pr => pr.state === 'MERGED')
+    .map(pr => ({ pr, at: Date.parse(pr.mergedAt ?? pr.closedAt ?? pr.createdAt) }))
+    .filter(({ at }) => mergedGuardHours > 0 && now - at >= 0 && now - at <= mergedGuardHours * 3_600_000)
+    .sort((a, b) => b.at - a.at)[0]?.pr;
+  if (merged) {
+    return { reason: `merged prepare PR #${merged.number} (within ${mergedGuardHours}h guard)` };
   }
   const key = normNum(num);
   const claim = claims.find(c => normNum(c.meta?.num) === key);

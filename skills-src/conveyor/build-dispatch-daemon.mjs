@@ -1210,32 +1210,32 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // A refused card is recorded, so the next ticks hold it out of tick-core (see `prepareRefusals`).
   const refusePrepareLaunch = async (num, { pickBornAs, cardBornAs, replacesStamp } = {}) => {
     const bornAs = pickBornAs ?? admission.queue?.find(r => normNum(r.num) === num)?.bornAs ?? cardBornAs;
-    const lastDispatchAt = [
-      ...ledgerFailures.filter(f => normNum(f.num) === num).map(f => f.recordedAt),
-      ...prepareClaims.filter(c => normNum(c.meta?.num) === num).map(c => c.meta.claimedAt),
-      ...allSettledPrepares.filter(r => normNum(r.num) === num).map(r => r.startedAt),
-      ...prepareRows.filter(r => normNum(r.num) === num).map(r => r.row?.entry?.startedAt),
-    ].filter(Boolean).sort().at(-1);
     let refusal;
     try {
       if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
       const prs = await effects.listPreparePrs({ num, bornAs });
       if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
       refusal = prepareLaunchRefusal({ num, bornAs, prs,
-        lastDispatchAt, now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
+        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
         claims: prepareClaims, liveRows: prepareRows, ledgerFailures, releases });
       // Keep WHICH prepare PR refused the card, so the refusal probe reads that PR and no other.
       const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
       const matched = prs.find(pr => pr?.number === refusingPr);
+      const scopeHold = (admission.held ?? []).find(h => normNum(h.num) === num
+        && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
+      if (matched?.state === 'MERGED' && scopeHold) {
+        refusal.note = `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope`;
+      }
       if (refusal && matched) refusalDetail.set(num, { pr: refusingPr, head: matched.headRefName ?? null,
+        ...(refusal.note ? { note: refusal.note } : {}),
         ...(bornAs ? { bornAs } : {}), ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
     } catch {
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
     refusedPrepares.add(num);
-    prepare.refused.push({ num, reason: refusal.reason });
-    console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}`);
+    prepare.refused.push({ num, ...refusal });
+    console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
@@ -2088,7 +2088,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     for (const [sha, status] of statuses) prepareBlobStatuses.set(sha, status);
   }
   const prListArgs = (search, limit) => ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-    '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)];
+    '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', String(limit)];
   function ghPrList(search, limit) {
     if (!queryResults.has(search)) {
       try {

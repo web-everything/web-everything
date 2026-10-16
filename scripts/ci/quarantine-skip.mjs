@@ -20,6 +20,8 @@
  *   (run everything — the safe direction). The decision and its reason go to stderr (the CI log).
  *
  * Usage (repo root as cwd, inside a GitHub Actions job):  node scripts/ci/quarantine-skip.mjs
+ *   Without --job, selects legacy and tagged test-shard entries (the unit-suite default).
+ *   --job=<ci job name> selects entries for that job; --nonblocking prints their files.
  *   Test/replay overrides: --event=<name> --ref=<ref> --event-path=<file> --base=<branch> --changed=<a,b> --now=<ms>
  */
 import { execFileSync } from 'node:child_process';
@@ -71,9 +73,9 @@ export function quarantineSkip({
   const changedFiles = changed !== undefined ? changed
     : flags.changed !== undefined ? String(flags.changed).split(',').filter(Boolean)
       : (ctx.known && !ctx.onMain ? changedOf({ board, base }) : null);
-  const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now });
+  const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now, job: firstSet(flags.job) });
   const why = `${d.why}${d.unsupported?.length ? `; ${d.unsupported.length} name-qualified entr${d.unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file)` : ''}`;
-  return { line: d.skip.map((f) => `--exclude=${f}`).join(' '), why, skip: d.skip };
+  return { line: (flags.nonblocking ? d.skip : d.skip.map((f) => `--exclude=${f}`)).join(' '), why, skip: d.skip };
 }
 
 function flagsOf(argv) {

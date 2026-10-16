@@ -82,6 +82,16 @@ net and fallback lists with the same check. Deterministic reader tests must reje
 real-git fixtures must preserve HEAD, branch, index, status and dirty file contents around each read.
 Review checklist: for each new fail-closed path, does the failure mode scale per PR or per sweep?
 
+## Quarantine proof fixtures
+
+Quarantine addition scenarios using `red-main-quarantine-62da75ed3.json` must explicitly supply a
+hypothetical earlier run of the failing sha whose re-run passed the job (run attempt 2, latest job
+attempt `success`), never a passing attempt on the failing run itself (a job that passes there is no
+longer failing): the recorded episode had none and must remain a negative replay. A green merge group is never flake
+proof, because it tested its queued PR's changes, which may fix the failure. Keep proof validation
+enabled and the recorded fixture unchanged, including when exercising the once-per-tick safety net
+through both health smells.
+
 ## Soak shard isolation
 
 Keep the 50-tick baseline alone in CI shard 1; balance break scenarios by measured time across the other
@@ -880,8 +890,12 @@ An ended attempt frees its prepare slot even while its PR is OPEN (that PR refus
 test cap-many ended OPEN-PR cards and assert a clean card still launches.
 Probe OPEN and MERGED PRs without stamps: neither is an unstamped failure.
 The launch guard must also run without a surviving claim, and refuse when PR listing throws.
-Merged launch refusals expire by PR creation age under `prepare.mergedGuardHours` (default 24;
-0 disables only the merged refusal); probe the time boundary with an injected clock.
+Merged launch refusals measure age from `mergedAt`, falling back to `closedAt`, then `createdAt`,
+under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal). They apply even
+without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
+created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
+records a "scope moved after prepare" note for the build step in the refusal and its persisted
+bookkeeping; it must never dispatch another prepare within the window.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
