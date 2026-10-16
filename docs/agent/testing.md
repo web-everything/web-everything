@@ -23,6 +23,8 @@ it does not prove a tool actually read the file or confine the tool's filesystem
 Regression coverage: **scrubs unsafe filesRead at the comment and evidence sinks**,
 **scrubs filesRead when completing speculative evidence and retrying legacy rows**, and
 **the production re-check uses an independent pinned lane and cleans it**.
+For evidence leak assertions, inspect nested string values directly: JSON property names can
+match unsafe inputs such as `"file"`, while serialization can hide control characters by escaping them.
 
 `redTeam.recheckReadsRepo` and `redTeam.skipCardOnly` default to true. The cascade is standard
 → platform (`delivery-platform-preferences.json`'s `redTeam` block) → tool

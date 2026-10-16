@@ -524,13 +524,20 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     'a\nb\n', 'a//b', './file', 'a/./b', '.git/config', 'a/'.repeat(301) + 'b',
   ];
 
+  function evidenceStrings(value) {
+    if (typeof value === 'string') return [value];
+    if (value && typeof value === 'object') return Object.values(value).flatMap(evidenceStrings);
+    return [];
+  }
+
   it.each(unsafeFilesRead)('scrubs unsafe filesRead at the comment and evidence sinks: %j', async unsafe => {
     const { io, rows } = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'refuted', filesRead: [unsafe] }] }) });
     const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
     expect(rows).toHaveLength(1);
-    expect(rows[0].findings[0].filesRead).toEqual([]);
+    expect(rows[0].findings[0]).toMatchObject({ file: BREAK.file, filesRead: [], recheckOutcome: 'unverifiable' });
     expect(result.comment.body).not.toContain(unsafe);
-    expect(JSON.stringify(rows)).not.toContain(unsafe);
+    // Inspect stored values: JSON property names include "file", and serialization escapes control characters.
+    for (const value of evidenceStrings(rows)) expect(value).not.toContain(unsafe);
     // Direct rendering also covers retrying a legacy, unsanitized evidence row.
     const body = renderRedTeamComment({ pr: 5, rev: REV, findings: [{ ...BREAK, filesRead: [unsafe] }], recheckStatus: 'ok', foldedVerdict: 'accept' });
     expect(body).toContain('Files read: none');
