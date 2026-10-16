@@ -553,6 +553,36 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
     expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
     expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME=/other && cd ~/clone')).toBe('/other/clone');
+    expect(at('echo "$HOME" ${HOME}; cd ~/clone')).toBe(`${HOME}/clone`);
+  });
+  // PR #5403 review r5 — an assignment that runs in a CHILD shell never changes the parent's HOME, so it must
+  // not steer the parent's `cd ~` (a subshell, a pipeline element, a background job, a prefix assignment).
+  it('a HOME assignment in a subshell, pipeline or background job keeps the parent HOME', () => {
+    expect(at('( true; HOME=/tmp ); cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('(true;HOME=/tmp); cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('( HOME=/tmp; true ); cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('((true; HOME=/tmp) ); cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('HOME=/tmp | true; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('true | HOME=/tmp; cd ~/clone')).toBe(`${HOME}/clone`);
+    expect(at('HOME=/tmp & cd ~/clone')).toBe(`${HOME}/clone`);
+  });
+  it('a HOME rebinding it cannot place in the parent shell makes home unknown, never a guessed value', () => {
+    for (const pre of [
+      'HOME=/tmp true', '{ HOME=/tmp; }', '{ true; HOME=/tmp; }', 'false && HOME=/tmp', 'true || HOME=/tmp',
+      'if true; then HOME=/tmp; fi', 'f() { HOME=/tmp; }', 'declare HOME=/tmp', 'export -n HOME', 'unset HOME',
+      'read -r HOME </dev/null', 'printf -v HOME /tmp', 'eval "HOME=/tmp"', 'eval "$X"', 'source ./env.sh',
+      '. ./env.sh', 'X=$(HOME=/tmp)', 'HOME+=/x', '(( HOME=5 ))', 'export HOME=/tmp OTHER=/x',
+    ]) expect(at(`${pre}; cd ~/clone`), pre).toBe(REPORTED);
+    expect(at("HOME='/tmp' && true; cd ~/clone")).toBe('/tmp/clone');
+    expect(at('cd ~/HOME && ls')).toBe(`${HOME}/HOME`);
+  });
+  it('a lane-variable assignment in a subshell, pipeline or background job keeps the parent value', () => {
+    expect(at('D=/p; (true;D=/tmp); cd "$D"')).toBe('/p');
+    expect(at('D=/p; ( true; D=/tmp ); cd "$D"')).toBe('/p');
+    expect(at('D=/p; D=/tmp | true; cd "$D"')).toBe('/p');
+    expect(at('D=/p; D=/tmp & cd "$D"')).toBe('/p');
+    expect(at('D=/p; D=/q; cd "$D"')).toBe('/q');
   });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);
@@ -3545,6 +3575,8 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   it.each([
     ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
     ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    ['unspaced subshell assignment', `D=${fakeClone}; (true;D=/tmp); cd "$D" && git checkout --detach`, false],
+    ['pipeline assignment', `D=${fakeClone}; D=/tmp | true; cd "$D" && git checkout --detach`, false],
     ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
     ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
   ])('retains the main refusal for %s', (_name, command, startsProtected) => {
@@ -3572,6 +3604,9 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
       ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
       ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
+      ['subshell HOME assignment', '( true; HOME=/tmp ); cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['pipeline HOME assignment', 'HOME=/tmp | true; cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['background HOME assignment', 'HOME=/tmp & cd ~/some-new-daemon-clone && git checkout --detach'],
     ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
