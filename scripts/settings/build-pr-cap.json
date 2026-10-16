@@ -1,0 +1,4 @@
+{
+  "$comment": "Builder landing-cap population. builder counts explicit build/prepare lane refs or the mechanical delivery body provenance; all restores the previous population. Existing openPrCap exclusions still apply. Cascade: standard builder → platform build.maxOpenPrsCounts → tool → WE_BUILD_MAX_OPEN_PRS_COUNTS; the source is logged.",
+  "build": { "maxOpenPrsCounts": "builder" }
+}

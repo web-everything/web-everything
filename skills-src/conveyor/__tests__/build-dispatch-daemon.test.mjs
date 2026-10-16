@@ -808,7 +808,7 @@ describe('runBuildDispatchTick — #4131/#4382 build-orphan-adopt', () => {
 
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans } });
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans, killSwitch: () => ({ engaged: true, reason: 'operator' }) } });
-    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `x-${i}` }));
+    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `lane/${9000 + i}-build-test` }));
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans, fetchOpenPrs: async () => [{ repo: 'we', prs: tooManyPrs }] } });
 
     expect(seen.map((o) => o?.allowResume)).toEqual([true, false, false]);
@@ -903,7 +903,7 @@ describe('runBuildDispatchTick — #4465 build-dispatch-hold-router wiring', () 
       ],
       routeHeldItems: async (plan) => { seen.push(plan.map((p) => p.num)); return plan.map((p) => ({ num: p.num, route: p.route, action: 'x' })); },
     };
-    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `x-${i}` }));
+    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `lane/${9000 + i}-build-test` }));
 
     await runBuildDispatchTick({ live: true, effects: base });
     const killed = await runBuildDispatchTick({ live: true, effects: { ...base, killSwitch: () => ({ engaged: true, reason: 'operator' }) } });
@@ -1781,6 +1781,27 @@ describe('automatic item preparation', () => {
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
     };
   }
+  it('skips a prepare merged 20 minutes ago before allocating the next slot', async () => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T23:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    const rows = [{ num: '4501' }, { num: '4502' }];
+    effects.planTick = (bk) => ({ decisions: {
+      admission: { queue: rows, held: rows.map(r => ({ ...r, reason: 'needs-prepare' })) },
+      itemPrepareSpawns: planPrepareSpawns({ needsPrepare: rows, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = ({ num }) => num === '4501' ? [{ number: 91, state: 'MERGED',
+      headRefName: 'lane/4501-prepare-design', createdAt: '2026-10-14T00:00:00Z', mergedAt: '2026-10-16T22:40:00Z' }] : [];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '4501', reason: 'skipped in planning: prepared 20 min ago (#91)' }]);
+      expect(tick.prepare.planned.map(r => r.num)).toEqual(['4502']);
+      expect(tick.prepare.launched.map(r => r.num)).toEqual(['4502']);
+      expect(tick.prepare.refused).toEqual([]);
+    } finally { log.mockRestore(); }
+  });
   function claimed(effects, num = '4501', { age = 40, alive = false } = {}) {
     acquireBuildDispatchClaim({ num, lockRoot, owner: 'host:10', pid: 10,
       nowMs: Date.now() - age * 60_000 });
@@ -2048,7 +2069,7 @@ describe('automatic item preparation', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const tick = await runBuildDispatchTick({ live: true, effects });
-      expect(tick.prepare.refused).toEqual([{ num: '5028', reason }]);
+      expect(_name === 'merged after dispatch' ? tick.prepare.skippedInPlanning : tick.prepare.refused).toEqual(_name === 'merged after dispatch' ? [{ num: '5028', reason: expect.stringContaining('skipped in planning: prepared') }] : [{ num: '5028', reason }]);
       expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
       expect(effects.dispatch).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
@@ -2098,7 +2119,7 @@ describe('automatic item preparation', () => {
       const tick = await runBuildDispatchTick({ live: true, effects });
       expect(effects.preparePolicy).toHaveBeenCalledTimes(1);
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
-      expect(tick.prepare.refused).toHaveLength(launches ? 0 : 1);
+      expect(tick.prepare.skippedInPlanning).toHaveLength(launches ? 0 : 1);
     });
   it.each([
     ['2026-10-16T20:32:38Z', false],
@@ -2123,10 +2144,9 @@ describe('automatic item preparation', () => {
       if (launches) {
         expect(tick.prepare.refused).toEqual([]);
       } else {
-        const note = `scope moved after prepare: ${detail}; build step must reconcile scope`;
-        expect(tick.prepare.refused).toEqual([{ num: '5966', reason: 'merged prepare PR #5399 (within 24h guard)', note }]);
-        expect(tick.nextBookkeeping.prepareRefusals).toEqual([expect.objectContaining({ num: '5966', pr: 5399, note })]);
-        expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
+        expect(tick.prepare.refused).toEqual([]);
+        expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)') }]);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('skipped in planning: prepared'));
       }
     } finally { log.mockRestore(); }
   });
@@ -4052,11 +4072,12 @@ describe('grouped PREPARE daemon ticks', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const tick = await runBuildDispatchTick({ live: true, effects });
-      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204', '7205'] })]);
+      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: _name === 'merged prepare PR' ? ['7202', '7204', '7205'] : ['7202', '7203', '7204', '7205'] })]);
       expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
       expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', groupMembers: ['7202', '7204', '7205'] }));
-      expect(tick.prepare.refused).toEqual([{ num: '7203', reason }]);
-      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7203']);
+      expect(tick.prepare.refused).toEqual(_name === 'merged prepare PR' ? [] : [{ num: '7203', reason }]);
+      expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(_name === 'merged prepare PR' ? [] : ['7203']);
+      if (_name === 'merged prepare PR') expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7203', reason: 'skipped in planning: prepared 60 min ago (#94)' }]);
     } finally { log.mockRestore(); }
   });
 

@@ -31,7 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
-import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
@@ -506,7 +507,32 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
-  const out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
+  let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const planningSkips = [];
+  const initialAdmission = out?.decisions?.admission ?? {};
+  const prepareCandidates = new Map([
+    ...(initialAdmission.held ?? []).filter(h => ['needs-prepare', 'prepare-stale', 'no-size'].includes(h.reason)),
+    ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? []),
+  ].map(row => [normNum(row.num), row]));
+  for (const [num, candidate] of prepareCandidates) {
+    if (typeof effects.listPreparePrs !== 'function') continue; // legacy injected readers
+    try {
+      const bornAs = candidate.bornAs ?? initialAdmission.queue?.find(r => normNum(r.num) === num)?.bornAs
+        ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
+      const prs = await effects.listPreparePrs({ num, bornAs });
+      const merged = recentMergedPrepare({ num, bornAs, prs,
+        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
+      if (!merged) continue;
+      const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+      planningSkips.push({ num, reason });
+      console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
+    } catch { /* The launch guard still fails closed on an unreadable listing. */ }
+  }
+  if (planningSkips.length) {
+    tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
+    out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  }
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
@@ -918,7 +944,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
-  const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
+  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
   const settledPrepares = new Map();
   for (const row of allSettledPrepares) {
     if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
@@ -934,7 +960,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
-  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
@@ -942,6 +967,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
@@ -1226,7 +1252,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
-    && !refusalHeldNums.has(normNum(num))
+    && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
@@ -2634,6 +2660,7 @@ export function policyFrom(flags, env = process.env) {
   const n = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
   return {
     ...BUILD_DISPATCH_POLICY,
+    ...readBuilderPrCapSettings({ env }),
     maxConcurrentBuilds: n(flags['max-concurrent'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT, BUILD_DISPATCH_POLICY.maxConcurrentBuilds),
     maxConcurrentExternalBuilds: n(flags['max-concurrent-external'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL, BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds),
     maxOpenPrs: n(flags['max-open-prs'], BUILD_DISPATCH_POLICY.maxOpenPrs),
@@ -2767,7 +2794,7 @@ async function dryRun(flags) {
     timings: { ...timer.snapshot(), tickCore: tick.timings.tickCore },
     statusLine: tick.statusLine,
     policy: {
-      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenItems: policy.maxOpenItems,
+      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenPrsCounts: policy.maxOpenPrsCounts, maxOpenPrsCountsSource: policy.maxOpenPrsCountsSource, maxOpenItems: policy.maxOpenItems,
       // #3383 continuation, live incident 2026-09-28 — `globalFreezeLabels` is what actually freezes every
       // candidate now; the three per-PR `*-stalled` labels only hold a scope-overlapping build (`freezeLabels`
       // still lists all four for anything reading the historical shape, kept alongside, not replaced).

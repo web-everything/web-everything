@@ -1167,3 +1167,20 @@ membership, with trusted live comments plus the shared follow-up state's `cleara
 Failure counts/backoff live in that same state file; preserve them during follow-up writes. Exercise false
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
+
+### Builder cap and prepare cooldown
+
+`build.maxOpenPrsCounts` defaults to `builder`; `all` restores the earlier open-PR
+population. The policy cascade logs the effective value and source. Builder provenance
+is an explicit `lane/<card><optional-attempt>-build-*` or `lane/<card><optional-attempt>-prepare-*` ref (including hash identities)
+or the mechanical delivery wrapper's body signature. A generic lane ref, fixer, or
+Codex author does not prove ownership. The REST producer and normalized planner input
+must preserve `body`; the producer-contract test pins that path. Existing card-only
+and accepted exclusions still apply; scope and freeze-label guards inspect every PR.
+
+Before finalizing prepare picks, inspect all held prepare candidates using
+`recentMergedPrepare`, shared with `prepareLaunchRefusal`. Add recent merges to the
+planner's prepare exclusions and re-plan the same tick so the next candidate gets the
+slot. Log the elapsed minutes and PR number. Keep the launch guard as the final race
+check. Replay a merge 20 minutes ago with one slot and a clean second candidate;
+include grouped members, hash aliases, guard-off, and older merges in the touched suites.
