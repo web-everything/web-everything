@@ -46,10 +46,20 @@ describe('health responder closed decision table', () => {
       expect(decide(i)[0].rule).toBe('owner-refused');
     }
   });
-  it.each(['pr-no-movement', 'red-main-quarantined-test'])('keeps %s observation-only even with a permitted action plan', (smell) => {
+  it('keeps PR liveness alerts observation-only even with a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
-    e.smell = smell; e.key = `${e.smell}::${e.subject}`;
+    e.smell = 'pr-no-movement'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Grant rounds and re-arm review';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
+  });
+  it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'red-main-quarantined-test'; e.key = `${e.smell}::${e.subject}`;
     e.recommendation = 'Grant rounds and re-arm review';
     facts.episodeKey = e.key;
     i.subjectFacts = { [e.key]: facts };
