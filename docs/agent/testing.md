@@ -33,6 +33,33 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Human clearance across empty commits
+
+An empty recovery commit can carry a fingerprinted human clearance when `rev-parse --verify
+<sha>^{tree}` proves the cleared and live heads have exactly the same root tree. This includes
+paths, modes, blobs and the lane manifest; changed trees receive no tree-based carry.
+Use `applyHumanClearanceCarry`, with a pinned scored diff and a fresh complete comment thread
+from `readCompletePrComments` plus formal reviews before the durable record. Missing fingerprints,
+unknown evidence and head mismatches refuse general carry before Git or the writer. SHA-only
+clearances remain confined to the explicitly requested numbering-only proof. Test real empty
+commits and changed trees through the writer, alongside refusal cases with zero writer calls.
+
+## Human clearance across drain numbering
+
+A `clear-human` record already counts as acceptance; a numbering carry must also run before
+workflow and anti-test-gaming holds can re-park it. Use the existing human carry writer with a
+fresh head, complete comment thread and formal reviews before posting. Its numbering tier uses
+`proveNumberingOnlyMove` unchanged: exact blob bytes, file modes and a bounded linear chain.
+A SHA-only clearance can use that proof without an old diff fingerprint; the new record still
+requires a pinned, scored live diff and retains the original human actor and carried-from head.
+`review.carryHumanClearanceAcrossNumbering` defaults true and resolves through standard,
+platform, tool and env (`WE_REVIEW_CARRY_HUMAN_CLEARANCE_ACROSS_NUMBERING`), with its source logged.
+The existing human carry master switch still applies. General refresh equivalence cannot waive
+the exact-head workflow ceremony. Regress through the production gate with real numbering git
+objects: a human clearance, numbering alone, numbering plus an unrelated byte, SHA-only markers,
+a live objection, the disabled switch and an automated acceptance. Keep the automated restamp
+suite intact; the human-specific switch must not disable automated acceptance carries.
+
 ## Human-only re-park net basis
 
 The human-surface sweep uses `readHumanSurfaceNetFiles` over the shared `readNetFileSets` reader.

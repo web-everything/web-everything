@@ -9,10 +9,11 @@ import { checkReviewLabelSingleHomeCode } from '../review-skill-guard.mjs';
 import { proveHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
-  MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
+  resolveNumberingHumanClearanceSetting, MAX_NUMBERING_COMMITS, MAX_NUMBERING_BLOB_BYTES, parseNumberingSubject, isMappedRewrite, checkNumberingCommit, proveNumberingOnlyMove,
   planNumberingRestamp, buildNumberingRestampBody, buildNumberingWithdrawnBody, restampAfterNumbering as restampWithoutGuard,
   _resetNumberingRestampMemo, numberingWithdrawalOwed, strandedNumberingRecords, MAX_WITHDRAWALS_PER_PASS,
 } from '../numbering-carry.mjs';
+import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 
 // The writer supplies the referral guard (numbering-carry does not import the label writer: that would close an
@@ -628,6 +629,16 @@ describe('numbering acceptance restamp', () => {
     const calls = [];
     return { calls, provider: { postComment: (_r, _n, body) => calls.push(body), setLabels: (_r, _n, spec) => calls.push(spec) } };
   };
+  it.each([false, true])('human switch off preserves automated acceptance carry (human: %s)', human => {
+    const rec = accept();
+    if (!human) rec.body = rec.body.replace('✅ review — human cleared', '✅ review — accepted')
+      .replace('<!-- cleared-human: chalbert -->', '');
+    const { calls, provider } = recording();
+    const result = run({ state: { labels: ['review:pending'], headRefOid: TO, comments: [rec] }, provider,
+      numberingSetting: { value: false, source: 'tool' }, prove: () => ({ ok: true, reason: 'verified' }) });
+    if (human) { expect(result).toBeNull(); expect(calls).toEqual([]); }
+    else { expect(result).toMatchObject({ action: 'restamped', human: false }); expect(calls).toHaveLength(2); }
+  });
   describe('a hold that arrives while the proof runs (red team #5233)', () => {
     const ok = () => ({ ok: true, reason: 'verified' });
     // A live thread with comment node ids: every post and edit lands on it, and every re-read copies it.
@@ -1108,5 +1119,99 @@ describe('numbering acceptance restamp', () => {
     expect(run({ cwd: r.cwd, state: { labels: ['review:pending'], headRefOid: head, comments: [accept(r.base)] },
       provider: { postComment: () => writes.push('comment'), setLabels: () => writes.push('labels') } }).action).toBe('refused');
     expect(writes).toEqual([]);
+  });
+});
+
+// #5414: clear-human at 4301480c → the drain's numbering commit 21ce5fcd.
+// Use real git objects and the production gate, including its live re-read and writer.
+describe('#5414 human clearance through the drain gate', () => {
+  function replay({ mixed = false, fingerprint = true, workflow = false, human = true, liveHold = false, numberingSetting } = {}) {
+    const r = repo();
+    const head = r.number(mixed);
+    const comments = [{ author: { login: 'chalbert' }, createdAt: '2026-10-15T23:45:00Z',
+      body: `${human ? '✅ review — \`review:human\` cleared via the sanctioned path' : '✅ review — accepted'}\n`
+        + `<!-- reviewed-sha: ${r.base} -->\n`
+        + (fingerprint ? `<!-- reviewed-diff: ${normalizeDiffFingerprint('old diff')} -->\n` : '')
+        + (human ? '<!-- cleared-human: chalbert -->' : '') }];
+    const posted = [];
+    let views = 0;
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'git') return execFileSync(cmd, args, { ...opts, cwd: r.cwd });
+      if (args[0] === 'api') return args.some(a => a.includes('/comments'))
+        ? (liveHold ? [...comments, { author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments)
+          .map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author.login].join('\t')).join('\n') : '';
+      if (args[1] === 'view') {
+        views++;
+        return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: views > 1 && liveHold
+          ? [...comments, { author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments });
+      }
+      if (args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
+      throw Error(`unexpected command ${cmd} ${args}`);
+    };
+    const result = decideDrainReviewGate({ labels: ['review:accepted'], escalate: true, humanRequired: true, permissionChange: true }, {
+      pr: 5414, repo: 'web-everything/web-everything', cwd: r.cwd, local: true, exec,
+      files: [workflow ? '.github/workflows/ci.yml' : 'scripts/app.mjs'], filesComplete: true, listedHeadSha: head,
+      netDiff: () => ({ scored: true, text: 'numbered diff', rev: head, revSha: head }),
+      carry: { log: () => {}, ...(numberingSetting ? { numberingSetting } : {}) },
+    });
+    return { result, posted, views, from: r.base, head };
+  }
+  it.each([false, true])('carries clear-human across numbering (workflow: %s)', workflow => {
+    const r = replay({ workflow });
+    expect(r.result, r.result.reason).toMatchObject({ action: 'merge' });
+    expect(r.views).toBeGreaterThan(1);
+    expect(r.posted).toHaveLength(1);
+    expect(r.posted[0]).toContain('<!-- cleared-human: chalbert -->');
+    expect(r.posted[0]).toContain(`from=${r.from} to=${r.head}`);
+  });
+  it('carries a SHA-only human clearance using the exact numbering proof', () => {
+    const r = replay({ fingerprint: false });
+    expect(r.result, r.result.reason).toMatchObject({ action: 'merge' });
+    expect(r.posted).toHaveLength(1);
+  });
+  it('refuses numbering plus any other byte', () => {
+    const r = replay({ mixed: true });
+    expect(r.result.action).not.toBe('merge');
+    expect(r.posted).toEqual([]);
+  });
+  it('refuses a hold arriving during the proof', () => {
+    const r = replay({ liveHold: true });
+    expect(r.result.action).not.toBe('merge');
+    expect(r.posted).toEqual([]);
+  });
+  it('honours the numbering carry switch', () => {
+    const r = replay({ numberingSetting: { value: false, source: 'env' } });
+    expect(r.result.action).not.toBe('merge');
+    expect(r.posted).toEqual([]);
+  });
+  it('never grants a human clearance to an automated accept', () => {
+    const r = replay({ human: false });
+    expect(r.result.action).not.toBe('merge');
+    expect(r.posted).toEqual([]);
+  });
+});
+
+describe('review.carryHumanClearanceAcrossNumbering cascade', () => {
+  const key = 'carryHumanClearanceAcrossNumbering';
+  const resolve = over => resolveNumberingHumanClearanceSetting({ env: {}, platform: {}, tool: {}, ...over });
+  it('defaults true and names the standard source', () => {
+    expect(resolve()).toEqual({ value: true, source: 'standard' });
+  });
+  it('reads the platform preference', () => {
+    expect(resolve({ platform: { [key]: false } })).toEqual({ value: false, source: 'platform' });
+  });
+  it('lets the tool override platform', () => {
+    expect(resolve({ platform: { [key]: false }, tool: { [key]: true } })).toEqual({ value: true, source: 'tool' });
+  });
+  it('lets env override the tool and reports its source', () => {
+    expect(resolve({ tool: { [key]: true }, env: { WE_REVIEW_CARRY_HUMAN_CLEARANCE_ACROSS_NUMBERING: 'off' } }))
+      .toEqual({ value: false, source: 'env' });
+  });
+  it('an invalid env cannot override a disabled policy', () => {
+    expect(resolve({ tool: { [key]: false }, env: { WE_REVIEW_CARRY_HUMAN_CLEARANCE_ACROSS_NUMBERING: 'maybe' } }))
+      .toEqual({ value: false, source: 'tool' });
+  });
+  it('loads the declared tool setting', () => {
+    expect(resolveNumberingHumanClearanceSetting({ env: {}, platform: {} })).toEqual({ value: true, source: 'tool' });
   });
 });

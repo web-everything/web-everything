@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -688,7 +689,7 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * `review:held-mechanical` (`decideTestGamingPark`), which the carry sweep retries; a decided refusal parks `review:human`.
  * @returns {{humanClearedSha: string|null, carried: boolean, reason: string, retryable: boolean}}
  */
-export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null } = {}) {
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null, applyNumberingCarry = null } = {}) {
   const unchanged = (reason, retryable = false) => ({ humanClearedSha, carried: false, reason, retryable });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
@@ -710,6 +711,17 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   });
   if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
     return { humanClearedSha: headSha, carried: true, reason: carry.reason, retryable: false };
+  }
+  // The strict fingerprint changes when the drain numbers cards. Reuse the durable human carry writer;
+  // its exact git proof and live pre-write guard remain mandatory, and it cannot grant an agent a human clearance.
+  if (typeof applyNumberingCarry === 'function' && setting === 'on') {
+    const humanClearance = latestHumanClearance(comments);
+    if (humanClearance?.sha === humanClearedSha) {
+      const numbered = applyNumberingCarry({ humanClearance, headSha, headDiffSha: headSha, headDiff: netDiffText.text });
+      if (numbered?.carried?.recorded) return { humanClearedSha: headSha, carried: true,
+        reason: numbered.carried.mechanicalReason, retryable: false };
+      if (numbered?.action === 'defer') return unchanged(numbered.reason, true);
+    }
   }
   return unchanged(carry.reason, carry.retryable === true);
 }
@@ -809,7 +821,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     }
   }
   const { acceptedSha, acceptedDiff, acceptedContribution } = evidence;
-  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha && moved);
+  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution || evidence.humanClearance) && acceptedSha && moved);
   if (liveDiffReadOwed && d.headRefName && (local || cwd)) {
     try {
       // PR #4631 round 7 (toctou-head-binding): read AT `headSha`, the head this coverage is judged for (see
@@ -828,6 +840,20 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
   return evidence;
+}
+
+/** Fresh head, complete thread and formal reviews for the numbering carry's pre-write guard. */
+function readLiveDrainCarryEvidence({ pr, repo, exec = execFileSync, readReviews } = {}) {
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 };
+  const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
+    '--json', 'headRefOid'], opts));
+  if (!d?.headRefOid) throw Error('incomplete live head');
+  const comments = readCompletePrComments(pr, { repo, exec });
+  const slug = repo || '{owner}/{repo}';
+  return { headSha: d.headRefOid, ...readDrainCarryEvidence({ comments,
+    readComments: () => readCompletePrComments(pr, { repo, exec }),
+    readReviews: readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(slug, pr), opts))),
+  }) };
 }
 
 /** The skip reason for a PR whose merge state is not landable, naming the ACTUAL state (see the call site). */
@@ -868,19 +894,24 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
     files = read.files;
     filesComplete = true;
   }
-  const workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+  let workflow = decideDrainWorkflowEditHold({ files, filesComplete,
     headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
   if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
+  // A workflow clearance may move over proven numbering or exact tree identity here. General refresh equivalence does not
+  // waive the exact-head workflow ceremony. Record the carry before any gate can honour it.
+  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun,
+    readNumberingLiveEvidence: () => readLiveDrainCarryEvidence(readOptions), ...readOptions?.carry,
+    numberingOnly: workflow.hold === true || (!!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution) });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) {
+    evidence = { ...evidence, humanClearedSha: evidence.headSha, acceptedSha: evidence.headSha };
+    workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+      headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+  }
   if (workflow.hold) return { action: 'park', applyLabel: REVIEW_LABELS.human, humanRequired: true,
     workflowEditHold: true, reason: workflow.reason };
-  // The bare/waived rubric pass uses only this additional boundary; its existing backstops still run.
-  if (readOptions?.workflowOnly) return { action: 'merge' };
-  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
-  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
-  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
-    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
-  if (carry?.action === 'defer') return carry;
-  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  if (readOptions?.workflowOnly) return { action: 'merge', ...(carry?.carried ? { carriedClearance: carry.carried } : {}) };
   const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
   return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
@@ -5701,6 +5732,10 @@ async function runCli() {
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
+              applyNumberingCarry: (carryEvidence) => applyHumanClearanceCarry({ evidence: carryEvidence,
+                pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN, numberingOnly: true,
+                readNumberingLiveEvidence: () => readLiveDrainCarryEvidence({ pr: v.num, repo: slug, exec: diffExec }),
+              }),
             });
             humanClearedSha = carried.humanClearedSha;
             carryRetryable = carried.retryable === true;

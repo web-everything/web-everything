@@ -21,6 +21,7 @@ import {
   readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
   buildTestGamingParkReason, buildHeldReviewHoldReason, decideTestGamingPark, readNetDiffAtHead,
 } from '../../merge-ai-prs.mjs';
+import { applyHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { REBASE_ONTO_MAIN_COMMENT_MARKER, MISSING_RUN_COMMENT_MARKER } from '../../conveyor/main-red-recovery.mjs';
 import { HUNG_CI_COMMENT_MARKER } from '../../conveyor/ci-red-recovery-watch.mjs';
@@ -868,6 +869,34 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
   const agentAccept = () => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->` });
   const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, pinnedHeadSha: NEW, netDiffText: { scored: true, text: TEXT, rev: NEW } });
   const run = (over = {}) => carryHumanClearanceOnIdenticalDiff({ ...base(), ...over });
+
+  it.each([true, false])('numbering fallback records only an exact proof (proof ok: %s)', ok => {
+    const comments = [clear()];
+    const posted = [];
+    const result = run({ comments, netDiffText: { scored: true, text: `${TEXT}+numbered\n`, rev: NEW },
+      applyNumberingCarry: evidence => applyHumanClearanceCarry({ evidence, pr: 5414, numberingOnly: true,
+        setting: { value: true, source: 'standard' }, numberingSetting: { value: true, source: 'standard' }, log: () => {},
+        exec: (cmd, args) => { posted.push([cmd, args]); return ''; },
+        proveNumbering: () => ({ ok, reason: ok ? 'exact numbering' : 'unrelated byte' }),
+        readNumberingLiveEvidence: () => ({ headSha: NEW, comments, reviews: [] }),
+      }),
+    });
+    expect(result.carried).toBe(ok);
+    expect(posted).toHaveLength(ok ? 1 : 0);
+    if (ok) expect(posted[0][1].at(-1)).toContain(`from=${OLD} to=${NEW}`);
+  });
+  it.each(['agent', 'off', 'unpinned'])('does not invoke numbering fallback for %s', kind => {
+    let calls = 0;
+    const result = run({
+      netDiffText: { scored: true, text: `${TEXT}+numbered\n`, rev: NEW },
+      ...(kind === 'agent' ? { comments: [agentAccept()] } : {}),
+      ...(kind === 'off' ? { setting: 'off' } : {}),
+      ...(kind === 'unpinned' ? { pinnedHeadSha: OLD } : {}),
+      applyNumberingCarry: () => { calls++; throw Error('must not call'); },
+    });
+    expect(result.carried).toBe(false);
+    expect(calls).toBe(0);
+  });
 
   it('the fixture\'s own fingerprint is what the live text fingerprints to (the positive control is real)', () => {
     expect(FP).toMatch(/^[0-9a-f]{64}$/);

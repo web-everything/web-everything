@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { proveHumanClearanceCarry, latestHumanClearance } from '../human-clearance-carry.mjs';
+import { proveHumanClearanceCarry, latestHumanClearance, applyHumanClearanceCarry } from '../human-clearance-carry.mjs';
 import { buildReviewedShaMarker, buildReviewedDiffMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { evaluatePrGates, resolveCarryApproval, loadCarryApproval, loadMergeGateMode, STANDARD_CARRY_APPROVAL, CARRY_APPROVAL_ENV } from '../merge-gate-ci.mjs';
 
@@ -49,6 +49,41 @@ describe('shared carry proof against real git', () => {
   });
   it('refuses conflict resolution changing the PR lines', () => {
     expect(repository({ conflict: true }).prove()).toMatchObject({ carry: false, reason: expect.stringContaining('net diff changed') });
+  });
+  it.each([false, true])('carries an empty recovery commit through the writer; tree changed=%s', (changed) => {
+    const r = repository();
+    r.git('checkout', '-q', '--detach', r.a);
+    if (changed) r.commit('src/x.txt', 'unreviewed byte\n');
+    r.git('commit', '--allow-empty', '-qm', 'ci: recover missing PR checks');
+    const head = r.git('rev-parse', 'HEAD');
+    const evidence = r.evidence(head);
+    const comment = { viewerDidAuthor: true, body: [buildReviewedShaMarker(r.a),
+      buildReviewedDiffMarker(r.evidence(r.a).headDiff), buildClearedHumanMarker('op')].join('\n') };
+    const writer = vi.fn();
+    const exec = (cmd, args, opts) => cmd === 'git' ? execFileSync(cmd, args, opts) : writer(cmd, args);
+    const result = applyHumanClearanceCarry({ evidence, exec, cwd: r.cwd, pr: 5414,
+      setting: { value: true, source: 'test' }, numberingOnly: true, log: () => {},
+      readNumberingLiveEvidence: () => ({ headSha: head, comments: [comment], reviews: [] }) });
+    if (changed) {
+      expect(result).toBeNull(); expect(writer).not.toHaveBeenCalled();
+    } else {
+      expect(result).toMatchObject({ carried: { recorded: true, tier: 'tree', fromSha: r.a, toSha: head } });
+      expect(writer).toHaveBeenCalledTimes(1);
+      const [cmd, args] = writer.mock.calls[0];
+      expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
+      expect(latestHumanClearance([{ viewerDidAuthor: true, body: args.at(-1) }])).toMatchObject({ sha: head, actor: 'op' });
+    }
+  });
+  it.each(['missing fingerprint', 'mismatched head', 'unknown head', 'unreadable diff', 'unknown equivalence'])('never calls the writer for %s', (kind) => {
+    const r = repository(); const evidence = r.evidence(); const writer = vi.fn();
+    if (kind === 'missing fingerprint') evidence.humanClearance.diff = null;
+    if (kind === 'mismatched head') evidence.headDiffSha = r.a;
+    if (kind === 'unknown head') evidence.headSha = null;
+    if (kind === 'unreadable diff') evidence.headDiff = null;
+    const result = applyHumanClearanceCarry({ evidence, cwd: r.cwd, pr: 5414, exec: writer,
+      ...(kind === 'unknown equivalence' ? { equivalence: 'unknown' } : {}),
+      setting: { value: true, source: 'test' }, log: () => {} });
+    expect(result).toBeNull(); expect(writer).not.toHaveBeenCalled();
   });
   it('fails closed on absent fingerprints, mismatched heads and unreadable git', () => {
     const r = repository(); const e = r.evidence(); const exec = vi.fn(() => { throw new Error('unreadable'); });
