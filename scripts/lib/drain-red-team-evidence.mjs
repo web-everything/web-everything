@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { pidAlive } from '../operations/review-job-store.mjs';
+import { pidAlive } from './pid-alive.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
