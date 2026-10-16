@@ -597,7 +597,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('IFS=n; cd ${HOME}')).toBe(REPORTED);
   });
   it('a CR, NBSP or other Unicode space in a home-spelled target is never trimmed into a different path', () => {
-    for (const ch of ['\r', ' ', ' ', '　', '\v', '\f']) {
+    for (const ch of ['\r', '\v', '\f', ...[0xa0, 0x2028, 0x3000].map((c) => String.fromCharCode(c))]) {
       expect(at(`cd ~/clone${ch}\ngit status`), JSON.stringify(ch)).toBe(REPORTED);
       expect(at(`cd ~/clone${ch}x && git status`), JSON.stringify(ch)).toBe(REPORTED);
     }
