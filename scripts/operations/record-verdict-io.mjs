@@ -48,8 +48,7 @@ import { advance, runStatus } from './engine.mjs';
 import { applyPendingEffects } from './effect-executor.mjs';
 import { createRegistry } from './registry.mjs';
 import {
-  reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, codexAdvisoryFromRun, securitySeatFromRun, correctnessAdvisoryFromEnv,
-  antigravityReviewFromEnv, seatSettingsForRun,
+  reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, reviewSeatOptionsForRun,
 } from './review-pr.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
 
@@ -276,24 +275,13 @@ export function createRunReader({ root = REPO_ROOT, store = createFileRunStore()
  */
 export async function advanceReviewPrToWriteUp(record, { to, store, sinks = createReviewPrSinks() } = {}) {
   const answer = confirmAnswerFor(to);
-  if (!answer || !record || record.op !== 'review-pr') return record;
+  if (!answer || !record || record.op !== 'review-pr' || record.pending?.kind !== 'confirm') return record;
 
   const registry = createRegistry();
-  // #xqa9ttq / #x8n4crp / #3383 — the roster this registration seats must match the one the run was STARTED
-  // with, or a resume here would be reasoning about a run shape that no longer exists.
-  // PR #2117 review: seat 3 (Codex advisory) reads its roster from the SAVED RUN (`codexAdvisoryFromRun`), not
-  // the ambient env. Seats 4 and 5 still read the SAME env vars `run.mjs` reads
-  // (`REVIEW_PR_CODEX_CORRECTNESS_ADVISORY`, `REVIEW_PR_ANTIGRAVITY_REVIEW`) — see
-  // `correctnessAdvisoryFromEnv`/`antigravityReviewFromEnv`'s own docs (`we:scripts/operations/review-pr.mjs`).
+  // Both CLI entry points reconstruct every optional seat from the completed panel, never live flags.
   registry.register(reviewPrOperation({
     readPr: createReviewPrReader(),
-    codexAdvisory: codexAdvisoryFromRun(record),
-    correctnessAdvisory: correctnessAdvisoryFromEnv(),
-    antigravityReview: antigravityReviewFromEnv(),
-    // Card 84 — the advisory agy seat's presence is read off the saved run, like seat 3.
-    seatSettings: seatSettingsForRun(record, loadReviewSeatSettings()),
-    // `review.seatsByTouchSet` — whether the security juror was seated is read off the saved run, like seat 3.
-    securitySeat: securitySeatFromRun(record),
+    ...reviewSeatOptionsForRun(record, loadReviewSeatSettings()),
   }));
   if (runStatus(record, { registry }) !== 'awaiting-confirm') return record;
 

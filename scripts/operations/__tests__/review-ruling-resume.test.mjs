@@ -7,10 +7,14 @@
  * line 43; the referral cited :29 "no planned regression test"). Both are replayed here. Each test is RED on the code
  * before this card: there was no resume (a ruling always started a new panel), and no round scoping for referrals.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { createRegistry } from '../registry.mjs';
-import { createMemoryRunStore } from '../run-store.mjs';
+import { createFileRunStore, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
@@ -19,7 +23,10 @@ import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
   mandatoryReferralReviewer, renderReferralRecord, openReferralHeads, buildOperatorRulingComment,
 } from '../../lib/jury-core.mjs';
-import { advanceWhileRunning, startRun } from '../engine.mjs';
+import { advance, advanceWhileRunning, startRun } from '../engine.mjs';
+import { resolveOperation } from '../run.mjs';
+import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
+import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
 import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
@@ -156,6 +163,108 @@ function sinksWith({ seen, ruled }) {
 }
 
 const argv = ['--pr=4361', '--repo=o/n'];
+
+describe('ordinary review-pr CLI resume preserves the saved roster', () => {
+  it.each([
+    {},
+    { codexAdvisory: true },
+    { correctnessAdvisory: true },
+    { antigravityReview: true },
+    { seatSettings: { agyCorrectnessAdvisory: true } },
+  ])('reconstructs %j despite changed flags and diversity minimums', async (seats) => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-cli-roster-'));
+    try {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      const historicalDefault = Object.keys(seats).length === 0;
+      vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', historicalDefault || seats.codexAdvisory ? '0' : '1');
+      vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', historicalDefault || seats.correctnessAdvisory ? '0' : '1');
+      vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', historicalDefault || seats.antigravityReview ? '0' : '1');
+      vi.stubEnv('WE_REVIEW_SHADOW_AGY_ENABLED', '0');
+      const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0, ...seats });
+      const registry = createRegistry();
+      registry.register(declaration);
+      const store = createFileRunStore();
+      const parked = await runReviewLoopOnce({ declaration, registry, argv, store,
+        sinks: sinksWith({ seen: [], ruled: { value: true } }),
+        makeJudge: () => async () => judgeOutcome({ summary: 'looked', findings: [] }, {}),
+        mintRunId: () => 'historical-cli' });
+      expect(parked.stopped).toBe('confirm');
+      for (const minimum of ['1', '2']) {
+        vi.stubEnv('WE_REVIEW_MIN_NON_CLAUDE_SEATS', minimum);
+        const resumed = resolveOperation('review-pr', { resumeId: parked.run.id });
+        expect(resumed.declaration.steps.map(s => s.name)).toEqual(declaration.steps.map(s => s.name));
+        const answered = advance(store.read(parked.run.id), { registry: resumed.registry, resume: { value: 'abstain' } });
+        expect(answered.findings.confirm).toBe('abstain');
+        expect(answered.cursor).toBe(parked.run.cursor + 1);
+        // The second confirmation entry point reaches its existing human-review guard,
+        // rather than failing earlier because flags changed its declaration.
+        await expect(advanceReviewPrToWriteUp(store.read(parked.run.id), { to: 'accepted', store }))
+          .rejects.toThrow(/gate-self: review:human is human-ceremony-only/);
+      }
+      // Exercise the actual argv-to-registration path too. No answer means no external effects.
+      vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+      for (const earlierFlags of [[], ['--resume=missing-earlier-run']]) {
+        const cli = spawnSync(process.execPath, [new URL('../run.mjs', import.meta.url).pathname,
+          'review-pr', ...earlierFlags, `--resume=${parked.run.id}`, '--json'], {
+          encoding: 'utf8', timeout: 30_000,
+          env: { ...process.env, WE_DAEMON_MANAGED_CLONE: '1', OPERATION_CALLS_DIR: join(dir, 'calls') },
+        });
+        expect(cli.error).toBeUndefined();
+        expect(cli.status).toBe(0);
+        expect(cli.stdout + cli.stderr).not.toContain('declaration changed');
+        expect(JSON.parse(cli.stdout).pending.step).toBe('confirm');
+      }
+      // Fresh registrations still enforce the new minimum.
+      const fresh = resolveOperation('review-pr');
+      expect(fresh.declaration.steps.map(s => s.name)).toContain('judgeAdvisory');
+      expect(fresh.declaration.steps.map(s => s.name)).toContain('judgeCorrectnessAdvisory');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.each([true, false])('keeps future and failed advisory seats in an unfinished panel (security=%s)', async (securitySeat) => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-cli-unfinished-'));
+    try {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+      vi.stubEnv('WE_REVIEW_MIN_NON_CLAUDE_SEATS', '2');
+      const readPr = input => {
+        const read = stubReader()(input);
+        if (!securitySeat) {
+          read.net.paths = ['docs/review.md'];
+          read.detail.diffStat = [{ path: 'docs/review.md', additions: 1, deletions: 0 }];
+        }
+        return read;
+      };
+      const declaration = reviewPrOperation({ readPr, securitySeat, seatSettings: loadReviewSeatSettings({ log: () => {} }) });
+      const registry = createRegistry();
+      registry.register(declaration);
+      const store = createFileRunStore();
+      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'unfinished', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+      const visited = [];
+      while (run.pending?.kind === 'judge') {
+        visited.push(run.pending.step);
+        store.write(run);
+        const resumed = resolveOperation('review-pr', { resumeId: run.id });
+        expect(resumed.declaration.steps.map(s => s.name)).toEqual(declaration.steps.map(s => s.name));
+        expect(await advanceReviewPrToWriteUp(run, { to: 'accepted', store })).toBe(run);
+        run = advanceWhileRunning(run, { registry: resumed.registry, resume: { value: { summary: 'looked', findings: [] } } });
+      }
+      expect(visited).toContain('judge');
+      expect(visited).toContain('judgeAdvisory');
+      expect(visited).toContain('judgeCorrectnessAdvisory');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('rewindRunToStep', () => {
   it('keeps every finding before the step and drops the step and everything after it', async () => {

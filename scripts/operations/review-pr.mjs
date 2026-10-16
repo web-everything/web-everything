@@ -799,6 +799,18 @@ export function seatSettingsForRun(record, settings) {
   return { ...settings, agyCorrectnessAdvisory: seated, preserveSavedRoster: true };
 }
 
+/** Rebuild a completed panel's roster for confirmation/replay, independently of current flags and minimums. */
+export function reviewSeatOptionsForRun(record, settings) {
+  const findings = record?.findings ?? {};
+  return {
+    securitySeat: securitySeatFromRun(record),
+    codexAdvisory: codexAdvisoryFromRun(record),
+    correctnessAdvisory: Object.hasOwn(findings, CORRECTNESS_ADVISORY_SEAT.step),
+    antigravityReview: Object.hasOwn(findings, ANTIGRAVITY_REVIEW_SEAT.step),
+    seatSettings: seatSettingsForRun(record, settings ?? {}),
+  };
+}
+
 /**
  * The real (non-injected) probation check `antigravityReviewFromEnv` defaults to: is the seated Antigravity
  * identity declared `'probation'` or `'trusted'` for the `'advisory-review'` role? Named and exported

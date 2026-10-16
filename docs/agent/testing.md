@@ -220,6 +220,11 @@ Test the actual judge request and panel reduction with injected providers, inclu
 zero agy calls when disabled and failed Codex answers, through heavy-admission.
 Historical optional-roster fixtures explicitly use a zero declaration minimum; the
 operational settings never accept zero.
+Exercise historical confirmation through both `resolveOperation('review-pr', {resumeId})`
+and the real `run.mjs review-pr --resume=<id>` CLI, with Codex flags off and the default
+minimum, then with changed flags and a minimum of two. Both CLI confirmation paths
+use `reviewSeatOptionsForRun` to keep every saved optional seat; fresh registrations
+still enforce the live minimum.
 
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader
