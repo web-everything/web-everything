@@ -1,4 +1,5 @@
 ---
+bornAs: x3t6b43
 kind: story
 size: 3
 status: open
