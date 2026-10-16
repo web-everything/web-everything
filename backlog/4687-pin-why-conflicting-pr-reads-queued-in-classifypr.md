@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/progress-board.mjs", "we:scripts/__tests__/progress-board.test.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs"]
 dateOpened: "2026-09-30"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "3f130ea59e0ffd5524322915a70a1866235d32ec"
+preparedDate: "2026-10-16"
+preparedAgainstSha: "1ca5edb490fbc03fe55aee05985107d6272c4628"
 tags: []
 ---
 
@@ -22,11 +22,13 @@ Diagnosis: `we:reports/2026-09-30-conflicting-prs-nobody-owns.md`. Preserve the 
 
 ## Progress
 
+- Revalidated at checkout 1ca5edb490 on 2026-10-16: acquisition still omits mergeable, projection still drops it, and the refusal still omits both inputs. Updated moved citations below. Retain size 2: approximately 20 source lines across the three sources and 100 regression lines across their three matching suites; the six-file scope is unchanged. Current verification is source inspection; the dated classifier probe below is prior evidence.
+
 - Original premise/scope: `classifyPr` already checked `DIRTY`/`BEHIND` before acceptance, leaving stale/unknown/disagreeing merge inputs as candidates for #3176/#3215. Scope named only `we:scripts/progress-board.mjs` and `we:scripts/conveyor/reconcile-core.mjs`, without matching test paths.
-- Corrected premise: the conflict check still exists at `we:scripts/progress-board.mjs:603`, but `classifyPr` never reads `mergeable`. The board query omits it at `we:scripts/progress-board.mjs:443`; the reconcile query also omits it at `we:scripts/conveyor/reconcile-pass.mjs:132`; and the classifier projection drops it at `we:scripts/conveyor/reconcile-core.mjs:1591`. Thus adding a classifier branch alone cannot fix production reads. The refusal at `we:scripts/conveyor/reconcile-core.mjs:2110` exposes neither field.
+- Corrected premise: the conflict check still exists at `we:scripts/progress-board.mjs:603`, but `classifyPr` never reads `mergeable`. The board query omits it at `we:scripts/progress-board.mjs:443`; the reconcile query also omits it at `we:scripts/conveyor/reconcile-pass.mjs:286`; and the classifier projection drops it at `we:scripts/conveyor/reconcile-core.mjs:2442`. Thus adding a classifier branch alone cannot fix production reads. The refusal at `we:scripts/conveyor/reconcile-core.mjs:3415` exposes neither field.
 - Observed preparation probe: importing the current classifier and passing an open, accepted PR with an empty rollup, `UNKNOWN` merge state and `CONFLICTING` mergeability returned `queued`. This establishes the present code defect, not the historical payload of either PR. The goal is not already delivered.
 - Corrected scope: add `we:scripts/conveyor/reconcile-pass.mjs` for acquisition; pair the board source with existing `we:scripts/__tests__/progress-board.test.mjs`, and both reconciliation sources with existing `we:scripts/conveyor/__tests__/reconcile-core.test.mjs`, which already imports and tests `defaultReadPrs` and its query fields. No source implementation is changed during preparation.
-- Test-scope repair: the prior scope paired both reconciliation sources only with `we:scripts/conveyor/__tests__/reconcile-core.test.mjs`. Add the existing matching `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` for `we:scripts/conveyor/reconcile-pass.mjs`: its `prFileContract` invocation at line 17 pins the discovery field list at line 20, which must also gain `mergeable`. This expands test coverage scope without changing the implementation goal.
+- Test-scope repair: the prior scope paired both reconciliation sources only with `we:scripts/conveyor/__tests__/reconcile-core.test.mjs`. Add the existing matching `we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` for `we:scripts/conveyor/reconcile-pass.mjs`: its `prFileContract` invocation at line 77 pins the discovery field list at line 80, which must also gain `mergeable`. This expands test coverage scope without changing the implementation goal.
 - Existing ownership evidence: `we:scripts/conveyor/parked-pr-conflict-watch.mjs#isQueuedConflictTarget` already recognizes positive `CONFLICTING` mergeability. `we:scripts/conveyor/reconcile-core.mjs#OWED_ELSEWHERE` already routes `conflicted` to a rebase refusal. Reusing that phase requires no new ownership policy or unknown phase. The report explicitly leaves the original incident inputs unsettled.
 
 ## Design
@@ -35,7 +37,7 @@ Extend the existing conflict predicate in `we:scripts/progress-board.mjs#classif
 
 Request `mergeable` alongside `mergeStateStatus` in both `we:scripts/progress-board.mjs#ghPrList` and `we:scripts/conveyor/reconcile-pass.mjs#PR_LIST_JSON_FIELDS`. Forward it in `we:scripts/conveyor/reconcile-core.mjs#planReconcile`'s classifier projection. Keep the shared-read and direct-query paths using the same requested field set.
 
-Extend the `nothing-owed` refusal's `why` in `we:scripts/conveyor/reconcile-core.mjs` with named `mergeStateStatus` and `mergeable` values from that pass's PR record, preserving raw values for diagnosis and using `<missing>` for null/undefined. Put the values in the human-readable reason, not only extra object properties: `we:scripts/conveyor/reconcile-pass.mjs:963` renders that reason. Do not refetch inside the pure planner or infer that a current response was also the historical response.
+Extend the `nothing-owed` refusal's `why` in `we:scripts/conveyor/reconcile-core.mjs` with named `mergeStateStatus` and `mergeable` values from that pass's PR record, preserving raw values for diagnosis and using `<missing>` for null/undefined. Put the values in the human-readable reason, not only extra object properties: `we:scripts/conveyor/reconcile-pass.mjs:1261` renders that reason. Do not refetch inside the pure planner or infer that a current response was also the historical response.
 
 ## MVP
 
