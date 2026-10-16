@@ -1199,3 +1199,26 @@ needs-you feed (honoring `WE_NEEDS_YOU_FEED`). No Claude session or judgment ste
 Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through heavy admission.
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
+
+## False-finding coroner pass
+
+`coroner-false-findings.mjs` reads PRs updated in the window (including older and closed PRs),
+complete comment threads through the shared reader, and the shadow agreement store. It never advances
+`WE_CORONER_STATE`; run it before the main extractor when using `--since=last`.
+`coroner-extract` also includes it as `errorRates.falseFindings`, feeding daily `perf-snapshot` counts.
+`WE_CORONER_NO_FALSE_FINDINGS=1` skips that census in the main extractor.
+
+Confirm or override each rule guess using the ruling reason, the red-team Re-check, and a bounded
+live-head probe when needed. Recorded `--cause` on `record-referral-ruling --ruling=not-real` takes
+precedence; the writer also preserves the finding lens. Allowed causes are `diff-only-recheck`,
+`stale-head-reraise`, `auto-policy-over-not-real`, `card-only-probe`, `config-prose`, `test-nit`, and `other`.
+A repeated not-real on another head is a stale hint, not proof the newer finding is false for the same reason.
+Report code and card-only separately and keep unknown PR types visible when file reads fail.
+
+Counts describe source events, not unique defects: a fixer stand-down can overlap a ruling.
+Unmatched agy findings are separately **unconfirmed**, never proven false by non-agreement alone.
+Capped PR discovery and failed reads are explicit; do not present such a census as exhaustive or infer
+false-findings / total-findings percentages without a matching denominator.
+For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
+coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
+separate shadow count and read completeness.
