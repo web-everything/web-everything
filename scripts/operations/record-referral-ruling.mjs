@@ -45,6 +45,7 @@
  * PURE. The reader and the sink live in `./record-referral-ruling-io.mjs`.
  */
 
+import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
@@ -287,6 +288,7 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
 export function planOperatorRuling(read, input) {
   const { repo, pr, finding, ruling, actor, channel, reason } = input;
   if (!OPERATOR_RULING_RESULTS.includes(ruling)) throw new Error(`--ruling must be one of ${OPERATOR_RULING_RESULTS.join('|')}`);
+  if (input.cause !== undefined && (ruling !== 'not-real' || !FALSE_FINDING_CAUSES.includes(input.cause))) throw new Error('--cause requires not-real and a known false-finding cause');
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   if (byPolicy && ruling !== 'block') throw new Error(`--actor=${AUTO_POLICY_ACTOR} may only rule \`block\`; card and not-real are the operator's`);
   if (!byPolicy && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
@@ -349,7 +351,8 @@ export function planOperatorRuling(read, input) {
   }
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
-    rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'card' ? { card: read.card.ref } : {}),
+    rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
+      ...(input.cause ? { cause: input.cause } : {}), ...(ruling === 'card' ? { card: read.card.ref } : {}),
       ...(supersedesFor(o).length ? { supersedes: supersedesFor(o) } : {}) })),
     actor: String(actor).toLowerCase(), channel: String(channel).trim(), reason: String(reason), at: read.now,
     clearerId: read.clearerId,
@@ -375,6 +378,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       ruling: { type: 'string', enum: [...OPERATOR_RULING_RESULTS] },
       card: { type: 'string', required: false },
       supersedes: { type: 'string', required: false },
+      cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       actor: 'string',
       channel: 'string',
       reason: 'string',
@@ -388,7 +392,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
     }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
-        'input.reason', 'input.sendBack', 'input.supersedes', 'findings.read'],
+        'input.reason', 'input.cause', 'input.sendBack', 'input.supersedes', 'findings.read'],
       fn: (view) => planOperatorRuling(view.findings.read, view.input),
     }),
     write: effectStep({

@@ -38,13 +38,19 @@ import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindi
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
-  runReviewLoopOnce as driveReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
+  runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
   renderReferralRecord } from '../../lib/jury-core.mjs';
+
+// #5725 — ordinary orchestration cases never enumerate the checkout backlog: the filed-card lookups default to an
+// explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
+// lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
+const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -395,6 +401,21 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.lines.join('\n')).toMatch(/prevention guard\(s\) filed mechanically — backlog\/9001-file-the-guard\.md \(#9001\)/);
     expect(out.lines.join('\n')).toMatch(/no human was asked/);
     expect(out.lines.join('\n')).not.toMatch(/QUEUED for a human/);
+  });
+
+  // The production-default lookup path (the checkout backlog scan) is not observable from here — only that it runs without
+  // breaking the flow; the real lookups' hit/miss/idempotency behavior is pinned against temp backlogs further down.
+  it('#5725 — with NO lookup injected (explicit `undefined` restores the production defaults) the default lookup path runs to completion and the card is filed', async () => {
+    const { declaration, registry } = registryFor({});
+    const fileItemCalls = [];
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-prevention-default-lookup',
+      findFiledPrevention: undefined, findFiledRoundCards: undefined,
+      fileItem: async (input) => { fileItemCalls.push(input); return stubFileItem()(); },
+    });
+    expect(out.stopped).toBe('complete');
+    expect(fileItemCalls).toHaveLength(1);
   });
 
   it('carries `preventionFiled` (num + path) in --json, with no `queued`/`resumeCommand`/`outstandingGuards` fields', async () => {

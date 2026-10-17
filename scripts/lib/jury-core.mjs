@@ -37,6 +37,7 @@
  *
  * Pure, unit-tested through `review-core.mjs`'s re-exports in `we:scripts/lib/__tests__/review-core.test.mjs`.
  */
+import { FALSE_FINDING_CAUSES } from './false-finding-causes.mjs';
 import { createHash } from 'node:crypto';
 import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
@@ -3614,6 +3615,8 @@ export function validateOperatorRuling(r) {
     for (const x of r.rulings) {
       if (!x || typeof x.runId !== 'string' || !x.runId.trim() || typeof x.key !== 'string' || !x.key.trim()
         || !OPERATOR_RULING_RESULTS.includes(x.result)) return false;
+      if (x.cause !== undefined && (x.result !== 'not-real' || !FALSE_FINDING_CAUSES.includes(x.cause))) return false;
+      if (x.lens !== undefined && (typeof x.lens !== 'string' || !x.lens.trim() || x.lens.length > 200 || /[\r\n]/.test(x.lens))) return false;
       if (x.result === 'card' ? !CARD_REF_RE.test(x.card ?? '') : x.card !== undefined) return false;
       // Held item 132: an operator ruling may name the earlier rulings it SUPERSEDES (their ids), so a block carried
       // onto a new head can be re-ruled. Optional; a malformed list voids the whole record (a hold, never a clearance).
@@ -3687,7 +3690,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     const r = parsed.record;
     for (const x of r.rulings) {
       rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
-        result: x.result, ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
+        result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
   }
