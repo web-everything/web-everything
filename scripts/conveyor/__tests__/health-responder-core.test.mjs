@@ -56,6 +56,18 @@ describe('health responder closed decision table', () => {
     i.config.smells = { [e.smell]: true };
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
   });
+  it('keeps disk-space alerts observation-only with or without subject facts', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'disk-space'; e.subject = 'data-volume'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Delete temporary checkouts and dispatch recovery';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
+  });
   it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
