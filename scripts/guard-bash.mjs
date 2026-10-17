@@ -2443,6 +2443,64 @@ export function hasDestructiveLaneOp(command) {
   return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
 }
 
+// #5957 (review r10) — the child-shell depth before every offset of every segment, carried across segments: an
+// assignment inside `( … )`, `$( … )` or `<( … )` runs in a child shell and never changes the parent's value.
+// Only a subshell `(` counts. `((` / `$((` arithmetic (and a `(` inside it) assigns in THIS shell, and a `(` in
+// quotes, an escape, `${…}`, backticks or a comment opens nothing. A mis-scan errs toward depth 0, where a
+// binding counts: an unmatched `)` only lowers the depth, never below zero.
+function subshellDepths(segs, commented) {
+  const stack = [];                                          // { sub: is a child shell, dq: the quoting it opened in }
+  let d = 0;
+  const push = (sub, dq) => { stack.push({ sub, dq }); if (sub) d += 1; };
+  return segs.map((seg, k) => {
+    const s = String(seg);
+    const out = new Array(s.length + 1).fill(d);
+    if (commented[k]) return out;
+    let dq = false;
+    // the end of a `${…}` run (braces balanced, escapes and single quotes skipped), or s.length when unclosed
+    const braceEnd = (from) => {
+      for (let j = from, n = 0; j < s.length; j++) {
+        if (s[j] === '\\') j += 1;
+        else if (s[j] === "'" && !dq) j = s.indexOf("'", j + 1) < 0 ? s.length : s.indexOf("'", j + 1);
+        else if (s[j] === '{') n += 1;
+        else if (s[j] === '}' && --n === 0) return j;
+      }
+      return s.length;
+    };
+    const tickEnd = (from) => { const j = s.slice(from + 1).search(/(?<!\\)`/); return j < 0 ? s.length : from + 1 + j; };
+    for (let i = 0; i < s.length; i++) {
+      out[i] = d;
+      const ch = s[i];
+      let skip = i;
+      if (ch === '\\') skip = i + 1;
+      else if (ch === '`') skip = tickEnd(i);
+      else if (ch === '$' && s[i + 1] === '{') skip = braceEnd(i + 1);
+      else if (ch === '$' && s[i + 1] === '(') {
+        if (s[i + 2] === '(') { push(false, dq); push(false, dq); skip = i + 2; } else { push(true, dq); skip = i + 1; }
+        dq = false;
+      } else if (dq) {
+        if (ch === '"') dq = false;
+      } else if (ch === '"') dq = true;
+      else if (ch === "'") {
+        if (s[i - 1] === '$') { let j = i + 1; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; skip = j; }
+        else skip = s.indexOf("'", i + 1) < 0 ? s.length : s.indexOf("'", i + 1);
+      } else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(s[i - 1]))) skip = s.length;
+      else if (ch === '(') {
+        const arith = stack.length > 0 && !stack.at(-1).sub;
+        if (!arith && s[i + 1] === '(') { push(false, dq); push(false, dq); skip = i + 1; } else push(!arith, dq);
+      } else if (ch === ')' && stack.length) {
+        const top = stack.pop();
+        if (top.sub) d -= 1;
+        dq = top.dq;
+      }
+      for (let j = i + 1; j <= Math.min(skip, s.length); j++) out[j] = d;
+      i = Math.max(i, Math.min(skip, s.length));
+    }
+    out[s.length] = d;
+    return out;
+  });
+}
+
 // #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
 // double-quoted forms) lands on the SAME path as its absolute spelling and so reaches the same daemon-clone /
 // lane-lease guards. Quoting is kept until expansion is done: a quoted `~` and a single-quoted `$HOME` are
@@ -2544,8 +2602,11 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // conditional, followed by a command word — `HOME=/a true` binds it for `true` only — or glob-shaped).
   const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
   const initialHome = usableHome(home);
+  // the child-shell depth where a statement starts: an assignment there never reaches this shell (review r10)
+  const depths = subshellDepths(segs, commented);
+  const inChild = (at) => depths[at][String(segs[at]).search(/\S|$/)] > 0;
   const homeAfter = (stmt, h, at) => {
-    if (commented[at]) return h;                              // comment text (`true # ; HOME=/x`) binds nothing
+    if (commented[at] || inChild(at)) return h;               // comment text (`true # ; HOME=/x`) binds nothing
     const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
     if (!assignment) return h;
     const val = assignment[1].trim();
@@ -2567,10 +2628,15 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // Names a statement may bind in a form the literal walk does not read (`{ D=/x; }`, `then D=/x`, `A=1 D=/x`,
   // `D+=x`, `D[0]=x`, `declare D=/x`, `read D`, `for D in …`): a home-derived name learns it changed there.
   // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`.
-  const BINDING_WORDS = /(?:^|[\s;&|(){}!])(?:local|read|for|select|mapfile|readarray|printf\s+-v|unset|let|getopts|eval|source|\.)(?=\s)/;
-  const reboundNames = (text) => (BINDING_WORDS.test(text)
-    ? text.match(/[A-Za-z_]\w*/g) ?? []
-    : [...text.matchAll(/(?:^|[^\w$])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/g)].map((r) => r[1]));
+  // A binding inside a child shell (`( D=/tmp )`, `X=$(D=/tmp)`) leaves the parent's value alone; a binding word
+  // in this shell (`eval "$(…)"`) still counts every name it may bind, a substitution's included.
+  const BINDING_WORDS = /(?:^|[\s;&|(){}!])(local|read|for|select|mapfile|readarray|printf\s+-v|unset|let|getopts|eval|source|\.)(?=\s)/dg;
+  const reboundNames = (text, at, base) => {
+    const here = (i) => depths[at][base + i] === 0;
+    if ([...text.matchAll(BINDING_WORDS)].some((w) => here(w.indices[1][0]))) return text.match(/[A-Za-z_]\w*/g) ?? [];
+    return [...text.matchAll(/(?:^|[^\w$])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/dg)]
+      .filter((r) => here(r.indices[1][0])).map((r) => r[1]);
+  };
   parsed.segments.forEach((stmt, at) => {
     if (commented[at]) {
       // comment text binds nothing in bash; main still read a literal there, so keep that for ordinary names
@@ -2579,7 +2645,15 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       return;
     }
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
-    for (const name of reboundNames(m ? m[2] : stmt)) (history[name] ??= []).push({ at, value: undefined });
+    if (m && inChild(at)) {
+      // a child shell's assignment (`( true; D=/tmp )`): main's literal reading for ordinary names; it never
+      // enters `history`, so a home-derived name keeps the value the parent gave it
+      const literal = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+      if (!/[`$(]/.test(m[2]) && !/\s/.test(literal)) vars[m[1]] = literal;
+      return;
+    }
+    const valueAt = m ? stmt.trimEnd().length - m[2].length : 0;
+    for (const name of reboundNames(m ? m[2] : stmt, at, valueAt)) (history[name] ??= []).push({ at, value: undefined });
     if (m) {
       const val = m[2].trim();
       const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes

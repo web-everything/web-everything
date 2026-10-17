@@ -682,6 +682,41 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/a; D=$HOME/b; [ x ] && D=$X; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
   });
+  // review r10 — an assignment in a child shell never changes this shell's value, so it never makes the
+  // parent's known value unknown
+  it('a child-shell assignment keeps the value a home-derived name has in this shell', () => {
+    for (const cmd of [
+      'D=~/x; D=/clone; ( D=/tmp ); cd "$D" && git checkout --detach',
+      'D=~/x; D=/clone; (D=/tmp); cd "$D" && ls',
+      'D=~/x; D=/clone; ( true; D=/tmp ); cd "$D" && ls',
+      'D=~/x; D=/clone; ( true\nD=~/y\n); cd "$D" && ls',
+      'D=~/x; D=/clone; ( ( D=/tmp ) ); cd "$D" && ls',
+      'D=~/x; D=/clone; X=$(D=/tmp); cd "$D" && ls',
+      'D=~/x; D=/clone; X="$(D=/tmp; echo ")")"; cd "$D" && ls',
+      'D=~/x; D=/clone; cat <(D=/tmp); cd "$D" && ls',
+      'D=~/x; D=/clone; ( read D ); cd "$D" && ls',
+      'D=/clone; ( true; D=~/y ); cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    expect(at('HOME=/h; ( true; HOME=/z ); cd ~/clone && ls')).toBe('/h/clone');
+  });
+  it('a this-shell rebinding still counts, and a quoted, escaped or comment `(` opens no child shell', () => {
+    for (const cmd of [
+      'D=~/x; D=/clone; { D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; ((D=5)); cd "$D" && ls',
+      'D=~/x; D=/clone; : $((D=5)); cd "$D" && ls',
+      'D=~/x; D=/clone; : $(( (D=5) )); cd "$D" && ls',
+      'D=~/x; eval "$(echo D=/tmp)"; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    for (const cmd of [
+      'D=~/x; echo "("; D=/clone; cd "$D" && ls',
+      "D=~/x; echo '('; D=/clone; cd \"$D\" && ls",
+      "D=~/x; echo $'\\'('; D=/clone; cd \"$D\" && ls",
+      'D=~/x; echo \\(; D=/clone; cd "$D" && ls',
+      'D=~/x; echo ${D//(/}; D=/clone; cd "$D" && ls',
+      'D=~/x; echo `echo "("`; D=/clone; cd "$D" && ls',
+      'D=~/x; true # (\nD=/clone; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+  });
   it('a HOME assignment that is conditional, prefixes a command or is glob-shaped leaves home unknown', () => {
     for (const cmd of [
       'HOME=/a true; cd ~ && ls',
@@ -3724,6 +3759,8 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   it.each([
     ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
     ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    // review r10 — the operator's exact command: a home-derived name, then a literal, then a child-shell assignment
+    ['subshell assignment after a home-derived one', `D=~/x; D=${fakeClone}; ( D=/tmp ); cd "$D" && git checkout --detach`, false],
     ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
     ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
   ])('retains the main refusal for %s', (_name, command, startsProtected) => {
