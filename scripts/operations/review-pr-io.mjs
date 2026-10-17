@@ -1412,9 +1412,9 @@ export function createReviewPrSinks({
     // missed, and it APPENDS — a second row for one verdict in an append-only authority, which nothing can
     // undo. Verdict comparison fails the other way: its one ambiguity is a verdict that legitimately REPEATS
     // (a second `accepted` after a re-review), where the sink treats the earlier identical row as this
-    // round's and writes nothing. That costs a duplicate history row saying what the ledger already says —
-    // `current`, `clears` and `outstandingHolds` are all unchanged by its absence, so no consumer, present or
-    // Phase-2, computes a different answer. An under-write of a redundant row against an unrecoverable
+    // round's and writes nothing. That usually costs only a duplicate history row saying what the ledger already
+    // says. The one exception fails closed: a later hold on a superseded or missing head (which the fold applies)
+    // stays current until a fresh row lands, so the PR stays held, never released. An under-write of a redundant row against an unrecoverable
     // double-write of a real one is not a close call.
     //
     // The DECLARATION is unchanged (`we:scripts/operations/review-pr.mjs` still declares

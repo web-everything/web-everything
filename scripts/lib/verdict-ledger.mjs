@@ -907,7 +907,9 @@ function foldWithWitness(records) {
     const head = r.coverage?.headSha;
     const superseded = supersededHeads.get(r.pr);
     const transition = ['head-moved', 'carried'].includes(r.verdict);
-    if (r.source === 'first-seen' && witnessed) continue;
+    // A late baseline never moves the witness; a hold it imported from the label still applies.
+    const lateFirstSeen = r.source === 'first-seen' && Boolean(witnessed);
+    if (lateFirstSeen && (r.clears || !verdictBears(r.verdict))) continue;
     if (transition) {
       // A review may already have witnessed the destination before this observation arrived.
       if (witnessed && r.fromHead !== witnessed) continue;
@@ -917,7 +919,7 @@ function foldWithWitness(records) {
     // A headless or superseded-head HOLD still applies (fail closed): the drain's park writers may lack a head or
     // name a stale snapshot head, and the label they set holds whatever head is live. Such a CLEAR stays history:
     // it cannot vouch for the witnessed head. Neither moves the witness.
-    const offWitness = !transition && witnessed && (!head || superseded.has(head));
+    const offWitness = lateFirstSeen || (!transition && witnessed && (!head || superseded.has(head)));
     if (offWitness && r.clears) continue;
     if (head && !offWitness && (verdictBears(r.verdict) || r.source === 'first-seen')) {
       if (witnessed && witnessed !== head) superseded.add(witnessed);

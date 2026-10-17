@@ -69,6 +69,12 @@ describe('open-head ledger observations', () => {
     expect(derivePrState(staleParked, facts).clears).toBe(false);
     expect(plan({ events: staleParked })).toEqual([]);
     expect(foldVerdictLedger([...staleParked, accepted()]).get(1).current).toBe(stalePark);
+    // A late baseline (a store split or transport race past the append guard) keeps its imported hold.
+    const lateHold = plan({ events: [], headSha: head, labels: ['review:human'] })[0];
+    const lateBaseline = [baseline, accepted(), moved, acceptedNext, lateHold];
+    expect(foldVerdictLedger(lateBaseline).get(1)).toMatchObject({ current: lateHold, clears: false });
+    expect(plan({ events: lateBaseline })).toEqual([]);
+    expect(foldVerdictLedger([baseline, accepted(), plan({ events: [], headSha: next })[0]]).get(1).current).toMatchObject({ verdict: 'accepted' });
     // A headless hold never moves the witness, so the next live transition from that head still applies.
     const movedAfterPark = plan({ events: parked })[0];
     expect(movedAfterPark).toMatchObject({ verdict: 'head-moved', fromHead: head });
