@@ -16,6 +16,7 @@ import { addedLines, commonLines, fencedPush, operatorScope, removalMarkers, res
 const FENCE_DIFF = ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color', '--text', '--no-relative', '--ignore-submodules=none', '--submodule=short'];
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const MAX_MERGED = 20;
+const FENCE_MAX_BUFFER = 64 * 1024 * 1024;
 
 /**
  * The newest commit a catch-up merge (`git merge <base sha>`) brought into `sha`, when GitHub confirms it is part of the
@@ -65,7 +66,33 @@ export function readPrCommitMessages({ gh, repo, pr, head }) {
 
 export function createScopeFencedPush({ root, exec = execFileSync, env = process.env, log = console.error, loadItems = () => defaultLoadItems(root), readComments = readCompletePrComments }) {
   const gh = args => String(exec('gh', args, { encoding: 'utf8', env, timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
-  return ({ repo, pr, sha, git, push }) => {
+  return ({ repo, pr, sha, git: port, push }) => {
+    // Commit-to-commit reads only; the port supplies the lane hardening. Replace refs, grafts and a commit-graph are lane
+    // state that would show the fence a history the push never sends, and the buffer is sized for `--text` patches.
+    // The port merges `opts.env` over its own environment.
+    const git = args => port(['--no-replace-objects', '-c', 'core.commitGraph=false', ...args],
+      { maxBuffer: FENCE_MAX_BUFFER, timeout: 120_000, env: { GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
+    const readDiff = ({ head, base, removed = [] }) => {
+      // Prove our saved commit exists before attributing a missing remote head to branch movement.
+      git(['cat-file', '-e', `${sha}^{commit}`]);
+      try { git(['cat-file', '-e', `${head}^{commit}`]); } catch (e) {
+        if (e.status === 1 || e.status === 128) throw new ScopeFenceHeadMovedError(head, sha);
+        throw e;
+      }
+      try { git(['merge-base', '--is-ancestor', head, sha]); } catch (e) {
+        if (e.status === 1) throw new ScopeFenceHeadMovedError(head, sha);
+        throw e;
+      }
+      const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
+      // Patches are read only when there is a removed identifier to look for.
+      const added = (from, to) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--'])) : [];
+      const paths = names(head, sha);
+      const merged = mergedBase({ git, gh, repo, head, sha, base });
+      if (!merged) return { paths, additions: added(head, sha) };
+      // A path neither the PR (since the merge base) nor the fixer (against the merged base) changed carries only upstream's change.
+      const own = new Set([...names(git(['merge-base', head, merged]).trim(), head), ...names(merged, sha)]);
+      return { paths: paths.filter(p => own.has(p)), additions: commonLines(added(head, sha), added(merged, sha)) };
+    };
     const resolved = resolveScopeFence({ env });
     const policy = resolved.value.scopeFence;
     log(`fix.scopeFence.enabled=${policy.enabled} (${resolved.sources['scopeFence.enabled']}); fix.scopeFence.mode=${policy.mode} (${resolved.sources['scopeFence.mode']})`);
@@ -95,26 +122,12 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         const removed = [...operator.removed, ...commitMarkers];
         return { scope, repo: key, removed, head: view.headRefOid, base, comments };
       },
-      readDiff: ({ head, base }) => {
-        // Commit-to-commit reads only; hardening is supplied by the daemon's git port.
-        // Prove our saved commit exists before attributing a missing remote head to branch movement.
-        git(['cat-file', '-e', `${sha}^{commit}`]);
-        try { git(['cat-file', '-e', `${head}^{commit}`]); } catch (e) {
-          if (e.status === 1 || e.status === 128) throw new ScopeFenceHeadMovedError(head, sha);
+      readDiff: context => {
+        try { return readDiff(context); } catch (e) {
+          // Output too large to read in full will not shrink on retry: a person decides.
+          if (e?.code === 'ENOBUFS') throw new ScopeFenceEvidenceError(`git output exceeds ${FENCE_MAX_BUFFER / 1024 / 1024} MiB`, context);
           throw e;
         }
-        try { git(['merge-base', '--is-ancestor', head, sha]); } catch (e) {
-          if (e.status === 1) throw new ScopeFenceHeadMovedError(head, sha);
-          throw e;
-        }
-        const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
-        const added = (from, to) => addedLines(git([...FENCE_DIFF, '-U0', from, to, '--']));
-        const paths = names(head, sha);
-        const merged = mergedBase({ git, gh, repo, head, sha, base });
-        if (!merged) return { paths, additions: added(head, sha) };
-        // A path neither the PR (since the merge base) nor the fixer (against the merged base) changed carries only upstream's change.
-        const own = new Set([...names(git(['merge-base', head, merged]).trim(), head), ...names(merged, sha)]);
-        return { paths: paths.filter(p => own.has(p)), additions: commonLines(added(head, sha), added(merged, sha)) };
       },
       standDown: (reason, { head, comments }) => {
         const body = buildStandDownComment({ reason: 'scope-increase', detail: reason, head });

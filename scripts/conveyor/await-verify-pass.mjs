@@ -778,7 +778,7 @@ export async function defaultAwaitVerifyIo({
       if (!head.remoteUrl) return { ok: false, reason: `PR #${pr}'s URL is not a github.com pull URL; refusing to push ${ref}` };
       let laneGitDir;
       try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
-      return scopePush({ repo, pr, sha, git: args => git(lane, args), push: () => {
+      return scopePush({ repo, pr, sha, git: (args, { env: extra, ...opts } = {}) => git(lane, args, { ...opts, env: { ...env, ...extra } }), push: () => {
       try {
         // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
         const { remote, alreadyThere } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000, sleep });
@@ -822,7 +822,7 @@ export async function defaultAwaitVerifyIo({
       if (!head.open) return { ok: false, terminal: true, reason: `PR #${record.pr} is no longer open` };
       if (head.crossRepo || !head.remoteUrl) return { ok: false, terminal: true, reason: `PR #${record.pr} is not a same-repo github.com PR` };
       return scopePush({ repo: record.repo, pr: record.pr, sha: record.sha,
-        git: args => String(exec('git', ['--git-dir', join(salvageStoreDir(env), `${key}.git`), ...hardening, ...args], { encoding: 'utf8', env })),
+        git: (args, { env: extra, ...opts } = {}) => String(exec('git', ['--git-dir', join(salvageStoreDir(env), `${key}.git`), ...hardening, ...args], { encoding: 'utf8', ...opts, env: { ...env, ...extra } })),
         push: () => {
       try {
         pushShaFromScratch({ laneGitDir: join(salvageStoreDir(env), `${key}.git`), url: head.remoteUrl, sha: record.sha, ref: record.ref, exec, env, timeout: 180_000, sleep });

@@ -211,14 +211,15 @@ describe('the live scope fence adapter over a real repository', () => {
     const dir = mkdtempSync(join(tmpdir(), 'fix-scope-fence-live-'));
     const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' };
     const git = args => String(execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env }));
-    const port = args => String(execFileSync('git', ['-C', dir, ...laneGitConfigArgs(), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env }));
+    const port = (args, { env: extra, ...opts } = {}) => String(execFileSync('git', ['-C', dir, ...laneGitConfigArgs(), ...args],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts, env: { ...env, ...extra } }));
     const write = (file, text) => writeFileSync(join(dir, file), text);
     const commit = message => { git(['add', '.']); git([...ident, 'commit', '-qm', message]); return git(['rev-parse', 'HEAD']).trim(); };
     git(['init', '-q', '-b', 'main']);
     return { dir, git, port, write, commit };
   }
   /** The live adapter against a fake GitHub: the PR head and base, one marker commit, and the compare verdict for a merged commit. */
-  function liveFence(repo, { head, sha, base = null, compare = 'ahead' }) {
+  function liveFence(repo, { head, sha, base = null, compare = 'ahead', port = repo.port }) {
     const writes = [], compares = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
@@ -236,7 +237,7 @@ describe('the live scope fence adapter over a real repository', () => {
     const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: () => {},
       loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => [] });
     const push = vi.fn(() => ({ ok: true }));
-    return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: repo.port, push }), push, writes, compares };
+    return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: port, push }), push, writes, compares };
   }
 
   it.each([
@@ -286,6 +287,59 @@ describe('the live scope fence adapter over a real repository', () => {
       expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
       expect(result.reason).toContain(violation);
       expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it('reads the commit the push sends, not a lane replace ref that hides it', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'function cdLandings() {}\n'); r.commit('initial');
+      r.write('guard.mjs', '// leading cd only\n'); const head = r.commit('removal');
+      r.write('guard.mjs', 'function cdLandings() {}\n'); r.write('other.mjs', 'export const smuggled = 1;\n'); const sha = r.commit('fixer re-addition');
+      r.git(['replace', sha, head]);
+      expect(r.git(['diff', '--name-only', head, sha]).trim()).toBe('');
+      const { result, push } = liveFence(r, { head, sha });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('outside declared scope: other.mjs');
+      expect(result.reason).toContain('re-adds operator-removed identifier: cdLandings');
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('does not credit a graft-faked merge of a base commit whose change the base later reverted', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'function guard() {}\n'); r.write('other.mjs', 'export const other = 1;\n'); r.commit('initial');
+      r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', 'function guard() { return 1; }\n'); const head = r.commit('removal');
+      r.git(['checkout', '-q', 'main']); r.write('other.mjs', 'export const other = 2;\n'); const side = r.commit('side');
+      r.write('other.mjs', 'export const other = 1;\n'); const base = r.commit('revert side');
+      r.git(['checkout', '-q', 'pr']); r.write('other.mjs', 'export const other = 2;\n'); const sha = r.commit('repair');
+      r.write('.git/info/grafts', `${sha} ${head} ${side}\n`);
+      const { result, push, compares } = liveFence(r, { head, sha, base, compare: 'ahead' });
+      expect(compares).toEqual([]);
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('outside declared scope: other.mjs');
+      expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('sends a fence read too large for its buffer to a person, never a transient retry', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'function cdLandings() {}\n'); r.commit('initial');
+      r.write('guard.mjs', '// leading cd only\n'); const head = r.commit('removal');
+      r.write('guard.mjs', '// still only a leading cd\n'); const sha = r.commit('repair');
+      const opts = [];
+      const port = (args, o) => {
+        opts.push(o);
+        if (args.includes('-U0')) throw Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+        return r.port(args, o);
+      };
+      const { result, push, writes } = liveFence(r, { head, sha, port });
+      expect(opts.every(o => o.maxBuffer >= 32 * 1024 * 1024 && o.timeout > 0 && o.env.GIT_NO_REPLACE_OBJECTS === '1' && o.env.GIT_GRAFT_FILE === '/dev/null')).toBe(true);
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.transient).toBeUndefined();
+      expect(result.reason).toMatch(/git output exceeds 64 MiB/);
+      expect(push).not.toHaveBeenCalled();
+      expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
