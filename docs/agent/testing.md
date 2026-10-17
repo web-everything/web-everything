@@ -1476,7 +1476,7 @@ Before finalizing prepare picks, inspect the actual planned picks using
 planner's prepare exclusions and re-plan the same tick so the next candidate gets the
 slot. Inspect selected group members before finalizing groups, refilling groups after
 cooldown skips. Share the same lookahead budget between leads and members; never scan
-the entire grouping pool. Bound it to eight distinct cards (at most 24 listing calls), leaving
+the entire grouping pool. Bound it to eight distinct cards (at most 32 listing calls), leaving
 the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
 Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
 ago with one slot and a clean second candidate; include grouped members, hash aliases,
