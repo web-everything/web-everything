@@ -6228,8 +6228,8 @@ async function runCli() {
     // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
     const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of verdicts) {
-      observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num }, {
-        observe: facts => observeLedgerHead(facts, { read: readDrainLedger }),
+      observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha }, {
+        read: readDrainLedger, observe: facts => observeLedgerHead(facts, { read: readDrainLedger }),
       });
     }
     for (const v of skipped) {

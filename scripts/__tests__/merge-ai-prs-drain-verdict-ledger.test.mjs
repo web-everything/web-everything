@@ -153,9 +153,11 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     const end = src.indexOf('for (const v of skipped)', start);
     const observation = src.slice(start, end);
     expect(start).toBeGreaterThan(0);
-    expect(observation).toContain('observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num }');
+    // The listed head only gates the live read (skipped when it equals the witnessed head); the observed head is
+    // always the live one (`facts`). Behaviour: ledger-observation.test.mjs "skips the live read …".
+    expect(observation).toContain('observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num, listedHeadSha: v.listedHeadSha || v.headSha }');
     expect(observation).toContain('observeLedgerHead(facts, { read: readDrainLedger })');
-    expect(observation).not.toMatch(/listedHeadSha|v\.headSha/);
+    expect(observation).not.toMatch(/observeLedgerHead\(\{/);
   });
 
   it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {

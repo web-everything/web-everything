@@ -239,6 +239,23 @@ describe('open-head ledger observations', () => {
     expect(result).toMatchObject({ ok: true, rows: [] });
     expect(append).not.toHaveBeenCalled();
   });
+  it('skips the live read only while the listed head equals the witnessed head', () => {
+    const readPr = vi.fn(() => ({ state: 'OPEN', headRefOid: next, labels: [] }));
+    const observe = vi.fn(() => ({ ok: true, rows: [] }));
+    const witnessed = [plan({ events: [], headSha: head })[0]];
+    // Steady state: nothing moved, so no `gh pr view` this pass.
+    expect(observeLiveLedgerHead({ repo, pr: 1, listedHeadSha: head.toUpperCase() }, { read: () => witnessed, readPr, observe }))
+      .toMatchObject({ ok: true, skipped: 'head-unchanged' });
+    expect(readPr).not.toHaveBeenCalled();
+    // A moved listed head, no witnessed head, a short listed head, or an unreadable snapshot all read live.
+    observeLiveLedgerHead({ repo, pr: 1, listedHeadSha: next }, { read: () => witnessed, readPr, observe });
+    observeLiveLedgerHead({ repo, pr: 1, listedHeadSha: head }, { read: () => [], readPr, observe });
+    observeLiveLedgerHead({ repo, pr: 1, listedHeadSha: 'sha-1' }, { read: () => witnessed, readPr, observe });
+    observeLiveLedgerHead({ repo, pr: 1, listedHeadSha: head }, { read: () => { throw Error('unreadable'); }, readPr, observe });
+    expect(readPr).toHaveBeenCalledTimes(4);
+    // The observed head is always the live one, never the listed snapshot.
+    expect(observe.mock.calls.every(([facts]) => facts.headSha === next)).toBe(true);
+  });
   it('uses the existing numbering proof on real git objects', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'ledger-numbering-'));
     const git = args => String(execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();

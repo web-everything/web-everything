@@ -1563,7 +1563,8 @@ GitHub's live head because delivered events and drain list snapshots may describ
 event waker defaults to a no-op observer; the production wrapper opts into ledger observation explicitly.
 The waker observes only repos on its allowlist (none without one), each PR once per poll and at most
 `PR_EVENTS_DEFAULTS.maxObservationsPerPoll`; an observer failure is logged and never drops the wake.
-The drain observes each PR's live head before its holds; an exemption a late head move ended is re-emitted,
+The drain observes each PR's live head before its holds, skipping the live read only while the listed head
+already equals the ledger's witnessed head (the observed head is always the live one); an exemption a late head move ended is re-emitted,
 using the same `eventsSinceHeadMove` boundary as the pr-state view.
 Completed reviews witness their own pinned head even if observation writes are disabled or missed;
 delayed verdicts for superseded heads remain history and do not clear outstanding holds. A later explicit

@@ -100,7 +100,17 @@ export function observeLedgerPrEvent(event, pr, { readPr = (repo, number) => JSO
   } catch (e) { log(`ledger-write-miss: event observation ${event.repo}#${pr}: ${e.message}`); return { ok: false }; }
 }
 
-/** Drain snapshots are also historical evidence. Use the same live read as the feed consumer. */
-export function observeLiveLedgerHead({ repo, pr }, options = {}) {
+/** Drain snapshots are also historical evidence. Use the same live read as the feed consumer.
+ *  With `read` (the caller's ledger snapshot) and a full `listedHeadSha` that already equals the ledger's witnessed
+ *  head, the live read is skipped: nothing has moved, and a per-PR `gh pr view` every pass would burn the shared
+ *  API budget. A head that moved shows up as a listed/witnessed mismatch on this or the next pass. */
+export function observeLiveLedgerHead({ repo, pr, listedHeadSha = null }, options = {}) {
+  const listed = /^[0-9a-f]{40}$/i.test(listedHeadSha ?? '') ? listedHeadSha.toLowerCase() : null;
+  if (listed && typeof options.read === 'function') {
+    try {
+      const mine = options.read(repo).filter(e => e.repo.toLowerCase() === repo.toLowerCase() && e.pr === Number(pr));
+      if (mine.length && observedLedgerHead(mine) === listed) return { ok: true, rows: [], skipped: 'head-unchanged' };
+    } catch { /* an unreadable snapshot never skips: the live read below decides, and logs its own miss */ }
+  }
   return observeLedgerPrEvent({ repo }, pr, options);
 }
