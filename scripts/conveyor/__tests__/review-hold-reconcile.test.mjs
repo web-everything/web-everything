@@ -567,7 +567,7 @@ it('still proves and plans numbering carry with an injected accept runner', () =
     const proof = vi.fn(() => ({ ok: true, reason: 'verified' }));
     const result = sweepFixture({ repo: 'o/n', provider: p, dryRun: true,
       listPrs: () => [pr(5025, ['review:pending'])], acceptCarry: vi.fn(),
-      numberingRestamp: opts => restampAfterNumbering({ ...opts, enabled: true, prove: proof }) });
+      numberingRestamp: opts => restampAfterNumbering({ ...opts, enabled: true, readNetDiff: () => null, prove: proof }) });
     expect(proof).toHaveBeenCalledTimes(1);
     expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'would-restamp' }));
   } finally { vi.unstubAllEnvs(); _resetNumberingRestampMemo(); }
