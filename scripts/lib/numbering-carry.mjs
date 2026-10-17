@@ -652,7 +652,11 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   const netSetting = netPatchSetting;
   logIdenticalNetPatchSetting(netSetting);
   let proof = plan.human && !numberingSetting.value ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
-  if (!proof.ok && netSetting.value) proof = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+  if (!proof.ok && netSetting.value) {
+    // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
+    const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+    proof = net.ok ? net : { ...net, retryable: Boolean(proof.retryable || net.retryable), reason: `${proof.reason}; net patch: ${net.reason}` };
+  }
   if (!proof.ok) {
     if (!proof.retryable) settledRestamps.add(key);
     return { action: proof.retryable ? 'retry' : 'refused', reason: proof.reason };

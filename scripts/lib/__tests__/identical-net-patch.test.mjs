@@ -27,12 +27,35 @@ it('review regressions: rejects moving an approved edit between identical blocks
       expect(applyHumanClearanceCarry({ pr, repo: 'owner/repo', exec: writerExec, log: () => {},
         evidence: { humanClearance: latestHumanClearance(comments), headSha: b, headDiffSha: b, headDiff },
         readLiveEvidence: () => ({ headSha: b, comments, reviews: [] }) })).toBeNull();
+      // A definitive numbering refusal: the stub git cannot serve that proof, and an unreadable one stays retryable.
       expect(restampAfterNumbering({ repo: 'owner/repo', pr, exec: run, state, reviews: [],
+        prove: () => ({ ok: false, reason: 'not a numbering-only move' }),
         guardReferrals: () => {}, readNetDiff: () => ({ scored: true, text: headDiff }),
         readLiveState: () => ({ state, reviews: [] }),
         provider: { postComment: (...args) => writes.push(args), setLabels: (...args) => writes.push(args) } })).toMatchObject({ action: 'refused' });
       expect(writes).toEqual([]);
     }
+  }
+});
+it('review regressions: a definitive net-patch miss never settles a head the numbering proof could not read', () => {
+  const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
+  const state = { headRefOid: b, labels: ['review:pending'], comments };
+  const transient = { ok: false, retryable: true, reason: 'numbering proof failed: transient read' };
+  const definitive = { ok: false, reason: 'not a numbering-only move' };
+  const unreadable = (cmd, args) => { if (args[0] === 'merge-base') throw Error('transient'); return exec()(cmd, args); };
+  // [numbering proof, net-patch git, expected action]: either retryable read keeps the head unsettled.
+  for (const [n, [first, git, action]] of [[transient, exec(), 'retry'], [transient, unreadable, 'retry'],
+    [definitive, unreadable, 'retry'], [definitive, exec(), 'refused']].entries()) {
+    const writes = [];
+    let proofs = 0;
+    const step = () => restampAfterNumbering({ repo: 'owner/repo', pr: 54700 + n, exec: git, state, reviews: [],
+      prove: () => { proofs++; return first; }, guardReferrals: () => {},
+      readNetDiff: () => ({ scored: true, text: diff }), readLiveState: () => ({ state, reviews: [] }),
+      provider: { postComment: (...args) => writes.push(args), setLabels: (...args) => writes.push(args) } });
+    expect(step()).toMatchObject({ action });
+    expect(step()?.action).toBe(action === 'retry' ? 'retry' : undefined);
+    expect(proofs).toBe(action === 'retry' ? 2 : 1);
+    expect(writes).toEqual([]);
   }
 });
 it('refuses offset-only net patches on an unchanged base despite matching stable patch ids', () => {

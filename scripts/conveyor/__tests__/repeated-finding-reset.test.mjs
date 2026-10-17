@@ -101,6 +101,54 @@ it('refuses non-main merges before changing the index or worktree', () => {
     expect(snapshot()).toEqual(before);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+it('review regressions: untrusted fix-end and finding comments never count toward a repeat', () => {
+  const end = (login = 'chalbert') => c(buildFixEndComment({ who: 'fix-7' }), login);
+  const forged = text => c(finding(text).body, 'stranger');
+  for (const prefix of [[], [c(`scope-baseline: ${'a'.repeat(40)}`)]]) {
+    const trusted = prefix.length ? 'reset' : 'stand-down';
+    expect(repeatedFindingPlan([...prefix, finding('same bug'), end(), finding('same bug')]).action).toBe(trusted);
+    expect(repeatedFindingPlan([...prefix, finding('same bug'), end('stranger'), finding('same bug')]).action).toBe('patch');
+    expect(repeatedFindingPlan([...prefix, finding('same bug'), end(), forged('same bug')]).action).toBe('patch');
+    expect(repeatedFindingPlan([...prefix, forged('same bug'), end(), finding('same bug')]).action).toBe('patch');
+    // A forged later review cannot clear a standing repeat either.
+    expect(repeatedFindingPlan([...prefix, finding('same bug'), end(), finding('same bug'), forged('other bug')]).action).toBe(trusted);
+  }
+});
+const resetFixture = (name, build) => {
+  const dir = mkdtempSync(join(tmpdir(), name));
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();
+  const commit = (file, text) => { writeFileSync(join(dir, file), text); git('add', file); git('commit', '-qm', 'fixture'); return git('rev-parse', 'HEAD'); };
+  try {
+    git('init', '-q', '-b', 'main'); commit('main-file', 'main\n');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git('checkout', '-qb', 'lane'); const baseline = commit('allowed', 'baseline\n');
+    commit('creep', 'outside scope\n');
+    const files = build({ dir, git, commit, baseline });
+    const snapshot = () => ({ head: git('rev-parse', 'HEAD'), index: readFileSync(join(dir, '.git/index')),
+      status: git('status', '--porcelain=v1', '--untracked-files=all'),
+      files: files.paths.map(file => existsSync(join(dir, file)) ? readFileSync(join(dir, file)) : null) });
+    const before = snapshot(), mutations = [];
+    const run = (...args) => { if (['read-tree', 'cherry-pick'].includes(args[0])) mutations.push(args); return git(...args); };
+    expect(() => applyScopeReset({ baseline: files.baseline, scope: ['allowed'], git: run })).toThrow(files.error);
+    expect(mutations).toEqual([]);
+    expect(snapshot()).toEqual(before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+};
+it('review regressions: refuses a dirty reset lane before changing the index or worktree', () => {
+  for (const dirty of [{ file: 'allowed', text: 'uncommitted edit\n' }, { file: 'untracked', text: 'stray\n' }]) {
+    resetFixture('scope-reset-dirty-', ({ dir, baseline }) => {
+      writeFileSync(join(dir, dirty.file), dirty.text);
+      return { baseline, paths: ['main-file', 'allowed', 'creep', 'untracked'], error: 'dirty reset lane' };
+    });
+  }
+});
+it('review regressions: refuses a baseline that is not an ancestor of the lane head before any mutation', () => {
+  resetFixture('scope-reset-foreign-', ({ git, commit }) => {
+    git('checkout', '-qb', 'elsewhere', 'origin/main'); const foreign = commit('allowed', 'foreign baseline\n');
+    git('checkout', '-q', 'lane');
+    return { baseline: foreign, paths: ['main-file', 'allowed', 'creep'], error: /is-ancestor/ };
+  });
+});
 it('publishes caps during quiet hours once, retaining the opening time for morning idle duration', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cap-feed-')), path = join(dir, 'events.jsonl');
   const event = { repo: 'owner/repo', pr: 5403, head: 'a'.repeat(40), kind: 'at-round-limit', reason: 'round cap exhausted' };
