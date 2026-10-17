@@ -1,4 +1,5 @@
 ---
+bornAs: xpdw3em
 kind: story
 size: 5
 status: active
@@ -15,7 +16,7 @@ The collector in we:scripts/operations/delivery-metrics.mjs reads source ledgers
 
 Owns delivery.metrics.enabled (default true), delivery.metrics.schedule (default daily 00:15 America/New_York), and the protocol list in we:scripts/settings/delivery-metrics.json. New protocols require settings changes alone. Each protocol reports stage (proposed = card only, defined = pure rule exists, fixtures = replay fixtures exist, live = daemons call it), rule and fixture counts, and the measured overall percentage of delivery decisions behind a protocol (null with a reason when the denominator is unavailable or zero). Examples include the review/fix policy protocol of #5468 and the Decision API of #5461.
 
-The consumer contract is a versioned row with ET date, collection timestamp, repo identity, the seven measure groups, a delivery-protocols group and per-field availability reasons. Use null plus a reason for an unavailable measure, never a fabricated zero. Document exact field names, units and per-measure multi-day aggregation semantics alongside fixtures in the test file before building the consumers. Daily percentiles may be displayed as daily series but cannot be averaged into a weekly percentile; mark that weekly aggregate unavailable unless the row carries sufficient aggregation data. Dashboard xeluwak and digest x4pfhf5 consume this contract. Daily health-watch wiring belongs to xxvode8, which waits for PR #5487; this card does not touch its files. The digest card owns delivery.digest.schedule.
+The consumer contract is a versioned row with ET date, collection timestamp, repo identity, the seven measure groups, a delivery-protocols group and per-field availability reasons. Use null plus a reason for an unavailable measure, never a fabricated zero. Document exact field names, units and per-measure multi-day aggregation semantics alongside fixtures in the test file before building the consumers. Daily percentiles may be displayed as daily series but cannot be averaged into a weekly percentile; mark that weekly aggregate unavailable unless the row carries sufficient aggregation data. Dashboard 6202 and digest 6204 consume this contract. Daily health-watch wiring belongs to 6203, which waits for PR #5487; this card does not touch its files. The digest card owns delivery.digest.schedule.
 
 ## Acceptance
 

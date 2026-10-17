@@ -1,10 +1,11 @@
 ---
+bornAs: xxvode8
 kind: story
 size: 2
 status: active
 scaffoldedBy: "delivery-metrics-cards-2-lane-16-51caddc5"
 dateScaffolded: "2026-10-17"
-blockedBy: ["xpdw3em"]
+blockedBy: ["6201"]
 scope: ["we:scripts/conveyor/delivery-metrics-job.mjs", "we:scripts/conveyor/__tests__/delivery-metrics-job.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
@@ -12,7 +13,7 @@ tags: []
 
 # Wire the delivery-metrics collector as a daily health-watch job
 
-Run the delivery-metrics collector (we:scripts/operations/delivery-metrics.mjs) once a day as a health-watch job at 00:15 America/New_York, declared like the nightly coroner: a job module we:scripts/conveyor/delivery-metrics-job.mjs, a health-watch entry and a daemon manifest entry, honouring delivery.metrics.enabled and delivery.metrics.schedule. Split out of the collector card because PR #5487 (no card of its own) holds the health-watch and manifest files; start after it lands. Blocked on the collector card xpdw3em.
+Run the delivery-metrics collector (we:scripts/operations/delivery-metrics.mjs) once a day as a health-watch job at 00:15 America/New_York, declared like the nightly coroner: a job module we:scripts/conveyor/delivery-metrics-job.mjs, a health-watch entry and a daemon manifest entry, honouring delivery.metrics.enabled and delivery.metrics.schedule. Split out of the collector card because PR #5487 (no card of its own) holds the health-watch and manifest files; start after it lands. Blocked on the collector card 6201.
 
 ## Acceptance
 
@@ -31,7 +32,7 @@ All cases below are CAPABILITY tests (RED before implementation) in we:scripts/c
 
 ## Non-goals
 
-- [N1] No collector calculations, history format changes, settings-file edits, dashboard or digest job. Reuse xpdw3em's settings contract; preserve PR #5487's health-watch/manifest changes and start only after that PR lands.
+- [N1] No collector calculations, history format changes, settings-file edits, dashboard or digest job. Reuse 6201's settings contract; preserve PR #5487's health-watch/manifest changes and start only after that PR lands.
 
 ## Edge cases this change must handle
 

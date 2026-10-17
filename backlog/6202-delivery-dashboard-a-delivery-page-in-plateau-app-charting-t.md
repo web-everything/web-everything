@@ -1,11 +1,12 @@
 ---
+bornAs: xeluwak
 kind: story
 locus: plateau-app
 size: 5
 status: active
 scaffoldedBy: "delivery-metrics-cards"
 dateScaffolded: "2026-10-17"
-blockedBy: ["xpdw3em"]
+blockedBy: ["6201"]
 scope: ["plateau-app:src/delivery/delivery-view.ts", "plateau-app:src/delivery/delivery-view.test.ts", "plateau-app:src/delivery/delivery-read.ts", "plateau-app:src/main.ts", "plateau-app:index.html"]
 dateOpened: "2026-10-17"
 tags: []
@@ -13,7 +14,7 @@ tags: []
 
 # Delivery dashboard: a /delivery/ page in plateau-app charting the metrics history
 
-A /delivery/ page in plateau-app (the product), routed like /wip: a route template and nav link in plateau-app:index.html, a title entry and mount in plateau-app:src/main.ts, and a view in plateau-app:src/delivery/delivery-view.ts. The reader in plateau-app:src/delivery/delivery-read.ts reads ONLY the versioned collector history contract delivered by xpdw3em (delivery-metrics JSON lines, retained in WE). It charts throughput, speed, quality, operator load, trust, reliability and cost. The "Delivery protocols" panel shows each protocol's stage (proposed → defined → fixtures → live), rule and fixture counts, and overall percent of delivery decisions behind a protocol, all taken from history. Dev port 4000.
+A /delivery/ page in plateau-app (the product), routed like /wip: a route template and nav link in plateau-app:index.html, a title entry and mount in plateau-app:src/main.ts, and a view in plateau-app:src/delivery/delivery-view.ts. The reader in plateau-app:src/delivery/delivery-read.ts reads ONLY the versioned collector history contract delivered by 6201 (delivery-metrics JSON lines, retained in WE). It charts throughput, speed, quality, operator load, trust, reliability and cost. The "Delivery protocols" panel shows each protocol's stage (proposed → defined → fixtures → live), rule and fixture counts, and overall percent of delivery decisions behind a protocol, all taken from history. Dev port 4000.
 
 ## Acceptance
 
@@ -46,4 +47,4 @@ All cases below are CAPABILITY tests (RED before implementation) in plateau-app:
 
 ## Risks
 
-The cross-repo history path and schema must come from xpdw3em's delivered contract. The history-only integration assertion must observe the mounted route, not just a mocked view, to catch accidental extra data sources.
+The cross-repo history path and schema must come from 6201's delivered contract. The history-only integration assertion must observe the mounted route, not just a mocked view, to catch accidental extra data sources.

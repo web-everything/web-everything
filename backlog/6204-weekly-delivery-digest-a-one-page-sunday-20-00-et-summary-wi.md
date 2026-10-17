@@ -1,10 +1,11 @@
 ---
+bornAs: x4pfhf5
 kind: story
 size: 3
 status: active
 scaffoldedBy: "delivery-metrics-cards"
 dateScaffolded: "2026-10-17"
-blockedBy: ["xpdw3em", "xxvode8"]
+blockedBy: ["6201", "6203"]
 scope: ["we:scripts/operations/delivery-digest.mjs", "we:scripts/operations/__tests__/delivery-digest.test.mjs", "we:scripts/conveyor/delivery-digest-job.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs", "we:scripts/settings/delivery-metrics.json"]
 dateOpened: "2026-10-17"
 tags: []
@@ -12,7 +13,7 @@ tags: []
 
 # Weekly delivery digest: a one-page Sunday 20:00 ET summary with week-over-week arrows
 
-A health-watch job reads only the collector history contract from xpdw3em and writes a one-page Markdown digest and a JSON summary to the handoff folder, with week-over-week arrows per measure. Code in we:scripts/operations/delivery-digest.mjs and we:scripts/conveyor/delivery-digest-job.mjs. Declare the job in we:scripts/conveyor/health-watch.mjs and we:skills-src/conveyor/daemon-manifest.mjs using the collector wiring delivered by xxvode8; health-watch's morning status output links the latest successfully published digest. Both prerequisites must land first, including xxvode8's prerequisite PR #5487.
+A health-watch job reads only the collector history contract from 6201 and writes a one-page Markdown digest and a JSON summary to the handoff folder, with week-over-week arrows per measure. Code in we:scripts/operations/delivery-digest.mjs and we:scripts/conveyor/delivery-digest-job.mjs. Declare the job in we:scripts/conveyor/health-watch.mjs and we:skills-src/conveyor/daemon-manifest.mjs using the collector wiring delivered by 6203; health-watch's morning status output links the latest successfully published digest. Both prerequisites must land first, including 6203's prerequisite PR #5487.
 
 This card owns delivery.digest.schedule (default Sunday 20:00 America/New_York) in we:scripts/settings/delivery-metrics.json; preserve collector-owned delivery.metrics.* and the protocol list. The blockedBy edges serialize the shared settings, health-watch and manifest edits. Compare the seven completed ET dates preceding the Sunday run with the preceding seven dates; aggregate counts by sum and other measures by their documented collector units/aggregation. Mark incomplete windows and unavailable values explicitly; compare only compatible measures. Arrows ↑/↓/→ mean positive/negative/zero numeric delta, not good/bad. An unavailable baseline yields an unavailable comparison, not a zero baseline.
 
