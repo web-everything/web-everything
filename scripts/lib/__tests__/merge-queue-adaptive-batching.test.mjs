@@ -580,6 +580,7 @@ describe('batching IO shell and drain hook', () => {
     const drain = createDrainMergeStrategy({
       resolved: { policy: { strategy: 'github-merge-queue', sources: {} }, note: null },
       localSlug: 'owner/repo', log: { write: () => {} },
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
       readFile: () => JSON.stringify(stored), writeState: (_path, state) => { stored = structuredClone(state); },
       batching: {
         gate: num => { order.push(['gate', num]); return num === 1 ? { admit: true, groupId: 'reservation-1' } : { admit: false, reason: 'group full' }; },
@@ -627,16 +628,22 @@ describe('batching IO shell and drain hook', () => {
     const drain = createDrainMergeStrategy({
       resolved: { policy: { strategy: 'github-merge-queue', sources: {} }, note: null },
       localSlug: 'owner/repo', log: { write: () => {} }, batching: h.shell,
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
       readFile: () => JSON.stringify({ pending: [], followedUp: [] }),
       exec: (cmd, args) => {
         calls.push([cmd, args]);
         if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, labels: ['ready-to-merge'] });
+        if (cmd === 'gh' && args[0] === 'api' && args.includes('--slurp')) return '[[]]';
         throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
       },
     });
     expect(drain.enqueue({ num: 4 }, head)).toEqual({ enqueued: false, deferred: true, reason: 'queue holds 1 group(s) (max 1)' });
-    // Live admission facts are read before batching; deferral still makes no enqueue or clearance mutation.
-    expect(calls).toEqual([['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels']]]);
+    // Live admission reads the complete thread for recorded breaks before batching, even with no owed red team.
+    // Deferral still makes no enqueue or clearance mutation.
+    expect(calls).toEqual([
+      ['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels']],
+      ['gh', ['api', '--paginate', '--slurp', 'repos/owner/repo/issues/4/comments']],
+    ]);
   });
   it('dry run performs neither state writes, dequeue, nor cancel', () => {
     const h = ioHarness({ dryRun: true, state: { ...empty(), groups: [group({ seen: [1, 2] })] }, queue: [2] });
