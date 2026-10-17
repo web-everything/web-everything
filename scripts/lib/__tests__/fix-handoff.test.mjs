@@ -54,12 +54,14 @@ it('also checks local hand-offs when webhook waking is enabled', async () => {
   await waker.sleep(60_000);
   expect(polled).toBe(false);
 });
-it('reserves one send-back slot when no setting is supplied (the standard default)', () => {
-  const claims = [{ meta: { kind: 'fix', repo: 'we', pr: 1 } }];
-  const throttle = createResourceFixThrottle({ env: {}, listClaims: () => claims, alive: () => true, readSnap: () => null, readHeavyWait: () => 0,
-    settings: { cutover: 'enforce', fixCap: { floor: 2, ceiling: 2 } }, gate: () => ({ admit: true }), log: () => {} });
-  expect(throttle.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'send-back-reserved' });
-  expect(throttle.tryAdmit('fix', { sendBack: true }).admit).toBe(true);
+it('reserves exactly one send-back slot when no setting is supplied (the standard default)', () => {
+  const throttleWith = live => createResourceFixThrottle({ env: {}, alive: () => true, readSnap: () => null, readHeavyWait: () => 0,
+    listClaims: () => Array.from({ length: live }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } })),
+    settings: { cutover: 'enforce', fixCap: { floor: 3, ceiling: 3 } }, gate: () => ({ admit: true }), log: () => {} });
+  expect(throttleWith(1).tryAdmit('fix').admit).toBe(true); // a default of 2+ would refuse here
+  const atReserve = throttleWith(2);
+  expect(atReserve.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'send-back-reserved' }); // a default of 0 would admit
+  expect(atReserve.tryAdmit('fix', { sendBack: true }).admit).toBe(true);
 });
 
 import { vi } from 'vitest';
@@ -69,21 +71,25 @@ it('the live dispatch pass asks the throttle for the send-back slot only for a r
     { kind: 'fix', prNumber: 5401, headRefName: 'lane/5401-bounced', labels: ['review:changes'] },
     { kind: 'fix', prNumber: 5402, headRefName: 'lane/5402-ci-red', labels: ['ci:failed'] },
   ];
-  const tryAdmit = vi.fn(() => ({ admit: false, kind: 'fix-cap', why: 'full' }));
+  // Only the reserved send-back slot is free: whichever entry the pass marks sendBack is the one that dispatches.
+  const tryAdmit = vi.fn((_kind, { sendBack } = {}) => (sendBack ? { admit: true } : { admit: false, kind: 'send-back-reserved', why: 'reserved' }));
+  const dispatch = vi.fn(entry => ({ pr: entry.pr, lane: entry.lane }));
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  let result;
   try {
-    runReconcileFixDispatch({
+    result = runReconcileFixDispatch({
       root: '.', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
       reconcile: () => ({ dispatch: entries, refusals: [] }),
       findItemFn: key => ({ num: key, scope: [`we:scripts/${key}.mjs`] }),
       fetchItemlessDiffPaths: () => [], resolveFallbackScope: () => [],
       loadItems: () => [], pickFreeLanes: () => [3, 4], listBuildClaims: () => [], listFixClaims: () => [],
-      dispatch: vi.fn(), borrowGate: { consider: () => ({ borrow: false, why: 'borrow-off' }), clear: () => {} },
+      dispatch, borrowGate: { consider: () => ({ borrow: false, why: 'borrow-off' }), clear: () => {} },
       priorityShadow: null, readMainRedPriorityRecord: () => null, dispatchThrottle: { tryAdmit },
     });
   } finally { log.mockRestore(); }
-  expect(tryAdmit.mock.calls).toEqual(expect.arrayContaining([['fix', { sendBack: true }], ['fix', { sendBack: false }]]));
   expect(tryAdmit).toHaveBeenCalledTimes(2);
+  expect(dispatch.mock.calls.map(([entry]) => entry.pr)).toEqual([5401]);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 5402, kind: 'send-back-reserved' }));
 });
 
 import { runReviewLabelCli } from '../../review-set-label.mjs';

@@ -52,25 +52,36 @@ it('retains the push record and stops before editing when label creation fails',
   expect(recorded).toEqual([push]);
   expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create']]);
 });
-it('a same-head retry after CI finished keeps the CI verdict and drops only fixer state', () => {
+it('a same-head retry after a required check failed keeps the red verdict and drops only fixer state', () => {
   const calls = [];
   const rollup = [
-    { __typename: 'CheckRun', name: 'unit', status: 'IN_PROGRESS' },
-    { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'FAILURE' },
-    { __typename: 'StatusContext', context: 'soak', state: 'SUCCESS' },
+    { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { __typename: 'StatusContext', context: 'smoke', state: 'PENDING' },
   ];
   const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', statusCheckRollup: rollup, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }, { name: 'status:fixing' }] }); };
-  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(false);
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
   expect(calls.map(a => a.slice(0, 2))).toEqual([['pr', 'view'], ['pr', 'edit']]);
   expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'status:fixing']);
 });
-it('ciSettledOnHead: empty or any still-running check is not settled', async () => {
-  const { ciSettledOnHead } = await import('../fix-push-ci.mjs');
-  expect(ciSettledOnHead(undefined)).toBe(false);
-  expect(ciSettledOnHead([])).toBe(false);
-  expect(ciSettledOnHead([{ __typename: 'CheckRun', name: 'a', status: 'COMPLETED', conclusion: 'SUCCESS' }, { __typename: 'CheckRun', name: 'b', status: 'QUEUED' }])).toBe(false);
-  expect(ciSettledOnHead([{ __typename: 'StatusContext', context: 'c', state: 'PENDING' }])).toBe(false);
-  expect(ciSettledOnHead([{ __typename: 'CheckRun', name: 'a', status: 'COMPLETED', conclusion: 'FAILURE' }, { __typename: 'StatusContext', context: 'c', state: 'ERROR' }])).toBe(true);
+it('a same-head retry after CI went green drops the previous head\'s red labels without re-handing to CI', () => {
+  const calls = [];
+  const rollup = [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { __typename: 'StatusContext', context: 'smoke', state: 'SUCCESS' }];
+  const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', statusCheckRollup: rollup, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }); };
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
+  expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'ci:failed', '--remove-label', 'status:ci-red']);
+});
+it('headCiVerdict judges required checks only: partial, unknown and missing-status rows are pending', async () => {
+  const { headCiVerdict, readRequiredChecksSafe } = await import('../fix-push-ci.mjs');
+  const run = (name, status, conclusion) => ({ __typename: 'CheckRun', name, status, ...(conclusion ? { conclusion } : {}) });
+  const req = ['test', 'smoke'];
+  expect(headCiVerdict(undefined, req)).toBe('pending');
+  expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS')], req)).toBe('pending'); // smoke never reported
+  expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS'), run('smoke', 'COMPLETED', 'SUCCESS')], [])).toBe('pending');
+  expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS'), { name: 'smoke' }], req)).toBe('pending');
+  expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS'), run('smoke', 'COMPLETED', 'NEUTRAL'), run('merge-gate', 'COMPLETED', 'FAILURE')], req)).toBe('green');
+  expect(headCiVerdict([run('test', 'COMPLETED', 'TIMED_OUT'), run('smoke', 'QUEUED')], req)).toBe('red');
+  expect(headCiVerdict([run('test', 'COMPLETED', 'SUCCESS'), { __typename: 'StatusContext', context: 'smoke', state: 'ERROR' }], req)).toBe('red');
+  expect(readRequiredChecksSafe('o/r', () => { throw new Error('403'); })).toEqual([]);
 });
 it('resolves missing-CI timing per leaf through the cascade', () => {
   const out = resolveHandoffSettings('fix', { tool: { ciMissingAfterPushMin: 12 }, platform: { ciMissingAfterPushMin: 15, sendBackReservedSlots: 2 }, env: {} });

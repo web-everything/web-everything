@@ -52,7 +52,7 @@
  * `--who` are therefore still two authors. Anything else is "anyone else" and is refused.
  */
 import { recordFixPush } from './fix-push-state.mjs';
-import { markFixPushAwaitingCi, ciSettledOnHead, FIX_PUSH_FIXER_LABELS } from './fix-push-ci.mjs';
+import { markFixPushAwaitingCi, headCiVerdict, fixPushLabelPlan, readRequiredChecksSafe } from './fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
 import { readGit } from '../lib/proc-read.mjs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -708,7 +708,7 @@ export async function fixBegin({
 export async function fixEnd({
   repo, pr, who, sessionId = callerIdentity().sessionId, token = callerIdentity().token, gh = ghDefault, labels = null, lockRoot = fixDispatchClaimRoot(),
   readCompletion = readCompletionDefault, readSelfReview = readSelfReviewDefault, clearSelfReview = null,
-  selfRelease = null, recordPush = recordFixPush,
+  selfRelease = null, recordPush = recordFixPush, readRequiredChecks = readRequiredChecksSafe,
 } = {}) {
   const repoKey = repoKeyOf(repo);
   const slug = CONSTELLATION_REPOS[repoKey].slug;
@@ -743,10 +743,10 @@ export async function fixEnd({
   const steps = [];
   let headSha = null;
   let headLabels = [];
-  let ciSettled = false;
+  let rollup = [];
   try {
     const view = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid,labels,statusCheckRollup'])));
-    headSha = view.headRefOid ?? null; headLabels = (view.labels ?? []).map(l => l.name ?? l); ciSettled = ciSettledOnHead(view.statusCheckRollup);
+    headSha = view.headRefOid ?? null; headLabels = (view.labels ?? []).map(l => l.name ?? l); rollup = view.statusCheckRollup ?? [];
   } catch { headSha = null; }
   let infraStall = false;
   try {
@@ -755,19 +755,20 @@ export async function fixEnd({
   const provider = labels ?? await labelProviderDefault();
   // Raw agent pushes also pass through fix-end. A changed head proves a push since fix-begin;
   // an unchanged head or infrastructure stand-down must not reset CI state.
-  // CI can finish between that push and fix-end: then its verdict stands and only the fixer-state labels go.
+  // CI can finish between that push and fix-end: then this head's required-check verdict stands (fixPushLabelPlan).
   if (headSha && rel.entry?.meta?.headSha && headSha !== rel.entry.meta.headSha && !infraStall) {
     try {
       recordPush({ repo: slug, pr: Number(pr), head: headSha });
-      if (ciSettled) {
-        const fixerLabels = headLabels.filter(l => FIX_PUSH_FIXER_LABELS.includes(l));
-        if (fixerLabels.length) provider.setLabels(slug, Number(pr), { remove: fixerLabels });
-        steps.push('ci-settled');
+      const verdict = rollup.length ? headCiVerdict(rollup, readRequiredChecks(slug)) : 'pending';
+      const plan = fixPushLabelPlan(headLabels, verdict);
+      if (!plan.handOff) {
+        if (plan.remove.length) provider.setLabels(slug, Number(pr), { remove: plan.remove });
+        steps.push(`ci-${verdict}`);
       } else {
         provider.ensureLabel(slug, 'checking', { color: 'fbca04', description: 'Waiting for CI' });
         provider.ensureLabel(slug, 'status:awaiting-ci', { color: 'fbca04', description: 'Waiting for CI — auto-managed' });
-        provider.setLabels(slug, Number(pr), { add: 'checking', remove: headLabels.filter(l => l === 'ci:failed') });
-        provider.setLabels(slug, Number(pr), { add: 'status:awaiting-ci', remove: headLabels.filter(l => ['status:ci-red', ...FIX_PUSH_FIXER_LABELS, 'status:awaiting-review'].includes(l)) });
+        provider.setLabels(slug, Number(pr), { add: 'checking', remove: plan.remove.filter(l => l === 'ci:failed') });
+        provider.setLabels(slug, Number(pr), { add: 'status:awaiting-ci', remove: plan.remove.filter(l => l !== 'ci:failed') });
         steps.push('awaiting-ci');
       }
     } catch (e) { steps.push(`awaiting-ci-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
@@ -779,7 +780,8 @@ export async function fixEnd({
 
 /**
  * After `push` succeeded: hand the claimed PR's new head to CI. Best effort — the push already landed and the
- * missing-CI watch repairs a missed hand-off, so a claim/git/gh failure is logged and reported, never thrown.
+ * drain's CI-lifecycle label pass relabels the head from its own CI read, so a claim/git/gh failure is logged and
+ * reported, never thrown.
  */
 export function handClaimedPushToCi({ repoKey, branch, src = 'HEAD' }, {
   listClaims = listLiveFixClaims, revParse = ref => readGit(['rev-parse', ref]).trim(), mark = markFixPushAwaitingCi, log = () => {},
@@ -789,7 +791,7 @@ export function handClaimedPushToCi({ repoKey, branch, src = 'HEAD' }, {
     if (!claim) return 'no-claim';
     return mark({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: revParse(src) }) ? 'awaiting-ci' : 'skipped';
   } catch (e) {
-    log(`fix-procedure: push landed; CI hand-off failed (the missing-CI watch retries): ${String(e?.message ?? e).split('\n')[0]}`);
+    log(`fix-procedure: push landed; CI hand-off failed (the CI-lifecycle label pass relabels it):${String(e?.message ?? e).split('\n')[0]}`);
     return 'failed';
   }
 }
