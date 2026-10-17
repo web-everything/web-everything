@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { fencedPush, operatorScope, removalMarkers, scopeBrief, resolveScopeFence, scopeFenceDecision } from '../fix-scope-fence.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 
@@ -18,6 +19,27 @@ function run(over = {}) {
 }
 
 describe('fix scope fence', () => {
+  it('rejects oversized marker evidence within a bounded time', () => {
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/conveyor/fix-scope-fence.mjs')).href;
+    const probe = `import { removalMarkers } from ${JSON.stringify(moduleUrl)};
+      import assert from 'node:assert/strict';
+      for (const text of ['scope-removed: a' + ' '.repeat(100_000) + 'b', ('x' + String.fromCharCode(10)).repeat(600_000)]) {
+        assert.throws(() => removalMarkers(text), /scope-removed.*limit/);
+      }`;
+    expect(() => execFileSync(process.execPath, ['--input-type=module', '-e', probe], { timeout: 3000, stdio: 'pipe' })).not.toThrow();
+  });
+  it('parses plain and HTML markers across line endings without normalizing identifier text', () => {
+    expect(removalMarkers('  scope-removed: one, two\r\n <!-- scope-removed: $three _four -->\r\nscope-removed: one')).toEqual(['one', 'two', '$three', '_four', 'one']);
+    expect(removalMarkers('quoted scope-removed: ignored\nscope-removed: --flag ../path `quoted` "name" ｎame')).toEqual([]);
+    const r = run({ readContext: () => ({ ...context, removed: removalMarkers('scope-removed: a' + ' '.repeat(100_000) + 'b') }) });
+    expect(r.result).toMatchObject({ ok: false, scopeFence: true });
+    expect(r.push).not.toHaveBeenCalled();
+  });
+  it('checks added prefix increments inside hunks while ignoring file headers', () => {
+    const patch = 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n@@ -1 +1 @@\n-old\n+++ cdLandings;\n';
+    expect(run({ readDiff: () => ({ paths: ['guard.mjs'], patch }) }).result).toMatchObject({ ok: false, scopeFence: true });
+    expect(scopeFenceDecision({ ...context, removed: ['guard'], paths: ['guard.mjs'], patch: patch.replace('+++ cdLandings;', '+safe();'), policy }).action).toBe('push');
+  });
   it('preserves operator scope lines verbatim and ignores untrusted or ordinary review comments', () => {
     expect(context.notes).toEqual(['Out of scope: every cd landing', '- subshell walks', 'x5tbryq carries landing budgets']);
     for (const line of context.notes) expect(scopeBrief(context.scope, context)).toContain(line);

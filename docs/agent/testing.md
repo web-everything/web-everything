@@ -1211,12 +1211,23 @@ is still forbidden by the scope brief even when the marker cannot identify it me
 
 The harness checks before early, green and saved-commit pushes. Unreadable scope/diff evidence withholds
 the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+Marker parsing scans lines without a backtracking expression and rejects evidence over 1 MiB or a line
+over 16 KiB, withholding the push rather than silently truncating removal policy. Plain and HTML markers
+accept LF, CRLF, CR and Unicode line separators. Diff file headers are excluded from identifier checks;
+added prefix-increment statements inside hunks are checked like all other additions.
+When the PR head diverged or its commit is absent locally, the fence refuses to push and returns a
+terminal moved-head result. Live waits use the existing `push-rejected` recovery prompt; salvage stops
+retrying the stale saved commit. Unexpected Git failures remain transient evidence failures.
 `fix.scopeFence.enabled` (true) and `fix.scopeFence.mode` (`stand-down` or `warn`, default `stand-down`)
 resolve independently through standard → platform `fix.scopeFence` → tool settings →
 `WE_FIX_SCOPE_FENCE_ENABLED` / `WE_FIX_SCOPE_FENCE_MODE`; push logs name each source. Warn mode posts a
 PR note before pushing. Replay #5403 with a real temporary git removal/re-addition diff and injected
-push/comment sinks in `fix-scope-fence.test.mjs`; existing push-port tests isolate the fence via its
-explicit seam. Run these and the await-verify, round-history and operator-queue suites through heavy admission.
+push/comment sinks in `fix-scope-fence.test.mjs`. The default-IO regressions in `await-verify-pass.test.mjs`
+keep the real fence enabled for early, green and salvage ports, assert stand-down and no Git push, and
+cover diverged/missing heads plus unexpected ancestry errors. Older push-port tests isolate unrelated
+behavior via the explicit seam. Prompt regressions cover one scope header on fresh, borrowed and round
+resume launches, retaining historical exclusions. Run these and the round-history and operator-queue
+suites through heavy admission.
 
 ## False-finding coroner pass
 

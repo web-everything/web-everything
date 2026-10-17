@@ -114,6 +114,83 @@ function harness({ records = [rec()], session = { sessionId: rec().sessionId, na
   return { io, store, calls, state };
 }
 
+describe('scope fence default wiring regressions', () => {
+  const ref = 'lane/scope-fence';
+  function fixture({ ancestry = 'ancestor', outside = true, evidenceError = null } = {}) {
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'gh') {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (args.includes('--jq')) return `OPEN https://github.com/web-everything/web-everything/pull/4115 false ${ref}`;
+          return JSON.stringify({ headRefName: ref, headRefOid: OTHER, commits: [] });
+        }
+        if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
+        return '';
+      }
+      if (cmd === 'git') {
+        if (args.includes('--absolute-git-dir')) return '/lanes/lane-5/.git';
+        if (args.includes('cat-file') && args.includes(`${SHA}^{commit}`) && evidenceError === 'missing-verified') throw Object.assign(new Error('missing verified commit'), { status: 128 });
+        if (args.includes('cat-file') && args.includes(`${OTHER}^{commit}`) && ancestry === 'missing') throw Object.assign(new Error('missing head'), { status: 128 });
+        if (args.includes('merge-base')) {
+          if (evidenceError) throw Object.assign(new Error('git unavailable'), { status: evidenceError === 'fatal' ? 128 : null });
+          if (ancestry !== 'ancestor') throw Object.assign(new Error('not an ancestor'), { status: ancestry === 'missing' ? 128 : 1 });
+        }
+        if (args.includes('diff')) return args.includes('--name-only') ? `${outside ? 'outside.mjs' : 'guard.mjs'}\0` : '+const repair = true;';
+        return '';
+      }
+      throw new Error(`unexpected command: ${cmd}`);
+    };
+    return { calls, build: () => defaultAwaitVerifyIo({
+      weRoot: '/we', exec, env: { WE_FIX_SCOPE_FENCE_ENABLED: 'true', WE_FIX_SCOPE_FENCE_MODE: 'stand-down' },
+      poolRoot: '/lanes', realpath: p => p, dispatchIo: {}, stopSessionFn: () => {},
+      pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: ref } }),
+    }) };
+  }
+  const pushArg = () => ({ lane: '/lanes/lane-5', sha: SHA, ref, repo: rec().repo, pr: 4115, who: 'fix-4115', sessionId: 'S' });
+  for (const phase of ['early', 'green', 'salvage']) {
+    it(`scope fence refuses an out-of-scope diff through the real ${phase} port`, async () => {
+      const f = fixture(), real = await f.build();
+      if (phase === 'salvage') {
+        expect(real.salvagePush(pushArg())).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      } else {
+        const h = harness({ records: [rec({ ref, sessionId: 'S' })] });
+        h.io.listSessions = () => [{ sessionId: 'S', state: 'done' }];
+        h.io.push = real.push;
+        h.state.marker = marker(phase === 'green' ? 'green' : 'running');
+        await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL, pushPolicy: { pushBeforeGate: phase === 'early' } });
+        expect(h.calls.resume).toHaveLength(1);
+        expect(h.calls.resume[0].prompt).toMatch(/needs-you[\s\S]*Do not retry/);
+      }
+      expect(f.calls.some(c => c[0] === 'git' && c.includes('diff'))).toBe(true);
+      expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(false);
+      expect(f.calls.some(c => c[0] === 'gh' && c.includes('comment') && c.at(-1).includes('scope-increase'))).toBe(true);
+    }, 20_000);
+  }
+  for (const ancestry of ['diverged', 'missing']) {
+    it(`routes a ${ancestry} PR head through push-rejected recovery with the scope fence enabled`, async () => {
+      const f = fixture({ ancestry, outside: false }), real = await f.build();
+      const result = real.push(pushArg());
+      expect(result).toMatchObject({ ok: false, moved: true });
+      expect(result.transient).not.toBe(true);
+      expect(result.scopeFence).not.toBe(true);
+      const h = harness({ pushResult: result });
+      h.state.marker = marker('green');
+      await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(h.calls.resume[0].prompt).toMatch(/push rejected because the branch moved[\s\S]*alt branch/);
+      expect(real.salvagePush(pushArg())).toMatchObject({ ok: false, terminal: true, moved: true });
+      expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(false);
+    });
+  }
+  for (const evidenceError of ['unavailable', 'fatal', 'missing-verified']) {
+    it(`keeps ${evidenceError} Git evidence failures transient and never pushes`, async () => {
+      const f = fixture({ evidenceError }), real = await f.build();
+      expect(real.push(pushArg())).toMatchObject({ ok: false, scopeFence: true, transient: true });
+      expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(false);
+    });
+  }
+});
+
 describe('runAwaitVerifyPass', () => {
   it('green → pushes the exact sha to the recorded ref, then resumes the SAME session and clears the record', async () => {
     const h = harness();

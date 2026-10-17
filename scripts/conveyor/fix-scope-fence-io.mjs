@@ -5,7 +5,7 @@ import { defaultLoadItems, findItem } from '../operations/dispatch-lane-io.mjs';
 import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardScopeAtRef } from './reconcile-fix-dispatch.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
-import { fencedPush, operatorScope, removalMarkers, resolveScopeFence } from './fix-scope-fence.mjs';
+import { fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
 
 export function createScopeFencedPush({ root, exec = execFileSync, env = process.env, log = console.error, loadItems = () => defaultLoadItems(root), readComments = readCompletePrComments }) {
   const gh = args => String(exec('gh', args, { encoding: 'utf8', env, timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
@@ -32,7 +32,16 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       },
       readDiff: ({ head }) => {
         // Commit-to-commit reads only; hardening is supplied by the daemon's git port.
-        git(['merge-base', '--is-ancestor', head, sha]);
+        // Prove our saved commit exists before attributing a missing remote head to branch movement.
+        git(['cat-file', '-e', `${sha}^{commit}`]);
+        try { git(['cat-file', '-e', `${head}^{commit}`]); } catch (e) {
+          if (e.status === 1 || e.status === 128) throw new ScopeFenceHeadMovedError(head, sha);
+          throw e;
+        }
+        try { git(['merge-base', '--is-ancestor', head, sha]); } catch (e) {
+          if (e.status === 1) throw new ScopeFenceHeadMovedError(head, sha);
+          throw e;
+        }
         const paths = git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', head, sha, '--']).split('\0').filter(Boolean);
         const patch = git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '-U0', head, sha, '--']);
         return { paths, patch };

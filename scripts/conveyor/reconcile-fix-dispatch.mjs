@@ -1096,10 +1096,10 @@ export function tryResumeRoundFix(planned, {
   const history = historyInputs ? renderRoundHistory(buildRoundHistory(historyInputs), { previousOnly: false, title: 'All rounds so far' }) : '';
   // The durable ruling notice first, exactly as a fresh launch does (once per head and rung; a failed post throws).
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
-  const prompt = scopeBrief(planned.scope ?? [], operatorScope(historyInputs?.comments ?? [])) + withPlannedContext(buildRoundResumePrompt({
+  const prompt = withPlannedContext(buildRoundResumePrompt({
     pr: planned.pr, itemNum: planned.itemNum, round: decision.round, cap: planned.cap ?? null,
     lane: decision.lane, headRefOid: planned.headRefOid, history,
-  }), planned);
+  }), planned, historyInputs?.comments ?? []);
   // The trigger starts where the earlier session's transcript is filed: its listing cwd, which planRoundResume
   // already proved is a direct child of the dispatch scratch root (never a lane checkout, #4174). `resumeOptions`
   // cannot override it.
@@ -1173,11 +1173,12 @@ export function fixerTableFor(ruling) {
   return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
 }
 
-/** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
-export function withPlannedContext(prompt, planned) {
-  const fence = operatorScope(planned.operatorSendBack ? [{ body: planned.operatorSendBack.body, author: { login: planned.operatorSendBack.login } }] : []);
+/** Own scope insertion, then optional round history, then the per-entry sections (operator ledger always first). */
+export function withPlannedContext(prompt, planned, comments = [], wrapBrief = p => p) {
+  const fence = operatorScope([...comments, ...(planned.operatorSendBack ? [{ body: planned.operatorSendBack.body, author: { login: planned.operatorSendBack.login } }] : [])]);
   if (planned.scopeNotes) fence.notes.push(...(Array.isArray(planned.scopeNotes) ? planned.scopeNotes : [String(planned.scopeNotes)]));
-  if (!prompt.includes('## Declared repair scope\n')) prompt = scopeBrief(planned.scope ?? [], fence) + prompt;
+  // This helper owns the block once per launch. Text in staged evidence cannot stand in for owned policy.
+  prompt = wrapBrief(scopeBrief(planned.scope ?? [], fence) + prompt);
   return renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
 }
 
@@ -1238,23 +1239,21 @@ export function briefWithRoundContext(prompt, planned, { repo, fixSettings, read
   const wantHistory = planned.takeover || fixSettings?.roundHistory !== 'off';
   let inputs = null;
   try { inputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { inputs = null; }
-  const fence = operatorScope(inputs?.comments ?? []);
-  if (planned.scopeNotes) fence.notes.push(...(Array.isArray(planned.scopeNotes) ? planned.scopeNotes : [String(planned.scopeNotes)]));
-  prompt = scopeBrief(planned.scope ?? [], fence) + prompt;
   const history = wantHistory && inputs ? buildRoundHistory(inputs) : null;
+  let wrapBrief = p => p;
   if (planned.takeover) {
     const previous = planned.takeover.previous ?? null;
     let diffText = null;
     if (previous?.startHead && previous?.reviewedHead) {
       try { diffText = readTakeoverDiff({ repo, pr: planned.pr, from: previous.startHead, to: previous.reviewedHead }); } catch { diffText = null; }
     }
-    return withTakeover(prompt, planned.takeover, {
+    wrapBrief = p => withTakeover(p, planned.takeover, {
       allRoundsSection: history ? renderRoundHistory(history, { previousOnly: false, title: 'All rounds so far' }) : '',
       previousTakeoverSection: renderPreviousTakeover({ previous, diffText }),
       baseRefName: inputs?.baseRefName ?? null, headRefName: inputs?.headRefName ?? planned.laneRef ?? null,
     });
-  }
-  return history ? withRoundHistory(prompt, renderRoundHistory(history)) : prompt;
+  } else if (history) wrapBrief = p => withRoundHistory(p, renderRoundHistory(history));
+  return withPlannedContext(prompt, planned, inputs?.comments ?? [], wrapBrief);
 }
 
 /**
@@ -1528,7 +1527,7 @@ export function dispatchFix(planned, {
     if (!borrowed && decision.executor !== 'claude') stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
     if (decision.executor !== 'claude') {
       // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
-      const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
+      const promptFile = writeBorrowedPrompt(sessionSlug, prompt);
       let handle;
       try {
         launchAttempted = true;
@@ -1577,7 +1576,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withPlannedContext(prompt, planned), sessionSlug, launchKind: 'fix' },
+      payload: { prompt, sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

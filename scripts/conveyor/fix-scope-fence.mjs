@@ -17,14 +17,27 @@ export function resolveScopeFence({ env = process.env, tool = readSettings().fix
 }
 
 export function removalMarkers(text) {
-  return [...String(text ?? '').matchAll(/(?:^|\n)\s*(?:<!--\s*)?scope-removed:\s*([^\n]*?)(?:\s*-->)?(?=\n|$)/g)]
-    .flatMap(m => m[1].split(/[,\s]+/)).filter(s => /^[A-Za-z_$][\w$]*$/.test(s));
+  text = String(text ?? '');
+  // Reject incomplete evidence rather than silently dropping a removal marker beyond a cap.
+  if (text.length > 1024 * 1024) throw new RangeError('scope-removed input limit exceeded (1 MiB)');
+  const removed = [], marker = 'scope-removed:';
+  for (const raw of text.split(/\r\n?|\n|\u2028|\u2029/)) {
+    if (raw.length > 16 * 1024) throw new RangeError('scope-removed line limit exceeded (16 KiB)');
+    let line = raw.trim();
+    if (line.startsWith('<!--')) line = line.slice(4).trimStart();
+    if (!line.startsWith(marker)) continue;
+    line = line.slice(marker.length).trimEnd();
+    if (line.endsWith('-->')) line = line.slice(0, -3);
+    removed.push(...line.split(/[,\s]+/).filter(s => /^[A-Za-z_$][\w$]*$/.test(s)));
+  }
+  return removed;
 }
 
 export function operatorScope(comments = []) {
   const notes = [], removed = [];
   for (const c of comments) {
     if (!isOperatorAuthored(c) || !/^🔁 review — changes requested/.test(c.body ?? '')) continue;
+    removed.push(...removalMarkers(c.body));
     const lines = c.body.split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (/^\s*(?:>\s*)?(?:Out of scope:|scopeNotes:)/i.test(lines[i])) {
@@ -32,7 +45,6 @@ export function operatorScope(comments = []) {
         while (i + 1 < lines.length && /^\s*(?:[-*]|\d+\.)\s/.test(lines[i + 1])) notes.push(lines[++i]);
       } else if (/\bx[a-z0-9]+ carries\b/i.test(lines[i])) notes.push(lines[i]);
     }
-    removed.push(...removalMarkers(c.body));
   }
   return { notes, removed: [...new Set(removed)] };
 }
@@ -45,12 +57,25 @@ export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', r
   if (policy?.enabled === false) return { action: 'push', violations: [] };
   const allowed = scope.filter(s => !s.includes(':') || s.startsWith(`${repo}:`)).map(s => s.replace(/^[^:]+:/, '').split('#')[0]);
   const outside = paths.filter(p => !allowed.some(s => coversFile(`${repo}:${s}`, `${repo}:${p}`) || (!/[*?]/.test(s) && p.startsWith(`${s.replace(/\/$/, '')}/`))));
-  const additions = patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++ ')).join('\n');
-  const identifiers = [...new Set(removed)].filter(id => additions.match(/[A-Za-z_$][\w$]*/g)?.includes(id));
+  let inHunk = false;
+  const additions = patch.split('\n').filter(line => {
+    if (line.startsWith('diff --git ')) inHunk = false;
+    if (line.startsWith('@@ ')) inHunk = true;
+    return line.startsWith('+') && (inHunk || !line.startsWith('+++ '));
+  }).join('\n');
+  const addedIdentifiers = new Set(additions.match(/[A-Za-z_$][\w$]*/g) ?? []);
+  const identifiers = [...new Set(removed)].filter(id => addedIdentifiers.has(id));
   const violations = [...outside.map(p => `outside declared scope: ${p}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${id}`)];
   if (!violations.length) return { action: 'push', violations };
   return { action: policy?.mode === 'warn' ? 'warn' : 'stand-down', violations,
     reason: `scope-increase request: proposed repair ${violations.join('; ')}. Operator approval is required to widen this PR's scope.` };
+}
+
+/** A known head movement refuses the push without sending the repair into an infrastructure retry loop. */
+export class ScopeFenceHeadMovedError extends Error {
+  constructor(head, sha) {
+    super(`PR head ${head.slice(0, 8)} moved beyond the verified ${sha.slice(0, 8)} or is unavailable locally; follow push-rejected recovery`);
+  }
 }
 
 /** The same gate wraps early, green and salvage pushes. Failures never fall through to the push sink. */
@@ -61,6 +86,7 @@ export function fencedPush({ readContext, readDiff, push, standDown, note, polic
     context = readContext();
     decision = scopeFenceDecision({ ...context, ...readDiff(context), policy });
   } catch (e) {
+    if (e instanceof ScopeFenceHeadMovedError) return { ok: false, moved: true, terminal: true, reason: e.message };
     return { ok: false, scopeFence: true, transient: true, reason: `scope fence evidence unavailable: ${e.message}` };
   }
   if (decision.action === 'stand-down') {
