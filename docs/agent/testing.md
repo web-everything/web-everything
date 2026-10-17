@@ -88,6 +88,11 @@ Worker failures stay in `groupDropped` and enter the normal prepare failure/hold
 including failed leads and members. A failed assembly gate or publication accounts for
 every undelivered card except conflicts. Test consecutive ticks to prevent immediate
 readmission; replay `prepare-batch-window-and-failure-accounting` for both cases.
+The batch branch uses the first surviving card and surviving count; status reads require
+that branch to agree with the exact title membership. Preserve the original group lead
+in settlement fixtures, including when that lead failed but a member has a stamped OPEN PR.
+Redact diagnostics before any head/tail limit and again at the public body writer;
+replay `prepare-batch-publication-boundaries` for credential cuts and claim retirement.
 
 `review.cardOnly.lightLane` (true) seats one blocking Codex correctness juror for a net
 diff containing only direct `backlog/*.md` cards. `review.cardOnly.claudeSeat` (false)

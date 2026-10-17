@@ -1271,7 +1271,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         { reason: settled.groupDropReasons?.[num] ?? 'batch member preparation failed' }, settled.source);
       if (failure.held) prepare.held.push({ num, reason: failure.holdReason ?? 'prepare-unstamped' });
     }
-    const why = deferred ? 'deferred-to-next-batch' : replaced ? 'prepared on main' : failed ? 'prepare-unstamped' : !leadTracked ? 'group-lead-gone' : null;
+    // A failed lead can still publish its successful members. Their verified stamped PR owns the
+    // remaining lifecycle even after the original lead's claim has been retired.
+    const awaitingStampedPr = status?.pr?.state === 'OPEN' && status.pr.preparedDate;
+    const why = deferred ? 'deferred-to-next-batch' : replaced ? 'prepared on main' : failed ? 'prepare-unstamped'
+      : !leadTracked && !awaitingStampedPr ? 'group-lead-gone' : null;
     if (why) {
       if (live) effects.releasePrepareClaim({ num });
       prepare.retired.push({ num, why, released: live });

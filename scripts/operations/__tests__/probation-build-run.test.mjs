@@ -184,6 +184,15 @@ describe('parseArgs', () => {
 });
 
 describe('runProbationBuild — the arc', () => {
+  it('redacts a failed worker diagnostic before the 300-character detail limit', async () => {
+    const { io } = fakeIo();
+    const secret = `ghp_${'a'.repeat(36)}`;
+    io.runWorker = () => ({ ok: false, out: `${'x'.repeat(250)} Authorization: Bearer ${secret}` });
+    const result = await runProbationBuild(args(), io);
+    expect(result.outcome).toBe('escalated-needs-human');
+    expect(result.detail).not.toContain('ghp_');
+    expect(result.detail).not.toContain('a'.repeat(20));
+  });
   it('claim → worker builds within envelope → resolve → commit → gate green → PR opened parked, one launch row', async () => {
     const { io, calls } = fakeIo();
     const r = await runProbationBuild(args(), io);
@@ -949,9 +958,9 @@ describe('standalone prepare', () => {
     const accepted = ids.filter(n => !(n === failed && ['conflict', 'failed-card', 'failed-lead'].includes(mode)));
     expect(publications).toHaveLength(1);
     expect(publications[0].preparedIds).toEqual(accepted);
-    expect(openPrArgv(publications[0])).toContain(`--ref=lane/prepare-batch-4291-${accepted.length}`);
+    expect(openPrArgv(publications[0])).toContain(`--ref=lane/prepare-batch-${accepted[0]}-${accepted.length}`);
     expect(picks).toEqual(['failed-card', 'failed-lead'].includes(mode) ? accepted : ids);
-    expect(branches).toEqual([...ids.filter(n => !(['failed-card', 'failed-lead'].includes(mode) && n === (mode === 'failed-lead' ? '4291' : '4292'))).map(n => `lane/prep-${n}`), `lane/prepare-batch-4291-${accepted.length}`]);
+    expect(branches).toEqual([...ids.filter(n => !(['failed-card', 'failed-lead'].includes(mode) && n === (mode === 'failed-lead' ? '4291' : '4292'))).map(n => `lane/prep-${n}`), `lane/prepare-batch-${accepted[0]}-${accepted.length}`]);
     expect([...children.values()].flatMap(c => c.calls).filter(c => c[0] === 'commit')).toHaveLength(['failed-card', 'failed-lead'].includes(mode) ? 2 : 3);
     expect(result.deferredToNextBatch).toEqual(mode === 'conflict' ? [failed] : []);
     if (mode === 'conflict') expect(result.groupDropReasons['4292']).toMatch(/conflict.*next batch/);

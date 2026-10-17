@@ -5,15 +5,28 @@ import { releasedAttempt } from './prepare-failure-policy.mjs';
 const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const newestFirst = (a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? ''));
 
+const batchMembers = pr => {
+  const match = /^prepare: ([a-z0-9]+(?:, [a-z0-9]+)*)$/.exec(pr.title ?? '');
+  return match && match[0] === pr.title ? match[1].split(', ') : null;
+};
+
 /**
- * Write grade: a same-repo PR from the card's own lane prepare branch. Only this may drive a stamp, a hold or a
+ * Write grade: a same-repo PR from the card's own lane prepare branch, or a batch branch whose lead/count
+ * agree with its exact, unique title membership. Only this may drive a stamp, a hold or a
  * claim retirement (PR #5366 round 7): a title is free text any collaborator can type on any branch.
  */
 export function isLanePreparePrFor(pr, { num, bornAs }) {
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
   if (!key) return false;
-  const ids = [key, normNum(bornAs)].filter(Boolean).map(escapeRegex).join('|');
+  const aliases = [key, normNum(bornAs)].filter(Boolean);
+  const batch = /^lane\/prepare-batch-([a-z0-9]+)-([1-9][0-9]*)$/.exec(pr.headRefName ?? '');
+  if (batch) {
+    const members = batchMembers(pr);
+    return Boolean(batch[0] === pr.headRefName && members && members[0] === batch[1] && String(members.length) === batch[2]
+      && new Set(members).size === members.length && aliases.some(id => members.includes(id)));
+  }
+  const ids = aliases.map(escapeRegex).join('|');
   return new RegExp(`^lane/(?:${ids})[a-z]?-prepare-`).test(pr.headRefName ?? '');
 }
 
@@ -22,8 +35,8 @@ export function isPreparePrFor(pr, { num, bornAs }) {
   if (isLanePreparePrFor(pr, { num, bornAs })) return true;
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
-  const batch = /^prepare: ([a-z0-9]+(?:, [a-z0-9]+)*)$/.exec(pr.title ?? '');
-  if (batch && batch[1].split(', ').includes(key)) return true;
+  const batch = batchMembers(pr);
+  if (batch?.includes(key)) return true;
   return Boolean(key) && new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
 }
 

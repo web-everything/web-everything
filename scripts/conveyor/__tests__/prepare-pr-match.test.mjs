@@ -138,3 +138,32 @@ it('refuses duplicate prepare batch members by exact title identity without gran
   expect(isLanePreparePrFor(pr, { num: '7202' })).toBe(false);
   expect(isPreparePrFor({ ...pr, isCrossRepository: true }, { num: '7202' })).toBe(false);
 });
+
+it.each(['7201', '7202'])('recognizes published batch membership for #%s at write grade', num => {
+  const batch = { title: 'prepare: 7201, 7202', headRefName: 'lane/prepare-batch-7201-2' };
+  expect(isLanePreparePrFor(batch, { num })).toBe(true);
+  expect(isLanePreparePrFor(batch, { num: '720' })).toBe(false);
+  expect(isLanePreparePrFor(batch, { num: '7203' })).toBe(false);
+});
+
+it.each([
+  { headRefName: 'someone/manual' },
+  { headRefName: 'lane/7201-prepare-batch' },
+  { headRefName: 'lane/prepare-batch-7201-20' },
+  { headRefName: 'lane/prepare-batch-7202-2' },
+  { headRefName: 'lane/prepare-batch-7201-2-extra' },
+  { headRefName: 'lane/prepare-batch-7201-2\n' },
+  { title: 'prepare: 7201, 7202\n' },
+  { title: 'prepare: 7201, 7201' },
+  { isCrossRepository: true },
+])('rejects unverified batch identity %j', extra => {
+  expect(isLanePreparePrFor({ title: 'prepare: 7201, 7202',
+    headRefName: 'lane/prepare-batch-7201-2', ...extra }, { num: '7202' })).toBe(false);
+});
+
+it('keeps batch identity across numbering and rejects duplicate title members', () => {
+  const batch = { title: 'prepare: xabcdef, 7202', headRefName: 'lane/prepare-batch-xabcdef-2' };
+  expect(isLanePreparePrFor(batch, { num: '7201', bornAs: 'xabcdef' })).toBe(true);
+  expect(isLanePreparePrFor({ title: 'prepare: 7201, 7201',
+    headRefName: 'lane/prepare-batch-7201-2' }, { num: '7201' })).toBe(false);
+});

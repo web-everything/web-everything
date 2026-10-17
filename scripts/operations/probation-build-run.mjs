@@ -81,6 +81,7 @@ import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
+import { redactSecrets, sanitizeForPublicComment } from '../conveyor/ci-heal-mark.mjs';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
 import { parseCard } from '../lib/priority-order.mjs';
 import { appendScorecard as appendScorecardRow } from '../conveyor/run-scorecard-store.mjs';
@@ -474,7 +475,7 @@ export async function runProbationBuild(args, io) {
       // #4291 plan-review finding (correctness, round 2) — a worker that crashed or timed out but still left a
       // partial, envelope-sized diff must never be treated as a clean build: a resolved item + an opened PR would
       // credit a failed run as a success. `run.ok` (not just "did it change anything") gates everything after it.
-      if (!run.ok) return abandon('escalated-needs-human', `not built: the worker did not finish cleanly: ${String(run.out ?? '').slice(0, 300)}`, {});
+      if (!run.ok) return abandon('escalated-needs-human', `not built: the worker did not finish cleanly: ${redactSecrets(run.out).slice(0, 300)}`, {});
 
       summary = summarizeNumstat(io.diffNumstat(lanePath, baseSha, excludeFromDiff), { exclude: excludeFromDiff });
       diffRow = { files: summary.files, loc: summary.loc };
@@ -507,7 +508,7 @@ export async function runProbationBuild(args, io) {
       }
       if (rescoped !== null && summary.files && workerMadeNoChange && report?.outcome === 'done') {
         // The only change in the lane is the runner's own scope edit and the worker declined nothing: nothing was prepared.
-        return abandon('gate-red', `prepare requires a card-only diff from the worker; only the runner's re-scope was present. worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
+        return abandon('gate-red', `prepare requires a card-only diff from the worker; only the runner's re-scope was present. worker report: ${sanitizeHoldReason(redactSecrets(run.lastMessage), { max: 1200 }) || 'no final message'}`, { diff: diffRow });
       }
       const needsYou = (kind, detail) => {
         const reason = needsYouReason(kind, detail);
@@ -554,7 +555,7 @@ export async function runProbationBuild(args, io) {
       if (report?.outcome === 'blocked') {
         if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', 'refused: worker moved HEAD before prepare finding', { diff: diffRow });
         couldNotPrepare = true;
-        declinedReason = sanitizeHoldReason(run.lastMessage, { max: 1200 });
+        declinedReason = sanitizeHoldReason(redactSecrets(run.lastMessage), { max: 1200 });
         const [route] = planHoldRouting([{ num, reason: `worker-declined: ${declinedReason}` }]);
         io.holdWorkerDecline(route);
         const unstamped = removeFrontmatterField(removeFrontmatterField(item.raw, 'preparedDate'), 'preparedAgainstSha');
@@ -562,7 +563,7 @@ export async function runProbationBuild(args, io) {
         break;
       }
       if (preparing && (!summary.files || summary.paths.some(p => !scopeEntries.includes(p)))) {
-        return abandon('gate-red', `prepare requires a card-only diff; worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
+        return abandon('gate-red', `prepare requires a card-only diff; worker report: ${sanitizeHoldReason(redactSecrets(run.lastMessage), { max: 1200 }) || 'no final message'}`, { diff: diffRow });
       }
       if (!summary.files) {
         // Classify the original report: prefixing it with worker-declined deliberately suppresses
@@ -579,7 +580,7 @@ export async function runProbationBuild(args, io) {
             landed.status === 'landed' ? `already-done: ${done.commit}; opened PR #${landed.pr}`
               : `already-done landing failed: ${landed.error}`, { diff: diffRow, pr: landed.pr });
         }
-        declinedReason = sanitizeHoldReason(run.lastMessage, { max: 600 })
+        declinedReason = sanitizeHoldReason(redactSecrets(run.lastMessage), { max: 600 })
           || 'The worker changed nothing and provided no final message.';
         const [route] = planHoldRouting([{ num, reason: `worker-declined: ${declinedReason}` }]);
         io.holdWorkerDecline(route);
@@ -763,7 +764,7 @@ export async function runProbationBuild(args, io) {
 
 /** Keep the first failure before the subprocess output is truncated for the result. */
 export function gateFailureDetail(output) {
-  const lines = String(output ?? '').replace(/\x1b\[[0-9;]*m/g, '').split(/\r?\n/).map(line => line.trim());
+  const lines = redactSecrets(String(output ?? '').replace(/\x1b\[[0-9;]*m/g, '')).split(/\r?\n/).map(line => line.trim());
   const first = lines.find(line => /^(?:error\b|FAIL\b|Error:|npm error|[^\w\s]*\s*AssertionError:)/i.test(line));
   const check = first?.startsWith('error ') && lines.some(line => line.includes('check-standards'))
     ? 'check:standards'
@@ -788,7 +789,7 @@ function trySh(bin, args, opts = {}) {
  * @returns {string[]}
  */
 export function openPrArgv({ num, attemptTag, slug, bodyFile, taskType = 'doc-fix', preparedIds = [] }) {
-  const ref = preparedIds.length ? `lane/prepare-batch-${num}-${preparedIds.length}` : `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
+  const ref = preparedIds.length ? `lane/prepare-batch-${preparedIds[0]}-${preparedIds.length}` : `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
   return [
     'open-pr', `--ref=${ref}`, '--sha=HEAD', '--base=main', `--bodyFile=${bodyFile}`,
     `--title=${preparedIds.length ? `prepare: ${preparedIds.join(', ')}` : machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
@@ -995,7 +996,8 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
         if (!reportedPath && signature(path) === before) return '';
         try { return readFileSync(path, 'utf8'); } catch { return ''; }
       });
-      return { modelEvidence: parseAgyReportEvidence(r.stdout ?? r.out), ok: r.ok, out: r.out.slice(-4000), lastMessage: typeof lastMessage === 'string' ? lastMessage : '' };
+      // Redact before taking a tail: otherwise a cut can remove a token's identifying prefix.
+      return { modelEvidence: parseAgyReportEvidence(r.stdout ?? r.out), ok: r.ok, out: redactSecrets(r.out).slice(-4000), lastMessage: typeof lastMessage === 'string' ? lastMessage : '' };
     },
     runChecker: (argv, dir) => {
       const r = trySh(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 20 * 60 * 1000 });
@@ -1034,7 +1036,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
     resolveItem: (n, dir) => {
       const r = node('scripts/operations/run.mjs', ['resolve', `--ref=${n}`, '--json'], { cwd: dir, env: laneEnv });
       if (r.ok) return { ok: true };
-      let reason = r.out.trim().slice(0, 500);
+      let reason = redactSecrets(r.out).trim().slice(0, 500);
       try { reason = JSON.parse(r.out)?.reason ?? reason; } catch { /* not JSON — keep the raw tail */ }
       return { ok: false, reason };
     },
@@ -1048,17 +1050,17 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       // The DEFAULT (marker-writing) mode — never `run` mode — so `open-pr --requireVerified=true` below finds
       // a fresh GREEN marker keyed to the commit this gate just verified.
       const r = node('scripts/verify-lane.mjs', ['--json'], { cwd: dir, env: laneEnv, timeout: GATE_TIMEOUT_MS });
-      return { pass: r.ok, output: r.out.slice(-12000), failureDetail: r.ok ? null : gateFailureDetail(r.out) };
+      return { pass: r.ok, output: redactSecrets(r.out).slice(-12000), failureDetail: r.ok ? null : gateFailureDetail(r.out) };
     },
     writePrBody: (dir, { num: n, worker: w, diff, taskType = 'doc-fix', declinedReason, proposedEdges = [], groupMembers = [], groupDropped = [], groupDropReasons = {} }) => {
       const bodyFile = join(dir, '.pr-body.md');
       const groupLines = groupMembers.length ? [
         `Grouped prepare: ${[String(n), ...groupMembers].filter(m => !groupDropped.includes(m)).map(m => `#${m}`).join(', ')}`,
-        ...groupDropped.map(m => `Not prepared: #${m} — ${groupDropReasons[m] ?? 'not prepared'}`), '',
+        ...groupDropped.map(m => `Not prepared: #${m} — ${sanitizeForPublicComment(groupDropReasons[m] ?? 'not prepared')}`), '',
       ] : [];
       writeFileSync(bodyFile, declinedReason ? [
         `Standalone worker declined #${n}; no implementation change.`, '',
-        `> ${declinedReason}`, '',
+        `> ${sanitizeForPublicComment(declinedReason)}`, '',
         declinedReason.startsWith('scope exceeds')
           ? 'Implementation changes were discarded; the card is held for the builder with its scope preserved.'
           : 'The hold router removed scope and attached the finding. A prepare pass or human must re-scope the card.',
@@ -1098,12 +1100,12 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       }
       if (!r.ok) {
         const blockedOnInfra = /blocked-on-infra|outside dependency|network fault/i.test(r.out);
-        return { ok: false, blockedOnInfra, reason: marker + r.out.trim().slice(0, 1000) };
+        return { ok: false, blockedOnInfra, reason: marker + redactSecrets(r.out).trim().slice(0, 1000) };
       }
       try {
         submit ??= extractSubmitResult(JSON.parse(r.out));
         if (!submit?.pr) {
-          return { ok: false, blockedOnInfra: false, reason: `${marker}open-pr reported no PR number: ${r.out.slice(0, 500)}` };
+          return { ok: false, blockedOnInfra: false, reason: `${marker}open-pr reported no PR number: ${redactSecrets(r.out).slice(0, 500)}` };
         }
         return { ok: true, pr: submit.pr, url: submit.url ?? null };
       } catch (e) {

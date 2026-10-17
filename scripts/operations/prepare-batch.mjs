@@ -79,7 +79,7 @@ export async function runPrepareBatch(args, io, policy, runCard) {
     }
     if (!assembled.length) return settle({ outcome: 'gate-red', detail: 'all cards deferred to next batch' });
     const preparedIds = assembled.map(c => c.num);
-    const finalRef = `lane/prepare-batch-${ids[0]}-${preparedIds.length}`;
+    const finalRef = `lane/prepare-batch-${preparedIds[0]}-${preparedIds.length}`;
     assemblyIo.finishPrepareAssembly(lanePath, finalRef);
     const gate = assemblyIo.runGate(lanePath);
     if (!gate.pass) return settle({ outcome: 'gate-red', detail: 'assembled prepare gate failed' });
