@@ -35,7 +35,6 @@
   "scripts/gen-decision-docket.mjs": 1,
   "scripts/gen-inventory.mjs": 6,
   "scripts/graduation-import-check.mjs": 1,
-  "scripts/guard-bash.mjs": 1,
   "scripts/guard-prototype-tracker.mjs": 1,
   "scripts/lane-resume.mjs": 15,
   "scripts/lane-stack.mjs": 2,

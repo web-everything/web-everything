@@ -4289,7 +4289,7 @@ export function decide(command, ctx = {}) {
 // informative, we don't fetch here) — a guard bug or an unusual checkout must never wedge the agent.
 function commitsBehindUpstream(cwd) {
   try {
-    return Number(execFileSync('git', ['rev-list', '--count', 'HEAD..@{u}'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
+    return Number(execFileSync('git', ['rev-list', '--count', 'HEAD..@{u}'], { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
   } catch {
     return 0;
   }
