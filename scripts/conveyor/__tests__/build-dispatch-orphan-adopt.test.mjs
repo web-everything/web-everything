@@ -1008,8 +1008,13 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
     const path = join(dir, 'failures.json');
     const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
     try {
+      // Keep every live seam explicit here: the hermetic scan cannot follow the fixture helpers.
       const pass = (claimedAt) => adoptOrphanedBuildClaims(dead('4413', {
         listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413', claimedAt } }],
+        readDelivery: () => null,
+        sessionLivenessFor: () => null,
+        releaseLaneLease: () => {},
+        spawnResume: () => { throw new Error('no resume'); },
         recordFailure: (o) => recordBuildFailure(o, { path, now: 0, settings }),
         releaseClaim: () => { throw new Error('lock store unavailable'); },
       }));
