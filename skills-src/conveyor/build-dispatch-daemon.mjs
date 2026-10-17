@@ -513,29 +513,32 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const planningSkips = [];
   // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
   // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
-  // bound this lookahead to 24 calls; picks beyond that window still pass the ordinary fail-closed launch guard.
+  // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
+  // pass the ordinary fail-closed launch guard.
   const inspectedPrepares = new Set();
+  const inspectPrepareCooldown = async candidate => {
+    const num = normNum(candidate.num);
+    if (typeof effects.listPreparePrs !== 'function' || inspectedPrepares.has(num) || inspectedPrepares.size >= 8) return;
+    inspectedPrepares.add(num);
+    try {
+      const bornAs = candidate.bornAs ?? out?.decisions?.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
+        ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
+      const prs = await effects.listPreparePrs({ num, bornAs });
+      const merged = recentMergedPrepare({ num, bornAs, prs,
+        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
+      if (!merged) return;
+      const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+      planningSkips.push({ num, reason });
+      console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
+    } catch { /* The launch guard still fails closed on an unreadable listing. */ }
+  };
   while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
     const decisions = out?.decisions ?? {};
     const candidates = (decisions.spawnPrepareItems ?? decisions.itemPrepareSpawns ?? [])
       .filter(row => !inspectedPrepares.has(normNum(row.num))).slice(0, 8 - inspectedPrepares.size);
     if (!candidates.length) break;
     const previousSkips = planningSkips.length;
-    for (const candidate of candidates) {
-      const num = normNum(candidate.num);
-      inspectedPrepares.add(num);
-      try {
-        const bornAs = candidate.bornAs ?? decisions.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
-          ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
-        const prs = await effects.listPreparePrs({ num, bornAs });
-        const merged = recentMergedPrepare({ num, bornAs, prs,
-          now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
-        if (!merged) continue;
-        const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
-        planningSkips.push({ num, reason });
-        console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
-      } catch { /* The launch guard still fails closed on an unreadable listing. */ }
-    }
+    for (const candidate of candidates) await inspectPrepareCooldown(candidate);
     if (planningSkips.length === previousSkips) break;
     tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
     out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
@@ -1288,7 +1291,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       } catch { /* An unknown prepare route cannot own grouped members. */ }
     }
   }
-  const prepareGroupPlan = planBuildGroups({
+  const planPrepareGroups = () => planBuildGroups({
     picks: prepareGroupPicks,
     pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
@@ -1296,6 +1299,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
       && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
   });
+  let prepareGroupPlan = planPrepareGroups();
+  // Group members are actual launch candidates too. Inspect only selected members, sharing the lead lookahead
+  // budget, and rebuild after skips so a guarded member cannot crowd a clean replacement out of the group.
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const members = prepareGroupPlan.groups.flatMap(g => g.members)
+      .filter(num => !inspectedPrepares.has(normNum(num))).slice(0, 8 - inspectedPrepares.size);
+    if (!members.length) break;
+    const previousSkips = planningSkips.length;
+    for (const num of members) await inspectPrepareCooldown(groupRowsByNum.get(normNum(num)) ?? { num });
+    if (planningSkips.length === previousSkips) break;
+    prepareGroupPlan = planPrepareGroups();
+  }
   prepare.groups = prepareGroupPlan.groups;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
