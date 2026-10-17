@@ -29,6 +29,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "daemon-held-on-last-good": "Last-good is an intentional safety hold; no forced adoption or smoke bypass.",
   "daemon-owed-no-dispatch": "Aggregate refusal is not a uniquely actionable PR; use linked specific episodes only.",
   "daemon-silent": "Dead/hung/not-ticking are distinct; supervisor owns lifecycle. No kill/restart/lease theft.",
+  "disk-space": "Disk pressure requires operator inspection; the health-watch sweeper owns bounded temporary cleanup. Never delete files or dispatch recovery from the responder.",
   "dispatch-permission-stall": "No unattended permission grants; name the blocked dispatcher/session.",
   "dispatch-refused-stale-clone": "Rebuild/overlay owner must fix the named refusal; no manual clone writes.",
   "dispatch-trust-refused": "A trust refusal never grants permission to rewrite trust settings. Existing spawn retry remains the owner.",

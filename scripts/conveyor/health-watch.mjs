@@ -16,6 +16,7 @@
  * Also archives old finished Claude job folders daily (claudeJobsArchive* config); archives have no retention limit.
  * Also runs the daily temp sweep (we:scripts/conveyor/tmp-sweep.mjs): deletes our own proven-prefix temp entries
  * older than `tmpSweepOlderThanMs`, skipping any a process has as its cwd. All knobs are `tmpSweep*` config keys.
+ * Review scratch TTL and backlog cache size are also enforced each tick (`tmp` config block).
  * State lives under the pinned daemon state root (#4052, `health-watch-section.mjs#healthDir`, the ONE shared
  *   resolver every reader goes through — see that file's own header): `.conveyor/health/`
  *   state.json          episodes, per-daemon memory, log cursors, gh cache (written only by the tick)
@@ -40,6 +41,8 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
@@ -53,7 +56,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, realpathSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
 } from 'node:fs';
-import { homedir, loadavg, cpus, tmpdir } from 'node:os';
+import { homedir, hostname, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1105,6 +1108,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun, prev.tmpSweep?.nextCursor)))
     : null;
 
+  if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1194,6 +1199,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // xegykal — the session watchdog (its own interval, every-tick probe; see probeSessionWatchdog).
   probes.sessionWatchdog = attempt('sessionWatchdog', () => probeSessionWatchdog({ dir, now, config, processes: probes.processes, flags }));
   if (probes.sessionWatchdog?.configError) probeErrors.sessionWatchdogConfig = probes.sessionWatchdog.configError;
+  probes.diskSpace = attempt('diskSpace', () => probeDiskSpace({ path: REPO_ROOT }));
   probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
     ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
     : probeMachineLoad()));
@@ -1358,6 +1364,17 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
   if (prSweepJob) state.prSweep = prSweepJob.state;
   else if (prev.prSweep) state.prSweep = prev.prSweep;
+  if (!flags['state-root'] && !flags['dry-run']) {
+    for (const t of result.transitions.filter(t => t.type === 'opened' && t.episode?.smell === 'disk-space')) {
+      attempt('diskSpaceNeedsYou', () => publishAttention({
+        repo: `host/${hostname()}`, pr: 0,
+        // Episode report ids have minute precision. openedAt distinguishes even
+        // two openings in the same minute and supplies the feed's complete identity.
+        head: `${t.episode.subject}:${t.episode.openedAt}`, kind: 'disk-space',
+        reason: t.episode.summary, episode: t.episode.id,
+      }, { now }));
+    }
+  }
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);

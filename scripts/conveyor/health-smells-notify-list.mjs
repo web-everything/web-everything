@@ -27,6 +27,7 @@
  */
 export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'nightly-coroner-failed', // Operator: missed nights and repeated probe errors must alert.
+  'disk-space',
   // Previously approved (earlier operator decisions; the old scattered `notifyEvenInShadow: true` field) — kept.
   'claude-auth-expired',
   'daemon-held-on-last-good',
