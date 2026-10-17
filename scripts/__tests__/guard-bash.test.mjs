@@ -740,7 +740,15 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/tmp; echo "${X:-(}"; D=/clone; cd "$D" && ls',
       'D=~/x; D=/tmp; echo ${#D} ${D#/} ${D%(*}; D=/clone; cd "$D" && ls',
       'D=~/x; D=/tmp; X=$(echo | cat); D=/clone; cd "$D" && ls',
+      'D=~/x; D=/tmp; ( echo ${X:-{} ); D=/clone; cd "$D" && git checkout --detach',  // `${…}` nests no `{`
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    // a case arm's assignment runs in this shell however the `case` is reached: never a stale value
+    for (const cmd of [
+      'D=~/x; D=/tmp; time case x in x|b) D=/clone;; esac; cd "$D" && git checkout --detach',
+      'D=~/x; D=/tmp; if case x in x|b) D=/clone;; esac; then :; fi; cd "$D" && ls',
+      'D=~/x; D=/tmp; ! case x in x|b) D=/clone;; esac; cd "$D" && ls',
+      'D=~/x; D=/tmp; while case x in x|b) D=/clone;; esac; do break; done; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).not.toBe('/tmp');
     // the HOME walk reads the same scan: never the stale home
     expect(at("HOME=/h; echo \\$'\\' x '('; HOME=/l; cd ~/clone && ls")).not.toBe('/h/clone');
   });
@@ -764,6 +772,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/h; HOME=/z | true; cd ~/clone && ls')).toBe('/h/clone');
     for (const cmd of [
       'shopt -s lastpipe; D=~/x; D=/clone; true | D=/tmp; cd "$D" && ls',  // the last element runs here
+      "shopt -s last''pipe; D=~/x; D=/clone; echo /t | read D; cd \"$D\" && ls",
       'D=~/x; D=/clone; case x in a|b) D=/tmp;; esac; cd "$D" && ls',     // `a|b)` is a pattern
       'D=~/x; D=/clone; D=$(echo | cat); cd "$D" && ls',                  // the `|` is inside `$(…)`
       'D=~/x; D=/clone; { D=/tmp; }; { a; } | cat; cd "$D" && ls',        // only the piped group

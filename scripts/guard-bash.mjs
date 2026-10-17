@@ -2454,15 +2454,17 @@ export function hasDestructiveLaneOp(command) {
 const PIPE_SEP = /^\|&?\n*$/;
 const BG_SEP = /^&\n*$/;
 const GROUP_SPAN = 64;
+// words after which a command (so a reserved word) starts
+const CMD_WORDS = ['then', 'do', 'else', 'elif', 'if', 'while', 'until', 'time', '{'];
 const COPROC_HEAD = /coproc[ \t]+(?:[A-Za-z_]\w*[ \t]+)?([{(])(?=[\s(]|$)/y;
 function subshellDepths(segs, commented, seps = [], lastpipe = false) {
   // { kind: sub | arith | tick | param | seg (a simple coproc command, to its segment end) | cobrace | brace |
-  //   case, sub: is a child shell, dq: the quoting it opened in, n: a `${…}`'s open inner braces }
+  //   case, sub: is a child shell, dq: the quoting it opened in }
   const stack = [];
   const open = { tick: 0, seg: 0, cobrace: 0, case: 0 };
   let d = 0;
   const push = (kind, sub, dq) => {
-    stack.push({ kind, sub, dq, n: 0 });
+    stack.push({ kind, sub, dq });
     if (sub) d += 1;
     if (kind in open) open[kind] += 1;
   };
@@ -2489,7 +2491,7 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
     let coBrace = -1;                                         // the offset of a `coproc [NAME] {`'s brace
     // a reserved word's position: the start of a command (`{`, `}`, `case`, `esac` and `coproc` are words only
     // there), or after one of `words`; the lookback stops at the first word
-    const cmdStart = (i, words = ['then', 'do', 'else', '{']) => {
+    const cmdStart = (i, words = CMD_WORDS) => {
       let j = i - 1;
       while (j >= 0 && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j -= 1;
       if (j < 0 || ';&|(!'.includes(s[j])) return true;
@@ -2521,9 +2523,9 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
         while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1;
         skip = j;
       } else if (top?.kind === 'param' && ch !== '"' && !(ch === "'" && !top.dq)) {
-        // inside `${…}` only braces matter (and a `'` is literal when the `${` was double-quoted)
-        if (ch === '{') top.n += 1;
-        else if (ch === '}') { if (top.n > 0) top.n -= 1; else dq = pop().dq; }
+        // inside `${…}` only the first bare `}` matters: bash does not nest a plain `{` there (`${X:-{}` is `{`),
+        // and a `'` is literal when the `${` was double-quoted
+        if (ch === '}') dq = pop().dq;
       } else if (ch === '"') dq = true;
       else if (ch === "'") skip = s.indexOf("'", i + 1) < 0 ? s.length : s.indexOf("'", i + 1);
       else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(s[i - 1]))) skip = s.length;
@@ -2539,7 +2541,7 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
         push('case', false, dq);
         skip = i + 3;
       } else if (ch === 'e' && s.startsWith('esac', i) && /[\s;&|<>)]/.test(s[i + 4] ?? ' ')
-        && cmdStart(i, ['then', 'do', 'else', '{', 'in'])) {
+        && cmdStart(i, [...CMD_WORDS, 'in'])) {
         if (open.case > 0) popTo(['case']);
         skip = i + 3;
       } else if (ch === 'c' && s.startsWith('coproc', i) && /\s/.test(s[i + 6] ?? '') && cmdStart(i)) {
@@ -2573,8 +2575,15 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
   // a pipeline element (`D=/tmp | true`, `true | read D`) and a background job (`D=/tmp &`) run in a child
   // shell; with `lastpipe` the last pipeline element runs here. Only a separator with no frame open counts: a
   // `|` inside `X=$(a | b)` or a `case` pattern (`a|b)`) leaves the segment as scanned, and one inside comment
-  // text is text. An element that is a `{ … }` group spans its segments; any other brace in the group's
-  // segments, a frame or comment text there leaves the group as scanned.
+  // text is text. A segment with an unmatched `)` is never marked: in a pipeline element that is only a case
+  // pattern (`b) D=1` after `a|`, however the `case` was spelled) or the end of a subshell that already counts.
+  // An element that is a `{ … }` group spans its segments; any other brace in the group's segments, a frame or
+  // comment text there leaves the group as scanned.
+  const unmatchedClose = (k) => {
+    let n = 0;
+    for (const ch of String(segs[k])) if (ch === '(') n += 1; else if (ch === ')' && --n < 0) return true;
+    return false;
+  };
   const leads = [];
   const leading = (k) => {
     if (leads[k]) return leads[k];
@@ -2604,7 +2613,7 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
     if (commented[k]) return;
     const after = outerEnd[k] && !commented[k + 1] && (PIPE_SEP.test(seps[k] ?? '') || BG_SEP.test(seps[k] ?? ''));
     const before = k > 0 && outerStart[k] && PIPE_SEP.test(seps[k - 1] ?? '') && !lastpipe;
-    if (!after && !before) return;
+    if ((!after && !before) || unmatchedClose(k)) return;
     piped[k] = true;
     for (const [from, to] of [after && group(k, -1), before && group(k, 1)].filter(Boolean)) {
       for (let j = from; j <= to; j += 1) piped[j] = true;
@@ -2715,7 +2724,9 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
   const initialHome = usableHome(home);
   // the child-shell depth where a statement starts: an assignment there never reaches this shell (review r10)
-  const depths = subshellDepths(segs, commented, seps, /\blastpipe\b/.test(cmd));
+  // `lastpipe` may run the last pipeline element here: any `shopt` / `lastpipe` / `BASH_ENV` spelling, however
+  // quoted, keeps that element as scanned
+  const depths = subshellDepths(segs, commented, seps, /shopt|lastpipe|BASH_ENV/.test(cmd.replace(/['"\\]/g, '')));
   const inChild = (at) => depths[at][String(segs[at]).search(/\S|$/)] > 0;
   const homeAfter = (stmt, h, at) => {
     if (commented[at] || inChild(at)) return h;               // comment text (`true # ; HOME=/x`) binds nothing
