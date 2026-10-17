@@ -581,6 +581,14 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/q | cat; cd ~/x')).toBe(`${HOME}/x`);
     // a background job is not visible in the statements: main's resolution, never the job's HOME
     expect(at('HOME=/q & cd ~/x')).toBe(`${REPORTED}/~/x`);
+    // a paren in a comment, a case arm or a ${…} body cannot be counted: main's resolution
+    expect(at('( case x in a) true;; esac\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('(\necho ${x//)/}\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('( true # )\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('true # (\nHOME=/q\ntrue # )\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('( case x in a) true;; esac\ncd ~/x\n)\ngit status')).toBe(`${REPORTED}/~/x`);
+    // text after the first cd never steers it
+    expect(at('cd ~/x && git status # (note')).toBe(`${HOME}/x`);
     // a cd in a child shell, or a target that leaks an operator, is never home-expanded
     expect(at('(true; cd ~/x); git status')).toBe(`${REPORTED}/~/x)`);
     expect(at('D=/clone; (true; D=~/x); cd $D')).not.toMatch(new RegExp(`^${HOME}/`));

@@ -2854,8 +2854,14 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
   let depth = 0;
   for (const [i, stmt] of segments.entries()) {
     const text = maskQuotedKeepingExpansions(stmt).trim();
+    // A paren in a comment, a `case` arm or a `${…}` body is no child shell; the count cannot read those.
+    if (/#|(?:^|[^\w$])(?:case|esac)(?!\w)|\$\{[^}]*[()]/.test(text)) return null;
     child.push(depth > 0 || /^\((?!\()/.test(text) || !!pipedFrom[i] || !!pipedFrom[i + 1]);
-    for (const ch of text) depth = Math.max(0, depth + (ch === '(' ? 1 : ch === ')' ? -1 : 0));
+    for (const ch of text) {
+      depth += ch === '(' ? 1 : ch === ')' ? -1 : 0;
+      if (depth < 0) return null;
+    }
+    if (/^cd\s/.test(stmt.trim())) break;                       // nothing after the first cd steers it
   }
   for (const [i, stmt] of segments.entries()) {
     homes.push(currentHome);
