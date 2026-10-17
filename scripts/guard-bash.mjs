@@ -2439,7 +2439,12 @@ export function hasDestructiveLaneOp(command) {
 // overridden in command order by a literal `HOME=/abs` assignment. Nothing is ever executed or looked up: an
 // unset/relative HOME, `~user`, an unknown variable, a substitution or an unquoted glob stays unresolved.
 function expandCdTarget(rest, home) {
-  const s = String(rest);
+  return expandWord(String(rest), home)?.text || null;
+}
+
+// One shell word of `s` from its start: `{ text, end }` (`end` = index just past the word), or null when
+// the word cannot be read statically.
+function expandWord(s, home) {
   const variable = (at) => {
     const m = s.slice(at).match(/^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/);
     if (!m) return null;
@@ -2448,7 +2453,8 @@ function expandCdTarget(rest, home) {
     return typeof value === 'string' ? { value, end: at + m[0].length - 1 } : null;
   };
   let out = '';
-  for (let i = 0; i < s.length; i++) {
+  let i = 0;
+  for (; i < s.length; i++) {
     const ch = s[i];
     if ((ch === '<' || ch === '>') && s[i + 1] === '(') return null;      // a process substitution's path
     if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
@@ -2484,7 +2490,48 @@ function expandCdTarget(rest, home) {
       out += ch;
     }
   }
-  return out || null;
+  return { text: out, end: i };
+}
+
+// HOME rebound by anything but a plain literal assignment: an arithmetic or array-element assignment,
+// `${HOME=…}`, `++HOME`, a name-binding builtin's operand, or text run by eval/source. The resolver cannot
+// read the new value, so home becomes unknown — never the stale one.
+const HOME_LVALUE = /(?:\+\+|--)\s*HOME(?!\w)|(?<![\w$./-])HOME(?:\[[^\]]*\])?\s*(?:\+\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))/;
+const BINDS_NAME_OPERANDS = /^(?:(?:builtin|command|time|!)\s+)*(?:read|mapfile|readarray|getopts|unset|for|select|wait|printf|declare|typeset|local)(?=\s|$)/;
+const RUNS_OPAQUE_TEXT = /^(?:(?:builtin|command|time|!)\s+)*(?:eval|source|\.)(?=\s|$)/;
+const SPECIAL_BUILTIN = /^(?::|\.|break|continue|eval|exec|exit|export|readonly|return|set|shift|source|times|trap|unset)$/;
+
+// Is a position whose preceding statement text is `prefix` inside a child shell (`( … )`, `$( … )`, backticks)?
+// Arithmetic `((` / `$((` opens none.
+function inChildShell(prefix) {
+  const p = prefix.replace(/\$?\(\(/g, '');
+  return (p.match(/\(/g) || []).length > (p.match(/\)/g) || []).length || (p.match(/`/g) || []).length % 2 === 1;
+}
+
+// HOME after one statement runs: `home` unchanged, the newly assigned absolute path, or null (unknown).
+function homeAfter(stmt, home) {
+  const s = stmt.trim();
+  const assignment = s.match(/^(export\s+)?HOME(\+?)=(.*)$/);
+  if (assignment) {
+    const [, exported, append, rest] = assignment;
+    const word = expandWord(rest, home);
+    if (!word) return null;
+    const after = rest.slice(word.end).trim();
+    if (exported && HOME_LVALUE.test(after)) return null;
+    if (!exported && after) {
+      const words = after.split(/\s+/);
+      const assignsOnly = words.every((w) => /^[A-Za-z_]\w*\+?=[^'"`$()\\<>]*$/.test(w) && !/^HOME\W/.test(w));
+      // A command after it makes this a prefix assignment that ends with that command (a special builtin
+      // keeps it under POSIX mode, so that one stays unknown).
+      if (!assignsOnly) return /^[\w./:-]+$/.test(words[0]) && !SPECIAL_BUILTIN.test(words[0]) ? home : null;
+    }
+    const value = append ? (home ? home + word.text : null) : word.text;
+    return value?.startsWith('/') ? value : null;
+  }
+  if (RUNS_OPAQUE_TEXT.test(s)) return null;
+  if (BINDS_NAME_OPERANDS.test(s) && /(?<![\w$./-])HOME(?!\w)/.test(s)) return null;
+  const lvalue = HOME_LVALUE.exec(s);
+  return lvalue && !inChildShell(s.slice(0, lvalue.index)) ? null : home;
 }
 
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
@@ -2510,23 +2557,25 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
   for (const stmt of parsed.segments) {
-    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
+    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)(\+?)=(.+)$/);
     if (!m) continue;
-    let val = m[2].trim();
-    if (/[`$(]/.test(val)) continue;                          // command-subst / nested expansion → skip
-    val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
-    if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
+    const [, name, append] = m;
+    let val = m[3].trim();
+    val = /[`$(]/.test(val) ? null : val.replace(/^(['"])(.*)\1$/, '$2'); // command-subst / nested expansion → skip
+    if (val === null || /\s/.test(val)) {                     // single-token literal only
+      if (append) delete vars[name];                          // an unreadable append leaves no stale value
+    } else if (!append) {
+      vars[name] = val;
+    } else if (name in vars) {
+      vars[name] += val;
+    }
   }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   for (const stmt of parsed.segments) {
-    const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
-    if (assignment) {
-      const value = expandCdTarget(assignment[1].trim(), currentHome);
-      currentHome = value?.startsWith('/') ? value : null;
-    }
+    currentHome = homeAfter(stmt, currentHome);
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.

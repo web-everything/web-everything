@@ -554,6 +554,33 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
     expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
   });
+  it('a HOME append extends the current home instead of leaving the stale value', () => {
+    expect(at('HOME=/a; HOME+=/b; cd ~/clone')).toBe('/a/b/clone');
+    expect(at('HOME+=/b; cd ~/clone')).toBe(`${HOME}/b/clone`);
+    expect(at('HOME=/a; export HOME+=/c; cd "$HOME/clone"')).toBe('/a/c/clone');
+    expect(at('HOME=/a; HOME+="/sp ace"; cd "$HOME/clone"')).toBe('/a/sp ace/clone');
+    expect(at('HOME=/a; HOME+=/b; HOME+=/c; cd ~')).toBe('/a/b/c');
+    // the appended text cannot be read, or there is no home to append to — never the stale value
+    expect(at('HOME=/a; HOME+=$(pwd); cd ~/clone')).toBe(REPORTED);
+    expect(at('HOME+=/b; cd ~/clone', null)).toBe(REPORTED);
+  });
+  it('any other HOME rebinding the resolver cannot read leaves home unknown, never stale', () => {
+    for (const rebind of ['HOME[0]=/z', 'HOME[0]+=/z', 'declare HOME=/z', 'declare -x HOME+=/z', 'typeset HOME=/z',
+      'readonly HOME=/z', 'local HOME=/z', 'read HOME', 'read -r HOME <f', 'printf -v HOME %s /z', 'unset HOME',
+      'let HOME=1', '(( HOME=1 ))', 'eval "HOME=/z"', 'source ./env.sh', '. ./env.sh', 'mapfile -t HOME <f']) {
+      expect(at(`HOME=/a; ${rebind}; cd ~/clone`), rebind).toBe(REPORTED);
+    }
+    // a temporary prefix assignment does not outlive its command
+    expect(at('HOME=/a; HOME=/x true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; HOME=/x B=/y; cd ~/clone')).toBe('/x/clone');
+    // HOME read, not rebound, changes nothing
+    expect(at('HOME=/a; echo "$HOME"; export HOME; cd ~/clone')).toBe('/a/clone');
+  });
+  it('an ordinary variable append extends the literal instead of leaving it stale', () => {
+    expect(at('D=/a; D+=/b; cd "$D"')).toBe('/a/b');
+    expect(at('D=/a; export D+=/b; cd $D')).toBe('/a/b');
+    expect(at('D=/a; D+=$(pwd); cd "$D"')).toBe(REPORTED);
+  });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);
     expect(at('cd $HOME/[c]lone')).toBe(REPORTED);
