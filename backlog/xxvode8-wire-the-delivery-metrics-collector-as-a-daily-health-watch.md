@@ -5,7 +5,7 @@ status: active
 scaffoldedBy: "delivery-metrics-cards-2-lane-16-51caddc5"
 dateScaffolded: "2026-10-17"
 blockedBy: ["xpdw3em"]
-scope: ["we:scripts/conveyor/delivery-metrics-job.mjs", "we:scripts/conveyor/health-watch.mjs", "we:skills-src/conveyor/daemon-manifest.mjs"]
+scope: ["we:scripts/conveyor/delivery-metrics-job.mjs", "we:scripts/conveyor/__tests__/delivery-metrics-job.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -16,28 +16,33 @@ Run the delivery-metrics collector (we:scripts/operations/delivery-metrics.mjs) 
 
 ## Acceptance
 
-- [A1] **Executable** — a test shows the job is declared in the manifest and calls the collector once per day; it fails before this item lands and passes after.
+- [A1] **Executable** — From WE, `npm run test:unit -- delivery-metrics-job.test` selects we:scripts/conveyor/__tests__/delivery-metrics-job.test.mjs by filename filter; it fails before implementation and passes after, exercising every named case below.
 
-## Acceptance
+## Test plan
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+All cases below are CAPABILITY tests (RED before implementation) in we:scripts/conveyor/__tests__/delivery-metrics-job.test.mjs. Drive the real health-watch registration with isolated scheduling state, a controlled clock and an observed collector invocation; tests must cover the call path as well as the job module.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- `manifestDeclaresCollectorJob` — RED; assert the real daemon manifest contains the job and health-watch resolves it to the collector module, with the intended repo/state root.
+- `repeatedTicksCollectOncePerETDay` — RED; assert one collector invocation at 00:15 ET, none before it, no duplicate on subsequent ticks/restart and a new invocation on the next ET date; test both DST transitions and winter/summer UTC offsets.
+- `disabledCollectorNeverRuns` — RED; delivery.metrics.enabled=false produces zero collector invocations across ticks/restarts and no scheduling-state success stamp.
+- `configuredScheduleOverridesDefault` — RED; assert the default daily 00:15 America/New_York and a configured override through health-watch; invalid schedules refuse invocation without advancing success state.
+- `failedAndConcurrentTicksDoNotLoseWork` — RED; race two ticks, crash before completion, recover a stale lease, resume its expired holder and restart health-watch. Assert a single active invocation, no success stamp on failure, retry through the collector's repo/date idempotency, and rejection of stale-holder completion. A successful daily publication remains unique even if a crash causes a retry.
+- `boundsAndScopesCollectorInvocation` — RED; assert an argument-vector call to the fixed collector module (shell-like config cannot execute), repo/state-root scoping, a finite child timeout and explicit error on timeout/unreadable settings. The job passes the intended completed ET date and records job/attempt identity without rewriting source ledgers.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No collector calculations, history format changes, settings-file edits, dashboard or digest job. Reuse xpdw3em's settings contract; preserve PR #5487's health-watch/manifest changes and start only after that PR lands.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Call the fixed collector with an argument vector, validate schedules and bound child execution (`boundsAndScopesCollectorInvocation`, `configuredScheduleOverridesDefault`). No HTTP endpoint is added; body caps, CSRF and request rate controls do not apply.
+2. **Truncated reads** — Unreadable/partial settings or scheduling state reports failure rather than defaulting to a successful run (`boundsAndScopesCollectorInvocation`, `failedAndConcurrentTicksDoNotLoseWork`). The collector owns ledger parsing.
+3. **Shared state files** — Use the existing job lease mechanism, re-read state under lease, fence expired holders and stamp success after collector completion (`failedAndConcurrentTicksDoNotLoseWork`).
+4. **Fail closed** — Disabled/invalid/unreadable configuration does not invoke collection; timeout/failure records an error and leaves the date retryable (`disabledCollectorNeverRuns`, `configuredScheduleOverridesDefault`, `boundsAndScopesCollectorInvocation`).
+5. **Identity scoping** — Job identity, repo and coordination root follow the collector contract (`manifestDeclaresCollectorJob`, `boundsAndScopesCollectorInvocation`).
+6. **State over time** — Deduplicate successful ET-day runs across ticks/restarts; retries rely on collector idempotency and DST uses America/New_York (`repeatedTicksCollectOncePerETDay`, `failedAndConcurrentTicksDoNotLoseWork`).
+7. **Who wrote it** — Record the job/attempt identity and completion result; only the current lease holder may stamp success (`boundsAndScopesCollectorInvocation`, `failedAndConcurrentTicksDoNotLoseWork`).
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Risks
+
+PR #5487 is an external prerequisite without a card; confirm it has landed before dispatch. Scheduling tests must drive health-watch and the manifest, since an isolated job test would miss registration failures. Exactly-once daily publication is the collector's guarantee; a crash before the success stamp can cause a safe retry.
