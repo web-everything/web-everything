@@ -5,6 +5,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { canConsumePrestagedAdmission } from '../merge-ai-prs.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -36,14 +37,20 @@ if (a[0] === 'api') {
 out([]);
 `;
 const fakeGit = `#!/usr/bin/env node
+const fs = require('node:fs');
 const a = process.argv.slice(2);
+fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/prestage.git\\n');
 else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('${sha}\\n');
 else if (a[0] === 'diff') {
   if (a.includes('--name-only')) process.stdout.write('README.md\\0');
   else if (a.includes('--numstat')) process.stdout.write('1\\t0\\tREADME.md\\n');
   else process.stdout.write('diff --git a/README.md b/README.md\\n--- a/README.md\\n+++ b/README.md\\n@@ -1 +1 @@\\n-old\\n+new\\n');
-} else if (a[0] === 'show') process.exit(1);
+} else if (a[0] === 'ls-tree' && a.includes('${sha}')) process.stdout.write('backlog/xabc123-card.md\\n');
+else if (a[0] === 'show') {
+  if (a[1] === 'origin/main:scripts/lib/queue-branch-numbering.mjs') process.stdout.write('drain-branch-numbering-ci-v1');
+  else process.exit(1);
+}
 `;
 
 function world(fn) {
@@ -60,14 +67,14 @@ function world(fn) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-    const run = (green = false) => {
+    const run = (green = false, { rebaseDrop = false, numbering = false } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json',
-        '--no-drain-lease','--no-red-main-freeze','--no-rebase-drop','--no-heal-collision','--no-overlap-yield',
+        '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:30_000,
         env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log,
           WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
-          WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:'off',
+          WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
           WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0' } });
       expect(r.status, r.stderr + r.stdout).toBe(0);
       return { report:JSON.parse(r.stdout), calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
@@ -77,6 +84,60 @@ function world(fn) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each([[], ['checking']])('does not admit an accepted PR without ready-to-merge (%j)', (...labels) => world(({pr,run}) => {
+    pr.labels = [{name:'review:accepted'}, ...labels.map(name => ({name}))];
+    expect(run().stderr).not.toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
+  it.each([true, false])('pending-CI manifest candidates cannot trigger head or review writes (accepted head=%s)', accepted => world(({pr,run,coord}) => {
+    pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({ item:'xabc123', repos:[{repo:'we',ref:pr.headRefName}], blockedBy:[],stackParents:[] }) + '\n```\n<!-- lane-manifest:end -->';
+    if (!accepted) pr.comments = [];
+    const first = run(false, { rebaseDrop:true });
+    expect(first.stderr).toContain('prepared while CI pending');
+    expect(first.calls.filter(a => a[0] === 'git' && ['push','commit-tree','update-index','write-tree','read-tree'].includes(a[1]))).toEqual([]);
+    // CI lifecycle bookkeeping precedes preparation and still reports checking.
+    expect(first.calls.filter(a => a[0] === 'pr' && ['comment','merge'].includes(a[1])
+      || a[0] === 'pr' && a[1] === 'edit' && !a.includes('checking')
+      || a[0] === 'label' && a.some(x => x.startsWith('review:')))).toEqual([]);
+    expect(first.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    const entries = readdirSync(join(coord,'drain-prestage')).map(file => JSON.parse(readFileSync(join(coord,'drain-prestage',file),'utf8')));
+    expect(entries[0].eligible).toBe(false);
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.report.prestaged).not.toBe(true);
+  }));
+  it('coupled candidates cannot consume prestaged admission', () => world(({pr,run,coord}) => {
+    const admission = { ready:true, branchPreparationRequired:false, queueAdmission:{allowed:true} };
+    expect(canConsumePrestagedAdmission({decision:'merge',hasManifest:false,coupleCarrier:{num:43}}, admission)).toBe(false);
+    expect(canConsumePrestagedAdmission({decision:'merge',hasManifest:true,crossRepo:true}, admission)).toBe(false);
+    expect(canConsumePrestagedAdmission({decision:'merge',hasManifest:false}, admission)).toBe(true);
+    pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({ item:'xabc123', repos:[{repo:'we',ref:pr.headRefName},{repo:'fui',ref:'lane/impl'}], blockedBy:[],stackParents:[] }) + '\n```\n<!-- lane-manifest:end -->';
+    run();
+    const entries = readdirSync(join(coord,'drain-prestage')).map(file => JSON.parse(readFileSync(join(coord,'drain-prestage',file),'utf8')));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].eligible).toBe(false);
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.report.prestaged).not.toBe(true);
+  }));
+  it('branches requiring preparation retain the full cascade', () => world(({pr,run,coord}) => {
+    expect(canConsumePrestagedAdmission({decision:'merge',hasManifest:false}, {
+      ready:true, branchPreparationRequired:true, queueAdmission:{allowed:true},
+    })).toBe(false);
+    run(false, { numbering:true });
+    const entries = readdirSync(join(coord,'drain-prestage')).map(file => JSON.parse(readFileSync(join(coord,'drain-prestage',file),'utf8')));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].eligible).toBe(false);
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { numbering:true });
+    expect(next.stderr).toContain('full fast drain');
+    expect(next.report.prestaged).not.toBe(true);
+  }));
   it('prepares while pending, then a green event enqueues without listing or gate reads', () => world(({pr,run,coord}) => {
     const first = run();
     expect(first.stderr).toContain('prepared while CI pending (eligible=true)');

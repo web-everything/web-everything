@@ -56,7 +56,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, env, readRedTeamEvidence: () => evidence, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -784,8 +784,29 @@ describe('queue safeguard overrides and untracked queue entries', () => {
 
 
 describe('drain pre-stage queue admission', () => {
-  it('reads red-team disposition while pending without queue or state writes, then reuses it', () => {
-    const { s, calls, state } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'checking'], evidence: { loopPayload: null } });
+  it('changed safety policy falls back before mutation or failure backoff', () => {
+    const { s, calls, state } = harness({ strategy:'github-merge-queue', enqueueFails:true });
+    const c = { num:42, repo:null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    prepared.safety = { ...prepared.safety, redTeamPendingMaxMin:999 };
+    calls.length = 0;
+    expect(s.enqueue(c, HEAD, { prepared })).toEqual({ fallback:true });
+    expect(calls).toEqual([]);
+    expect(state()).toBeNull();
+  });
+  it('a throwing prepared enqueue leaves the ordinary recovery attempt unthrottled', () => {
+    const { s, calls, state } = harness({ strategy:'github-merge-queue', enqueueFails:true });
+    const c = { num:42, repo:null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    expect(() => s.enqueue(c, HEAD, { prepared })).toThrow('prepared enqueue FAILED');
+    expect(state()).toBeNull();
+    expect(() => s.enqueue(c, HEAD)).toThrow('enqueue FAILED');
+    expect(calls.filter(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toHaveLength(2);
+  });
+  it('prepares without writes and rechecks red-team disposition at enqueue', () => {
+    const { s, calls, state } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });
     const c = { num: 42, repo: null, headRef: 'lane/a' };
     const prepared = s.prestage(c, HEAD);
     expect(prepared.allowed).toBe(true);
@@ -793,13 +814,43 @@ describe('drain pre-stage queue admission', () => {
     expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
     calls.length = 0;
     expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
-    // The post-enqueue clearance stamp retains its fresh dedupe read. Red-team admission is cached.
-    expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(1);
+    // Both admission and the post-enqueue clearance dedupe read the live thread.
+    expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(2);
     expect(calls.some(call => call[0] === 'git')).toBe(false);
   });
   it('keeps held red-team dispositions ineligible', () => {
-    const { s } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'checking'],
+    const { s } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
       evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true } });
     expect(s.prestage({ num: 42, repo: null }, HEAD).allowed).toBe(false);
+  });
+  it.each([{ labels:['review:accepted'] }, { labels:['review:accepted', 'checking'] }])('requires explicit ready-to-merge authorization: $labels', ({ labels }) => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels, evidence: { loopPayload: null } });
+    const c = { num: 42, repo: null };
+    expect(s.prestage(c, HEAD)).toMatchObject({ allowed: false, reason: 'ready-to-merge was removed' });
+    const authorized = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } }).s.prestage(c, HEAD);
+    expect(authorized.allowed).toBe(true);
+    expect(s.enqueue(c, HEAD, { prepared: { ...authorized, labels: JSON.stringify([...labels].sort()) } })).toMatchObject({ enqueued: false, kind: 'sent-back' });
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each(['break', 'in-flight', 'unreadable'])('revalidates %s evidence that arrives after preparation', async variant => {
+    const evidence = { loopPayload: null, inFlight: false, recorded: false };
+    const comments = [];
+    const { s, calls } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence, liveComments: comments });
+    const c = { num: 5283, repo: null };
+    const prepared = s.prestage(c, HEAD);
+    expect(prepared.allowed).toBe(true);
+    if (variant === 'break') {
+      const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+      comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+        pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+      }) });
+    } else if (variant === 'in-flight') {
+      evidence.loopPayload = { verdict: { verdict: 'accept' } };
+      evidence.inFlight = true;
+    } else evidence.readError = true;
+    if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
+    else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
   });
 });

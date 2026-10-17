@@ -763,11 +763,9 @@ export function createEnqueueOnEvent({
       if (r?.ok !== false) for (const mark of r?.marked || []) {
         const cause = parseMarkCause(mark.cause), pr = parseMarkKey(mark.key);
         if (pr?.repo !== String(localSlug).toLowerCase() || !cause) continue;
-        if (['check_suite', 'check_run'].includes(cause.type) && cause.action === 'completed' && cause.conclusion !== 'success') {
-          prestageCache.drop(pr.repo, pr.num);
-          pending.delete(`${pr.repo}#${pr.num}`);
-        }
-        else if (!activeNums.has(pr.num)) pending = notePending(pending, [mark], { localSlug, now: now() });
+        // Marks carry neither required-context identity nor head SHA. An optional or stale
+        // failure cannot withdraw a green wake; the drain re-reads current required checks.
+        if (!activeNums.has(pr.num)) pending = notePending(pending, [mark], { localSlug, now: now() });
       }
     },
     /** Run due PRs now (bounded catch-up concurrency; serial events) if enabled and allowed; a no-op while a tick is already running. */

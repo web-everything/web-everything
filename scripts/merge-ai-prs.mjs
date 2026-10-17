@@ -990,7 +990,7 @@ export function attachLiveFixClaim(data, { claimKey, readClaim }) {
  * `'main'`); when it or `baseRefName` is unknown the arm is inert and the chain behaves exactly as before.
  */
 export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
-  const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && !pr.isDraft
+  const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
     && prestageCi(pr, queueRequiredChecks) === 'pending';
   const num = pr?.number;
   const title = pr?.title || '';
@@ -1319,7 +1319,13 @@ export function needsAcceptanceRestamp(v, rebase) {
  * whole mechanism.
  */
 export function needsManifestStripBeforeMerge(v) {
-  return !!v && v.decision === 'merge' && !!v.hasManifest; // @merge-gate-exempt a held PR must NEVER be manifest-stripped (a force-push mutation); reviewHeld PRs are excluded here on purpose
+  return !!v && v.decision === 'merge' && !v.prestagePendingCi && !!v.hasManifest; // @merge-gate-exempt a held or pending PR must NEVER be manifest-stripped (a force-push mutation)
+}
+
+/** A cached admission cannot bypass head preparation or the coupled landing cascade. */
+export function canConsumePrestagedAdmission(c, { ready, branchPreparationRequired, queueAdmission }) {
+  return !!c && c.decision === 'merge' && ready && !c.hasManifest && !isImplHalf(c)
+    && !branchPreparationRequired && queueAdmission?.allowed === true;
 }
 
 /**
@@ -5076,9 +5082,8 @@ async function runCli() {
       }
       const rows = await __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       const { prs: labelMatched, truncated } = filterOpenPrsByLabel(rows, label, OPEN_PR_LIST_LIMIT);
-      const stagedCandidates = prestageSetting.value.prestageWhileCiRuns && mergeStrategy.enqueues(repo) && REVIEW_ESCALATION
-        ? rows.filter(p => hasLabel(p, REVIEW_LABELS.accepted) && !p.isDraft && isRequiredCheckPending(p, REQUIRED)) : [];
-      const prs = filterOpenPrsByBase([...new Map([...labelMatched, ...stagedCandidates].map(p => [p.number, p])).values()], base);
+      // Preparation observes the same release-label and operator label filter as the full drain.
+      const prs = filterOpenPrsByBase(labelMatched, base);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       return { repo, prs, rows };
     }
@@ -5270,7 +5275,7 @@ async function runCli() {
       // lane/* ref (renumbers the NNN), moving the head out from under an active reviewer and invalidating any
       // #2409 acceptance stamped against the old SHA. The heal's premise ("a red required check is the symptom")
       // never held for a green-held PR: it has no collision to heal. Excluding `reviewHeld` restores that premise.
-      if (!certified || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError) continue;
+      if (!certified || v.prestagePendingCi || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError) continue;
       if (!isLocalRepo(v.repo) || !v.headRef) continue;
       // #2276 — a rebase-drop candidate (stale-green + BEHIND/CONFLICTING) is healed INSIDE the rebase-drop
       // rebuild below (one rebuilt tip drops the manifest AND renumbers), so skip it here to avoid a double
@@ -5359,7 +5364,7 @@ async function runCli() {
       // Rebuild-to-drop the manifest when the PR is BLOCKED on it (CONFLICTING/BEHIND) OR when it is already
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
-      if (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v)) continue;
+      if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
@@ -5512,7 +5517,7 @@ async function runCli() {
   // Best-effort, exactly like every other label write here: the merge gate re-checks the hold directly and parks
   // a held PR whether or not `ready-to-merge` is present, so the label is a collection filter, never the land gate.
   const stripReadyOnPark = (v, { applyLabel = null, staleAcceptance = false } = {}) => {
-    if (DRY_RUN) return;
+    if (DRY_RUN || v.prestagePendingCi) return;
     if (!decideParkReadyStrip(v.prLabels, { applyLabel, staleAcceptance })) return;
     try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL], { stdio: ['ignore', 'ignore', 'pipe'] }); }
     catch { /* label best-effort */ }
@@ -5539,7 +5544,7 @@ async function runCli() {
       // catch: the PR reports `humanRequired:true` in JSON but carries only `review:pending` on GitHub, and
       // `review-parked-prs.mjs` then treats it as agent-clearable and auto-accepts a PR a human was required to
       // clear. Minting for held PRs too keeps every verdict label present before any escalation pass applies one.
-      const escalationRepos = new Set(verdicts.filter((v) => v.decision === 'merge' || v.reviewHeld).map((v) => v.repo || null));
+      const escalationRepos = new Set(verdicts.filter((v) => !v.prestagePendingCi && (v.decision === 'merge' || v.reviewHeld)).map((v) => v.repo || null));
       for (const repo of escalationRepos) {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
@@ -5568,6 +5573,7 @@ async function runCli() {
       // not, and decideReviewGate never returns `merge` for it (an uncleared, non-accepted review label always
       // parks). Everything else (no review label) is unaffected — only `decision === 'merge'` OR `reviewHeld`.
       if (v.decision !== 'merge' && !v.reviewHeld) continue;
+      const candidateDryRun = DRY_RUN || v.prestagePendingCi;
       let changedFiles = [];
       let diffLines = 0;
       // #2390-review-fix — the CUMULATIVE origin/main…head file set the gate-self/human trigger scores over
@@ -5670,7 +5676,7 @@ async function runCli() {
       // durable per-PR signal, so it is not defended here (see review-baseline-state.mjs's cache-loss residual).
       const liveManifestValues = { hasManifest: !!v.hasManifest, dismissedFindings: v.dismissedFindings, crossRepo: v.crossRepo, blockedBy: v.blockedBy };
       const priorBaseline = getBaseline(baselineState, { repo: v.repo, num: v.num });
-      if (!priorBaseline && !DRY_RUN) {
+      if (!priorBaseline && !candidateDryRun) {
         const nextBaseline = recordBaseline(baselineState, { repo: v.repo, num: v.num }, liveManifestValues);
         if (nextBaseline !== baselineState) { baselineState = nextBaseline; baselineStateChanged = true; }
       }
@@ -5685,7 +5691,7 @@ async function runCli() {
         v.humanRequired = true;
         v.escalateReasons = tamper.reasons;
         v.reason = `manifest baseline mismatch — post-review tamper suspected: ${tamper.reasons.join('; ')}`;
-        if (!DRY_RUN) {
+        if (!candidateDryRun) {
           // #2766/#2767 — same mutual-exclusivity target as the test-gaming park below, but this site has no
           // `humanClearedSha` proof of its own (no fetch — the manifest-tamper trigger never checked comments),
           // so `keepHumanClearance: true` UNCONDITIONALLY: a co-present `review:accepted` is left standing
@@ -5772,7 +5778,7 @@ async function runCli() {
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
-              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN }),
+              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: candidateDryRun }),
             });
             humanClearedSha = carried.humanClearedSha;
             carryRetryable = carried.retryable === true;
@@ -5798,7 +5804,7 @@ async function runCli() {
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
         v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
-        if (!DRY_RUN) {
+        if (!candidateDryRun) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-
           // closed-toward-PRESERVATION direction (see `decideParkToHuman`'s own docstring). It successfully
@@ -5866,7 +5872,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN, ...workflowReadOptions(v) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -5917,7 +5923,7 @@ async function runCli() {
         // redundant `gh pr edit --add-label` call when the verdict label is already present (never a
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
-        if (gate.applyLabel && !DRY_RUN) {
+        if (gate.applyLabel && !candidateDryRun) {
           if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
@@ -6002,7 +6008,7 @@ async function runCli() {
         // re-park that scores a different set than the first park replaces the stale block; a re-park scoring
         // the SAME set writes nothing. Then verify the write landed — best-effort (a write/verify miss is
         // surfaced, never fatal: the label already carries the signal).
-        if (gate.humanRequired && !DRY_RUN) {
+        if (gate.humanRequired && !candidateDryRun) {
           let liveBody = '';
           let liveBodyRead = false; // 74b — an unread body is UNKNOWN: never reconcile/overwrite from '' (that would clobber the PR body)
           try { liveBody = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''; liveBodyRead = true; } catch { /* fetch miss — unknown body: skip the write, fall to the loud skip-stamp */ }
@@ -6257,14 +6263,14 @@ async function runCli() {
     // store its writes land in, taken before it writes, so a shared-store miss is retried next pass.
     const readDrainLedger = await readDrainLedgerSnapshot(verdicts.map((v) => v.repo || localSlug));
     for (const v of skipped) {
-      if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
+      if (v.prestagePendingCi || !v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
       const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason, read: readDrainLedger });
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
     for (const v of skipped) {
       // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
       // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).
-      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
+      if (v.prestagePendingCi || v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
       if (!(v.certifyLabel || v.aiGenerated)) continue;
       // xnsk54v follow-up — mirror the park path: record the acted-on manifest values into the durable skip
       // comment for a manifest-carrying PR (tamper-evidence), leaving orphan/impl skip comments unchanged.
@@ -6410,8 +6416,8 @@ async function runCli() {
     const row = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
     if (!DRY_RUN && row && mergeStrategy.enqueues(c.repo)) {
       const queueAdmission = mergeStrategy.prestage(c, c.listedHeadSha);
-      const eligible = c.decision === 'merge' && stageReady.has(candKey(c)) && !isImplHalf(c) && !isCoupleCarrier(c)
-        && !branchPreparationRequired(c) && queueAdmission.allowed;
+      const eligible = canConsumePrestagedAdmission(c, { ready: stageReady.has(candKey(c)),
+        branchPreparationRequired: branchPreparationRequired(c), queueAdmission });
       prestageCache.put(c.repo || localSlug, c.num, {
         headSha: c.listedHeadSha, labels: labelSignature(row.labels), body: row.body, baseRefName: row.baseRefName,
         requiredChecks: queueRequiredChecksOf(c.repo), candidate: c, eligible, queueAdmission,

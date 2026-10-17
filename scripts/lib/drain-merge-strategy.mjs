@@ -304,8 +304,7 @@ export function createDrainMergeStrategy({
       try {
         const live = readLive(c.repo, c.num);
         if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { allowed: false, reason: 'live state unreadable' };
-        // Pending CI may temporarily replace ready-to-merge with checking. Review holds still veto.
-        const held = sendBackReason([...live.labels, { name: 'ready-to-merge' }]);
+        const held = sendBackReason(live.labels);
         if (held) return { allowed: false, reason: held };
         const pinned = readPinnedChangedFiles({ headSha, base: c.baseRefName || 'main', cwd, exec });
         const surface = workflowEditHold({ files: pinned.files, expectedCount: pinned.files?.length });
@@ -324,6 +323,8 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
+      const preparedAdmission = prepared?.allowed === true && JSON.stringify(prepared.safety) === JSON.stringify(safety.value);
+      if (prepared != null && !preparedAdmission) return { fallback: true };
       // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.
       const before = readQueueState(statePath, readFile);
       if (before.unreadable) throw new Error(`github-merge-queue: follow-up state ${statePath} is unreadable — refusing to enqueue (and NOT merging directly); fix or remove it`);
@@ -334,14 +335,14 @@ export function createDrainMergeStrategy({
       }
       const live = readLive(c.repo, c.num);
       if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'live head or labels do not match the judged state' };
-      const preparedAdmission = prepared?.allowed === true && JSON.stringify(prepared.safety) === JSON.stringify(safety.value);
       if (preparedAdmission && prepared.labels !== labelSignature(live.labels)) return { fallback: true };
-      const held = sendBackReason(preparedAdmission ? [...live.labels, { name: 'ready-to-merge' }] : live.labels);
+      const held = sendBackReason(live.labels);
       if (held) {
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
-      if (!preparedAdmission && safety.value.waitForRedTeamBeforeEnqueue) {
+      // Head-bound file preparation is reusable; authorization evidence is always live.
+      if (safety.value.waitForRedTeamBeforeEnqueue) {
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const owed = postAcceptRedTeamOwed(evidence.loopPayload, env);
         const pending = before.redTeamPending?.[key];
@@ -349,7 +350,7 @@ export function createDrainMergeStrategy({
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
         const newComment = Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
-        if (owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
+        if (!preparedAdmission && owed && sameHead && pending.retryAt > now() && !newComment && !overdue) return pendingOutcome(c, pending);
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
@@ -396,6 +397,12 @@ export function createDrainMergeStrategy({
       } catch (e) { say(`  ⚠ merge-queue batching admission failed (${firstLine(e)}) — continuing enqueue`); }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
+        // A shortcut refusal delegates to the full cascade in this pass. Do not install
+        // retry backoff here: it would hide the refusal from that cascade's recovery catch.
+        if (preparedAdmission) throw Object.assign(new Error(`github-merge-queue prepared enqueue FAILED (${r.error})`), {
+          githubMessage: r.error,
+          ...(r.reason === REQUIRED_WORKFLOWS_UNSATISFIED ? { code: REQUIRED_WORKFLOWS_UNSATISFIED, headSha } : {}),
+        });
         log.write(`  enqueue FAILED ${key}: ${r.error}\n`);
         const conflict = /merge conflicts?|not (?:in )?(?:a )?mergeable state|not mergeable/i.test(r.error);
         const state = readQueueState(statePath, readFile);

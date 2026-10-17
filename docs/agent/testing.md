@@ -1536,11 +1536,30 @@ Legacy runs without seat observations are omitted; absent times are never recons
 
 ## Drain CI pre-stage
 
-The drain caches non-CI gate dispositions for accepted pending heads in coordination storage,
+The drain caches non-CI gate dispositions for accepted pending heads carrying `ready-to-merge` in coordination storage,
 bound to repo, PR and head. Green check events may consume this preparation before listing;
 head, label, body/base changes and TTL expiry require the full fast drain. Every required
 context needs its own successful row before enqueue; missing, pending, cancelled and red
-contexts never authorize enqueue. Coupled candidates and branches requiring preparation
+contexts never authorize enqueue. A newly failed optional CodeQL check also vetoes admission when
+`drainBlocksOnCodeQL` is enabled. Red-team evidence and the complete comment thread are re-read at enqueue;
+the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible.
+Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
+then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
 keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
 preparation may evaluate the remaining gates while CI is pending, but must leave the real
 merge cascade before any enqueue. Regression home: `scripts/lib/__tests__/drain-prestage.test.mjs`.
+
+Pre-stage regression contracts (PR #5480): every enqueue entry point must cover throwing mutations
+(including required-workflow, conflict and unreadable-state failures). A shortcut refusal drops its cache
+and falls back without installing backoff that hides the error from ordinary cascade recovery. Keep
+table-driven coverage of every GitHub check conclusion, missing release labels, evidence added after
+preparation, optional CodeQL failures, coupled candidates and branch preparation. The CLI fixture must
+assert pending manifest candidates cause no head writes or review writes, including a stale acceptance.
+The provisional `merge` disposition is used only to evaluate gates: collision healing, manifest rebuilding,
+review-label provisioning, clearance carry, baseline/ledger writes, parking and skip comments must suppress
+writes for `prestagePendingCi`; the actual merge set excludes these candidates.
+
+Prevention follow-up owed by this review: add an enqueue-call lint that recognizes both enclosing
+try/catch and callbacks protected by `enqueuePrestage`. It must flag unprotected `mergeStrategy.enqueue`
+calls without treating the protected callback as an uncaught call. The throwing-entry-point regression
+contracts above are the immediate guard; the repository-wide lint remains separate tooling work.

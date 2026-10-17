@@ -6,6 +6,7 @@ import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { failedCodeQLCheck, loadDrainGateSettings } from './codeql-gate.mjs';
 
 export function resolvePrestageSettings({ env = process.env, tool, platform, log = () => {} } = {}) {
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
@@ -55,25 +56,40 @@ export function createPrestageCache({ env = process.env, root = join(resolveCoor
 }
 
 /** No listing or gate evaluation on a hit. Unknown/stale evidence delegates to the ordinary drain. */
-export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock }) {
+export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
   if (!settings.value.prestageWhileCiRuns) return { fallback: true };
   const entry = cache.get(repo, num, settings.value.prestageTtlMin);
   if (!entry?.eligible) return { fallback: true };
+  // Entries written before manifest preparation was excluded may still be within their TTL.
+  if (entry.candidate?.hasManifest || entry.candidate?.coupleCarrier) {
+    cache.drop(repo, num);
+    return { fallback: true };
+  }
   let pr;
   try { pr = await readPr(); } catch { return { fallback: true }; }
   if (!pr || pr.headRefOid !== entry.headSha || pr.state !== 'OPEN' || pr.isDraft
+      || !pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'ready-to-merge')
       || labelSignature(pr.labels) !== entry.labels || pr.body !== entry.body || pr.baseRefName !== entry.baseRefName) {
     cache.drop(repo, num);
     return { fallback: true };
+  }
+  if (blockOnCodeQL && failedCodeQLCheck(pr)) {
+    cache.drop(repo, num);
+    return { enqueued: false, reason: 'CodeQL check failed' };
   }
   const ci = prestageCi(pr, entry.requiredChecks);
   if (ci === 'red') { cache.drop(repo, num); return { enqueued: false, reason: 'required checks red' }; }
   if (ci === 'unknown') return { fallback: true };
   if (ci !== 'green') return { enqueued: false, reason: `required checks ${ci}` };
-  const locked = withLock(() => enqueue(entry.candidate, entry.headSha, entry));
-  if (locked.ran === false) return { enqueued: false, reason: 'merge-write mutex held' };
-  const result = locked.result;
-  if (result.fallback) cache.drop(repo, num);
-  if (result.enqueued) cache.drop(repo, num);
-  return result;
+  try {
+    const locked = await withLock(() => enqueue(entry.candidate, entry.headSha, entry));
+    if (locked.ran === false) return { enqueued: false, reason: 'merge-write mutex held' };
+    const result = await locked.result;
+    if (result.fallback || result.enqueued) cache.drop(repo, num);
+    return result;
+  } catch {
+    // The ordinary cascade owns required-workflow refresh, conflict and stale-gate recovery.
+    cache.drop(repo, num);
+    return { fallback: true };
+  }
 }

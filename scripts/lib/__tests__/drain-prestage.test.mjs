@@ -3,16 +3,16 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, labelSignature, enqueuePrestage } from '../drain-prestage.mjs';
-import { classifyPr, buildDrainVerdicts } from '../../merge-ai-prs.mjs';
+import { classifyPr, buildDrainVerdicts, needsManifestStripBeforeMerge } from '../../merge-ai-prs.mjs';
 import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
 const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
-  labels: [{ name: 'review:accepted' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
+  labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
-function fixture() {
+function fixture(options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'drain-prestage-')); roots.push(root);
   let clock = 1000;
   const cache = createPrestageCache({ root, now: () => clock });
@@ -22,17 +22,40 @@ function fixture() {
   const enqueue = vi.fn(() => ({ enqueued: true }));
   const settings = resolvePrestageSettings({ env: {}, tool: {}, platform: {} });
   const readPr = vi.fn(async () => pr);
-  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, withLock: fn => ({ ran: true, result: fn() }) });
+  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, withLock: fn => ({ ran: true, result: fn() }), ...options });
   return { cache, pr, enqueue, settings, run, readPr, advance: ms => { clock += ms; } };
 }
 
 describe('CI pre-stage', () => {
+  it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
+    const f = fixture();
+    const entry = f.cache.get(repo, 42, 30);
+    f.cache.put(repo, 42, { ...entry, candidate:{...entry.candidate,...candidate} });
+    expect(await f.run()).toEqual({ fallback:true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it.each(['REQUIRED_WORKFLOWS_UNSATISFIED', 'CONFLICT', 'UNREADABLE'])('drops cached admission and falls back when enqueue throws %s', async code => {
+    const f = fixture();
+    f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+    f.enqueue.mockImplementation(() => { throw Object.assign(new Error(code), { code }); });
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it('drops admission after an asynchronously rejected enqueue', async () => {
+    const f = fixture();
+    f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+    f.enqueue.mockRejectedValue(new Error('enqueue failed'));
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
   it('computes the non-CI verdict while pending, without changing ordinary classification', () => {
     const p = pending();
     expect(classifyPr(p).decision).toBe('skip');
     const verdicts = buildDrainVerdicts({ prsByRepo: new Map([[repo, [p]]]), repos: [repo],
       preparePendingCi: true, isLocalRepo: () => true, queueRequiredChecksOf: () => ['test'], readOf: () => ({ commits: [] }) });
     expect(verdicts[0]).toMatchObject({ decision: 'merge', prestagePendingCi: true, testGreen: false, mergeable: 'MERGEABLE', listedHeadSha: head });
+    expect(needsManifestStripBeforeMerge({ ...verdicts[0], hasManifest: true })).toBe(false);
   });
   it('never enqueues a pending head, then green enqueues with one targeted read and no listing', async () => {
     const f = fixture();
@@ -63,6 +86,32 @@ describe('CI pre-stage', () => {
     expect(await f.run()).toMatchObject({ enqueued: false, reason: 'required checks red' });
     expect(f.enqueue).not.toHaveBeenCalled();
     expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it('rejects a newly failed optional CodeQL check on cached admission', async () => {
+    const f = fixture();
+    f.pr.statusCheckRollup.push({ name: 'CodeQL', status: 'IN_PROGRESS', conclusion: null });
+    expect(await f.run()).toMatchObject({ enqueued: false });
+    f.pr.statusCheckRollup[0].status = 'COMPLETED';
+    f.pr.statusCheckRollup[0].conclusion = 'SUCCESS';
+    f.pr.statusCheckRollup[1] = { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' };
+    expect(await f.run()).toMatchObject({ enqueued: false, reason: 'CodeQL check failed' });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it('honors the CodeQL gate setting on cached admission', async () => {
+    const f = fixture({ blockOnCodeQL: false });
+    f.pr.statusCheckRollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' }];
+    expect(await f.run()).toEqual({ enqueued: true });
+  });
+  it.each([{ labels: [] }, { labels: [{ name: 'checking' }] }])('never consumes cached admission without the release label ($labels)', async ({ labels }) => {
+    const f = fixture();
+    f.pr.labels = [{ name: 'review:accepted' }, ...labels];
+    const entry = f.cache.get(repo, 42, 30);
+    f.cache.put(repo, 42, { ...entry, labels: labelSignature(f.pr.labels) });
+    f.pr.statusCheckRollup[0].conclusion = 'SUCCESS';
+    f.pr.statusCheckRollup[0].status = 'COMPLETED';
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
   });
   it('expires at the configured TTL and respects disabling', async () => {
     const f = fixture(); f.advance(30 * 60_000);

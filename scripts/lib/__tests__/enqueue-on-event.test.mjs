@@ -1563,14 +1563,14 @@ describe('pre-staged green events', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toContain('--from-green-event');
   });
-  it('red drops preparation and withdraws a pending green wake', async () => {
+  it.each(['success', 'skipped', 'neutral', 'cancelled', 'failure', 'timed_out', 'action_required', 'stale', 'startup_failure', null])('keeps the green wake after an unattributed %s event', async conclusion => {
     const prestageCache = { get: () => ({ eligible: true }), drop: vi.fn() };
     const { handle, calls } = setup({ prestageCache });
     handle.notePoll({ ok: true, marked: [mark()] });
-    handle.notePoll({ ok: true, marked: [mark(42, 'check_run.completed=failure@13')] });
+    handle.notePoll({ ok: true, marked: [mark(42, `check_run.completed${conclusion ? `=${conclusion}` : ''}@13`)] });
     await handle.tick();
-    expect(prestageCache.drop).toHaveBeenCalledWith(REPO, 42);
-    expect(calls).toHaveLength(0);
+    expect(prestageCache.drop).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
     expect(handle.pending()).toHaveLength(0);
   });
 });
