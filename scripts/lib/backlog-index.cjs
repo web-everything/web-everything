@@ -16,7 +16,9 @@ const fingerprint = (backlogDir, name) => {
 // One load owns one disk snapshot. Values are serialized BEFORE callers can add graph fields.
 // readCard may return null for malformed cards or call skipCache for external dependencies.
 function createBacklogIndex({ backlogDir, indexDir = process.env.WE_BACKLOG_INDEX_DIR, loaderVersion, readCard }) {
-  const enabled = process.env.WE_BACKLOG_INDEX !== '0' && (!isUnderTest() || Boolean(indexDir));
+  // Ephemeral review checkouts must not leave a whole-backlog snapshot per seat.
+  const ephemeral = /(?:^|[/\\])we-(?:review-seat|red-team-recheck)-/.test(backlogDir);
+  const enabled = !ephemeral && process.env.WE_BACKLOG_INDEX !== '0' && (!isUnderTest() || Boolean(indexDir));
   const file = join(indexDir || join(tmpdir(), `we-backlog-index-${process.getuid?.() ?? 'unknown'}`),
     `${sha1(backlogDir)}.bin`);
   const stats = { hits: 0, misses: 0 };
