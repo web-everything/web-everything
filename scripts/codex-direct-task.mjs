@@ -93,7 +93,8 @@
 import { randomUUID } from 'node:crypto';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
-import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff } from './lib/build-self-review.mjs';
+import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
+import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
@@ -592,15 +593,18 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
   if (typeof dir !== 'string' || !dir.trim()) throw new TypeError('codex-direct-task: `dir` must be a non-empty path');
   if (typeof startSha !== 'string' || !startSha.trim()) throw new TypeError('codex-direct-task: `startSha` must be a non-empty sha');
 
-  // Codex can write this checkout's git config, so these reads run no fsmonitor, external diff or textconv command.
-  const git = (args) => execFn('git', ['-C', dir, '-c', 'core.fsmonitor=false', ...args]);
+  // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
+  // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
+  const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv() });
+  assertNoLaneFilterDrivers(git);
   const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
   if (untracked.length) {
     try { git(['add', '--intent-to-add', '--', ...untracked]); } catch { /* best-effort */ }
   }
-  const diff = git(['diff', '--no-ext-diff', '--no-textconv', startSha]);
-  const diffStat = git(['diff', '--no-ext-diff', '--no-textconv', '--stat', startSha]);
+  const diff = git(['diff', '--text', startSha]);
+  const diffStat = git(['diff', '--stat', startSha]);
   const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
   return { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };

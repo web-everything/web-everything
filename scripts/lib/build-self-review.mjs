@@ -1,15 +1,25 @@
 /** Bounded pre-review check. No publication and no GitHub calls. */
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
+import { laneGitConfigArgs, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
 
 export const SELF_REVIEW_MAX_DIFF_BYTES = 512 * 1024;
 const TOO_LARGE = 'Self-review incomplete: net diff exceeds the 512 KiB limit. No review verdict was obtained for this diff; human review of the full diff is required.';
 class SelfReviewDiffTooLargeError extends Error {}
 
 /**
- * git argv prefix for reading a builder's diff in the caller's own process. The builder can write the lane's
- * `.git/config` and `.gitattributes`, so external diff drivers, textconv filters and fsmonitor stay off.
+ * git argv for reading a builder's diff in the caller's own process (run it with `laneGitHardeningEnv()`). The builder
+ * can write the lane's `.git/config` and attributes, so the shared lane pins apply, external diff drivers and textconv
+ * stay off, and `--text` keeps a path marked binary in the review. A clean filter still runs on worktree content:
+ * a worktree read checks {@link assertNoLaneFilterDrivers} first.
  */
-export const SELF_REVIEW_DIFF_ARGS = ['-c', 'core.fsmonitor=false', '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-color'];
+export const selfReviewDiffArgs = (...revs) => [...laneGitConfigArgs(), '--no-replace-objects',
+  ...hardenLaneGitArgs(['diff', '--no-color', '--text', ...revs, '--'])];
+
+/** Refuse a checkout whose own config defines a filter driver; `git diff`/`git status` would run it on worktree content. */
+export function assertNoLaneFilterDrivers(listConfig) {
+  const drivers = laneFilterDrivers(listConfig(LANE_CONFIG_LIST_ARGS));
+  if (drivers.length) throw new Error(`refusing to read a checkout that defines a filter driver: ${drivers.join(', ')}`);
+}
 
 /** Run a diff read; an overflowing read buffer is the known size bound, not an unavailable review. */
 export function boundedSelfReviewDiff(read) {
@@ -28,11 +38,15 @@ export async function selfReviewPrompt(diff) {
     FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n');
 }
 
-/** One verdict object: bare, inside one fenced block, or after a lead-in sentence. Anything else is invalid. */
+/**
+ * One verdict object: bare, or inside exactly one fenced block, either with prose around it. Without a fence the
+ * object runs from the first `{` to the last `}`. Anything else (two blocks, two objects, extra keys) is invalid.
+ */
 export function parseSelfReviewVerdict(message) {
-  const text = String(message ?? '').trim();
-  const fenced = /^```(?:json)?[ \t]*\n([\s\S]*?)\n```$/.exec(text);
-  const body = fenced ? fenced[1].trim() : text.slice(text.indexOf('{'));
+  const text = String(message ?? '').replace(/\r\n?/g, '\n').trim();
+  const fences = [...text.matchAll(/^```[ \t]*(?:json)?[ \t]*\n([\s\S]*?)\n```[ \t]*$/gm)];
+  if (fences.length > 1) throw new Error('invalid self-review verdict: more than one fenced block');
+  const body = fences.length ? fences[0][1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
   const parsed = JSON.parse(body);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'findings') {
     throw new Error('invalid self-review verdict');
@@ -77,16 +91,20 @@ export async function runBuildSelfReview({ policy, readDiff, review = reviewBuil
   }
 }
 
+// One-for-one look-alikes for characters that act on the raw PR body even inside a code block.
+const INERT = { '<': '＜', '>': '＞', '@': '＠', '#': '＃' };
+
 /**
- * Quote model notes for PR prose as inert text: no model-authored markers, terminal controls, mentions,
- * issue references (closing keywords act on them), links or images. Every line stays inside the quote.
+ * Model notes as inert PR prose: a fenced code block (no markdown, links, images or autolinks), longer than any
+ * backtick run in the notes. `<`/`>` (machine markers), `@` (mentions), `#`, `GH-` and `://` (issue references a
+ * closing keyword could act on) become look-alikes, one character each, so the 16,000-character cap holds after.
  */
 export function renderSelfReviewNotes(result) {
   if (!result?.notes?.length) return '';
   const safe = result.notes.join('\n').slice(0, 16000)
-    .replace(/[^\P{Cc}\n]|\p{Cf}/gu, ' ')
-    // References and mentions first: the entities below contain `#`.
-    .replace(/@/g, '＠').replace(/#/g, '＃').replace(/\b(GH)-(?=\d)/gi, '$1‐')
-    .replace(/[<>&`[\]!\\*_|]/g, c => `&#${c.charCodeAt(0)};`);
-  return `\n\nPre-review notes remaining after ${result.rounds} repair round(s):\n\n${safe.split('\n').map(line => `> ${line}`).join('\n')}\n`;
+    .replace(/[^\P{Cc}\n]|\p{Cf}|\p{Zl}|\p{Zp}/gu, ' ')
+    .replace(/[<>@#]/g, c => INERT[c])
+    .replace(/\b(GH)-(?=\d)/gi, '$1‐').replace(/:\/\//g, ':／／');
+  const fence = '`'.repeat(Math.max(3, ...[...safe.matchAll(/`+/g)].map(m => m[0].length + 1)));
+  return `\n\nPre-review notes remaining after ${result.rounds} repair round(s):\n\n${fence}text\n${safe}\n${fence}\n`;
 }

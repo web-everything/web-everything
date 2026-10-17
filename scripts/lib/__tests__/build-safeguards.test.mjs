@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveBuildPolicy, renderBuildRequirements, appendBuildRequirements } from '../build-policy.mjs';
-import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, SELF_REVIEW_DIFF_ARGS } from '../build-self-review.mjs';
+import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, selfReviewDiffArgs } from '../build-self-review.mjs';
+import { laneGitHardeningEnv } from '../lane-git-hardening.mjs';
 import { buildCodexPrompt, buildCodexDirectTaskArgv, runCodexDirectExec, runGate, codexDirectTask, captureDiff, cliExitCode } from '../../codex-direct-task.mjs';
 import { readFixBriefTemplate } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { readCiHealBriefTemplate } from '../../operations/ci-heal-pr-dispatch.mjs';
@@ -149,6 +150,8 @@ describe('production self-review adapter', () => {
   it.each([
     ['a fenced verdict', '```json\n{"findings":["a.mjs:1 defect"]}\n```', ['a.mjs:1 defect']],
     ['a verdict after a leading sentence', 'Here is the result:\n{"findings":[]}', []],
+    ['a fenced verdict between prose lines, with CRLF', 'Result {see below}:\r\n```json\r\n{"findings":["a {b}"]}\r\n```\r\nDone.', ['a {b}']],
+    ['a verdict with trailing prose', '{"findings":[]}\nNo blocking defects.', []],
   ])('accepts %s', async (_name, lastMessage, expected) => {
     const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
     try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).resolves.toEqual(expected); }
@@ -158,6 +161,7 @@ describe('production self-review adapter', () => {
   it.each([
     ['prose without a verdict', 'Looks fine to me.'],
     ['two verdicts', '{"findings":[]}\n{"findings":["x"]}'],
+    ['two fenced verdicts', '```json\n{"findings":[]}\n```\n```json\n{"findings":["x"]}\n```'],
     ['an unexpected key', '{"findings":[],"clear":true}'],
     ['an array', '[]'],
   ])('rejects %s', async (_name, lastMessage) => {
@@ -181,49 +185,62 @@ describe('production self-review adapter', () => {
 
 describe('self-review notes in the PR body', () => {
   const render = notes => renderSelfReviewNotes({ rounds: 2, notes });
-  it('quotes every line and leaves no live link, image, reference, closing keyword or mention', () => {
-    const body = render(['Fixes #123 and closes web-everything/web-everything#9 GH-7',
-      '![x](https://attacker.example/p.png) [click](https://attacker.example)\n# heading\n- item @operator']);
-    const quoted = body.slice(body.indexOf('\n\n> ') + 2).trimEnd().split('\n');
-    for (const line of quoted) expect(line.startsWith('> ')).toBe(true);
-    expect(body.replace(/&#\d+;/g, '')).not.toMatch(/#\d/); // an entity renders as its character, never `#`
-    expect(body).toContain('&#33;&#91;x&#93;(https://attacker.example/p.png)');
+  it('renders inert code: no live link, image, reference, closing keyword, mention or marker', () => {
+    const body = render(['Fixes #123, closes web-everything/web-everything#9, GH-7 and https://github.com/o/r/issues/4',
+      '![x](https://attacker.example/p.png) <!-- we:marker --> ````\n# heading\n- item @operator']);
+    const fence = /\n(`{5,})text\n[\s\S]*\n\1\n$/.exec(body);
+    expect(fence, body).not.toBeNull(); // longer than the notes' own 4-backtick run, so the block cannot be closed early
+    expect(body).not.toMatch(/#\d/);
     expect(body).not.toMatch(/GH-\d/i);
-    expect(body).not.toContain('![');
-    expect(body).not.toContain('](');
+    expect(body).not.toContain('://');
+    expect(body).not.toContain('<!--');
     expect(body).not.toContain('@operator');
     expect(body).toContain('attacker.example');
+    expect(render(['x'.repeat(20000)]).length).toBeLessThan(16100);
   });
 });
 
 describe('self-review diff reads', () => {
   const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
-  function plantedRepo() {
+  const commit = (dir, msg) => git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', msg]);
+  // The builder plants its drivers AFTER the fixture's own commits, so only the code under test can trigger them.
+  function plantedRepo({ filter = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'self-review-diff-'));
     git(dir, ['init', '-q']);
     git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'base']);
     const start = git(dir, ['rev-parse', 'HEAD']).trim();
+    writeFileSync(join(dir, '.gitattributes'), `*.txt diff=evil${filter ? ' filter=evil' : ''}\n`);
+    writeFileSync(join(dir, 'a.txt'), 'change\n');
+    git(dir, ['add', '.']);
+    commit(dir, 'change');
+    writeFileSync(join(dir, 'a.txt'), 'worktree change\n');
     const ran = join(dir, 'planted-ran');
-    const planted = `${process.execPath} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${ran}`;
+    const planted = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${JSON.stringify(ran)}`;
     git(dir, ['config', 'diff.external', planted]);
     git(dir, ['config', 'diff.evil.textconv', planted]);
     git(dir, ['config', 'core.fsmonitor', planted]);
-    writeFileSync(join(dir, '.gitattributes'), '*.txt diff=evil\n');
-    writeFileSync(join(dir, 'a.txt'), 'change\n');
-    git(dir, ['add', '.']);
-    git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'change']);
-    writeFileSync(join(dir, 'a.txt'), 'worktree change\n');
+    if (filter) git(dir, ['config', 'filter.evil.clean', planted]);
     return { dir, start, ran };
   }
 
   it('never runs a builder-planted external diff, textconv or fsmonitor command', () => {
     const { dir, start, ran } = plantedRepo();
     try {
-      const diff = git(dir, [...SELF_REVIEW_DIFF_ARGS, `${start}...HEAD`, '--']);
+      const diff = execFileSync('git', selfReviewDiffArgs(`${start}...HEAD`), { cwd: dir, encoding: 'utf8', env: laneGitHardeningEnv() });
       expect(diff).toContain('+change');
       const captured = captureDiff({ dir, startSha: start });
       expect(captured.diff).toContain('+worktree change');
       expect(captured.diffStat).toContain('a.txt');
+      expect(existsSync(ran)).toBe(false);
+      git(dir, ['diff', `${start}...HEAD`]); // positive control: an unhardened read does run it
+      expect(existsSync(ran)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses a checkout that defines a filter driver before any worktree read runs it', () => {
+    const { dir, start, ran } = plantedRepo({ filter: true });
+    try {
+      expect(() => captureDiff({ dir, startSha: start })).toThrow('filter driver');
       expect(existsSync(ran)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

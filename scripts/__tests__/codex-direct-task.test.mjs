@@ -628,7 +628,8 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       return '';
     };
     const r = captureDiff({ dir: '/d', startSha: 'abc123', execFn });
-    expect(calls).toContain('-C /d add --intent-to-add -- new-file.txt');
+    // Every read carries the shared lane pins between `-C <dir>` and the subcommand.
+    expect(calls.some((c) => /^-C \/d .*core\.fsmonitor=false .* add --intent-to-add -- new-file\.txt$/.test(c))).toBe(true);
     expect(r.hasChanges).toBe(true);
     expect(r.diffStat).toContain('2 files changed');
   });

@@ -95,8 +95,9 @@
  */
 import { resolveBuildPolicy, appendBuildRequirements } from '../lib/build-policy.mjs';
 import {
-  runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, SELF_REVIEW_DIFF_ARGS, SELF_REVIEW_MAX_DIFF_BYTES,
+  runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, selfReviewDiffArgs, SELF_REVIEW_MAX_DIFF_BYTES,
 } from '../lib/build-self-review.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
@@ -606,8 +607,9 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     const selfReview = await runBuildSelfReview({
       policy: buildPolicy, dir: gate.lanePath,
       // Hardened and bounded: the builder controls this lane's git config, and an overflow is the size note.
-      readDiff: () => boundedSelfReviewDiff(() => run('git', [...SELF_REVIEW_DIFF_ARGS, 'origin/main...HEAD', '--'],
-        { cwd: gate.lanePath, maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
+      // Commit against commit, so no worktree clean filter runs.
+      readDiff: () => boundedSelfReviewDiff(() => run('git', selfReviewDiffArgs('origin/main...HEAD'),
+        { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
       review: reviewBuild,
       fix: async prompt => {
         const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
