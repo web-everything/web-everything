@@ -6274,3 +6274,33 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 
 **Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Stacking a PR on another PR is a configurable cascade policy; a fixed safety floor protects guard and merge-path code {#stacked-pr-policy-configurable}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, both forks at the card's default
+(`#xv85eqi`).** The operator's words: *"Ok, make sure the stacking is a configurable policy"*. Composes with
+[review-stringency-classified-outcomes](#review-stringency-classified-outcomes) (the guard and low-risk classes are read
+from its class list) and the drain's existing proof-of-land gate (base lands first).
+
+**The rule:**
+1. **The whole policy is a cascade policy, each value with its source logged.** That covers every matrix cell (base
+   state by child class), the safety floor, the urgent classes, `stack.smallChildMaxLines` (50),
+   `stack.lowRiskClasses` (cards, settings, docs), `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack, then
+   re-review only the child's delta) and the closed or rejected base handling. Home: `we:scripts/settings/stack.json`.
+2. **Default matrix.** Small and low-risk children stack on any base state. Normal children stack on an approved-waiting
+   base, on an approved-held base only when urgent, on an in-review or fixing base only in an operator-flagged
+   emergency. Guard or merge-path children stack on an approved-waiting base, on an approved-held base only when
+   urgent, and never on an in-review or fixing base.
+3. **Safety floor (Fork 1 = a).** Guard or merge-path code never stacks on an in-review or fixing base. The class is read
+   from the touched paths, not from the card label. "Emergency" is operator-flagged only. The floor can be changed only
+   by an operator-sourced setting, never by an agent. Unknown state, unknown class or a missing proof gate means no
+   stacking (fail closed).
+4. **Base first.** The drain lands the base before the child. Review judges the child's own delta. When the base head
+   moves, the child is restacked and only its delta is re-reviewed; the hold marker moves only when the delta
+   fingerprint is unchanged and the base's new commits touch none of the child's files.
+5. **Closed or rejected base (Fork 2 = a).** A low-risk child rebases onto main by itself only when the rebase is clean
+   and its delta fingerprint is unchanged. Every other child goes to the operator.
+6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
+   only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
+
+**Lineage:** `#xv85eqi` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).

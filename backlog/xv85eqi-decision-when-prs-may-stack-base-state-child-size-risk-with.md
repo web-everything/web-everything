@@ -3,9 +3,12 @@ bornAs: xv85eqi
 kind: decision
 size: 3
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:backlog/"]
 dateOpened: "2026-10-17"
+dateStarted: "2026-10-17"
+dateResolved: "2026-10-17"
+codifiedIn: "docs/agent/platform-decisions.md#stacked-pr-policy-configurable"
 preparedDate: "2026-10-17"
 preparedAgainstSha: "2fd013ac53894e9f955069bce0d82a08f6e0ac8d"
 relatedTo: ["2387", "2393", "2394", "4631", "xugqjw1", "xrlwbd7"]
@@ -13,6 +16,18 @@ tags: [stacked-prs, drain, free-scope, decision-prep]
 ---
 
 # Decision: when PRs may stack — base state × child size/risk, with settings
+
+## Ruling
+
+**Ruled 2026-10-17 by the operator (Nicolas Gilbert), in conversation.** Verbatim: *"Ok, make sure the stacking is a configurable policy"*. The rule is codified at
+[we:docs/agent/platform-decisions.md#stacked-pr-policy-configurable](../docs/agent/platform-decisions.md#stacked-pr-policy-configurable).
+The prepared text below is kept as the lineage; where it differs from this section, this section wins.
+
+- **Fork 1 = (a).** Guard or merge-path code never stacks on an in-review or fixing base; the matrix ships as default settings values.
+- **Fork 2 = (a).** A low-risk child rebases onto main only on a clean rebase with an unchanged delta fingerprint; all else goes to the operator.
+- **Amendment.** The WHOLE policy is a configurable cascade policy, each value with its source logged: every matrix cell (base state x child class), the safety floor (default: guard or merge-path never stacks on an in-review or fixing base; changeable only by an operator-sourced setting, never by an agent), the urgent classes, `stack.smallChildMaxLines` (50), `stack.lowRiskClasses`, `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack + delta re-review) and the closed or rejected base handling.
+
+**Build slices:** see the children of this card (`parent` edges): policy settings and evaluator; free-scope `--stack-on`; drain ordered landing, restack and delta re-review; base-closed handling.
 
 Operator ask, 2026-10-17: "We'll need to normalise when we can use stacked pr, both in circumstance and timing, like a pr waiting for drain could probably be stacked on with little cost or risk, and in some cases it might be cheaper to use stacked pr for urgent things" … "Or when little change or risk maybe". Operator go ("Yes") to file and prepare one card.
 
