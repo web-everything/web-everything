@@ -15,7 +15,8 @@ PR 5485 turned on the full gate and the capped self-review by default in codex-d
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/codex-caller-policy.test.mjs` fails before this item lands (no such test) and passes after: it lists every `codexDirectTask` caller and `we:scripts/codex-direct-task.mjs` CLI invocation and asserts each passes an explicit gate and an explicit self-review choice.
+- [A2] Where a caller keeps self-review on, its remaining notes reach the PR or report it publishes (`renderSelfReviewNotes`); a reviewer outage stops that caller with a named outcome, never a silent pass.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
