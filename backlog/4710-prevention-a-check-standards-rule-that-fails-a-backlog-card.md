@@ -26,3 +26,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#5513 (finding 1: `we:backlog/xfrggva-red-team-setting-redteam-holdcapminutes-45-enforced-red-team.md:14` — Add a check:standards rule that refuses a card moving from filed to queued while any [A1] or edge-case line still contains 'TODO:'. Add a lint that requires a card with 'Test:' prose to carry a Test plan entry naming the file and case.) · key `approval-prevention-key:web-everything/web-everything#5513@8acbabd07164bef09f8f1f3ca93ab1f485547673`
