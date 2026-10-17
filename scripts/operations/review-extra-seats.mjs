@@ -2,6 +2,7 @@
 import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
+import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
@@ -640,7 +641,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
       });
       await Promise.all(calls);
     } finally {
-      if (scratch) { try { io.removeScratch(scratch); } catch { /* a stray temp dir is harmless */ } }
+      if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
     return { status: 'ran', seats, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage, rowsWritten };
   } catch (e) {
@@ -758,12 +759,98 @@ export function withLedgerLock(path, fn, { timeoutMs = LEDGER_LOCK_TIMEOUT_MS, s
 /** @param {{env?:object, root?:string, storePath?:string, lockTimeoutMs?:number}} [o] — `storePath` pins the store (tests); default is the shared one. */
 /** Card xbizuci — the pids of the seat CLIs this process has running (each the leader of its own process group). */
 export const ACTIVE_SEAT_PIDS = new Set();
+const ACTIVE_SEAT_PROCESSES = new Map();
+let stoppingSeats = false;
+let terminatingSeats = false;
+let stoppingAllSeats;
 
-/** Card xbizuci — kill every running seat's process group. Used when a speculative red team is called off. */
-export function killActiveSeats(signal = 'SIGKILL') {
-  for (const pid of ACTIVE_SEAT_PIDS) {
-    try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+function shutdownActiveSeats() {
+  terminatingSeats = true;
+  return killActiveSeats();
+}
+
+function trackSeat(child, signal = 'SIGTERM') {
+  if (!child.pid) return child;
+  ACTIVE_SEAT_PIDS.add(child.pid);
+  const closed = new Promise(resolveClosed => child.once('close', resolveClosed));
+  ACTIVE_SEAT_PROCESSES.set(child.pid, { closed, signal });
+  child.once('close', () => {
+    ACTIVE_SEAT_PIDS.delete(child.pid);
+    ACTIVE_SEAT_PROCESSES.delete(child.pid);
+  });
+  return child;
+}
+
+const signalSeat = (pid, signal) => {
+  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+};
+
+// Direct-task models start their own detached groups. Discover them while the
+// wrapper is still alive, before SIGKILL can orphan them and lose that ancestry.
+function seatDescendants(pid) {
+  const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error('cannot observe review seat descendants before SIGKILL');
+  const rows = String(r.stdout).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
+  if (!rows.some(([child]) => child === pid)) throw new Error('review seat absent from process snapshot');
+  const children = new Map();
+  for (const [child, parent] of rows) {
+    if (!Number.isSafeInteger(child) || child <= 0 || !Number.isSafeInteger(parent)) continue;
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(child);
   }
+  const found = new Set([pid]);
+  for (const parent of found) for (const child of children.get(parent) ?? []) found.add(child);
+  return [...found].slice(1).reverse();
+}
+
+function stopSeat(pid, requestedSignal = 'SIGTERM') {
+  const seat = ACTIVE_SEAT_PROCESSES.get(pid);
+  if (seat?.stopping) return seat.stopping;
+  // Direct-task wrappers own a second detached model group. Let their TERM handler
+  // kill that group before the wrapper exits. Escalation also kills detached descendants.
+  const signal = seat?.signal ?? requestedSignal;
+  signalSeat(pid, signal);
+  let poll;
+  const closed = seat?.closed ?? new Promise(resolveClosed => {
+    poll = setInterval(() => { if (!ACTIVE_SEAT_PIDS.has(pid)) resolveClosed(); }, 20);
+  });
+  const waitClosed = async ms => {
+    let timer;
+    try {
+      await Promise.race([closed, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('review seat did not close after stop')), ms);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  const stopping = (async () => {
+    try { await waitClosed(10000); }
+    catch {
+      let observationError;
+      try { for (const child of seatDescendants(pid)) signalSeat(child, 'SIGKILL'); }
+      catch (error) {
+        // Still stop the wrapper, but unknown detached children require retained scratch.
+        observationError = error;
+        retainReviewScratch();
+      }
+      signalSeat(pid, 'SIGKILL');
+      await waitClosed(1000);
+      if (observationError) throw observationError;
+    }
+  })().finally(() => { clearInterval(poll); });
+  if (seat) seat.stopping = stopping;
+  return stopping;
+}
+
+/** Stop every seat and wait for close before scratch cleanup, including speculative cancellation. */
+export function killActiveSeats(signal = 'SIGTERM') {
+  if (stoppingAllSeats) return stoppingAllSeats;
+  if (!ACTIVE_SEAT_PIDS.size) return;
+  stoppingSeats = true;
+  stoppingAllSeats = Promise.allSettled([...ACTIVE_SEAT_PIDS].map(pid => stopSeat(pid, signal))).then(results => {
+    const failed = results.find(r => r.status === 'rejected');
+    if (failed) { retainReviewScratch(); throw failed.reason; }
+  }).finally(() => { stoppingSeats = false; stoppingAllSeats = undefined; });
+  return stoppingAllSeats;
 }
 
 export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storePath, lockTimeoutMs = LEDGER_LOCK_TIMEOUT_MS } = {}) {
@@ -807,32 +894,43 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     // fetched: the lane's HEAD (or any ref) may already be another PR's by now.
     makeScratch: ({ lanePath, rev }) => {
       if (!isPinnedRev(rev)) throw new Error(`makeScratch: refusing an unpinned rev ${JSON.stringify(rev ?? null)} — only a commit id is safe on a released lane`);
-      const dir = mkdtempSync(join(tmpdir(), 'we-review-seat-'));
+      const dir = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.seat));
       const git = (args) => {
         const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000 });
         if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
       };
-      git(['init', '--quiet', dir]);
-      git(['-C', dir, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, rev]);
-      git(['-C', dir, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
-      return dir;
+      try {
+        ownReviewScratch(dir, shutdownActiveSeats);
+        git(['init', '--quiet', dir]);
+        git(['-C', dir, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, rev]);
+        git(['-C', dir, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
+        return dir;
+      } catch (error) {
+        removeReviewScratch(dir);
+        throw error;
+      }
     },
-    removeScratch: (dir) => rmSync(dir, { recursive: true, force: true }),
+    removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
+      if (stoppingSeats || terminatingSeats) {
+        resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
+        return;
+      }
       const argv = seatCallArgv({ provider, taskFile, dir, model, effort, timeoutMs, root });
       let out = '';
       let err = '';
       let timedOut = false;
-      const child = spawn(process.execPath, argv, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+      const child = trackSeat(spawn(process.execPath, argv, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }));
       // Card xbizuci — a seat runs in its OWN process group (detached), so a speculative red team that is called off
       // must kill it explicitly: killing the parent's group would leave the seat CLI running and spending.
-      if (child.pid) ACTIVE_SEAT_PIDS.add(child.pid);
-      child.on('exit', () => { ACTIVE_SEAT_PIDS.delete(child.pid); });
       // Outer wall above the script's own: gemini may take two half-budget attempts; codex one full one.
       const wall = setTimeout(() => {
         timedOut = true;
-        try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+        if (child.pid) stopSeat(child.pid).catch(error => {
+          retainReviewScratch(dir);
+          resolvePromise({ report: null, error: error.message, stderr: err.slice(-4000), timedOut });
+        });
       }, timeoutMs + 90_000);
       child.stdout.on('data', (d) => { out += d; });
       child.stderr.on('data', (d) => { err += d; if (err.length > 200_000) err = err.slice(-100_000); });
@@ -1421,7 +1519,7 @@ export async function speculateRedTeam({
       evidence = run?.report ?? {};
       quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
     } finally {
-      if (scratch) { try { io.removeScratch(scratch); } catch { /* harmless */ } }
+      if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
     const ran = call?.status === 'ok' && parsed?.[RED_TEAM_SEAT.key]?.ok === true;
     const rawFindings = ran ? (parsed[RED_TEAM_SEAT.key]?.findings ?? []) : [];
@@ -1615,7 +1713,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       const configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
       // Repo tools require Claude's enforceable allow-list. Other providers cannot honor it.
       if (readsRepo && configured && configured.provider !== 'claude') throw new Error('repo re-check requires the Claude read-only tool allow-list');
-      const spawn = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
+      const spawnJudge = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
       let scratch = null;
       let parent = null;
       try {
@@ -1623,16 +1721,24 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
         if (readsRepo) {
           scratch = base.makeScratch({ lanePath, rev });
           // Keep the independent pinned clone under the lane shape assertLaneCwd enforces.
-          parent = mkdtempSync(join(tmpdir(), 'we-red-team-recheck-'));
+          parent = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.recheck));
+          ownReviewScratch(parent, shutdownActiveSeats);
           cwd = join(parent, '.lanes', 'red-team-recheck', 'lane-1');
           mkdirSync(dirname(cwd), { recursive: true });
           renameSync(scratch, cwd);
+          removeReviewScratch(scratch); // release the old, now empty path from ownership
           scratch = null;
         }
-        const out = await spawn({
+        const out = await spawnJudge({
           mandate, input, shape, model: configured?.model ?? RECHECK_MODEL, effort: configured?.effort ?? resolveOperationEffort("review-recheck", "claude"), budget: RECHECK_BUDGET_USD,
           ...(readsRepo ? { cwd, allowedTools: ['Read', 'Glob', 'Grep'] } : {}),
           runId: `red-team-recheck-${pr}-${randomUUID()}`, lens: 'red-team-recheck', env, timeoutMs: 10 * 60 * 1000,
+          // Recheck providers spawn the model CLI itself, so it can be killed
+          // directly. A PID-targeted launcher signal does not reach its group.
+          spawnFn: (cli, argv, options) => {
+            if (stoppingSeats || terminatingSeats) throw new Error('review seats are stopping');
+            return trackSeat(spawn(cli, argv, { ...options, detached: true }), 'SIGKILL');
+          },
         });
         // Validate while the pinned checkout still exists; callers retain only safe relative paths.
         const value = out.value;
@@ -1641,7 +1747,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           ? { ...c, filesRead: publishableFilesRead(c.filesRead, readsRepo ? cwd : null) } : c) };
       } finally {
         if (scratch) base.removeScratch(scratch);
-        if (parent) rmSync(parent, { recursive: true, force: true });
+        if (parent) removeReviewScratch(parent);
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
@@ -1702,7 +1808,6 @@ if (IS_CLI) {
     // accounted for. SIGTERM (the job calling it off) kills the running seat CLI's own process group first.
     const outPath = flag('out');
     const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(value)}\n`); renameSync(tmp, path); };
-    process.on('SIGTERM', () => { killActiveSeats('SIGKILL'); process.exit(143); });
     const waitMs = Number(flag('wait-ms')) > 0 ? Number(flag('wait-ms')) : 45 * 60 * 1000;
     const startedAt = Date.now();
     const readSunk = () => { try { return existsSync(flag('read-sink')) ? JSON.parse(readFileSync(flag('read-sink'), 'utf8')) : null; } catch { return null; } };

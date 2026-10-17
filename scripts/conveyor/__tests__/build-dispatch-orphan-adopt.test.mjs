@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
+import { recordBuildFailure, listBuildBackoffs, dispatchAttemptKey } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
   adoptOrphanedBuildClaims, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
@@ -1013,6 +1014,72 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
     expect(settleRow).not.toHaveBeenCalled();
     expect(releaseLaneLease).not.toHaveBeenCalled();
   });
+  it('charges a dead claim once even when its release keeps failing (PR #5453)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orphan-charge-once-'));
+    const path = join(dir, 'failures.json');
+    const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+    try {
+      // Keep every live seam explicit here: the hermetic scan cannot follow the fixture helpers.
+      const pass = (claimedAt) => adoptOrphanedBuildClaims(dead('4413', {
+        listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413', claimedAt } }],
+        readDelivery: () => null,
+        sessionLivenessFor: () => null,
+        releaseLaneLease: () => {},
+        spawnResume: () => { throw new Error('no resume'); },
+        recordFailure: (o) => recordBuildFailure(o, { path, now: 0, settings }),
+        releaseClaim: () => { throw new Error('lock store unavailable'); },
+      }));
+      for (let i = 0; i < 5; i++) expect(await pass('2026-10-16T00:00:00.000Z')).toEqual([expect.objectContaining({ action: 'error' })]);
+      expect(listBuildBackoffs({ path, now: 0 })).toEqual([expect.objectContaining({ num: '4413', attempts: 1, reason: 'dispatch-backoff' })]);
+      // A NEW claim of the same card that dies again is a new attempt.
+      await pass('2026-10-16T01:00:00.000Z');
+      expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ attempts: 2 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('keys a dead dispatch on its claim and its row start time, the key the fail-group pass shares (PR #5453)', async () => {
+    const failures = [];
+    const row = buildRow({ num: '7101', handle: 'pid:98761' });
+    row.entry.startedAt = '2099-01-01T00:00:00Z';
+    await adoptFixtureClaims(dead('7101', { findRow: () => row, recordFailure: (o) => failures.push(o),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '7101', claimedAt: '2098-12-31T23:59:59Z' } }] }));
+    expect(failures).toEqual([expect.objectContaining({ num: '7101',
+      attemptKey: ['orphan:2098-12-31T23:59:59Z', dispatchAttemptKey('2099-01-01T00:00:00Z')] })]);
+    expect(failures[0].attemptKey[1]).toBe('dispatch:2099-01-01T00:00:00Z');
+  });
+  it.each([['missing, then readable', [false, true, false]], ['readable, then missing', [true, false, true]]])(
+    'an unreadable run row never charges the same dead claim as a new attempt (row %s, PR #5453 operator send-back)', async (_label, readable) => {
+      const dir = mkdtempSync(join(tmpdir(), 'orphan-row-flicker-'));
+      const path = join(dir, 'failures.json');
+      const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 2 };
+      try {
+        const row = buildRow({ num: '4413', handle: 'pid:98761' });
+        row.entry.startedAt = '2026-10-16T00:00:01.000Z';
+        // Keep every live seam explicit here: the hermetic scan cannot follow the fixture helpers.
+        const pass = (rowReadable) => adoptOrphanedBuildClaims(dead('4413', {
+          listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413', claimedAt: '2026-10-16T00:00:00.000Z' } }],
+          findRow: () => (rowReadable ? row : null),
+          readDelivery: () => null,
+          sessionLivenessFor: () => null,
+          releaseLaneLease: () => {},
+          spawnResume: () => { throw new Error('no resume'); },
+          recordFailure: (o) => recordBuildFailure(o, { path, now: 0, settings }),
+          releaseClaim: () => { throw new Error('lock store unavailable'); },
+        }));
+        for (const r of readable) await pass(r);
+        expect(listBuildBackoffs({ path, now: 0 })).toEqual([expect.objectContaining({ num: '4413', attempts: 1, reason: 'dispatch-backoff' })]);
+        // The fail-group pass charging the same dispatch by its row start time is that same attempt too.
+        expect(recordBuildFailure({ num: '4413', reason: 'group-member-dropped', attemptKey: dispatchAttemptKey(row.entry.startedAt) },
+          { path, now: 0, settings })).toMatchObject({ attempts: 1, exhausted: false });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it('keys a dead group lead on its surviving member claims too (PR #5453)', async () => {
+    const failures = [];
+    await adoptFixtureClaims(dead('7101', { findRow: () => null, recordFailure: (o) => failures.push(o),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '7101', claimedAt: 'c1' } },
+        { pid: 98761, meta: { kind: 'build', num: '7102', groupLead: '7101', claimedAt: 'c2' } },
+        { pid: 98761, meta: { kind: 'build', num: '7201', groupLead: '7200', claimedAt: 'c3' } }] }));
+    expect(failures.filter(f => f.num === '7101')).toEqual([expect.objectContaining({ attemptKey: ['orphan:c1', 'member:7102:c2'] })]);
+  });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
     await adoptFixtureClaims(dead('4388', {
@@ -1023,19 +1090,31 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
   });
   it.each(['pr-open', 'pr-merged', 'card-resolved'])('clears the card\'s failure history on observed delivery (%s), before releasing the claim', async (outcome) => {
     const order = [];
-    const result = await adoptFixtureClaims(dead('4413', {
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
       readDelivery: () => ({ outcome, reason: outcome }), settleDelivered: () => {},
       clearFailure: (o) => order.push(['clear', o.num]), releaseClaim: (o) => order.push(['release', o.num]),
-    }));
+    });
     expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
     expect(order).toEqual([['clear', '4413'], ['release', '4413']]);
   });
   it('keeps #4413 claimed when clearing its failure history fails, so a later pass retries the clear', async () => {
     const releaseClaim = vi.fn();
-    const result = await adoptFixtureClaims(dead('4413', {
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
       readDelivery: () => ({ outcome: 'pr-open', reason: 'PR #9001 is open' }), settleDelivered: () => {},
       clearFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim,
-    }));
+    });
     expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
     expect(releaseClaim).not.toHaveBeenCalled();
   });
