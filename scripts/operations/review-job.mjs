@@ -282,12 +282,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
-    carryAcrossRebaseSetting: () => {
-      const timing = resolveTimingPolicy({ env });
-      const carry = resolveCarryAcrossRebase({ env, readFile });
-      if (carry.value === 'off') return carry;
-      return { value: timing.review.skipDrainMechanical ? 'on' : 'off', source: timing.sources.review.skipDrainMechanical };
-    },
+    // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
+    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });

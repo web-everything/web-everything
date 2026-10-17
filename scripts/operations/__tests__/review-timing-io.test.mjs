@@ -59,12 +59,13 @@ it('honors the documented rebase carry setting independently of mechanical skipp
   expect(io.carryAcrossRebaseSetting().value).toBe('off');
 });
 it.each([
-  [{ WE_REVIEW_CARRY_ACROSS_REBASE: 'off' }, 'on'],
-  [{ WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'false' }, 'on'],
-  [{ WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' }, 'off'],
-])('keeps either rebase carry kill switch effective (%j, legacy=%s)', (env, legacy) => {
-  const io = createReviewJobIo({ env, readFile: () => JSON.stringify({ carryAcrossRebase: legacy }) });
-  expect(io.carryAcrossRebaseSetting().value).toBe('off');
+  [{ WE_REVIEW_CARRY_ACROSS_REBASE: 'off' }, 'on', 'off', 'env'],
+  [{ WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' }, 'off', 'off', 'settings'],
+  // review.skipDrainMechanical never governs the carry: its own resolver is the only source.
+  [{ WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'false' }, 'on', 'on', 'settings'],
+])('the rebase carry setting comes only from its own resolver (%j, file=%s)', (env, file, value, source) => {
+  const io = createReviewJobIo({ env, readFile: () => JSON.stringify({ carryAcrossRebase: file }) });
+  expect(io.carryAcrossRebaseSetting()).toMatchObject({ value, source });
 });
 it('fails open on a thrown CI read but refuses an unreadable head or a head change during that read', async () => {
   for (const mode of ['ci-fault', 'head-fault', 'head-moved']) {

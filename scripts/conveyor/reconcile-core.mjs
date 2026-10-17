@@ -112,7 +112,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
-import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf } from './mechanical-round-cap.mjs';
+import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
@@ -1338,16 +1338,32 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
   return false;
 }
 
+/**
+ * The advisory outcome the note's PRODUCER wrote, or null. we:scripts/operations/review-pr.mjs#renderAdvisoryNote puts
+ * it at a fixed place: the outcome line, a blank line, `---`, a blank line, then the basis line at the validated footer
+ * slot (we:scripts/conveyor/mechanical-round-cap.mjs#basisLineOf). Juror text sits above that block, so a juror line
+ * anywhere else — quoted, fenced, or a bare forged `**Advisory outcome:**` line — is never this one. Pure.
+ */
+function advisoryOutcomeAtSlot(c) {
+  const basis = basisLineOf(c);
+  if (!basis) return null;
+  const lines = String(c?.body ?? '').split('\n').map(l => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  const at = lines.lastIndexOf(basis.line);
+  if (at < 4 || lines[at - 1] !== '' || lines[at - 2] !== '---' || lines[at - 3] !== '') return null;
+  return /^\*\*Advisory outcome:\*\* `([a-z-]+)`/.exec(lines[at - 4])?.[1] ?? null;
+}
+
 /** Head-local inputs for the joined-fix policy; prior and superseded verdicts cannot reopen findings. */
 const isReviewerBinding = b => /^review-/.test(b.agent?.name ?? b.agent?.sessionSlug ?? '');
 function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispatched = false } = {}) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const latest = comments.filter(c => isTrustedMarkerAuthor(c) && verdictJudged(c, pr.headRefOid)).at(-1);
-  // Structure only: a bounce verdict, or an advisory note whose own unquoted outcome line says `changes`. Text quoted
-  // inside another verdict (`> **Advisory outcome:** \`changes\``) is never a finding.
+  // Structure only: a bounce verdict, or an advisory note whose PRODUCER outcome line says `changes` AND whose structured
+  // outcome labelled the PR `advisory:changes` (a note with no outcome line applies no label, so a juror line in that
+  // position cannot invent a finding). Text quoted inside another verdict or written by a juror is never read.
   const kind = latest ? verdictKind(latest) : null;
-  const findings = kind === 'changes' || (kind === 'advisory' && latestAdvisory([latest])?.outcome === ADVISORY_OUTCOMES.CHANGES)
-    ? [latest] : [];
+  const findings = kind === 'changes' || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES
+    && labelNames(pr?.labels).includes(ADVISORY_LABELS.CHANGES)) ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
   return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,

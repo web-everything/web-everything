@@ -347,7 +347,7 @@ export function sweepReviewHoldLabels({
   // card xu7kxtt (#5472) — an operator clearance a mechanical pass re-held after the head moved (merge queue / rebase)
   // is carried by the sanctioned re-stamp when the net diff is byte-identical. Same listing, own entry shape (`carry`).
   try {
-    for (const r of sweepAcceptCarry({ prs, repo, dryRun, ...(acceptCarry ? { runRestamp: acceptCarry } : {}) })) {
+    for (const r of sweepAcceptCarry({ prs, repo, dryRun, setting: carrySetting.value, ...(acceptCarry ? { runRestamp: acceptCarry } : {}) })) {
       results.push({ num: r.num, carry: r.carry, detail: r.detail });
     }
   } catch (e) {

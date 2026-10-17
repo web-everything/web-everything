@@ -419,18 +419,17 @@ prior head's review (a post-accept red-team bounce carries no reviewed-head
 marker, so a delta would drop its findings), and a thread at the 100-comment read
 cap, where that verdict may be cut off. Jurors judge the delta and its prior findings;
 the full contribution basis remains pinned for acceptance and roster checks.
-`review.skipDrainMechanical` (default true) enables existing proven numbering and
-identical-contribution carry writers. Commit subjects alone never prove a carry:
+`review.skipDrainMechanical` (default true) lets a re-review skip a proven
+drain-mechanical commit; it never turns a carry writer on or off. Commit subjects alone never prove a carry:
 JIT numbering needs the existing exact rewrite proof, a drain rebase needs the
 same contribution, and an empty recovery commit preserves that contribution.
 A refused carry falls back to review, preserving existing human/referral holds.
-The independent carry controls still apply: `WE_ACCEPT_CARRY_FORWARD` and
-`scripts/settings/accept-carry-forward.json` govern accept/numbering carry;
-`WE_REVIEW_CARRY_ACROSS_REBASE` and `scripts/settings/review.json`'s
-`carryAcrossRebase` govern rebase carry. Disabling either writer's own control
-prevents it from carrying even when `skipDrainMechanical` is true. The review-hold
-sweep's numbering carry reads only `resolveAcceptCarryForward()` and logs its value
-and source; `skipDrainMechanical` does not govern it.
+Each carry has exactly one control, read by its own resolver and logged with its
+source: `WE_ACCEPT_CARRY_FORWARD` / `scripts/settings/accept-carry-forward.json`
+(`resolveAcceptCarryForward()`) for accept and numbering carry, including the
+review-hold sweep; `WE_REVIEW_CARRY_ACROSS_REBASE` / `scripts/settings/review.json`'s
+`carryAcrossRebase` (`resolveCarryAcrossRebase()`) for rebase carry.
+`skipDrainMechanical` governs neither.
 
 `fix.joinCiAndReview` defaults true. When CI failures and head-local review
 findings are both ready, one existing fix worker gets both inputs. When the
