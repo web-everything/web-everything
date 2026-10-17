@@ -1144,6 +1144,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   // callers only ask "where does one command end"), so it rides as an extra field rather than a second parser.
   // `||` (logical or, not a pipe) is excluded: its second `|` is what the very next char test below reads.
   const pipedFrom = [];
+  const separators = [];         // `separators[i]` — the operator text that ended `segs[i]` ('' when none)
   let pendingPiped = false;      // segs[0] (the first segment) has no predecessor
   let cur = '';
   let unterminated = false;
@@ -1152,7 +1153,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   let inComment = false;
   // A comment switches quoting off until END OF LINE — a separator does NOT end it (bash agrees: `# a; b`
   // is all comment). Only a newline clears it.
-  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); cur = ''; atWordStart = true; };
+  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); separators.push(''); cur = ''; atWordStart = true; };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // Inside a `#` comment ONLY quoting is switched off; the comment TEXT and every separator in it are
@@ -1189,7 +1190,9 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       // the `cut()` that finalizes THIS next segment.
       pendingPiped = ch === '|' && s[i + 1] !== '|';
       if (ch === '\n') inComment = false;
+      const start = i;
       while (i + 1 < s.length && /[;&|\n]/.test(s[i + 1])) { if (s[i + 1] === '\n') inComment = false; i += 1; }
+      separators[separators.length - 1] = s.slice(start, i + 1);
       continue;
     }
     cur += ch;
@@ -1197,7 +1200,8 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   }
   segs.push(cur);
   pipedFrom.push(pendingPiped);
-  return { segments: segs, unterminated, continued, pipedFrom };
+  separators.push('');
+  return { segments: segs, unterminated, continued, pipedFrom, separators };
 }
 
 /** The segments-only view of `parseSegments` (the raw text of each `&&`/`||`/`;`/`&`/`|`/newline-separated
@@ -2511,45 +2515,56 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // bash splits words on space, tab and newline only; trim() and \s also drop CR, NBSP and other Unicode
   // spaces, which bash keeps inside the word (an NBSP before `cd` makes it no cd, `D=~/x\r` keeps the CR).
   const oddSpace = (s) => /[^\S \t\n]/.test(s);
-  // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable).
-  const initialHome = typeof home === 'string' && home.startsWith('/') ? home : null;
-  const homeAfter = (stmt, h) => {
+  // A home-derived value is trusted only from a statement that surely runs in THIS shell: nothing but `;` /
+  // newline before it, and no pipe or `&` after it (`a && D=~/x`, `D=~/x | true`, `HOME=/a & …` may not).
+  const seps = parsed.separators;
+  const plain = (at) => (at === 0 || /^[;\n]+$/.test(seps[at - 1])) && /^(?:[;\n]*|&&\n*|\|\|\n*)$/.test(seps[at]);
+  // A literal `HOME=…` statement sets the home later spellings expand against (unknown when unexpandable,
+  // conditional, followed by a command word — `HOME=/a true` binds it for `true` only — or glob-shaped).
+  const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
+  const initialHome = usableHome(home);
+  const homeAfter = (stmt, h, at) => {
     const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
     if (!assignment) return h;
-    const value = oddSpace(stmt) ? null : expandCdTarget(assignment[1].trim(), h);
-    return value?.startsWith('/') ? value : null;
+    const val = assignment[1].trim();
+    if (oddSpace(stmt) || /[ \t]/.test(val) || !plain(at)) return null;
+    return usableHome(expandCdTarget(val, h));
   };
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
-  const lastAt = Object.create(null);                         // statement index of each name's last assignment
-  const homeVars = new Set();                                 // names whose value came from a home expansion
+  // #5957 — every literal-shaped assignment in order, so a cd of a name with a home-derived assignment reads
+  // the value it had THEN (other names keep the base's last-value reading)
+  const history = Object.create(null);
+  const homeNames = new Set();
   let assignHome = initialHome;
   parsed.segments.forEach((stmt, at) => {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m) {
       let val = m[2].trim();
-      lastAt[m[1]] = at;
-      homeVars.delete(m[1]);
+      let value;
       if (val.startsWith('~') || /\$(?:HOME(?!\w)|\{HOME\})/.test(val)) {
-        // #5957 — bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value
-        // (`D=~/clone`, `D="$HOME/clone"`), against the home known at that statement. Anything it cannot
-        // expand exactly (`~user`, a `:~`, another variable, whitespace, an unknown home) leaves it unknown.
-        const expanded = oddSpace(stmt) || /\s|:~|[<>]/.test(val) ? null : expandCdTarget(val, assignHome);
-        if (expanded && !/\s/.test(expanded)) { vars[m[1]] = expanded; homeVars.add(m[1]); }
-        else delete vars[m[1]];
+        // bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value (`D=~/clone`,
+        // `D="$HOME/clone"`), against the home known at that statement. Anything it cannot expand exactly
+        // (`~user`, a `:~`, another variable, whitespace, an unknown home, a conditional statement) is unknown.
+        const expanded = oddSpace(stmt) || /\s|:~|[<>]/.test(val) || !plain(at) ? null : expandCdTarget(val, assignHome);
+        value = expanded && !/\s/.test(expanded) ? expanded : undefined;
+        homeNames.add(m[1]);
+        if (value === undefined) delete vars[m[1]];
+        else vars[m[1]] = value;
       } else if (!/[`$(]/.test(val)) {                        // command-subst / nested expansion → skip
         val = val.replace(/^(['"])(.*)\1$/, '$2');            // strip matching surrounding quotes
-        if (!/\s/.test(val)) vars[m[1]] = val;                // single-token literal only
+        if (!/\s/.test(val)) vars[m[1]] = value = val;        // single-token literal only
       }
+      (history[m[1]] ??= []).push({ at, value });
     }
-    assignHome = homeAfter(stmt, assignHome);
+    assignHome = homeAfter(stmt, assignHome, at);
   });
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
   let currentHome = initialHome;
   for (const [at, stmt] of parsed.segments.entries()) {
-    currentHome = homeAfter(stmt, currentHome);
+    currentHome = homeAfter(stmt, currentHome, at);
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
     const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
@@ -2566,15 +2581,16 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       }
     }
     const word = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
-    const homeVar = word.match(/^"?\$\{?([A-Za-z_]\w*)\}?"?$/)?.[1];
-    if (homeVar && homeVars.has(homeVar)) {
-      // a home-expanded value only counts when it was assigned before this cd, in a word bash reads as one
-      if (lastAt[homeVar] > at || !bashCd || oddSpace(bashCd[1].match(/^[^ \t\n]*/)[0])) return reportedCwd;
-    }
     const quoted = /^'[^']*'$|^"[^"]*"$/.test(word);          // one quoted run, nothing glued on
     let target = word.replace(/^(['"])(.*)\1$/, '$2');        // strip surrounding quotes
-    const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-    if (v) target = vars[v[1]] ?? '';
+    // whole target is $VAR / ${VAR} — never inside single quotes, where `$D` is literal text
+    const v = word.startsWith("'") ? null : target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);
+    if (v && homeNames.has(v[1])) {
+      // a home-derived name: the value assigned last BEFORE this cd, in a cd word bash reads as one word
+      const before = history[v[1]].filter((e) => e.at < at).at(-1);
+      if (!before || !bashCd || oddSpace(bashCd[1].match(/^[^ \t\n]*/)[0])) return reportedCwd;
+      target = before.value ?? '';
+    } else if (v) target = vars[v[1]] ?? '';
     // still unexpanded / globby → fail safe; a `[` is a glob only outside quotes
     if (!target || /[`$(*?]/.test(target) || (!quoted && target.includes('['))) return reportedCwd;
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);

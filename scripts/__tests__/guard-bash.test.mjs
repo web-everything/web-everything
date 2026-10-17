@@ -584,7 +584,36 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
   it('a home-expanded variable counts only when assigned before the cd', () => {
     expect(at('cd "$D" && ls; D=~/clone')).toBe(REPORTED);
     expect(at('cd "$D" && ls\nexport D="$HOME/clone"')).toBe(REPORTED);
-    expect(at('D=~/a; cd "$D" && ls; D=~/b')).toBe(REPORTED);
+    expect(at('D=~/a; cd "$D" && ls; D=~/b')).toBe(`${HOME}/a`);
+    // a later literal reassignment does not change the value the cd read
+    expect(at('D="$HOME/a"; cd "$D" && ls; D=/lit')).toBe(`${HOME}/a`);
+    expect(at('D=/lit; cd "$D" && ls; D=~/b')).toBe('/lit');
+  });
+  it('a home-derived assignment that may not run in this shell does not count', () => {
+    for (const cmd of [
+      '[ -d q ] && D="$HOME/x"; cd "$D" && ls',
+      'false || D=~/x; cd "$D" && ls',
+      'D="$HOME/x" | true; cd "$D" && ls',
+      'D="$HOME/x" & cd "$D" && ls',
+      'true | D=~/x; cd "$D" && ls',
+    ]) expect(at(cmd), cmd).toBe(REPORTED);
+    expect(at('D=~/x && cd "$D" && ls')).toBe(`${HOME}/x`);
+  });
+  it('a HOME assignment that is conditional, prefixes a command or is glob-shaped leaves home unknown', () => {
+    for (const cmd of [
+      'HOME=/a true; cd ~ && ls',
+      'HOME=/a true; D="$HOME/x"; cd "$D" && ls',
+      'true || HOME=/a; cd ~ && ls',
+      'HOME=/a | true; cd ~ && ls',
+      "HOME='/p/h[a]'; cd ~ && ls",
+      "HOME='/p/h*'; cd ~/x && ls",
+    ]) expect(at(cmd), cmd).toBe(REPORTED);
+    expect(at('cd ~ && ls', '/p/h[a]')).toBe(REPORTED);
+  });
+  it('a single-quoted variable name is literal text, never a variable lookup', () => {
+    expect(at(`D="$HOME/x"; cd '$D' && ls`)).toBe(REPORTED);
+    expect(at("D=~/x; cd '${D}' && ls")).toBe(REPORTED);
+    expect(at("D=/lit; cd '$D' && ls")).toBe(REPORTED);
   });
   it('a home-expanded variable never loses a character bash keeps (CR, NBSP, other Unicode spaces)', () => {
     for (const ch of [0x0d, 0xa0, 0x2028, 0x3000, 0xfeff].map((c) => String.fromCodePoint(c))) {
