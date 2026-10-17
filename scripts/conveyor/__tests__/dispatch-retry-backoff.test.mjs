@@ -511,6 +511,18 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
       expect(Date.parse(recordBuildFailure({ num: '4648', reason: NOT_CONFIRMED }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(5 * 60_000);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('late-launch attempts never spend the build failure budget (PR #5453)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-split-'));
+    try {
+      const path = join(dir, 'b.json');
+      const rec = (reason) => recordBuildFailure({ num: '4413', reason }, { path, now: 0, settings: S });
+      rec(IN_FLIGHT); rec(IN_FLIGHT);
+      // A confirmed launch retains history; the worker then dies. That is the card's FIRST real failure.
+      expect(rec('launch-died: x')).toMatchObject({ reasonCode: 'launch-died', attempts: 1, exhausted: false });
+      expect(rec(IN_FLIGHT)).toMatchObject({ reasonCode: 'launch-in-flight', attempts: 3, exhausted: true });
+      expect(rec('launch-died: x')).toMatchObject({ attempts: 2, exhausted: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('a healed (unknown -> transient) prepare record with that evidence is released on the quick window (releaseDuePrepareRetries threads the reason code)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'quick-retry-healed-'));
     try {

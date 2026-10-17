@@ -610,7 +610,10 @@ export async function adoptOrphanedBuildClaims({
         // Hold BEFORE release (the wrapper's own `settleTerminal` order): a crash between the two must never
         // leave the item unheld and free to re-dispatch into the same failure.
         if (exhausted) placeHold({ num, reason: `orphan-adopt: ${attempts} resume attempt(s) died without settling` });
-        recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off` });
+        // Keyed by the dead claim: if the release below throws, the next pass re-records the SAME attempt, uncharged.
+        const claimKey = claim.meta?.claimedAt ?? row?.runId;
+        recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off`,
+          ...(claimKey != null ? { attemptKey: `orphan:${claimKey}` } : {}) });
         releaseClaim({ num });
         clearMarker(num);
         settleRow({ runId: row?.runId, key: row?.entry?.key, outcome: exhausted ? 'orphan-resume-exhausted' : 'orphan-released' });

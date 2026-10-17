@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
+import { recordBuildFailure, listBuildBackoffs } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
   adoptOrphanedBuildClaims as adoptOrphanedBuildClaimsReal, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
@@ -1001,6 +1002,23 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
     expect(releaseClaim).not.toHaveBeenCalled();
     expect(settleRow).not.toHaveBeenCalled();
     expect(releaseLaneLease).not.toHaveBeenCalled();
+  });
+  it('charges a dead claim once even when its release keeps failing (PR #5453)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orphan-charge-once-'));
+    const path = join(dir, 'failures.json');
+    const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+    try {
+      const pass = (claimedAt) => adoptOrphanedBuildClaims(dead('4413', {
+        listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413', claimedAt } }],
+        recordFailure: (o) => recordBuildFailure(o, { path, now: 0, settings }),
+        releaseClaim: () => { throw new Error('lock store unavailable'); },
+      }));
+      for (let i = 0; i < 5; i++) expect(await pass('2026-10-16T00:00:00.000Z')).toEqual([expect.objectContaining({ action: 'error' })]);
+      expect(listBuildBackoffs({ path, now: 0 })).toEqual([expect.objectContaining({ num: '4413', attempts: 1, reason: 'dispatch-backoff' })]);
+      // A NEW claim of the same card that dies again is a new attempt.
+      await pass('2026-10-16T01:00:00.000Z');
+      expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ attempts: 2 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
