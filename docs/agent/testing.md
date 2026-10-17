@@ -114,6 +114,32 @@ Codex retry order through `codex.modelByTask` settings; use an explicit route fi
 Claude helper defaults resolve through `claudeHelper` and `WE_CLAUDE_HELPER_MODEL`; explicit
 per-lens design models still override the helper default.
 
+## Rebuild smoke proof reuse
+
+Rebuilds retain up to five complete passing smoke proofs in the existing per-clone rebuild state.
+Keys bind clone kind, Git tree, lockfile, Node version and the running smoke harness hash.
+`rebuildSmoke.reuseEnabled` (true) and `rebuildSmoke.reuseHours` (12) resolve through the
+standard → platform → `scripts/settings/rebuild-smoke.json` → env cascade; env overrides are
+`WE_REBUILD_SMOKE_REUSE_ENABLED=0|1` and `WE_REBUILD_SMOKE_REUSE_HOURS`. Log each leaf's source.
+On reuse, materialize the candidate and skip only table rows declaring `kind: code`; every `env`
+row runs again, including lane lease/release, daemon boot and tree cleanliness. A failed env
+check refuses adoption. Reused passes never refresh the original proof timestamp; missing rows,
+failures, disabled gates, busy-pool skips and other partial runs never establish a proof.
+After a candidate failure, set-aside, plain-main, confirmation and last-good smokes run fresh
+code checks, without cached proofs or unchanged-code skips. Even a fallback already running
+must pass a fresh comparison before the rebuild blames and removes an overlay.
+Probe identical-content commits, changed trees, expiry, disabled reuse, failure and partial
+results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
+Run these suites through the host heavy-admission queue.
+
+## Daemon entry import regression
+
+`daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the
+rebuild boot smoke in a separate eval-mode Node child, without invoking daemon main functions.
+Keep this in the unit tier: shared-process imports can hide ordering-dependent ESM cycles.
+Process liveness helpers shared by drain evidence and review jobs live in the dependency-free
+`scripts/lib/pid-alive.mjs`; importing the job store for a helper pulls in dispatch and reconcile.
+
 ## Smoke sentinel worker isolation
 
 Daemon rebuild dispatch dry-runs force `WE_WORKER_WRAPPER=off` so injected spawners capture both fix and
@@ -204,6 +230,41 @@ successful build. Operation records use UUID filenames and atomic rename; call l
 writes, so they do not replace a sibling process's records.
 
 ## Shadow reviewer agreement evidence
+
+The agy mandatory-seat shadows are off by default (operator 2026-10-16).
+`review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
+`scope` / `WE_REVIEW_SHADOW_AGY_SCOPE` defaults to `high-care`: use the read's
+`earnedShape` from `review-core-cli.mjs shape`, seating elevated/high care and sensitive
+escalation reasons (including human-required surfaces). Routine PRs stay unseated.
+`sampled` restores the deterministic PR sample, with `sampleRate` / `WE_REVIEW_SHADOW_AGY_SAMPLE_RATE` defaulting to 0.1.
+Rates must be finite numbers in `[0, 1)`; 1 is refused and the invalid layer is logged.
+Selection uses SHA-256 of lowercase `owner/repo#pr` (first unsigned 32 bits below
+`floor(sampleRate * 2^32)`; at least one bucket always excluded), shared across lenses and rounds. Missing PR identity does not seat a shadow.
+Disabled panel rows say `agy shadow off (setting)`; unsampled rows say `off (sample)`.
+Routing-policy declarations and model/trial settings alone do not enable live shadows.
+
+`dailyCap` / `WE_REVIEW_SHADOW_AGY_DAILY_CAP` defaults to 100 sessions per
+America/New_York day (zero disables launches). The runner atomically reserves a
+numbered slot under `agy-shadow-agreement.jsonl.sessions/<day>/` before each
+attempt, including model retries. Reservations count starts rather than completions;
+quota refusals and crashes conservatively consume a slot. Slots are shared across
+lanes and survive process restarts; local midnight, including DST, selects a new day.
+A full budget logs `daily cap reached` and records a skipped shadow. An unreadable
+counter refuses admission. Neither a cap skip nor a quota hold retries on the
+routing model or adds a Claude fallback; the original mandatory Claude answer remains.
+Skipped shadows have their own count in agreement and trial reports; they are neither
+failures nor comparisons and do not advance the trial. A primary `agy` seat still
+falls back to Claude on quota or skip results when its `onEscape` policy is `claude`.
+Use temporary stores and injected admission/providers in tests, never host quota.
+
+Gemini admission settings preserve the caller's requested Codex advisory roster.
+Tests cover primary and shadow modes with each escape policy, quota holds, quota exhaustion, and cap skips,
+all runner statuses through the real row builder and both reports, unavailable
+budget storage, and reserving a second slot before a model retry at the cap.
+These settings resolve through standard → platform `review` → tool
+`scripts/settings/review.json` → env, logging effective values and sources.
+Test the actual judge request and panel reduction with injected providers, including
+zero agy calls when disabled and failed Codex answers, through heavy-admission.
 
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader
@@ -969,6 +1030,28 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
 
+### Orchestrator responsiveness hook probes
+
+`session.orchestratorMode` defaults to false and resolves through the shared policy cascade;
+`WE_ORCHESTRATOR_SESSION=1` opts in. The Bash hook keeps policy diagnostics silent by default;
+`WE_POLICY_CASCADE_LOG=1` logs the final effective value and source to stderr through the shared
+cascade logger, and `WE_POLICY_CASCADE_LOG=0` silences it.
+Subagent hook payloads (`agent_id`), dispatched agents, and marked daemon workers always resolve
+false, even with inherited opt-in settings. `operator-session-bootstrap` currently records no
+session ID, so it does not automatically enable this policy.
+
+`session.orchestratorDelegateCommands` replaces the executable-prefix array declared in
+`scripts/lib/orchestrator-session-settings.mjs`. Configure it in
+`scripts/settings/orchestrator-session.json` (or platform preferences); an empty array disables
+this delegation check. Match executable positions, including Node options before the script and
+npm options before `run` or its script name. Heredocs fed to a shell (including `cat <<EOF | bash`)
+are executable scripts and must be checked, as are shell here-strings. Unquoted heredoc bodies can
+execute command substitutions even when used as data; quoted delimiters suppress those expansions.
+Plain mentions and literal heredoc data stay opaque.
+Probe hook stdin with both an interactive payload and a subagent payload sharing the same env.
+The existing background-verification denial must still win in every session: delegate the work
+to a background agent, which runs the command in its own foreground.
+
 ### Prepare queue admission
 
 Operator decision 2026-10-06: prepare-family dispatches (`prepare`, `prepare-scope`, `prepare-decision`,
@@ -1158,6 +1241,48 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
+Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
+the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
+An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
+lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
+through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
+can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
+head past that age must log a named health smell and recheck complete comments and run evidence.
+A recorded or live pass still waits. With neither, request through an available review dispatch hook;
+if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
+“red team never scheduled” note and its source. The current drain has no standalone red-team request
+queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
+comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
+with a different birth time is a reused process, not an active red team. An unavailable birth-time
+probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
+locale in both writer and reader. A running status from another host or PID namespace stays held
+until its result arrives; a local pid probe cannot prove a remote process has crashed. Replay both
+cases, plus old records without birth-time metadata and finished records. Also replay acceptance
+with empty status and run stores: labels alone still do not schedule work (#5439/#5443). The
+persisted accepting run must hold admission before the job's first running-status write. Missing
+or pruned run evidence remains the explicit label-only boundary, rather than an invented accept.
+A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
+admission must also read the exact combined comment emitted by verdict carry: gate markers,
+the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
+carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts. An operator's
+later `clear-human` ceremony on the same head releases findings handed over at the round cap;
+an ordinary accept, restamp alone, superseded clearance or ruling before the finding does not.
+Preserve a proven ruling through chains of identical-contribution carries. Both paginated comment
+reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a thread above
+Node's default 1 MiB using a real child process, retaining the complete thread and clearance stamp.
+Queue removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
+drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
+from the unfiltered open listing, without a durable follow-up entry. Discover membership once per
+sweep through the shared batched merge-queue reader before revalidating any individual PR. Assert
+one discovery call and zero per-PR reads for 150 non-queued rows, for each send-back label shape;
+mixed listings must revalidate only queued rows. Failed or incomplete discovery (including more
+than 100 entries) skips the sweep and retries next pass, without an expensive per-row fallback.
+Manual queue entries also follow the existing label policy; membership alone never authorizes a
+dequeue without fresh labels. Table-test every gate outcome: only `sent-back` invokes removal;
+`round-cap` stays operator-owned under the current ruling. Both safeguards resolve through
+the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.
+
 Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
 followed by GraphQL `isInMergeQueue` plus the judged head. The installed `gh pr view --json` does not
 expose `isInMergeQueue`; use `readMergeQueueState`, not an invented CLI field. GraphQL errors (including
@@ -1236,6 +1361,20 @@ behavior via the explicit seam. Prompt regressions cover one scope header on fre
 resume launches, retaining historical exclusions. Run these and the round-history and operator-queue
 suites through heavy admission.
 
+## Referral re-checks on the live head
+
+`review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
+`scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
+Historical referrals persist a `recheck` provenance marker and go through the existing mandatory review against the pinned live net diff;
+changed or unavailable citations require re-check, never an inherited block. The reviewer must
+check the condition asserted in the finding, including function replacements, resolved settings
+and completed card splits or negative controls. Unchanged citation bytes alone do not prove a defect.
+Auto-policy respects authenticated operator and counted reviewer not-real decisions across heads,
+including exact claim copies with an empty or `(no file)` citation. Only proven changes at the
+original citation permit another automatic block; unavailable comparison evidence refuses the write.
+An interrupted re-check stays review-owned; auto-policy cannot replace its missing reviewer answer.
+This protection is narrower than gate clearance: a policy skip never accepts a PR.
+
 ## False-finding coroner pass
 
 `coroner-false-findings.mjs` reads PRs updated in the window (including older and closed PRs),
@@ -1258,3 +1397,16 @@ false-findings / total-findings percentages without a matching denominator.
 For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
 coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
 separate shadow count and read completeness.
+
+### Review seat timing
+
+Review-pr run records retain `seatTimings` per attempt: seat, lens, provider, model,
+ISO `startedAt`/`finishedAt`, verdict and findingsCount. Parallel seats persist at launch
+and settlement, before declared-order reduction; retries retain separate start instants.
+Extra-seat groups share their model call's instants. The speculative red team retains its
+model call times through finish/discard, excluding sink wait and the subsequent re-check.
+A cancelled call has no observed finish. `node scripts/operations/review-seat-timing.mjs`
+reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR` overrides
+it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
+excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
+Legacy runs without seat observations are omitted; absent times are never reconstructed.

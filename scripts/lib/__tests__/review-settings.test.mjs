@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
-  BUILT_IN_REVIEW_SETTINGS, defaultReviewSettingsPath, isValidRoundBudget, resolveReviewSettings, ROUND_BUDGET_MAX, validateReviewSettings,
+  resolveReviewSettingSource, BUILT_IN_REVIEW_SETTINGS, defaultReviewSettingsPath, isValidRoundBudget, resolveReviewSettings, ROUND_BUDGET_MAX, validateReviewSettings,
 } from '../review-settings.mjs';
 
 // Card 5471 [A2] — the round budget K is a declared setting under the review policy cascade
@@ -72,5 +72,24 @@ describe('review settings: scopedRereview on (card 5470)', () => {
   it('the declared file stays in shadow (ruling P3 revised: no flip planned)', () => {
     const declared = JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8'));
     expect(declared.scopedRereview).toBe('shadow');
+  });
+});
+
+
+describe('referral live-head settings', () => {
+  it.each([
+    ['recheckCarriedReferrals', 'WE_REVIEW_RECHECK_CARRIED_REFERRALS'],
+    ['autoPolicyRespectsNotReal', 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL'],
+  ])('%s defaults on and resolves values and sources through the cascade', (key, envKey) => {
+    expect(resolveReviewSettings({ fileConfig: null, env: {} })[key]).toBe(true);
+    expect(resolveReviewSettings({ fileConfig: null, platform: { [key]: false }, env: {} })[key]).toBe(false);
+    expect(resolveReviewSettingSource(key, { fileRaw: null, platform: { [key]: false }, env: {} })).toBe('platform');
+    expect(resolveReviewSettingSource(key, { fileRaw: null, platform: null, env: {} })).toBe('standard');
+    expect(resolveReviewSettings({ fileConfig: { [key]: false }, env: {} })[key]).toBe(false);
+    expect(resolveReviewSettingSource(key, { fileRaw: { [key]: false }, env: {} })).toBe('tool');
+    expect(resolveReviewSettings({ fileConfig: { [key]: false }, env: { [envKey]: 'true' } })[key]).toBe(true);
+    expect(resolveReviewSettingSource(key, { fileRaw: { [key]: false }, env: { [envKey]: 'true' } })).toBe('env');
+    expect(resolveReviewSettings({ fileConfig: { [key]: true }, env: { [envKey]: 'false' } })[key]).toBe(false);
+    expect(resolveReviewSettings({ fileConfig: { [key]: false }, env: { [envKey]: 'invalid' } })[key]).toBe(false);
   });
 });

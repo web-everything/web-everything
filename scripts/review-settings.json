@@ -4,5 +4,7 @@
   "roundBudget": 3,
   "takeoverReviewAttempts": 1,
   "rulingResolvesStandDown": "on",
-  "standDownQueueSection": "needs-you"
+  "standDownQueueSection": "needs-you",
+  "recheckCarriedReferrals": true,
+  "autoPolicyRespectsNotReal": true
 }

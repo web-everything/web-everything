@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
+import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
+import { readRun, writeRun } from './run-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -272,6 +276,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    redTeamStatus: input => {
+      try { recordRedTeamStatus(input, { env }); }
+      catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
+    },
     root,
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -463,6 +471,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     cleanupSpeculativeRedTeam: (handle) => {
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
     },
+    recordSeatTimings: (runId, rows) => {
+      if (!runId || !rows.length) return;
+      let run = readRun(runId);
+      for (const row of rows) run = withSeatTiming(run, row);
+      writeRun(run);
+    },
     log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
   };
 }
@@ -497,7 +511,7 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
       const reason = `review ${out.outcome} with verdict ${out.verdict ?? 'none'} — not accept`;
       const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason });
       log(`discarded (${reason}); pass ${pass?.status ?? (reserved ? 'in flight, killed' : 'not started')}; spend ${spend?.status ?? '-'}`);
-      return { decision: 'discard', passStatus: pass?.status ?? (reserved ? 'killed-in-flight' : 'not-started'), spend, timings: timings(pass), result: null };
+      return { decision: 'discard', passStatus: pass?.status ?? (reserved ? 'killed-in-flight' : 'not-started'), spend, timings: timings(pass), seatTimings: speculativeSeatTimings(pass, reserved), result: null };
     }
     // The loop is over: if it never wrote the read sink (a failed sink write, a loop that stopped before its read
     // step), the speculative pass can never get a read. Call it off now and run the sequential pass, rather than
@@ -507,13 +521,13 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
       const spend = reserved || pass?.status === 'speculated'
         ? io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason: 'the review loop wrote no read sink' }) : null;
       log('the loop wrote no read sink — called off; sequential pass instead');
-      return { decision: 'sequential', passStatus: 'no-read', reason: 'the review loop wrote no read sink', ...(spend ? { spend } : {}), timings: timings(pass), result: null };
+      return { decision: 'sequential', passStatus: 'no-read', reason: 'the review loop wrote no read sink', ...(spend ? { spend } : {}), timings: timings(pass), seatTimings: speculativeSeatTimings(pass, reserved), result: null };
     }
     const remaining = Math.max(60_000, speculativeRedTeamWallMs() - (Date.now() - spec.startedAt));
     const waited = io.awaitSpeculativeRedTeam(spec, { timeoutMs: remaining });
     const pass = waited.spec;
     const decision = decideSpeculativeOutcome({ accepted: true, spec: waited.timedOut ? null : pass });
-    const base = { waitedMs: waited.waitedMs ?? null, timings: timings(pass) };
+    const base = { waitedMs: waited.waitedMs ?? null, timings: timings(pass), seatTimings: speculativeSeatTimings(pass) };
     log(`${decision}; pass ${pass?.status ?? 'none'}; read at +${base.timings.readAfterMs ?? '?'}ms, pass done at +${base.timings.finishedAfterMs ?? '?'}ms, `
       + `loop done at +${base.timings.loopFinishedAfterMs ?? '?'}ms; waited ${base.waitedMs ?? '?'}ms after the review`);
     if (decision === 'finish') {
@@ -530,6 +544,7 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
       if (!pass || waited.timedOut) {
         const { reserved } = io.cancelSpeculativeRedTeam(spec);
         if (reserved) spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, reserved, reason: 'speculative red team died or ran out its wall mid-call' });
+        base.seatTimings = speculativeSeatTimings(pass, reserved);
       }
       const result = pass?.status === 'error' && !waited.timedOut
         ? { status: 'error', reason: pass.reason ?? 'speculative red team error' }
@@ -611,6 +626,10 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     if (setting) io.log(`review-job: ${formatSpeculativeRedTeamSourceLine(setting)}`);
   }
   const out = runReviewArc(opts, io, seatsBox);
+  const recordSeats = (rows) => {
+    const observed = rows.filter(r => r?.startedAt).map(r => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
+    try { io.recordSeatTimings?.(out.runId, observed); } catch (e) { io.log(`review-job: seat timing write failed (${e.message})`); }
+  };
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -624,6 +643,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
     io.log(`review-job ${out.sessionSlug}: added seats — ${extraSeats?.status ?? 'none'}${extraSeats?.reason ? ` (${extraSeats.reason})` : ''}`
       + `${Array.isArray(extraSeats?.seats) ? `: ${extraSeats.seats.map((x) => `${x.lens}@${x.provider}=${x.status}/${x.findingsCount ?? 0}f/${x.confirmedCount ?? 0}c`).join(', ')}` : ''}`);
+    recordSeats(extraSeats?.seats ?? []);
     out.extraSeats = summarizeExtraSeats(extraSeats);
   }
   // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
@@ -634,9 +654,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
+      recordSeats(out.redTeamSpeculative.seatTimings ?? []);
     } catch (e) {
       out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
     }
@@ -653,6 +675,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
     io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
       + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
+    recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
     // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
     // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
@@ -665,6 +688,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }
+  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
   return out;
 }
 
