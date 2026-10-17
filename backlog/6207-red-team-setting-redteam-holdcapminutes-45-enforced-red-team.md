@@ -1,15 +1,16 @@
 ---
+bornAs: xfrggva
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/lib/numbering-carry.mjs"]
+scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/settings/drain-queue-safety.json"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Fix unfixed red-team break (PR 5233): numbering carry leaves an acceptance when the post-write read fails
+# Red team setting redTeam.holdCapMinutes=45 enforced: red-team-pending past the cap goes to needs-you
 
-Operator 2026-10-17: Ok. Real confirmed red-team break (broken, edge-case) never fixed on PR 5233, which merged 2026-10-15. we:scripts/lib/numbering-carry.mjs:595 - The daemon leaves an authoritative acceptance when its post-write verification is unreadable. Scenario: review:pending plus review:accepted; a formal COMMENTED objection arrives between the successful pre-write check and the numbering comment; the post-write comments read succeeds but the formal-reviews read fails and returns null; restampAfterNumbering returns retry with commentPosted:true without withdrawing its record because check.hold is false; readDrainAcceptance then reports the new head as accepted and reconcileDrainReviewPending invokes to:accepted without reading formal reviews. The new record must stay inert or be withdrawn when post-write verification is unreadable. Confirmed by the Claude re-check. Source: red-team-analysis quality sample (20 breaks: 3 real never fixed).
+Build after #5482 and #5480 land (they hold we:scripts/lib/drain-merge-strategy.mjs, we:scripts/lib/drain-queue-safety.mjs and we:scripts/settings/drain-queue-safety.json). The existing cap drain.redTeamPendingMaxMin=45 is not enforced: past the cap the drain only logs a health smell in we:scripts/lib/drain-merge-strategy.mjs and keeps holding silently; #5461 was held 111 min, #5486 held from 20:17Z. 30 hold episodes on 28 PRs in 23 h, 1,651 min held, median 33, p90 92.6, 5 over 60 min, 2 over 4 h. Spec: redTeam.holdCapMinutes = 45, ENFORCED. Find the existing cap setting and why it does not apply. When the red-team-pending hold passes the cap, the PR goes to needs-you (the existing feed) with how long it waited. It is NOT released to merge; the guard stays fail-closed. Test: cap passed -> needs-you, not merged. Operator 2026-10-17: Ok. Never weaken a hold. Tests first, run red, one per setting. A cascade setting with its source logged.
 
 ## Acceptance
 

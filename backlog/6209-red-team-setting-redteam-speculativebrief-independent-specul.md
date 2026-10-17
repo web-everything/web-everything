@@ -1,15 +1,16 @@
 ---
+bornAs: xq2bksy
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/operations/dispatch-providers/probation-worker.mjs", "we:scripts/lib/dispatch-routing-policy.json"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/review-speculative-red-team.mjs", "we:scripts/settings/review.json"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Fix unfixed red-team break (PR 5370): grouped feature builds routed into a probation provider that refuses groups
+# Red team setting redTeam.speculativeBrief=independent: speculative brief from diff and card only
 
-Operator 2026-10-17: Ok. Real confirmed red-team break (broken, failing-input) never fixed on PR 5370, which merged 2026-10-15. we:scripts/operations/dispatch-providers/probation-worker.mjs:47 - Grouped feature builds are routed into a provider that refuses groups. Scenario: route {kind:'build', size:3, scopePaths:['we:scripts/example.mjs']} and dispatch it with groupMembers:['9002'], probationLaunch:'on' and all executables available; the new default feature route selects probation, but routeDispatchProvider throws 'grouped probation requests require prepare-item' before invoking any provider, including the mechanical build provider; zero provider calls. Grouped feature builds should keep the group-capable delivery path or get a group-capable probation implementation. Confirmed by the Claude re-check. Source: red-team-analysis quality sample (20 breaks: 3 real never fixed).
+Build after #5482 land (it holds we:scripts/operations/review-extra-seats.mjs). 412 of 788 accept-path speculative red-team passes (52%) were thrown away as stale ('the jurors raised N finding(s) the speculative brief could not carry') and re-run: about 412 wasted calls and 1,650 codex minutes per 7 days; only 38% of accepts got the zero-wait benefit. Spec: redTeam.speculativeBrief = independent (default). The speculative start uses a brief built only from the diff and the card, never from juror findings, so a later juror change does not invalidate it. The result is keyed to the head and reused when that head is accepted. A head move still invalidates it. Operator 2026-10-17: Ok. Never weaken a hold. Tests first, run red, one per setting. A cascade setting with its source logged.
 
 ## Acceptance
 

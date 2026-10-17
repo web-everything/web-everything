@@ -1,15 +1,16 @@
 ---
+bornAs: xwkr5we
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/lib/red-team-gate.mjs", "we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/settings/drain-queue-safety.json"]
+scope: ["we:scripts/operations/probation-build-run.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Red team setting: keep a red-team result whose comment failed to post; the drain hold reads the saved result
+# Fix unfixed red-team break (PR 5187): grouped prepare can publish edits outside its card-only scope
 
-Build after #5482, #5480 and #5462 land (they hold the drain and red-team-gate files). 175 of 1,283 red-team runs (14%) leave no comment (105 withheld by the secret scrub, 56 errored, 14 not posted); the gate then records no-red-team-on-head (168 times) and the drain holds silently: 27 episodes, 831 min, median 29.3, p90 59. #5461 (1 confirmed break, comment error) and #5486 (2 confirmed breaks, comment withheld). Spec: a result that fails to post its comment is kept. The drain hold reads the saved red-team result (evidence row) for the head as well as the comment, using the existing readers. A saved result with no confirmed breaks satisfies the hold. A saved result with confirmed breaks is treated exactly as a posted one. Test: a saved result with breaks still holds. Operator 2026-10-17: Ok. Never weaken a hold. Tests first, run red, one per setting. A cascade setting with its source logged.
+Operator 2026-10-17: Ok. Real confirmed red-team break (broken, security) never fixed on PR 5187, which merged 2026-10-15. we:scripts/operations/probation-build-run.mjs:518 - A grouped prepare can publish edits outside its card-only scope by declining the unchanged lead. Scenario: dispatch prepare for lead #7101 with members #7102 and #7103, leasing only their backlog cards; the worker leaves the lead unchanged, edits an unrelated file, and returns could-not-prepare; line 518 treats the unchanged lead as no worker change despite the unrelated diff; the blocked-report branch breaks before the scope, envelope and checker guards; members are restored but the unrelated edit survives and couldNotPrepare skips the final scope guard; with a green gate the runner commits that file. Confirmed by the Claude re-check. Source: red-team-analysis quality sample (20 breaks: 3 real never fixed).
 
 ## Acceptance
 

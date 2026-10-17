@@ -1,15 +1,16 @@
 ---
+bornAs: xhosxil
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/probation-build-run.mjs"]
+scope: ["we:scripts/operations/dispatch-providers/probation-worker.mjs", "we:scripts/lib/dispatch-routing-policy.json"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Fix unfixed red-team break (PR 5187): grouped prepare can publish edits outside its card-only scope
+# Fix unfixed red-team break (PR 5370): grouped feature builds routed into a probation provider that refuses groups
 
-Operator 2026-10-17: Ok. Real confirmed red-team break (broken, security) never fixed on PR 5187, which merged 2026-10-15. we:scripts/operations/probation-build-run.mjs:518 - A grouped prepare can publish edits outside its card-only scope by declining the unchanged lead. Scenario: dispatch prepare for lead #7101 with members #7102 and #7103, leasing only their backlog cards; the worker leaves the lead unchanged, edits an unrelated file, and returns could-not-prepare; line 518 treats the unchanged lead as no worker change despite the unrelated diff; the blocked-report branch breaks before the scope, envelope and checker guards; members are restored but the unrelated edit survives and couldNotPrepare skips the final scope guard; with a green gate the runner commits that file. Confirmed by the Claude re-check. Source: red-team-analysis quality sample (20 breaks: 3 real never fixed).
+Operator 2026-10-17: Ok. Real confirmed red-team break (broken, failing-input) never fixed on PR 5370, which merged 2026-10-15. we:scripts/operations/dispatch-providers/probation-worker.mjs:47 - Grouped feature builds are routed into a provider that refuses groups. Scenario: route {kind:'build', size:3, scopePaths:['we:scripts/example.mjs']} and dispatch it with groupMembers:['9002'], probationLaunch:'on' and all executables available; the new default feature route selects probation, but routeDispatchProvider throws 'grouped probation requests require prepare-item' before invoking any provider, including the mechanical build provider; zero provider calls. Grouped feature builds should keep the group-capable delivery path or get a group-capable probation implementation. Confirmed by the Claude re-check. Source: red-team-analysis quality sample (20 breaks: 3 real never fixed).
 
 ## Acceptance
 
