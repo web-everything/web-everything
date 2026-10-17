@@ -177,7 +177,6 @@ import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedL
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
 import { classifySession } from './operations/session-role.mjs';
-import { loadOrchestratorSessionSettings, ORCHESTRATOR_DELEGATE_COMMANDS } from './lib/orchestrator-session-settings.mjs';
 // #xpt9fvd — the shared daemon-clone registry `guard-lane.mjs`'s Edit/Write arm also reads, so the two guards
 // can never disagree about which paths are a resident daemon's OWN clone.
 import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-registry.mjs';
@@ -436,118 +435,6 @@ export function isDirectTaskInvocation(command) {
     const script = words[1] === '--' ? words[2] : words[1];
     return /(?:^|\/)(?:codex|gemini)-direct-task\.mjs$/.test(script || '');
   });
-}
-
-/** Match executable prefixes, including shell re-execution; quoted mentions remain data. */
-export function orchestratorDelegateReason(command, ctx = {}) {
-  if (!ctx.orchestratorMode || ctx.agentSession || ctx.dispatchKind) return null;
-  const nodeValueFlags = new Set([...NODE_SCRIPT_VALUE_FLAGS, '-C', '--conditions', '--input-type',
-    '--title', '--env-file', '--env-file-if-exists', '--icu-data-dir', '--openssl-config',
-    '--redirect-warnings', '--diagnostic-dir', '--trace-event-categories', '--trace-event-file-pattern',
-    '--cpu-prof-dir', '--cpu-prof-name', '--heap-prof-dir', '--heap-prof-name', '--snapshot-blob',
-    '--inspect-port', '--debug-port', '--inspect-publish-uid', '--max-old-space-size', '--max-semi-space-size',
-    '--stack-size', '--experimental-default-type', '--unhandled-rejections', '--dns-result-order',
-    '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config', '--cpu-prof-interval', '--disable-proto',
-    '--disable-warning', '--experimental-policy', '--experimental-sea-config', '--heap-prof-interval',
-    '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--max-http-header-size',
-    '--network-family-autoselection-attempt-timeout', '--policy-integrity', '--report-directory', '--report-dir',
-    '--report-filename', '--report-signal', '--secure-heap', '--secure-heap-min', '--test-concurrency',
-    '--test-name-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard',
-    '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog', '--use-largepages',
-    '--v8-pool-size', '--watch-path']);
-  // npm accepts config options before both `run` and the script name, including separate values.
-  const npmValueFlags = new Set([...RUNNER_VALUE_FLAGS, ...(`
-    --_auth --access --also --audit-level --auth-type --before --ca --cache --cache-max --cache-min
-    --cafile --call --cert --cidr --cpu --depth --diff --diff-dst-prefix --diff-src-prefix --diff-unified
-    --editor --expect-result-count --fetch-retries --fetch-retry-factor --fetch-retry-maxtimeout
-    --fetch-retry-mintimeout --fetch-timeout --git --globalconfig --heading --https-proxy --include
-    --init-author-email --init-author-name --init-author-url --init-license --init-module --init-version
-    --init.author.email --init.author.name --init.author.url --init.license --init.module --init.version
-    --install-strategy --key --libc --local-address --location --lockfile-version --loglevel --logs-dir
-    --logs-max --maxsockets --message --node-options --noproxy --omit --only --os --otp --package
-    --pack-destination --prefix --preid --provenance-file --proxy --registry --replace-registry-host
-    --save-prefix --sbom-format --sbom-type --scope --script-shell --searchexclude --searchlimit
-    --searchopts --searchstaleness --shell --tag --tag-version-prefix --umask --user-agent --userconfig
-    --viewer --which --workspace
-  `).trim().split(/\s+/)]);
-  const normalize = (text) => {
-    const words = headWords(canonicalCommand(peelPollingSegment(text))).map(w => w.text);
-    if (words[0] === 'node') {
-      let i = 1;
-      const preloads = [];
-      let sourceMode = false;
-      while (words[i]?.startsWith('-') && words[i] !== '--' && words[i] !== '-') {
-        if (/^(?:--check|--help|--version)(?:=|$)|^-(?:c|[hv]$)/.test(words[i])) return [];
-        if (/^(?:--eval|--print)(?:=|$)|^-[ep]/.test(words[i])) {
-          sourceMode = true; // preloads still execute, including those specified after the source
-          i += /^(?:--eval|--print|-[ep]{1,2})$/.test(words[i]) ? 2 : 1;
-          continue;
-        }
-        const flag = words[i].split('=')[0].replaceAll('_', '-');
-        if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) {
-          const value = words[i].includes('=') ? words[i].slice(words[i].indexOf('=') + 1) : words[i + 1];
-          if (value) preloads.push(['node', value.split('/').at(-1)]);
-        } else if (/^-r./.test(words[i])) preloads.push(['node', words[i].slice(2).split('/').at(-1)]);
-        i += !words[i].includes('=') && nodeValueFlags.has(flag) ? 2 : 1;
-      }
-      if (words[i] === '--') i += 1;
-      return [...preloads, ...(sourceMode ? [] : [['node', ...(words[i] ? [words[i].split('/').at(-1), ...words.slice(i + 1)] : [])]])];
-    }
-    if (words[0] === 'npm') {
-      let i = 1;
-      const skipOptions = () => {
-        while (words[i]?.startsWith('-')) {
-          if (words[i] === '--') { i += 1; break; }
-          const flag = words[i];
-          // Exact booleans take precedence over config-name abbreviations (e.g. --save vs --save-prefix).
-          const valueFlag = npmValueFlags.has(flag) || (!/^(?:--audit|--global|--provenance|--save)$/.test(flag)
-            && flag.startsWith('--') && [...npmValueFlags].some(known => known.startsWith(flag)));
-          i += !flag.includes('=') && (valueFlag || /^(?:true|false)$/.test(words[i + 1] || '')
-            || (flag === '--color' && words[i + 1] === 'always')) ? 2 : 1;
-        }
-      };
-      skipOptions();
-      if (words[i] === 'run' || words[i] === 'run-script') {
-        i += 1;
-        skipOptions();
-        return [['npm', 'run', ...words.slice(i)]];
-      }
-    }
-    return [words];
-  };
-  const prefixes = (ctx.orchestratorDelegateCommands ?? ORCHESTRATOR_DELEGATE_COMMANDS).flatMap(normalize);
-  const seen = new Set();
-  let budget = NESTED_NODE_CAP;
-  const matches = (text, depth = 0) => {
-    if (depth > NESTED_DEPTH_CAP || budget <= 0 || seen.has(text)) return false;
-    seen.add(text);
-    budget -= 1;
-    const { text: raw, heredocs } = heredocScan(text);
-    const segments = parseSegments(raw).segments;
-    for (const segment of segments) {
-      if (normalize(segment).some(words => prefixes.some(prefix => prefix.length
-        && prefix.every((word, i) => word === words[i])))) return true;
-    }
-    // Keep data heredocs opaque, but scan stdin scripts with the same bounded traversal as shell -c.
-    const nested = [...substitutionBodies(raw), ...segments.flatMap(nestedCommandStrings)];
-    for (const segment of segments) {
-      const tokens = shellTokens(segment);
-      const at = tokens.findIndex(token => token.op && /^(?:0)?<<<$/.test(token.text));
-      if (at >= 0 && tokens[at + 1] && heredocInterpreter(segment)?.kind === 'shell') {
-        nested.push(tokens[at + 1].text);
-      }
-    }
-    const group = leadingGroupBody(raw);
-    if (group !== null) nested.push(group);
-    for (const h of heredocs) {
-      if (heredocInterpreter(h.head)?.kind === 'shell') nested.push(h.body);
-      if (h.expand) nested.push(...substitutionBodies(h.body, [], true));
-    }
-    return nested.some(inner => matches(inner, depth + 1));
-  };
-  return matches(String(command || ''))
-    ? 'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground'
-    : null;
 }
 
 /** Whole-command check: retain both the shell background operator and the Bash tool parameter. Pure. */
@@ -1381,7 +1268,7 @@ function groupEnd(s, open) {
  *  one opaque span instead lost `echo "`+"`"+`find . -name "*.ts"; yarn build`+"`"+`"` — the `"` before
  *  `*.ts` read as the run's closer, so the substitution's tail (a real `yarn build`) was never seen.
  *  `$'…'` is ANSI-C quoting, not a substitution, and falls through to the single-quote branch. */
-function substitutionBodies(s, out = [], heredoc = false) {
+function substitutionBodies(s, out = []) {
   let inDouble = false;
   // …and it must read a `#` COMMENT the way the rest of the parser already does. Without this, the
   // apostrophe in `# a note — don't forget` ⏎ `echo \`pnpm exec vite build\`` opened a phantom
@@ -1394,9 +1281,9 @@ function substitutionBodies(s, out = [], heredoc = false) {
     if (ch === '\n') { if (!inDouble) { inComment = false; atWordStart = true; } continue; }
     if (inComment) continue;
     if (ch === '\\') { i += 1; atWordStart = false; continue; }
-    if (!heredoc && !inDouble && ch === '#' && atWordStart) { inComment = true; continue; }
-    if (!heredoc && !inDouble && ch === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return out; i = e; atWordStart = false; continue; }
-    if (!heredoc && ch === '"') { inDouble = !inDouble; atWordStart = false; continue; }
+    if (!inDouble && ch === '#' && atWordStart) { inComment = true; continue; }
+    if (!inDouble && ch === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return out; i = e; atWordStart = false; continue; }
+    if (ch === '"') { inDouble = !inDouble; atWordStart = false; continue; }
     if (ch === '$' && s[i + 1] === '(') {
       const e = groupEnd(s, i + 1);
       const body = s.slice(i + 2, e === -1 ? s.length : e);
@@ -2320,61 +2207,32 @@ function shellWaits(text) {
   }
   return waits;
 }
+const HEREDOC_OPERATOR = /<<-?\s*(?:'[^']*'|"[^"]*"|\\?\w+)/g;
 /** What does a heredoc's HEAD line feed its body to: `{ kind: 'shell', prog }` (bash/sh/…, the body is a script of
  *  commands), `{ kind: 'script', prog }` (python/node/perl/…, the body is a program), or null — `cat`,
  *  `git commit -F -`, or a shell/interpreter given a script FILE (`node x.mjs <<EOF`: the body is that script's
  *  stdin DATA). A `cat <<EOF | bash` pipe is followed to its consumer. */
 function heredocInterpreter(head) {
-  let segs, pipedFrom;
-  try { ({ segments: segs, pipedFrom } = parseSegments(String(head || ''))); } catch { return null; }
+  let segs;
+  try { segs = parseSegments(String(head || '')).segments; } catch { return null; }
   const progOf = (words) => (words[0] || '').replace(/^.*\//, '');
-  const wordsOf = (seg) => {
-    const tokens = shellTokens(canonicalCommand(seg));
-    const words = [];
-    for (let i = 0; i < tokens.length; i++) {
-      if (tokens[i].op) { i += 1; continue; } // redirects and their operands are not script arguments
-      words.push(tokens[i].text);
-    }
-    return words;
-  };
+  const wordsOf = (seg) => headWords(canonicalCommand(seg.replace(HEREDOC_OPERATOR, ' '))).map((w) => w.text);
   const interpreters = new RegExp(`^(?:${WAIT_INTERPRETERS})$`);
   const kindOf = (seg) => {
     const words = wordsOf(seg);
-    if (progOf(words) === 'busybox' && SHELL_PROGRAMS.has(words[1])) words.shift();
     const prog = progOf(words);
     const shell = SHELL_PROGRAMS.has(prog);
     if (!shell && !interpreters.test(prog)) return null;
     const rest = words.slice(1);
-    if (shell) {
-      let stdin = false;
-      let i = 0;
-      for (; i < rest.length; i++) {
-        const word = rest[i];
-        if (word === '--') { i += 1; break; }
-        if (!/^[+-]./.test(word)) break;
-        // -c wins over -s; a later positional -s after a script file is just data.
-        if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word) || word === '--help' || word === '--version') return null;
-        if (/^-[A-Za-z]*s/.test(word)) stdin = true;
-        if (/^(?:-[oO]|--rcfile|--init-file)$/.test(word) && rest[i + 1] && !rest[i + 1].startsWith('-')) i += 1;
-      }
-      if (stdin || i === rest.length || ['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'].includes(rest[i])) {
-        return { kind: 'shell', prog };
-      }
-      return null;
-    }
+    if (shell && rest.includes('-s')) return { kind: 'shell', prog };
     if (rest.some((w) => w !== '-' && !w.startsWith('-'))) return null;   // a script file / `-c` string: stdin is data
     return { kind: shell ? 'shell' : 'script', prog };
   };
   const at = segs.findIndex((s) => s.includes('<<'));
   if (at < 0) return null;
-  const stdinOps = shellTokens(segs[at]).filter(token => token.op && /^(?:0)?</.test(token.text));
-  if (!/^(?:0)?<<<?$/.test(stdinOps.at(-1)?.text || '')) return null;
   const direct = kindOf(segs[at]);
   if (direct) return direct;
-  let consumer = at;
-  while (pipedFrom[consumer + 1]) consumer += 1;
-  if (consumer > at && shellTokens(segs[consumer]).some(token => token.op && /^(?:0)?</.test(token.text))) return null;
-  return /^(?:cat|tee)$/.test(progOf(wordsOf(segs[at]))) && consumer > at ? kindOf(segs[consumer]) : null;
+  return /^(?:cat|tee|printf|echo)$/.test(progOf(wordsOf(segs[at]))) && segs.length > at + 1 ? kindOf(segs[segs.length - 1]) : null;
 }
 /** A segment as its command: drop the loop/conditional keyword (`do bash -c '…'`) and a `timeout <dur>` prefix. */
 const peelPollingSegment = (seg) => seg.replace(/^\s*(?:(?:do|then|else|elif|if|while|until)\s+)+(?:!\s*)?/, '').replace(/^\s*timeout\s+(?:-\S+\s+)*\S+\s+/, '');
@@ -2574,6 +2432,61 @@ export function hasDestructiveLaneOp(command) {
   return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
 }
 
+// #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
+// double-quoted forms) lands on the SAME path as its absolute spelling and so reaches the same daemon-clone /
+// lane-lease guards. Quoting is kept until expansion is done: a quoted `~` and a single-quoted `$HOME` are
+// literal text, exactly as in a shell. The home source is the hook process's own HOME (`home`; `null` = unset),
+// overridden in command order by a literal `HOME=/abs` assignment. Nothing is ever executed or looked up: an
+// unset/relative HOME, `~user`, an unknown variable, a substitution or an unquoted glob stays unresolved.
+function expandCdTarget(rest, home) {
+  const s = String(rest);
+  const variable = (at) => {
+    const m = s.slice(at).match(/^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/);
+    if (!m) return null;
+    const name = m[1] ?? m[2];
+    const value = name === 'HOME' ? home : null;
+    return typeof value === 'string' ? { value, end: at + m[0].length - 1 } : null;
+  };
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if ((ch === '<' || ch === '>') && s[i + 1] === '(') return null;      // a process substitution's path
+    if (/\s/.test(ch) || ch === '<' || ch === '>') break;                  // first argument only
+    if (ch === "'") {                                                      // single quotes: all literal
+      const close = s.indexOf("'", i + 1);
+      if (close < 0) return null;
+      out += s.slice(i + 1, close);
+      i = close;
+    } else if (ch === '"') {                                               // double quotes: only $VAR and \ escapes
+      for (i += 1; s[i] !== '"'; i++) {
+        if (i >= s.length || s[i] === '`') return null;
+        if (s[i] === '\\' && '$`"\\'.includes(s[i + 1] ?? '')) { out += s[++i]; continue; }
+        if (s[i] !== '$') { out += s[i]; continue; }
+        const v = variable(i);
+        if (!v) return null;
+        out += v.value;
+        i = v.end;
+      }
+    } else if (ch === '\\') {
+      if (i + 1 >= s.length) return null;
+      out += s[++i];
+    } else if (ch === '$') {                                               // unquoted: must not word-split or glob
+      const v = variable(i);
+      if (!v || /[\s*?\[]/.test(v.value)) return null;
+      out += v.value;
+      i = v.end;
+    } else if (ch === '~' && i === 0) {                                    // only `~` / `~/…` — never `~user`, `~+`
+      if (!/^(?:\/|$|\s|[<>])/.test(s.slice(1)) || !home) return null;
+      out += home;
+    } else if (ch === '`' || ch === '*' || ch === '?' || ch === '[') {
+      return null;
+    } else {
+      out += ch;
+    }
+  }
+  return out || null;
+}
+
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
 // standard lane invocation `cd <lane> && node …/backlog.mjs claim` reports cwd=primary and gets misclassified
 // as a primary mutation (denied) AND makes the #2323 git call run in the primary (a false "behind" count).
@@ -2585,7 +2498,7 @@ export function hasDestructiveLaneOp(command) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve) {
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -2605,14 +2518,28 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve)
     if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
   }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
+  // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
+  // declarations without values and assignments inside subshells must not erase a known parent value.
+  let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   for (const stmt of parsed.segments) {
+    const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
+    if (assignment) {
+      const value = expandCdTarget(assignment[1].trim(), currentHome);
+      currentHome = value?.startsWith('/') ? value : null;
+    }
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
+    // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
+    const raw = cd[1].trim();
+    if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+      const target = expandCdTarget(raw, currentHome);
+      return target ? (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target)) : reportedCwd;
+    }
     let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
     if (v) target = vars[v[1]] ?? '';
-    if (!target || /[`$(*?]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
+    if (!target || /[`$(*?\[]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
   return reportedCwd;
@@ -3964,7 +3891,7 @@ export function stripHeredocBodies(command) {
   return heredocScan(command).text;
 }
 
-/** `stripHeredocBodies` plus the parse state it reached. Pure. Returns `{ text, unterminated }`.
+/** `stripHeredocBodies` plus the parse state and `{ head, body, expand }` records it reached. Pure.
  *
  *  r3 audit — this pass is ITSELF a parser (it has to be: only an unquoted, un-commented `<<` opens a
  *  heredoc), so it has the same degrade-or-deny obligation as the splitter. An unterminated quoted run in
@@ -3976,6 +3903,9 @@ export function stripHeredocBodies(command) {
 export function heredocScan(command) {
   const text = String(command || '');
   if (!text.includes('<<')) return { text, unterminated: parseSegments(text).unterminated, heredocs: [] };
+  // A delimiter is ONE word, possibly made of several quoted/escaped runs. Reading only its first run
+  // (E in E"OF" or E\OF) would consume the terminator and every real command after it as body text.
+  const OPENER = /^<<-?[ \t]*((?:'[^'\n]*'|"(?:\\[^\n]|[^"\\\n])*"|\\[^\n]|[A-Za-z_0-9])+)(?=[ \t\r\n;&|<>()]|$)/;
   const kept = [];
   let line = '';
   let atWordStart = true;
@@ -4022,29 +3952,15 @@ export function heredocScan(command) {
       i = run.end + 1;
       atWordStart = false;
       continue;
-    } else if (!inComment && ch === '<' && text[i + 1] === '<' && pending === null) {
-      if (text[i + 2] === '<') { line += '<<<'; i += 3; atWordStart = true; continue; }
-      let end = i + 2;
-      if (text[end] === '-') end += 1;
-      while (/[ \t]/.test(text[end] || '')) end += 1;
-      let delim = '';
-      let expand = true;
-      let hasDelimiter = false;
-      const delimiterStart = /[A-Za-z_'"\\]/.test(text[end] || ''); // preserve the existing exclusion of numeric arithmetic shifts
-      // A delimiter is one shell word: E"OF" and E\OF both mean literal EOF, with expansion disabled.
-      for (; delimiterStart && end < text.length && !/[\s;&|()<>]/.test(text[end]); end++) {
-        const part = scanRun(text, end, false);
-        if (part) {
-          if (part.kind === 'unterminated') unterminated = true;
-          delim += part.body;
-          expand = false;
-          hasDelimiter = true;
-          end = part.end;
-        } else { delim += text[end]; hasDelimiter = true; }
-      }
-      if (hasDelimiter) {
-        pending = { delim, expand };
-        line += text.slice(i, end); i = end; atWordStart = false; continue;
+    } else if (!inComment && ch === '<' && text[i + 1] === '<' && text[i - 1] !== '<' && text[i + 2] !== '<' && pending === null) {
+      const m = text.slice(i).match(OPENER);
+      if (m) {
+        // Quote removal only: no parameter/command expansion is performed on a heredoc delimiter.
+        // In double quotes, bash removes a backslash only before $, `, ", or another backslash.
+        const delim = m[1].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+          (_, single, double, escaped) => single ?? (double === undefined ? escaped : double.replace(/\\([$`"\\])/g, '$1')));
+        pending = { delim, expand: !/['"\\]/.test(m[1]) };
+        line += m[0]; i += m[0].length; atWordStart = false; continue;
       }
     }
     line += ch;
@@ -4314,8 +4230,6 @@ export function decide(command, ctx = {}) {
   if (bg) return bg;
   const directTask = backgroundedDirectTaskReason(command, ctx.runInBackground);
   if (directTask) return directTask;
-  const delegate = orchestratorDelegateReason(fullCommand, ctx);
-  if (delegate) return delegate;
   // #3105 — same whole-command timing as the check above: a dispatched agent's own gate call must be caught
   // before the per-segment split, since the property being checked (is this a verification-set invocation at
   // all) does not depend on which segment of a chained command it sits in.
@@ -4477,7 +4391,6 @@ if (IS_CLI) {
   let effectiveCwd = null;
   let daemonRoots = [];
   let hookSessionId = null;
-  let orchestratorSettings = {};
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
     cmd = (ev.tool_input || {}).command || '';
@@ -4498,8 +4411,6 @@ if (IS_CLI) {
     // blocks the `verify-lane.mjs run` gate the fix/ci-heal briefs tell the agent to run.
     agentSession = (typeof ev.agent_id === 'string' && ev.agent_id !== '') || !!dispatchKind
       || classifySession(process.env).role === 'worker';
-    orchestratorSettings = loadOrchestratorSessionSettings({ agentSession,
-      log: line => process.stderr.write(`guard-bash: ${line}\n`) }).value;
     // #2367 — the DURABLE session identity. Key on `CLAUDE_CODE_SESSION_ID` (env) FIRST — the SAME source
     // `lane-pool.mjs acquire` stamps into the lease's `ownerSession`, so my own lease can never read as foreign
     // due to a string-source mismatch (r2 correctness fix). The hook payload's `session_id` is only a secondary
@@ -4536,7 +4447,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

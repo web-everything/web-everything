@@ -8,7 +8,6 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
-  orchestratorDelegateReason,
   decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
@@ -499,6 +498,90 @@ describe('guard-bash — resolveEffectiveCwd honours a leading `cd` (#2335)', ()
     expect(isPrimaryCwd(eff, [PRIMARY])).toBe(false);
     expect(isLaneCwd(eff)).toBe(true);
     expect(reason('node scripts/backlog.mjs claim 2335', { primaryCwd: false })).toBeNull();
+  });
+});
+
+describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading `cd` (#5957)', () => {
+  const REPORTED = '/ws/webeverything';
+  const HOME = '/home/dev';
+  const SPACED = '/home/dev with space';
+  const at = (cmd, home = HOME) => resolveEffectiveCwd(cmd, REPORTED, undefined, home);
+
+  it('bare tilde, tilde-slash, $HOME and ${HOME} reach the same path as the absolute spelling', () => {
+    expect(at('cd ~ && ls')).toBe(HOME);
+    expect(at('cd ~/clone && ls')).toBe(at(`cd ${HOME}/clone && ls`));
+    expect(at('cd $HOME/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd ${HOME}/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "${HOME}/clone" && ls')).toBe(`${HOME}/clone`);
+    expect(at('cd "$HOME" && ls')).toBe(HOME);
+  });
+  it('keeps a trailing slash and dot segments exactly as the absolute spelling would', () => {
+    expect(at('cd ~/clone/ && ls')).toBe(at(`cd ${HOME}/clone/ && ls`));
+    expect(at('cd ~/a/../clone && ls')).toBe(at(`cd ${HOME}/a/../clone && ls`));
+    expect(at('cd "$HOME/./clone" && ls')).toBe(at(`cd ${HOME}/./clone && ls`));
+  });
+  it('a home path containing spaces survives double quotes, and is unresolved when left unquoted', () => {
+    expect(at('cd "$HOME/clone" && ls', SPACED)).toBe(`${SPACED}/clone`);
+    expect(at('cd "${HOME}" && ls', SPACED)).toBe(SPACED);
+    expect(at('cd ~/clone && ls', SPACED)).toBe(`${SPACED}/clone`);
+    // unquoted $HOME word-splits in a real shell, so `cd` would fail — never a fabricated target
+    expect(at('cd $HOME/clone && ls', SPACED)).toBe(REPORTED);
+  });
+  it('quoted tilde and single-quoted HOME are literal shell text, not home aliases', () => {
+    expect(at('cd "~/clone" && ls')).toBe(`${REPORTED}/~/clone`);
+    expect(at("cd '~' && ls")).toBe(`${REPORTED}/~`);
+    expect(at("cd '$HOME/clone' && ls")).toBe(REPORTED);
+  });
+  it('unsupported spellings keep the reported cwd and never become a home target', () => {
+    expect(at('cd ~someone/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$UNKNOWN/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "$(echo ~)/clone" && ls')).toBe(REPORTED);
+    expect(at('cd "`echo $HOME`" && ls')).toBe(REPORTED);
+    expect(at('cd ${HOME:-/x}/clone && ls')).toBe(REPORTED);
+    expect(at('cd "$HOME/*" && ls')).toBe(`${HOME}/*`);
+    expect(at('cd $HOME/* && ls')).toBe(REPORTED);
+  });
+  it('a missing or non-absolute HOME fabricates nothing', () => {
+    expect(at('cd ~/clone && ls', null)).toBe(REPORTED);
+    expect(at('cd "$HOME" && ls', null)).toBe(REPORTED);
+    expect(at('cd ~ && ls', '')).toBe(REPORTED);
+    expect(at('cd ~ && ls', 'relative/home')).toBe(REPORTED);
+  });
+  it('uses only preceding literal HOME assignments for home expansion', () => {
+    expect(at('HOME=/other; cd ~/clone')).toBe('/other/clone');
+    expect(at('export HOME=/other; cd "$HOME/clone"')).toBe('/other/clone');
+    expect(at('cd ~/clone; HOME=/other')).toBe(`${HOME}/clone`);
+    expect(at('HOME=$(mktemp -d); cd ~/clone')).toBe(REPORTED);
+  });
+  it('leaves unquoted bracket globs unresolved', () => {
+    expect(at('cd ~/[c]lone')).toBe(REPORTED);
+    expect(at('cd $HOME/[c]lone')).toBe(REPORTED);
+    expect(at('cd /other/[c]lone')).toBe(REPORTED);
+    expect(at('cd "$HOME/[c]lone"')).toBe(`${HOME}/[c]lone`);
+  });
+  it('heredoc body text never steers the resolution', () => {
+    const cmd = `cat <<'EOF'\ncd ~/clone\nEOF`;
+    expect(at(cmd)).toBe(REPORTED);
+  });
+  it('pins the existing literal lane-variable behaviour', () => {
+    const LANE = '/ws/.lanes/web-everything/lane-5';
+    expect(at(`LANE=${LANE}; cd "$LANE" && ls`)).toBe(LANE);
+    expect(at(`LANE=${LANE}; cd \${LANE} && ls`)).toBe(LANE);
+    expect(at('cd relative/dir && ls')).toBe(`${REPORTED}/relative/dir`);
+  });
+  it('preserves the parent target after a home assignment is overwritten and a subshell assigns it', () => {
+    const clone = '/fixture/clone';
+    expect(at(`D=~/x; D=${clone}; ( D=/tmp ); cd "$D" && git checkout --detach`)).toBe(clone);
+  });
+  it('a home-spelled cd lands in the same lane root and ownership classification as the absolute spelling', () => {
+    const LANE_HOME = `${HOME}/.lanes/web-everything/lane-9`;
+    const viaHome = at('cd ~/.lanes/web-everything/lane-9/scripts && ls');
+    const viaAbs = at(`cd ${LANE_HOME}/scripts && ls`);
+    expect(viaHome).toBe(viaAbs);
+    expect(isLaneCwd(viaHome)).toBe(true);
+    expect(laneRootFromCwd(viaHome)).toBe(laneRootFromCwd(viaAbs));
+    expect(laneRootFromCwd(viaHome)).toBe(LANE_HOME);
   });
 });
 
@@ -2118,6 +2201,34 @@ describe('guard-bash — the parser fails CLOSED on input it cannot represent (#
     expect(heredocScan("cat <<'EOF'\ndon't\nEOF").unterminated).toBe(false);
   });
 
+  it.each([
+    'EOF', "''", '""', 'E"OF"',
+  ])('heredocScan preserves a here-string with word %s and the next command', (word) => {
+    const command = `cat <<<${word}\nnpm run build`;
+    expect(heredocScan(command).text).toBe(command);
+    expect(heredocScan(command).heredocs).toEqual([]);
+    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
+  });
+
+  it.each([
+    ["E'OF'", 'EOF'],
+    ["'E'\"O\"F", 'EOF'],
+    ['EOF""', 'EOF'],
+    ['"E\\q"', 'E\\q'],
+    ['"E\\\"OF"', 'E"OF'],
+    ["'E\"OF'", 'E"OF'],
+    ["'E\\OF'", 'E\\OF'],
+    ["''", ''],
+  ])('heredocScan removes delimiter quoting in %s and preserves the next command', (word, delimiter) => {
+    const head = `cat <<${word}`;
+    const tail = 'npm run build';
+    const command = `${head}\nbody\n${delimiter}\n${tail}`;
+    const result = heredocScan(command);
+    expect(result.text).toBe(`${head}\n${tail}`);
+    expect(result.heredocs).toEqual([{ head, body: 'body', expand: false }]);
+    expect(decide(command, { primaryCwd: true })).toMatch(/PRIMARY/);
+  });
+
   it('canonicalCommand is quote-aware, and peels a subshell CLOSER as well as its opener', () => {
     expect(canonicalCommand('(pnpm --filter web exec vite build)')).toBe('pnpm --filter web exec vite build');
     expect(canonicalCommand('(vite build) \\')).toBe('vite build');
@@ -3433,10 +3544,10 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   // The house idiom (see the #3311 CLI-boundary block above): vitest rewrites `import.meta.url` to a
   // non-file base, so `new URL(…, import.meta.url)` + `fileURLToPath` is NOT used here.
   const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
-  const runHook = (command, cwd) => {
+  const runHook = (command, cwd, home) => {
     const res = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir },
+      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home ? { HOME: home } : {}) },
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
@@ -3461,6 +3572,61 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+  // These preserve main's single-directory behavior; the proposed shell strings are never executed.
+  it.each([
+    ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],
+    ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
+    ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
+  ])('retains the main refusal for %s', (_name, command, startsProtected) => {
+    const out = runHook(command, startsProtected ? fakeClone : lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
+  // HOME is the temp `root` here, so `~/some-new-daemon-clone` IS the registered clone. The command strings
+  // are inert: the hook only inspects them, it never runs the proposed checkout.
+  describe('home-spelled leading cd (#5957)', () => {
+    const denies = (cmd) => {
+      const out = runHook(cmd, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    };
+    it('the absolute spelling is denied (baseline)', () => {
+      denies(`cd ${fakeClone} && git checkout --detach`);
+    });
+    it.each([
+      ['tilde', 'cd ~/some-new-daemon-clone && git checkout --detach'],
+      ['$HOME', 'cd $HOME/some-new-daemon-clone && git checkout --detach'],
+      ['${HOME}', 'cd ${HOME}/some-new-daemon-clone && git checkout --detach'],
+      ['double-quoted $HOME', 'cd "$HOME/some-new-daemon-clone" && git checkout --detach'],
+      ['trailing slash', 'cd ~/some-new-daemon-clone/ && git checkout --detach'],
+      ['dot segments', 'cd ~/lane/../some-new-daemon-clone && git checkout --detach'],
+    ])('DENIES `git checkout --detach` after a %s cd into the registered clone', (_n, cmd) => denies(cmd));
+    it('DENIES detach using the parent value despite a subshell assignment after a home assignment', () => {
+      const command = `D=~/x; D=${fakeClone}; ( D=/tmp ); cd "$D" && git checkout --detach`;
+      expect(resolveEffectiveCwd(command, lane, undefined, root)).toBe(fakeClone);
+      denies(command);
+    });
+    it('keeps the read-only control allowed', () => {
+      expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
+    });
+    it('does not treat a quoted tilde or single-quoted HOME as the home path', () => {
+      expect(runHook('cd "~/some-new-daemon-clone" && git checkout --detach', lane, root)).toBeNull();
+      expect(runHook("cd '$HOME/some-new-daemon-clone' && git checkout --detach", lane, root)).toBeNull();
+    });
+    it('fabricates no home target when HOME is unset', () => {
+      const res = execFileSync(process.execPath, [GUARD], {
+        input: JSON.stringify({ tool_input: { command: 'cd ~/some-new-daemon-clone && git checkout --detach' }, cwd: lane }),
+        env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, HOME: '' },
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'ignore'],
+      }).trim();
+      // unresolved target → reported cwd (the lane) → the clone is never reached → nothing to deny
+      expect(res).toBe('');
+    });
   });
 });
 
@@ -3559,144 +3725,5 @@ describe('admitted vitest must be one-shot (#4449)', () => {
     expect(line).toBeTruthy();
     const mutated = line.replace(' --run', '');
     for (const k of KINDS) expect(dispatchedAgentVerificationReason(mutated, k)).not.toBeNull();
-  });
-});
-
-
-describe('orchestrator foreground delegation', () => {
-  const commands = [
-    'node scripts/operations/run.mjs verify',
-    'node scripts/operations/run.mjs verify-lane',
-    'node scripts/verify-lane.mjs run',
-    'node scripts/operations/run.mjs open-pr',
-    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/example.test.mjs',
-    'npx vitest run scripts/example.test.mjs',
-    'npm run check:standards', 'npm run test:unit -- scripts/example.test.mjs',
-    'node scripts/daemon-rebuild.mjs', 'node scripts/daemon-load-overlay.mjs',
-    'node scripts/daemon-overlay.mjs add example',
-    'node scripts/codex-direct-task.mjs', 'node scripts/gemini-direct-task.mjs',
-  ];
-  it.each(commands)('delegates %s only in orchestrator mode', command => {
-    expect(decide(command, { orchestratorMode: true })).toContain(
-      'orchestrator session: delegate this to a background light agent (Agent tool, run_in_background, model haiku/sonnet), which runs it in its own foreground');
-    expect(orchestratorDelegateReason(command)).toBeNull();
-    expect(String(decide(command) || '')).not.toMatch(/orchestrator session/);
-    expect(orchestratorDelegateReason(command, { orchestratorMode: true, agentSession: true })).toBeNull();
-    expect(orchestratorDelegateReason(command, { orchestratorMode: true, dispatchKind: 'build' })).toBeNull();
-  });
-  it('uses the configured prefix list, including an empty replacement', () => {
-    const ctx = { orchestratorMode: true, orchestratorDelegateCommands: ['node scripts/custom-slow.mjs run'] };
-    expect(decide('node scripts/custom-slow.mjs run', ctx)).toMatch(/orchestrator session/);
-    expect(decide('node scripts/daemon-rebuild.mjs', ctx)).toBeNull();
-    expect(decide('node scripts/daemon-rebuild.mjs', { ...ctx, orchestratorDelegateCommands: [] })).toBeNull();
-  });
-  it('recognizes executable positions and wrappers without matching mentions', () => {
-    const ctx = { orchestratorMode: true };
-    for (const command of [
-      'cd scripts && node daemon-rebuild.mjs',
-      'env EXAMPLE=1 node scripts/daemon-rebuild.mjs',
-      'timeout 600 node scripts/daemon-rebuild.mjs',
-      "bash -c 'node scripts/daemon-rebuild.mjs'",
-      'node "scripts/daemon-rebuild.mjs"',
-    ]) expect(decide(command, ctx), command).toMatch(/orchestrator session/);
-    for (const command of [
-      'echo "node scripts/daemon-rebuild.mjs"',
-      'node scripts/daemon-rebuild.mjs.bak',
-      'node scripts/other.mjs scripts/daemon-rebuild.mjs',
-      'node scripts/daemon-overlay.mjs status',
-      'node scripts/operations/run.mjs status',
-      "cat <<'EOF'\nnode scripts/daemon-rebuild.mjs\nEOF",
-    ]) expect(orchestratorDelegateReason(command, ctx), command).toBeNull();
-  });
-  it('preserves the existing background verification ban in every session', () => {
-    for (const orchestratorMode of [false, true]) {
-      expect(decide('node scripts/operations/run.mjs verify', { orchestratorMode, runInBackground: true })).toMatch(/#2833/);
-    }
-  });
-  it.each([
-    'node --no-warnings scripts/daemon-rebuild.mjs',
-    'node --require ./preload.cjs --no-warnings -- scripts/daemon-rebuild.mjs',
-    'node --require="./preload file.cjs" scripts/daemon-rebuild.mjs',
-    'env EXAMPLE=1 node --conditions custom --title decoy.mjs scripts/daemon-rebuild.mjs',
-    'node --experimental-default-type module --inspect-port 9230 scripts/daemon-rebuild.mjs',
-    'node --unhandled_rejections strict scripts/daemon-rebuild.mjs',
-    'node --import ./scripts/daemon-rebuild.mjs scripts/other.mjs',
-    'node --import ./scripts/daemon-rebuild.mjs --eval "1"',
-    'node --eval "1" --import ./scripts/daemon-rebuild.mjs',
-    'node --no-warnings "scripts/daemon-"rebuild.mjs',
-    'node --no-warnings scripts/daemon-\\\nrebuild.mjs',
-    'npm --silent run test:unit -- scripts/example.test.mjs',
-    'npm --prefix ./workspace run --silent test:unit -- scripts/example.test.mjs',
-    'npm --loglevel silent run-script --workspace="./workspace dir" test:unit -- scripts/example.test.mjs',
-    'npm --fetch-retries 1 run test:unit -- scripts/example.test.mjs',
-    'npm --heading example run test:unit -- scripts/example.test.mjs',
-    'npm --progress false run test:unit -- scripts/example.test.mjs',
-    'npm --save run test:unit -- scripts/example.test.mjs',
-    'npm --audit run test:unit -- scripts/example.test.mjs',
-    'npm --global run test:unit -- scripts/example.test.mjs',
-    'npx --yes vitest run scripts/example.test.mjs',
-    'bash <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
-    "sh <<'EOF'\nnode --no-warnings scripts/daemon-rebuild.mjs\nEOF",
-    'bash -s <<-EOF\n\tnpm --silent run test:unit -- scripts/example.test.mjs\n\tEOF',
-    'cat <<EOF | bash\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'bash -o errexit <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'bash /dev/stdin <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'bash <<EOF 2>/dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'busybox sh <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'cat <<EOF | bash -o errexit\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'cat <<EOF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
-    "cat <<EOF\n# '$(node scripts/daemon-rebuild.mjs)'\nEOF",
-    "bash -c 'bash <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF'",
-    'bash <<OUTER\nsh <<INNER\nnode scripts/daemon-rebuild.mjs\nINNER\nOUTER',
-    "bash <<< 'node scripts/daemon-rebuild.mjs'",
-    "cat <<< 'data'\nnode scripts/daemon-rebuild.mjs",
-    'echo $((1<<2))\nnode scripts/daemon-rebuild.mjs',
-    '((1<<2))\nnode scripts/daemon-rebuild.mjs',
-  ])('delegates executable options and interpreter heredocs: %s', command => {
-    const ctx = { orchestratorMode: true };
-    expect(orchestratorDelegateReason(command, ctx)).toMatch(/orchestrator session/);
-    expect(decide(command, ctx)).toMatch(/orchestrator session/);
-    const output = execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
-      input: JSON.stringify({ tool_input: { command } }),
-      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '1', WE_CONVEYOR_WORKER: undefined,
-        WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0' }, encoding: 'utf8',
-    });
-    expect(output).toMatch(/orchestrator session/);
-  });
-  it.each([
-    'node --check scripts/daemon-rebuild.mjs',
-    'node --eval "console.log(1)" scripts/daemon-rebuild.mjs',
-    'node -p "1" scripts/daemon-rebuild.mjs',
-    'node --env-file scripts/daemon-rebuild.mjs scripts/other.mjs',
-    'node --title scripts/daemon-rebuild.mjs scripts/other.mjs',
-    'npm --prefix test:unit run lint -- scripts/daemon-rebuild.mjs',
-    "cat <<'EOF'\nnode --no-warnings scripts/daemon-rebuild.mjs\nEOF",
-    'bash script.sh <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'cat <<EOF && bash\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'echo <<EOF | bash\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'cat <<EOF | bash </dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
-    'bash <<EOF </dev/null\nnode scripts/daemon-rebuild.mjs\nEOF',
-    "bash -c 'true' -s <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF",
-    "cat <<'EOF'\n$(node scripts/daemon-rebuild.mjs)\nEOF",
-    'cat <<\\EOF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
-    'cat <<E"OF"\n$(node scripts/daemon-rebuild.mjs)\nEOF',
-    'cat <<E\\OF\n$(node scripts/daemon-rebuild.mjs)\nEOF',
-    "cat <<< 'node scripts/daemon-rebuild.mjs'",
-    'node <<EOF\nconst message = "node scripts/daemon-rebuild.mjs";\nEOF',
-    "bash -c 'cat <<EOF\nnode scripts/daemon-rebuild.mjs\nEOF'",
-    'bash <<EOF\necho "node scripts/daemon-rebuild.mjs"\nEOF',
-  ])('keeps options, mentions and heredoc data distinct: %s', command => {
-    expect(orchestratorDelegateReason(command, { orchestratorMode: true })).toBeNull();
-  });
-  it('wires env detection, source logging and subagent exclusion through hook stdin', () => {
-    const invoke = (event, extraEnv = {}) => execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
-      input: JSON.stringify({ tool_input: { command: 'node scripts/daemon-rebuild.mjs' }, ...event }),
-      env: { ...process.env, WE_ORCHESTRATOR_SESSION: '1', WE_CONVEYOR_WORKER: undefined,
-        WE_DISPATCH_KIND: '', WE_POLICY_CASCADE_LOG: '0', ...extraEnv }, encoding: 'utf8',
-    });
-    expect(invoke({})).toMatch(/orchestrator session/);
-    expect(invoke({ agent_id: 'delegated-agent' })).not.toMatch(/orchestrator session/);
-    expect(invoke({}, { WE_CONVEYOR_WORKER: '1' })).not.toMatch(/orchestrator session/);
-    expect(invoke({}, { WE_ORCHESTRATOR_SESSION: '0' })).not.toMatch(/orchestrator session/);
   });
 });
