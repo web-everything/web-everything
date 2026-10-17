@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
 import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { validateRoutingPolicy, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
@@ -300,8 +300,8 @@ it('inherits feature probation by default and preserves explicit operator pins a
 });
 
 it('routes only card 5209 to Codex through its per-card override', () => {
-  const { data: card } = matter(readFileSync(new URL(
-    '../../../backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md', import.meta.url), 'utf8'));
+  const { data: card } = matter(readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    '../../../backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md'), 'utf8'));
   expect(card.deliveryAgent).toBe('codex');
   const route = decideDispatchRoute({ kind: 'build', size: card.size, scopePaths: card.scope,
     deliveryAgent: card.deliveryAgent, deliveryAgentReason: card.deliveryAgentReason,
