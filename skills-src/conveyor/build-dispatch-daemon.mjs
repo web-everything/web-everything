@@ -521,8 +521,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
   const planningSkipDetail = new Map();
   // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
-  // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
-  // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
+  // four synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
+  // bound this lookahead (including selected group members below) to 32 calls; picks beyond that window still
   // pass the ordinary fail-closed launch guard.
   const inspectedPrepares = new Set();
   const inspectPrepareCooldown = async candidate => {

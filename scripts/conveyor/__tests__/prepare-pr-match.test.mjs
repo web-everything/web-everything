@@ -142,6 +142,10 @@ it('refuses duplicate prepare batch members by exact title identity without gran
   expect(isPreparePrFor(early, { num: '7201', bornAs: 'xabcdef' })).toBe(true);
   expect(isPreparePrFor(early, { num: '7201' })).toBe(false);
   expect(isLanePreparePrFor(early, { num: '7201', bornAs: 'xabcdef' })).toBe(false);
+  const single = { title: 'WE #xabcdef: prepare — scope', headRefName: 'custom-branch', state: 'OPEN' };
+  expect(isPreparePrFor(single, { num: '7201', bornAs: 'xabcdef' })).toBe(true);
+  expect(isPreparePrFor(single, { num: '7201' })).toBe(false);
+  expect(isPreparePrFor({ ...single, title: 'WE #xabcdefg: prepare' }, { num: '7201', bornAs: 'xabcdef' })).toBe(false);
 });
 
 it.each(['7201', '7202'])('recognizes published batch membership for #%s at write grade', num => {

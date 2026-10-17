@@ -35,9 +35,12 @@ export function isPreparePrFor(pr, { num, bornAs }) {
   if (isLanePreparePrFor(pr, { num, bornAs })) return true;
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
+  if (!key) return false;
+  // A title written before numbering names the card by its bornAs id; discovery searches titles under both.
+  const aliases = [key, normNum(bornAs)].filter(Boolean);
   const batch = batchMembers(pr);
-  if (key && [key, normNum(bornAs)].filter(Boolean).some(id => batch?.includes(id))) return true;
-  return Boolean(key) && new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
+  if (aliases.some(id => batch?.includes(id))) return true;
+  return new RegExp(`^WE #(?:${aliases.map(escapeRegex).join('|')}): prepare\\b`).test(pr.title ?? '');
 }
 
 export function preparePrGuard({ num, bornAs, prs = [], lastDispatchAt }) {
