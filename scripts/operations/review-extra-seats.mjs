@@ -427,7 +427,7 @@ function publishable(text) {
  */
 export function buildSeatRows({
   callId, pr, repo, provider, model, effort, seats, call, parsed, claudeFindings, claudeVerdict = null, quota = {}, durationMs = null, evidence = {},
-  changedFiles = null,
+  changedFiles = null, startedAt = null, finishedAt = null,
 }) {
   const provenance = provider?.startsWith('agy-')
     ? { ...agyRunEvidence({ requestedModel: model }), ...pickAgyEvidence(evidence) }
@@ -456,7 +456,7 @@ export function buildSeatRows({
       item: null, handle: `review-${pr}`,
       pr, repo,
       seat: s.seat, lens: s.lens, taskType: reviewSeatTaskType(s.key),
-      callId, status,
+      callId, status, startedAt, finishedAt,
       seatVerdict: status === 'ok' ? seatParse.verdict : null,
       claudeVerdict,
       findingsCount: findings.length,
@@ -627,12 +627,14 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         } catch (e) {
           run = { report: null, error: String(e?.message ?? e) };
         }
+        const finishedAt = new Date(io.now()).toISOString();
         const call = classifySeatCall(provider, run);
         const parsed = call.status === 'ok' ? repoRelativeFindings(parseSeatAnswer(call.text, group), scratch) : {};
         const quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
         const rows = buildSeatRows({
           evidence: run?.report ?? {},
-          callId, pr, repo, provider, model, effort, seats: group, call, parsed, claudeFindings, claudeVerdict, quota, durationMs: io.now() - t0,
+          callId, pr, repo, provider, model, effort, seats: group, call, parsed, claudeFindings, claudeVerdict, quota, durationMs: Date.parse(finishedAt) - t0,
+          startedAt: new Date(t0).toISOString(), finishedAt,
           changedFiles: read.netChangedFiles ?? null,
         });
         for (const row of rows) {
@@ -1295,7 +1297,7 @@ export function redTeamReadFingerprint(read) {
  * prior clean row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
  */
 export async function speculateRedTeam({
-  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, resume = true,
+  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true,
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
@@ -1358,6 +1360,8 @@ export async function speculateRedTeam({
     let call;
     let parsed = {};
     let durationMs = null;
+    let startedAt = null;
+    let finishedAt = null;
     let quota = {};
     let evidence = {};
     let headMessage = '';
@@ -1375,11 +1379,17 @@ export async function speculateRedTeam({
         pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], claudeFindings, openOperatorSendBacks: read.openOperatorSendBacks,
       }));
       const t0 = io.now();
+      startedAt = new Date(t0).toISOString();
+      const observe = (values) => { try { onTiming({ callId, provider, model, effort, rev, startedAt, ...values }); } catch { /* timing never changes review results */ } };
+      observe({ finishedAt: null });
       let run;
       try { run = await io.runSeat({ provider, taskFile, dir: scratch, model, effort, timeoutMs }); } catch (e) { run = { report: null, error: String(e?.message ?? e) }; }
-      durationMs = io.now() - t0;
+      finishedAt = new Date(io.now()).toISOString();
+      durationMs = Date.parse(finishedAt) - t0;
       call = classifySeatCall(provider, run);
       if (call.status === 'ok') parsed = repoRelativeFindings(parseSeatAnswer(call.text, [RED_TEAM_SEAT]), scratch);
+      observe({ finishedAt, verdict: parsed[RED_TEAM_SEAT.key]?.verdict ?? null,
+        findingsCount: parsed[RED_TEAM_SEAT.key]?.findings?.length ?? null });
       evidence = run?.report ?? {};
       quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
     } finally {
@@ -1403,7 +1413,7 @@ export async function speculateRedTeam({
     }
     return {
       status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(read), title: read.title ?? '', body: read.body ?? '',
-      changedFiles: read.netChangedFiles ?? null, provider, model, effort, callId, call, parsed, evidence, quota, durationMs,
+      changedFiles: read.netChangedFiles ?? null, provider, model, effort, callId, call, parsed, evidence, quota, durationMs, startedAt, finishedAt,
       headMessage, findings, recheckStatus, callsUsedToday: usedByProvider[provider] + 1, dailyCap: caps[provider],
     };
   } catch (e) {
@@ -1424,7 +1434,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
     const [seatRow] = buildSeatRows({
-      evidence,
+      evidence, startedAt: pass.startedAt, finishedAt: pass.finishedAt,
       callId, pr, repo, provider, model, effort, seats: [RED_TEAM_SEAT], call, parsed, claudeFindings, claudeVerdict: verdict, quota, durationMs,
       changedFiles: pass.changedFiles ?? null,
     });
@@ -1642,6 +1652,7 @@ if (IS_CLI) {
         result = await speculateRedTeam({
           pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), read: sunk.read, resume: false,
           onReserved: (r) => writeJson(`${outPath}.reserved`, r),
+          onTiming: (r) => writeJson(`${outPath}.reserved`, r),
         });
       }
       writeJson(outPath, { ...result, timings: { startedAt, readAt, finishedAt: Date.now() } });

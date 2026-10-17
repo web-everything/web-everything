@@ -1257,3 +1257,16 @@ false-findings / total-findings percentages without a matching denominator.
 For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
 coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
 separate shadow count and read completeness.
+
+### Review seat timing
+
+Review-pr run records retain `seatTimings` per attempt: seat, lens, provider, model,
+ISO `startedAt`/`finishedAt`, verdict and findingsCount. Parallel seats persist at launch
+and settlement, before declared-order reduction; retries retain separate start instants.
+Extra-seat groups share their model call's instants. The speculative red team retains its
+model call times through finish/discard, excluding sink wait and the subsequent re-check.
+A cancelled call has no observed finish. `node scripts/operations/review-seat-timing.mjs`
+reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR` overrides
+it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
+excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
+Legacy runs without seat observations are omitted; absent times are never reconstructed.

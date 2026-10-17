@@ -385,3 +385,22 @@ describe('calling a speculative pass off kills real processes', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 });
+
+describe('durable run seat timing handoff', () => {
+  it('hands extra seats and the speculative model-call times to the existing run writer', () => {
+    const writes = [];
+    const startedAt = new Date(NOW).toISOString();
+    const finishedAt = new Date(NOW + 120000).toISOString();
+    const spec = { ...PASS, startedAt, finishedAt, parsed: { 'red-team': { verdict: 'accept' } } };
+    const extra = { seat: 'advisory', lens: 'simplicity', provider: 'codex', model: 'test', startedAt, finishedAt, seatVerdict: 'changes', findingsCount: 2 };
+    const { io } = jobIo({ spec, over: {
+      runExtraSeats: () => ({ status: 'ran', seats: [extra] }),
+      recordSeatTimings: (id, rows) => writes.push({ id, rows }),
+    } });
+    runReviewJob({ pr: 5, repo: REPO }, io);
+    const rows = writes.flatMap(w => w.rows);
+    expect(writes.every(w => w.id === 'review-pr-1')).toBe(true);
+    expect(rows).toContainEqual({ seat: 'advisory', lens: 'simplicity', provider: 'codex', model: 'test', startedAt, finishedAt, verdict: 'changes', findingsCount: 2 });
+    expect(rows).toContainEqual({ seat: 'red-team', lens: 'red-team', provider: 'codex', model: null, startedAt, finishedAt, verdict: 'accept', findingsCount: 0 });
+  });
+});
