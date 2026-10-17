@@ -22,7 +22,8 @@
  * Every answer this returns carries `seatProvider: {provider, ...}` so the run record says who actually judged.
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
-import { appendShadowRow, buildShadowRow, compareShadowAnswers } from '../lib/review-shadow-agreement.mjs';
+import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
+import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
 /** The closed set of directive modes this runner accepts. */
@@ -42,7 +43,7 @@ export const SEAT_RUN_MODES = Object.freeze(['agy', 'shadow']);
  */
 export async function runSeatWithProvider(request, {
   claudeJudge, unwrap, wrap, cwd, agyJuror = runAgyReviewJuror, appendRow = appendShadowRow, now = () => Date.now(),
-  log = (m) => console.error(m),
+  log = (m) => console.error(m), reserveSession = reserveShadowSession,
 }) {
   const { seatProvider: directive, ...plain } = request;
   if (!directive || !SEAT_RUN_MODES.includes(directive.mode)) {
@@ -50,6 +51,13 @@ export async function runSeatWithProvider(request, {
   }
   const model = directive.model;
   const runAgy = async (runModel = model) => {
+    if (directive.mode === 'shadow' && directive.dailyCap !== undefined) {
+      const admission = reserveSession({ dailyCap: directive.dailyCap, now: now() });
+      if (!admission.allowed) {
+        logReviewSeat(log, `review-seat: agy shadow skipped: ${admission.reason}`);
+        return { status: 'skipped', reasons: [admission.reason] };
+      }
+    }
     try { return await agyJuror({ request: plain, laneCwd: cwd, model: runModel }); } catch (e) {
       // A thrown error's text reaches the run record and a skipped advisory seat's PR summary: no local paths there.
       return { status: 'failed', reasons: [scrubPaths(e?.message ?? e, [cwd])] };
@@ -74,7 +82,7 @@ export async function runSeatWithProvider(request, {
         agyRun: { ...run, claudeSessionId }, agyAnswer, claudeAnswer: claude.value, comparison, ...extra,
       });
     };
-    if (agyRun.status === 'failed' && typeof directive.fallbackModel === 'string'
+    if (agyRun.status === 'failed' && !isQuotaHeldShadow(agyRun) && typeof directive.fallbackModel === 'string'
       && directive.fallbackModel.trim() && directive.fallbackModel !== model) {
       appendRow(makeRow(agyRun, model, { fellBackTo: directive.fallbackModel }));
       fallbackFrom = { model, status: agyRun.status, reasons: agyRun.reasons ?? [] };

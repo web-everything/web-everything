@@ -99,8 +99,8 @@ export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowMod
     // Group identical directives; a policy may give the two seats different routing models.
     const groups = new Map();
     for (const lens of lenses) {
-      const d = seatProviderDirective({ ...settings, shadowPolicy: undefined }, lens);
-      const description = `${settings.shadowPolicy.shadowEnabled ? 'enabled (PR sample)' : 'off (setting)'}; model ${d.model} (source: ${sources[d.modelSource] ?? 'routing-policy'}${d.fallbackModel ? `; fallback ${d.fallbackModel} from routing-policy` : ''})`;
+      const d = modelDirective(settings, lens, 'shadow');
+      const description = `${settings.shadowPolicy.shadowEnabled ? 'enabled (scope selection)' : 'off (setting)'}; model ${d.model} (source: ${sources[d.modelSource] ?? 'routing-policy'}${d.fallbackModel ? `; fallback ${d.fallbackModel} from routing-policy` : ''})`;
       groups.set(description, [...(groups.get(description) ?? []), lens]);
     }
     for (const [description, seats] of groups) {
@@ -124,25 +124,37 @@ export function seatProviderDirective(settings, lens, context) {
   if (!mode || mode === 'claude') return null;
   if (mode === 'shadow' && shadowSeatStatus(settings, context) !== 'sampled') return null;
   if (!SEAT_PROVIDERS.includes(mode)) throw new TypeError(`review-seat-provider: unknown seat provider ${JSON.stringify(mode)}`);
+  return modelDirective(settings, lens, mode);
+}
+
+// Model selection is also used for logging disabled seats; it does not grant admission.
+function modelDirective(settings, lens, mode) {
   const model = settings.seatModel?.[lens] ?? settings.agyModel;
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
+  const budget = mode === 'shadow' && settings.shadowPolicy ? { dailyCap: settings.shadowPolicy.dailyCap ?? 100 } : {};
   const override = settings.shadowModelOverride;
   if (mode === 'shadow' && override?.model && override.model !== model) {
-    return Object.freeze({ mode, model: override.model, fallbackModel: model, modelSource: override.source, onEscape: 'claude' });
+    return Object.freeze({ ...budget, mode, model: override.model, fallbackModel: model, modelSource: override.source, onEscape: 'claude' });
   }
   // No override: today's directive, unchanged. The runner reads an absent `modelSource` as `routing-policy`.
-  return Object.freeze({ mode, model, onEscape: 'claude' });
+  return Object.freeze({ ...budget, mode, model, onEscape: 'claude' });
 }
 
 /** Stable PR-level sampling, shared across both mandatory lenses and all review rounds.
  * Missing identity refuses sampling. Rates at or above 1 are never eligible.
- * Pure routing-policy projections have no operational policy; live settings always carry one.
+ * A routing-policy projection alone does not enable shadows; operational policy is required.
  */
-export function shadowSeatStatus(settings, { repo, pr } = {}) {
+export function shadowSeatStatus(settings, { repo, pr, earnedShape, careLevel, reasons = [], humanRequired } = {}) {
   const policy = settings?.shadowPolicy;
-  if (!policy) return 'sampled';
+  if (!policy) return 'off (setting)';
   if (!policy.shadowEnabled) return 'off (setting)';
   if (typeof repo !== 'string' || !repo.trim() || !Number.isSafeInteger(Number(pr)) || Number(pr) < 1) return 'off (missing PR identity)';
+  if ((policy.scope ?? 'high-care') === 'high-care') {
+    const shape = earnedShape ?? { careLevel, reasons, humanRequired };
+    const sensitive = shape.humanRequired === true || (shape.reasons ?? []).some((r) =>
+      /^(gate-self|gate-derivation|permission-change|principle-surface|statute|security|merge-gate|review|human-only)(?:\s|$)/.test(r));
+    return ['elevated', 'high'].includes(shape.careLevel) || sensitive ? 'sampled' : 'off (routine PR)';
+  }
   const rate = policy.sampleRate;
   if (typeof rate !== 'number' || rate < 0 || rate >= 1) return 'off (invalid sample rate)';
   const bucket = createHash('sha256').update(`${repo.trim().toLowerCase()}#${Number(pr)}`).digest().readUInt32BE(0);

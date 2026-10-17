@@ -1,0 +1,67 @@
+/**
+ * Card 5966: prepare #5399 was created over 24 hours ago but merged only 21 minutes
+ * before duplicate #5438 launched. Scope moving after prepare must not bypass the
+ * post-merge guard. Exercise the real live build-dispatch tick, not just the matcher.
+ */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+const GUARD = 'scripts/conveyor/prepare-pr-match.mjs';
+
+export default {
+  id: 'merged-prepare-guard-measures-from-merge',
+  title: 'An old-created, recently merged prepare permits a duplicate after scope moves',
+  card: '5966 / PRs 5399, 5438',
+  fixedBy: {
+    sha: 'e3e18b0a2a0f928f6d8d17e33c276a9ced15e348',
+    where: 'main',
+    paths: [GUARD],
+  },
+  fixPresent(root) {
+    return readFileSync(resolve(root, GUARD), 'utf8').includes('pr.mergedAt ?? pr.closedAt ?? pr.createdAt');
+  },
+  async run() {
+    const { runBuildDispatchTick } = await import(resolve(ROOT, 'skills-src/conveyor/build-dispatch-daemon.mjs'));
+    const claimed = [], dispatched = [];
+    const effects = {
+      now: () => Date.parse('2026-10-16T20:53:36Z'),
+      planTick: () => ({ decisions: {
+        itemPrepareSpawns: [{ num: '5966' }],
+        admission: { queue: [{ num: '5966' }], cleared: [], held: [{
+          num: '5966', reason: 'prepare-stale',
+          detail: 'scope changed since 2026-10-16T20:32:38Z',
+        }] },
+      }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      listPrepareInFlight: () => [], listPrepareFailures: () => [], listPrepareReleases: () => [],
+      killSwitch: () => ({ engaged: false }),
+      readPreparedStamp: () => ({ preparedDate: '2026-10-16', preparedAgainstSha: 'a'.repeat(40) }),
+      listPreparePrs: () => [{
+        number: 5399, state: 'MERGED', headRefName: 'lane/5966-prepare-stand-down',
+        title: 'WE #5966: prepare', isCrossRepository: false,
+        createdAt: '2026-10-15T17:18:00Z', mergedAt: '2026-10-16T20:32:38Z',
+      }],
+      acquirePrepareClaim: ({ num }) => { claimed.push(num); return { ok: true }; },
+      releasePrepareClaim: () => {}, placePrepareHold: () => {}, releasePrepareHold: () => {},
+      dispatch: request => { dispatched.push(request); return { dispatching: true }; },
+    };
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    return { claimed, dispatchCount: dispatched.length, launched: tick.prepare.launched, refused: tick.prepare.refused };
+  },
+  judge(report) {
+    const problems = [];
+    if (report.claimed.length || report.dispatchCount || report.launched.length) {
+      problems.push('recently merged #5399 allowed a duplicate prepare claim/launch (#5438 shape)');
+    }
+    const refusal = report.refused.find(row => row.num === '5966');
+    if (refusal?.reason !== 'merged prepare PR #5399 (within 24h guard)') {
+      problems.push('missing merged-prepare refusal for #5399');
+    }
+    if (!refusal?.note?.includes('scope moved after prepare: scope changed since ')) {
+      problems.push('missing scope-moved reconciliation note');
+    }
+    return problems;
+  },
+};

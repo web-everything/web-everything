@@ -279,6 +279,7 @@ it('cannot reduce clean juror answers to accept while an operator send-back rema
 /** Card 84 — both mandatory seats shadowed by agy, plus the advisory agy seat. */
 const AGY_SEAT_SETTINGS = Object.freeze({
   seatProvider: { correctness: 'shadow', security: 'shadow' }, agyModel: 'claude-opus-5-5-high', agyCorrectnessAdvisory: true,
+  shadowPolicy: { shadowEnabled: true, scope: 'high-care', dailyCap: 100 },
 });
 
 // ── PROPERTY 1: THE DIFF ARRIVES ON THE NET BASIS ─────────────────────────────────────────────────────────
@@ -4750,6 +4751,27 @@ describe('operator review diversity minimum', () => {
     } });
     expect(verdict.nonClaudeSeats).toBe(2);
     expect(verdict.nonClaudeSeatShortfall).toBeNull();
+  });
+});
+
+describe('Gemini admission and the Codex roster', () => {
+  it('Gemini admission settings preserve the requested Codex roster', () => {
+    for (const securitySeat of [true, false]) {
+      for (const codexAdvisory of [false, true]) {
+        for (const correctnessAdvisory of [false, true]) {
+          for (const shadowPolicy of [undefined, { shadowEnabled: false, scope: 'high-care', dailyCap: 100 },
+            { shadowEnabled: true, scope: 'sampled', sampleRate: 0.1, dailyCap: 0 }]) {
+            const declaration = reviewPrOperation({ readPr: stubReader(), securitySeat, codexAdvisory,
+              correctnessAdvisory, seatSettings: { shadowPolicy } });
+            expect(declaration.steps.filter(s => ['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory']
+              .includes(s.name)).map(s => s.name)).toEqual([
+              'judge', ...(securitySeat ? ['judgeSecurity'] : []), ...(codexAdvisory ? ['judgeAdvisory'] : []),
+              ...(correctnessAdvisory ? ['judgeCorrectnessAdvisory'] : []),
+            ]);
+          }
+        }
+      }
+    }
   });
 });
 
