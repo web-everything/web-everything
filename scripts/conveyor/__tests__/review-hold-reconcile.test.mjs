@@ -532,6 +532,76 @@ it('restamps numbering before the stale-accept heal and skips that heal', () => 
   expect(p.calls.set).toEqual([]);
 });
 
+it.each([false, true])('preserves the numbering carry kill switch with injected runner=%s', injected => {
+  vi.stubEnv('WE_ACCEPT_CARRY_FORWARD', 'off');
+  try {
+    const runner = vi.fn();
+    const p = provider({ readPrState: () => ({ comments: [{ author: { login: 'chalbert' },
+      body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->` }] }) });
+    p.readPrReviews = () => [];
+    const result = sweepFixture({ repo: 'o/n', provider: p,
+      listPrs: () => [pr(5025, ['review:pending'])], ...(injected ? { acceptCarry: runner } : {}),
+      numberingRestamp: opts => {
+        expect(opts).not.toHaveProperty('acceptCarry');
+        return restampAfterNumbering({ ...opts, enabled: true,
+          prove: () => { throw Error('kill switch must prevent proof'); } });
+      } });
+    expect(result.some(r => r.numberingRestamp)).toBe(false);
+    expect(runner).not.toHaveBeenCalled();
+  } finally { vi.unstubAllEnvs(); }
+});
+describe('review.skipDrainMechanical only narrows the accept-carry setting, never turns carry on', () => {
+  const accepted = () => provider({ readPrState: () => ({ comments: [{ author: { login: 'chalbert' },
+    body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->` }] }) });
+  const sweep = (env) => {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+    _resetNumberingRestampMemo();
+    const p = accepted(); p.readPrReviews = () => [];
+    const proof = vi.fn(() => ({ ok: true, reason: 'verified' }));
+    const result = sweepFixture({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(5025, ['review:pending'])],
+      numberingRestamp: opts => restampAfterNumbering({ ...opts, enabled: true, readNetDiff: () => null, prove: proof }) });
+    return { proof, result };
+  };
+  afterEach(() => { vi.unstubAllEnvs(); _resetNumberingRestampMemo(); });
+  it('acceptCarryForward=off still disables the numbering carry with skipDrainMechanical on', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'off', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' });
+    expect(proof).not.toHaveBeenCalled();
+    expect(result.some(r => r.numberingRestamp)).toBe(false);
+  });
+  it('skipDrainMechanical=false stops the hold-reconcile numbering carry with acceptCarryForward on', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'on', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'false' });
+    expect(proof).not.toHaveBeenCalled();
+    expect(result.some(r => ['restamped', 'would-restamp'].includes(r.numberingRestamp))).toBe(false);
+  });
+  it('both on: the carry still proves and plans', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'on', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' });
+    expect(proof).toHaveBeenCalledTimes(1);
+    expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'would-restamp' }));
+  });
+});
+it('keeps the injected restamp runner out of the numbering setting', () => {
+  let options;
+  sweepFixture({ repo: 'o/n', provider: provider(), listPrs: () => [pr(5025, ['review:pending'])],
+    acceptCarry: vi.fn(), numberingRestamp: opts => { options = opts; return null; } });
+  expect(options).not.toHaveProperty('acceptCarry');
+});
+
+it('still proves and plans numbering carry with an injected accept runner', () => {
+  vi.stubEnv('WE_ACCEPT_CARRY_FORWARD', 'on');
+  _resetNumberingRestampMemo();
+  try {
+    const p = provider({ readPrState: () => ({ comments: [{ author: { login: 'chalbert' },
+      body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->` }] }) });
+    p.readPrReviews = () => [];
+    const proof = vi.fn(() => ({ ok: true, reason: 'verified' }));
+    const result = sweepFixture({ repo: 'o/n', provider: p, dryRun: true,
+      listPrs: () => [pr(5025, ['review:pending'])], acceptCarry: vi.fn(),
+      numberingRestamp: opts => restampAfterNumbering({ ...opts, enabled: true, readNetDiff: () => null, prove: proof }) });
+    expect(proof).toHaveBeenCalledTimes(1);
+    expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'would-restamp' }));
+  } finally { vi.unstubAllEnvs(); _resetNumberingRestampMemo(); }
+});
+
 it('keeps an unsatisfied mandatory referral held on the daemon numbering path', () => {
   _resetNumberingRestampMemo();
   const p = provider({ readPrState: () => ({ comments: [

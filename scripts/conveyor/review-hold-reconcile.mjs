@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * @file scripts/conveyor/review-hold-reconcile.mjs
  * @description THE REVIEW-HOLD RECONCILE SWEEP (#x01u7az) — a one-time-and-ongoing cleanup pass for two
@@ -162,7 +163,12 @@ export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
+  skipDrainMechanical,
 } = {}) {
+  // An unreadable timing policy withholds only the numbering carry (fail closed), never the whole sweep.
+  if (skipDrainMechanical === undefined) {
+    try { skipDrainMechanical = resolveTimingPolicy().review.skipDrainMechanical; } catch { skipDrainMechanical = false; }
+  }
   const prs = listPrs({ repo });
   const startedAt = now();
   for (const [k, until] of strandedChecked) if (until <= startedAt) strandedChecked.delete(k);
@@ -252,6 +258,9 @@ export function sweepReviewHoldLabels({
       });
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
+        // The accept-carry setting (resolveAcceptCarryForward) stays authoritative: the drain-mechanical skip only
+        // narrows it, by withholding this numbering carry when off. It never passes 'on'.
+        ...(skipDrainMechanical === false ? { acceptCarry: 'off' } : {}),
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
       // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
       // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.

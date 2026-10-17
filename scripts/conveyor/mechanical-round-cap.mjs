@@ -191,10 +191,19 @@ function structuredMarkerLines(body) {
     const s = REVIEWED_MARKER_LINE.exec(line);
     const n = s ? null : NET_BASIS_LINES.map((re) => re.exec(line)).find(Boolean);
     if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase(), at: i });
-    else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase(), at: i });
+    else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase(), at: i, line });
   }
   const slot = basisSlot(lines, lastRule);
-  return out.filter((m) => m.kind === 'reviewed-sha' || m.at === slot).map(({ kind, sha }) => ({ kind, sha }));
+  return out.filter((m) => m.kind === 'reviewed-sha' || m.at === slot).map(({ kind, sha, line }) => ({ kind, sha, line }));
+}
+
+/**
+ * The producer's own `Net basis` line at the fixed footer slot (the one {@link reviewedHeadsOf} may read), as
+ * `{sha, line}`, or null. A quoted, fenced or juror-written basis line is never returned. Pure.
+ */
+export function basisLineOf(c) {
+  const m = structuredMarkerLines(bodyOf(c)).find((row) => row.kind === 'net-basis');
+  return m ? { sha: m.sha, line: m.line } : null;
 }
 
 /**

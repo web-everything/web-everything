@@ -3,8 +3,9 @@ import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
-import { createReviewPrSinks } from '../review-pr-io.mjs';
-import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
+import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
 /**
  * @file review-pr.test.mjs — the `review-pr` declaration and its derived command line (#3035).
  *
@@ -1494,6 +1495,23 @@ describe('the write-up reports the seats that ACTUALLY judged, and no others', (
     const { run } = atConfirm({ registry, input: { ...BASE_INPUT, lens }, id: `run-wu-${lens}` });
     return renderVerdictWriteUp({ read: run.findings.read, verdict: run.verdict, answer: 'accept', actor: 'op' });
   };
+
+  it('records the full-review anchor in the footer: its own head, or the delta chain anchor', () => {
+    const { registry } = registryFor({});
+    const { run } = atConfirm({ registry, input: { ...BASE_INPUT }, id: 'run-wu-anchor' });
+    const { read, verdict } = { read: run.findings.read, verdict: run.verdict };
+    const anchor = 'c'.repeat(40);
+    const pinned = { ...read, netBasis: { ...read.netBasis, rev: 'd'.repeat(40) } };
+    for (const render of [r => renderVerdictWriteUp({ read: r, verdict, answer: 'changes', actor: 'op' }), r => renderAdvisoryNote({ read: r, verdict })]) {
+      expect(render(pinned)).toContain(`Full-review anchor: \`${'d'.repeat(40)}\``);
+      expect(render({ ...pinned, deltaReview: { anchor } })).toContain(`Full-review anchor: \`${anchor}\``);
+    }
+    // The anchor rides on the basis line, so a posted bounce still names the head it judged and its anchor.
+    const bounce = { author: { login: 'web-everything' }, body: buildVerdictComment({ to: 'changes', actor: 'op', channel: REVIEW_PR_CHANNEL,
+      body: renderVerdictWriteUp({ read: { ...pinned, deltaReview: { anchor } }, verdict, answer: 'changes', actor: 'op' }) }) };
+    expect(reviewedHeadsOf(bounce)).toEqual(['d'.repeat(40)]);
+    expect(fullReviewAnchor([bounce], 'd'.repeat(40))).toBe(anchor);
+  });
 
   it('lists BOTH mandatory lenses now that both judged — and still no lens as `(no verdict)`', () => {
     const body = writeUp(DEFAULT_LENS);
@@ -3875,6 +3893,7 @@ describe('xfkqowg historical ruling replay', () => {
       editComment: (id, body) => { trace.push('referral'); state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; } };
     const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
+      readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }),
       mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
     const first = records[0];
     let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: runId,
@@ -4321,7 +4340,7 @@ describe('held item 177: a stacked accept declares and applies only the stack ho
     const root = mkdtempSync(joinPath(tmpdir(), 'stack-hold-effects-'));
     try {
       const posted = []; const shelled = [];
-      const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+      const sinks = createReviewPrSinks({ root, out: () => {}, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
         runNode: (argv) => { shelled.push(argv); return '{"ok":true}'; } });
       const { declared } = await drive({ answer: 'accept', id: 'run-stack-apply' });
       const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);

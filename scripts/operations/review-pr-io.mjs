@@ -1,3 +1,7 @@
+import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
+import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -73,7 +77,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 // behind it) into a CI job. Re-exported below: every existing importer of this module is unchanged.
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
-import { REVIEW_EFFECTS } from './review-pr.mjs';
+import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
@@ -211,7 +215,7 @@ export function readPr({
   // an operator sees WHERE it looked rather than only that it failed. Message-only; decides nothing.
   probed = null,
   // Card 5469 — the declared `scopedRereview` mode (we:scripts/review-settings.json); injectable for tests.
-  scopedRereview = null,
+  scopedRereview = null, timingPolicy = resolveTimingPolicy().review,
   // Card 5471 — the declared `roundBudget` K, and the ledger reader the round count comes from; injectable for tests.
   roundBudget = null,
   readLedgerRows = defaultReadLedgerRows,
@@ -308,6 +312,32 @@ export function readPr({
       } catch { stackBase = null; }
     }
   }
+  const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
+  let deltaReview = null;
+  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
+    try {
+      const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
+        { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
+      const sizeSince = from => {
+        const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', from, revSha],
+          { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
+        return { files: stat.length, lines: stat.reduce((sum, row) => {
+          const [a, d] = row.split('\t');
+          return /^\d+$/.test(a) && /^\d+$/.test(d) ? sum + Number(a) + Number(d) : NaN;
+        }, 0) };
+      };
+      const { lines, files } = sizeSince(latestFix.priorHead);
+      // The caps bound the TOTAL change since the last full review too, so small rounds cannot add up unreviewed.
+      const anchor = fullReviewAnchor(view.comments, latestFix.priorHead);
+      const total = anchor === latestFix.priorHead ? { lines, files } : anchor ? sizeSince(anchor) : null;
+      const delta = size => rereviewMode({ priorHead: latestFix.priorHead, head: revSha, ...size, policy: timingPolicy }) === 'delta';
+      if (total && delta({ lines, files }) && delta(total)) {
+        // Retain the FULL net basis/fingerprint for acceptance and roster checks. Only the juror diff is narrowed.
+        deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files, anchor, totalLines: total.lines, totalFiles: total.files, text,
+          priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
+      }
+    } catch { /* unreadable delta requires full review */ }
+  }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
 
@@ -339,7 +369,7 @@ export function readPr({
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
     net: { ...netPaths, revSha },
-    latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
+    latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
     // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
@@ -482,6 +512,38 @@ export function resolveScopedRereviewMode(explicit = null, { settings = resolveR
   try { return SCOPED_REREVIEW_MODES.includes(settings().scopedRereview) ? settings().scopedRereview : 'off'; } catch { return 'off'; }
 }
 
+const CHANGES_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
+/**
+ * Is a review verdict newer than the prior head's own review still outstanding? A post-accept red-team bounce (or any
+ * changes / advisory verdict) carries no reviewed-head marker for `priorHead`, so a delta review would drop its
+ * findings and the unchanged code they cite. Unreadable chronology, or a thread at the `gh pr view` comment page cap
+ * (the newest bounce may be cut off), counts as outstanding. Pure.
+ */
+export function outstandingVerdictSince(comments, priorHead) {
+  if (Array.isArray(comments) && comments.length >= PR_COMMENTS_PAGE_SIZE) return true;
+  const trusted = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string');
+  const tied = c => reviewedHeadsOf(c).includes(priorHead);
+  const others = trusted.filter(c => !tied(c) && (isReviewVerdictComment(c) || CHANGES_HEADING_RE.test(c.body)));
+  if (!others.length) return false;
+  const at = c => Date.parse(c.createdAt ?? '');
+  const reviewedAt = Math.max(...trusted.filter(tied).map(at));
+  return !Number.isFinite(reviewedAt) || others.some(c => !(at(c) < reviewedAt));
+}
+
+/**
+ * The head of the last FULL review in `priorHead`'s chain, read ONLY from the producer's `Net basis` slot line of the
+ * trusted verdicts that judged `priorHead` (juror text cannot reach that slot). `null` forces a full review: no anchor
+ * at all (a verdict that predates the anchor, a degraded basis, or a restamp / carry / clear-human record that judged
+ * nothing), or two different anchors. Pure.
+ */
+export function fullReviewAnchor(comments, priorHead) {
+  const anchors = new Set((Array.isArray(comments) ? comments : [])
+    .filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string' && reviewedHeadsOf(c).includes(priorHead))
+    .map(basisLineOf).filter(b => b && priorHead.startsWith(b.sha))
+    .map(b => FULL_REVIEW_ANCHOR.exec(b.line)?.[1]).filter(Boolean));
+  return anchors.size === 1 ? [...anchors][0] : null;
+}
+
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */
 export const LATEST_FIX_DIFF_MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -497,9 +559,8 @@ export function readLatestFixRange(options = {}) {
     const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
     for (const comment of (Array.isArray(comments) ? comments : []).slice().reverse()) {
       if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
-      // The LAST line-anchored match: the renderer emits the real `Net basis:` line after the juror text, so a line
-      // forged above it by a PR author must not choose the prior head.
-      const reviewed = [...comment.body.matchAll(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/gim)].at(-1)?.[2]?.toLowerCase();
+      // The producer-validated footer names the reviewed head; quoted or forged juror text cannot select a basis.
+      const reviewed = reviewedHeadsOf(comment).at(-1)?.toLowerCase();
       if (reviewed && (!current || (!reviewed.startsWith(current) && !current.startsWith(reviewed)))) {
         priorHead = reviewed;
         break;
@@ -840,6 +901,8 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  publishGate = readReviewCiGate,
+  readPublishHead = readReviewHead,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -876,7 +939,28 @@ export function createReviewPrSinks({
   readLedgerRows = defaultReadLedgerRows,
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
-} = {}) {
+ } = {}) {
+  const assertPublishable = async payload => {
+    if (!payload.reviewedHead) throw notApplied('review void: missing reviewed head');
+    const policy = resolveTimingPolicy({ env }).review;
+    const args = { repo: payload.repo, pr: payload.pr, expectedHead: payload.reviewedHead };
+    const assertHead = async () => {
+      let currentHead;
+      try { currentHead = await readPublishHead(args); } catch { /* An unreadable head cannot authorize publication. */ }
+      if (reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead }))
+        throw notApplied('review void: head moved or current head could not be read');
+    };
+    await assertHead();
+    if (!policy.cancelOnCiRed) return;
+    let ci;
+    try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
+    catch { /* CI read faults do not void a completed review. The head is checked independently. */ }
+    if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead)
+      || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks,
+        requiredChecks: ci?.requiredChecks, policy }))
+      throw notApplied('review void: head moved or CI became red');
+    await assertHead();
+  };
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
@@ -1332,6 +1416,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
+      await assertPublishable(payload);
       // The SAME run-scoped path effect 0 wrote — both sinks derive it from `ctx.runId`, which is one run's id
       // for every effect in that run, so 1 always posts the write-up 0 staged and never a sibling run's.
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
@@ -1497,6 +1582,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
+      await assertPublishable(payload);
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -1521,6 +1607,7 @@ export function createReviewPrSinks({
     // `postComment` is the exact primitive that single home itself calls for its own comment write, so this
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
     [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
+      await assertPublishable(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };
     },
