@@ -20,6 +20,16 @@ the policy checks at most 100 entries of at most 600 characters each, deduplicat
 While the pinned clone exists, paths must resolve to regular files inside it; missing files,
 Git metadata, and symlinks escaping the clone are discarded. This validates reported evidence;
 it does not prove a tool actually read the file or confine the tool's filesystem access.
+Re-check reasons use a fixed vocabulary (`demonstrated break`, `relevant code refutes claim`,
+`insufficient evidence`); unknown text becomes `reason withheld`. Enforce this in the answer
+schema, parser, and publication paths, including completion of saved speculative passes and
+legacy comment retries. Pattern-based secret scrubbing cannot safely publish arbitrary text
+from a juror with filesystem access. Regression coverage: **withholds unrecognized re-check
+reasons at every publication sink**. Filesystem read confinement remains separate work.
+Provider failure text can contain raw juror output too: re-check statuses use fixed values
+(`ok`, `pending`, `not-needed`, `error`), including saved-pass completion and legacy retries.
+Regression coverage: **withholds raw juror errors and legacy re-check statuses from stored and
+public evidence**.
 Regression coverage: **scrubs unsafe filesRead at the comment and evidence sinks**,
 **scrubs filesRead when completing speculative evidence and retrying legacy rows**, and
 **the production re-check uses an independent pinned lane and cleans it**.
@@ -31,7 +41,13 @@ match unsafe inputs such as `"file"`, while serialization can hide control chara
 (`scripts/settings/red-team.json`'s `redTeam` block) → environment
 (`WE_RED_TEAM_RECHECK_READS_REPO`, `WE_RED_TEAM_SKIP_CARD_ONLY`; true/false, on/off, 1/0).
 Effective values and sources are logged before probes. Card-only detection reuses
-`ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list; unknown/empty lists do not skip.
+`ci-card-only.mjs#isCardOnlyDiff` on the net changed-file list plus `netRenameSources` (both
+rename and copy sources); unknown/empty destination lists or malformed source lists do not skip.
+Moves into or out of `backlog/` probe whenever either side is code; card-to-card moves still skip.
+Regression coverage: **includes rename sources before deciding to skip probes**, covering both
+sequential and speculative paths. The speculative fingerprint also includes rename sources.
+Replay derives rename/copy sources from diff headers using the review reader's existing parser;
+**replay retains rename/copy sources so code moved into backlog still probes** pins that wiring.
 The sequential and speculative paths skip before budget reservation and record the reason
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
