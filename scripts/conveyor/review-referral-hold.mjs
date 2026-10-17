@@ -15,6 +15,18 @@ import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
+import { readStore, resolveScorecardStorePath } from './run-scorecard-store.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+
+// review-extra-seats -> review-pr -> reconcile-core -> this module. A static import breaks cold ESM startup.
+// Load only on an eligible decision, after module initialization. Until ready, retain the hold (next daemon tick).
+let redTeamReaders;
+let redTeamReadersLoading;
+/** Test seam: wait for the same lazy readers a daemon decision starts. @test-only-export-ok */
+export function loadRedTeamHoldReaders() {
+  return redTeamReadersLoading ??= import('../operations/review-extra-seats.mjs')
+    .then(readers => { redTeamReaders = readers; }, () => {});
+}
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -230,7 +242,53 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now() } = {}) {
+/** A saved post-accept result owes its comment, not another model call. Reserve the single release BEFORE
+ * returning it: mkdir is exclusive across processes; the receipt is written atomically inside it. A crash or
+ * failed write leaves the reservation spent (fail closed), never an unbounded retry on every daemon tick.
+ * State lives beside review-referral-notices and survives daemon restarts. No job-log parser is introduced.
+ */
+function rearmOwedRedTeam(pr, { repo, env, now, redTeam: {
+  storePath = resolveScorecardStorePath(env),
+  settingsPath = join(REPO_ROOT, 'scripts', 'settings', 'red-team.json'),
+  stateDir = join(dirname(resolveRunsDir()), 'review-red-team-rearms'),
+  commentsReadable = true, log = line => console.error(line),
+} = {} }) {
+  try {
+    if (!repo || !sha(pr.headRefOid) || !Array.isArray(pr.comments) || !commentsReadable) return false;
+    if (!redTeamReaders) { void loadRedTeamHoldReaders(); return false; }
+    const { priorRedTeamRow, redTeamCommentPosted } = redTeamReaders;
+    const file = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
+    // The cascade's convenience reader skips platform read failures. Here a read failure must retain the hold.
+    const { prefs, errors } = readPlatformPreferences({ env });
+    if (errors.length) return false;
+    const pick = block => block?.reArmOnMissingComment === undefined ? {}
+      : { reArmOnMissingComment: block.reArmOnMissingComment };
+    const raw = env.WE_RED_TEAM_REARM_ON_MISSING_COMMENT;
+    const value = String(raw ?? '').trim().toLowerCase();
+    const envValues = raw === undefined || raw === '' ? {} : { reArmOnMissingComment:
+      ['true', 'on', '1'].includes(value) ? true : ['false', 'off', '0'].includes(value) ? false : raw };
+    const policy = cascadePolicy('redTeam', pick(file.redTeam), {
+      standard: { reArmOnMissingComment: true }, platform: pick(prefs.redTeam), envValues,
+      valid: v => typeof v === 'boolean', env, log,
+    });
+    if (!policy.value.reArmOnMissingComment || redTeamCommentPosted(pr.comments, pr.number, pr.headRefOid)) return false;
+    // priorRedTeamRow scopes pr/head itself; the shared store spans repositories, so scope repo first.
+    const { records } = readStore({ path: storePath });
+    if (!priorRedTeamRow(records.filter(r => r?.repo === repo), pr.number, pr.headRefOid)) return false;
+    mkdirSync(stateDir, { recursive: true });
+    const reservation = join(stateDir, hash([repo, Number(pr.number), pr.headRefOid]));
+    mkdirSync(reservation); // EEXIST (including an incomplete prior attempt) keeps the normal hold.
+    const receipt = join(reservation, 'receipt.json');
+    const tmp = `${receipt}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ repo, pr: Number(pr.number), head: pr.headRefOid, liftedAt: now }));
+    renameSync(tmp, receipt);
+    log(`${repo}#${pr.number}: same-head hold lifted once for owed red-team comment at ${pr.headRefOid}`);
+    return true;
+  } catch { return false; }
+}
+
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), redTeam } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
@@ -246,6 +304,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // bounded to VERDICT_RETRY_EXTRA extra runs, and past that keep the hold with an explicit reason.
   const noVerdict = verdictNeverLanded(pr, last, now);
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
+  if (rearmOwedRedTeam(pr, { repo, env, now, redTeam })) return null;
   const head = pr.headRefOid;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
@@ -272,24 +331,27 @@ function defaultReadComments({ repo, number }) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
 }
 
-export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence,
-  readComments = defaultReadComments } = {}) {
+export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env,
+  readRuns = readReviewRunEvidence, readComments = defaultReadComments, redTeam } = {}) {
   const runs = readRuns();
   return prs.map(pr => {
+    let commentsReadable = true;
     // List reads cap comments at 100; later operator events must reach both hold decisions.
     if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
       && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
       try {
         const full = readComments({ repo, number: pr.number });
         if (Array.isArray(full)) pr = { ...pr, comments: full };
+        else commentsReadable = false;
       }
-      catch { /* Keep the list snapshot when the full thread is unavailable. */ }
+      catch { commentsReadable = false; /* Keep the snapshot, but don't infer an owed comment from a failed read. */ }
     }
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, env, now,
+        redTeam: { ...redTeam, commentsReadable } })) };
   });
 }
 
