@@ -46,4 +46,45 @@ describe('describeDispatchFailure', () => {
 
 describe('redactSpawnText', () => {
   it('is a no-op on clean text', () => { expect(redactSpawnText('nothing secret')).toBe('nothing secret'); });
+
+  // PR #5472 red team: opaque credential values (no token shape) are redacted by position and by name.
+  it('redacts a whole --settings object however it is nested or quoted', () => {
+    for (const s of [`--settings {"worktree":{"a":"b"},"env":{"X":"opaque1"}} tail`, `--settings '{"env":{"X":"opaque1"}}' tail`,
+      `--settings={"env":{"S":"{\\"a\\":{}}","X":"opaque1"}} tail`]) {
+      expect(redactSpawnText(s, { env: {} })).toBe('--settings <redacted> tail');
+    }
+  });
+  it('redacts every value of an env object, whatever the key is called', () => {
+    expect(redactSpawnText('{"env":{"WHATEVER":"opaque1"},"ok":1}', { env: {} })).toBe('{"env":"<redacted>","ok":1}');
+  });
+  it('keeps JSON-encoded text parseable when it redacts inside it', () => {
+    const text = JSON.stringify({ error: 'x --settings {"env":{"A":"opaque1"}} y', inner: 'z {"env":{"A":"opaque1"}}' });
+    const out = redactSpawnText(text, { env: {} });
+    expect(out).not.toContain('opaque1');
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+  it('redacts credential-named values in shell, JSON, header and URL forms', () => {
+    const out = redactSpawnText([
+      'GH_TOKEN=opaque1', 'export ANTHROPIC_API_KEY=opaque2', '{"api_key":"opa\\"que3"}', 'Authorization: Basic opaque4',
+      'https://u:opaque5@host/x', 'password: opaque6', 'KEY_ID=opaque7',
+    ].join(' '), { env: {} });
+    expect(out).not.toMatch(/opaque|que3/);
+  });
+  it("redacts the literal value of this process's own credential-named env vars", () => {
+    expect(redactSpawnText('child said: s3cretValue!!', { env: { SOME_SECRET: 's3cretValue!!' } })).toBe('child said: <redacted-env>');
+  });
+  it('stays linear on long adversarial text', () => {
+    const started = Date.now();
+    for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000)]) {
+      redactSpawnText(text, { env: {} });
+    }
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('still reaches a credential that follows a non-credential name', () => {
+    expect(redactSpawnText('Command failed: GH_TOKEN=opaque1 claude', { env: {} })).toBe('Command failed: GH_TOKEN=<redacted> claude');
+  });
+  it('leaves ordinary words alone', () => {
+    const text = 'author: me, keyboard monkey; session name "fix-3794" is already in use';
+    expect(redactSpawnText(text, { env: {} })).toBe(text);
+  });
 });
