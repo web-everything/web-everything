@@ -644,6 +644,33 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // a plain `${NAME}` read is no grouping
     expect(at('X=${Y}; D=~/x; cd "$D" && ls')).toBe(`${HOME}/x`);
   });
+  it('comment text binds nothing and runs no cd for a home spelling or home-derived name', () => {
+    for (const cmd of [
+      'true # ; cd ~/lane\ngit status',
+      'true # ; D=~/lane\ncd "$D" && ls',
+      'x=1 # ; D=~/a\ncd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    // HOME is untouched by comment text, so `cd ~` lands in the real home
+    expect(at('true # ; HOME=/evil\ncd ~ && ls')).toBe(HOME);
+    expect(at('D=~/a; true # ; D=/x\ncd "$D" && ls')).toBe(`${HOME}/a`);
+    expect(at('true # ; cd ~/x\ncd ~/clone && ls')).toBe(`${HOME}/clone`);
+  });
+  it('a reassignment the literal walk does not read still makes a home-derived name unknown', () => {
+    for (const cmd of [
+      'D=$HOME/lane; if true; then D=/prim; fi; cd "$D" && ls',
+      'D=$HOME/lane; { D=/prim; }; cd "$D" && ls',
+      'D=$HOME/lane; true && { D=/prim; }; cd "$D" && ls',
+      'D=$HOME/lane; declare D=/prim; cd "$D" && ls',
+      'D=$HOME/lane; D+=x; cd "$D" && ls',
+      'D=$HOME/lane; read D; cd "$D" && ls',
+      'D=$HOME/lane; for D in /prim; do :; done; cd "$D" && ls',
+      'D=$HOME/lane; D[0]=/prim; cd "$D" && ls',
+      'D=$HOME/lane; A=1 D=/prim; cd "$D" && ls',
+      'D=$HOME/lane; printf -v D /prim; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    // a bare export / readonly keeps the value, and reading it is no rebinding
+    expect(at('D=~/lane; export D; readonly D; echo "$D"; cd "$D" && ls')).toBe(`${HOME}/lane`);
+  });
   it('a later unreadable reassignment of a home-derived name leaves it unknown', () => {
     for (const cmd of [
       'D=$HOME/a; D=$(pwd); cd "$D" && ls',

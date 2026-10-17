@@ -2545,6 +2545,7 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const usableHome = (h) => (typeof h === 'string' && h.startsWith('/') && !/[*?[]/.test(h) ? h : null);
   const initialHome = usableHome(home);
   const homeAfter = (stmt, h, at) => {
+    if (commented[at]) return h;                              // comment text (`true # ; HOME=/x`) binds nothing
     const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
     if (!assignment) return h;
     const val = assignment[1].trim();
@@ -2563,8 +2564,22 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     else vars[name] = value;
     (history[name] ??= []).push({ at, value });
   };
+  // Names a statement may bind in a form the literal walk does not read (`{ D=/x; }`, `then D=/x`, `A=1 D=/x`,
+  // `D+=x`, `D[0]=x`, `declare D=/x`, `read D`, `for D in …`): a home-derived name learns it changed there.
+  // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`.
+  const BINDING_WORDS = /(?:^|[\s;&|(){}!])(?:local|read|for|select|mapfile|readarray|printf\s+-v|unset|let|getopts|eval|source|\.)(?=\s)/;
+  const reboundNames = (text) => (BINDING_WORDS.test(text)
+    ? text.match(/[A-Za-z_]\w*/g) ?? []
+    : [...text.matchAll(/(?:^|[^\w$])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/g)].map((r) => r[1]));
   parsed.segments.forEach((stmt, at) => {
+    if (commented[at]) {
+      // comment text binds nothing in bash; main still read a literal there, so keep that for ordinary names
+      const c = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(\S+)$/);
+      if (c && !/[`$(~]/.test(c[2])) vars[c[1]] = c[2].replace(/^(['"])(.*)\1$/, '$2');
+      return;
+    }
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
+    for (const name of reboundNames(m ? m[2] : stmt)) (history[name] ??= []).push({ at, value: undefined });
     if (m) {
       const val = m[2].trim();
       const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes
@@ -2599,7 +2614,10 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
     const raw = cd[1].trim();
-    if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) {
+    const homeSpelled = /^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw);
+    // a `cd` inside comment text (`true # ; cd ~/x`) never runs; a home-spelled one is not this PR's to resolve
+    if (commented[at] && (homeSpelled || homeNames.has(raw.match(/^"?\$\{?([A-Za-z_]\w*)/)?.[1]))) continue;
+    if (homeSpelled) {
       if (!bashCd) return reportedCwd;
       const target = expandCdTarget(bashCd[1], currentHome);
       if (target) return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
