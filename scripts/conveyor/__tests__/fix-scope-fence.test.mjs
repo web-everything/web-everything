@@ -1,6 +1,6 @@
 import { beforeAll, describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -141,6 +141,15 @@ describe('fix scope fence', () => {
     expect(defaults.sources['scopeFence.enabled']).toBe('standard');
     const invalid = resolveScopeFence({ env: { WE_FIX_SCOPE_FENCE_ENABLED: 'nonsense', WE_FIX_SCOPE_FENCE_MODE: 'push' }, platform: { scopeFence: { mode: 'warn' } }, tool: { scopeFence: { enabled: 'yes', mode: false } } });
     expect(invalid.value.scopeFence).toEqual({ enabled: true, mode: 'warn' }); expect(invalid.invalid).toHaveLength(4);
+  });
+  it('states the shipped fix.scopeFence.mode default in the fixer brief and testing doc', () => {
+    const shipped = resolveScopeFence({ env: {}, platform: {}, tool: {} }).value.scopeFence.mode;
+    const settings = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/fix-scope-fence.json'), 'utf8'));
+    expect(settings.fix.scopeFence.mode).toBe(shipped);
+    const brief = readFileSync(join(process.cwd(), 'skills-src/conveyor/fix-agent-brief.md'), 'utf8');
+    expect(brief.match(/`fix\.scopeFence\.mode` defaults `([\w-]+)`/)?.[1]).toBe(shipped);
+    const doc = readFileSync(join(process.cwd(), 'docs/agent/testing.md'), 'utf8');
+    expect(doc.match(/`fix\.scopeFence\.mode` \([^)]*default `([\w-]+)`/)?.[1]).toBe(shipped);
   });
   it('observes a real git diff re-adding a function after a marked removal commit', () => {
     const dir = mkdtempSync(join(tmpdir(), 'fix-scope-fence-'));
