@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { ownReviewScratch, removeReviewScratch } from '../lib/review-scratch.mjs';
+import { ownReviewScratch, removeReviewScratch, retainReviewScratch } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
@@ -757,12 +757,49 @@ export function withLedgerLock(path, fn, { timeoutMs = LEDGER_LOCK_TIMEOUT_MS, s
 /** @param {{env?:object, root?:string, storePath?:string, lockTimeoutMs?:number}} [o] — `storePath` pins the store (tests); default is the shared one. */
 /** Card xbizuci — the pids of the seat CLIs this process has running (each the leader of its own process group). */
 export const ACTIVE_SEAT_PIDS = new Set();
+const ACTIVE_SEAT_PROCESSES = new Map();
+let stoppingSeats = false;
 
-/** Card xbizuci — kill every running seat's process group. Used when a speculative red team is called off. */
-export function killActiveSeats(signal = 'SIGKILL') {
-  for (const pid of ACTIVE_SEAT_PIDS) {
-    try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
-  }
+function trackSeat(child, signal = 'SIGTERM') {
+  if (!child.pid) return child;
+  ACTIVE_SEAT_PIDS.add(child.pid);
+  const closed = new Promise(resolveClosed => child.once('close', resolveClosed));
+  ACTIVE_SEAT_PROCESSES.set(child.pid, { closed, signal });
+  child.once('close', () => {
+    ACTIVE_SEAT_PIDS.delete(child.pid);
+    ACTIVE_SEAT_PROCESSES.delete(child.pid);
+  });
+  return child;
+}
+
+function stopSeat(pid) {
+  const seat = ACTIVE_SEAT_PROCESSES.get(pid);
+  if (seat?.stopping) return seat.stopping;
+  // Direct-task wrappers own a second detached model group. Let their TERM handler
+  // kill that group before the wrapper exits; SIGKILL would orphan the model.
+  const signal = seat?.signal ?? 'SIGTERM';
+  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+  let timer;
+  let poll;
+  const closed = seat?.closed ?? new Promise(resolveClosed => {
+    poll = setInterval(() => { if (!ACTIVE_SEAT_PIDS.has(pid)) resolveClosed(); }, 20);
+  });
+  const stopping = Promise.race([
+    closed,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('review seat did not close after stop')), 10000); }),
+  ]).finally(() => { clearTimeout(timer); clearInterval(poll); });
+  if (seat) seat.stopping = stopping;
+  return stopping;
+}
+
+/** Stop every seat and wait for close before scratch cleanup, including speculative cancellation. */
+export function killActiveSeats() {
+  stoppingSeats = true;
+  if (!ACTIVE_SEAT_PIDS.size) return;
+  return Promise.all([...ACTIVE_SEAT_PIDS].map(stopSeat)).catch(error => {
+    retainReviewScratch();
+    throw error;
+  });
 }
 
 export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storePath, lockTimeoutMs = LEDGER_LOCK_TIMEOUT_MS } = {}) {
@@ -825,19 +862,24 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
+      if (stoppingSeats) {
+        resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
+        return;
+      }
       const argv = seatCallArgv({ provider, taskFile, dir, model, effort, timeoutMs, root });
       let out = '';
       let err = '';
       let timedOut = false;
-      const child = spawn(process.execPath, argv, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+      const child = trackSeat(spawn(process.execPath, argv, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }));
       // Card xbizuci — a seat runs in its OWN process group (detached), so a speculative red team that is called off
       // must kill it explicitly: killing the parent's group would leave the seat CLI running and spending.
-      if (child.pid) ACTIVE_SEAT_PIDS.add(child.pid);
-      child.on('exit', () => { ACTIVE_SEAT_PIDS.delete(child.pid); });
       // Outer wall above the script's own: gemini may take two half-budget attempts; codex one full one.
       const wall = setTimeout(() => {
         timedOut = true;
-        try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+        if (child.pid) stopSeat(child.pid).catch(error => {
+          retainReviewScratch(dir);
+          resolvePromise({ report: null, error: error.message, stderr: err.slice(-4000), timedOut });
+        });
       }, timeoutMs + 90_000);
       child.stdout.on('data', (d) => { out += d; });
       child.stderr.on('data', (d) => { err += d; if (err.length > 200_000) err = err.slice(-100_000); });
@@ -1609,7 +1651,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       const configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
       // Repo tools require Claude's enforceable allow-list. Other providers cannot honor it.
       if (readsRepo && configured && configured.provider !== 'claude') throw new Error('repo re-check requires the Claude read-only tool allow-list');
-      const spawn = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
+      const spawnJudge = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
       let scratch = null;
       let parent = null;
       try {
@@ -1625,10 +1667,16 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           removeReviewScratch(scratch); // release the old, now empty path from ownership
           scratch = null;
         }
-        const out = await spawn({
+        const out = await spawnJudge({
           mandate, input, shape, model: configured?.model ?? RECHECK_MODEL, effort: configured?.effort ?? resolveOperationEffort("review-recheck", "claude"), budget: RECHECK_BUDGET_USD,
           ...(readsRepo ? { cwd, allowedTools: ['Read', 'Glob', 'Grep'] } : {}),
           runId: `red-team-recheck-${pr}-${randomUUID()}`, lens: 'red-team-recheck', env, timeoutMs: 10 * 60 * 1000,
+          // Recheck providers spawn the model CLI itself, so it can be killed
+          // directly. A PID-targeted launcher signal does not reach its group.
+          spawnFn: (cli, argv, options) => {
+            if (stoppingSeats) throw new Error('review seats are stopping');
+            return trackSeat(spawn(cli, argv, { ...options, detached: true }), 'SIGKILL');
+          },
         });
         // Validate while the pinned checkout still exists; callers retain only safe relative paths.
         const value = out.value;
@@ -1698,7 +1746,6 @@ if (IS_CLI) {
     // accounted for. SIGTERM (the job calling it off) kills the running seat CLI's own process group first.
     const outPath = flag('out');
     const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(value)}\n`); renameSync(tmp, path); };
-    process.on('SIGTERM', () => { killActiveSeats('SIGKILL'); process.exit(143); });
     const waitMs = Number(flag('wait-ms')) > 0 ? Number(flag('wait-ms')) : 45 * 60 * 1000;
     const startedAt = Date.now();
     const readSunk = () => { try { return existsSync(flag('read-sink')) ? JSON.parse(readFileSync(flag('read-sink'), 'utf8')) : null; } catch { return null; } };

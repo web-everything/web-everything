@@ -1542,6 +1542,14 @@ setup as well as the run's `finally`, and register catchable signal/exit cleanup
 host crashes require the health-watch backstop. Ephemeral review paths bypass the persistent
 backlog index to avoid a full snapshot for every seat.
 
+Signal cleanup stops seats before deleting their checkouts. Direct-task wrappers receive
+SIGTERM so their handlers can kill the models' separate detached process groups; cleanup
+waits for wrapper close. The outer timeout follows the same stop path. Re-check jurors
+are tracked too. Repeated signals cannot interrupt that wait or start another seat.
+A synchronous process exit requests shutdown and retains any checkout whose stop cannot
+be awaited. A stop that does not close within ten seconds also retains scratch, including
+through callers' `finally` blocks, for the health-watch sweeper.
+
 Each health-watch tick sweeps `we-review-seat-*` and `we-overlay-dispatch-smoke-*` older than
 `config.json`'s `tmp.reviewSeatTtlMin` (120 minutes), preserving live owner PIDs and process
 working directories. Unknown cwd observation preserves checkouts. It also caps all
