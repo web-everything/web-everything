@@ -550,6 +550,35 @@ it.each([false, true])('preserves the numbering carry kill switch with injected 
     expect(runner).not.toHaveBeenCalled();
   } finally { vi.unstubAllEnvs(); }
 });
+describe('review.skipDrainMechanical only narrows the accept-carry setting, never turns carry on', () => {
+  const accepted = () => provider({ readPrState: () => ({ comments: [{ author: { login: 'chalbert' },
+    body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->` }] }) });
+  const sweep = (env) => {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+    _resetNumberingRestampMemo();
+    const p = accepted(); p.readPrReviews = () => [];
+    const proof = vi.fn(() => ({ ok: true, reason: 'verified' }));
+    const result = sweepFixture({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(5025, ['review:pending'])],
+      numberingRestamp: opts => restampAfterNumbering({ ...opts, enabled: true, readNetDiff: () => null, prove: proof }) });
+    return { proof, result };
+  };
+  afterEach(() => { vi.unstubAllEnvs(); _resetNumberingRestampMemo(); });
+  it('acceptCarryForward=off still disables the numbering carry with skipDrainMechanical on', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'off', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' });
+    expect(proof).not.toHaveBeenCalled();
+    expect(result.some(r => r.numberingRestamp)).toBe(false);
+  });
+  it('skipDrainMechanical=false stops the hold-reconcile numbering carry with acceptCarryForward on', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'on', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'false' });
+    expect(proof).not.toHaveBeenCalled();
+    expect(result.some(r => ['restamped', 'would-restamp'].includes(r.numberingRestamp))).toBe(false);
+  });
+  it('both on: the carry still proves and plans', () => {
+    const { proof, result } = sweep({ WE_ACCEPT_CARRY_FORWARD: 'on', WE_REVIEW_SKIP_DRAIN_MECHANICAL: 'true' });
+    expect(proof).toHaveBeenCalledTimes(1);
+    expect(result).toContainEqual(expect.objectContaining({ num: 5025, numberingRestamp: 'would-restamp' }));
+  });
+});
 it('keeps the injected restamp runner out of the numbering setting', () => {
   let options;
   sweepFixture({ repo: 'o/n', provider: provider(), listPrs: () => [pr(5025, ['review:pending'])],

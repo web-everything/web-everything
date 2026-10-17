@@ -1123,6 +1123,17 @@ function pinnedSha(value) {
 }
 
 /**
+ * The footer line naming the head of the last FULL review; a delta review's cumulative cap is measured from it. Plain
+ * text like `Net basis:`, because the verdict writer escapes HTML comments in a posted body.
+ */
+export const FULL_REVIEW_ANCHOR_LINE = /^Full-review anchor: `([0-9a-f]{40})`/gm;
+/** A full review anchors on its own head; a delta review carries its chain's anchor forward. Unpinned: no line. */
+export function renderFullReviewAnchor(read) {
+  const sha = read?.deltaReview ? pinnedSha(read.deltaReview.anchor) : pinnedSha(read?.netBasis?.rev);
+  return sha ? `Full-review anchor: \`${sha}\`${read?.deltaReview ? ' (this was a delta review)' : ' (this review)'}` : '';
+}
+
+/**
  * SHAPE-CHECK one `readPr` result and turn it into the `read` finding. PURE — separated from the injected read
  * so the refusal below is testable without touching `gh` or `git`.
  *
@@ -1911,7 +1922,8 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so the `
       + 'file list below may be inflated by sibling-lane content this PR does not touch (#2450).'
     : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
+      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
+      + (renderFullReviewAnchor(read) ? `\n${renderFullReviewAnchor(read)}` : '');
   return [
     body,
     ...renderDeferredAdvisorySection({ read, verdict }),
@@ -2211,7 +2223,8 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     ? `⚠️ DEGRADED BASIS (\`${read.degradedReason}\`) — the net diff vs current main could not be resolved, so `
       + 'the file list above may be inflated by sibling-lane content this PR does not touch (#2450).'
     : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
-      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
+      + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`
+      + (renderFullReviewAnchor(read) ? `\n${renderFullReviewAnchor(read)}` : '');
   return [
     `${ADVISORY_NOTE_MARKER} ${reasonLine}`,
     'This PR carries `review:human`. The independent',

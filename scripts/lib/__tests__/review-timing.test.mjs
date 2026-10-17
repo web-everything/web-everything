@@ -62,9 +62,22 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(false);
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('CodeQL', 'failure')] })).toBe(true);
   });
+  it.each([
+    ['review-gate red', [check('review-gate', 'failure')], false],
+    ['merge-gate red on a review hold', [check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } })], false],
+    ['plain merge-gate red', [check('merge-gate', 'failure')], true],
+  ])('required %s: healable=%s, the same rule the CI heal uses (#5463)', (_name, rows, healable) => {
+    const requiredChecks = ['test', 'review-gate', 'merge-gate'];
+    const checks = [...rows, check('test'), ...fast.map(n => check(n))];
+    expect(ciRedOnHead({ headSha: head, checks, requiredChecks })).toBe(healable);
+    expect(fixReadiness({ headSha: head, checks, requiredChecks }).ciFailed).toBe(healable);
+    for (const startAfter of ['fast-checks', 'push'])
+      expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks, policy: { ...review, startAfter } }).allowed).toBe(!healable);
+    expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(healable);
+  });
   it('a review-dependent gate is never healable red, even when branch protection requires it', () => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
-    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure'), check('test')];
+    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } }), check('test')];
     expect(ciRedOnHead({ headSha: head, checks: gates, requiredChecks })).toBe(false);
     expect(fixReadiness({ headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
     for (const startAfter of ['fast-checks', 'push'])

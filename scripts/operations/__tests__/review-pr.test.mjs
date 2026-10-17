@@ -1495,6 +1495,17 @@ describe('the write-up reports the seats that ACTUALLY judged, and no others', (
     return renderVerdictWriteUp({ read: run.findings.read, verdict: run.verdict, answer: 'accept', actor: 'op' });
   };
 
+  it('records the full-review anchor in the footer: its own head, or the delta chain anchor', () => {
+    const { registry } = registryFor({});
+    const { run } = atConfirm({ registry, input: { ...BASE_INPUT }, id: 'run-wu-anchor' });
+    const { read, verdict } = { read: run.findings.read, verdict: run.verdict };
+    const anchor = 'c'.repeat(40);
+    for (const render of [r => renderVerdictWriteUp({ read: r, verdict, answer: 'accept', actor: 'op' }), r => renderAdvisoryNote({ read: r, verdict })]) {
+      if (read.netBasis.rev) expect(render(read)).toContain(`Full-review anchor: \`${read.netBasis.rev}\``);
+      expect(render({ ...read, deltaReview: { anchor } })).toContain(`Full-review anchor: \`${anchor}\``);
+    }
+  });
+
   it('lists BOTH mandatory lenses now that both judged — and still no lens as `(no verdict)`', () => {
     const body = writeUp(DEFAULT_LENS);
     expect(body).toContain(`| ${DEFAULT_LENS} | mandatory | accept |`);

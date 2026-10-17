@@ -400,12 +400,18 @@ Outside the configured fast-check prerequisite, only required CI failures block
 early review; optional failures have no CI-heal
 owner and must not strand a pending review. Every new review refusal needs an
 identified dispatcher or external event that clears it. Review-dependent gates
-(`review-gate`, `merge-gate`) never cancel a review. Publication requires a pinned,
+never count as healable red, even when required: `review-gate` always, and
+`merge-gate` when its red is a review hold (the CI heal's rule since #5463). A plain
+required `merge-gate` failure is healable. Publication requires a pinned,
 unchanged head even when CI is unreadable; CI reads are skipped with cancellation
 off, and CI read faults alone do not discard a completed verdict.
 
 A changed head gets a delta review when additions plus deletions are at most
-`review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3). Binary or
+`review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3), both for
+this fix and for the total change since the last FULL review. Each verdict's footer
+records that full review's head (`Full-review anchor:`); a full review anchors on its
+own head. A missing anchor means the prior review was full; two different anchors
+on the prior head's verdicts force a full review. Binary or
 unreadable deltas get full review. So does a head with a verdict newer than the
 prior head's review (a post-accept red-team bounce carries no reviewed-head
 marker, so a delta would drop its findings), and a thread at the 100-comment read
@@ -420,7 +426,9 @@ The independent carry controls still apply: `WE_ACCEPT_CARRY_FORWARD` and
 `scripts/settings/accept-carry-forward.json` govern accept/numbering carry;
 `WE_REVIEW_CARRY_ACROSS_REBASE` and `scripts/settings/review.json`'s
 `carryAcrossRebase` govern rebase carry. Disabling either writer's own control
-prevents it from carrying even when `skipDrainMechanical` is true.
+prevents it from carrying even when `skipDrainMechanical` is true, and
+`skipDrainMechanical=false` stops the review-hold sweep's numbering carry; it never
+turns a carry on.
 
 `fix.joinCiAndReview` defaults true. When CI failures and head-local review
 findings are both ready, one existing fix worker gets both inputs. When the

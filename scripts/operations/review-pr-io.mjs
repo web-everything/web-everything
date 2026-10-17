@@ -77,7 +77,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 // behind it) into a CI job. Re-exported below: every existing importer of this module is unchanged.
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
-import { REVIEW_EFFECTS } from './review-pr.mjs';
+import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR_LINE } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
@@ -318,15 +318,22 @@ export function readPr({
     try {
       const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
         { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
-      const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', latestFix.priorHead, revSha],
-        { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
-      const lines = stat.reduce((sum, row) => {
-        const [a, d] = row.split('\t');
-        return /^\d+$/.test(a) && /^\d+$/.test(d) ? sum + Number(a) + Number(d) : NaN;
-      }, 0);
-      if (rereviewMode({ priorHead: latestFix.priorHead, head: revSha, lines, files: stat.length, policy: timingPolicy }) === 'delta') {
+      const sizeSince = from => {
+        const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', from, revSha],
+          { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
+        return { files: stat.length, lines: stat.reduce((sum, row) => {
+          const [a, d] = row.split('\t');
+          return /^\d+$/.test(a) && /^\d+$/.test(d) ? sum + Number(a) + Number(d) : NaN;
+        }, 0) };
+      };
+      const { lines, files } = sizeSince(latestFix.priorHead);
+      // The caps bound the TOTAL change since the last full review too, so small rounds cannot add up unreviewed.
+      const anchor = fullReviewAnchor(view.comments, latestFix.priorHead);
+      const total = anchor === latestFix.priorHead ? { lines, files } : anchor ? sizeSince(anchor) : null;
+      const delta = size => rereviewMode({ priorHead: latestFix.priorHead, head: revSha, ...size, policy: timingPolicy }) === 'delta';
+      if (total && delta({ lines, files }) && delta(total)) {
         // Retain the FULL net basis/fingerprint for acceptance and roster checks. Only the juror diff is narrowed.
-        deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files: stat.length, text,
+        deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files, anchor, totalLines: total.lines, totalFiles: total.files, text,
           priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
       }
     } catch { /* unreadable delta requires full review */ }
@@ -521,6 +528,18 @@ export function outstandingVerdictSince(comments, priorHead) {
   const at = c => Date.parse(c.createdAt ?? '');
   const reviewedAt = Math.max(...trusted.filter(tied).map(at));
   return !Number.isFinite(reviewedAt) || others.some(c => !(at(c) < reviewedAt));
+}
+
+/**
+ * The head of the last FULL review in `priorHead`'s chain, from the producer anchor line on the trusted verdicts that
+ * judged `priorHead`. No line: that review predates delta review, so it was full and anchors on itself. Two different
+ * values (a quoted or forged line beside the producer's): `null`, which forces a full review. Pure.
+ */
+export function fullReviewAnchor(comments, priorHead) {
+  const anchors = new Set((Array.isArray(comments) ? comments : [])
+    .filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string' && reviewedHeadsOf(c).includes(priorHead))
+    .flatMap(c => [...c.body.matchAll(FULL_REVIEW_ANCHOR_LINE)].map(m => m[1])));
+  return anchors.size === 0 ? priorHead : anchors.size === 1 ? [...anchors][0] : null;
 }
 
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */

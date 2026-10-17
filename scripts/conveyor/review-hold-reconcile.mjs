@@ -163,6 +163,7 @@ export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now,
+  skipDrainMechanical = resolveTimingPolicy().review.skipDrainMechanical,
 } = {}) {
   const prs = listPrs({ repo });
   const startedAt = now();
@@ -253,7 +254,9 @@ export function sweepReviewHoldLabels({
       });
       const r = numberingRestamp({ repo: slug, pr: pr.number, state, reviews, provider, dryRun, cwd: noCheckout ? undefined : cwd,
         readNetDiff, readLiveState, exec, guardReferrals: assertMandatoryReferralsCleared,
-        ...(!resolveTimingPolicy().review.skipDrainMechanical ? { acceptCarry: 'off' } : {}),
+        // The accept-carry setting (resolveAcceptCarryForward) stays authoritative: the drain-mechanical skip only
+        // narrows it, by withholding this numbering carry when off. It never passes 'on'.
+        ...(skipDrainMechanical === false ? { acceptCarry: 'off' } : {}),
         ...(noCheckout ? { prove: () => ({ ok: false, retryable: true, reason: 'no checkout for repository' }) } : {}) });
       // A pass that withdrew, posted or failed is read again next pass. A clean one settles the check until it expires —
       // briefly when the formal reviews were unreadable, since without them a record they strand looks like any other.

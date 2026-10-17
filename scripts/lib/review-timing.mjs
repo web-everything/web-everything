@@ -36,12 +36,19 @@ const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_requi
  * we:scripts/operations/pr-status.mjs#CI_TRUTH_EXCLUDED_CHECKS (a test pins that this list covers it).
  */
 export const NON_HEALABLE_CHECKS = Object.freeze(['review-gate', 'merge-gate', 'soak-replay-gate']);
-/** Red while a review is owed, so never a CI failure — even when branch protection requires them. */
-const REVIEW_DEPENDENT_GATES = Object.freeze(['review-gate', 'merge-gate']);
+/**
+ * A review hold, never a CI failure — even when branch protection requires the check. Same rule as the CI heal's
+ * `reviewHoldRed` (#5463): `review-gate` always, `merge-gate` when its red is a review hold (`mergeGateReviewHold`,
+ * attached by we:scripts/lib/merge-gate-hold-class.mjs#excuseMergeGateRows). A plain required merge-gate red is healable.
+ */
+export const isReviewHoldGate = row => {
+  const name = row?.name ?? row?.context;
+  return name === 'review-gate' || (name === 'merge-gate' && !!row.mergeGateReviewHold);
+};
 /** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
 const isHealable = (row, requiredChecks) => {
   const name = row.name ?? row.context;
-  if (REVIEW_DEPENDENT_GATES.includes(name)) return false;
+  if (isReviewHoldGate(row)) return false;
   return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
 };
 /** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
@@ -89,7 +96,7 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
  */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
   const latest = collapseRollupToLatestPerName(checks).filter(row =>
-    !REVIEW_DEPENDENT_GATES.includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
+    !isReviewHoldGate(row) && (!row.head_sha || row.head_sha === headSha));
   const failed = latest.filter(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]

@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchReview } from '../review-dispatch.mjs';
 import { dispatchReviewJob, createReviewJobIo } from '../review-job.mjs';
-import { readPr, createReviewPrSinks } from '../review-pr-io.mjs';
-import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS } from '../review-pr.mjs';
+import { readPr, createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderFullReviewAnchor } from '../review-pr.mjs';
 import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../../lib/review-label-provider.mjs';
@@ -148,6 +148,56 @@ it('requires a full review when a confirmed post-accept red-team break is still 
   // A thread at the gh comment page cap may hide the newest bounce: full review.
   const filler = Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, () => ({ author: { login: 'someone' }, body: 'note' }));
   expect(readDeltaFixture(prior => [acceptAt(prior, '2026-10-17T10:00:00Z'), ...filler]).deltaReview).toBeNull();
+});
+
+it('caps the cumulative delta since the last full review: three small deltas, the third is reviewed in full', () => {
+  const root = mkdtempSync(join(tmpdir(), 'review-timing-'));
+  const git = (...args) => String(execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+  const lines = n => Array.from({ length: 20 }, (_, i) => `delta ${n} line ${i}\n`).join('');
+  try {
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.test'); git('config', 'user.name', 'Fixture');
+    writeFileSync(join(root, 'file.txt'), 'base\n'); git('add', '.'); git('commit', '-qm', 'base');
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    let content = 'base\noriginal contribution\n';
+    writeFileSync(join(root, 'file.txt'), content); git('commit', '-qam', 'feature');
+    const comments = [];
+    const review = () => {
+      const head = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', head);
+      const raw = readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
+        exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+        readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: head,
+          labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
+      // The posted verdict carries the producer's anchor line through the real verdict writer.
+      const shaped = shapeReadFinding(raw, { pr: 7, repo: 'o/n' });
+      comments.push(bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: head,
+        body: `findings\n\n${renderFullReviewAnchor(shaped)}` }), new Date(Date.UTC(2026, 9, 17, 10, comments.length)).toISOString()));
+      return { head, raw };
+    };
+    const full = review();
+    expect(full.raw.deltaReview).toBeNull();
+    const modes = [];
+    for (const n of [1, 2, 3]) {
+      content += lines(n); writeFileSync(join(root, 'file.txt'), content); git('commit', '-qam', `fix ${n}`);
+      const { raw } = review();
+      modes.push(raw.deltaReview ? 'delta' : 'full');
+      if (raw.deltaReview) expect(raw.deltaReview).toMatchObject({ anchor: full.head, lines: 20, files: 1 });
+    }
+    // 20 + 20 lines stay within deltaMaxLines (50); the third brings the total since the full review to 60.
+    expect(modes).toEqual(['delta', 'delta', 'full']);
+    // The full third review re-anchors the chain on its own head, so the next small fix is a delta again.
+    content += lines(4); writeFileSync(join(root, 'file.txt'), content); git('commit', '-qam', 'fix 4');
+    expect(review().raw.deltaReview).toMatchObject({ anchor: git('rev-parse', 'HEAD~1'), lines: 20 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('reads the full-review anchor fail-closed: a second anchor value in the thread forces a full review', () => {
+  const prior = 'b'.repeat(40);
+  const tied = body => bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: prior, body }));
+  const line = sha => renderFullReviewAnchor({ deltaReview: { anchor: sha } });
+  expect(fullReviewAnchor([tied('x')], prior)).toBe(prior); // a verdict without the line predates delta review: full
+  expect(fullReviewAnchor([tied(line('c'.repeat(40)))], prior)).toBe('c'.repeat(40));
+  expect(fullReviewAnchor([tied(`${line('c'.repeat(40))}\n${line(prior)}`)], prior)).toBeNull();
+  // An untrusted author's line is never read.
+  expect(fullReviewAnchor([tied('x'), { author: { login: 'someone' }, body: `<!-- reviewed-sha: ${prior} -->\n${line('c'.repeat(40))}` }], prior)).toBe(prior);
 });
 
 it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {
