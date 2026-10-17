@@ -1,18 +1,27 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dayWindow, classifyPaths, snapshot, writeHistory, backfillDates, protocolProgress, collectMerged, resolveSettings, collectDay, collectAgreement, main } from '../delivery-metrics.mjs';
 import { collectExecutorLogs } from '../coroner-executors.mjs';
 
-// Native imports in shared readers must observe the same spies as this test.
+// Vitest can snapshot named builtin imports before syncBuiltinESMExports runs.
+// Forward both import styles through the same real fs object so shared readers
+// and the lock helper observe the spies, while all filesystem operations stay real.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    ...Object.fromEntries(['openSync', 'closeSync', 'readSync', 'readFileSync', 'writeFileSync', 'renameSync', 'unlinkSync']
+      .map(key => [key, (...args) => actual.default[key](...args)])),
+  };
+});
+
 const traceFs = () => {
   for (const key of ['openSync', 'closeSync', 'readSync', 'readFileSync', 'writeFileSync', 'renameSync', 'unlinkSync']) vi.spyOn(fs, key);
-  syncBuiltinESMExports();
 };
-afterEach(() => { vi.restoreAllMocks(); syncBuiltinESMExports(); });
+afterEach(() => vi.restoreAllMocks());
 
 const settings = { delivery: { metrics: { deliveryPaths: ['scripts/conveyor/', 'scripts/operations/'], protocols: [] } } };
 const available = rows => ({ rows, source: 'fixture' });
