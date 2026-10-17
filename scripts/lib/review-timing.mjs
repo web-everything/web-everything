@@ -36,9 +36,12 @@ const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_requi
  * we:scripts/operations/pr-status.mjs#CI_TRUTH_EXCLUDED_CHECKS (a test pins that this list covers it).
  */
 export const NON_HEALABLE_CHECKS = Object.freeze(['review-gate', 'merge-gate', 'soak-replay-gate']);
+/** Red while a review is owed, so never a CI failure — even when branch protection requires them. */
+const REVIEW_DEPENDENT_GATES = Object.freeze(['review-gate', 'merge-gate']);
 /** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
 const isHealable = (row, requiredChecks) => {
   const name = row.name ?? row.context;
+  if (REVIEW_DEPENDENT_GATES.includes(name)) return false;
   return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
 };
 /** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
@@ -86,7 +89,7 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
  */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
   const latest = collapseRollupToLatestPerName(checks).filter(row =>
-    !['review-gate', 'merge-gate'].includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
+    !REVIEW_DEPENDENT_GATES.includes(row.name ?? row.context) && (!row.head_sha || row.head_sha === headSha));
   const failed = latest.filter(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]

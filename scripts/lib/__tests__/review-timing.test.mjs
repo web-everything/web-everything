@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
-  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS } from '../review-timing.mjs';
+  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const head = 'a'.repeat(40);
@@ -61,6 +61,18 @@ describe('parallel review start and void', () => {
     // Unknown set: the CI-heal rule — soak-replay-gate is never healable, any other red is.
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(false);
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('CodeQL', 'failure')] })).toBe(true);
+  });
+  it('a review-dependent gate is never healable red, even when branch protection requires it', () => {
+    const requiredChecks = ['test', 'review-gate', 'merge-gate'];
+    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure'), check('test')];
+    expect(ciRedOnHead({ headSha: head, checks: gates, requiredChecks })).toBe(false);
+    expect(fixReadiness({ headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
+    for (const startAfter of ['fast-checks', 'push'])
+      expect(reviewStartGate({ headSha: head, repo: 'we', checks: [...gates, ...fast.map(n => check(n))], requiredChecks,
+        policy: { ...review, startAfter } }).allowed).toBe(true);
+    expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks: gates, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(false);
+    // A required non-gate red still counts.
+    expect(ciRedOnHead({ headSha: head, checks: [...gates, check('test', 'failure')], requiredChecks })).toBe(true);
   });
   it('the non-healable list covers the CI-truth exclusions the heal path uses', () => {
     for (const name of CI_TRUTH_EXCLUDED_CHECKS) expect(NON_HEALABLE_CHECKS).toContain(name);
