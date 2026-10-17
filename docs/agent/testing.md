@@ -340,6 +340,28 @@ Selection uses SHA-256 of lowercase `owner/repo#pr` (first unsigned 32 bits belo
 Disabled panel rows say `agy shadow off (setting)`; unsampled rows say `off (sample)`.
 Routing-policy declarations and model/trial settings alone do not enable live shadows.
 
+`review.minNonClaudeSeats` / `WE_REVIEW_MIN_NON_CLAUDE_SEATS` defaults to 1, accepts
+positive integers, and adds the Codex simplicity and then correctness advisory seats
+as needed. These answers stay advisory. A skipped/unavailable answer does not count;
+a shortfall (including a minimum above the two available Codex lenses) is recorded on
+the verdict and printed in both the verdict write-up and human advisory note. Saved
+runs retain their original roster, with the same explicit shortfall reporting.
+These settings resolve through standard → platform `review` → tool
+`scripts/settings/review.json` → env, logging effective values and sources.
+Validate each complete scalar before cascading: nested and empty objects, arrays,
+and null must be logged as invalid and fall through. Cover every safeguard setting at
+both platform and tool layers, including platform `{value:false}` against tool
+`enabled:false` through directive selection: neither lens may launch a shadow.
+Test the actual judge request and panel reduction with injected providers, including
+zero agy calls when disabled and failed Codex answers, through heavy-admission.
+Historical optional-roster fixtures explicitly use a zero declaration minimum; the
+operational settings never accept zero.
+Exercise historical confirmation through both `resolveOperation('review-pr', {resumeId})`
+and the real `run.mjs review-pr --resume=<id>` CLI, with Codex flags off and the default
+minimum, then with changed flags and a minimum of two. Both CLI confirmation paths
+use `reviewSeatOptionsForRun` to keep every saved optional seat; fresh registrations
+still enforce the live minimum.
+
 `dailyCap` / `WE_REVIEW_SHADOW_AGY_DAILY_CAP` defaults to 100 sessions per
 America/New_York day (zero disables launches). The runner atomically reserves a
 numbered slot under `agy-shadow-agreement.jsonl.sessions/<day>/` before each
@@ -354,14 +376,10 @@ failures nor comparisons and do not advance the trial. A primary `agy` seat stil
 falls back to Claude on quota or skip results when its `onEscape` policy is `claude`.
 Use temporary stores and injected admission/providers in tests, never host quota.
 
-Gemini admission settings preserve the caller's requested Codex advisory roster.
+Gemini admission settings leave Codex advisory selection to the requested roster and the non-Claude minimum.
 Tests cover primary and shadow modes with each escape policy, quota holds, quota exhaustion, and cap skips,
 all runner statuses through the real row builder and both reports, unavailable
 budget storage, and reserving a second slot before a model retry at the cap.
-These settings resolve through standard → platform `review` → tool
-`scripts/settings/review.json` → env, logging effective values and sources.
-Test the actual judge request and panel reduction with injected providers, including
-zero agy calls when disabled and failed Codex answers, through heavy-admission.
 
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader

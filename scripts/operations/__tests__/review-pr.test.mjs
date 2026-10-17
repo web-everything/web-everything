@@ -49,7 +49,7 @@ import {
   renderAdvisoryNote,
   deriveAdvisoryOutcome,
   overridesJuror,
-  reviewPrOperation,
+  reviewPrOperation as buildReviewPrOperation,
   shapeReadFinding,
   REVIEW_JUROR_TOOLS,
   JUDGE_STEPS,
@@ -4718,6 +4718,42 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
   });
 });
 
+// Historical fixtures pin their optional-seat roster; default diversity has dedicated regression coverage.
+function reviewPrOperation(options) { return buildReviewPrOperation({ minNonClaudeSeats: 0, ...options }); }
+
+describe('operator review diversity minimum', () => {
+  it('seats a Codex advisory session by default, including prose-only reviews', () => {
+    for (const securitySeat of [true, false]) {
+      const declaration = buildReviewPrOperation({ readPr: stubReader(), securitySeat });
+      const request = declaration.steps.find(s => s.name === 'judgeAdvisory').step.request({ input: {}, findings: {
+        read: shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' }),
+      } });
+      expect(request.providerName).toBe('codex');
+    }
+  });
+  it.each([false, true])('reports unavailable Codex answers in the durable write-up (absent=%s)', (absent) => {
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings: absent
+      ? { minNonClaudeSeats: 1, preserveSavedRoster: true } : { minNonClaudeSeats: 1 } });
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const verdict = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER,
+      ...(!absent ? { judgeAdvisory: { summary: 'Codex unavailable', findings: [], skipped: { reason: 'quota' } } } : {}),
+    } });
+    expect(verdict.nonClaudeSeats).toBe(0);
+    expect(renderVerdictWriteUp({ read, verdict, answer: 'accept', actor: 'operator' })).toContain('NON-CLAUDE SEAT SHORTFALL: 0/1');
+  });
+  it('counts a completed Codex seat and seats both Codex lenses for a minimum of two', () => {
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings: { minNonClaudeSeats: 2 } });
+    expect(declaration.steps.map(s => s.name)).toContain('judgeCorrectnessAdvisory');
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const verdict = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER, judgeCorrectnessAdvisory: CLEAN_ANSWER,
+    } });
+    expect(verdict.nonClaudeSeats).toBe(2);
+    expect(verdict.nonClaudeSeatShortfall).toBeNull();
+  });
+});
+
 describe('Gemini admission and the Codex roster', () => {
   it('Gemini admission settings preserve the requested Codex roster', () => {
     for (const securitySeat of [true, false]) {
@@ -4741,8 +4777,8 @@ describe('Gemini admission and the Codex roster', () => {
 
 describe('disabled agy shadows at the launch boundary', () => {
   it('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner', async () => {
-    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1 } }, log: () => {} });
-    const declaration = reviewPrOperation({ readPr: stubReader(), seatSettings });
+    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
     const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
     const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));

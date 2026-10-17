@@ -92,7 +92,7 @@ export function logReviewSeat(log, message) {
 export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
   const resolved = safeguards ?? resolveReviewSeatSafeguards({ log });
   const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel }),
-    shadowPolicy: resolved.value });
+    shadowPolicy: resolved.value, minNonClaudeSeats: resolved.value.minNonClaudeSeats });
   const lenses = SEAT_PROVIDER_LENSES.filter((lens) => settings.seatProvider[lens] === 'shadow');
   if (lenses.length) {
     const sources = { env: 'env WE_REVIEW_SHADOW_AGY_MODEL', settings: 'settings scripts/settings/review.json key shadowSeats.antigravity.model' };
