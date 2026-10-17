@@ -239,8 +239,9 @@ describe('the live scope fence adapter over a real repository', () => {
       if (args[0] === 'api' && args[1] === 'graphql') return `1\n${head}\tremoval\\n\\nscope-removed: cdLandings\n`;
       if (args[0] === 'api' && /\/compare\//.test(args[1])) {
         compares.push(args[1]);
-        if (compare === 404) throw Object.assign(new Error('gh: Not Found (HTTP 404)'), { status: 1, stderr: 'gh: No commit found for SHA (HTTP 404)' });
-        return `${compare}\n`;
+        const status = typeof compare === 'function' ? compare(args[1]) : compare;
+        if (status === 404) throw Object.assign(new Error('gh: Not Found (HTTP 404)'), { status: 1, stderr: 'gh: No commit found for SHA (HTTP 404)' });
+        return `${status}\n`;
       }
       if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
       if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
@@ -312,21 +313,30 @@ describe('the live scope fence adapter over a real repository', () => {
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
-  function catchUp(r, { upstream = 'export const other = 2;\n', fixer = 'function guard() { return 2; }\n', smuggle = false } = {}) {
+  function catchUp(r, { upstream = 'export const other = 2;\n', fixer = 'function guard() { return 2; }\n', smuggle = false, amend } = {}) {
     r.write('guard.mjs', 'function guard() {}\n'); r.write('other.mjs', 'export const other = 1;\n'); r.commit('initial');
     r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', 'function guard() { return 1; }\n'); const head = r.commit('removal');
     r.git(['checkout', '-q', 'main']); r.write('other.mjs', upstream); const base = r.commit('upstream');
     r.git(['checkout', '-q', 'pr']); r.write('guard.mjs', fixer); r.commit('repair');
     r.git([...ident, 'merge', '-q', '--no-edit', base]);
     if (smuggle) { r.write('other.mjs', `${upstream}export const smuggled = 1;\n`); r.git(['add', 'other.mjs']); r.git([...ident, 'commit', '-q', '--amend', '--no-edit']); }
+    if (amend) {
+      if (amend === 'delete') r.git(['rm', '-q', 'other.mjs']);
+      if (amend === 'mode') r.git(['update-index', '--chmod=+x', 'other.mjs']);
+      if (amend === 'in-scope') { r.write('guard.mjs', '// merge repair\n'); r.git(['add', 'guard.mjs']); }
+      r.git([...ident, 'commit', '-q', '--amend', '--no-edit']);
+    }
     return { head, base, sha: r.git(['rev-parse', 'HEAD']).trim() };
   }
   it.each([
     ['an in-scope repair merged with the base', {}, 'identical', null],
     ['an upstream line that happens to name a removed identifier', { upstream: 'export const cdLandings = 2;\n' }, 'ahead', null],
-    ['a merge-only path outside the non-merge repair', { smuggle: true }, 'identical', null],
-    ['a merged commit GitHub does not place on the base', {}, 'diverged', null],
-    ['a merged commit GitHub does not know', {}, 404, null],
+    ['a merge-only path outside the non-merge repair', { smuggle: true }, 'identical', 'outside declared scope: other.mjs'],
+    ['a merge-only deletion outside scope', { amend: 'delete' }, 'identical', 'outside declared scope: other.mjs'],
+    ['a merge-only mode change outside scope', { amend: 'mode' }, 'identical', 'outside declared scope: other.mjs'],
+    ['an in-scope merge amendment', { amend: 'in-scope' }, 'identical', null],
+    ['a merged commit GitHub does not place on the base', {}, 'diverged', 'outside declared scope: other.mjs'],
+    ['a merged commit GitHub does not know', {}, 404, 'outside declared scope: other.mjs'],
     ['a removed identifier re-added alongside the catch-up', { fixer: 'function cdLandings() {}\n' }, 'identical', 're-adds operator-removed identifier: cdLandings'],
   ])('a base catch-up merge: %s', (_, shape, compare, violation) => {
     const r = realRepo();
@@ -338,6 +348,30 @@ describe('the live scope fence adapter over a real repository', () => {
       expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
       expect(result.reason).toContain(violation);
       expect(push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it.each([[false, 'outside.mjs'], [true, 'outside.mjs'], [true, 'guard.mjs']])('checks an unverified side-branch merge (verified catch-up: %s, repair: %s)', (withBase, file) => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'function guard() {}\n'); r.commit('initial');
+      r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', '// PR\n'); const head = r.commit('removal');
+      r.git(['checkout', '-qb', 'side']); r.write(file, 'export const repair = true;\n'); const side = r.commit('side repair');
+      r.git(['checkout', '-q', 'pr']);
+      r.git([...ident, 'merge', '-q', '--no-ff', '--no-edit', side]);
+      let base = null;
+      if (withBase) {
+        r.git(['checkout', '-q', 'main']); r.write('upstream.mjs', 'export const upstream = true;\n'); base = r.commit('upstream');
+        r.git(['checkout', '-q', 'pr']); r.git([...ident, 'merge', '-q', '--no-edit', base]);
+      }
+      const sha = r.git(['rev-parse', 'HEAD']).trim();
+      const compare = url => url.endsWith(`${base}...${base}`) ? 'identical' : 'diverged';
+      const { result, push, writes } = liveFence(r, { head, sha, base, compare });
+      if (file === 'guard.mjs') { expect(result).toEqual({ ok: true }); expect(push).toHaveBeenCalledOnce(); return; }
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.reason).toContain('outside declared scope: outside.mjs');
+      expect(push).not.toHaveBeenCalled();
+      expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 
@@ -452,6 +486,27 @@ describe('the live scope fence adapter over a real repository', () => {
       expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
       expect(result.transient).toBeUndefined();
       expect(result.reason).toMatch(/git output exceeds 64 MiB/);
+      expect(push).not.toHaveBeenCalled();
+      expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('bounds cumulative history reads and stands down instead of retrying an oversized repair', () => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', '// initial\n'); const head = r.commit('initial');
+      r.write('guard.mjs', '// repair\n'); const sha = r.commit('repair');
+      let reads = 0;
+      const port = (args, opts) => {
+        reads++;
+        if (args.includes('rev-list') && args.includes('--no-merges')) return `${sha}\n`.repeat(2100);
+        if (args.includes('diff-tree')) return 'guard.mjs\0';
+        return r.port(args, opts);
+      };
+      const { result, push, writes } = liveFence(r, { head, sha, port });
+      expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(result.transient).toBeUndefined();
+      expect(result.reason).toContain('repair history exceeds 2000 Git reads or 120 seconds');
+      expect(reads).toBe(2000);
       expect(push).not.toHaveBeenCalled();
       expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
     } finally { rmSync(r.dir, { recursive: true, force: true }); }

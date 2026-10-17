@@ -1477,15 +1477,24 @@ is still forbidden by the scope brief even when the marker cannot identify it me
 
 The harness checks before early, green and saved-commit pushes. Unreadable scope/diff evidence withholds
 the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
-File scope checks union the paths of each non-merge commit on the first-parent spine from the pre-fix
-PR head to the proposed push. Main catch-up merges and the commits reached through their side parents
-do not count as fixer file edits, including upstream edits to files the PR previously changed. An
-out-of-scope fixer edit still counts if a later fixer commit reverts it. Merge-only paths are outside
-this file-scope check; operator-removed identifiers remain separately checked, including conflict
-resolutions. Repo-qualified scopes accept the repository key or GitHub slug as the repo context;
+File scope checks union the paths of repair commits, including side branches and merge-authored edits,
+from the pre-fix PR head to the proposed push. Without a GitHub-verified merged base, the whole range
+diff also counts. Only commits reachable from a verified merged base are exempt as upstream history.
+For merge paths, an unchanged upstream tree entry is exempt; existing PR edits may also carry forward
+when the patch from the merge base to the first parent exactly matches the patch from the upstream
+parent to the merge result (excluding blob IDs and section headings, retaining coordinates, whitespace and modes). This
+permits upstream edits to files the PR previously changed while rejecting extra merge amendments.
+Shifted or rewritten conflict resolutions that cannot be proved unchanged require declared scope.
+An out-of-scope fixer edit still counts if a later fixer commit reverts it. Operator-removed
+identifiers remain separately checked, including conflict resolutions. Repo-qualified scopes accept the repository key or GitHub slug as the repo context;
 trailing-slash directories cover their subtree and exact-file entries never cover replacement directories.
 The real-repository regressions in `fix-scope-fence.test.mjs` replay 13- and 40-file catch-ups over two
-main merges, a one-file repair, and an outside edit followed by its revert.
+main merges, a one-file repair, an outside edit followed by its revert, unverified side merges and
+amended catch-ups. The `fix-scope-merge-bypass` daemon soak break replays both merge bypass shapes
+through the live adapter with real repository history and injected GitHub/push sinks. These are the
+prevention regressions for PR #5461; accepting unchanged upstream content is a separate control.
+The complete Git diff/history read shares a 120-second deadline and a 2,000-command budget; exhaustion
+records a permanent evidence stand-down rather than blocking the daemon indefinitely or retrying forever.
 Marker parsing scans lines without a backtracking expression and rejects evidence over 1 MiB or a line
 over 16 KiB, withholding the push rather than silently truncating removal policy. Plain and HTML markers
 accept LF, CRLF, CR and Unicode line separators. PR commit messages are read through paginated GraphQL. A

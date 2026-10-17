@@ -17,6 +17,15 @@ const FENCE_DIFF = ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '-
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const MAX_MERGED = 20;
 const FENCE_MAX_BUFFER = 64 * 1024 * 1024;
+const FENCE_MAX_GIT_READS = 2000;
+const FENCE_READ_TIMEOUT = 120_000;
+
+function isAncestor(git, a, b) {
+  try { git(['merge-base', '--is-ancestor', a, b]); return true; } catch (e) {
+    if (e.status === 1) return false;
+    throw e;
+  }
+}
 
 /**
  * The newest commit a catch-up merge (`git merge <base sha>`) brought into `sha`, when GitHub confirms it is part of the
@@ -26,22 +35,53 @@ const FENCE_MAX_BUFFER = 64 * 1024 * 1024;
 export function mergedBase({ git, gh, repo, head, sha, base }) {
   const parents = git(['rev-list', '--first-parent', '--merges', '--parents', `${head}..${sha}`])
     .split('\n').flatMap(line => line.trim().split(' ').slice(2)).filter(p => OID.test(p));
-  const isAncestor = (a, b) => {
-    try { git(['merge-base', '--is-ancestor', a, b]); return true; } catch (e) {
-      if (e.status === 1) return false;
+  const merged = [...new Set(parents)].filter(p => !isAncestor(git, p, head));
+  if (!merged.length || merged.length > MAX_MERGED || !OID.test(String(base ?? ''))) return null;
+  const newest = merged.find(c => merged.every(o => o === c || isAncestor(git, o, c)));
+  const verified = [];
+  for (const candidate of newest ? [newest, ...merged.filter(c => c !== newest)] : merged) {
+    let status;
+    try { status = gh(['api', `repos/${repo}/compare/${candidate}...${base}`, '--jq', '.status']).trim(); } catch (e) {
+      if (/HTTP (?:404|422)/.test(String(e?.stderr ?? e?.message ?? e))) continue;
       throw e;
     }
-  };
-  const merged = [...new Set(parents)].filter(p => !isAncestor(p, head));
-  if (!merged.length || merged.length > MAX_MERGED || !OID.test(String(base ?? ''))) return null;
-  const newest = merged.find(c => merged.every(o => o === c || isAncestor(o, c)));
-  if (!newest) return null;
-  let status;
-  try { status = gh(['api', `repos/${repo}/compare/${newest}...${base}`, '--jq', '.status']).trim(); } catch (e) {
-    if (/HTTP (?:404|422)/.test(String(e?.stderr ?? e?.message ?? e))) return null;
-    throw e;
+    if (status === 'ahead' || status === 'identical') {
+      if (candidate === newest) return candidate;
+      verified.push(candidate);
+    }
   }
-  return status === 'ahead' || status === 'identical' ? newest : null;
+  return verified.find(c => verified.every(o => o === c || isAncestor(git, o, c))) ?? null;
+}
+
+/** Credit only verified upstream trees and unchanged PR patches; never replay lane merge drivers or attributes. */
+function mergeScopePaths({ git, names, head, sha, merged }) {
+  const range = [`${head}..${sha}`, ...(merged ? [`^${merged}`] : [])];
+  // Include side-branch repairs, and retain evidence even when a later commit reverts them.
+  const commits = git(['rev-list', '--no-merges', ...range]).split('\n').filter(Boolean);
+  const paths = new Set(merged ? [] : names(head, sha));
+  for (const c of commits) {
+    const changed = git(['diff-tree', '--root', '--no-commit-id', '-r', ...FENCE_DIFF.slice(1), '--name-only', '-z', c, '--']);
+    for (const p of changed.split('\0').filter(Boolean)) paths.add(p);
+  }
+  // Retain coordinates, whitespace, modes and edit text; blob IDs and hunk section headings are context only.
+  // A shifted or rewritten conflict resolution that cannot be proved unchanged requires declared scope.
+  const patch = (from, to, p) => git([...FENCE_DIFF, '-U0', from, to, '--', `:(top,literal)${p}`])
+    .split('\n').filter(line => !line.startsWith('index '))
+    .map(line => line.replace(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@).*$/, '$1')).join('\n');
+  const merges = git(['rev-list', '--merges', '--parents', ...range]).split('\n').filter(Boolean);
+  for (const line of merges) {
+    const [c, first, ...side] = line.split(' ');
+    const upstream = merged && side.filter(p => isAncestor(git, p, merged));
+    const parent = upstream && upstream.find(p => upstream.every(o => o === p || isAncestor(git, o, p)));
+    const bases = parent ? git(['merge-base', '--all', first, parent]).trim().split('\n').filter(Boolean) : [];
+    const differsFromUpstream = new Set(parent ? names(parent, c) : []);
+    for (const p of names(first, c)) {
+      if (parent && !differsFromUpstream.has(p)) continue;
+      if (bases.length === 1 && patch(bases[0], first, p) === patch(parent, c, p)) continue;
+      paths.add(p);
+    }
+  }
+  return [...paths];
 }
 
 const COMMITS_QUERY = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid message}}}}}}';
@@ -65,15 +105,36 @@ export function readPrCommitMessages({ gh, repo, pr, head }) {
 }
 
 export function createScopeFencedPush({ root, exec = execFileSync, env = process.env, log = console.error, loadItems = () => defaultLoadItems(root), readComments = readCompletePrComments }) {
-  const gh = args => String(exec('gh', args, { encoding: 'utf8', env, timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
+  const gh = (args, timeout = 60_000) => String(exec('gh', args, { encoding: 'utf8', env, timeout, maxBuffer: 32 * 1024 * 1024 }));
   return ({ repo, pr, sha, git: port, push }) => {
     // Commit-to-commit reads only; the port supplies the lane hardening. Replace refs, grafts and a commit-graph are lane
     // state that would show the fence a history the push never sends, and the buffer is sized for `--text` patches.
     // The port merges `opts.env` over its own environment; the pathspec switches are pinned off so `:(literal)` magic holds.
-    const git = args => port(['--no-replace-objects', '-c', 'core.commitGraph=false', ...args],
-      { maxBuffer: FENCE_MAX_BUFFER, timeout: 120_000, env: { GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
-        GIT_LITERAL_PATHSPECS: '0', GIT_GLOB_PATHSPECS: '0', GIT_NOGLOB_PATHSPECS: '0', GIT_ICASE_PATHSPECS: '0' } });
-    const readDiff = ({ head, base, removed = [] }) => {
+    const readDiff = context => {
+      const { head, base, removed = [] } = context;
+      const deadline = Date.now() + FENCE_READ_TIMEOUT;
+      let reads = 0;
+      const exhausted = () => new ScopeFenceEvidenceError(`repair history exceeds ${FENCE_MAX_GIT_READS} Git reads or ${FENCE_READ_TIMEOUT / 1000} seconds`, context);
+      const git = args => {
+        const remaining = deadline - Date.now();
+        if (++reads > FENCE_MAX_GIT_READS || remaining <= 0) throw exhausted();
+        try {
+          return port(['--no-replace-objects', '-c', 'core.commitGraph=false', ...args],
+            { maxBuffer: FENCE_MAX_BUFFER, timeout: remaining, env: { GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
+              GIT_LITERAL_PATHSPECS: '0', GIT_GLOB_PATHSPECS: '0', GIT_NOGLOB_PATHSPECS: '0', GIT_ICASE_PATHSPECS: '0' } });
+        } catch (e) {
+          if (Date.now() >= deadline) throw exhausted();
+          throw e;
+        }
+      };
+      const budgetGh = args => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw exhausted();
+        try { return gh(args, Math.min(60_000, remaining)); } catch (e) {
+          if (Date.now() >= deadline) throw exhausted();
+          throw e;
+        }
+      };
       // Prove our saved commit exists before attributing a missing remote head to branch movement.
       git(['cat-file', '-e', `${sha}^{commit}`]);
       try { git(['cat-file', '-e', `${head}^{commit}`]); } catch (e) {
@@ -85,17 +146,13 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         throw e;
       }
       const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
-      // Patches are read only when there is a removed identifier to look for.
+      // Identifier patches are read only when there is a removed identifier to look for.
       const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
-      // Walk the fixer's first-parent spine only. A range diff includes upstream files (including files the
-      // PR previously changed); a plain --no-merges walk also includes commits reached through main's side.
-      // Union each non-merge patch so an out-of-scope edit still counts if a later commit reverts it.
-      const commits = git(['rev-list', '--first-parent', '--no-merges', `${head}..${sha}`]).split('\n').filter(Boolean);
-      const paths = [...new Set(commits.flatMap(c => names(`${c}^`, c)))];
-      const merged = mergedBase({ git, gh, repo, head, sha, base });
+      const merged = mergedBase({ git, gh: budgetGh, repo, head, sha, base });
+      const paths = mergeScopePaths({ git, names, head, sha, merged });
       if (!merged) return { paths, additions: added(head, sha) };
       // Identifier exclusions also guard conflict resolutions that restore an operator removal. This is separate from
-      // the non-merge path scope above. Never replay a merge using the lane's fixer-writable config and attributes.
+      // file scope. Never replay a merge using the lane's fixer-writable config and attributes.
       // Judge PR paths (and upstream renames of them) against the PR head; judge other additions against the merged base.
       const bases = git(['merge-base', '--all', head, merged]).split('\n').filter(Boolean);
       const pr = new Set(bases.flatMap(b => names(b, head)));
