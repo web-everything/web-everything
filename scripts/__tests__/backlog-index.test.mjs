@@ -53,6 +53,14 @@ afterEach(() => {
 });
 
 describe('per-file backlog index', () => {
+  it.each(['we-review-seat-abcdef', 'we-red-team-recheck-abcdef'])('does not persist indexes for %s', name => {
+    backlogDir = join(temp, name, 'backlog');
+    mkdirSync(backlogDir, { recursive: true });
+    card('001-first.md', good('First'));
+    expect(load().stats.misses).toBe(1);
+    expect(load().stats.misses).toBe(1);
+    expect(fs.existsSync(indexDir)).toBe(false);
+  });
   it('reads zero unchanged cards, preserves dates/undefined, and does not rewrite the index', () => {
     const first = load();
     const path = join(indexDir, readdirSync(indexDir)[0]);
