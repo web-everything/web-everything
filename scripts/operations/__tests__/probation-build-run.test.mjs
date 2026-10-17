@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import { clearScopeAndAppendFinding, sanitizeHoldReason } from '../build-dispatch-hold-route-land.mjs';
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
+import { buildCodexDirectTaskArgv } from '../../codex-direct-task.mjs';
 import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
 
 describe('realIo().blockedByGraph', () => {
@@ -936,7 +937,8 @@ describe('standalone prepare', () => {
         ? { configHash: 'clean', files: { 'pre-commit': 'planted' } } : snapshot(...a);
       io.headSha = () => mode === 'head-moved' && runs > 0 ? 'worker-commit' : 'base-sha';
       // A gitignored file (.env.local, node_modules) is invisible to HEAD, card, hook and numstat checks.
-      io.snapshotIgnored = () => mode === 'ignored-changed' && runs > 0 ? 'ignored:.env.local=changed' : 'ignored:.env.local=base';
+      // The task count stands in for the runner's own writes: a snapshot taken before them would mismatch.
+      io.snapshotIgnored = () => `tasks=${tasks.length}:.env.local=${mode === 'ignored-changed' && runs > 0 ? 'changed' : 'base'}`;
       io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
       io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
       io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
@@ -960,6 +962,9 @@ describe('standalone prepare', () => {
           expect(argv).toContain('--model=gpt-6.1-sol');
           // Read-only sandbox (codex `-s read-only`, no network): the validator never gets write access.
           expect(argv).toContain('--review');
+          const codexArgv = buildCodexDirectTaskArgv({ cwd: '/lanes/22', model: 'gpt-6.1-sol', effort: 'low', review: argv.includes('--review') });
+          expect(codexArgv[codexArgv.indexOf('-s') + 1]).toBe('read-only');
+          expect(codexArgv.join(' ')).not.toContain('network_access');
           if (mode === 'tampered') current += '\nunauthorized edit';
           return { ok: true, lastMessage: mode === 'invalid' ? 'yes' : JSON.stringify({
             verdict: mode === 'needs-reprepare' ? 'needs-reprepare' : 'still-valid', reason: 'Scope changes preserve the plan.' }) };

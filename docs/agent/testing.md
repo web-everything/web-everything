@@ -1560,9 +1560,12 @@ and leave the checkout unchanged. Only `still-valid` allows the runner to append
 `revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
 answers, disabled policy, and diffs above the cap use full preparation. A worker
 that changes files, HEAD, or hooks is refused. The worker runs in Codex's `--review`
-read-only sandbox with no network. A fingerprint of every gitignored entry (content for
-files up to 1 MiB, metadata for collapsed directories) is compared after the run. A
-change there escalates for a human because a discard does not restore ignored files.
+read-only sandbox with no network; that sandbox is the guard for edits deep inside
+collapsed ignored directories such as node_modules. As a second check, a fingerprint of
+the gitignored entries git lists (content for files up to 1 MiB, mode/size/mtime for
+collapsed directories, so only adding or removing a direct child shows there) is
+compared after the run. A change escalates for a human because a discard does not
+restore ignored files.
 Re-stamps use the existing verified
 card-only prepare PR lane; the builder waits for the stamp to land on main before
 building. Light candidates are excluded from grouped prepares so each verdict

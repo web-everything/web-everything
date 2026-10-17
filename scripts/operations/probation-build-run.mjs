@@ -485,16 +485,17 @@ export async function runProbationBuild(args, io) {
         const input = lightRevalidationInput({ raw: item.raw, scope: item.scope, baseSha, policy: preparePolicy,
           diff: (sha, base, paths) => io.prepareScopeDiff(lanePath, sha, base, paths) });
         const lightWorker = input && { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
-        let refusal = null, preIgnored = null;
+        let refusal = null, preIgnored = null, lightTask = null;
         if (input) {
           try { refusal = lightWorkerRefusal({ worker: lightWorker, records: io.readScorecards() }); } catch { refusal = 'trial history unreadable'; }
           if (!refusal) {
+            // Snapshot after the runner's own writes, right before the worker, so only the worker's changes count.
+            lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
             try { preIgnored = io.snapshotIgnored(lanePath); } catch { refusal = 'ignored-file snapshot unavailable'; }
           }
           if (refusal) log(`light revalidation skipped: ${refusal}; full prepare`);
         }
         if (input && !refusal) {
-          const lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
           resultWorker = lightWorker;
           // `--review` runs Codex in its `-s read-only` sandbox with no network: the validator only reads.
           const answer = io.runWorker([...buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
