@@ -2202,6 +2202,7 @@ describe('automatic item preparation', () => {
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
       expect(effects.listPrepareClaims()).toHaveLength(launches ? 1 : 0);
       if (launches) {
+        expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ lightRevalidate: true, launchKind: 'prepare-item' }));
         expect(tick.prepare.refused).toEqual([]);
       } else {
         // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
@@ -3393,6 +3394,24 @@ describe('probation prepare route circuit breaker', () => {
     expect(prepareRouteFallback([...failed, { ...row('26'), taskType: 'doc-fix' }])).toBe(true);
     expect(prepareRouteFallback([failed[0], row('24', 'opened-pr', 99), failed[1]])).toBe(true);
     expect(prepareRouteFallback([...failed, row('26', 'opened-pr', 99)])).toBe(true);
+  });
+  it('hands the scope-only candidate to the detached prepare runner through its environment', async () => {
+    const exec = vi.fn(() => '{}');
+    cliDispatch({ num: '4327', launchKind: 'prepare-item', lightRevalidate: true }, { exec });
+    const env = exec.mock.calls[0][2].env;
+    expect(env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('4327');
+    const { parseArgs } = await import('../../../scripts/operations/probation-build-run.mjs');
+    const previous = process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+    try {
+      process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      expect(parseArgs(['--num=4327', '--taskType=prepare']).lightRevalidate).toBe(true);
+      expect(parseArgs(['--num=4328', '--taskType=prepare']).lightRevalidate).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM;
+      else process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM = previous;
+    }
+    cliDispatch({ num: '4328', launchKind: 'prepare-item' }, { exec });
+    expect(exec.mock.calls.at(-1)[2].env.WE_PREPARE_LIGHT_REVALIDATE_ITEM).toBe('');
   });
   it('disables probation only for fallback prepares without overriding the policy model', () => {
     for (const launchKind of ['prepare-item', 'build']) {

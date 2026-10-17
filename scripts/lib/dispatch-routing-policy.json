@@ -75,7 +75,7 @@
   "operations": {
     "*": {"inherit": true,"effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"}},
     "build": {"provider": "codex","model": "sol","effort": {"claude": "high","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
-    "build:build-new-feature": {"inherit": true},
+    "build:build-new-feature": {"provider": "codex","model": "sol","effort": {"claude": "high","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
     "fix": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
     "fix:ruling-escalation-stronger": {"provider": "claude","model": "sonnet","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": []},
     "fix:critical-work": {"provider": "claude","model": "opus","effort": "high","fallback": []},
