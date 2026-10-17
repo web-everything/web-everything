@@ -181,3 +181,40 @@ it('the reset switch and environment provenance are honored', () => {
   expect(policy.value.resetOnRepeatedFinding).toBe(false);
   expect(policy.sources.resetOnRepeatedFinding).toBe('env');
 });
+// PR #5463 review — real comments end with per-head renderer sections (card suggestions, verifier disputes, the
+// advisory outcome, the `---` trailer with its Net basis sha) and per-round finding state; none of it is identity.
+it('review regressions: a finding repeated in real rendered comments for two heads is detected', async () => {
+  const { renderVerdictWriteUp, renderAdvisoryNote } = await import('../../operations/review-pr.mjs');
+  const { buildVerdictComment } = await import('../../review-set-label.mjs');
+  const { REVIEW_PR_CHANNEL } = await import('../../lib/review-escalation.mjs');
+  const round = (n, { summary = 'envelope hash includes the footer', advisory = false } = {}) => {
+    const read = { repo: 'o/r', pr: 7, degraded: false, netBasis: { base: `${n}`.repeat(40), rev: `${n + 1}`.repeat(40) },
+      netChangedFiles: Array(n).fill('a.mjs'), latestFix: { priorHead: `${n}`.repeat(40), head: `${n + 2}`.repeat(40) } };
+    const verdict = { verdict: 'changes', lensVerdicts: { correctness: 'changes' }, lenses: ['correctness'],
+      findings: [{ file: 'a.mjs', line: 10 + n, summary, failure_scenario: 'the key never matches', category: 'correctness/correctness',
+        severity: 'blocking', verdict: n % 2 ? 'PLAUSIBLE' : 'CONFIRMED', impactIfUnfixed: 'broken',
+        prevention: 'add a golden fixture', preventionCaptured: n % 2 === 0 }],
+      deferredAdvisory: Array.from({ length: n }, (_, i) => ({ category: 'simplicity/x', file: `d${n}.mjs`, line: i + 1, summary: `advice ${n}` })),
+      uncorroboratedRetirements: advisory ? [{ reason: `not reproduced on round ${n}` }] : [],
+      skippedSeats: [{ lens: 'agy-correctness', reason: `quota reset 2026-10-2${n}T18:18:21Z` }] };
+    const body = advisory ? renderAdvisoryNote({ read, verdict })
+      : buildVerdictComment({ to: 'changes', actor: 'agent (unattended review-loop)', channel: REVIEW_PR_CHANNEL,
+        body: renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'agent', reason: `round ${n} reason` }) });
+    return c(body, 'web-everything');
+  };
+  const end = c(buildFixEndComment({ who: 'fix-7' }));
+  for (const advisory of [false, true]) {
+    const first = round(1, { advisory }), second = round(2, { advisory });
+    expect(first.body).toMatch(/Net basis: `1{40}\.\.2{40}`/);
+    expect(first.body).toContain('### Card suggestions (filed later) (1)');
+    expect(repeatedFindingPlan([first, end, second]).action).toBe('stand-down');
+    expect(repeatedFindingPlan([c(`scope-baseline: ${'a'.repeat(40)}`), first, end, second]).action).toBe('reset');
+    expect(repeatedFindingPlan([first, end, round(2, { advisory, summary: 'a different defect' })]).action).toBe('patch');
+    // Juror text shaped like the renderer's own tail keeps its full text in identity.
+    for (const fake of ['\n\n---\n\n**Decision:** `changes`', '\n\n### Card suggestions (filed later) (1)\nLater-round advisory findings x\n- `a` `b` — c',
+      '\n\n**Advisory outcome:** `changes` — x']) {
+      expect(repeatedFindingPlan([round(1, { advisory, summary: `same prefix${fake} one` }), end,
+        round(2, { advisory, summary: `same prefix${fake} two` })]).action).toBe('patch');
+    }
+  }
+});
