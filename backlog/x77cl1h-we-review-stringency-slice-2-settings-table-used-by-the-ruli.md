@@ -15,6 +15,10 @@ Add the review-stringency settings table (class by level to block, expedite, deb
 ## Acceptance
 
 - [A1] **Executable** — a validator over `we:scripts/settings/review-stringency.json` fails on an unknown class, a missing level cell, or a debt cell without a must-pay-before level, passes on the ratified amended table, and a ruling-step test shows a table gap resolves to block.
+- [A2] **Executable** — ruling-step test `override-precedence` supplies a reviewer tag that conflicts with a matching path rule, then with a matching pattern rule; each rule wins and the outcome comes from the overridden class at the current level. With no matching rule, the reviewer tag supplies the class.
+- [A3] **Executable** — ruling-step test `confidence-cap` covers each non-always-block outcome (block, expedite, debt, advisory): low reviewer confidence yields advisory. An always-block class at low confidence triggers a second check and stays block pending it, including when a path or pattern override selects that class; an unknown class or table gap still blocks.
+- [A4] **Executable** — settings-write test `settings-edit-authority` rejects agent attempts to change any table cell, an invariant row, or the current level, leaving the effective settings unchanged; the corresponding operator edits succeed and log the setting source and operator identity.
+- [A5] **Executable** — ruling-step test `careless-debt-block` rejects reckless or inadvertent debt as block regardless of the configured cell or low reviewer confidence; prudent-deliberate debt follows the class/level outcome and confidence rules.
 
 Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
