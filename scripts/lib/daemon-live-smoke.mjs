@@ -777,13 +777,13 @@ async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcela
 // `rebuildClone` never holds the clone's write lock for any part of it — see that file's own header. A slow
 // smoke here no longer means a single daemon tick gets skipped, whatever its duration.
 export const SMOKE_CHECKS = Object.freeze([
-  { name: 'lane-pool-list', run: checkLanePoolList, mayBeTransient: false, codeEntries: ['scripts/lane-pool.mjs'] },
-  { name: 'lane-acquire-release', run: checkLaneAcquireRelease, mayBeTransient: false, codeEntries: ['scripts/lane-pool.mjs'] },
-  { name: 'gh-api-repo', run: checkGhApiRepo, mayBeTransient: true },
-  { name: 'gh-pr-list', run: checkGhPrList, mayBeTransient: true },
-  { name: 'reconcile-dry-run', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'] },
+  { name: 'lane-pool-list', kind: 'env', run: checkLanePoolList, mayBeTransient: false, codeEntries: ['scripts/lane-pool.mjs'] },
+  { name: 'lane-acquire-release', kind: 'env', run: checkLaneAcquireRelease, mayBeTransient: false, codeEntries: ['scripts/lane-pool.mjs'] },
+  { name: 'gh-api-repo', kind: 'env', run: checkGhApiRepo, mayBeTransient: true },
+  { name: 'gh-pr-list', kind: 'env', run: checkGhPrList, mayBeTransient: true },
+  { name: 'reconcile-dry-run', kind: 'code', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'] },
   // xp4lw2v (epic #4075/#3383) — see the two functions' own docblocks just above for what each covers.
-  { name: 'dispatch-dry-run', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES },
+  { name: 'dispatch-dry-run', kind: 'code', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES },
   // #4468 — actually BOOTS (imports) every standalone daemon entry module on the candidate tree; see
   // `daemon-boot-smoke.mjs`'s own header for the live incident this closes (#2921: a smoke-passing candidate
   // that then crash-looped every daemon at startup, because nothing before this row ever imported an entry file).
@@ -792,8 +792,10 @@ export const SMOKE_CHECKS = Object.freeze([
   // drifted from the exported object the tests actually assert on).
   DAEMON_BOOT_SMOKE_CHECK,
   // ALWAYS LAST, NEVER SKIPPED: no `codeEntries`, so `checkCodeUnchanged` never short-circuits it.
-  { name: 'tree-stays-clean', run: checkTreeStaysClean, mayBeTransient: false },
+  { name: 'tree-stays-clean', kind: 'env', run: checkTreeStaysClean, mayBeTransient: false },
 ]);
+
+if (SMOKE_CHECKS.some(check => !['code', 'env'].includes(check.kind))) throw new Error('Smoke checks must declare code or env');
 
 /**
  * PURE (given `closureOf`): may `check` be skipped because none of `changedFiles` touches the code it runs?
@@ -822,7 +824,7 @@ export function decideSmokeVerdict(results) {
 export async function runLiveSmoke({
   root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
-  clock = Date.now, hostBusy = undefined,
+  clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
 } = {}) {
@@ -880,10 +882,10 @@ export async function runLiveSmoke({
     for (const check of SMOKE_CHECKS) {
       const startedAt = clock();
       let result;
-      if (checkCodeUnchanged({ check, changedFiles, root, closureOf })) {
+      if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
         results.push({
           name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
-          detail: 'code unchanged since the last live-verified build — not re-run (#4044)',
+          detail: reuseCode ? 'reused passing tree smoke (code check)' : 'code unchanged since the last live-verified build — not re-run (#4044)',
         });
         continue;
       }
@@ -1048,7 +1050,7 @@ export async function runLiveSmokeWithRetry({
   root, env = process.env, runChild = runBounded, sleep = defaultSleep,
   retries = envNonNegInt(env, SMOKE_TRANSIENT_RETRIES_ENV, 2),
   backoffMs = envMs(env, SMOKE_RETRY_BACKOFF_MS_ENV, 15_000),
-  changedFiles = null,
+  changedFiles = null, reuseCode = false,
   refreshAuth = refreshSmokeGithubEnv,
   clock = Date.now,
   loadAvg = () => loadavg(),
@@ -1072,7 +1074,7 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
     verdict = classifySmokeFailure(smoke.results);
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
