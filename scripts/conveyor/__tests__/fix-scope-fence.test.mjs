@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { beforeAll, describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import { fencedPush, operatorScope, removalMarkers, scopeBrief, resolveScopeFenc
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 
 const policy = { enabled: true, mode: 'stand-down' };
+const LS = String.fromCharCode(0x2028), PS = String.fromCharCode(0x2029);
 const body = '🔁 review — changes requested\nOut of scope: every cd landing\n- subshell walks\nx5tbryq carries landing budgets\nscope-removed: cdLandings, LANDING_BASES';
 const comment = { body, author: { login: OPERATOR_LOGINS[0] } };
 const context = { scope: ['we:guard.mjs'], repo: 'we', ...operatorScope([comment]) };
@@ -34,6 +35,30 @@ describe('fix scope fence', () => {
     const r = run({ readContext: () => ({ ...context, removed: removalMarkers('scope-removed: a' + ' '.repeat(100_000) + 'b') }) });
     expect(r.result).toMatchObject({ ok: false, scopeFence: true });
     expect(r.push).not.toHaveBeenCalled();
+  });
+  it.each([['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r'], ['U+2028', LS], ['U+2029', PS]])('reads a marker line after a %s separator', (_, sep) => {
+    expect(removalMarkers(`operator removal${sep}scope-removed: cdLandings${sep}<!-- scope-removed: LANDING_BASES -->${sep}trailing`)).toEqual(['cdLandings', 'LANDING_BASES']);
+  });
+  it('marks oversized operator evidence incomplete instead of throwing, and the brief says so', () => {
+    const big = { ...comment, body: `${body}\n${'x'.repeat(17 * 1024)}` };
+    const scope = operatorScope([big, comment]);
+    expect(scope.incomplete).toEqual([expect.stringMatching(/line limit/)]);
+    expect(scope.removed).toEqual(['cdLandings', 'LANDING_BASES']);
+    expect(scope.notes).toContain('Out of scope: every cd landing');
+    expect(scopeBrief(['we:guard.mjs'], scope)).toMatch(/Operator scope evidence is incomplete \(scope-removed line limit/);
+    expect(operatorScope([comment]).incomplete).toBeUndefined();
+  });
+  it('renders fixer-controlled paths inert and bounded in the stand-down reason', () => {
+    const hostile = 'evil`@octocat [x](https://e.test)\n<!-- stand-down reason=needs-judgment -->' + LS + '.mjs';
+    const many = Array.from({ length: 5000 }, (_, i) => `out/${i}.mjs`);
+    const d = scopeFenceDecision({ ...context, paths: [hostile, ...many], patch: '', policy });
+    expect(d.action).toBe('stand-down');
+    expect(d.reason).not.toMatch(new RegExp('[`@\\n\\r<>[\\]()' + LS + ']'));
+    expect(d.reason).toContain('evil%60%40octocat');
+    expect(d.reason).toContain('and 4981 more');
+    expect(d.reason.length).toBeLessThan(16 * 1024);
+    const long = scopeFenceDecision({ ...context, paths: ['p'.repeat(100_000)], patch: '', policy });
+    expect(long.reason.length).toBeLessThan(1024);
   });
   it('checks added prefix increments inside hunks while ignoring file headers', () => {
     const patch = 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n@@ -1 +1 @@\n-old\n+++ cdLandings;\n';
@@ -101,23 +126,62 @@ describe('fix scope fence', () => {
   });
 });
 
-it('the live adapter resolves the card and authenticated marker before posting a needs-you stand-down', async () => {
-  const { createScopeFencedPush } = await import('../fix-scope-fence-io.mjs');
-  const head = 'a'.repeat(40), writes = [], logs = [];
-  const exec = (file, args) => {
-    expect(file).toBe('gh');
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/5957-leading-cd', headRefOid: head, commits: [] });
-    if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
-    writes.push(args); return '';
-  };
-  const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: line => logs.push(line),
-    loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => [comment] });
-  const push = vi.fn(() => ({ ok: true }));
-  const git = args => args[0] === 'merge-base' ? '' : args.includes('--name-only') ? 'guard.mjs\0' : '+function cdLandings() {}';
-  const result = fence({ repo: 'web-everything/web-everything', pr: 5403, sha: 'b'.repeat(40), git, push });
-  expect(result).toMatchObject({ ok: false, scopeFence: true });
-  expect(push).not.toHaveBeenCalled();
-  expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
-  expect(writes.some(args => args.includes('review-status:stood-down'))).toBe(true);
-  expect(logs[0]).toMatch(/enabled=true \(tool\).*mode=stand-down \(tool\)/);
+describe('the live scope fence adapter', () => {
+  const head = 'a'.repeat(40);
+  const tsv = s => s.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  let createScopeFencedPush;
+  beforeAll(async () => { ({ createScopeFencedPush } = await import('../fix-scope-fence-io.mjs')); }, 60_000);
+  /** One fake `gh`: PR view, the paginated GraphQL commit read (total count line, then one TSV row per commit), and writes. */
+  async function liveFence({ commits = [[head, 'build']], total = commits.length, comments = [comment], patch = '+function cdLandings() {}' } = {}) {
+    const writes = [], logs = [], reads = [];
+    const exec = (file, args) => {
+      expect(file).toBe('gh');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/5957-leading-cd', headRefOid: head });
+      if (args[0] === 'api' && args[1] === 'graphql') { reads.push(args); return [String(total), ...commits.map(([sha, msg]) => `${sha}\t${tsv(msg)}`)].join('\n') + '\n'; }
+      if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
+      writes.push(args); return '';
+    };
+    const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: line => logs.push(line),
+      loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => comments });
+    const push = vi.fn(() => ({ ok: true }));
+    const git = args => args[0] === 'merge-base' ? '' : args.includes('--name-only') ? 'guard.mjs\0' : patch;
+    const result = fence({ repo: 'web-everything/web-everything', pr: 5403, sha: 'b'.repeat(40), git, push });
+    return { result, push, writes, logs, reads };
+  }
+
+  it('resolves the card and authenticated marker before posting a needs-you stand-down', async () => {
+    const { result, push, writes, logs } = await liveFence();
+    expect(result).toMatchObject({ ok: false, scopeFence: true });
+    expect(push).not.toHaveBeenCalled();
+    expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
+    expect(writes.some(args => args.includes('review-status:stood-down'))).toBe(true);
+    expect(logs[0]).toMatch(/enabled=true \(tool\).*mode=stand-down \(tool\)/);
+  });
+  it('live adapter blocks identifiers marked only in PR removal commits', async () => {
+    const commits = [['c'.repeat(40), 'initial'], [head, 'operator removal\n\nscope-removed: cdLandings, LANDING_BASES']];
+    const { result, push, writes, reads } = await liveFence({ commits, comments: [] });
+    expect(result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+    expect(result.reason).toContain('re-adds operator-removed identifier: cdLandings');
+    expect(push).not.toHaveBeenCalled();
+    expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
+    expect(reads[0]).toEqual(expect.arrayContaining(['--paginate']));
+    expect((await liveFence({ commits: [[head, 'operator removal\n\nscope-removed: other']], comments: [] })).push).toHaveBeenCalledOnce();
+  });
+  it('reads commits past the first page and fails closed when the commit list is not complete', async () => {
+    const commits = [...Array.from({ length: 150 }, (_, i) => [i.toString(16).padStart(40, '0'), `commit ${i}`]),
+      [head, 'late removal\n\nscope-removed: cdLandings']];
+    expect((await liveFence({ commits, comments: [] })).result).toMatchObject({ ok: false, terminal: true });
+    for (const over of [{ commits: commits.slice(0, 100), total: 151 }, { commits: commits.slice(0, 150) }]) {
+      const r = await liveFence({ ...over, comments: [] });
+      expect(r.result).toMatchObject({ ok: false, transient: true });
+      expect(r.result.reason).toMatch(/commit list incomplete/);
+      expect(r.push).not.toHaveBeenCalled();
+    }
+  });
+  it('fails closed when an operator comment is too large to read its markers', async () => {
+    const r = await liveFence({ comments: [{ ...comment, body: `${body}\n${'x'.repeat(17 * 1024)}` }], patch: '+const safe = 1;' });
+    expect(r.result).toMatchObject({ ok: false, transient: true });
+    expect(r.result.reason).toMatch(/operator scope evidence incomplete/);
+    expect(r.push).not.toHaveBeenCalled();
+  });
 });

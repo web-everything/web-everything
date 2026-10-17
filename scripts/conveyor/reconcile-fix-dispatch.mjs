@@ -881,6 +881,7 @@ export function tryResumeFix(planned, {
   // the candidate id being resumed rather than a freshly minted one (nothing else needs to address it).
   sessionCwdFor = (id) => dispatchSessionCwd(id, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more: `runReconcileFixDispatch` is the ONE place that
   // decides whether this repo's `fix` capability is on (`docs/agent/platform-decisions.md#conveyor-multi-repo-
@@ -936,9 +937,12 @@ export function tryResumeFix(planned, {
   }
 
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
+  // The conflict resume carries the same operator exclusions as every other launch path.
+  let historyInputs = null;
+  try { historyInputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { historyInputs = null; }
   return resumeBgSession(planned, {
     candidate,
-    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
+    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned, historyInputs?.comments ?? null),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1099,7 +1103,7 @@ export function tryResumeRoundFix(planned, {
   const prompt = withPlannedContext(buildRoundResumePrompt({
     pr: planned.pr, itemNum: planned.itemNum, round: decision.round, cap: planned.cap ?? null,
     lane: decision.lane, headRefOid: planned.headRefOid, history,
-  }), planned, historyInputs?.comments ?? []);
+  }), planned, historyInputs?.comments ?? null);
   // The trigger starts where the earlier session's transcript is filed: its listing cwd, which planRoundResume
   // already proved is a direct child of the dispatch scratch root (never a lane checkout, #4174). `resumeOptions`
   // cannot override it.
@@ -1173,9 +1177,13 @@ export function fixerTableFor(ruling) {
   return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
 }
 
-/** Own scope insertion, then optional round history, then the per-entry sections (operator ledger always first). */
-export function withPlannedContext(prompt, planned, comments = [], wrapBrief = p => p) {
-  const fence = operatorScope([...comments, ...(planned.operatorSendBack ? [{ body: planned.operatorSendBack.body, author: { login: planned.operatorSendBack.login } }] : [])]);
+/**
+ * Own scope insertion, then optional round history, then the per-entry sections (operator ledger always first).
+ * `comments` is the PR thread; `null` (unread) is named in the brief as incomplete evidence, never treated as no exclusions.
+ */
+export function withPlannedContext(prompt, planned, comments = null, wrapBrief = p => p) {
+  const fence = operatorScope([...(comments ?? []), ...(planned.operatorSendBack ? [{ body: planned.operatorSendBack.body, author: { login: planned.operatorSendBack.login } }] : [])]);
+  if (!Array.isArray(comments)) (fence.incomplete ??= []).unshift('operator comments unavailable');
   if (planned.scopeNotes) fence.notes.push(...(Array.isArray(planned.scopeNotes) ? planned.scopeNotes : [String(planned.scopeNotes)]));
   // This helper owns the block once per launch. Text in staged evidence cannot stand in for owned policy.
   prompt = wrapBrief(scopeBrief(planned.scope ?? [], fence) + prompt);
@@ -1253,7 +1261,7 @@ export function briefWithRoundContext(prompt, planned, { repo, fixSettings, read
       baseRefName: inputs?.baseRefName ?? null, headRefName: inputs?.headRefName ?? planned.laneRef ?? null,
     });
   } else if (history) wrapBrief = p => withRoundHistory(p, renderRoundHistory(history));
-  return withPlannedContext(prompt, planned, inputs?.comments ?? [], wrapBrief);
+  return withPlannedContext(prompt, planned, inputs?.comments ?? null, wrapBrief);
 }
 
 /**

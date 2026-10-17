@@ -1213,7 +1213,12 @@ The harness checks before early, green and saved-commit pushes. Unreadable scope
 the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
 Marker parsing scans lines without a backtracking expression and rejects evidence over 1 MiB or a line
 over 16 KiB, withholding the push rather than silently truncating removal policy. Plain and HTML markers
-accept LF, CRLF, CR and Unicode line separators. Diff file headers are excluded from identifier checks;
+accept LF, CRLF, CR and Unicode line separators. PR commit messages are read through paginated GraphQL; a
+list whose length differs from `totalCount` or does not end at the PR head withholds the push. An oversized
+operator comment marks the evidence incomplete: the brief names it on every launch path (fresh, borrowed,
+round and conflict resume, and an unread thread) and the push fence withholds. Fixer-controlled paths in
+the stand-down reason are percent-encoded outside `[\w./+-]`, capped at 200 characters, and listed at most
+20 times. Diff file headers are excluded from identifier checks;
 added prefix-increment statements inside hunks are checked like all other additions.
 When the PR head diverged or its commit is absent locally, the fence refuses to push and returns a
 terminal moved-head result. Live waits use the existing `push-rejected` recovery prompt; salvage stops

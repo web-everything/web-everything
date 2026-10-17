@@ -56,6 +56,42 @@ describe('scope prompt ownership regressions', () => {
     expect(result.resumed).toBe(true);
     check(resume.mock.calls[0][1].prompt);
   });
+  it('scope prompt ownership: conflict resume renders the scope once and retains historical exclusions', () => {
+    const spawnCalls = [];
+    const result = tryResumeFix({ ...planned, itemNum: '3438', isConflict: true, body: `body\n\n${buildAuthorActorMarker(sid)}\n` }, {
+      root: '/repo', readHistoryInputs, postNotice: () => {},
+      spawnAgent: argv => { spawnCalls.push(argv); return 'backgrounded · 11111111\n'; },
+      listAgentsAll: () => [{ sessionId: sid, id: '11111111', cwd: '/lanes/lane-4', name: 'conveyor-3438' }],
+      resolveHead: cwd => (cwd === '/lanes/lane-4' ? head : null),
+    });
+    expect(result.resumed).toBe(true);
+    check(spawnCalls[0].at(-1));
+  });
+  it('scope prompt ownership: unreadable operator comments are named in the brief, never silently dropped', () => {
+    expect(withPlannedContext('BRIEF', planned)).toMatch(/Operator scope evidence is incomplete \(operator comments unavailable\)/);
+    expect(withPlannedContext('BRIEF', planned, comments)).not.toContain('Operator scope evidence is incomplete');
+  });
+  const oversized = () => ({ comments: [{ ...comments[0], body: `${comments[0].body}\n${'x'.repeat(17 * 1024)}` }], commits: [] });
+  for (const borrowed of [false, true]) {
+    it(`scope prompt ownership: ${borrowed ? 'borrowed' : 'fresh'} launch with an oversized operator comment degrades to a warning`, () => {
+      let prompt;
+      expect(() => dispatchFix(planned, {
+        root: '/repo', wrapFix: false, readBrief: () => '# Repair {{PR_NUM}}', packFixBrief: x => x,
+        readHistoryInputs: oversized, fixSettings: { roundHistory: 'off' }, readFixClaim: () => null,
+        acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, postNotice: () => {},
+        executorDecision: { executor: 'claude', reason: 'test' },
+        ...(borrowed ? { borrowed: { executor: 'codex', reason: 'test' } } : {}),
+        writeBorrowedPrompt: (_, value) => { prompt = value; return '/tmp/prompt'; },
+        spawnBorrowed: () => 'pid:123', stampRunner: () => {},
+        mintSessionId: () => sid, sessionCwdFor: () => '/scratch/x', ensureSessionCwd: x => x,
+        grantConflictHelper: () => {}, isolateSession: () => ({ hooks: { ok: true }, write: { ok: true } }),
+        resolveSettingsEnv: () => null, advisorFor: () => null, recordAdvisor: () => {},
+        spawnAgent: args => { prompt = args.at(-1); return ''; },
+      })).not.toThrow();
+      expect(prompt.split('## Declared repair scope\n')).toHaveLength(2);
+      expect(prompt).toMatch(/Operator scope evidence is incomplete \(scope-removed line limit exceeded/);
+    });
+  }
   for (const borrowed of [false, true]) {
     it(`scope prompt ownership: ${borrowed ? 'borrowed' : 'fresh'} launch renders the scope once`, () => {
       let prompt;
@@ -822,7 +858,8 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
       // unfilled template and the agent self-aborts (live 3/3: fix-2127/fix-2130/fix-2003).
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
-      '## Declared repair scope\n\nwe:scripts/conveyor/reconcile-fix-dispatch.mjs\n\n\n\n'
+      '## Declared repair scope\n\nwe:scripts/conveyor/reconcile-fix-dispatch.mjs\n\n\n'
+      + 'Operator scope evidence is incomplete (operator comments unavailable). Treat every operator exclusion on the PR as binding; the push fence withholds any push it cannot check.\n\n'
       + 'Stay inside this scope; anything else → stand down with a scope-increase request.\n\n'
       + '# fix brief for 1764 (item 3438)\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --lane=9 --session=fix-1764 '

@@ -123,8 +123,9 @@ describe('scope fence default wiring regressions', () => {
       if (cmd === 'gh') {
         if (args[0] === 'pr' && args[1] === 'view') {
           if (args.includes('--jq')) return `OPEN https://github.com/web-everything/web-everything/pull/4115 false ${ref}`;
-          return JSON.stringify({ headRefName: ref, headRefOid: OTHER, commits: [] });
+          return JSON.stringify({ headRefName: ref, headRefOid: OTHER });
         }
+        if (args[0] === 'api' && args[1] === 'graphql') return `1\n${OTHER}\tbuild\n`;
         if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
         return '';
       }

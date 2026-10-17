@@ -33,11 +33,15 @@ export function removalMarkers(text) {
   return removed;
 }
 
+/** `incomplete` names marker evidence that could not be read; the brief warns and the push fence fails closed on it. */
 export function operatorScope(comments = []) {
-  const notes = [], removed = [];
+  const notes = [], removed = [], incomplete = [];
   for (const c of comments) {
     if (!isOperatorAuthored(c) || !/^🔁 review — changes requested/.test(c.body ?? '')) continue;
-    removed.push(...removalMarkers(c.body));
+    try { removed.push(...removalMarkers(c.body)); } catch (e) {
+      if (!(e instanceof RangeError)) throw e;
+      incomplete.push(e.message);
+    }
     const lines = c.body.split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (/^\s*(?:>\s*)?(?:Out of scope:|scopeNotes:)/i.test(lines[i])) {
@@ -46,12 +50,22 @@ export function operatorScope(comments = []) {
       } else if (/\bx[a-z0-9]+ carries\b/i.test(lines[i])) notes.push(lines[i]);
     }
   }
-  return { notes, removed: [...new Set(removed)] };
+  return { notes, removed: [...new Set(removed)], ...(incomplete.length ? { incomplete } : {}) };
 }
 
-export function scopeBrief(scope, { notes = [], removed = [] } = {}) {
-  return `## Declared repair scope\n\n${scope.join(', ')}\n\n${notes.join('\n')}\n${removed.length ? `scope-removed: ${removed.join(', ')}\n` : ''}\nStay inside this scope; anything else → stand down with a scope-increase request.\n\n`;
+export function scopeBrief(scope, { notes = [], removed = [], incomplete = [] } = {}) {
+  const warning = incomplete.length ? `Operator scope evidence is incomplete (${incomplete.join('; ')}). Treat every operator exclusion on the PR as binding; the push fence withholds any push it cannot check.\n` : '';
+  return `## Declared repair scope\n\n${scope.join(', ')}\n\n${notes.join('\n')}\n${removed.length ? `scope-removed: ${removed.join(', ')}\n` : ''}${warning}\nStay inside this scope; anything else → stand down with a scope-increase request.\n\n`;
 }
+
+/** Fixer-controlled text is percent-encoded outside a safe path alphabet and capped before it reaches a posted comment or prompt. */
+export function inertText(value, max = 200) {
+  const chars = Array.from(String(value ?? ''));
+  const cut = chars.slice(0, max).join('').replace(/[^\w./+-]/gu, c => `%${c.codePointAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
+  return chars.length > max ? `${cut}...` : cut;
+}
+
+const LISTED_VIOLATIONS = 20;
 
 export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', removed = [], policy }) {
   if (policy?.enabled === false) return { action: 'push', violations: [] };
@@ -65,10 +79,12 @@ export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', r
   }).join('\n');
   const addedIdentifiers = new Set(additions.match(/[A-Za-z_$][\w$]*/g) ?? []);
   const identifiers = [...new Set(removed)].filter(id => addedIdentifiers.has(id));
-  const violations = [...outside.map(p => `outside declared scope: ${p}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${id}`)];
+  const violations = [...outside.map(p => `outside declared scope: ${inertText(p)}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${inertText(id)}`)];
   if (!violations.length) return { action: 'push', violations };
+  const more = violations.length - LISTED_VIOLATIONS;
+  const listed = [...violations.slice(0, LISTED_VIOLATIONS), ...(more > 0 ? [`and ${more} more`] : [])];
   return { action: policy?.mode === 'warn' ? 'warn' : 'stand-down', violations,
-    reason: `scope-increase request: proposed repair ${violations.join('; ')}. Operator approval is required to widen this PR's scope.` };
+    reason: `scope-increase request: proposed repair ${listed.join('; ')}. Operator approval is required to widen this PR's scope.` };
 }
 
 /** A known head movement refuses the push without sending the repair into an infrastructure retry loop. */
