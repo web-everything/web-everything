@@ -1,15 +1,16 @@
 ---
+bornAs: xh6o4xy
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/dispatch-smoke-launch.mjs", "we:scripts/lib/dispatch-smoke-launch.real-run.test.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/smoke-classify/redact-detail.mjs", "we:scripts/operations/worker-wrapper.mjs", "we:scripts/lib/daemon-rebuild/smoke-classify/redact-detail.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Dispatch-smoke launcher diagnostics path has a real-run test
+# Tighter redaction of the local stderr diagnostics file
 
-Priority: expedite (operator 2026-10-17, from PR #5460's review; the expedite outcome isn't built yet, so treat it as top priority). Add a test that really runs the launcher diagnostics path in we:scripts/lib/dispatch-smoke-launch.mjs (not mocked). Acceptance: [A1] Executable - the new test spawns the launcher for real, forces a failure, and asserts the allow-listed summary and the 0600 local stderr file; passes under vitest.
+Priority: expedite (operator 2026-10-17, from PR #5460's review; the expedite outcome isn't built yet, so treat it as top priority). Tighten redaction of the local stderr file: generic *_KEY assignments, multiline quoted credentials, a tail starting inside a credential, and stderr compaction in we:scripts/operations/worker-wrapper.mjs:322. Acceptance: [A1] Executable - tests feed each of the four credential shapes through redaction and assert none survive; passes under vitest.
 
 ## Acceptance
 
