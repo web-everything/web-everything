@@ -511,26 +511,32 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
   const planningSkips = [];
-  const initialAdmission = out?.decisions?.admission ?? {};
-  const prepareCandidates = new Map([
-    ...(initialAdmission.held ?? []).filter(h => ['needs-prepare', 'prepare-stale', 'no-size'].includes(h.reason)),
-    ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? []),
-  ].map(row => [normNum(row.num), row]));
-  for (const [num, candidate] of prepareCandidates) {
-    if (typeof effects.listPreparePrs !== 'function') continue; // legacy injected readers
-    try {
-      const bornAs = candidate.bornAs ?? initialAdmission.queue?.find(r => normNum(r.num) === num)?.bornAs
-        ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
-      const prs = await effects.listPreparePrs({ num, bornAs });
-      const merged = recentMergedPrepare({ num, bornAs, prs,
-        now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
-      if (!merged) continue;
-      const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
-      planningSkips.push({ num, reason });
-      console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
-    } catch { /* The launch guard still fails closed on an unreadable listing. */ }
-  }
-  if (planningSkips.length) {
+  // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
+  // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
+  // bound this lookahead to 24 calls; picks beyond that window still pass the ordinary fail-closed launch guard.
+  const inspectedPrepares = new Set();
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const decisions = out?.decisions ?? {};
+    const candidates = (decisions.spawnPrepareItems ?? decisions.itemPrepareSpawns ?? [])
+      .filter(row => !inspectedPrepares.has(normNum(row.num))).slice(0, 8 - inspectedPrepares.size);
+    if (!candidates.length) break;
+    const previousSkips = planningSkips.length;
+    for (const candidate of candidates) {
+      const num = normNum(candidate.num);
+      inspectedPrepares.add(num);
+      try {
+        const bornAs = candidate.bornAs ?? decisions.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
+          ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
+        const prs = await effects.listPreparePrs({ num, bornAs });
+        const merged = recentMergedPrepare({ num, bornAs, prs,
+          now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours });
+        if (!merged) continue;
+        const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+        planningSkips.push({ num, reason });
+        console.error(`build-dispatch-daemon: prepare #${num} ${reason}`);
+      } catch { /* The launch guard still fails closed on an unreadable listing. */ }
+    }
+    if (planningSkips.length === previousSkips) break;
     tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
     out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
   }

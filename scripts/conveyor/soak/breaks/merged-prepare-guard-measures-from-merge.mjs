@@ -23,7 +23,7 @@ export default {
     return readFileSync(resolve(root, GUARD), 'utf8').includes('pr.mergedAt ?? pr.closedAt ?? pr.createdAt');
   },
   async run() {
-    const { runBuildDispatchTick } = await import(resolve(ROOT, 'skills-src/conveyor/build-dispatch-daemon.mjs'));
+    const { runBuildDispatchTick, createPrepareStatusReader } = await import(resolve(ROOT, 'skills-src/conveyor/build-dispatch-daemon.mjs'));
     const claimed = [], dispatched = [];
     let hideMergeDuringPlanning = false;
     let listingCalls = 0;
@@ -55,10 +55,32 @@ export default {
       launched: planned.prepare.launched, skipped: planned.prepare.skippedInPlanning };
     hideMergeDuringPlanning = true;
     const tick = await runBuildDispatchTick({ live: true, effects });
-    return { planning, claimed, dispatchCount: dispatched.length, launched: tick.prepare.launched, refused: tick.prepare.refused };
+    // A large held backlog must not consume the reader's budget before the actual late-ordered pick.
+    const rows = Array.from({ length: 60 }, (_, i) => ({ num: String(8000 + i), bornAs: `xabc${String(i).padStart(3, '0')}` }));
+    let searches = 0;
+    const reader = createPrepareStatusReader({ exec: cmd => {
+      if (cmd !== 'gh') throw new Error(`unexpected ${cmd} in listing-only probe`);
+      searches++;
+      return '[]';
+    } });
+    const volumeClaims = [], volumeDispatches = [];
+    const volumeTick = await runBuildDispatchTick({ live: true, effects: { ...effects,
+      planTick: () => ({ decisions: { itemPrepareSpawns: [rows.at(-1)],
+        admission: { queue: rows, held: rows.map(row => ({ ...row, reason: 'needs-prepare' })) } }, nextState: {} }),
+      listPreparePrs: args => reader.listPrs(args),
+      acquirePrepareClaim: ({ num }) => { volumeClaims.push(num); return { ok: true }; },
+      dispatch: request => { volumeDispatches.push(request); return { dispatching: true }; },
+    } });
+    return { planning, claimed, dispatchCount: dispatched.length, launched: tick.prepare.launched, refused: tick.prepare.refused,
+      volume: { searches, claimed: volumeClaims, dispatchCount: volumeDispatches.length,
+        launched: volumeTick.prepare.launched.map(row => row.num), refused: volumeTick.prepare.refused } };
   },
   judge(report) {
     const problems = [];
+    if (report.volume.searches !== 3 || report.volume.claimed.join() !== '8059'
+      || report.volume.dispatchCount !== 1 || report.volume.launched.join() !== '8059' || report.volume.refused.length) {
+      problems.push('held backlog exhausted the prepare listing budget before the actual pick');
+    }
     if (report.planning.claimed.length || report.planning.dispatchCount || report.planning.launched.length) {
       problems.push('recently merged #5399 allowed a duplicate during planning');
     }

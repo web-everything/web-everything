@@ -1178,12 +1178,16 @@ Codex author does not prove ownership. The REST producer and normalized planner 
 must preserve `body`; the producer-contract test pins that path. Existing card-only
 and accepted exclusions still apply; scope and freeze-label guards inspect every PR.
 
-Before finalizing prepare picks, inspect all held prepare candidates using
+Before finalizing prepare picks, inspect the actual planned picks using
 `recentMergedPrepare`, shared with `prepareLaunchRefusal`. Add recent merges to the
 planner's prepare exclusions and re-plan the same tick so the next candidate gets the
-slot. Log the elapsed minutes and PR number. Keep the launch guard as the final race
-check. Replay a merge 20 minutes ago with one slot and a clean second candidate;
-include grouped members, hash aliases, guard-off, and older merges in the touched suites.
+slot. Bound this lookahead to eight distinct cards (at most 24 listing calls), leaving
+the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
+Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
+ago with one slot and a clean second candidate; include grouped members, hash aliases,
+guard-off, and older merges in the touched suites. Use the production reader in a tick
+with more than 50 held cards and late-ordered picks; assert the picks launch without
+listing-budget refusals. Also cover consecutive merged picks beyond the lookahead limit.
 
 ### Build dispatch launch lifetime and prepare discovery
 

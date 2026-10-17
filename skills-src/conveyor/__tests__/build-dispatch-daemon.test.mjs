@@ -1802,6 +1802,66 @@ describe('automatic item preparation', () => {
       expect(tick.prepare.refused).toEqual([]);
     } finally { log.mockRestore(); }
   });
+  it('reserves listing budget for actual picks behind more than 50 held prepare candidates', async () => {
+    const effects = fixture();
+    const rows = Array.from({ length: 60 }, (_, i) => ({ num: String(8000 + i), bornAs: `xabc${String(i).padStart(3, '0')}` }));
+    const git = prepareGitFixture(Object.fromEntries(rows.map(row => [row.num, `---\nbornAs: ${row.bornAs}\n---\nunprepared`])));
+    const searches = [];
+    const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      searches.push(args[args.indexOf('--search') + 1]);
+      return '[]';
+    } });
+    effects.planTick = bk => ({ decisions: {
+      admission: { queue: rows, held: rows.map((row, i) => ({ ...row,
+        reason: i < 58 ? ['needs-prepare', 'prepare-stale', 'no-size'][i % 3] : 'needs-prepare' })) },
+      itemPrepareSpawns: planPrepareSpawns({ needsPrepare: rows.slice(-2), prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1, 2], maxConcurrentItemPrepares: 2 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.refused).toEqual([]);
+    expect(tick.prepare.launched.map(row => row.num)).toEqual(['8058', '8059']);
+    expect(searches).toHaveLength(6);
+    expect(effects.dispatch).toHaveBeenCalledTimes(2);
+  });
+  it.each([3, 60])('bounds replanning through %s consecutive guarded picks and still evaluates the final pick', async guardedCount => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T23:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    const rows = Array.from({ length: guardedCount + 1 }, (_, i) => ({ num: String(8100 + i), bornAs: `xdef${String(i).padStart(3, '0')}` }));
+    const searches = [];
+    const reader = createPrepareStatusReader({ exec: (cmd, args) => {
+      expect(cmd).toBe('gh');
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const row = rows.find(row => search === `head:lane/${row.num}` || search === `head:lane/${row.bornAs}`
+        || search === `in:title "WE #${row.num}: prepare"`);
+      return JSON.stringify(row !== rows.at(-1) ? [{ number: Number(row.num), state: 'MERGED',
+        headRefName: `lane/${row.num}-prepare-design`, mergedAt: '2026-10-16T22:40:00Z' }] : []);
+    } });
+    effects.planTick = bk => ({ decisions: {
+      admission: { queue: rows, held: rows.map(row => ({ ...row, reason: 'needs-prepare' })) },
+      spawnPrepareItems: planPrepareSpawns({ needsPrepare: rows, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.skippedInPlanning).toHaveLength(Math.min(guardedCount, 8));
+      // The successor outside the planning window must still get a complete final guard observation.
+      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 3);
+      if (guardedCount === 3) {
+        expect(tick.prepare.launched.map(row => row.num)).toEqual(['8103']);
+        expect(tick.prepare.refused).toEqual([]);
+      } else {
+        expect(tick.prepare.refused).toEqual([{ num: '8108', reason: 'merged prepare PR #8108 (within 24h guard)' }]);
+        expect(effects.listPrepareClaims()).toEqual([]);
+        expect(effects.dispatch).not.toHaveBeenCalled();
+      }
+    } finally { log.mockRestore(); }
+  });
   function claimed(effects, num = '4501', { age = 40, alive = false } = {}) {
     acquireBuildDispatchClaim({ num, lockRoot, owner: 'host:10', pid: 10,
       nowMs: Date.now() - age * 60_000 });
