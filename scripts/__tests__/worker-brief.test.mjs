@@ -36,7 +36,7 @@ describe('renderWorkerBrief', () => {
       'free-scope-cli.mjs release --agent=fix-widget --owner=tok12345',
       'lane-pool.mjs acquire --purpose=fix-widget --adopt',
       'lane-pool.mjs release --lane=<N> --session=<holder slug it printed>',
-      'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=standards',
+      'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=full',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
       `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,

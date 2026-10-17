@@ -1,3 +1,6 @@
+import { beforeEach as beforeBuildPolicy, afterEach as afterBuildPolicy, vi as buildPolicyVi } from 'vitest';
+beforeBuildPolicy(() => buildPolicyVi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
 /** #4410 — completed persistence boundaries, exercised through deliverItem and the real dispatch tick. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, cpSync, rmSync } from 'node:fs';

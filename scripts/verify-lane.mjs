@@ -17,17 +17,12 @@
  *
  * The pure decision half (marker shape + the gate decision `pr-land` calls) lives in `scripts/lib/lane-verify.mjs`.
  *
- * THE DEFAULT GATE IS DIFF-DRIVEN (#3372). Rather than an unconditional `npm run test:unit`, the default gate
- * decides off the lane's actual `git diff` against `origin/main` via `scripts/readiness/test-selection.mjs`
- * (#2681), using its LOCAL policy (xpnhz4o, `decideLocalSelection`): the working-tree diff runs only
- * `npx vitest related <changed files + tests naming them>` (including shared helpers). A config/setup/dependency
- * change, a deleted source file, or an empty/unresolvable diff now requires an explicit affected-test gate;
- * the gate prints which of the two it chose, and why, before it starts. CI still runs the full suite.
- * See `scripts/lib/verify-lane-gate.mjs` for the decision core and why defaulting the shrink at THIS call site
- * does not conflict with #2681's own "not defaulted [on the CI merge gate]" DoD.
+ * The default build.finalGate is full: the whole unit tier plus standards, through heavy admission.
+ * Set build.finalGate=related to retain the diff-driven selection in lib/verify-lane-gate.mjs.
+ * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
- *   node scripts/verify-lane.mjs                      # run the default gate (diff-driven selection + check:standards; #3372) foreground, record green/red for HEAD
+ *   node scripts/verify-lane.mjs                      # run the default full gate (whole unit tier + check:standards) foreground, record green/red for HEAD
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
@@ -60,6 +55,7 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
@@ -348,6 +344,12 @@ const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
+const buildPolicy = resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
+if (flags.gate === undefined && buildPolicy.finalGate === 'full') {
+  const scripts = readCheckoutScripts();
+  const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
+  flags.gate = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+}
 let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {

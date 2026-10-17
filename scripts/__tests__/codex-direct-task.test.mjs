@@ -7,7 +7,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -38,6 +38,10 @@ import {
   runCodexDirectExec,
   codexDirectTask,
 } from '../codex-direct-task.mjs';
+
+// Historical orchestration fixtures isolate the new independently tested self-review.
+beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+afterEach(() => vi.unstubAllEnvs());
 
 function flagValue(argv, flag) {
   const i = argv.indexOf(flag);
@@ -624,7 +628,8 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       return '';
     };
     const r = captureDiff({ dir: '/d', startSha: 'abc123', execFn });
-    expect(calls).toContain('-C /d add --intent-to-add -- new-file.txt');
+    // Every read carries the shared lane pins between `-C <dir>` and the subcommand.
+    expect(calls.some((c) => /^-C \/d .*core\.fsmonitor=false .* add --intent-to-add -- new-file\.txt$/.test(c))).toBe(true);
     expect(r.hasChanges).toBe(true);
     expect(r.diffStat).toContain('2 files changed');
   });
@@ -660,7 +665,7 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
 });
 
 describe('runGate — none/standards/full, never commits', () => {
-  it('mode "none" (default) runs nothing and passes', () => {
+  it('mode "none" runs nothing and passes', () => {
     const execFn = vi.fn();
     const r = runGate({ dir: '/d', mode: 'none', execFn });
     expect(r.ran).toBe(false);
@@ -675,22 +680,22 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(r.pass).toBe(true);
   });
 
-  it('mode "full" runs check:standards then the full vitest suite', () => {
+  it('mode "full" runs verify-lane with the whole unit tier and standards', () => {
     const execFn = vi.fn(() => 'ok');
     const r = runGate({ dir: '/d', mode: 'full', execFn });
-    expect(r.steps.map((s) => s.cmd)).toEqual(['npm run check:standards', 'npm run test:unit']);
+    expect(r.steps.map((s) => s.cmd)).toEqual(['node scripts/verify-lane.mjs run --gate=npm run test:unit && npm run check:standards']);
   });
 
   it('a failing step is caught and reported, not thrown — and marks the gate failed', () => {
     const execFn = vi.fn((bin, args) => {
-      if (args.includes('check:standards')) { const e = new Error('exit 1'); e.stdout = 'BAD'; throw e; }
+      if (args.some(a => a.includes('check:standards'))) { const e = new Error('exit 1'); e.stdout = 'BAD'; throw e; }
       return 'ok';
     });
     const r = runGate({ dir: '/d', mode: 'full', execFn });
     expect(r.pass).toBe(false);
     expect(r.steps[0].pass).toBe(false);
     expect(r.steps[0].output).toContain('BAD');
-    expect(r.steps[1].pass).toBe(true); // the second step still ran
+    expect(r.steps).toHaveLength(1); // verify-lane owns the full gate
   });
 });
 
@@ -777,7 +782,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const stdout = '{}\n';
       const { fn: spawnFn, seen } = fakeSpawn(stdout);
       const logFile = explicitLog ? join(dir, 'logs', 'custom.jsonl') : undefined;
-      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', stream: false, spawnFn, logFile });
+      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', gate: 'none', stream: false, spawnFn, logFile });
       expect(seen.opts.cwd).toBe(worktree);
       expect(report.exitCode).toBe(0);
       expect(report.logFile).toBe(logFile ?? join(gitDir, 'codex-direct-task.jsonl'));
@@ -793,6 +798,22 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('isolates review final-message files so a previous clear verdict cannot be reused', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-review-output-'));
+    try {
+      const paths = [];
+      for (let i = 0; i < 2; i++) {
+        const { fn } = fakeSpawn('{}\n');
+        const r = await runCodexDirectExec({ dir, gitDir: dir, review: true, task: 'review',
+          logFile: join(dir, 'events.jsonl'), stream: false, spawnFn: fn });
+        paths.push(r.outputLastMessageFile);
+        if (i === 0) writeFileSync(r.outputLastMessageFile, '{"findings":[]}');
+        else expect(() => readFileSync(r.outputLastMessageFile, 'utf8')).toThrow();
+      }
+      expect(paths[0]).not.toBe(paths[1]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('spawns codex with the exact argv buildCodexDirectTaskArgv would produce, writes the task to stdin, and logs raw stdout to the log file', async () => {

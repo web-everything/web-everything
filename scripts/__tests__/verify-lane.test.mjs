@@ -11,7 +11,7 @@
  *   for a DIFFERENT sha mid-run — i.e. between this run's start-write and its finish-write, exactly when a real
  *   sibling run B would claim the marker.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,10 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
+
+// Selection fixtures retain the historical related gate explicitly.
+beforeEach(() => vi.stubEnv('WE_BUILD_FINAL_GATE', 'related'));
+afterEach(() => vi.unstubAllEnvs());
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
@@ -1709,4 +1713,39 @@ describe('item 98 — --help prints usage without running the gate', () => {
       expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
     });
   }
+});
+
+describe('full build gate default', () => {
+  it('runs both whole-unit and standards scripts without a gate flag', () => {
+    const scripts = {
+      'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+    };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    const env = { ...process.env };
+    delete env.WE_BUILD_FINAL_GATE;
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toContain('finalGate="full" (standard)');
+    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+    expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
+  });
+
+  // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
+  it.each([
+    ['full', true], ['related', false], ['none', false],
+  ])('finalGate=%s runs the whole unit tier only when full', (finalGate, wholeUnit) => {
+    const scripts = {
+      'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+    };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+    const explicit = spawnSync('node', [VERIFY_LANE, 'run', '--json', '--gate=npm run check:standards'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(explicit.status, explicit.stderr).toBe(0);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+  });
 });

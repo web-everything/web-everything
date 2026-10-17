@@ -93,6 +93,11 @@
  *      remains the DEFAULT (see `DEFAULT_DELIVERY_AGENT_PROVIDER_NAME`); Codex is opt-in by name, and the
  *      operator chose to build it ahead of `#3581`'s ratified reviewer-first sequencing gate knowingly.
  */
+import { resolveBuildPolicy, appendBuildRequirements } from '../lib/build-policy.mjs';
+import {
+  runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, selfReviewDiffArgs, SELF_REVIEW_MAX_DIFF_BYTES,
+} from '../lib/build-self-review.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
@@ -325,7 +330,7 @@ export const ensureDeliveryHooksSettingsFile = createHooksSettingsWriter(
  *   used rather than minting a second one. `newSessionId` is injectable only so a test can assert on a
  *   deterministic value instead of a fresh random UUID every run.
  */
-export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER, { newSessionId = randomUUID } = {}) {
+export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER, { newSessionId = randomUUID, reviewBuild = reviewBuildDiff } = {}) {
   // `runId`/`effectKey` name this delivery's own run-store dispatch effect, threaded through from the daemon's
   // dispatch sink. Either absent — an older dispatch, a hand-built test launch, a resumed dispatch that
   // predates this — and `settleTerminal` below just skips the run-store settle; it still releases/holds the
@@ -598,8 +603,33 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // `provider` threaded through (mechanical-dispatcher follow-up to #3580) — see `runConvergeEdit`'s own
     // docblock ("VISIBILITY fix") for why this does not make Codex the converge editor; it only makes the
     // requested build provider visible to, and recorded by, the round that runs regardless.
-    const convergeVerdict = spanAround('converge.round', { attributes: { item: String(item), buildProvider: provider.name } },
-      () => runConverge({ lane: gate.lanePath, item }, { provider }));
+    const buildPolicy = resolveBuildPolicy({ log: line => console.error(line) });
+    const selfReview = await runBuildSelfReview({
+      policy: buildPolicy, dir: gate.lanePath,
+      // Hardened and bounded: the builder controls this lane's git config, and an overflow is the size note.
+      // Commit against commit, so no worktree clean filter runs.
+      readDiff: () => boundedSelfReviewDiff(() => run('git', selfReviewDiffArgs('origin/main...HEAD'),
+        { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
+      review: reviewBuild,
+      fix: async prompt => {
+        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
+          prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
+          lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
+        const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
+          : tryReadDeliveryReport(sessionSlug, resolveDeliveryReportsDir(gate.lanePath));
+        if (!updated || updated.status !== 'done' || !['done', 'needs-human-judgment'].includes(updated.outcome)) {
+          throw new Error('self-review builder did not complete its repair');
+        }
+        report = updated;
+        commitBuildTurn({ lane: gate.lanePath, item, provider, phase: 'self-review' });
+      },
+      gate: () => runVerifyOperation(gate.lanePath).outcome === 'pass',
+    });
+    report.selfReview = selfReview;
+    const convergeVerdict = buildPolicy.selfReview.enabled
+      ? { verdict: 'land', selfReview }
+      : spanAround('converge.round', { attributes: { item: String(item), buildProvider: provider.name } },
+        () => runConverge({ lane: gate.lanePath, item }, { provider }));
 
     // ---- 5. Map outcome + convergeVerdict + statute-touch to a park mode, via the EXISTING deterministic
     // rubric (`review-escalation.mjs`) — REAL import, SKETCH call (the real `scoreEscalation` signature takes
@@ -1595,7 +1625,7 @@ export async function runAgentToCompletion(
     resume = false,
   },
   {
-    readBrief = () => readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'),
+    readBrief = () => appendBuildRequirements(readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'), { selfReview: false }),
     readReport = tryReadDeliveryReport,
     resolveLane = resolveLanePath,
     resolveReportsDir = resolveDeliveryReportsDir,
@@ -1809,15 +1839,7 @@ async function resumeAgentWithGateFailure({
   // files in $LANE are correct"; `runGateWithOneRetry` commits this resumed turn's fix itself, the same
   // wrapper-owned way it already commits the original build (see `commitBuildTurn`'s own header for why —
   // this is the #3565 Codex sandbox finding applied as a structural fix, not a sandbox carve-out).
-  const prompt = gateOutcome === 'unrun'
-    ? `The verification gate could not RUN for your commit in $LANE (this looks like a wrapper/environment `
-      + `problem, not necessarily a problem in your own diff):\n\n${failureOutput}\n\nIf you can see something `
-      + `genuinely wrong in your own change, fix it in $LANE and send a fresh \`done\` report exactly as `
-      + `before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you. If you cannot find `
-      + `anything wrong in your own diff, do not guess at a code change — send a report with `
-      + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
-    : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
-      + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
+  const prompt = gateFailureResumePrompt({ failureOutput, gateOutcome });
   // BUG-5 FIX: both `sessionId` and `resumeSessionId` are `claudeSessionId` — the real UUID minted once in
   // `deliverItem` and reused by the fresh spawn — never `sessionSlug`. `--resume <id>` must name the SAME CLI
   // session the fresh spawn created, and that id must itself be a UUID (CLI-enforced).
@@ -1828,6 +1850,20 @@ async function resumeAgentWithGateFailure({
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
   }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
+}
+
+/** The resumed turn's prompt after a red or unrun gate (`resumeAgentWithGateFailure`), with the build requirements once. */
+export function gateFailureResumePrompt({ failureOutput, gateOutcome = 'fail' }) {
+  const prompt = gateOutcome === 'unrun'
+    ? `The verification gate could not RUN for your commit in $LANE (this looks like a wrapper/environment `
+      + `problem, not necessarily a problem in your own diff):\n\n${failureOutput}\n\nIf you can see something `
+      + `genuinely wrong in your own change, fix it in $LANE and send a fresh \`done\` report exactly as `
+      + `before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you. If you cannot find `
+      + `anything wrong in your own diff, do not guess at a code change — send a report with `
+      + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
+    : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
+      + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
+  return appendBuildRequirements(prompt, { selfReview: false });
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the
@@ -2565,6 +2601,7 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
   if (touchesStatute) return { mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' };
   if (report.outcome === 'needs-human-judgment') return { mode: 'park', label: 'review:human', reason: report.reason };
   if (convergeVerdict.verdict === 'escalate') return { mode: 'park', label: 'review:human', reason: convergeVerdict.reason };
+  if (convergeVerdict.selfReview) return { mode: 'park', label: 'review:pending', reason: 'pre-review self-check complete; independent review required' };
 
   const dismissedFindings = Array.isArray(convergeVerdict.dismissed) ? convergeVerdict.dismissed.length : 0;
   const diffStats = lanePath ? computeLaneDiffStats(lanePath, { run: runFn }) : { changedFiles: filesTouched || [], diffLines: 0 };
@@ -2622,7 +2659,7 @@ export function buildPrBody({ item, report, delegation = null, groupMembers = []
     + groupDropped.map((num) => `\nDropped from group: #${num} — ${sanitizeGroupDropReason(groupDropReasons[num])}`).join('');
   return `## #${item}\n\n${summary}${filesLine}${groupBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
     + '(the mechanical wrapper drove review/gate/PR — the agent only built and reported).\n'
-    + (marker ? `${marker}\n` : '');
+    + (marker ? `${marker}\n` : '') + renderSelfReviewNotes(report?.selfReview);
 }
 
 /**
