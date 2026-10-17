@@ -128,11 +128,19 @@ it('a red-main fix still passes the fixer cap when only the send-back reservatio
   expect(dispatch.mock.calls.map(([entry]) => entry.pr)).toEqual([5269]);
   expect(result.refusals).toEqual([]);
 });
-it('an ordinary repair held by the reservation may still borrow a builder slot, like any fixer-cap wait', () => {
-  const { result, dispatch, borrowGate } = passWith([{ kind: 'fix', prNumber: 5268, headRefName: 'lane/304-ordinary', labels: ['ci:failed'] }]);
-  expect(dispatch).not.toHaveBeenCalled();
-  expect(borrowGate.consider).toHaveBeenCalledWith({ repo: 'we', pr: 5268 });
+it('an ordinary repair held only by the reservation never borrows into it, and the slot stays free for a send-back', () => {
+  const ready = { borrow: true, executor: 'codex', reason: 'borrowed-build-slot', waitedMinutes: 99 };
+  const ordinary = { kind: 'fix', prNumber: 5268, headRefName: 'lane/304-ordinary', labels: ['ci:failed'] };
+  const sendBack = { kind: 'fix', prNumber: 5401, headRefName: 'lane/5401-bounced', labels: ['review:changes'] };
+  const { result, dispatch, borrowGate } = passWith([ordinary, sendBack], { borrowGate: { consider: vi.fn(() => ready), clear: vi.fn() } });
+  expect(borrowGate.consider).not.toHaveBeenCalled();
   expect(result.refusals).toEqual([expect.objectContaining({ pr: 5268, kind: 'fix-cap' })]);
+  expect(dispatch.mock.calls.map(([entry]) => entry.pr)).toEqual([5401]);
+});
+it('a full cap (not the reservation) still offers the builder-slot borrow', () => {
+  const { borrowGate } = passWith([{ kind: 'fix', prNumber: 5268, headRefName: 'lane/304-ordinary', labels: ['ci:failed'] }],
+    { dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'full' }) } });
+  expect(borrowGate.consider).toHaveBeenCalledWith({ repo: 'we', pr: 5268 });
 });
 
 import { buildCliDaemonEffects, fixDaemonPrEventsOptions } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
