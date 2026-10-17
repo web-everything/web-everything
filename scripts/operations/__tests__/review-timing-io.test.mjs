@@ -8,11 +8,20 @@ import { dispatchReviewJob } from '../review-job.mjs';
 import { readPr, createReviewPrSinks } from '../review-pr-io.mjs';
 import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS } from '../review-pr.mjs';
 const head = 'a'.repeat(40);
-it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red', async effect => {
+it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red and cancellation is enabled', async effect => {
   const runNode = vi.fn(); const postComment = vi.fn();
-  const sinks = createReviewPrSinks({ runNode, postComment, publishGate: () => ({ headSha: head, checks: [{ name: 'unit', head_sha: head, conclusion: 'failure' }] }) });
+  const sinks = createReviewPrSinks({ env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, runNode, postComment,
+    publishGate: () => ({ headSha: head, checks: [{ name: 'unit', head_sha: head, conclusion: 'failure' }] }) });
   await expect(sinks[effect]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).rejects.toThrow('review void');
   expect(runNode).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
+});
+it('publishes an advisory on same-head red CI when cancellation is disabled', async () => {
+  const postComment = vi.fn();
+  const sinks = createReviewPrSinks({ env: { WE_REVIEW_CANCEL_ON_CI_RED: 'false' }, postComment,
+    publishGate: () => ({ headSha: head, checks: [{ name: 'unit', head_sha: head, conclusion: 'failure' }] }) });
+  await expect(sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).resolves.toEqual({ posted: true });
+  expect(postComment).toHaveBeenCalledTimes(1);
+  expect(postComment).toHaveBeenCalledWith('o/n', 7, 'verdict');
 });
 it('reads a real small fix as a delta while keeping the full net diff and head fingerprint basis', () => {
   const root = mkdtempSync(join(tmpdir(), 'review-timing-'));
