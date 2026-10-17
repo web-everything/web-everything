@@ -21,11 +21,12 @@ function fixture(options = {}) {
     eligible: true, candidate: { num: 42, repo, listedHeadSha: head }, queueAdmission: { allowed: true } });
   const enqueue = vi.fn(() => ({ enqueued: true }));
   const recordLanded = vi.fn();
+  const beforeEnqueue = vi.fn();
   const settings = resolvePrestageSettings({ env: {}, tool: {}, platform: {} });
   const readPr = vi.fn(async () => pr);
-  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, recordLanded, fixClaimHeld: () => false,
+  const run = () => enqueuePrestage({ cache, repo, num: 42, settings, readPr, enqueue, recordLanded, beforeEnqueue, fixClaimHeld: () => false,
     withLock: fn => ({ ran: true, result: fn() }), ...options });
-  return { cache, pr, enqueue, recordLanded, settings, run, readPr, advance: ms => { clock += ms; } };
+  return { cache, pr, enqueue, recordLanded, beforeEnqueue, settings, run, readPr, advance: ms => { clock += ms; } };
 }
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
@@ -148,7 +149,25 @@ describe('CI pre-stage', () => {
     expect(f.recordLanded).not.toHaveBeenCalled();
     expect(f.cache.get(repo, 42, 30)).toBeNull();
   });
-  it.each(['fixClaimHeld', 'recordLanded'])('refuses the shortcut when %s is not wired', async hook => {
+  it('runs the pre-landing steps once, after every check and before the enqueue', async () => {
+    const f = fixture();
+    f.beforeEnqueue.mockImplementation(() => expect(f.enqueue).not.toHaveBeenCalled());
+    expect(await f.run()).toMatchObject({ enqueued: false });
+    expect(f.beforeEnqueue).not.toHaveBeenCalled();
+    green(f);
+    expect(await f.run()).toEqual({ enqueued: true });
+    expect(f.beforeEnqueue).toHaveBeenCalledTimes(1);
+    expect(f.beforeEnqueue).toHaveBeenCalledWith(expect.objectContaining({ num: 42 }), head, expect.objectContaining({ baseRefName: 'main' }));
+  });
+  it('a throwing pre-landing step drops admission and falls back without enqueuing', async () => {
+    const f = fixture();
+    green(f);
+    f.beforeEnqueue.mockRejectedValue(new Error('gh unreachable'));
+    expect(await f.run()).toEqual({ fallback: true });
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.cache.get(repo, 42, 30)).toBeNull();
+  });
+  it.each(['beforeEnqueue', 'fixClaimHeld', 'recordLanded'])('refuses the shortcut when %s is not wired', async hook => {
     const f = fixture({ [hook]: undefined });
     green(f);
     expect(await f.run()).toEqual({ fallback: true });

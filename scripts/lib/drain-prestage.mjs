@@ -67,12 +67,13 @@ export function prestageLiveHold(pr) {
 
 /**
  * No listing or gate evaluation on a hit. Unknown/stale evidence delegates to the ordinary drain.
+ * The cascade's own steps around an enqueue are hooks, all required (without any one the shortcut is refused):
+ * `beforeEnqueue(candidate, headSha, entry)` runs the cascade's pre-landing steps once every check passed,
  * `fixClaimHeld` is re-read inside the merge-write lock (a fixer may claim the PR while this waits for it), and
  * `recordLanded(candidate, headSha)` writes the ledger facts the full cascade writes after a confirmed enqueue.
- * Both are required: without either one the shortcut is refused.
  */
-export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, fixClaimHeld, recordLanded, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
-  if (!settings.value.prestageWhileCiRuns || typeof fixClaimHeld !== 'function' || typeof recordLanded !== 'function') return { fallback: true };
+export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqueue, withLock, beforeEnqueue, fixClaimHeld, recordLanded, blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL }) {
+  if (!settings.value.prestageWhileCiRuns || [beforeEnqueue, fixClaimHeld, recordLanded].some(hook => typeof hook !== 'function')) return { fallback: true };
   const entry = cache.get(repo, num, settings.value.prestageTtlMin);
   if (!entry?.eligible) return { fallback: true };
   // Entries written before manifest preparation was excluded may still be within their TTL.
@@ -98,6 +99,7 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
   if (ci === 'unknown') return { fallback: true };
   if (ci !== 'green') return { enqueued: false, reason: `required checks ${ci}` };
   try {
+    await beforeEnqueue(entry.candidate, entry.headSha, entry);
     const locked = await withLock(() => (fixClaimHeld() ? { fallback: true } : enqueue(entry.candidate, entry.headSha, entry)));
     if (locked.ran === false) return { enqueued: false, reason: 'merge-write mutex held' };
     const result = await locked.result;

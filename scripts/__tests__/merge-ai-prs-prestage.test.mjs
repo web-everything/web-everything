@@ -21,6 +21,7 @@ fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
 const out = x => { if (a.includes('-i')) process.stdout.write('HTTP/2 200 OK\\n\\n'); process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 const page = ${openPrPageFixture};
 if (a[0] === 'repo') out('main');
+if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
@@ -76,7 +77,7 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       const r = spawnSync(process.execPath, [script, '--this-repo','--label=ready-to-merge','--only=42', '--json',
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
-        ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:30_000,
+        ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
         env: { ...process.env, PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
           WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
@@ -109,7 +110,7 @@ describe('real drain pre-stage path', () => {
     const result = await enqueuePrestage({ cache: createPrestageCache({ root: join(coord, 'drain-prestage') }), repo: 'web-everything/web-everything', num: 42,
       settings: resolvePrestageSettings({ env: {}, tool: {}, platform: {} }), recordLanded: vi.fn(), enqueue,
       readPr: async () => ({ ...pr, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
-      fixClaimHeld: () => prestageFixClaimHeld(42, { claimKey: 'we', readClaim: q => readLiveFixClaim({ ...q, lockRoot }) }),
+      fixClaimHeld: () => prestageFixClaimHeld(42, { claimKey: 'we', readClaim: q => readLiveFixClaim({ ...q, lockRoot }) }), beforeEnqueue: vi.fn(),
       // The initial read saw no claim; the fixer takes it while the drain waits for the merge-write lock.
       withLock: fn => {
         const now = Date.now();
@@ -203,8 +204,24 @@ describe('real drain pre-stage path', () => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = run(true);
     expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
-    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' || a.some(x => x.includes('pullRequests(')))).toBe(false);
+    // The only list is the stacked-set read scoped to this head (`--base lane/readme`), never an open-PR listing.
+    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' && !a.includes('--base') || a.some(x => x.includes('pullRequests(')))).toBe(false);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
+  }));
+  it('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice', () => world(({pr,run}) => {
+    expect(run().stderr).toContain('eligible=true');
+    // The pre-landing read is fresh: the reviewed-sha record is gone by green time, so coverage is announced.
+    pr.comments = [];
+    pr.stacked = [{ number: 43, baseRefName: pr.headRefName }];
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true);
+    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    const at = pred => next.calls.findIndex(pred);
+    const enqueued = at(a => a.some(x => x.includes('enqueuePullRequest')));
+    const listed = at(a => a[0] === 'pr' && a[1] === 'list' && a.includes('--base') && a.includes(pr.headRefName));
+    const retargeted = at(a => a[0] === 'pr' && a[1] === 'edit' && a[2] === '43' && a.includes('--base') && a.includes('main'));
+    const announced = at(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '42' && a.some(x => x.includes('Incomplete review')));
+    expect([listed, retargeted, announced].every(i => i >= 0 && i < enqueued), JSON.stringify(next.calls)).toBe(true);
   }));
   it('a moved head falls back to a full listing', () => world(({pr,run}) => {
     expect(run().stderr).toContain('eligible=true');

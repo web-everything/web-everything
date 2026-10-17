@@ -4604,6 +4604,38 @@ async function runCli() {
     const facts = recordDrainLedgerFacts({ verdicts: [{ ...c, decision: 'merge', listedHeadSha: headSha }], localSlug, read });
     if (!facts.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} verdict-ledger drain facts (non-fatal) — ${facts.errors.slice(0, 3).join('; ')}\n`);
   };
+  // The steps every landing entry point runs right before its merge or enqueue: the cascade below and the
+  // green-event pre-stage shortcut both call this one function. Best-effort: neither step can block the landing.
+  //
+  // #3308 — announce a skipped or degraded review on the PR, so the record survives on the merged PR. Gated on a
+  // successful comment read: a `gh` miss returns `[]`, and announcing `no-recorded-review` off a failed fetch would
+  // assert an absence from an unknown. `postDrainReasonComment` dedupes on the rendered text.
+  //
+  // #3383 — retarget any OPEN PR stacked on this branch to the default branch. The merge (or the queue's merge)
+  // deletes the head branch, and GitHub CLOSES (never retargets) a PR whose base branch vanished — the #2578
+  // incident; once closed, GitHub refuses both `pr edit --base` and reopen, so this MUST run before landing.
+  // `--base <headRef>` scopes the listing to exactly the stacked set — no full-repo PR fan-out.
+  const announceAndRetargetBeforeLand = (c, { preread, defaultBranch }) => {
+    if (preread.read) {
+      const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
+      if (gaps.length) {
+        const reason = buildReviewCoverageReason(gaps);
+        const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);
+        if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} review coverage: ${gaps.map((g) => g.code).join(', ')}${posted ? ' — announced on the PR' : ' (already stamped / post failed)'}\n`);
+      }
+    } else if (!AS_JSON) {
+      process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} could not read PR comments — review coverage NOT assessed (unknown, not clean; #3308)\n`);
+    }
+    retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch,
+      onRetarget: (num) => { if (!AS_JSON) process.stderr.write(`  ↷ ${repoTag(c.repo)}${num} retargeted ${c.headRef}→${defaultBranch} before deleting the merged branch (#3383)\n`); },
+      onFailed: (num) => {
+        if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${num} could not be retargeted off ${c.headRef} before the merge — it may get closed by the branch delete (#3383)\n`);
+        // #4138 — a PR GitHub is about to close (via the base-branch-delete cascade) must ALWAYS carry a reason
+        // comment, posted BEFORE the close happens. Best-effort like the retarget itself.
+        postDrainReasonComment(c.repo, num, STACKED_BASE_CLOSE_KIND, buildStackedBaseCloseReason({ headRef: c.headRef }), null);
+      },
+    });
+  };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
@@ -4992,6 +5024,8 @@ async function runCli() {
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
+      // The cached base was verified unchanged, and preparation required it to be the default branch.
+      beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
       enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
       recordLanded: recordLandedLedgerFacts,
     });
@@ -6716,16 +6750,10 @@ async function runCli() {
           // byte-identical to before this item; and `postDrainReasonComment` dedupes on the rendered text, so a
           // `--watch` loop that re-lands nothing re-posts nothing. It cannot affect the merge either — the post
           // swallows every `gh` error internally and returns a bool.
-          if (preread.read) {
-            const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
-            if (gaps.length) {
-              const reason = buildReviewCoverageReason(gaps);
-              const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);
-              if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} review coverage: ${gaps.map((g) => g.code).join(', ')}${posted ? ' — announced on the PR' : ' (already stamped / post failed)'}\n`);
-            }
-          } else if (!AS_JSON) {
-            process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} could not read PR comments — review coverage NOT assessed (unknown, not clean; #3308)\n`);
-          }
+          //
+          // #3383 — the same shared step also retargets any OPEN PR stacked on THIS branch BEFORE the merge or
+          // enqueue below (see `announceAndRetargetBeforeLand`); the green-event pre-stage shortcut calls it too.
+          announceAndRetargetBeforeLand(c, { preread, defaultBranch: defaultBranchOf(c.repo) || 'main' });
           // #2412 Gap 2 — the before-land trace: the exact head SHA about to land, plus the merging
           // caller/session. Read fresh (not reused from earlier in the pass) so the SHA names the commit
           // actually about to merge. #xngv3vn — the WRITE is deferred until the merge is CONFIRMED
@@ -6739,29 +6767,6 @@ async function runCli() {
           // pass-start decision judged), not a second best-effort read that could miss or see a newer head.
           const traceHeadSha = revalidated.headSha;
           postMergeTrace = makeMergeTrace(traceHeadSha, preread.comments);
-          // #3383 — BEFORE the merge below (which lands with `--delete-branch`, or the repo may auto-delete
-          // the head branch on merge either way), retarget any OPEN PR stacked on THIS branch to the repo's
-          // default branch. Left unguarded, GitHub CLOSES (never retargets) a PR whose base branch just
-          // vanished — the #2578 incident: an approved, unmerged sibling PR was silently killed by a
-          // base-branch delete it had nothing to do with, and by the time it's closed GitHub refuses both
-          // `pr edit --base` and reopen (verified live recovering #2578), so this MUST run before the merge,
-          // not after. `--base <headRef>` scopes the listing to exactly the stacked set — no full-repo PR
-          // fan-out. Best-effort: a `gh` miss here must never block the merge itself.
-          {
-            const defBranch = defaultBranchOf(c.repo) || 'main';
-            retargetStackedPrs({ repo: c.repo, headRef: c.headRef, defaultBranch: defBranch,
-              onRetarget: (num) => { if (!AS_JSON) process.stderr.write(`  ↷ ${repoTag(c.repo)}${num} retargeted ${c.headRef}→${defBranch} before deleting the merged branch (#3383)\n`); },
-              onFailed: (num) => {
-                if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${num} could not be retargeted off ${c.headRef} before the merge — it may get closed by the branch delete (#3383)\n`);
-                // #4138 — a PR GitHub is about to close (via the base-branch-delete cascade) must ALWAYS carry
-                // a reason comment, posted BEFORE the close happens (never after — GitHub refuses both
-                // `pr edit --base` and reopen once it has actually closed, so "after" may be too late to even
-                // post against the right state). Best-effort like the retarget itself: a `gh pr comment` miss
-                // here must never block the merge that is about to run.
-                postDrainReasonComment(c.repo, num, STACKED_BASE_CLOSE_KIND, buildStackedBaseCloseReason({ headRef: c.headRef }), null);
-              },
-            });
-          }
           // #2290 — the drain is the SOLE writer to main: the one `gh pr merge` now routes through the shared
           // gate (caller 'drain' — the only caller the gate permits). Behaviour is identical to the prior
           // inline call (`gh pr merge <n> [--repo …] --merge --delete-branch`, throw on a non-zero gh exit).

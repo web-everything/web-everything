@@ -1557,9 +1557,10 @@ contexts never authorize enqueue. A newly failed optional CodeQL check also veto
 the cache never substitutes for live release-label or red-team authorization. `checking` alone is ineligible,
 including at the event wake boundary. Cached admission also reads the live fix claim before admission and
 again inside the locked enqueue callback: a claim acquired while waiting for the lock must still veto enqueue.
-`enqueuePrestage` owns that in-lock re-read (`fixClaimHeld`) and the post-enqueue ledger facts (`recordLanded`,
+`enqueuePrestage` owns that in-lock re-read (`fixClaimHeld`), the cascade's pre-landing steps (`beforeEnqueue`:
+the review-coverage notice and the stacked-PR retarget) and the post-enqueue ledger facts (`recordLanded`,
 the same recorder the cascade calls after a confirmed enqueue: exemption, restamp, drain-hold release); it
-refuses the shortcut when either is not wired.
+refuses the shortcut when any of them is not wired.
 Check-event marks lack required-context identity and head SHA: preserve pending wakes on non-success marks,
 then let the live required-check read drop red preparation. Coupled candidates, manifest-carrying heads and branches requiring preparation
 keep the full cascade. Keep pre-stage tests separate from ordinary classification tests:
