@@ -1,11 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
 import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
 import { hostname } from 'node:os';
 import { reserve } from '../../readiness/file-locks.mjs';
+
+// Vitest captures named builtin imports before the per-test spy is installed.
+// Forward named reads through the default export so both import styles reach the
+// spy, while retaining the real filesystem reads and their byte-range assertions.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readSync: (...args) => actual.default.readSync(...args) };
+});
+
 const at = m => new Date(Date.UTC(2026, 9, 17, 0, m)).toISOString();
 const comment = (m, body) => ({ createdAt: at(m), body, author: { login: 'web-everything' } });
 function fixture(pr = 1) {
@@ -131,10 +139,9 @@ describe('per PR postmortem', () => {
       const spy = vi.spyOn(fs,'readSync').mockImplementation((fd,buffer,offset,length,position) => {
         reads.push({length,position}); return original(fd,buffer,offset,length,position);
       });
-      syncBuiltinESMExports();
       let raw;
       try { raw = collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}}); }
-      finally { spy.mockRestore(); syncBuiltinESMExports(); }
+      finally { spy.mockRestore(); }
       expect(raw.fixLoop).toHaveLength(1);
       expect(reads.length).toBeGreaterThan(0);
       expect(reads.reduce((sum,r) => sum+r.length,0)).toBeLessThanOrEqual(cap);
