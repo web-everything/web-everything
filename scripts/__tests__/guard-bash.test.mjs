@@ -3720,9 +3720,13 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['a tilde cd after a subshell HOME assignment', '(HOME=/tmp); cd ~/some-new-daemon-clone && git checkout --detach'],
       ['a home-derived variable a later subshell statement reassigns', 'D=~/some-new-daemon-clone; (true; D=/tmp); cd "$D" && git checkout --detach'],
       ['a home-derived variable a pipeline member reassigns', 'D=~/some-new-daemon-clone; D=/tmp | cat; cd "$D" && git checkout --detach'],
+      ['a tilde-assigned variable with an unquoted target', 'D=~/some-new-daemon-clone; cd $D && git checkout --detach'],
+      ['a tilde-assigned variable with a braced target', 'D=~/some-new-daemon-clone; cd ${D} && git checkout --detach'],
+      ['a ${HOME}-assigned variable', 'D=${HOME}/some-new-daemon-clone; cd $D && git checkout --detach'],
     ])('DENIES `git checkout --detach` through %s', (_n, cmd) => denies(cmd));
     it('a quoted tilde in an assignment stays literal and never reaches the clone', () => {
       expect(runHook(`D='~/some-new-daemon-clone'; cd "$D" && git checkout --detach`, lane, root)).toBeNull();
+      expect(runHook('D="~/some-new-daemon-clone"; cd "$D" && git checkout --detach', lane, root)).toBeNull();
     });
     // Where no home expansion applies, main's literal-variable resolution still decides — never weaker.
     it.each([
@@ -3730,6 +3734,12 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       ['a variable rebound by a substitution', `D=${fakeClone}; D=$(x); cd "$D" && git checkout --detach`],
       ['a variable rebound by read', `D=${fakeClone}; read D <f; cd "$D" && git checkout --detach`],
       ['HOME rebound by read', `HOME=${fakeClone}; read HOME <f; cd "$HOME" && git checkout --detach`],
+      ['HOME made unknown, with an unquoted target', `HOME=${fakeClone}; HOME=$(x); cd $HOME && git checkout --detach`],
+      ['HOME rebound by read, with a braced target', `HOME=${fakeClone}; read HOME <f; cd \${HOME} && git checkout --detach`],
+      ['HOME made unknown, with a quoted braced target', `HOME=${fakeClone}; HOME=$(x); cd "\${HOME}" && git checkout --detach`],
+      ['a variable rebound by read, with an unquoted target', `D=${fakeClone}; read D <f; cd $D && git checkout --detach`],
+      ['a variable rebound by a substitution, with a braced target', `D=${fakeClone}; D=$(x); cd \${D} && git checkout --detach`],
+      ['HOME appended inside the clone', `HOME=${fakeClone}; HOME+=/sub; cd "$HOME" && git checkout --detach`],
     ])('DENIES like main when %s', (_n, cmd) => denies(cmd));
     it('keeps the read-only control allowed', () => {
       expect(runHook('cd ~/some-new-daemon-clone && git status', lane, root)).toBeNull();
