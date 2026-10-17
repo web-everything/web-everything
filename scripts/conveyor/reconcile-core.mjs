@@ -1341,8 +1341,9 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
 /**
  * The advisory outcome the note's PRODUCER wrote, or null. we:scripts/operations/review-pr.mjs#renderAdvisoryNote puts
  * it at a fixed place: the outcome line, a blank line, `---`, a blank line, then the basis line at the validated footer
- * slot (we:scripts/conveyor/mechanical-round-cap.mjs#basisLineOf). Juror text sits above that block, so a juror line
- * anywhere else — quoted, fenced, or a bare forged `**Advisory outcome:**` line — is never this one. Pure.
+ * slot (we:scripts/conveyor/mechanical-round-cap.mjs#basisLineOf). The producer always writes that line (`none` when
+ * it derived no outcome), and juror text sits above it, so a juror line — quoted, fenced, or a bare forged
+ * `**Advisory outcome:**` line — is never this one. Pure.
  */
 function advisoryOutcomeAtSlot(c) {
   const basis = basisLineOf(c);
@@ -1350,7 +1351,7 @@ function advisoryOutcomeAtSlot(c) {
   const lines = String(c?.body ?? '').split('\n').map(l => (l.endsWith('\r') ? l.slice(0, -1) : l));
   const at = lines.lastIndexOf(basis.line);
   if (at < 4 || lines[at - 1] !== '' || lines[at - 2] !== '---' || lines[at - 3] !== '') return null;
-  return /^\*\*Advisory outcome:\*\* `([a-z-]+)`/.exec(lines[at - 4])?.[1] ?? null;
+  return /^\*\*Advisory outcome:\*\* `([a-z-]+)` — /.exec(lines[at - 4])?.[1] ?? null;
 }
 
 /** Head-local inputs for the joined-fix policy; prior and superseded verdicts cannot reopen findings. */
@@ -1358,12 +1359,12 @@ const isReviewerBinding = b => /^review-/.test(b.agent?.name ?? b.agent?.session
 function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispatched = false } = {}) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const latest = comments.filter(c => isTrustedMarkerAuthor(c) && verdictJudged(c, pr.headRefOid)).at(-1);
-  // Structure only: a bounce verdict, or an advisory note whose PRODUCER outcome line says `changes` AND whose structured
-  // outcome labelled the PR `advisory:changes` (a note with no outcome line applies no label, so a juror line in that
-  // position cannot invent a finding). Text quoted inside another verdict or written by a juror is never read.
+  // Structure only: a bounce verdict, or an advisory note whose PRODUCER outcome line says `changes`. Text quoted inside
+  // another verdict or written by a juror is never read. (Not the `advisory:changes` label: the label sweeps re-derive it
+  // from the first outcome-shaped line, which a juror can forge.)
   const kind = latest ? verdictKind(latest) : null;
-  const findings = kind === 'changes' || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES
-    && labelNames(pr?.labels).includes(ADVISORY_LABELS.CHANGES)) ? [latest] : [];
+  const findings = kind === 'changes' || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES)
+    ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
   return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,

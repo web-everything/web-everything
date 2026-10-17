@@ -1511,6 +1511,14 @@ describe('the write-up reports the seats that ACTUALLY judged, and no others', (
       body: renderVerdictWriteUp({ read: { ...pinned, deltaReview: { anchor } }, verdict, answer: 'changes', actor: 'op' }) }) };
     expect(reviewedHeadsOf(bounce)).toEqual(['d'.repeat(40)]);
     expect(fullReviewAnchor([bounce], 'd'.repeat(40))).toBe(anchor);
+    // The advisory note always writes its outcome line in the fixed slot four lines above the basis line — `none` when
+    // no outcome was derived — so a juror's last finding line can never occupy it.
+    for (const v of [verdict, {}, { pendingReferrals: ['k'] }]) {
+      const lines = renderAdvisoryNote({ read: pinned, verdict: v }).split('\n');
+      const at = lines.findIndex(l => l.startsWith('Net basis: '));
+      expect(lines.slice(at - 3, at)).toEqual(['', '---', '']);
+      expect(lines[at - 4]).toMatch(/^\*\*Advisory outcome:\*\* `[a-z-]+` — /);
+    }
   });
 
   it('lists BOTH mandatory lenses now that both judged — and still no lens as `(no verdict)`', () => {

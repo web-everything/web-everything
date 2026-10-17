@@ -2157,6 +2157,8 @@ function renderRevProvenance(netBasis) {
 
 /** The stated outcome of a note posted while mandatory referrals are unruled: neither `accept` nor `changes`. */
 const ADVISORY_PENDING_REFERRAL_OUTCOME = 'pending-referral';
+/** The stated outcome of a note whose outcome could not be derived: neither `accept` nor `changes`. */
+const ADVISORY_NO_OUTCOME = 'none';
 
 /** PR #5025 — at most this many lone-answer retirement reasons are listed to the human; the rest are counted. */
 const RETIREMENT_REASONS_SHOWN = 5;
@@ -2249,10 +2251,12 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
       ? ['', `**Advisory outcome:** \`${outcome}\` — ${outcome === ADVISORY_OUTCOMES.ACCEPT
         ? 'no blocking findings on this head; `advisory:accepted` is applied'
         : 'blocking findings on this head; `advisory:changes` is applied'}.`]
-      // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word.
+      // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word. The
+      // line is ALWAYS written: it holds the fixed slot above `---` (reconcile-core `advisoryOutcomeAtSlot`), so a
+      // juror's last finding line can never sit where the producer's outcome belongs.
       : v.pendingReferrals?.length
         ? ['', `**Advisory outcome:** \`${ADVISORY_PENDING_REFERRAL_OUTCOME}\` — mandatory referrals still need a ruling; no \`advisory:*\` label is applied`]
-        : []),
+        : ['', `**Advisory outcome:** \`${ADVISORY_NO_OUTCOME}\` — no outcome could be derived; no \`advisory:*\` label is applied`]),
     '',
     '---',
     '',
