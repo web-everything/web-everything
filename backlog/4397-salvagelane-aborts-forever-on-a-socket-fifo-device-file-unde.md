@@ -49,4 +49,4 @@ Add a test that places a real Unix socket (using `net.createServer().listen(sock
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — Add the named acceptance test `salvages a Unix socket with a skipped-file placeholder` in `we:scripts/lib/__tests__/lane-salvage.test.mjs`. Run `npm run test:unit -- lane-salvage`: that case must fail against the current unconditional special-file copy and pass after the build. It creates a real Unix socket, asserts salvage does not throw, and checks the destination `.skipped.txt` placeholder and its reason. Record the red run before implementation; this names the test to author, not a claimed passing result.
