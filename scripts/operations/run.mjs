@@ -184,13 +184,13 @@ export const OPERATIONS = Object.freeze({
   [HEALTH_RESPOND_OP]: () => ({ declaration: healthRespondOperation({ readDecisions: readLatestDecisions }), sinks: {} }),
   // #xqa9ttq — `codexAdvisory` reads `REVIEW_PR_CODEX_ADVISORY=1` off the environment (`codexAdvisoryFromEnv`,
   // `we:scripts/operations/review-pr.mjs`), OFF by default — see that flag's own docs for why it is an env
-  // var and not a CLI `--flag` (the step list is fixed here, before any run's argv is parsed) and why
-  // `record-verdict-io.mjs`'s resume registration now reads the SAVED RUN's roster instead (`codexAdvisoryFromRun`,
-  // PR #2117 review) - the env var only decides how a NEW run is started here.
+  // var and not a CLI `--flag` (the step list is fixed here, before any run's argv is parsed). Every resume
+  // registration reads the SAVED RUN's roster instead (`reviewSeatOptionsForRun`, PR #2117 / #5441 review) - the
+  // env var only decides how a NEW run is started here.
   // #x8n4crp / #3383 — `correctnessAdvisory` (`REVIEW_PR_CODEX_CORRECTNESS_ADVISORY`) and `antigravityReview`
   // (`REVIEW_PR_ANTIGRAVITY_REVIEW`) are the fourth and fifth seats, each read off its OWN env var by the same
   // reasoning (`correctnessAdvisoryFromEnv`/`antigravityReviewFromEnv`, `we:scripts/operations/review-pr.mjs`).
-  // `resumeId` reconstructs all seats from the saved panel; environment flags and minimums choose only NEW runs.
+  // `resumeId` reconstructs all seats from the saved run at any cursor; flags and minimums choose only NEW runs.
   // See `createReviewPrSinks`'s own `json` doc (`we:scripts/operations/review-pr-io.mjs`) for
   // WHY this exists: a `--json` caller's stdout must stay pure JSON even when the `record` step's notice
   // effect fires mid-run.

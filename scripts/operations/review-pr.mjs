@@ -832,8 +832,11 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
     return i >= 0 ? i : (['read', ...JUDGE_SEATS.map((seat) => seat.step)].includes(step) ? -1 : OPTIONAL_SEATS.length);
   };
   const furthest = Math.max(-1, ...reached.map(rank));
+  // A parallel batch may have saved a later seat's answer while an earlier seat is still owed (`prefilledSeats`):
+  // that proves the later seat was seated, but not that the seats before it were passed.
+  const prefilled = (Array.isArray(record.prefilledSeats) ? record.prefilledSeats : []).map((p) => p?.step);
   const seated = (seat, i) => (saved ? saved.includes(seat.step)
-    : reached.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
+    : reached.includes(seat.step) || prefilled.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
   const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
   return {
     securitySeat: securitySeatFromRun(record),

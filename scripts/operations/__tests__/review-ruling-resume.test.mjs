@@ -18,7 +18,7 @@ import { createRegistry } from '../registry.mjs';
 import { createFileRunStore, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
-import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
+import { REVIEW_EFFECTS, reviewPrOperation, reviewSeatOptionsForRun } from '../review-pr.mjs';
 import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
@@ -307,8 +307,29 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
     }
   });
 
+  it('keeps a historical seat a parallel batch already answered beyond the parked seat', async () => {
+    vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
+    vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
+    vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+    try {
+      const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0, correctnessAdvisory: true });
+      const registry = createRegistry();
+      registry.register(declaration);
+      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'prefilled', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+      const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
+      run = { ...run, findings: { ...run.findings, read },
+        prefilledSeats: [{ step: 'judgeCorrectnessAdvisory', stepIndex: 3, value: { summary: 'looked', findings: [] } }] };
+      expect(run.pending.step).toBe('judge');
+      const seats = reviewSeatOptionsForRun(run, null, { codexAdvisory: false, correctnessAdvisory: false });
+      expect(seats).toMatchObject({ codexAdvisory: false, correctnessAdvisory: true });
+      expect(reviewPrOperation({ readPr: stubReader(), ...seats }).steps.map(s => s.name)).toEqual(declaration.steps.map(s => s.name));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it.each([
-    ['the minimum rises to 2', { WE_REVIEW_MIN_NON_CLAUDE_SEATS: '2' }],
+    ['the minimum rises to 2',{ WE_REVIEW_MIN_NON_CLAUDE_SEATS: '2' }],
     ['the Codex correctness and Antigravity flags turn on',{ REVIEW_PR_CODEX_CORRECTNESS_ADVISORY: '1', REVIEW_PR_ANTIGRAVITY_REVIEW: '1' }],
   ])('keeps a new run\'s seated roster when %s mid-panel', async (_label, changed) => {
     const dir = mkdtempSync(join(tmpdir(), 'review-cli-changed-'));
