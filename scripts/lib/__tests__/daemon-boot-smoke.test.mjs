@@ -217,6 +217,17 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).not.toContain('ghp_secretAAAA');
   });
 
+  it('redacts a child error before bounding it, so a quoted secret straddling the 8 KB cut never leaks', async () => {
+    const error = `token=${'e'.repeat(7_960)} "password": "alpha bravo charlie delta echo foxtrot golf hotel"`;
+    expect(error.indexOf('alpha')).toBeLessThan(8_000);
+    expect(error.indexOf('hotel')).toBeGreaterThan(8_000);
+    const r = await checkDaemonEntriesBoot(ctx(async () => JSON.stringify({ ok: false, error })));
+    for (const w of ['bravo', 'charlie', 'hotel']) {
+      expect(r.detail).not.toContain(w);
+      expect(JSON.stringify(r.entries)).not.toContain(w);
+    }
+  });
+
   it('fails on unparsable child output rather than silently passing', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => 'not json'));
     expect(r.ok).toBe(false);

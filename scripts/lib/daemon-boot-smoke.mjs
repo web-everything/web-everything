@@ -197,7 +197,7 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
     // V8 quotes the unparsable output in its message, so it is redacted like every other child-text path.
     return { entry, ok: false, error: `unparsable child output: ${redactSecrets(firstLine(e))}` };
   }
-  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : redactSecrets(boundHead(parsed.error)) };
+  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : boundHead(redactSecrets(parsed.error)) };
 }
 
 /** Each failed entry gets an equal share of the detail budget (its first and newest lines), so the redaction

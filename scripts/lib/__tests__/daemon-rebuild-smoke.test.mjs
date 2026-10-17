@@ -9,7 +9,7 @@ import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
 import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
-import { redactSecrets, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactDetail, redactSecrets, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -199,6 +199,44 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
   });
   it.each(['monkey=banana', 'hockey: score 3', 'turkey sandwich', 'keyboard: true'])('leaves a word merely ending in "key" alone: %s', (line) => {
     expect(redactSecrets(line)).toBe(line);
+  });
+  describe('redact first, then truncate — a quoted secret straddling a cut never leaks (operator send-back 2026-10-17)', () => {
+    const quoted = '"password": "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa"';
+    const leaked = (out) => ['bravo', 'charlie', 'oscar', 'papa'].filter((w) => out.includes(w));
+    it('a quoted value straddling the 2,000-char per-line cut', () => {
+      // `token=<1,900 chars>` shrinks to 16 on redaction, so text past the old cut would land inside the 500-char line.
+      const line = `token=${'s'.repeat(1_900)} ${quoted}`;
+      expect(line.indexOf('alpha')).toBeLessThan(2_000);
+      expect(line.indexOf('papa')).toBeGreaterThan(2_000);
+      const out = redactSecrets(line);
+      expect(leaked(out)).toEqual([]);
+      expect(out).toContain('password=<redacted>');
+    });
+    it('a quoted value straddling the 8,000-char cut of a non-boot detail', () => {
+      const detail = `token=${'s'.repeat(7_950)}\n${quoted}`;
+      expect(detail.indexOf('alpha')).toBeLessThan(8_000);
+      expect(detail.indexOf('papa')).toBeGreaterThan(8_000);
+      expect(leaked(redactDetail(detail))).toEqual([]);
+    });
+    it('a quoted value straddling the 64 KiB tail window of a line with no break', () => {
+      const text = `"password": "${'secretword '.repeat(8_000)}" then FATAL`;
+      expect(text.length).toBeGreaterThan(64 * 1024);
+      const out = redactedTail(text);
+      expect(out).not.toContain('secretword');
+      expect(out).toContain('password=<redacted>');
+    });
+    it('withholds a line too long to redact whole instead of cutting it first', () => {
+      const out = redactedTail(`"password": "${'secretword '.repeat(40_000)}"`);
+      expect(out).not.toContain('secretword');
+      expect(out).toMatch(/withheld/);
+    });
+    it('fails closed: when redaction cannot run, no detail is emitted', () => {
+      const hostile = { toString() { throw new Error('boom ghp_secretAAAA'); } };
+      for (const out of [redactSecrets(hostile), redactedTail(hostile), redactDetail(hostile), redactDetail(hostile, 'daemon-entries-boot')]) {
+        expect(out).toMatch(/withheld/);
+        expect(out).not.toContain('ghp_secret');
+      }
+    });
   });
   it('redactedTail redacts before it cuts: an orphaned PEM body, CR runs, and a hostile key=value run stay bounded', () => {
     const body = Array.from({ length: 40 }, () => 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ');

@@ -13,6 +13,8 @@ must preserve boot tails beyond the ordinary detail caps while still redacting s
 stderr where it is read (`redactSecrets`: the `ci-heal-mark.mjs` secret shapes plus generic
 `*_KEY=` names, `*PASSWORD=` pairs, URL credentials and PEM keys, including a body whose BEGIN line
 was cut off; NFKC and invisible characters folded first; CR/U+2028 split lines; 500-char lines).
+Always redact first and cut after, so a cut never splits a quoted secret; fail closed when
+redaction cannot run (a line over 256 KiB, input over 1 MiB, or a throw emits a withheld marker).
 A boot detail names every failed entry and its signal in its header and gives each failure an
 equal share of a 12 KB budget (16 KB backstop). A dispatch-smoke stderr tail stays in the
 structured `diagnostics` field only, never in `detail`; `detail` is redacted where the verdict is
