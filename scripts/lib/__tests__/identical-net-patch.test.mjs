@@ -8,8 +8,59 @@ const exec = (different = false) => (cmd, args, opts) => {
   if (args[0] === 'patch-id') return `${different && opts.input.includes('@@ -2') ? b : a} ${base}\n`;
   throw Error('unexpected git');
 };
-it('carries offset-only net patches using git stable patch ids', () => {
-  expect(proveIdenticalNetPatch({ exec: exec(), fromSha: a, toSha: b })).toMatchObject({ ok: true, tier: 'net-patch' });
+it('review regressions: rejects moving an approved edit between identical blocks through both writers', () => {
+  const oldDiff = 'diff --git a/auth.mjs b/auth.mjs\n--- a/auth.mjs\n+++ b/auth.mjs\n@@ -2,7 +2,7 @@ function testOnlyAuthorization() {\n   const user = currentUser();\n   const role = user.role;\n   audit(role);\n-  return false;\n+  return true;\n }\n';
+  for (const [variant, header] of ['@@ -22,7 +22,7 @@ function productionAuthorization() {',
+    '@@ -22,7 +22,7 @@ function testOnlyAuthorization() {',
+    '@@ -2,7 +2,7 @@ function productionAuthorization() {'].entries()) {
+    const headDiff = oldDiff.replace('@@ -2,7 +2,7 @@ function testOnlyAuthorization() {', header);
+    const run = (cmd, args, opts) => {
+      if (args[0] === 'diff') return args.includes(a) ? oldDiff : headDiff;
+      return exec()(cmd, args, opts);
+    };
+    expect(proveIdenticalNetPatch({ exec: run, fromSha: a, toSha: b })).toMatchObject({ ok: false });
+    for (const human of [true, false]) {
+      const pr = 54630 + variant * 2 + Number(human);
+      const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(oldDiff)} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
+      const writes = [], state = { headRefOid: b, labels: ['review:pending'], comments };
+      const writerExec = (cmd, args, opts) => cmd === 'git' ? run(cmd, args, opts) : writes.push(args);
+      expect(applyHumanClearanceCarry({ pr, repo: 'owner/repo', exec: writerExec, log: () => {},
+        evidence: { humanClearance: latestHumanClearance(comments), headSha: b, headDiffSha: b, headDiff },
+        readLiveEvidence: () => ({ headSha: b, comments, reviews: [] }) })).toBeNull();
+      expect(restampAfterNumbering({ repo: 'owner/repo', pr, exec: run, state, reviews: [],
+        guardReferrals: () => {}, readNetDiff: () => ({ scored: true, text: headDiff }),
+        readLiveState: () => ({ state, reviews: [] }),
+        provider: { postComment: (...args) => writes.push(args), setLabels: (...args) => writes.push(args) } })).toMatchObject({ action: 'refused' });
+      expect(writes).toEqual([]);
+    }
+  }
+});
+it('refuses offset-only net patches on an unchanged base despite matching stable patch ids', () => {
+  expect(proveIdenticalNetPatch({ exec: exec(), fromSha: a, toSha: b })).toMatchObject({ ok: false, different: true });
+});
+it('carries identical positioned net patches on the same base', () => {
+  const run = (cmd, args, opts) => args[0] === 'diff' ? diff : exec()(cmd, args, opts);
+  expect(proveIdenticalNetPatch({ exec: run, fromSha: a, toSha: b })).toMatchObject({ ok: true, tier: 'net-patch' });
+});
+it('requires the same positioned upstream movement on the base and head when bases differ', () => {
+  const advancedBase = 'd'.repeat(40);
+  const upstream = 'diff --git a/f b/f\nindex 1111111..2222222 100644\n--- a/f\n+++ b/f\n@@ -1 +1,2 @@\n+upstream\n context\n';
+  for (const movement of [upstream.replace('1111111..2222222', '3333333..4444444'),
+    upstream.replace('@@ -1 +1,2 @@', '@@ -9 +9,2 @@'),
+    upstream.replace('+upstream', '+different'), null]) {
+    const run = (cmd, args, opts) => {
+      if (args[0] === 'merge-base') return args.includes(a) ? base : advancedBase;
+      if (args[0] === 'diff' && args.includes(base) && args.includes(advancedBase)) return upstream;
+      if (args[0] === 'diff' && args.includes(a) && args.includes(b)) {
+        if (movement === null) throw Error('unreadable head delta');
+        return movement;
+      }
+      return exec()(cmd, args, opts);
+    };
+    const proof = proveIdenticalNetPatch({ exec: run, fromSha: a, toSha: b });
+    expect(proof.ok).toBe(movement === upstream.replace('1111111..2222222', '3333333..4444444'));
+    if (movement === null) expect(proof.retryable).toBe(true);
+  }
 });
 it('refuses any different patch id and unreadable or empty evidence', () => {
   expect(proveIdenticalNetPatch({ exec: exec(true), fromSha: a, toSha: b }).ok).toBe(false);
@@ -27,12 +78,53 @@ it('keeps root-manifest whitespace even though contribution fingerprints omit th
 });
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { applyHumanClearanceCarry, latestHumanClearance } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint } from '../review-escalation.mjs';
 import { restampAfterNumbering } from '../numbering-carry.mjs';
+it('uses Git-generated diffs and stable patch ids to distinguish moved edits from safe offset rebases', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'net-patch-read-only-'));
+  const gitDiff = (before, after) => {
+    writeFileSync(join(dir, 'a/auth.mjs'), before);
+    writeFileSync(join(dir, 'b/auth.mjs'), after);
+    let output;
+    try {
+      output = execFileSync('git', ['diff', '--no-index', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', '--', 'a/auth.mjs', 'b/auth.mjs'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      if (error.status !== 1) throw error;
+      output = String(error.stdout);
+    }
+    return output.replaceAll('a/a/auth.mjs', 'a/auth.mjs').replaceAll('b/b/auth.mjs', 'b/auth.mjs');
+  };
+  const block = (name, allow = false) => `function ${name}() {\n  const user = currentUser();\n  const role = user.role;\n  audit(role);\n  return ${allow};\n  // shared padding one\n  // shared padding two\n  // shared padding three\n}\n\n`;
+  const initial = block('testOnlyAuthorization') + block('productionAuthorization');
+  const approved = block('testOnlyAuthorization', true) + block('productionAuthorization');
+  const moved = block('testOnlyAuthorization') + block('productionAuthorization', true);
+  try {
+    mkdirSync(join(dir, 'a')); mkdirSync(join(dir, 'b'));
+    const oldDiff = gitDiff(initial, approved), advancedBase = 'd'.repeat(40);
+    for (const advance of [false, true]) {
+      const prefix = advance ? '// upstream header\n' : '';
+      for (const [next, allowed] of [[approved, true], [moved, false]]) {
+        const headDiff = gitDiff(prefix + initial, prefix + next);
+        const baseDelta = gitDiff(initial, prefix + initial), headDelta = gitDiff(approved, prefix + next);
+        const patchId = input => execFileSync('git', ['patch-id', '--stable'], { cwd: dir, input, encoding: 'utf8' });
+        expect(patchId(oldDiff)).toBe(patchId(headDiff));
+        const run = (cmd, args, opts) => {
+          if (args[0] === 'merge-base') return advance && args.includes(b) ? advancedBase : base;
+          if (args[0] === 'diff' && args.includes(base) && args.includes(advancedBase)) return baseDelta;
+          if (args[0] === 'diff' && args.includes(a) && args.includes(b)) return headDelta;
+          if (args[0] === 'diff') return args.includes(a) ? oldDiff : headDiff;
+          if (args[0] === 'patch-id') return patchId(opts.input);
+          throw Error('unexpected git read');
+        };
+        expect(proveIdenticalNetPatch({ exec: run, fromSha: a, toSha: b }).ok).toBe(allowed);
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 it.each([
   ['indentation', 'if x:\n    pass\n    old()\n', 'if x:\n    pass\n        danger()\n', 'if x:\n    pass\n    danger()\n'],
   ['string whitespace', 'value = "old"\n', 'value = "a b"\n', 'value = "ab"\n'],

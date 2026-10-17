@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor } from '../../lib/fix-slot-borrow.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
@@ -1559,4 +1560,27 @@ it('routes a repeated finding from the Claude fixer to the mechanical launcher',
   expect(spawnAgent).not.toHaveBeenCalled();
   expect(spawnBorrowed).toHaveBeenCalledOnce();
   expect(out.agentId).toBe('pid:4242');
+});
+
+it('keeps infrastructure stalls and distinct em-dash findings on the ordinary executor route', () => {
+  const review = summary => ({ author: { login: 'web-everything' }, body: `🔁 review — changes requested\n### Findings (1)\n**correctness/bug** (1)\n- \`a.mjs:10\` — ${summary}` });
+  const end = infraStall => ({ author: { login: 'web-everything' }, body: buildFixEndComment({ who: 'fix-7', infraStall }) });
+  for (const prefix of [[], [{ author: { login: 'chalbert' }, body: `scope-baseline: ${'b'.repeat(40)}` }]]) {
+    for (const history of [[review('same bug'), end(true), review('same bug')],
+      [review('ID validation is wrong — whitespace-only IDs are accepted'), end(false),
+        review('ID validation is wrong — valid Unicode IDs are rejected')],
+      [review('ID validation is wrong\n### Detail\nwhitespace-only IDs are accepted'), end(false),
+        review('ID validation is wrong\n### Detail\nvalid Unicode IDs are rejected')]]) {
+      const spawnBorrowed = vi.fn(() => 'pid:4242');
+      const out = dispatchFix({ pr: 7, itemNum: '7', lane: 2, laneRef: 'lane/7-x', scope: ['we:a.mjs'], headRefOid: 'a'.repeat(40) }, {
+        root: '/repo', repo: 'we', executorDecision: { executor: 'agy-claude', source: 'test' },
+        readFixClaim: () => null, acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, stampExecutor: () => {}, stampRunner: () => {},
+        readHistoryInputs: () => ({ comments: [...prefix, ...history], commits: [] }), postNotice: () => {}, readBrief: () => 'brief {{PR_NUM}}',
+        spawnBorrowed, writeBorrowedPrompt: () => '/tmp/p.md',
+        checkoutExists: () => true, readPackageJson: () => ({ scripts: {} }),
+      });
+      expect(out.agentId).toBe('pid:4242');
+      expect(spawnBorrowed).toHaveBeenCalledWith(expect.objectContaining({ policyRoute: { provider: 'antigravity-claude' } }));
+    }
+  }
 });

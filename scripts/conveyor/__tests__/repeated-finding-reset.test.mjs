@@ -1,8 +1,41 @@
 import { it, expect } from 'vitest';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../repeated-finding-reset.mjs';
+import { buildFixEndComment } from '../fix-procedure.mjs';
 const c = (body, login = 'chalbert') => ({ author: { login }, body });
 const finding = text => c(`🔁 review — changes requested\nRecorded by agent\n### Findings (1)\n**correctness/bug** (1)\n- \`a.mjs:10\` — ${text}`, 'web-everything');
 const comments = [finding('Same   BUG'), c('🔓 conveyor fix-end'), finding('same bug')];
+it('review regressions: infrastructure-stalled fixes remain eligible for repair', () => {
+  for (const prefix of [[], [c(`scope-baseline: ${'a'.repeat(40)}`)]]) {
+    const history = [...prefix, finding('same bug'),
+      c(buildFixEndComment({ who: 'fix-7', infraStall: true })), finding('same bug')];
+    expect(repeatedFindingPlan(history).action).toBe('patch');
+    expect(repeatedFindingPlan([...history, c(buildFixEndComment({ who: 'fix-8' })),
+      finding('same bug')]).action).toBe(prefix.length ? 'reset' : 'stand-down');
+  }
+});
+it('review regressions: complete summaries distinguish findings containing em dashes', () => {
+  for (const prefix of [[], [c(`scope-baseline: ${'a'.repeat(40)}`)]]) {
+    for (const separator of [' — ', '\n', '\r\n', '\n\n', '\u2028', '\u2029', ' — detail — ',
+      '\n### Detail\n', '\n---\n', '\nNet basis: ', '\n### Findings (1)\n', '\n- `extra.mjs:20` — ']) {
+      const first = `ID validation is wrong${separator}whitespace-only IDs are accepted`;
+      const second = `ID validation is wrong${separator}valid Unicode IDs are rejected`;
+      expect(repeatedFindingPlan([...prefix, finding(first),
+        c(buildFixEndComment({ who: 'fix-7' })), finding(second)]).action).toBe('patch');
+      expect(repeatedFindingPlan([...prefix, finding(first),
+        c(buildFixEndComment({ who: 'fix-7' })), finding(first)]).action).toBe(prefix.length ? 'reset' : 'stand-down');
+    }
+  }
+});
+it('preserves source line movement without erasing coordinates embedded in an ambiguous summary', () => {
+  const end = c(buildFixEndComment({ who: 'fix-7' }));
+  expect(repeatedFindingPlan([finding('same bug'), end,
+    c(finding('same bug').body.replace('a.mjs:10', 'a.mjs:99'), 'web-everything')]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([finding('same prefix\n- `extra.mjs:20` — same suffix'), end,
+    finding('same prefix\n- `extra.mjs:21` — same suffix')]).action).toBe('patch');
+  const withFilelessFinding = line => c(finding(`same prefix\n- \`extra.mjs:${line}\` — same suffix`).body
+    .replace('Findings (1)', 'Findings (2)') + '\n- fileless finding', 'web-everything');
+  expect(repeatedFindingPlan([withFilelessFinding(20), end, withFilelessFinding(21)]).action).toBe('patch');
+});
 it('stands down on the second identical finding after a fix, without a baseline', () => {
   expect(repeatedFindingPlan(comments)).toMatchObject({ action: 'stand-down', reason: 'repeated finding' });
 });

@@ -27,15 +27,19 @@ export function proveIdenticalNetPatch({ exec, cwd, fromSha, toSha, mainRef = 'o
       if (Buffer.isBuffer(output) && !Buffer.from(decoded, 'utf8').equals(output)) throw Error('lossy net patch decoding');
       return decoded;
     };
+    const diffBetween = (base, sha) => git(['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', base, sha, '--']);
+    // Ignore only blob IDs: keep paths, modes, hunk positions, headings and context.
+    // Equal edits at different positions are not the same reviewed contribution.
+    const locatedPatch = diff => diff.split('\n').filter(line => !/^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$/.test(line)).join('\n');
     const read = sha => {
       const base = git(['merge-base', mainRef, sha]).trim();
       if (!/^[0-9a-f]{40}$/.test(base)) throw Error('unreadable merge-base');
-      const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', base, sha, '--']);
+      const diff = diffBetween(base, sha);
       if (!diff.trim()) throw Error('empty net patch');
       const output = git(['patch-id', '--stable'], diff).trim();
       const match = /^([0-9a-f]{40}) [0-9a-f]{40}$/.exec(output);
       if (!match) throw Error('unreadable patch-id');
-      return { id: match[1], diff };
+      return { id: match[1], diff, base };
     };
     const from = read(fromSha), to = read(toSha);
     if (from.id !== to.id) return { ok: false, different: true, reason: 'net patch-id differs' };
@@ -48,7 +52,19 @@ export function proveIdenticalNetPatch({ exec, cwd, fromSha, toSha, mainRef = 'o
       || changedLines(from.diff) !== changedLines(to.diff)) {
       return { ok: false, different: true, reason: 'net patch contribution bytes differ' };
     }
+    if (from.base === to.base) {
+      if (locatedPatch(from.diff) !== locatedPatch(to.diff)) {
+        return { ok: false, different: true, reason: 'net patch hunk locations or context differ on the same base' };
+      }
+    } else {
+      // Offset changes are allowed only when the exact same positioned upstream
+      // edits turn the old base into the new base AND the cleared head into the live head.
+      // This conservative read-only proof declines overlapping/shifted upstream edits.
+      if (locatedPatch(diffBetween(from.base, to.base)) !== locatedPatch(diffBetween(fromSha, toSha))) {
+        return { ok: false, different: true, reason: 'head movement does not match the positioned base movement' };
+      }
+    }
     return { ok: true, tier: 'net-patch', fingerprint: to.id, fromDiff: from.diff, toDiff: to.diff,
-      reason: `identical git patch-id --stable (${to.id}) and contribution bytes against each head's merge-base with main` };
+      reason: `identical git patch-id --stable (${to.id}), contribution bytes and positioned edits against each head's merge-base with main` };
   } catch { return { ok: false, retryable: true, reason: 'net patch identity unreadable' }; }
 }

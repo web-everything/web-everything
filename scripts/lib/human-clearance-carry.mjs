@@ -294,7 +294,7 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
       + (tier === 'net-patch'
-        ? `the net change has the same git patch-id --stable and byte-identical contribution lines against each head’s merge-base with main`
+        ? `the net change has the same git patch-id --stable, byte-identical contribution lines and verified hunk locations against each head’s merge-base with main (${mechanicalReason})`
         : tier === 'tree'
         ? 'the live head has exactly the cleared head’s tree (all paths, modes and blob bytes)'
         : tier === 'numbering'
