@@ -6,12 +6,60 @@ import { join } from 'node:path';
 import { dispatchReview } from '../review-dispatch.mjs';
 import { dispatchReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readPr, createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
-import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderNetBasisLine, REVIEW_PR_CHANNEL } from '../review-pr.mjs';
+import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderNetBasisLine, REVIEW_PR_CHANNEL, reviewPrOperation } from '../review-pr.mjs';
 import { reviewedHeadsOf, REVIEW_PR_FOOTER } from '../../conveyor/mechanical-round-cap.mjs';
 import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../../lib/review-label-provider.mjs';
 const head = 'a'.repeat(40);
+it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]
+  .flatMap(effect => [false, true].map(scored => [effect, scored])))('publishes %s for an explicitly unpinned read (scored=%s)', async (effect, scored) => {
+  const read = shapeReadFinding({ state: 'OPEN', detail: { pr: 7, repo: 'o/n', labels: ['review:human'], humanRequired: true },
+    net: { scored, reason: 'ref-unresolved', rev: scored ? 'origin/lane/test' : null, paths: [], revSha: null },
+    diff: { text: '--- a/x\n+++ b/x\n+material still available\n', scored } }, { pr: 7, repo: 'o/n' });
+  const op = reviewPrOperation({ readPr: () => ({}) });
+  const view = { input: { pr: 7, repo: 'o/n', actor: 'reviewer', reason: 'Restore a readable net basis' },
+    findings: { read, confirm: 'changes' },
+    verdict: { verdict: 'needs-human', findings: [], admittedFindings: [], deferredAdvisory: [] } };
+  const advisory = op.steps.find(s => s.name === 'advise').step.effects(view)
+    .find(e => e.type === REVIEW_EFFECTS.ADVISORY_NOTE).payload;
+  expect(read.netBasis.rev).toBeNull();
+  expect(advisory.reviewedHead).toBeNull();
+  const basisWarning = scored ? 'UNPINNED' : 'DEGRADED BASIS';
+  expect(advisory.body).toContain(basisWarning);
+  const root = mkdtempSync(join(tmpdir(), 'review-unpinned-publish-'));
+  const runNode = vi.fn(() => '{"ok":true}'); const postComment = vi.fn();
+  const sinks = createReviewPrSinks({ root, env: {}, runNode, postComment, out: () => {},
+    readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }) });
+  const ctx = { runId: 'degraded-read' }, bodyFile = 'verdict.md';
+  try {
+    if (effect === REVIEW_EFFECTS.LABEL) {
+      const staged = op.steps.find(s => s.name === 'stageVerdict').step.effects(view)[0];
+      const label = op.steps.find(s => s.name === 'record').step.effects(view).find(e => e.type === effect);
+      expect(label.payload).toMatchObject({ reviewedHead: null, to: 'changes' });
+      await sinks[staged.type](staged.payload, ctx);
+      await sinks[effect](label.payload, ctx);
+    } else {
+      await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile, body: advisory.body }, ctx);
+      // STACK_HOLD cannot currently be declared without a pinned stack marker; exercise its shared guard defensively.
+      await sinks[effect]({ ...advisory, bodyFile, note: 'held', marker: '' }, ctx);
+    }
+    if (effect === REVIEW_EFFECTS.LABEL) expect(runNode).toHaveBeenCalledTimes(1);
+    else {
+      expect(postComment).toHaveBeenCalledTimes(1);
+      expect(postComment.mock.calls[0][2]).toContain(basisWarning);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it.each([
+  { reviewedHead: null, to: 'accepted' },
+  { reviewedHead: undefined, to: 'changes' },
+])('refuses an unpinned acceptance or an omitted head (%j)', async payload => {
+  const runNode = vi.fn(); const postComment = vi.fn();
+  const sinks = createReviewPrSinks({ env: {}, runNode, postComment });
+  await expect(sinks[REVIEW_EFFECTS.LABEL]({ pr: 7, repo: 'o/n', ...payload })).rejects.toThrow('review void');
+  expect(runNode).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
+});
 it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red and cancellation is enabled', async effect => {
   const runNode = vi.fn(); const postComment = vi.fn();
   const sinks = createReviewPrSinks({ readPublishHead: () => head, env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, runNode, postComment,

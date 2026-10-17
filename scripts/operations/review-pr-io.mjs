@@ -941,6 +941,12 @@ export function createReviewPrSinks({
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
   const assertPublishable = async payload => {
+    // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
+    // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
+    // is no reviewed commit against which to apply head/CI cancellation. Never
+    // authorize an acceptance this way: the label writer would stamp the live head.
+    // An omitted field remains a malformed publish request.
+    if (payload.reviewedHead === null && payload.to !== 'accepted') return;
     if (!payload.reviewedHead) throw notApplied('review void: missing reviewed head');
     const policy = resolveTimingPolicy({ env }).review;
     const args = { repo: payload.repo, pr: payload.pr, expectedHead: payload.reviewedHead };

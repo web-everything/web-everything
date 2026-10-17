@@ -393,7 +393,7 @@ scope, so skipped tests cannot strand review.
 `ci-green` restores the complete required-check prerequisite; `push` starts at the
 head. A missing, pending or wrong-head fast check cannot release review. With
 `review.cancelOnCiRed` (default off; operator 2026-10-16: keep the option, don't use it yet),
-the publication sink voids a running review's verdict when CI turns red; a changed head always voids it. The merge
+the publication sink voids a running review's verdict when CI turns red; a changed pinned head always voids it. The merge
 requirements remain enforced by the merge gate.
 
 Outside the configured fast-check prerequisite, only required CI failures block
@@ -402,9 +402,14 @@ owner and must not strand a pending review. Every new review refusal needs an
 identified dispatcher or external event that clears it. Review-dependent gates
 never count as healable red, even when required: `review-gate` always, and
 `merge-gate` when its red is a review hold (the CI heal's rule since #5463). A plain
-required `merge-gate` failure is healable. Publication requires a pinned,
+required `merge-gate` failure is healable. For a pinned basis, publication requires an
 unchanged head even when CI is unreadable; CI reads are skipped with cancellation
-off, and CI read faults alone do not discard a completed verdict.
+off, and CI read faults alone do not discard a completed verdict. An explicitly
+unpinned basis (`netBasis.rev === null`) still publishes its non-accepting result:
+head/CI cancellation cannot compare it to a reviewed commit. It carries no pinned
+head attestation; the write-up marks it `UNPINNED` or `DEGRADED BASIS`. A degraded
+basis cannot reduce to acceptance. An unpinned acceptance or an omitted reviewed-head
+field remains refused.
 
 A changed head gets a delta review when additions plus deletions are at most
 `review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3), both for
