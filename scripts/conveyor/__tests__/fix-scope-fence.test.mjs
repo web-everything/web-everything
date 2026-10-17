@@ -69,6 +69,7 @@ describe('fix scope fence', () => {
     expect(context.notes).toEqual(['Out of scope: every cd landing', '- subshell walks', 'x5tbryq carries landing budgets']);
     for (const line of context.notes) expect(scopeBrief(context.scope, context)).toContain(line);
     expect(scopeBrief(context.scope, context)).toContain('Stay inside this scope; anything else → stand down with a scope-increase request.');
+    expect(scopeBrief(context.scope, context)).toContain('PR commit messages can carry more `scope-removed:` markers');
     expect(operatorScope([{ ...comment, author: { login: 'stranger' } }]).removed).toEqual([]);
     expect(operatorScope([{ ...comment, body: 'a casual comment\nscope-removed: cdLandings' }]).removed).toEqual([]);
   });
@@ -171,17 +172,29 @@ describe('the live scope fence adapter', () => {
     const commits = [...Array.from({ length: 150 }, (_, i) => [i.toString(16).padStart(40, '0'), `commit ${i}`]),
       [head, 'late removal\n\nscope-removed: cdLandings']];
     expect((await liveFence({ commits, comments: [] })).result).toMatchObject({ ok: false, terminal: true });
-    for (const over of [{ commits: commits.slice(0, 100), total: 151 }, { commits: commits.slice(0, 150) }]) {
-      const r = await liveFence({ ...over, comments: [] });
-      expect(r.result).toMatchObject({ ok: false, transient: true });
-      expect(r.result.reason).toMatch(/commit list incomplete/);
-      expect(r.push).not.toHaveBeenCalled();
-    }
+    // A push racing the read (the list no longer ends at the head) is retried; a stable short list goes to a person.
+    const raced = await liveFence({ commits: commits.slice(0, 150), comments: [] });
+    expect(raced.result).toMatchObject({ ok: false, transient: true });
+    expect(raced.result.reason).toMatch(/commit list incomplete/);
+    expect(raced.push).not.toHaveBeenCalled();
+    const short = await liveFence({ commits: [...commits.slice(0, 99), commits.at(-1)], total: 151, comments: [], patch: '+const safe = 1;' });
+    expect(short.result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+    expect(short.result.transient).toBeUndefined();
+    expect(short.result.reason).toMatch(/commit list incomplete \(read 100 of 151/);
+    expect(short.push).not.toHaveBeenCalled();
+    expect(short.writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
   });
-  it('fails closed when an operator comment is too large to read its markers', async () => {
-    const r = await liveFence({ comments: [{ ...comment, body: `${body}\n${'x'.repeat(17 * 1024)}` }], patch: '+const safe = 1;' });
-    expect(r.result).toMatchObject({ ok: false, transient: true });
-    expect(r.result.reason).toMatch(/operator scope evidence incomplete/);
+  it.each([
+    ['an operator comment', { comments: [{ ...comment, body: `${body}\n${'x'.repeat(17 * 1024)}` }] },
+      /operator scope evidence incomplete/],
+    ['a commit message', { comments: [], commits: [[head, `removal\n${'x'.repeat(17 * 1024)}`]] }, /line limit/],
+  ])('stands down for a person, never a transient retry, when %s is too large to read its markers', async (_, over, why) => {
+    const r = await liveFence({ ...over, patch: '+const safe = 1;' });
+    expect(r.result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+    expect(r.result.transient).toBeUndefined();
+    expect(r.result.reason).toMatch(why);
     expect(r.push).not.toHaveBeenCalled();
+    expect(r.writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
+    expect(r.writes.some(args => args.includes('review-status:stood-down'))).toBe(true);
   });
 });

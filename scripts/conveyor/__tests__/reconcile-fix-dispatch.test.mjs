@@ -859,7 +859,8 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       '## Declared repair scope\n\nwe:scripts/conveyor/reconcile-fix-dispatch.mjs\n\n\n'
-      + 'Operator scope evidence is incomplete (operator comments unavailable). Treat every operator exclusion on the PR as binding; the push fence withholds any push it cannot check.\n\n'
+      + 'Operator scope evidence is incomplete (operator comments unavailable). Treat every operator exclusion on the PR as binding; the push fence withholds any push it cannot check.\n'
+      + 'PR commit messages can carry more `scope-removed:` markers, and the push fence enforces them too: run `git log --format=%B origin/<base>..HEAD` and honour every one before re-adding removed code.\n\n'
       + 'Stay inside this scope; anything else → stand down with a scope-increase request.\n\n'
       + '# fix brief for 1764 (item 3438)\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --lane=9 --session=fix-1764 '

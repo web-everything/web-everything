@@ -53,9 +53,12 @@ export function operatorScope(comments = []) {
   return { notes, removed: [...new Set(removed)], ...(incomplete.length ? { incomplete } : {}) };
 }
 
+/** The brief lists comment markers only; commit-message markers are enforced too, so the fixer is told where to read them. */
+export const COMMIT_MARKERS_NOTE = 'PR commit messages can carry more `scope-removed:` markers, and the push fence enforces them too: run `git log --format=%B origin/<base>..HEAD` and honour every one before re-adding removed code.\n';
+
 export function scopeBrief(scope, { notes = [], removed = [], incomplete = [] } = {}) {
   const warning = incomplete.length ? `Operator scope evidence is incomplete (${incomplete.join('; ')}). Treat every operator exclusion on the PR as binding; the push fence withholds any push it cannot check.\n` : '';
-  return `## Declared repair scope\n\n${scope.join(', ')}\n\n${notes.join('\n')}\n${removed.length ? `scope-removed: ${removed.join(', ')}\n` : ''}${warning}\nStay inside this scope; anything else → stand down with a scope-increase request.\n\n`;
+  return `## Declared repair scope\n\n${scope.join(', ')}\n\n${notes.join('\n')}\n${removed.length ? `scope-removed: ${removed.join(', ')}\n` : ''}${warning}${COMMIT_MARKERS_NOTE}\nStay inside this scope; anything else → stand down with a scope-increase request.\n\n`;
 }
 
 /** Fixer-controlled text is percent-encoded outside a safe path alphabet and capped before it reaches a posted comment or prompt. */
@@ -94,6 +97,11 @@ export class ScopeFenceHeadMovedError extends Error {
   }
 }
 
+/** Evidence that will not become readable by retrying (an oversized marker, an uncompletable commit list): a person decides. */
+export class ScopeFenceEvidenceError extends Error {
+  constructor(message, context) { super(message); this.context = context; }
+}
+
 /** The same gate wraps early, green and salvage pushes. Failures never fall through to the push sink. */
 export function fencedPush({ readContext, readDiff, push, standDown, note, policy }) {
   if (policy.enabled === false) return push();
@@ -103,6 +111,11 @@ export function fencedPush({ readContext, readDiff, push, standDown, note, polic
     decision = scopeFenceDecision({ ...context, ...readDiff(context), policy });
   } catch (e) {
     if (e instanceof ScopeFenceHeadMovedError) return { ok: false, moved: true, terminal: true, reason: e.message };
+    if (e instanceof ScopeFenceEvidenceError) {
+      const reason = `scope-increase request: scope fence evidence cannot be read in full (${e.message}). Operator review is required before this repair is pushed.`;
+      standDown(reason, e.context);
+      return { ok: false, scopeFence: true, terminal: true, reason };
+    }
     return { ok: false, scopeFence: true, transient: true, reason: `scope fence evidence unavailable: ${e.message}` };
   }
   if (decision.action === 'stand-down') {

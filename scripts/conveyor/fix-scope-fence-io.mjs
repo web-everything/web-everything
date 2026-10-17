@@ -6,7 +6,7 @@ import { planFixesFromReconcile, fetchPrDiffScope, fetchPrDiffPaths, fetchCardSc
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { unescapeTsvField } from './pr-comments-list.mjs';
 import { buildStandDownComment, STAND_DOWN_LABEL } from './stand-down.mjs';
-import { fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
+import { fencedPush, operatorScope, removalMarkers, resolveScopeFence, ScopeFenceEvidenceError, ScopeFenceHeadMovedError } from './fix-scope-fence.mjs';
 
 const COMMITS_QUERY = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid message}}}}}}';
 
@@ -21,9 +21,10 @@ export function readPrCommitMessages({ gh, repo, pr, head }) {
     const tab = line.indexOf('\t');
     commits.push({ oid: line.slice(0, tab), message: unescapeTsvField(line.slice(tab + 1)) });
   }
-  if (totals.size !== 1 || commits.length !== [...totals][0] || commits.at(-1)?.oid !== head) {
-    throw new Error(`PR commit list incomplete (read ${commits.length} of ${[...totals].join('/') || '?'}, ending at ${String(commits.at(-1)?.oid ?? 'none').slice(0, 8)})`);
-  }
+  const detail = `PR commit list incomplete (read ${commits.length} of ${[...totals].join('/') || '?'}, ending at ${String(commits.at(-1)?.oid ?? 'none').slice(0, 8)})`;
+  // A push during the read changes the count or the last commit, so a retry can succeed; a stable short count cannot.
+  if (totals.size !== 1 || commits.at(-1)?.oid !== head) throw new Error(detail);
+  if (commits.length !== [...totals][0]) throw Object.assign(new Error(detail), { permanent: true });
   return commits;
 }
 
@@ -41,15 +42,22 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         if (!/^[0-9a-f]{40}$/.test(view.headRefOid)) throw new Error('missing PR head');
         const comments = readComments(pr, { repo, exec });
         const operator = operatorScope(comments);
-        if (operator.incomplete) throw new Error(`operator scope evidence incomplete: ${operator.incomplete.join('; ')}`);
-        const commits = readPrCommitMessages({ gh, repo, pr, head: view.headRefOid });
+        const evidence = { head: view.headRefOid, comments };
+        if (operator.incomplete) throw new ScopeFenceEvidenceError(`operator scope evidence incomplete: ${operator.incomplete.join('; ')}`, evidence);
+        let commitMarkers;
+        try {
+          commitMarkers = readPrCommitMessages({ gh, repo, pr, head: view.headRefOid }).flatMap(c => removalMarkers(c.message));
+        } catch (e) {
+          if (e.permanent || e instanceof RangeError) throw new ScopeFenceEvidenceError(e.message, evidence);
+          throw e;
+        }
         const options = { root, repo, exec };
         const result = planFixesFromReconcile([{ kind: 'fix', prNumber: pr, ...view }], findItem,
           loadItems, n => fetchPrDiffScope(n, options), key,
           n => fetchPrDiffPaths(n, options), (path, ref) => fetchCardScopeAtRef(path, ref, options));
         const scope = result.planned[0]?.scope;
         if (!scope?.length) throw new Error('declared scope could not be resolved');
-        const removed = [...operator.removed, ...commits.flatMap(c => removalMarkers(c.message))];
+        const removed = [...operator.removed, ...commitMarkers];
         return { scope, repo: key, removed, head: view.headRefOid, comments };
       },
       readDiff: ({ head }) => {
