@@ -39,7 +39,7 @@ import {
   createDefaultJudge, runOperationCli, buildCliSpec, parseOperationArgv, cwdFlagValue, hasJsonFlag,
 } from './cli-adapter.mjs';
 import {
-  reviewPrOperation, REVIEW_PR_OP, reviewSeatOptionsForRun, securitySeatFromRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
+  reviewPrOperation, REVIEW_PR_OP, reviewSeatOptionsForRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
 } from './review-pr.mjs';
 import { createReviewPrReader, createReviewPrSinks, PR_VIEW_FIELDS, prViewFileName } from './review-pr-io.mjs';
 import { stagePrViewOperation, STAGE_PR_VIEW_OP } from './stage-pr-view.mjs';
@@ -207,16 +207,11 @@ export const OPERATIONS = Object.freeze({
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
     const seatSettings = loadReviewSeatSettings();
-    // Until reduce completes, missing answers can mean future/failed seats. Keep the live declaration
-    // used by partial-run recovery; only completed panels can reconstruct every seat from their answers.
-    const seats = savedRun?.op === REVIEW_PR_OP && savedRun.findings?.reduce
-      ? reviewSeatOptionsForRun(savedRun, seatSettings) : {
-      securitySeat: savedRun?.op === REVIEW_PR_OP ? securitySeatFromRun(savedRun) : securitySeat,
-      codexAdvisory: codexAdvisoryFromEnv(),
-      correctnessAdvisory: correctnessAdvisoryFromEnv(),
-      antigravityReview: antigravityReviewFromEnv(),
-      seatSettings,
-    };
+    const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
+      antigravityReview: antigravityReviewFromEnv() };
+    // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
+    const seats = savedRun?.op === REVIEW_PR_OP
+      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, ...live, seatSettings };
     return {
       declaration: reviewPrOperation({
         ...seats,

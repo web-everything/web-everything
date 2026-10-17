@@ -268,6 +268,72 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
     }
   });
 
+  // Drive one unfinished panel to confirm, resolving the registration from the saved record at every judge step.
+  const driveUnfinished = async ({ declaration, registry, store, beforeResume = () => {}, strip = false }) => {
+    let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'mid-panel', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+    if (strip) {
+      // A run saved before the roster was persisted: its `read` finding names only the security seat.
+      const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
+      run = { ...run, findings: { ...run.findings, read } };
+    }
+    while (run.pending?.kind === 'judge') {
+      store.write(run);
+      beforeResume(run.pending.step);
+      const resumed = resolveOperation('review-pr', { resumeId: run.id });
+      expect(resumed.declaration.steps.map(s => s.name), run.pending.step).toEqual(declaration.steps.map(s => s.name));
+      run = advanceWhileRunning(run, { registry: resumed.registry, resume: { value: { summary: 'looked', findings: [] } } });
+    }
+    return run;
+  };
+
+  it('resumes a historical two-seat panel before reduce under the default minimum', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-cli-historical-'));
+    try {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+      vi.stubEnv('WE_REVIEW_SHADOW_AGY_ENABLED', '0');
+      // The pre-minimum build: the live seat settings, but no Codex seat.
+      const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0, seatSettings: loadReviewSeatSettings({ log: () => {} }) });
+      const registry = createRegistry();
+      registry.register(declaration);
+      const run = await driveUnfinished({ declaration, registry, store: createFileRunStore(), strip: true });
+      expect(run.findings.reduce).toBeTruthy();
+      expect(Object.keys(run.findings)).not.toContain('judgeAdvisory');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['the minimum rises to 2', { WE_REVIEW_MIN_NON_CLAUDE_SEATS: '2' }],
+    ['the Codex correctness and Antigravity flags turn on',{ REVIEW_PR_CODEX_CORRECTNESS_ADVISORY: '1', REVIEW_PR_ANTIGRAVITY_REVIEW: '1' }],
+  ])('keeps a new run\'s seated roster when %s mid-panel', async (_label, changed) => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-cli-changed-'));
+    try {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      vi.stubEnv('REVIEW_PR_CODEX_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_CODEX_CORRECTNESS_ADVISORY', '0');
+      vi.stubEnv('REVIEW_PR_ANTIGRAVITY_REVIEW', '0');
+      vi.stubEnv('WE_REVIEW_SHADOW_AGY_ENABLED', '0');
+      vi.stubEnv('WE_REVIEW_MIN_NON_CLAUDE_SEATS', '1');
+      const declaration = reviewPrOperation({ readPr: stubReader(), seatSettings: loadReviewSeatSettings({ log: () => {} }) });
+      const registry = createRegistry();
+      registry.register(declaration);
+      const run = await driveUnfinished({ declaration, registry, store: createFileRunStore(),
+        beforeResume: () => { for (const [k, v] of Object.entries(changed)) vi.stubEnv(k, v); } });
+      expect(run.findings.reduce).toBeTruthy();
+      expect(Object.keys(run.findings)).toContain('judgeAdvisory');
+      expect(Object.keys(run.findings)).not.toContain('judgeCorrectnessAdvisory');
+      expect(Object.keys(run.findings)).not.toContain('judgeAntigravityReview');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a bad run id or torn record reaches the adapter refusal, not the root-usage exit', () => {
     const dir = mkdtempSync(join(tmpdir(), 'review-cli-bad-resume-'));
     try {

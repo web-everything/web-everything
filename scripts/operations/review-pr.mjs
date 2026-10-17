@@ -799,15 +799,47 @@ export function seatSettingsForRun(record, settings) {
   return { ...settings, agyCorrectnessAdvisory: seated, preserveSavedRoster: true };
 }
 
-/** Rebuild a completed panel's roster for confirmation/replay, independently of current flags and minimums. */
-export function reviewSeatOptionsForRun(record, settings) {
-  const findings = record?.findings ?? {};
+const OPTIONAL_SEATS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT, AGY_CORRECTNESS_SEAT]);
+
+/**
+ * Rebuild a saved run's roster for a resume at ANY cursor position, independently of current flags and minimums.
+ * New runs persist it in `findings.read.seatSteps`. A run saved before that keeps every seat it answered or is
+ * parked on, drops a seat its progress already passed, and asks `live` (the requests a new run would make,
+ * never the minimum) only about seats it has not reached. A run with no `read` finding has judged nothing, so
+ * it gets the live roster, minimum included.
+ * @param {object|null|undefined} record
+ * @param {object|null} settings - the live resolved settings.
+ * @param {{codexAdvisory?: boolean, correctnessAdvisory?: boolean, antigravityReview?: boolean}} [live]
+ */
+export function reviewSeatOptionsForRun(record, settings, live = {}) {
+  const findings = record?.findings && typeof record.findings === 'object' ? record.findings : {};
+  const read = findings.read && typeof findings.read === 'object' ? findings.read : null;
+  const liveFlags = { [ADVISORY_JUDGE_SEAT.step]: live.codexAdvisory === true,
+    [CORRECTNESS_ADVISORY_SEAT.step]: live.correctnessAdvisory === true,
+    [ANTIGRAVITY_REVIEW_SEAT.step]: live.antigravityReview === true,
+    [AGY_CORRECTNESS_SEAT.step]: settings?.agyCorrectnessAdvisory === true };
+  if (!read) {
+    return { securitySeat: securitySeatFromRun(record), codexAdvisory: liveFlags.judgeAdvisory,
+      correctnessAdvisory: liveFlags.judgeCorrectnessAdvisory, antigravityReview: liveFlags.judgeAntigravityReview,
+      seatSettings: settings ?? null };
+  }
+  const saved = Array.isArray(read.seatSteps) ? read.seatSteps : null;
+  // Historical runs: the furthest point reached. Every step after the optional seats (verifier, reduce, confirm…)
+  // means all of them were passed.
+  const reached = [...Object.keys(findings), ...(record.pending?.step ? [record.pending.step] : [])];
+  const rank = (step) => {
+    const i = OPTIONAL_SEATS.findIndex((seat) => seat.step === step);
+    return i >= 0 ? i : (['read', ...JUDGE_SEATS.map((seat) => seat.step)].includes(step) ? -1 : OPTIONAL_SEATS.length);
+  };
+  const furthest = Math.max(-1, ...reached.map(rank));
+  const seated = (seat, i) => (saved ? saved.includes(seat.step)
+    : reached.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
+  const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
   return {
     securitySeat: securitySeatFromRun(record),
-    codexAdvisory: codexAdvisoryFromRun(record),
-    correctnessAdvisory: Object.hasOwn(findings, CORRECTNESS_ADVISORY_SEAT.step),
-    antigravityReview: Object.hasOwn(findings, ANTIGRAVITY_REVIEW_SEAT.step),
-    seatSettings: seatSettingsForRun(record, settings ?? {}),
+    codexAdvisory, correctnessAdvisory, antigravityReview,
+    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0 ? { minNonClaudeSeats: read.minNonClaudeSeats } : {}),
+    seatSettings: { ...(settings ?? {}), agyCorrectnessAdvisory, preserveSavedRoster: true },
   };
 }
 
@@ -2601,8 +2633,9 @@ export function reviewPrOperation({
           lens: view.input.lens, pr: view.input.pr, repo: view.input.repo, diffScored: finding.diffScored,
         });
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
-        // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it.
-        return { ...finding, securitySeat: securitySeat !== false };
+        // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
+        // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
+        return { ...finding, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
