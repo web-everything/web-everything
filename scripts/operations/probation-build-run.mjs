@@ -80,6 +80,7 @@ import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
+import { lightRevalidationInput, parseLightVerdict } from './prepare-light-revalidate.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
 import { parseCard } from '../lib/priority-order.mjs';
@@ -263,6 +264,7 @@ export function parseArgs(argv) {
     lane: flags.lane ? Number(flags.lane) : null,
     scope: typeof flags.scope === 'string' && flags.scope ? flags.scope.split(',') : [],
     worker,
+    lightRevalidate: process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM === String(flags.num),
     groupMembers: parseGroupMembers(flags['group-members'] ?? ''),
   };
 }
@@ -288,7 +290,9 @@ function validateAndStampPrepare(num, card, lanePath, io, autoSize) {
  * @param {object} io - see {@link realIo} for the shape.
  */
 export async function runProbationBuild(args, io) {
-  const { num, session, worker } = args;
+  const { num, session } = args;
+  const { worker } = args;
+  let resultWorker = worker;
   const taskType = args.taskType ?? 'doc-fix';
   if (!['doc-fix', 'bugfix', 'test-fix', 'prepare', 'build-new-feature'].includes(taskType)) throw new Error('unsupported probation build taskType');
   if (!num || !session || !worker?.id) throw new Error('probation-build-run: --num, --session and --worker are required');
@@ -296,7 +300,8 @@ export async function runProbationBuild(args, io) {
   if (!preparing && parseGroupMembers(args.groupMembers ?? []).length) {
     throw new Error('probation-build-run: grouped requests require prepare mode');
   }
-  const prepareAutoSize = preparing && (io.preparePolicy ?? readPreparePolicy()).autoSize;
+  const preparePolicy = preparing ? (io.preparePolicy ?? readPreparePolicy()) : {};
+  const prepareAutoSize = preparing && preparePolicy.autoSize;
   if (preparing && !['codex', 'antigravity-gemini'].includes(worker.id)) throw new Error('prepare requires codex or antigravity-gemini');
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);
   let declinedReason = null;
@@ -320,9 +325,9 @@ export async function runProbationBuild(args, io) {
     const failure = evidence ? { cause: classifyPrepareFailure(evidence), evidence } : {};
     // One `probation-launch` row per build the WORKER actually ran — an item that could never be claimed or
     // found is not a trial of it.
-    if (executor === worker.executor) {
+    if (executor === resultWorker.executor) {
       io.appendScorecard({ ...launchScorecardRow({
-        worker: { ...worker, taskType }, modelEvidence, checker: checkerRow, pr: row.pr ?? null, repo: REPO_SLUG, handle: session, item: num, launchOutcome: outcome, diff: row.diff ?? null,
+        worker: { ...resultWorker, taskType }, modelEvidence, checker: checkerRow, pr: row.pr ?? null, repo: REPO_SLUG, handle: session, item: num, launchOutcome: outcome, diff: row.diff ?? null,
       }), ...failure });
     }
     if (declinedReason) detail = `worker-declined: ${declinedReason} — ${detail}`;
@@ -351,7 +356,7 @@ export async function runProbationBuild(args, io) {
   // `executor` defaults to the worker's (a launch attempt worth a scorecard row) but a pre-worker consistency
   // check that never ran it passes `'none'` explicitly, so `finish` never credits/blames it for a trial it had
   // no part in.
-  const abandon = (outcome, detail, row = {}, executor = worker.executor) => {
+  const abandon = (outcome, detail, row = {}, executor = resultWorker.executor) => {
     if (baseSha != null) io.discardChanges(lanePath, baseSha, preexisting);
     return finish(outcome, executor, detail, { ...row, resultDiscarded: baseSha != null });
   };
@@ -476,7 +481,39 @@ export async function runProbationBuild(args, io) {
     let memberReport = '';
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
-      const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
+      let run;
+      if (preparing && args.lightRevalidate && attempt === 0 && !groupMembers.length) {
+        const input = lightRevalidationInput({ raw: item.raw, scope: item.scope, baseSha, policy: preparePolicy,
+          diff: (sha, base, paths) => io.prepareScopeDiff(lanePath, sha, base, paths) });
+        if (input) {
+          const lightWorker = { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
+          const lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
+          resultWorker = lightWorker;
+          const answer = io.runWorker(buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
+            taskFile: lightTask, card: num, caller: 'prepare-light-revalidate' }), lanePath);
+          workerRan = true;
+          const lightHooks = hookSurfaceChanged(preHookSurface, io.snapshotHookSurface(lanePath));
+          if (lightHooks.changed) {
+            if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
+            return abandon('escalated-needs-human', `refused: revalidation changed hooks: ${lightHooks.reason}`);
+          }
+          if (io.headSha(lanePath) !== baseSha || io.findItem(num, lanePath)?.raw !== item.raw
+            || summarizeNumstat(io.diffNumstat(lanePath, baseSha, [])).files) {
+            return abandon('gate-red', 'refused: revalidation changed the checkout');
+          }
+          const verdict = answer.ok ? parseLightVerdict(answer.lastMessage) : null;
+          log(`light revalidation: ${verdict?.verdict ?? 'invalid answer; full prepare'}${verdict ? `: ${verdict.reason}` : ''}`);
+          if (verdict?.verdict === 'still-valid') {
+            io.writeCard(lanePath, item.path, `${item.raw.trimEnd()}\n\nrevalidated: ${verdict.reason}\n`);
+            run = { ...answer, lastMessage: 'Preparation revalidated.' };
+          }
+        }
+      }
+      if (!run) {
+        // Full preparation and its repair retry always use the dispatcher's worker.
+        resultWorker = worker;
+        run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
+      }
       modelEvidence = run.modelEvidence ?? {};
       if (preparing) memberReport += `\n${run.lastMessage ?? ''}`;
       workerRan = true;
@@ -546,13 +583,13 @@ export async function runProbationBuild(args, io) {
         io.holdWorkerDecline(done);
         io.discardChanges(lanePath, baseSha, preexisting);
         const landed = io.landAlreadyDone(done, lanePath, { citation: 'prepare' });
-        if (landed.status === 'landed') return finish('prepare-already-done', worker.executor, `already-done: ${done.commit}; verified independently; opened resolve PR #${landed.pr}`, { diff: diffRow, pr: landed.pr });
+        if (landed.status === 'landed') return finish('prepare-already-done', resultWorker.executor, `already-done: ${done.commit}; verified independently; opened resolve PR #${landed.pr}`, { diff: diffRow, pr: landed.pr });
         // Replace the already-done hold installed above: left in place it would keep describing an automatically
         // routable claim the landing pass just refused (PR #4323 review). The needs-you hold overwrites it.
         const reason = needsYouReason('already-done', `claimed commit ${report.commit} was not verified: ${landed.error}`);
         const [route] = planHoldRouting([{ num, reason }]);
         io.holdWorkerDecline(route);
-        return finish('prepare-needs-you', worker.executor, reason, { diff: diffRow });
+        return finish('prepare-needs-you', resultWorker.executor, reason, { diff: diffRow });
       }
       if (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect') {
         // A bad scope is re-derived from the code the card cites (one hop through a cited backlog card's own
@@ -597,7 +634,7 @@ export async function runProbationBuild(args, io) {
           io.holdWorkerDecline(done);
           io.discardChanges(lanePath, baseSha, preexisting);
           const landed = io.landAlreadyDone(done, lanePath);
-          return finish(landed.status === 'landed' ? 'opened-pr' : 'escalated-needs-human', worker.executor,
+          return finish(landed.status === 'landed' ? 'opened-pr' : 'escalated-needs-human', resultWorker.executor,
             landed.status === 'landed' ? `already-done: ${done.commit}; opened PR #${landed.pr}`
               : `already-done landing failed: ${landed.error}`, { diff: diffRow, pr: landed.pr });
         }
@@ -656,20 +693,20 @@ export async function runProbationBuild(args, io) {
           break;
         }
 
-        if (worker.checker) {
+        if (resultWorker.checker) {
           const checkerTask = io.writeTaskFile(lanePath, 'probation-build-check.md', [
             `Check this ${taskType} against its spec. Answer APPROVE or REJECT on the first line, then reasons.`,
-            `Reject scope creep, weakened tests, incorrect fixes${worker.simpleOnly ? ', or work that is not simple and mechanical' : ', or incomplete acceptance criteria'}.`,
+            `Reject scope creep, weakened tests, incorrect fixes${resultWorker.simpleOnly ? ', or work that is not simple and mechanical' : ', or incomplete acceptance criteria'}.`,
             item.spec, io.diffText(lanePath, baseSha, preparing ? [item.path] : []),
           ].join('\n\n'));
-          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath));
-          checkerRow = { provider: worker.checker, verdict: verdict.verdict, reason: verdict.reason };
+          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: resultWorker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath));
+          checkerRow = { provider: resultWorker.checker, verdict: verdict.verdict, reason: verdict.reason };
           const checkerHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
           if (checkerHooks.changed) {
             if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
             return abandon('escalated-needs-human', `refused: checker changed the git-hook surface: ${checkerHooks.reason}`, { diff: diffRow });
           }
-          if (!verdict.approved) return abandon('gate-red', `the ${worker.checker} checker did not approve: ${verdict.reason}`, { diff: diffRow });
+          if (!verdict.approved) return abandon('gate-red', `the ${resultWorker.checker} checker did not approve: ${verdict.reason}`, { diff: diffRow });
         }
 
         const resolved = preparing ? validateAndStampPrepare(num, postWorkerItem, lanePath, io, prepareAutoSize) : io.resolveItem(num, lanePath);
@@ -774,7 +811,7 @@ export async function runProbationBuild(args, io) {
     if (io.headSha(lanePath) !== baseSha) {
       return abandon('escalated-needs-human', 'refused: worker or resolve moved HEAD before the launcher commit', { diff: diffRow });
     }
-    io.commit(lanePath, [...new Set([...summary.paths, item.path])], declinedReason ? `${machinePrTitle({ item: num, kind: 'findings', card: item })}\n` : buildDocFixCommitMessage({ num, worker, taskType, title: item.title }));
+    io.commit(lanePath, [...new Set([...summary.paths, item.path])], declinedReason ? `${machinePrTitle({ item: num, kind: 'findings', card: item })}\n` : buildDocFixCommitMessage({ num, worker: resultWorker, taskType, title: item.title }));
 
     // The FINAL gate, on the commit that carries both the build and the resolve — the marker-writing mode
     // (unlike `probation-heal-run.mjs#runGate`'s marker-less `run` mode), because `open-pr --requireVerified=true`
@@ -798,7 +835,7 @@ export async function runProbationBuild(args, io) {
     // `submitted.ok === false` case already handled explicitly. `writePrBody`/`openPr` therefore never reach
     // `abandon` — a throw here reports `escalated-needs-human` and stops, exactly like a `!submitted.ok` result.
     try {
-      const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges, groupMembers, groupDropped, groupDropReasons });
+      const bodyFile = io.writePrBody(lanePath, { num, worker: resultWorker, diff: diffRow, taskType, declinedReason, proposedEdges, groupMembers, groupDropped, groupDropReasons });
       const submit = attemptTag => io.openPr({ lanePath, num, slug: item.slug, attemptTag, bodyFile, taskType });
       const staleTip = result => !result.ok && /is not the tip of|push-rejected-stale-tip:/.test(result.reason ?? '');
       let submitted = submit(args.attemptTag);
@@ -816,17 +853,17 @@ export async function runProbationBuild(args, io) {
         // `blocked-on-infra` ref push is auto-retried by the conveyor's own recovery pass; anything else is a
         // real question for a human, and the built work stays in the lane for them to pick up rather than
         // being lost.
-        return finish(submitted.blockedOnInfra ? 'blocked-on-infra' : 'escalated-needs-human', worker.executor, submitted.reason, { diff: diffRow });
+        return finish(submitted.blockedOnInfra ? 'blocked-on-infra' : 'escalated-needs-human', resultWorker.executor, submitted.reason, { diff: diffRow });
       }
-      return finish(couldNotPrepare ? 'could-not-prepare' : 'opened-pr', worker.executor, `opened PR #${submitted.pr}, parked review:pending — full review and a run rating are owed`, { diff: diffRow, pr: submitted.pr });
+      return finish(couldNotPrepare ? 'could-not-prepare' : 'opened-pr', resultWorker.executor, `opened PR #${submitted.pr}, parked review:pending — full review and a run rating are owed`, { diff: diffRow, pr: submitted.pr });
     } catch (e) {
-      return finish('escalated-needs-human', worker.executor, `unexpected error opening the PR (the build is committed, gate-green, in the lane): ${e?.message ?? e}`, { diff: diffRow });
+      return finish('escalated-needs-human', resultWorker.executor, `unexpected error opening the PR (the build is committed, gate-green, in the lane): ${e?.message ?? e}`, { diff: diffRow });
     }
   } catch (e) {
     // `workerRan` (set the instant `io.runWorker` returns, above) decides the executor: `'none'` for anything
     // that failed before the worker ever ran (so `finish` never writes a scorecard row for a trial the worker
     // had no part in), the worker's own otherwise — see the `abandon` docblock above.
-    return abandon('escalated-needs-human', `unexpected error: ${e?.message ?? e}`, {}, workerRan ? worker.executor : 'none');
+    return abandon('escalated-needs-human', `unexpected error: ${e?.message ?? e}`, {}, workerRan ? resultWorker.executor : 'none');
   }
 }
 
@@ -1050,6 +1087,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       try { return JSON.parse(r.out).lastMessage ?? ''; } catch { return ''; }
     },
     addedPaths: (dir, base) => sh('git', ['-C', dir, 'diff', '--no-renames', '--diff-filter=A', '--name-only', base], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
+    prepareScopeDiff: (dir, sha, base, paths) => sh('git', ['-C', dir, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', `${sha}..${base}`, '--', ...paths], { cwd: dir, env: laneEnv }),
     diffText: (dir, base, paths = []) => sh('git', ['-C', dir, 'diff', '--no-renames', base, ...(paths.length ? ['--', ...paths] : [])], { cwd: dir, env: laneEnv }),
     untracked: (dir) => sh('git', ['-C', dir, 'ls-files', '--others', '--exclude-standard'], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
     diffNumstat: (dir, base, exclude = []) => {
