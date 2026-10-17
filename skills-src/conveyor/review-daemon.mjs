@@ -79,7 +79,7 @@ import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
-import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { claimReviewDispatch, notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
 import { refreshOntoMain, defaultPostRebaseComment } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
@@ -333,6 +333,7 @@ export function runReviewTick({
   defaultBranch = 'main',
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
+  claimReview = claimReviewDispatch,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
@@ -548,7 +549,16 @@ export function runReviewTick({
   for (const [i, d] of dispatchable.entries()) {
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
+      // Standalone ticks can lack the shared listing. The claim reader fetches comments in that case;
+      // CI below still has to pin the exact head carried by the planner's exception.
+      const rearmSubject = subject ?? (d.owedRedTeamReview
+        ? { number: Number(d.prNumber), headRefOid: d.owedRedTeamReview.head } : null);
       const result = dispatch({ pr: d.prNumber, repo,
+        // Planning is read-only. Claim any owed-comment exception after the dispatcher's CI and other gates.
+        ...(d.owedRedTeamReview ? { beforeSpawn: ci => d.owedRedTeamReview.repo === repo
+          && d.owedRedTeamReview.pr === Number(d.prNumber)
+          && ci?.headSha === d.owedRedTeamReview.head && rearmSubject?.headRefOid === d.owedRedTeamReview.head
+          && claimReview(rearmSubject, { repo }) } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),

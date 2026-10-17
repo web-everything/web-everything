@@ -553,6 +553,7 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
  */
 export function dispatchReview({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
+  beforeSpawn = () => true,
   pr, repo, root = REPO_ROOT,
   readBrief = (r) => readFileSync(reviewBriefPath(r), 'utf8'),
   mintSessionId = () => randomUUID(),
@@ -649,6 +650,7 @@ export function dispatchReview({
   // concluded no session had started — while the real session (findable by its `-n` slug) was running the
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
+  if (!beforeSpawn(ci)) return { pr: planned.pr, repo: planned.repo, skipped: 'same-head-hold' };
   if (wrapReview) {
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,

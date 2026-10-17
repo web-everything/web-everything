@@ -15,7 +15,10 @@ Follow-up, after #5482 and #5465 land: retry a failed red-team comment post once
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-extra-seats.test.mjs we:scripts/operations/__tests__/review-job-red-team.test.mjs` fails before this item lands (fail-once-then-succeed posts once; fail-twice; reason shown in summary) and passes after.
+- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-red-team.test.mjs we:scripts/operations/__tests__/review-job-red-team.test.mjs` fails before this item lands (fail-once-then-succeed posts once; fail-twice; reason shown in summary) and passes after.
+- [A2] **Planned** — `posts after one transient failure` in `we:scripts/operations/__tests__/review-red-team.test.mjs`: first post throws, second succeeds; assert two attempts, one delivered comment, and zero extra model calls.
+- [A3] **Planned** — `stops after two failed attempts` in `we:scripts/operations/__tests__/review-red-team.test.mjs`: both post attempts throw; assert exactly two attempts, `comment.status === 'error'`, a bounded reason, and no third attempt.
+- [A4] **Planned** — `includes the failure reason in the summary` in `we:scripts/operations/__tests__/review-job-red-team.test.mjs`: assert summarizeRedTeam and the job log contain only the scrubbed first line of comment.reason, including after retry exhaustion.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

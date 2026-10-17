@@ -2016,6 +2016,7 @@ export function planReconcile({
       prNumber,
       headRefName: pr?.headRefName ?? null,
       headRefOid: pr?.headRefOid ?? null,
+      ...(pr?.owedRedTeamReview ? { owedRedTeamReview: pr.owedRedTeamReview } : {}),
       // #3383 — carried on every row (evidence, mirrors `transcriptMtimeMs`/`body` just below): the STACKED-BASE
       // CONFLICT branch reads it, and a reader auditing any other row can see at a glance whether this PR is
       // stacked on another lane/PR at all, with no need to go back to the raw listing.

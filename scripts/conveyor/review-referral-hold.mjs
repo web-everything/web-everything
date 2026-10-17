@@ -17,16 +17,7 @@ import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { readStore, resolveScorecardStorePath } from './run-scorecard-store.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
-
-// Keep evidence reads independent of the seat runner and its CLI/review dependency graph.
-// Load only on an eligible decision. Until ready, retain the hold (next daemon tick).
-let redTeamReaders;
-let redTeamReadersLoading;
-/** Test seam: wait for the same lazy readers a daemon decision starts. @test-only-export-ok */
-export function loadRedTeamHoldReaders() {
-  return redTeamReadersLoading ??= import('../lib/red-team-evidence.mjs')
-    .then(readers => { redTeamReaders = readers; }, () => {});
-}
+import { priorRedTeamRow, redTeamCommentPosted } from '../lib/red-team-evidence.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -242,12 +233,8 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-/** A saved post-accept result owes its comment, not another model call. Reserve the single release BEFORE
- * returning it: mkdir is exclusive across processes; the receipt is written atomically inside it. A crash or
- * failed write leaves the reservation spent (fail closed), never an unbounded retry on every daemon tick.
- * State lives beside review-referral-notices and survives daemon restarts. No job-log parser is introduced.
- */
-function rearmOwedRedTeam(pr, { repo, env, now, redTeam: {
+/** Read eligibility without consuming it. The enricher opts in; no-option ledger decisions stay conservative. */
+function owedRedTeamReservation(pr, { repo, env, redTeam: {
   storePath = resolveScorecardStorePath(env),
   settingsPath = join(REPO_ROOT, 'scripts', 'settings', 'red-team.json'),
   stateDir = join(dirname(resolveRunsDir()), 'review-red-team-rearms'),
@@ -255,8 +242,6 @@ function rearmOwedRedTeam(pr, { repo, env, now, redTeam: {
 } = {} }) {
   try {
     if (!repo || !sha(pr.headRefOid) || !Array.isArray(pr.comments) || !commentsReadable) return false;
-    if (!redTeamReaders) { void loadRedTeamHoldReaders(); return false; }
-    const { priorRedTeamRow, redTeamCommentPosted } = redTeamReaders;
     const file = JSON.parse(readFileSync(settingsPath, 'utf8'));
     if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
     // The cascade's convenience reader skips platform read failures. Here a read failure must retain the hold.
@@ -276,19 +261,35 @@ function rearmOwedRedTeam(pr, { repo, env, now, redTeam: {
     // priorRedTeamRow scopes pr/head itself; the shared store spans repositories, so scope repo first.
     const { records } = readStore({ path: storePath });
     if (!priorRedTeamRow(records.filter(r => r?.repo === repo), pr.number, pr.headRefOid)) return false;
-    mkdirSync(stateDir, { recursive: true });
     const reservation = join(stateDir, hash([repo, Number(pr.number), pr.headRefOid]));
-    mkdirSync(reservation); // EEXIST (including an incomplete prior attempt) keeps the normal hold.
+    // stat distinguishes an absent allowance from an unreadable state directory. Only ENOENT releases.
+    try { statSync(stateDir); } catch (e) { if (e.code !== 'ENOENT') return false; }
+    try { statSync(reservation); return false; } catch (e) { if (e.code !== 'ENOENT') return false; }
+    return reservation;
+  } catch { return false; }
+}
+
+/** Called only immediately before a review spawn, after all dispatch gates. Exclusive mkdir arbitrates
+ * competing dispatchers. A crash or receipt failure spends the attempt, including an empty reservation.
+ */
+function reserveOwedRedTeamReview(pr, opts) {
+  const reservation = owedRedTeamReservation(pr, opts);
+  if (!reservation) return false;
+  const { repo, now = Date.now(), redTeam: { log = line => console.error(line),
+    writeReceipt = writeFileSync, renameReceipt = renameSync } = {} } = opts;
+  try {
+    mkdirSync(dirname(reservation), { recursive: true });
+    mkdirSync(reservation);
     const receipt = join(reservation, 'receipt.json');
     const tmp = `${receipt}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ repo, pr: Number(pr.number), head: pr.headRefOid, liftedAt: now }));
-    renameSync(tmp, receipt);
+    writeReceipt(tmp, JSON.stringify({ repo, pr: Number(pr.number), head: pr.headRefOid, liftedAt: now }));
+    renameReceipt(tmp, receipt);
     log(`${repo}#${pr.number}: same-head hold lifted once for owed red-team comment at ${pr.headRefOid}`);
     return true;
   } catch { return false; }
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), redTeam } = {}) {
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), redTeam = false } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
@@ -304,7 +305,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // bounded to VERDICT_RETRY_EXTRA extra runs, and past that keep the hold with an explicit reason.
   const noVerdict = verdictNeverLanded(pr, last, now);
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
-  if (rearmOwedRedTeam(pr, { repo, env, now, redTeam })) return null;
+  if (redTeam !== false && owedRedTeamReservation(pr, { repo, env, redTeam })) return null;
   const head = pr.headRefOid;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
@@ -349,10 +350,32 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
-    return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, env, now,
-        redTeam: { ...redTeam, commentsReadable } })) };
+    const referralHold = hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, env, now,
+      redTeam: { ...redTeam, commentsReadable } }));
+    // Carry why this review was released to the actual dispatcher. Other decision sources may authorize
+    // reviews independently; they must not be subjected to another legacy hold check at spawn time.
+    const owedRedTeamReview = !hold && !released && !referralHold
+      && decideSameHeadHold(pr, runs, { repo, env, now, redTeam: false })
+      ? { repo, pr: Number(pr.number), head: pr.headRefOid } : null;
+    const result = { ...pr, blockRuledReferrals, referralHold,
+      ...(owedRedTeamReview ? { owedRedTeamReview } : {}) };
+    if (!owedRedTeamReview) delete result.owedRedTeamReview;
+    return result;
   });
+}
+
+/** Claim an explicitly identified owed-comment exception at the dispatch boundary. */
+export function claimReviewDispatch(pr, { repo, env = process.env, now = Date.now(),
+  readComments = defaultReadComments, redTeam } = {}) {
+  if (!pr) return false;
+  if (!Array.isArray(pr.comments) || pr.comments.length >= GH_LIST_COMMENT_CAP) {
+    try {
+      const comments = readComments({ repo, number: pr.number });
+      if (!Array.isArray(comments)) return false;
+      pr = { ...pr, comments };
+    } catch { return false; }
+  }
+  return reserveOwedRedTeamReview(pr, { repo, env, now, redTeam });
 }
 
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
