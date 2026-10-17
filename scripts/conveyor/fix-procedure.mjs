@@ -791,7 +791,7 @@ export function handClaimedPushToCi({ repoKey, branch, src = 'HEAD' }, {
     if (!claim) return 'no-claim';
     return mark({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: revParse(src) }) ? 'awaiting-ci' : 'skipped';
   } catch (e) {
-    log(`fix-procedure: push landed; CI hand-off failed (the CI-lifecycle label pass relabels it):${String(e?.message ?? e).split('\n')[0]}`);
+    log(`fix-procedure: push landed; CI hand-off failed (the CI-lifecycle label pass relabels it): ${String(e?.message ?? e).split('\n')[0]}`);
     return 'failed';
   }
 }
