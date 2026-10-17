@@ -53,8 +53,10 @@ import {
   EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
   // ruled-hold-release — the card-change reader and the clone-stale launch gate
   cliCardChangedSince, cliDispatcherFresh,
+  defaultExecAsync,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
+import { recordBuildFailure as recordBuildFailureAt, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -4256,5 +4258,42 @@ describe('prepare discovery under repository PR volume', () => {
     expect(acquireClaim).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
     expect(recordBuildFailure).toHaveBeenCalledWith({ num: '99999', reason: 'build card #99999 unavailable on origin/main' });
+  });
+
+  it('routes async prepare discovery gh calls through the shared throttle', async () => {
+    const run = vi.fn((file, args, opts, done) => done(null, '[]'));
+    await expect(defaultExecAsync('gh', ['pr', 'list'], { cwd: '/x', maxBuffer: 9 }, run)).resolves.toBe('[]');
+    expect(run).toHaveBeenCalledWith(process.execPath, [expect.stringMatching(/[/\\]scripts[/\\]lib[/\\]gh-throttle\.mjs$/), 'pr', 'list'],
+      expect.objectContaining({ cwd: '/x', maxBuffer: 9 }), expect.any(Function));
+    await defaultExecAsync('git', ['ls-tree'], {}, run);
+    expect(run).toHaveBeenLastCalledWith('git', ['ls-tree'], expect.any(Object), expect.any(Function));
+  });
+
+  it('never charges a card for an origin/main read outage before its claim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-card-outage-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const exec = vi.fn((cmd) => { if (cmd === 'git') throw new Error('fatal: unable to access origin'); throw new Error(`unexpected ${cmd}`); });
+      const acquireClaim = vi.fn();
+      const dispatch = vi.fn();
+      const tick = () => {
+        const reader = createPrepareStatusReader({ exec });
+        return runBuildDispatchTick({ live: true, effects: {
+          planTick: () => ({ decisions: { spawnBuilds: [{ num: '4413', lane: 1 }], admission: {
+            queue: [{ num: '4413', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '4413', ready: true }],
+          } }, nextState: {} }),
+          fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+          killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+          dispatch, acquireClaim, recordBuildFailure: o => recordBuildFailureAt(o, { path }),
+        } });
+      };
+      for (let i = 0; i < 8; i++) {
+        expect((await tick()).failures).toContainEqual(expect.objectContaining({ num: '4413', stage: 'card', reason: 'build card lookup unavailable' }));
+      }
+      expect(acquireClaim).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).items?.['4413'] : undefined).toBeUndefined();
+      expect(listBuildBackoffs({ path })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

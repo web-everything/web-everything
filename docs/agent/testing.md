@@ -1175,7 +1175,8 @@ both, including daemon restarts; clear it only after observing a delivering PR. 
 orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
 pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
 Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
-identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
+the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
 unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof

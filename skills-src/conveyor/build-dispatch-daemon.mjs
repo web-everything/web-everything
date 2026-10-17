@@ -874,7 +874,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (effects.resolveBuildCard) {
           try { await effects.resolveBuildCard({ num: pick.num }); }
           catch (error) {
-            const reason = error.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
+            // A missing card is a card-level refusal; a failed origin/main read is clone-wide and charges nothing.
+            const reason = error?.code === 'card-not-found' ? `build card #${pick.num} unavailable on origin/main` : 'build card lookup unavailable';
             effects.recordBuildFailure?.({ num: pick.num, reason });
             failures.push({ num: pick.num, stage: 'card', reason });
             continue;
@@ -2030,8 +2031,9 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
   }
 }
 
-const defaultExecAsync = (cmd, args, opts) => new Promise((resolveExec, rejectExec) => {
-  execFile(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
+/** Async exec for prepare discovery: `gh` always goes through the shared throttle script. `run` is injectable for tests. */
+export const defaultExecAsync = (cmd, args, opts, run = execFile) => new Promise((resolveExec, rejectExec) => {
+  run(cmd === 'gh' ? process.execPath : cmd, cmd === 'gh' ? [join(SCRIPTS, 'lib', 'gh-throttle.mjs'), ...args] : args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
 });
 
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.

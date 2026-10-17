@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyHoldReason } from '../build-dispatch-hold-router.mjs';
-import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf, evidenceReasonCode, buildEvidenceReasonCode, isCardRefusal } from '../retry-backoff.mjs';
+import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf, evidenceReasonCode, buildEvidenceReasonCode, isCardRefusal, isCloneWideReasonCode } from '../retry-backoff.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, rearmFalseHolds, completePrepareFailures, classifyPrepareFailure } from '../prepare-failure-policy.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../build-dispatch-failures.mjs';
 import { runBuildDispatchTick, releaseOwnPrepareHolds } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
@@ -14,7 +14,8 @@ const NOT_CONFIRMED = 'dispatch launch not confirmed (missing effect; no running
 
 it('an unresolved build identity is a permanent card refusal', () => {
   expect(buildEvidenceReasonCode({ reason: 'build card #4413 unavailable on origin/main' })).toBe('card-refused');
-  expect(buildEvidenceReasonCode({ reason: 'build card lookup unavailable' })).not.toBe('card-refused');
+  expect(buildEvidenceReasonCode({ reason: 'build card lookup unavailable' })).toBe('card-lookup-unavailable');
+  expect(isCloneWideReasonCode('card-lookup-unavailable')).toBe(true);
 });
 
 describe('card-level refusal (#4701)', () => {
