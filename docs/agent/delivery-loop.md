@@ -386,8 +386,8 @@ Card-only changes publish a green shard receipt for their intentionally empty un
 scope, so skipped tests cannot strand review.
 `ci-green` restores the complete required-check prerequisite; `push` starts at the
 head. A missing, pending or wrong-head fast check cannot release review. With
-`review.cancelOnCiRed` (default true), the publication sink voids a running
-review's verdict when CI turns red; a changed head always voids it. The merge
+`review.cancelOnCiRed` (default off; operator 2026-10-16: keep the option, don't use it yet),
+the publication sink voids a running review's verdict when CI turns red; a changed head always voids it. The merge
 requirements remain enforced by the merge gate.
 
 A changed head gets a delta review when additions plus deletions are at most

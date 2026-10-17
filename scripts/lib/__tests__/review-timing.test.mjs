@@ -18,7 +18,8 @@ describe('parallel review start and void', () => {
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
     const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };
-    expect(reviewMustVoid(args)).toBe(true);
+    expect(reviewMustVoid(args)).toBe(false);
+    expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
     expect(reviewMustVoid({ ...args, currentHead: 'b'.repeat(40), policy: { ...review, cancelOnCiRed: false } })).toBe(true);
     expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')] })).toBe(false);
@@ -63,7 +64,7 @@ it('logs each timing setting with its effective source, including enabled defaul
   const logs = [];
   resolveTimingPolicy({ env: { WE_POLICY_CASCADE_LOG: '1' }, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {}, log: line => logs.push(line) });
   expect(logs.join('\n')).toContain('startAfter="fast-checks" (standard)');
-  expect(logs.join('\n')).toContain('cancelOnCiRed=true (standard)');
+  expect(logs.join('\n')).toContain('cancelOnCiRed=false (standard)');
   expect(logs.join('\n')).toContain('skipDrainMechanical=true (standard)');
   expect(logs.join('\n')).toContain('joinCiAndReview=true (standard)');
   expect(logs.join('\n')).toContain('joinWaitMaxMin=15 (standard)');

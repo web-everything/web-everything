@@ -2,8 +2,9 @@
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 
+// cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
-  startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'], cancelOnCiRed: true,
+  startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'], cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
 });
 export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15 });
