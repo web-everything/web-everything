@@ -853,7 +853,7 @@ export function parseLedgerEvents(text) {
  *   only place a non-bearing row is visible, and it is where "a review happened" is read back from.
  * @property {VerdictRecord[]} outstandingHolds - BEARING holds appended after the last clearing record. Empty
  *   when the live verdict clears. This is the card's *"no unanswered hold may exist"* in its computed form.
- * @property {VerdictRecord|null} lastHeadMove - latest applied invalidation; delayed observations do not reset approval scope.
+ * @property {VerdictRecord} [lastHeadMove] - latest applied invalidation; absent until a head move applies, preserving legacy fold output.
  */
 
 /**
@@ -889,7 +889,7 @@ export function foldVerdictLedger(records) {
     if (r.type !== undefined && r.type !== EVENT_TYPES.VERDICT) continue;
     let entry = byPr.get(r.pr);
     if (!entry) {
-      entry = { pr: r.pr, repo: r.repo, current: null, clears: false, history: [], outstandingHolds: [], lastHeadMove: null };
+      entry = { pr: r.pr, repo: r.repo, current: null, clears: false, history: [], outstandingHolds: [] };
       byPr.set(r.pr, entry);
       supersededHeads.set(r.pr, new Set());
       bearingByPr.set(r.pr, []);
