@@ -523,6 +523,18 @@ export function sameFindingForClearing(a, b) {
   return CARRY_SEVERITY_FIELDS.every((k) => a[k] === b[k]);
 }
 
+/** Exact key identity with only a missing path erased. Used to REFUSE policy writes, never to clear a gate. */
+export function sameReferralForPolicy(a, b) {
+  if (a.key === b.key) return true;
+  try {
+    const left = JSON.parse(a.key), right = JSON.parse(b.key);
+    const missing = path => path == null || path === '' || path === '(no file)';
+    return left.length === 4 && right.length === 4
+      && (missing(left[1]) || missing(right[1]))
+      && left[0] === right[0] && left[2] === right[2] && left[3] === right[3];
+  } catch { return false; }
+}
+
 // ── #76a FINDING IDENTITY ──────────────────────────────────────────────────────────────────────────────────────
 // ONE identity for "the same finding" across records, re-wordings and heads. Measured on #4017: five wordings of one
 // finding scored 0.05–0.73 word Jaccard, and an unrelated finding scored 0.50 against one of them, so TEXT SIMILARITY
@@ -3051,6 +3063,14 @@ export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
+/**
+ * A finding's live-head re-check marker. It rides on the referral entry when the record is created with it; an existing
+ * record gains it through the append-only `rechecks` list instead, because a record's `referrals` never change between
+ * snapshots (`readReferralRecords`).
+ */
+export const referralRecheck = (record, key) => record.referrals.find(f => f.key === key)?.recheck
+  ?? (record.rechecks ?? []).find(c => c.key === key);
+
 // `withdrawn` is the set of carried keys whose carry no longer stands at read time (`referralRecordState` holds them
 // pending): such a finding is live again, so the reviewer is asked about it instead of the hold having no owner.
 export const liveReferrals = (record, { withdrawn = null } = {}) => activeReferrals(record).filter(f => ![...(record.superseded ?? []),
@@ -3261,6 +3281,8 @@ export function validateReferralRecord(r) {
         || JSON.stringify(normalizeFinding(f.original)) !== JSON.stringify(f.finding)
         || f.key !== referralFindingKey(f.seat, f.original) || keys.has(f.key)
         // #76a — optional identity fields; a record without them (every record before #76) stays valid.
+        || (f.recheck !== undefined && (f.recheck?.status !== 'needs re-check on live head'
+          || !/^[a-f0-9]{40}$/.test(f.recheck.fromHead) || f.recheck.fromHead === r.head || f.recheck.head !== r.head))
         || (f.findingId !== undefined && !FINDING_ID_PATTERN.test(f.findingId))
         || (f.sameAs !== undefined && f.sameAs !== FINDING_SAME_AS_NEW && !FINDING_ID_PATTERN.test(f.sameAs))) return false;
       keys.add(f.key);
@@ -3269,6 +3291,10 @@ export function validateReferralRecord(r) {
       || new Set(r.dropped.map(d => d.key)).size !== r.dropped.length
       || r.dropped.some(d => d.reason !== REFERRAL_DROP_REASON
         || !Object.hasOwn(REFERRAL_SEAT_PROVIDERS, r.referrals.find(f => f.key === d.key)?.seat)))) return false;
+    if (r.rechecks !== undefined && (!Array.isArray(r.rechecks)
+      || new Set(r.rechecks.map(c => c?.key)).size !== r.rechecks.length
+      || r.rechecks.some(c => !c || !keys.has(c.key) || c.status !== 'needs re-check on live head'
+        || !/^[a-f0-9]{40}$/.test(c.fromHead) || c.fromHead === r.head || c.head !== r.head))) return false;
     if (r.superseded !== undefined && (!Array.isArray(r.superseded)
       || new Set(r.superseded.map(s => s.key)).size !== r.superseded.length
       || r.superseded.some(s => s.reason !== REFERRAL_SUPERSEDE_REASON
@@ -3486,7 +3512,8 @@ export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
-    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
+    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${referralRecheck(record, f.key) && !record.rulings.some(r => r.key === f.key)
+      && !(record.carried ?? []).some(c => c.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${carriedReasonText(c, { operatorRulings })} (${carriedActor(c, { operatorRulings })} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
@@ -3550,6 +3577,7 @@ export function readReferralRecords(comments, { head } = {}) {
           || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])
           || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
           || JSON.stringify((r.verified ?? []).slice(0, (previous.verified ?? []).length)) !== JSON.stringify(previous.verified ?? [])
+          || JSON.stringify((r.rechecks ?? []).slice(0, (previous.rechecks ?? []).length)) !== JSON.stringify(previous.rechecks ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }

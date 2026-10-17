@@ -132,6 +132,14 @@ Probe identical-content commits, changed trees, expiry, disabled reuse, failure 
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.
 
+## Daemon entry import regression
+
+`daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the
+rebuild boot smoke in a separate eval-mode Node child, without invoking daemon main functions.
+Keep this in the unit tier: shared-process imports can hide ordering-dependent ESM cycles.
+Process liveness helpers shared by drain evidence and review jobs live in the dependency-free
+`scripts/lib/pid-alive.mjs`; importing the job store for a helper pulls in dispatch and reconcile.
+
 ## Smoke sentinel worker isolation
 
 Daemon rebuild dispatch dry-runs force `WE_WORKER_WRAPPER=off` so injected spawners capture both fix and
@@ -948,7 +956,9 @@ under `prepare.mergedGuardHours` (default 24; 0 disables only the merged refusal
 without surviving dispatch history. Probe the time boundary with an injected clock, including a PR
 created over 24 hours ago but merged 21 minutes ago. Scope drift on a recently merged prepare
 records a "scope moved after prepare" note for the build step in the refusal and its persisted
-bookkeeping; it must never dispatch another prepare within the window.
+bookkeeping; it must never dispatch another prepare within the window. A card the planning pre-scan
+skips for that merge carries the same note and persists the same `prepareRefusals` record as a
+launch refusal; assert both on the planning tick, not only on a merge that appears after planning.
 A needs-you park in the newest ledger record refuses the launch while it is `held` and not `completed`.
 Any one of three things clears it: a stamp on main (it completes the record, so a hand stamp resolves
 the park), explicit `releasedAt`/`releasedBy` metadata, or a reviewed release of that exact attempt in
@@ -1021,6 +1031,28 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
+
+### Orchestrator responsiveness hook probes
+
+`session.orchestratorMode` defaults to false and resolves through the shared policy cascade;
+`WE_ORCHESTRATOR_SESSION=1` opts in. The Bash hook keeps policy diagnostics silent by default;
+`WE_POLICY_CASCADE_LOG=1` logs the final effective value and source to stderr through the shared
+cascade logger, and `WE_POLICY_CASCADE_LOG=0` silences it.
+Subagent hook payloads (`agent_id`), dispatched agents, and marked daemon workers always resolve
+false, even with inherited opt-in settings. `operator-session-bootstrap` currently records no
+session ID, so it does not automatically enable this policy.
+
+`session.orchestratorDelegateCommands` replaces the executable-prefix array declared in
+`scripts/lib/orchestrator-session-settings.mjs`. Configure it in
+`scripts/settings/orchestrator-session.json` (or platform preferences); an empty array disables
+this delegation check. Match executable positions, including Node options before the script and
+npm options before `run` or its script name. Heredocs fed to a shell (including `cat <<EOF | bash`)
+are executable scripts and must be checked, as are shell here-strings. Unquoted heredoc bodies can
+execute command substitutions even when used as data; quoted delimiters suppress those expansions.
+Plain mentions and literal heredoc data stay opaque.
+Probe hook stdin with both an interactive payload and a subagent payload sharing the same env.
+The existing background-verification denial must still win in every session: delegate the work
+to a background agent, which runs the command in its own foreground.
 
 ### Prepare queue admission
 
@@ -1211,6 +1243,48 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
+Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
+the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
+An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
+lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
+through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
+can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
+head past that age must log a named health smell and recheck complete comments and run evidence.
+A recorded or live pass still waits. With neither, request through an available review dispatch hook;
+if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
+“red team never scheduled” note and its source. The current drain has no standalone red-team request
+queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
+comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
+with a different birth time is a reused process, not an active red team. An unavailable birth-time
+probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
+locale in both writer and reader. A running status from another host or PID namespace stays held
+until its result arrives; a local pid probe cannot prove a remote process has crashed. Replay both
+cases, plus old records without birth-time metadata and finished records. Also replay acceptance
+with empty status and run stores: labels alone still do not schedule work (#5439/#5443). The
+persisted accepting run must hold admission before the job's first running-status write. Missing
+or pruned run evidence remains the explicit label-only boundary, rather than an invented accept.
+A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
+admission must also read the exact combined comment emitted by verdict carry: gate markers,
+the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
+carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts. An operator's
+later `clear-human` ceremony on the same head releases findings handed over at the round cap;
+an ordinary accept, restamp alone, superseded clearance or ruling before the finding does not.
+Preserve a proven ruling through chains of identical-contribution carries. Both paginated comment
+reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a thread above
+Node's default 1 MiB using a real child process, retaining the complete thread and clearance stamp.
+Queue removal probes must observe `isInMergeQueue=false` after `dequeuePullRequest`, and replay the gate and
+drain backstop to verify one mutation and one reason comment. Include a PR missing `ready-to-merge`
+from the unfiltered open listing, without a durable follow-up entry. Discover membership once per
+sweep through the shared batched merge-queue reader before revalidating any individual PR. Assert
+one discovery call and zero per-PR reads for 150 non-queued rows, for each send-back label shape;
+mixed listings must revalidate only queued rows. Failed or incomplete discovery (including more
+than 100 entries) skips the sweep and retries next pass, without an expensive per-row fallback.
+Manual queue entries also follow the existing label policy; membership alone never authorizes a
+dequeue without fresh labels. Table-test every gate outcome: only `sent-back` invokes removal;
+`round-cap` stays operator-owned under the current ruling. Both safeguards resolve through
+the `drain` policy cascade and default on; test off switches without using the host's live GitHub IO.
+
 Queue enqueue tests must distinguish mutation responses from membership reads: a returned entry is
 followed by GraphQL `isInMergeQueue` plus the judged head. The installed `gh pr view --json` does not
 expose `isInMergeQueue`; use `readMergeQueueState`, not an invented CLI field. GraphQL errors (including
@@ -1220,6 +1294,30 @@ membership, with trusted live comments plus the shared follow-up state's `cleara
 Failure counts/backoff live in that same state file; preserve them during follow-up writes. Exercise false
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
+
+### Builder cap and prepare cooldown
+
+`build.maxOpenPrsCounts` defaults to `builder`; `all` restores the earlier open-PR
+population. The policy cascade logs the effective value and source. Builder provenance
+is an explicit `lane/<card><optional-attempt>-build-*` or `lane/<card><optional-attempt>-prepare-*` ref (including hash identities)
+or the mechanical delivery wrapper's body signature. A generic lane ref, fixer, or
+Codex author does not prove ownership. The REST producer and normalized planner input
+must preserve `body`; the producer-contract test pins that path. Existing card-only
+and accepted exclusions still apply; scope and freeze-label guards inspect every PR.
+
+Before finalizing prepare picks, inspect the actual planned picks using
+`recentMergedPrepare`, shared with `prepareLaunchRefusal`. Add recent merges to the
+planner's prepare exclusions and re-plan the same tick so the next candidate gets the
+slot. Inspect selected group members before finalizing groups, refilling groups after
+cooldown skips. Share the same lookahead budget between leads and members; never scan
+the entire grouping pool. Bound it to eight distinct cards (at most 24 listing calls), leaving
+the shared tick budget available for launch guards. Log the elapsed minutes and PR number.
+Picks outside that window still pass the final launch guard. Replay a merge 20 minutes
+ago with one slot and a clean second candidate; include grouped members, hash aliases,
+guard-off, and older merges in the touched suites. Use the production reader in a tick
+with more than 50 held cards and late-ordered picks; assert the picks launch without
+listing-budget refusals. Also cover consecutive merged picks and group members beyond
+the lookahead limit, with uninspected replacements still passing final launch admission.
 
 ### Build dispatch launch lifetime and prepare discovery
 
@@ -1274,6 +1372,20 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+## Referral re-checks on the live head
+
+`review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
+`scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
+Historical referrals persist a `recheck` provenance marker and go through the existing mandatory review against the pinned live net diff;
+changed or unavailable citations require re-check, never an inherited block. The reviewer must
+check the condition asserted in the finding, including function replacements, resolved settings
+and completed card splits or negative controls. Unchanged citation bytes alone do not prove a defect.
+Auto-policy respects authenticated operator and counted reviewer not-real decisions across heads,
+including exact claim copies with an empty or `(no file)` citation. Only proven changes at the
+original citation permit another automatic block; unavailable comparison evidence refuses the write.
+An interrupted re-check stays review-owned; auto-policy cannot replace its missing reviewer answer.
+This protection is narrower than gate clearance: a policy skip never accepts a PR.
+
 ## False-finding coroner pass
 
 `coroner-false-findings.mjs` reads PRs updated in the window (including older and closed PRs),
@@ -1296,3 +1408,16 @@ false-findings / total-findings percentages without a matching denominator.
 For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
 coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
 separate shadow count and read completeness.
+
+### Review seat timing
+
+Review-pr run records retain `seatTimings` per attempt: seat, lens, provider, model,
+ISO `startedAt`/`finishedAt`, verdict and findingsCount. Parallel seats persist at launch
+and settlement, before declared-order reduction; retries retain separate start instants.
+Extra-seat groups share their model call's instants. The speculative red team retains its
+model call times through finish/discard, excluding sink wait and the subsequent re-check.
+A cancelled call has no observed finish. `node scripts/operations/review-seat-timing.mjs`
+reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR` overrides
+it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
+excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
+Legacy runs without seat observations are omitted; absent times are never reconstructed.

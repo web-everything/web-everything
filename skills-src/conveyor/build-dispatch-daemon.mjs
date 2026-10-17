@@ -31,7 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
-import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
+import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
@@ -507,7 +508,55 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
-  const out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
+  let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  const planningSkips = [];
+  // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
+  const planningSkipDetail = new Map();
+  // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
+  // three synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
+  // bound this lookahead (including selected group members below) to 24 calls; picks beyond that window still
+  // pass the ordinary fail-closed launch guard.
+  const inspectedPrepares = new Set();
+  const inspectPrepareCooldown = async candidate => {
+    const num = normNum(candidate.num);
+    if (typeof effects.listPreparePrs !== 'function' || inspectedPrepares.has(num) || inspectedPrepares.size >= 8) return;
+    inspectedPrepares.add(num);
+    try {
+      const bornAs = candidate.bornAs ?? out?.decisions?.admission?.queue?.find(r => normNum(r.num) === num)?.bornAs
+        ?? (await effects.readPreparedStamp?.({ num }))?.bornAs;
+      const prs = await effects.listPreparePrs({ num, bornAs });
+      const now = effects.now?.() ?? Date.now();
+      const merged = recentMergedPrepare({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      if (!merged) return;
+      const reason = `skipped in planning: prepared ${merged.minutesAgo} min ago (#${merged.pr.number})`;
+      // Persist what the launch guard would: its PR precedence (an open prepare PR outranks the merge, so the
+      // refusal probe still reads it) and reason. Claims, runs and parks stay the launch guard's own checks.
+      const refusal = prepareLaunchRefusal({ num, bornAs, prs, now, mergedGuardHours: preparePolicy.mergedGuardHours });
+      const refusingPr = Number(/prepare PR #(\d+)/.exec(refusal?.reason ?? '')?.[1]);
+      const matched = prs.find(pr => pr?.number === refusingPr) ?? merged.pr;
+      // Read the scope-drift hold from the plan that offered this card: a replan with it held may drop the hold.
+      const scopeHold = (out?.decisions?.admission?.held ?? []).find(h => normNum(h.num) === num
+        && h.reason === 'prepare-stale' && h.detail?.startsWith('scope changed since '));
+      const note = matched.state === 'MERGED' && scopeHold
+        ? `scope moved after prepare: ${scopeHold.detail}; build step must reconcile scope` : null;
+      planningSkips.push({ num, reason, ...(note ? { note } : {}) });
+      planningSkipDetail.set(num, { reason: refusal.reason, pr: matched.number, head: matched.headRefName ?? null,
+        ...(note ? { note } : {}), ...(bornAs ? { bornAs } : {}) });
+      console.error(`build-dispatch-daemon: prepare #${num} ${reason}${note ? ` · ${note}` : ''}`);
+    } catch { /* The launch guard still fails closed on an unreadable listing. */ }
+  };
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const decisions = out?.decisions ?? {};
+    const candidates = (decisions.spawnPrepareItems ?? decisions.itemPrepareSpawns ?? [])
+      .filter(row => !inspectedPrepares.has(normNum(row.num))).slice(0, 8 - inspectedPrepares.size);
+    if (!candidates.length) break;
+    const previousSkips = planningSkips.length;
+    for (const candidate of candidates) await inspectPrepareCooldown(candidate);
+    if (planningSkips.length === previousSkips) break;
+    tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
+    out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
+  }
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
@@ -935,7 +984,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
-  const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
+  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
   const settledPrepares = new Map();
   for (const row of allSettledPrepares) {
     if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
@@ -951,7 +1000,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
-  const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
@@ -959,6 +1007,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
@@ -1243,7 +1292,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
-    && !refusalHeldNums.has(normNum(num))
+    && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
@@ -1260,7 +1309,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       } catch { /* An unknown prepare route cannot own grouped members. */ }
     }
   }
-  const prepareGroupPlan = planBuildGroups({
+  const planPrepareGroups = () => planBuildGroups({
     picks: prepareGroupPicks,
     pool: [...groupRowsByNum.values()].filter(r => needsPrepare.has(normNum(r.num))
       && !otherPrepareHolds.has(normNum(r.num)) && prepareAvailable(r.num)),
@@ -1268,6 +1317,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     settings: { ...groupingSettings, groupSmallFindings: groupingSettings.groupSmallFindings
       && groupingCardsLoaded && groupingSettings.groupPrepare === 'per-group' }, exclude: groupDropped,
   });
+  let prepareGroupPlan = planPrepareGroups();
+  // Group members are actual launch candidates too. Inspect only selected members, sharing the lead lookahead
+  // budget, and rebuild after skips so a guarded member cannot crowd a clean replacement out of the group.
+  while (typeof effects.listPreparePrs === 'function' && inspectedPrepares.size < 8) {
+    const members = prepareGroupPlan.groups.flatMap(g => g.members)
+      .filter(num => !inspectedPrepares.has(normNum(num))).slice(0, 8 - inspectedPrepares.size);
+    if (!members.length) break;
+    const previousSkips = planningSkips.length;
+    for (const num of members) await inspectPrepareCooldown(groupRowsByNum.get(normNum(num)) ?? { num });
+    if (planningSkips.length === previousSkips) break;
+    prepareGroupPlan = planPrepareGroups();
+  }
   prepare.groups = prepareGroupPlan.groups;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
@@ -1427,11 +1488,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       groupDropped: [...groupDropped].slice(-200),
       itemPrepareAttempts,
       prepareRefusals: [
-        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched].some(x => normNum(x.num) === normNum(r.num))
+        ...freshRefusals.filter(r => ![...prepare.refused, ...prepare.launched, ...planningSkips].some(x => normNum(x.num) === normNum(r.num))
           && !finishedPrepares.has(normNum(r.num)))
           .map(r => probedRefusals.has(normNum(r.num)) ? { ...r, probed: true } : r),
         ...prepare.refused.map(r => ({ num: r.num, reason: r.reason, at: new Date(tickNowMs).toISOString(),
           ...refusalDetail.get(normNum(r.num)) })),
+        // A planning skip is a merged-prepare refusal decided earlier: persist it (and its scope note) the same way.
+        ...planningSkips.filter(r => !finishedPrepares.has(r.num))
+          .map(r => ({ num: r.num, at: new Date(tickNowMs).toISOString(), ...planningSkipDetail.get(r.num) })),
       ].slice(-200),
       prepareRecoveryPins: [...recoveryPins.values()].filter(p => !completedPrepares.has(normNum(p.num))).slice(-200),
       prepareGuards: (out?.nextState?.prepareGuards ?? []).filter((g) => !finishedPrepares.has(normNum(g.num))),
@@ -2646,6 +2710,7 @@ export function policyFrom(flags, env = process.env) {
   const n = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
   return {
     ...BUILD_DISPATCH_POLICY,
+    ...readBuilderPrCapSettings({ env }),
     maxConcurrentBuilds: n(flags['max-concurrent'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT, BUILD_DISPATCH_POLICY.maxConcurrentBuilds),
     maxConcurrentExternalBuilds: n(flags['max-concurrent-external'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL, BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds),
     maxOpenPrs: n(flags['max-open-prs'], BUILD_DISPATCH_POLICY.maxOpenPrs),
@@ -2779,7 +2844,7 @@ async function dryRun(flags) {
     timings: { ...timer.snapshot(), tickCore: tick.timings.tickCore },
     statusLine: tick.statusLine,
     policy: {
-      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenItems: policy.maxOpenItems,
+      maxConcurrentBuilds: policy.maxConcurrentBuilds, maxConcurrentExternalBuilds: policy.maxConcurrentExternalBuilds, maxOpenPrs: policy.maxOpenPrs, maxOpenPrsCounts: policy.maxOpenPrsCounts, maxOpenPrsCountsSource: policy.maxOpenPrsCountsSource, maxOpenItems: policy.maxOpenItems,
       // #3383 continuation, live incident 2026-09-28 — `globalFreezeLabels` is what actually freezes every
       // candidate now; the three per-PR `*-stalled` labels only hold a scope-overlapping build (`freezeLabels`
       // still lists all four for anything reading the historical shape, kept alongside, not replaced).

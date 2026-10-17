@@ -40,13 +40,14 @@ export function readPrsFromFile(path, { readFile = readFileSync } = {}) {
 // `defaultFetchOpenPrs` directly, once per constellation repo, every tick (`DEFAULT_INTERVAL_MS`): the widest,
 // 13-field GraphQL query above, paying its full nested-resolver cost (mergeable, statusCheckRollup, comments, …)
 // even though `build-dispatch-policy.mjs#normalizeOpenPrs`/`#prDeliversNum` — its ONLY consumers of the result —
-// read exactly `number`, `headRefName`, `labels`, `files` (paths only); `isDraft` is read by NEITHER (checked:
+// originally read only `number`, `headRefName`, `labels`, `files` (paths only);
+// `body` now preserves mechanical build launch provenance for the builder-only PR cap; `isDraft` is read by NEITHER (checked:
 // `build-dispatch-policy.mjs` has no `isDraft`/`.draft` reference at all), included below anyway because the
 // REST list endpoint gives it for free. Measured live 2026-09-29: this ONE caller was the top GraphQL spender —
 // 121 calls/3h at ~50 points/call (`gh-spend.mjs report --by=caller+op`), well over half the shared GraphQL
 // bucket that hour. `BUILD_DISPATCH_PR_FIELDS` is the caller-read field list this REST path is held to; a
 // consumer that starts reading a new field must widen it here first (or read a field this path never sends).
-export const BUILD_DISPATCH_PR_FIELDS = Object.freeze(['number', 'headRefName', 'labels', 'files', 'isDraft']);
+export const BUILD_DISPATCH_PR_FIELDS = Object.freeze(['number', 'headRefName', 'body', 'labels', 'files', 'isDraft']);
 
 /**
  * One REST `pulls` LIST item + its (separately-fetched) `files` page, in the shape `build-dispatch-policy.mjs`
@@ -61,6 +62,7 @@ export function restPullToBuildDispatchShape(p, files = []) {
   return {
     number: p.number,
     headRefName: p.head?.ref ?? '',
+    body: p.body ?? '',
     labels: (p.labels || []).map((l) => ({ name: (typeof l === 'string' ? l : l?.name) ?? '' })).filter((l) => l.name),
     isDraft: !!p.draft,
     files: (files || []).map((f) => ({ path: f?.filename ?? '' })).filter((f) => f.path),
