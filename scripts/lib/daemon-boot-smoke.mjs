@@ -202,10 +202,13 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
 /** Each failed entry gets an equal share of the detail budget (its first and newest lines), so the redaction
  *  backstop's 16 KB cap never drops a later entry's name or signal. */
 const BOOT_DETAIL_BUDGET = 12_000;
-/** The first 8 KB of a child's own error text, cut at a line end so redaction never sees half a line. */
+/** The first 8 KB of a child's own error text, cut back to a line end when it has one (a single line is kept). */
 function boundHead(text) {
   const raw = String(text);
-  return raw.length > 8_000 ? raw.slice(0, 8_000).replace(/\n?[^\n]*$/, '') : raw;
+  if (raw.length <= 8_000) return raw;
+  const head = raw.slice(0, 8_000);
+  const nl = head.lastIndexOf('\n');
+  return nl > 0 ? head.slice(0, nl) : head;
 }
 function budgetedError(error, budget) {
   const text = String(error ?? '');

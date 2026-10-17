@@ -32,7 +32,7 @@ export function redactSecrets(text) {
   const normalised = String(text ?? '').replace(LINE_BREAKS, '\n').replace(CONTROLS, '')
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '<redacted private key>')
     // A key whose BEGIN line was cut off upstream: its base64 body lines up to the orphaned END line.
-    .replace(/(?:^[A-Za-z0-9+/=]{16,}\n)*-----END [A-Z ]*PRIVATE KEY-----/gm, '<redacted private key>');
+    .replace(/(?:^[A-Za-z0-9+/=]{16,}\n){0,64}-----END [A-Z ]*PRIVATE KEY-----/gm, '<redacted private key>');
   return normalised.split('\n').map((raw) => {
     const line = redactLine(raw.length > MAX_LINE * 4 ? raw.slice(0, MAX_LINE * 4) : raw);
     return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE - 1)}…` : line;
@@ -45,7 +45,12 @@ export function redactSecrets(text) {
  */
 export function redactedTail(text, lines = 30) {
   let raw = String(text ?? '');
-  if (raw.length > 64 * 1024) raw = raw.slice(-64 * 1024).replace(/^[^\n]*\n?/, '');
+  if (raw.length > 64 * 1024) {
+    raw = raw.slice(-64 * 1024);
+    // Drop the partial first line only when a line break exists; a window with none is kept whole.
+    const br = raw.search(/[\r\n]/);
+    if (br >= 0) raw = raw.slice(br + 1);
+  }
   return redactSecrets(raw).trimEnd().split('\n').slice(-lines).join('\n');
 }
 

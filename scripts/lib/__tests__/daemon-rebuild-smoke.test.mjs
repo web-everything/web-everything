@@ -159,6 +159,9 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expect(cut).not.toContain('MIIEvQ');
     const crs = redactedTail(Array.from({ length: 30 }, () => 'p\r'.repeat(500)).join('\n'));
     expect(crs.split('\n')).toHaveLength(30);
+    // A 64 KiB window with no newline is kept, not emptied.
+    expect(redactedTail(`${'progress\r'.repeat(10_000)}FATAL: native abort`)).toContain('FATAL: native abort');
+    expect(redactedTail(`${'x'.repeat(70_000)}FATAL`)).toHaveLength(500);
     const t0 = Date.now();
     redactedTail(Array.from({ length: 200 }, () => 'token'.repeat(400)).join('\n'), 200);
     expect(Date.now() - t0).toBeLessThan(2_000);

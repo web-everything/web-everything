@@ -209,6 +209,14 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.detail).toContain('1/'); // only the one broken entry, not every entry
   });
 
+  it('keeps the head of a single-line child error over 8 KB, redacted', async () => {
+    const error = `ReferenceError: boom ghp_secretAAAA ${'e'.repeat(9_000)}`;
+    const r = await checkDaemonEntriesBoot(ctx(async () => JSON.stringify({ ok: false, error })));
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('ReferenceError: boom');
+    expect(r.detail).not.toContain('ghp_secretAAAA');
+  });
+
   it('fails on unparsable child output rather than silently passing', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => 'not json'));
     expect(r.ok).toBe(false);
