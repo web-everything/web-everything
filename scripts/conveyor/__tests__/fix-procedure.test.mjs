@@ -23,7 +23,7 @@ import {
   fixBegin, fixEnd, withAltBranchHint, repoKeyFromRemoteUrl, repoKeyForCheckout, DEFAULT_FIX_CLAIM_TTL_MINUTES,
   FIX_BEGIN_MARKER, FIX_END_MARKER, FIXING_LABEL, STOOD_DOWN_LABEL, parseGitPush, resolvePushDestination,
   fixBeginRefusalMessage, refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
-  isInfraStallCompletion,
+  isInfraStallCompletion, handClaimedPushToCi,
 } from '../fix-procedure.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../../lib/ruling-ledger.mjs';
 import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
@@ -614,6 +614,43 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     expect(pushes).toEqual([{ repo: 'web-everything/web-everything', pr: 2811, head: newHead }]);
     expect(labels.log).toContainEqual(['set', { add: 'checking', remove: ['ci:failed'] }]);
     expect(labels.log).toContainEqual(['set', { add: 'status:awaiting-ci', remove: ['status:ci-red'] }]);
+  });
+
+  it.each([
+    ['failure', 'FAILURE', ['ci:failed', 'status:ci-red', 'status:fixing']],
+    ['success', 'SUCCESS', ['status:awaiting-review', 'status:fixing']],
+  ])('fix-end preserves completed CI state on the pushed head (%s)', async (_name, conclusion, present) => {
+    const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40);
+    expect(acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', branch: BRANCH, headSha: oldHead, lockRoot: root }).ok).toBe(true);
+    const labels = fakeLabels();
+    const pushes = [];
+    const rollup = [{ __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion }];
+    const result = await fixEnd({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', lockRoot: root,
+      gh: async () => JSON.stringify({ headRefOid: newHead, labels: present.map(name => ({ name })), statusCheckRollup: rollup }),
+      labels, readCompletion: async () => null, recordPush: push => pushes.push(push) });
+    expect(result.steps).toContain('ci-settled');
+    expect(result.steps).not.toContain('awaiting-ci');
+    expect(pushes).toHaveLength(1);
+    const sets = labels.log.filter(([k]) => k === 'set').map(([, spec]) => spec);
+    expect(sets).toContainEqual({ remove: ['status:fixing'] });
+    expect(sets.some(s => s.add === 'checking' || s.add === 'status:awaiting-ci')).toBe(false);
+    expect(sets.flatMap(s => s.remove ?? [])).not.toEqual(expect.arrayContaining(['ci:failed']));
+    expect(sets.flatMap(s => s.remove ?? []).filter(l => ['status:ci-red', 'status:awaiting-review'].includes(l))).toEqual([]);
+  });
+
+  it('push hands the claimed head to CI best-effort: a gh failure after the push is reported, never thrown', () => {
+    const claim = { meta: { branch: 'lane/x', pr: 41 } };
+    const logs = [];
+    const marked = [];
+    const ok = handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x', src: 'HEAD' },
+      { listClaims: () => [claim], revParse: () => 'c'.repeat(40), mark: p => { marked.push(p); return true; } });
+    expect(ok).toBe('awaiting-ci');
+    expect(marked).toEqual([{ repo: 'web-everything/web-everything', pr: 41, head: 'c'.repeat(40) }]);
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x' },
+      { listClaims: () => [claim], revParse: () => 'c'.repeat(40), mark: () => { throw new Error('gh label create: HTTP 502'); }, log: l => logs.push(l) })).toBe('failed');
+    expect(logs).toEqual([expect.stringContaining('CI hand-off failed (the missing-CI watch retries): gh label create: HTTP 502')]);
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/x' }, { listClaims: () => { throw new Error('lock root unreadable'); }, log: l => logs.push(l) })).toBe('failed');
+    expect(handClaimedPushToCi({ repoKey: 'we', branch: 'lane/other' }, { listClaims: () => [claim] })).toBe('no-claim');
   });
 
   it('fix-begin DEFAULT (operator ruling 2026-09-27, draft-only-on-withdrawal): claim → NO draft → fixing label (stood-down removed) → marker; token-bound for a session-less caller; fix-end never relies on draft-first promotion', async () => {

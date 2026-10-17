@@ -52,6 +52,26 @@ it('retains the push record and stops before editing when label creation fails',
   expect(recorded).toEqual([push]);
   expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create']]);
 });
+it('a same-head retry after CI finished keeps the CI verdict and drops only fixer state', () => {
+  const calls = [];
+  const rollup = [
+    { __typename: 'CheckRun', name: 'unit', status: 'IN_PROGRESS' },
+    { __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { __typename: 'StatusContext', context: 'soak', state: 'SUCCESS' },
+  ];
+  const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', statusCheckRollup: rollup, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }, { name: 'status:fixing' }] }); };
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(false);
+  expect(calls.map(a => a.slice(0, 2))).toEqual([['pr', 'view'], ['pr', 'edit']]);
+  expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'status:fixing']);
+});
+it('ciSettledOnHead: empty or any still-running check is not settled', async () => {
+  const { ciSettledOnHead } = await import('../fix-push-ci.mjs');
+  expect(ciSettledOnHead(undefined)).toBe(false);
+  expect(ciSettledOnHead([])).toBe(false);
+  expect(ciSettledOnHead([{ __typename: 'CheckRun', name: 'a', status: 'COMPLETED', conclusion: 'SUCCESS' }, { __typename: 'CheckRun', name: 'b', status: 'QUEUED' }])).toBe(false);
+  expect(ciSettledOnHead([{ __typename: 'StatusContext', context: 'c', state: 'PENDING' }])).toBe(false);
+  expect(ciSettledOnHead([{ __typename: 'CheckRun', name: 'a', status: 'COMPLETED', conclusion: 'FAILURE' }, { __typename: 'StatusContext', context: 'c', state: 'ERROR' }])).toBe(true);
+});
 it('resolves missing-CI timing per leaf through the cascade', () => {
   const out = resolveHandoffSettings('fix', { tool: { ciMissingAfterPushMin: 12 }, platform: { ciMissingAfterPushMin: 15, sendBackReservedSlots: 2 }, env: {} });
   expect(out.value).toEqual({ ciMissingAfterPushMin: 12, sendBackReservedSlots: 2 });

@@ -534,7 +534,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels']).toContain(args[args.indexOf('--json') + 1]);
+        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels,statusCheckRollup']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
       }
@@ -1192,6 +1192,24 @@ describe('runFixCli', () => {
     expect(flat.some((c) => c.includes(`git ${HARDENED_GIT_ARGS.join(' ')} push --no-verify origin HEAD:refs/heads/lane/7-x`) && !c.includes('force'))).toBe(true);
     expect(flat.some((c) => c.includes('rearm-review.mjs 7 --repo=o/r'))).toBe(true);
     expect(flat.at(-1)).toContain('lane-pool.mjs release');
+  });
+  it('still re-arms after the push when the CI label step fails (best-effort hand-off)', async () => {
+    const m = mk(['aaa', 'bbb']);
+    const base = m.run.getMockImplementation();
+    const writeErr = vi.fn();
+    const run = vi.fn((cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'label') { m.calls.push([cmd, ...args]); throw new Error('HTTP 403: rate limit'); }
+      if (cmd === 'gh' && args.includes('headRefOid,labels,statusCheckRollup')) { m.calls.push([cmd, ...args]); return JSON.stringify({ headRefOid: 'bbb', labels: [] }); }
+      return base(cmd, args, opts);
+    });
+    const { code, result } = await runFixCli(argv, { ...m.io, run, writeErr });
+    expect(code).toBe(0);
+    expect(result).toMatch(/re-armed/);
+    const flat = m.calls.map((c) => c.join(' '));
+    expect(flat.some((c) => c.startsWith('gh label create'))).toBe(true);
+    expect(flat.some((c) => c.includes('rearm-review.mjs 7 --repo=o/r'))).toBe(true);
+    expect(m.owed.sha).toBe(null);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('CI hand-off failed, re-arming anyway: HTTP 403: rate limit'));
   });
   it('no commit: no push, no re-arm, lane still released', async () => {
     const m = mk(['aaa', 'aaa']);

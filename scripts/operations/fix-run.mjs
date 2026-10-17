@@ -626,7 +626,9 @@ export async function runFixCli(argv = [], {
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     const rearm = head => {
-      markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush });
+      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the missing-CI watch repairs it).
+      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
+      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
       } catch (e) {
