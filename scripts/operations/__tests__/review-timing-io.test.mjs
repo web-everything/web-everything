@@ -9,6 +9,7 @@ import { readPr, createReviewPrSinks } from '../review-pr-io.mjs';
 import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../../lib/review-label-provider.mjs';
 const head = 'a'.repeat(40);
 it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red and cancellation is enabled', async effect => {
   const runNode = vi.fn(); const postComment = vi.fn();
@@ -136,6 +137,9 @@ it('requires a full review when a confirmed post-accept red-team break is still 
   }
   // A bounce the prior-head review already superseded does not block the delta.
   expect(readDeltaFixture(prior => [redTeamBounce('2026-10-17T09:00:00Z'), acceptAt(prior, '2026-10-17T10:00:00Z')]).deltaReview).not.toBeNull();
+  // A thread at the gh comment page cap may hide the newest bounce: full review.
+  const filler = Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, () => ({ author: { login: 'someone' }, body: 'note' }));
+  expect(readDeltaFixture(prior => [acceptAt(prior, '2026-10-17T10:00:00Z'), ...filler]).deltaReview).toBeNull();
 });
 
 it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {

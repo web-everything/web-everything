@@ -1,7 +1,7 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
-import { repoKeyForSlug } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 // fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
@@ -13,9 +13,18 @@ const checkNames = v => Array.isArray(v) && v.length > 0 && v.every(n => typeof 
 /** A repo's fast checks (repo key or slug). An array applies to every repo; null means "use its required checks". */
 export function fastChecksFor(fastChecks, repo) {
   if (Array.isArray(fastChecks)) return checkNames(fastChecks) ? fastChecks : null;
-  const key = repoKeyForSlug(repo);
-  const named = fastChecks && typeof fastChecks === 'object' && key ? fastChecks[key] : null;
+  const key = repoKeyForSlug(String(repo ?? '').trim().toLowerCase());
+  const named = fastChecks && typeof fastChecks === 'object' && key ? normalizeFastChecks(fastChecks)[key] : null;
   return checkNames(named) ? named : null;
+}
+/**
+ * One settings layer's fastChecks as a map keyed by repo KEY, so layers merge per repo in the cascade: a list becomes
+ * the same list for every constellation repo, and slug keys become repo keys. Anything else is returned unchanged.
+ */
+export function normalizeFastChecks(v) {
+  if (Array.isArray(v)) return checkNames(v) ? Object.fromEntries(Object.keys(CONSTELLATION_REPOS).map(key => [key, v])) : v;
+  if (!v || typeof v !== 'object') return v;
+  return Object.fromEntries(Object.entries(v).map(([k, names]) => [repoKeyForSlug(String(k).trim().toLowerCase()) ?? k, names]));
 }
 /** Is this a valid fastChecks setting: a non-empty name list, or a map of repo key → non-empty name list? */
 export const validFastChecks = v => checkNames(v) || (!!v && typeof v === 'object' && !Array.isArray(v)

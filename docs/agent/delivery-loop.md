@@ -383,7 +383,10 @@ Operator policy (2026-10-16): review overlaps CI. `review.startAfter` defaults t
 `fast-checks`; `review.fastChecks` is keyed by repo and defaults to `standards`
 and `test-shard (1)` for WE only. Only WE's CI publishes those names, so a repo
 without an entry (FrontierUI, Plateau App) waits on its own required checks, as
-`ci-green` does. A plain list instead applies to every repo.
+`ci-green` does. A plain list instead applies to every repo, so use it only for
+names every repo's CI publishes. Each layer is normalized to a repo-key map (slugs
+become keys) and the layers merge per repo, so a lower-layer list never overrides
+a higher layer's entry for one repo.
 The independent standards CI job lets these finish before the aggregate gate.
 Card-only changes publish a green shard receipt for their intentionally empty unit
 scope, so skipped tests cannot strand review.
@@ -405,7 +408,8 @@ A changed head gets a delta review when additions plus deletions are at most
 `review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3). Binary or
 unreadable deltas get full review. So does a head with a verdict newer than the
 prior head's review (a post-accept red-team bounce carries no reviewed-head
-marker, so a delta would drop its findings). Jurors judge the delta and its prior findings;
+marker, so a delta would drop its findings), and a thread at the 100-comment read
+cap, where that verdict may be cut off. Jurors judge the delta and its prior findings;
 the full contribution basis remains pinned for acceptance and roster checks.
 `review.skipDrainMechanical` (default true) enables existing proven numbering and
 identical-contribution carry writers. Commit subjects alone never prove a carry:
@@ -429,7 +433,8 @@ dispatching and no reviewer is live, CI healing starts immediately.
 Timing settings resolve per leaf through standard defaults, platform `review` /
 `fix` preferences, tool settings (`scripts/review-settings.json` and the `fix`
 block in `scripts/settings/fix.json`), then environment. Environment names are
-`WE_REVIEW_START_AFTER`, `WE_REVIEW_FAST_CHECKS` (JSON array),
+`WE_REVIEW_START_AFTER`, `WE_REVIEW_FAST_CHECKS` (JSON object keyed by repo, e.g.
+`{"we":["standards"]}`, replacing the whole map; a JSON array applies to every repo),
 `WE_REVIEW_CANCEL_ON_CI_RED`, `WE_REVIEW_DELTA_MAX_LINES`,
 `WE_REVIEW_DELTA_MAX_FILES`, `WE_REVIEW_SKIP_DRAIN_MECHANICAL`,
 `WE_FIX_JOIN_CI_AND_REVIEW`, and `WE_FIX_JOIN_WAIT_MAX_MIN`. Invalid values leave

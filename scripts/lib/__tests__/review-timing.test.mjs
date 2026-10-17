@@ -28,13 +28,21 @@ describe('parallel review start and void', () => {
     // An explicit list still applies to every repo.
     expect(fastChecksFor(['lint'], 'frontierui')).toEqual(['lint']);
   });
-  it('accepts only a name list or a map of known repo keys to name lists', () => {
+  it('accepts only a name list or a map of known repos to name lists', () => {
     const resolve = value => resolveTimingPolicy({ env: { WE_REVIEW_FAST_CHECKS: JSON.stringify(value) }, read: () => '{}', review: {}, fix: {},
       platformReview: {}, platformFix: {}, log: () => {} }).review.fastChecks;
     expect(resolve({ frontierui: ['test'] })).toEqual({ frontierui: ['test'] });
-    expect(resolve(['lint'])).toEqual(['lint']);
-    for (const bad of [{ nope: ['x'] }, { we: [] }, {}, [], { 'web-everything/web-everything': ['standards'] }])
-      expect(resolve(bad)).toEqual(review.fastChecks);
+    expect(resolve({ 'Web-Everything/Web-Everything': ['standards'] })).toEqual({ we: ['standards'] });
+    expect(resolve(['lint'])).toEqual({ we: ['lint'], frontierui: ['lint'], 'plateau-app': ['lint'] });
+    for (const bad of [{ nope: ['x'] }, { we: [] }, {}, []]) expect(resolve(bad)).toEqual(review.fastChecks);
+  });
+  it('merges fastChecks per repo across layers, so a lower-layer list never overrides a higher-layer repo entry', () => {
+    const resolve = (platform, tool) => resolveTimingPolicy({ env: {}, read: () => '{}', fix: {}, platformFix: {}, log: () => {},
+      platformReview: { fastChecks: platform }, review: { fastChecks: tool } }).review.fastChecks;
+    const merged = resolve(['lint'], { we: ['x'] });
+    expect([fastChecksFor(merged, 'we'), fastChecksFor(merged, 'frontierui')]).toEqual([['x'], ['lint']]);
+    const kept = resolve(['lint'], { 'frontier-ui/frontierui': ['test'] });
+    expect([fastChecksFor(kept, 'web-everything/web-everything'), fastChecksFor(kept, 'frontierui')]).toEqual([['lint'], ['test']]);
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
     const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };

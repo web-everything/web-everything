@@ -509,9 +509,11 @@ const CHANGES_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes re
 /**
  * Is a review verdict newer than the prior head's own review still outstanding? A post-accept red-team bounce (or any
  * changes / advisory verdict) carries no reviewed-head marker for `priorHead`, so a delta review would drop its
- * findings and the unchanged code they cite. Unreadable chronology counts as outstanding. Pure.
+ * findings and the unchanged code they cite. Unreadable chronology, or a thread at the `gh pr view` comment page cap
+ * (the newest bounce may be cut off), counts as outstanding. Pure.
  */
 export function outstandingVerdictSince(comments, priorHead) {
+  if (Array.isArray(comments) && comments.length >= PR_COMMENTS_PAGE_SIZE) return true;
   const trusted = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string');
   const tied = c => reviewedHeadsOf(c).includes(priorHead);
   const others = trusted.filter(c => !tied(c) && (isReviewVerdictComment(c) || CHANGES_HEADING_RE.test(c.body)));
