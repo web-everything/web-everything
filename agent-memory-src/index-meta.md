@@ -96,5 +96,6 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - 150. Hold New Cards While Busy — host busy or PR queue not draining: collect cards in cards-to-file.md, file in one lane+PR when quiet; blocking issues filed+fixed now
 - [Operator session is portable](operator-session-portable.md) — sweeps, needs-you watch and quiet rules must survive a session or account switch: bootstrap from product files (card 359), operator-queue from a fresh lane
 - [Orchestrator stays responsive, uses light agents](feedback-orchestrator-responsive-light-agents.md) — no long blocking foreground commands; research goes to background Haiku/Sonnet agents, fixes go to Codex; Opus decides
+- [Improve the fixer, don't bypass it](feedback-improve-fixer-not-bypass.md) — no direct Codex passes on conveyor PRs; operator decisions/scope baseline/main-regression become binding fixer input
 - [Prefer Codex workers, keep one Claude review](prefer-codex-keep-one-claude-review.md) — Claude quota is binding: unblock via Codex workers (codex-direct-task), Codex-first routing for fixers/builders; reviews keep ≥1 Claude seat
 - [AI subscription plans](reference-ai-subscription-plans.md) — 2× Claude 20x, 1× Google Ultra 20x, 1× Codex 500; Gemini only where it adds most value (high-care PRs, long context), daily cap
