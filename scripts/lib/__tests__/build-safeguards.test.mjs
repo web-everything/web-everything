@@ -1,10 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveBuildPolicy, renderBuildRequirements } from '../build-policy.mjs';
-import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes, reviewBuildDiff } from '../build-self-review.mjs';
-import { buildCodexPrompt, buildCodexDirectTaskArgv, runCodexDirectExec, runGate, codexDirectTask } from '../../codex-direct-task.mjs';
+import { resolveBuildPolicy, renderBuildRequirements, appendBuildRequirements } from '../build-policy.mjs';
+import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, SELF_REVIEW_DIFF_ARGS } from '../build-self-review.mjs';
+import { buildCodexPrompt, buildCodexDirectTaskArgv, runCodexDirectExec, runGate, codexDirectTask, captureDiff, cliExitCode } from '../../codex-direct-task.mjs';
+import { readFixBriefTemplate } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { readCiHealBriefTemplate } from '../../operations/ci-heal-pr-dispatch.mjs';
 import * as codexTasks from '../../codex-direct-task.mjs';
 import { renderWorkerBrief } from '../../worker-brief.mjs';
 
@@ -140,6 +144,125 @@ describe('production self-review adapter', () => {
       expect(result).toMatchObject({ rounds: 1, incomplete: true });
       expect(task).toHaveBeenCalledOnce(); expect(fix).toHaveBeenCalledOnce(); expect(gate).toHaveBeenCalledOnce();
     } finally { task.mockRestore(); }
+  });
+
+  it.each([
+    ['a fenced verdict', '```json\n{"findings":["a.mjs:1 defect"]}\n```', ['a.mjs:1 defect']],
+    ['a verdict after a leading sentence', 'Here is the result:\n{"findings":[]}', []],
+  ])('accepts %s', async (_name, lastMessage, expected) => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
+    try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).resolves.toEqual(expected); }
+    finally { task.mockRestore(); }
+  });
+
+  it.each([
+    ['prose without a verdict', 'Looks fine to me.'],
+    ['two verdicts', '{"findings":[]}\n{"findings":["x"]}'],
+    ['an unexpected key', '{"findings":[],"clear":true}'],
+    ['an array', '[]'],
+  ])('rejects %s', async (_name, lastMessage) => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage });
+    try { await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow(); }
+    finally { task.mockRestore(); }
+  });
+
+  it('publishes the incomplete-review note when the diff overflows the bounded read', async () => {
+    const overflow = () => { throw Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' }); };
+    const review = vi.fn(); const fix = vi.fn(); const gate = vi.fn();
+    const result = await runBuildSelfReview({ policy: resolve(), readDiff: () => boundedSelfReviewDiff(overflow), review, fix, gate });
+    expect(result).toMatchObject({ rounds: 0, incomplete: true });
+    expect(renderSelfReviewNotes(result)).toContain('human review');
+    expect(review).not.toHaveBeenCalled();
+    const broken = () => { throw Object.assign(new Error('fatal: bad revision'), { code: 128 }); };
+    await expect(runBuildSelfReview({ policy: resolve(), readDiff: () => boundedSelfReviewDiff(broken), review, fix, gate }))
+      .rejects.toThrow('self-review unavailable');
+  });
+});
+
+describe('self-review notes in the PR body', () => {
+  const render = notes => renderSelfReviewNotes({ rounds: 2, notes });
+  it('quotes every line and leaves no live link, image, reference, closing keyword or mention', () => {
+    const body = render(['Fixes #123 and closes web-everything/web-everything#9 GH-7',
+      '![x](https://attacker.example/p.png) [click](https://attacker.example)\n# heading\n- item @operator']);
+    const quoted = body.slice(body.indexOf('\n\n> ') + 2).trimEnd().split('\n');
+    for (const line of quoted) expect(line.startsWith('> ')).toBe(true);
+    expect(body.replace(/&#\d+;/g, '')).not.toMatch(/#\d/); // an entity renders as its character, never `#`
+    expect(body).toContain('&#33;&#91;x&#93;(https://attacker.example/p.png)');
+    expect(body).not.toMatch(/GH-\d/i);
+    expect(body).not.toContain('![');
+    expect(body).not.toContain('](');
+    expect(body).not.toContain('@operator');
+    expect(body).toContain('attacker.example');
+  });
+});
+
+describe('self-review diff reads', () => {
+  const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+  function plantedRepo() {
+    const dir = mkdtempSync(join(tmpdir(), 'self-review-diff-'));
+    git(dir, ['init', '-q']);
+    git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'base']);
+    const start = git(dir, ['rev-parse', 'HEAD']).trim();
+    const ran = join(dir, 'planted-ran');
+    const planted = `${process.execPath} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${ran}`;
+    git(dir, ['config', 'diff.external', planted]);
+    git(dir, ['config', 'diff.evil.textconv', planted]);
+    git(dir, ['config', 'core.fsmonitor', planted]);
+    writeFileSync(join(dir, '.gitattributes'), '*.txt diff=evil\n');
+    writeFileSync(join(dir, 'a.txt'), 'change\n');
+    git(dir, ['add', '.']);
+    git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'change']);
+    writeFileSync(join(dir, 'a.txt'), 'worktree change\n');
+    return { dir, start, ran };
+  }
+
+  it('never runs a builder-planted external diff, textconv or fsmonitor command', () => {
+    const { dir, start, ran } = plantedRepo();
+    try {
+      const diff = git(dir, [...SELF_REVIEW_DIFF_ARGS, `${start}...HEAD`, '--']);
+      expect(diff).toContain('+change');
+      const captured = captureDiff({ dir, startSha: start });
+      expect(captured.diff).toContain('+worktree change');
+      expect(captured.diffStat).toContain('a.txt');
+      expect(existsSync(ran)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('brief composers carry the checklist exactly once', () => {
+  const heading = '# Reviewer expectations';
+  const count = text => text.split(heading).length - 1;
+  it('appends once, and composing an already-composed brief does not repeat it', () => {
+    const policy = resolve();
+    const once = appendBuildRequirements('brief', { policy });
+    expect(count(once)).toBe(1);
+    expect(appendBuildRequirements(once, { policy })).toBe(once);
+    const off = resolve({ tool: { finalGate: 'none', selfReview: { enabled: false }, reviewerExpectations: { enabled: false } } });
+    expect(appendBuildRequirements('brief', { policy: off })).toBe('brief');
+  });
+  it('the fix and ci-heal dispatchers compose their real templates with the checklist once', () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+    expect(count(readFixBriefTemplate(root))).toBe(1);
+    expect(count(readCiHealBriefTemplate(root))).toBe(1);
+  });
+});
+
+describe('Codex callers keep their exit contract', () => {
+  const report = (o = {}) => ({ exitCode: 0, timedOut: false, gate: { pass: true }, ...o });
+  it('a --json report exits 0 and carries the result; text mode exits 1 on a failed run or red gate', () => {
+    expect(cliExitCode(report({ gate: { pass: false } }), { json: true })).toBe(0);
+    expect(cliExitCode(report({ exitCode: 2 }), { json: true })).toBe(0);
+    expect(cliExitCode(report({ gate: { pass: false } }), { json: false })).toBe(1);
+    expect(cliExitCode(report({ timedOut: true }), { json: false })).toBe(1);
+    expect(cliExitCode(report(), { json: false })).toBe(0);
+  });
+  it('a caller can opt out of the self-review explicitly, including an ephemeral builder', async () => {
+    const selfReviewFn = vi.fn();
+    const spawnFn = vi.fn();
+    await expect(codexDirectTask({ task: 'change', dir: '.', ephemeral: true, selfReview: false,
+      env: { WE_BUILD_SELF_REVIEW_ENABLED: 'true' }, spawnFn, selfReviewFn, log: () => {},
+      execFn: () => { throw new Error('stop after policy'); } })).rejects.toThrow('stop after policy');
+    expect(selfReviewFn).not.toHaveBeenCalled();
   });
 });
 

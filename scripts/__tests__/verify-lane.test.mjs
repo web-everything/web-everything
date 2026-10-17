@@ -1730,4 +1730,22 @@ describe('full build gate default', () => {
     expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
     expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
   });
+
+  // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
+  it.each([
+    ['full', true], ['related', false], ['none', false],
+  ])('finalGate=%s runs the whole unit tier only when full', (finalGate, wholeUnit) => {
+    const scripts = {
+      'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+    };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+    const explicit = spawnSync('node', [VERIFY_LANE, 'run', '--json', '--gate=npm run check:standards'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(explicit.status, explicit.stderr).toBe(0);
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
+  });
 });

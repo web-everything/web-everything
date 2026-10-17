@@ -1560,6 +1560,26 @@ all turns and the latest final message. **uses full by default and resumes the o
 within the cap** defends the production wiring, and **builds fresh and resumed argv with identical
 routed configuration and directory grants** pins configuration parity.
 
+The delivery wrapper's publication guarantees are defended where it publishes: **opens no PR and
+settles a failure when the self-review is unavailable** / **…when the repair gate is red**. A diff
+that overflows the bounded read gets the same incomplete-review note as an oversized one (**publishes
+the incomplete note when the net diff overflows the bounded read, and reads it hardened**). The
+builder can write its lane's git config, so every self-review diff read disables external diff
+drivers, textconv and fsmonitor (**never runs a builder-planted external diff, textconv or
+fsmonitor command**). The reviewer verdict may be bare, in one fenced block, or after a lead-in;
+anything else is invalid. Notes reach the PR body as quoted inert text: no links, images, issue
+references or mentions.
+
+`finalGate` changes the default of every `verify-lane.mjs` mode, including `request` and the
+dispatched verify child, so a lane's marker means the same gate however it was requested. Only
+`full` replaces the default selection; an explicit `--gate` always wins (**finalGate=%s runs the
+whole unit tier only when full**). Every builder and fixer brief composes the checklist through
+`appendBuildRequirements`, which appends it once and never to a brief that already has it (**brief
+composers carry the checklist exactly once**). Codex callers opt out of self-review with
+`--no-self-review` (or `selfReview: false`). With `--json`, a completed run exits 0 and the report
+carries its result, so machine callers keep their contract; text mode exits 1 on a failed run or red
+gate.
+
 ### Review seat timing
 
 Review-pr run records retain `seatTimings` per attempt: seat, lens, provider, model,

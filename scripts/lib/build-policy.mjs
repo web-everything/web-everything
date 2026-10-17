@@ -40,3 +40,10 @@ export function renderBuildRequirements({ policy = resolveBuildPolicy(), selfRev
   if (selfReview && policy.selfReview.enabled) blocks.push(`This configured self-check replaces earlier pre-PR converge/self-review instructions while enabled. After the gate is green and before opening a PR, run one cheap correctness and security self-review on the net diff. Return findings to the same builder for at most ${policy.selfReview.maxRounds} repair rounds. Re-run the gate after edits. Never loop beyond the cap; open the PR with remaining notes in its body. The mechanical wrapper owns this step when present.`);
   return blocks.join('\n\n');
 }
+
+/** The one composer every brief uses: appends the requirements once, and never to a brief that already has them. */
+export function appendBuildRequirements(text, options) {
+  const requirements = renderBuildRequirements(options);
+  if (!requirements || String(text).includes(requirements)) return text;
+  return `${text}\n\n${requirements}`;
+}

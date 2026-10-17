@@ -82,13 +82,18 @@
  * related|standards|full (default full), --ephemeral, --no-stream (still logs to file, just not to stdout too),
  * --log=<path> (default: alongside the target dir), --wire-origin-to-remote (#3782 — opt-in; a fresh scratch
  * clone's `origin` otherwise stays at the local repoRoot path, non-push-capable, with the real remote only
- * PRINTED for a human to wire up by hand), --json (machine-readable final report on stdout).
+ * PRINTED for a human to wire up by hand), --json (machine-readable final report on stdout), --no-self-review
+ * (skip the build.selfReview check for this run; also what an --ephemeral builder needs).
+ *
+ * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
+ * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
+ * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
  */
 
 import { randomUUID } from 'node:crypto';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
-import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
-import { runBuildSelfReview, renderSelfReviewNotes } from './lib/build-self-review.mjs';
+import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
+import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff } from './lib/build-self-review.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
@@ -254,7 +259,7 @@ export function buildCodexPrompt(task, { review = false, policy = resolveBuildPo
   // "make the change directly" suffix that would contradict a read-only review brief.
   if (review) return `${task.trim()}\n\n---\n\n${REVIEW_MODE_SUFFIX}`;
   return (
-    `${task.trim()}\n\n---\n\n`
+    appendBuildRequirements(`${task.trim()}\n\n---\n\n`
     + 'Make the change directly by editing files in this working directory. When you are done, STOP — do '
     + 'not run `git commit`, do not run `git push`, and do not open a pull request. A human will review the '
     + 'diff and decide what to do with it.\n\n'
@@ -262,7 +267,7 @@ export function buildCodexPrompt(task, { review = false, policy = resolveBuildPo
     + 'Run tests ONLY through the host heavy-run queue: `node scripts/readiness/heavy-admission.mjs run -- npx '
     + 'vitest run <test-file>` (or `npm run test:unit -- <test-file>`, `npm run check:standards`). Never run a '
     + 'bare `npx vitest`, `npm test`, or `node scripts/check-standards.mjs` — they skip the queue and overload the host.'
-    + '\n\n' + renderBuildRequirements({ policy, selfReview: false })
+    , { policy, selfReview: false })
     + (policy.selfReview.enabled ? `\n\nThe launcher owns the capped pre-review check (${policy.selfReview.maxRounds} repair rounds); do not start a second self-review loop.` : '')
   );
 }
@@ -587,14 +592,16 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
   if (typeof dir !== 'string' || !dir.trim()) throw new TypeError('codex-direct-task: `dir` must be a non-empty path');
   if (typeof startSha !== 'string' || !startSha.trim()) throw new TypeError('codex-direct-task: `startSha` must be a non-empty sha');
 
-  const status = execFn('git', ['-C', dir, 'status', '--porcelain', '-z']);
+  // Codex can write this checkout's git config, so these reads run no fsmonitor, external diff or textconv command.
+  const git = (args) => execFn('git', ['-C', dir, '-c', 'core.fsmonitor=false', ...args]);
+  const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
   if (untracked.length) {
-    try { execFn('git', ['-C', dir, 'add', '--intent-to-add', '--', ...untracked]); } catch { /* best-effort */ }
+    try { git(['add', '--intent-to-add', '--', ...untracked]); } catch { /* best-effort */ }
   }
-  const diff = execFn('git', ['-C', dir, 'diff', startSha]);
-  const diffStat = execFn('git', ['-C', dir, 'diff', '--stat', startSha]);
-  const commitsRaw = execFn('git', ['-C', dir, 'log', '--oneline', `${startSha}..HEAD`]);
+  const diff = git(['diff', '--no-ext-diff', '--no-textconv', startSha]);
+  const diffStat = git(['diff', '--no-ext-diff', '--no-textconv', '--stat', startSha]);
+  const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
   return { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
 }
@@ -817,6 +824,7 @@ export async function codexDirectTask({
   mkTempDir = (prefix) => mkdtempSync(prefix),
   existsFn = existsSync,
   selfReviewFn,
+  selfReview: selfReviewEnabled,
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
 } = {}) {
@@ -826,10 +834,16 @@ export async function codexDirectTask({
 
   const policy = resolveBuildPolicy({ env });
   if (gate !== undefined) { policy.finalGate = gate; policy.sources.finalGate = 'argument'; }
+  // A caller class that has its own downstream review (or must stay ephemeral) opts out explicitly.
+  if (selfReviewEnabled !== undefined) {
+    if (typeof selfReviewEnabled !== 'boolean') throw new TypeError('codex-direct-task: `selfReview` must be a boolean');
+    policy.selfReview = { ...policy.selfReview, enabled: selfReviewEnabled };
+    policy.sources['selfReview.enabled'] = 'argument';
+  }
   (log ?? (line => console.error(line)))(formatCascadeSourcesLine('build', { value: policy, sources: policy.sources }));
   gate ??= review ? 'none' : policy.finalGate;
   if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
-  if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires build.selfReview.enabled=false: a repair must resume the original builder');
+  if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires self-review off (--no-self-review or build.selfReview.enabled=false): a repair must resume the original builder');
   const briefPolicy = { ...policy, finalGate: gate };
   let targetDir = dir;
   let scratch = null;
@@ -872,7 +886,7 @@ export async function codexDirectTask({
   let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env });
   const selfReview = !review && run.code === 0 && !run.timedOut && gateResult.pass ? await runBuildSelfReview({
     policy, dir: targetDir, env, ...(selfReviewFn ? { review: selfReviewFn } : {}),
-    readDiff: () => captureDiff({ dir: targetDir, startSha, execFn }).diff,
+    readDiff: () => boundedSelfReviewDiff(() => captureDiff({ dir: targetDir, startSha, execFn }).diff),
     fix: async prompt => {
       if (!summary.threadId) throw new Error('self-review requires the original builder session');
       const fixed = await withCodexUsage({ model, effort, taskKind: 'fix', caller, repo, pr, card, cwd: targetDir },
@@ -948,6 +962,12 @@ export async function codexDirectTask({
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
+/** Process exit status for a completed run; see the file header's "Exit status". PURE. */
+export function cliExitCode(report, { json = false } = {}) {
+  if (json) return 0;
+  return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
+}
+
 function parseFlags(argv) {
   const flags = {};
   for (const a of argv) {
@@ -970,7 +990,7 @@ async function main() {
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--json]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json]\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
       + '  --task-kind defaults to worker (review with --review). Model AND effort follow codex.modelByTask; '
@@ -1014,6 +1034,7 @@ async function main() {
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
+      ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });
   } catch (e) {
     console.error(`codex-direct-task: ${e.message}`);
@@ -1021,7 +1042,7 @@ async function main() {
     return;
   }
 
-  if (report.exitCode !== 0 || report.timedOut || !report.gate.pass) process.exitCode = 1;
+  process.exitCode = cliExitCode(report, { json: Boolean(flags.json) });
   if (flags.json) {
     console.log(JSON.stringify(report, null, 2));
   } else {

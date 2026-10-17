@@ -1,8 +1,24 @@
 /** Bounded pre-review check. No publication and no GitHub calls. */
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
-const MAX_DIFF_BYTES = 512 * 1024;
+export const SELF_REVIEW_MAX_DIFF_BYTES = 512 * 1024;
+const TOO_LARGE = 'Self-review incomplete: net diff exceeds the 512 KiB limit. No review verdict was obtained for this diff; human review of the full diff is required.';
 class SelfReviewDiffTooLargeError extends Error {}
+
+/**
+ * git argv prefix for reading a builder's diff in the caller's own process. The builder can write the lane's
+ * `.git/config` and `.gitattributes`, so external diff drivers, textconv filters and fsmonitor stay off.
+ */
+export const SELF_REVIEW_DIFF_ARGS = ['-c', 'core.fsmonitor=false', '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-color'];
+
+/** Run a diff read; an overflowing read buffer is the known size bound, not an unavailable review. */
+export function boundedSelfReviewDiff(read) {
+  try { return read(); }
+  catch (error) {
+    if (error?.code === 'ENOBUFS') throw new SelfReviewDiffTooLargeError(TOO_LARGE);
+    throw error;
+  }
+}
 
 export async function selfReviewPrompt(diff) {
   const { buildMandate } = await import('./review-core.mjs');
@@ -12,15 +28,27 @@ export async function selfReviewPrompt(diff) {
     FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n');
 }
 
+/** One verdict object: bare, inside one fenced block, or after a lead-in sentence. Anything else is invalid. */
+export function parseSelfReviewVerdict(message) {
+  const text = String(message ?? '').trim();
+  const fenced = /^```(?:json)?[ \t]*\n([\s\S]*?)\n```$/.exec(text);
+  const body = fenced ? fenced[1].trim() : text.slice(text.indexOf('{'));
+  const parsed = JSON.parse(body);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'findings') {
+    throw new Error('invalid self-review verdict');
+  }
+  return parsed;
+}
+
 export async function reviewBuildDiff({ dir, diff, env = process.env }) {
   if (typeof diff !== 'string') throw new Error('self-review net diff is unavailable');
-  if (Buffer.byteLength(diff) > MAX_DIFF_BYTES) throw new SelfReviewDiffTooLargeError('Self-review incomplete: net diff exceeds the 512 KiB limit. No review verdict was obtained for this diff; human review of the full diff is required.');
+  if (Buffer.byteLength(diff) > SELF_REVIEW_MAX_DIFF_BYTES) throw new SelfReviewDiffTooLargeError(TOO_LARGE);
   if (!diff.trim()) return [];
   const { codexDirectTask } = await import('../codex-direct-task.mjs');
   const report = await codexDirectTask({ dir, task: await selfReviewPrompt(diff), review: true, gate: 'none',
     taskKind: 'review', effort: 'low', ephemeral: true, stream: false, env });
   if (report.exitCode !== 0 || report.timedOut) throw new Error('self-review process failed');
-  const parsed = JSON.parse(report.lastMessage);
+  const parsed = parseSelfReviewVerdict(report.lastMessage);
   if (!Array.isArray(parsed.findings) || parsed.findings.some(f => typeof f !== 'string' || !f.trim()) || parsed.findings.length > 100) throw new Error('invalid self-review findings');
   return parsed.findings;
 }
@@ -49,9 +77,16 @@ export async function runBuildSelfReview({ policy, readDiff, review = reviewBuil
   }
 }
 
-/** Quote model notes for PR prose; no model-authored markers, terminal controls or mentions. */
+/**
+ * Quote model notes for PR prose as inert text: no model-authored markers, terminal controls, mentions,
+ * issue references (closing keywords act on them), links or images. Every line stays inside the quote.
+ */
 export function renderSelfReviewNotes(result) {
   if (!result?.notes?.length) return '';
-  const safe = result.notes.join('\n').slice(0, 16000).replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/[<>&@`]/g, c => `&#${c.charCodeAt(0)};`);
-  return `\n\nPre-review notes remaining after ${result.rounds} repair round(s):\n\n> ${safe}\n`;
+  const safe = result.notes.join('\n').slice(0, 16000)
+    .replace(/[^\P{Cc}\n]|\p{Cf}/gu, ' ')
+    // References and mentions first: the entities below contain `#`.
+    .replace(/@/g, '＠').replace(/#/g, '＃').replace(/\b(GH)-(?=\d)/gi, '$1‐')
+    .replace(/[<>&`[\]!\\*_|]/g, c => `&#${c.charCodeAt(0)};`);
+  return `\n\nPre-review notes remaining after ${result.rounds} repair round(s):\n\n${safe.split('\n').map(line => `> ${line}`).join('\n')}\n`;
 }

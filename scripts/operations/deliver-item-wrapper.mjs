@@ -93,8 +93,10 @@
  *      remains the DEFAULT (see `DEFAULT_DELIVERY_AGENT_PROVIDER_NAME`); Codex is opt-in by name, and the
  *      operator chose to build it ahead of `#3581`'s ratified reviewer-first sequencing gate knowingly.
  */
-import { resolveBuildPolicy, renderBuildRequirements } from '../lib/build-policy.mjs';
-import { runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff } from '../lib/build-self-review.mjs';
+import { resolveBuildPolicy, appendBuildRequirements } from '../lib/build-policy.mjs';
+import {
+  runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, SELF_REVIEW_DIFF_ARGS, SELF_REVIEW_MAX_DIFF_BYTES,
+} from '../lib/build-self-review.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
@@ -603,11 +605,13 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     const buildPolicy = resolveBuildPolicy({ log: line => console.error(line) });
     const selfReview = await runBuildSelfReview({
       policy: buildPolicy, dir: gate.lanePath,
-      readDiff: () => run('git', ['--no-replace-objects', 'diff', 'origin/main...HEAD', '--'], { cwd: gate.lanePath, maxBuffer: 64 * 1024 * 1024 }),
+      // Hardened and bounded: the builder controls this lane's git config, and an overflow is the size note.
+      readDiff: () => boundedSelfReviewDiff(() => run('git', [...SELF_REVIEW_DIFF_ARGS, 'origin/main...HEAD', '--'],
+        { cwd: gate.lanePath, maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
       review: reviewBuild,
       fix: async prompt => {
         const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
-          prompt: prompt + '\n' + renderBuildRequirements({ policy: buildPolicy, selfReview: false }),
+          prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
           lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
         const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
           : tryReadDeliveryReport(sessionSlug, resolveDeliveryReportsDir(gate.lanePath));
@@ -1619,7 +1623,7 @@ export async function runAgentToCompletion(
     resume = false,
   },
   {
-    readBrief = () => readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8') + '\n\n' + renderBuildRequirements({ selfReview: false }),
+    readBrief = () => appendBuildRequirements(readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'), { selfReview: false }),
     readReport = tryReadDeliveryReport,
     resolveLane = resolveLanePath,
     resolveReportsDir = resolveDeliveryReportsDir,
@@ -1833,6 +1837,21 @@ async function resumeAgentWithGateFailure({
   // files in $LANE are correct"; `runGateWithOneRetry` commits this resumed turn's fix itself, the same
   // wrapper-owned way it already commits the original build (see `commitBuildTurn`'s own header for why —
   // this is the #3565 Codex sandbox finding applied as a structural fix, not a sandbox carve-out).
+  const prompt = gateFailureResumePrompt({ failureOutput, gateOutcome });
+  // BUG-5 FIX: both `sessionId` and `resumeSessionId` are `claudeSessionId` — the real UUID minted once in
+  // `deliverItem` and reused by the fresh spawn — never `sessionSlug`. `--resume <id>` must name the SAME CLI
+  // session the fresh spawn created, and that id must itself be a UUID (CLI-enforced).
+  // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
+  // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
+  // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
+  return provider.spawn({
+    sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
+    lanePathOverride,
+  }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
+}
+
+/** The resumed turn's prompt after a red or unrun gate (`resumeAgentWithGateFailure`), with the build requirements once. */
+export function gateFailureResumePrompt({ failureOutput, gateOutcome = 'fail' }) {
   const prompt = gateOutcome === 'unrun'
     ? `The verification gate could not RUN for your commit in $LANE (this looks like a wrapper/environment `
       + `problem, not necessarily a problem in your own diff):\n\n${failureOutput}\n\nIf you can see something `
@@ -1842,16 +1861,7 @@ async function resumeAgentWithGateFailure({
       + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
     : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
       + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
-  // BUG-5 FIX: both `sessionId` and `resumeSessionId` are `claudeSessionId` — the real UUID minted once in
-  // `deliverItem` and reused by the fresh spawn — never `sessionSlug`. `--resume <id>` must name the SAME CLI
-  // session the fresh spawn created, and that id must itself be a UUID (CLI-enforced).
-  // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
-  // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
-  // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
-  return provider.spawn({
-    sessionId: claudeSessionId, prompt: prompt + '\n\n' + renderBuildRequirements({ selfReview: false }), resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
-    lanePathOverride,
-  }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
+  return appendBuildRequirements(prompt, { selfReview: false });
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the
