@@ -1544,6 +1544,36 @@ it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are sho
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
 
+### Ledger open-head observations
+
+`ledger-observation.mjs` is the shared entry for review, drain and PR-event consumers. It records an open
+head before the writer's own judgment. `ledger.firstSeenRows` and `ledger.headMoveInvalidation` default to
+true through the policy cascade; effective values and sources are logged. A first-seen row imports existing
+review holds and records the observed label state, but an acceptance label alone cannot manufacture a
+content-witnessed clearance. `node scripts/operations/ledger-backfill.mjs --dry-run` counts missing rows for
+all open PRs (paginated); omit `--dry-run` to append through the normal ledger writer and lock.
+
+`head-moved` is a holding verdict at the new head and ends implicit approval scope. A `carried` verdict
+requires the previous live acceptance to name the immediately preceding head, plus an existing numbering,
+exact root-tree identity, or identical-net-patch proof; `fromHead` and `carryRule` retain the witness.
+Observation preconditions are rechecked inside the home append lock and each transport retry, so a delayed
+baseline cannot overwrite a review or a delayed head observation overwrite a newer one. Feed events re-read
+GitHub's live head because delivered events and drain list snapshots may describe an older head. The bare
+event waker defaults to a no-op observer; the production wrapper opts into ledger observation explicitly.
+Completed reviews witness their own pinned head even if observation writes are disabled or missed;
+delayed verdicts for superseded heads remain history and do not clear outstanding holds. A later explicit
+live transition can return to an earlier head. Once a head is witnessed, a hold with no head or a
+superseded head (for example a drain park built from an old list snapshot) still applies without moving
+the witnessed head, while such a clear stays history.
+Reconciliation requires a full 40-hex reviewed SHA and normalizes case before checking for an existing
+verdict. A missing review base appends nothing: the reconcile effect prints a loud `ledger-write-skip`
+line and completes, so it is not retried on every resume. A malformed base is refused before append. A
+live head must never be substituted for a missing review witness.
+Regression coverage includes the four observation-setting combinations, late transition/completion order,
+stale drain snapshots, reconciliation replay, and first-seen/head-moved/carried transport retry races.
+Unreadable ledgers are write misses,
+never empty ledgers. These records do not change the authority rollout setting.
+
 ## Review scratch disk retention
 
 Review seats use independent shallow pinned checkouts: a released lane's objects cannot be

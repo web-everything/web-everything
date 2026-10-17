@@ -57,7 +57,7 @@ import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
-import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictBears, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
@@ -1412,9 +1412,9 @@ export function createReviewPrSinks({
     // missed, and it APPENDS — a second row for one verdict in an append-only authority, which nothing can
     // undo. Verdict comparison fails the other way: its one ambiguity is a verdict that legitimately REPEATS
     // (a second `accepted` after a re-review), where the sink treats the earlier identical row as this
-    // round's and writes nothing. That costs a duplicate history row saying what the ledger already says —
-    // `current`, `clears` and `outstandingHolds` are all unchanged by its absence, so no consumer, present or
-    // Phase-2, computes a different answer. An under-write of a redundant row against an unrecoverable
+    // round's and writes nothing. That usually costs only a duplicate history row saying what the ledger already
+    // says. The one exception fails closed: a later hold on a superseded or missing head (which the fold applies)
+    // stays current until a fresh row lands, so the PR stays held, never released. An under-write of a redundant row against an unrecoverable
     // double-write of a real one is not a close call.
     //
     // The DECLARATION is unchanged (`we:scripts/operations/review-pr.mjs` still declares
@@ -1426,14 +1426,30 @@ export function createReviewPrSinks({
       // builder refuses, so say so as a refusal rather than recording a guessed disposition.
       const verdict = verdictForLabelTarget(payload.to);
       if (!verdict) throw notApplied(`verdict-ledger: unknown label target ${JSON.stringify(payload.to)}`);
+      // An unpinned or degraded read names no head to key the row on. A headless row could not be found again
+      // on replay, and a refusal would fail this effect on every resume. So skip loudly, as LEDGER_EVENTS does.
+      if (payload.headSha == null) {
+        out(`ledger-write-skip: ${payload.repo}#${pr} no pinned review head, so no reconcile row was recorded for this run; the label write is unaffected`);
+        return { reconciled: false, skipped: 'unpinned-head', path: verdictLedgerPath(payload.repo) };
+      }
+      // A head that is present but not a commit SHA is a pinning bug upstream: refuse it, never skip it quietly.
+      if (typeof payload.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(payload.headSha)) {
+        throw notApplied('verdict-ledger: a pinned 40-hex review head is required');
+      }
+      const headSha = payload.headSha.toLowerCase();
+      // This is the reviewed head, possibly from a delayed effect, not a live lifecycle observation.
+      // The label writer observes the live PR; the reconciliation row witnesses only its own review.
       const folded = foldRepo(payload.repo).get(pr);
-      if (folded && folded.current && folded.current.verdict === verdict) {
+      // A delayed completion can remain historical. Its replay must still find that write rather than
+      // appending a new timestamped row forever. Within a head, compare the latest bearing verdict.
+      const existing = folded?.history.findLast(row => verdictBears(row.verdict) && row.coverage?.headSha === headSha);
+      if (existing?.verdict === verdict) {
         return {
           reconciled: true,
           path: verdictLedgerPath(payload.repo),
-          verdict: folded.current.verdict,
-          at: folded.current.at,
-          source: folded.current.source,
+          verdict: existing.verdict,
+          at: existing.at,
+          source: existing.source,
         };
       }
       const appended = appendVerdict(buildVerdictRecord({
@@ -1446,6 +1462,7 @@ export function createReviewPrSinks({
         session: currentActorId(),
         channel: payload.channel || '',
         source: 'operation-reconcile',
+        headSha,
         findingCount: Array.isArray(payload.findings) ? payload.findings.length : null,
       }));
       if (!appended.ok) throw notApplied(`verdict-ledger append refused: ${appended.errors.join('; ')}`);

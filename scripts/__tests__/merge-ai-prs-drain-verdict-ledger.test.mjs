@@ -148,6 +148,16 @@ describe('merge-ai-prs — #3215 recordDrainVerdict: the drain\'s own holds, led
 describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE the `gh` label call', () => {
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
 
+  it('observes a live PR head instead of the drain list snapshot', () => {
+    const start = src.indexOf('const readDrainLedger = await readDrainLedgerSnapshot');
+    const end = src.indexOf('for (const v of skipped)', start);
+    const observation = src.slice(start, end);
+    expect(start).toBeGreaterThan(0);
+    expect(observation).toContain('observeLiveLedgerHead({ repo: v.repo || localSlug, pr: v.num }');
+    expect(observation).toContain('observeLedgerHead(facts, { read: readDrainLedger })');
+    expect(observation).not.toMatch(/listedHeadSha|v\.headSha/);
+  });
+
   it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {
     expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(3);
     // PR #4631 (ruling a): the test-gaming site ledgers a `review:human` park, BEFORE its label add, and writes no row

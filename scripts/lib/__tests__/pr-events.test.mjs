@@ -4,7 +4,9 @@
  * safety-net interval while healthy, and the automatic fall-back to the base interval when the feed is stale or
  * unreachable (including mid-sleep).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { observeLedgerPrEvent } from '../ledger-observation.mjs';
+vi.mock('../ledger-observation.mjs', () => ({ observeLedgerPrEvent: vi.fn() }));
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +17,18 @@ import {
 
 const quiet = { error: () => {} };
 const MIN = 60_000;
+
+it('keeps a bare event waker free of ledger IO while the production wrapper opts in', async () => {
+  observeLedgerPrEvent.mockClear();
+  const event = { type: 'pull_request', repo: 'a/b', prs: [1], state: 'open' };
+  const poll = async () => ({ ok: true, cursor: 1, events: [event], more: false });
+  await createEventWaker({ role: 'review', poll }).pollOnce();
+  expect(observeLedgerPrEvent).not.toHaveBeenCalled();
+  const effects = withPrEvents({}, { role: 'review', poll, log: quiet, minWakeGapMs: 0,
+    env: { WE_PR_EVENTS: '1', WE_PR_EVENTS_URL: 'https://example.invalid', WE_PR_EVENTS_TOKEN: 'test', WE_PR_EVENTS_STATE_DIR: mkdtempSync(join(tmpdir(), 'pr-events-observe-')) } });
+  await effects.sleep(1);
+  expect(observeLedgerPrEvent).toHaveBeenCalledWith(event, 1);
+});
 
 describe('flag + config', () => {
   it('flag OFF returns the very same effects object', () => {

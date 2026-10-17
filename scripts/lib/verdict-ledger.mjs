@@ -134,6 +134,8 @@ export const VERDICT_LEDGER_KIND = 'we.review-verdict';
  * {@link NON_BEARING}.
  */
 export const VERDICTS = Object.freeze({
+  HEAD_MOVED: 'head-moved',    // prior head clearances invalidated
+  CARRIED: 'carried',          // proven acceptance at the new head; carryRule records the proof
   ACCEPTED: 'accepted',         // the reviewer accepted → clears
   CHANGES: 'changes',           // the reviewer bounced → holds
   PENDING: 'pending',           // parked, awaiting an independent review → holds
@@ -151,9 +153,9 @@ export const VERDICTS = Object.freeze({
 /** Verdicts in the closed set, as an array. */
 export const VERDICT_VALUES = Object.freeze(Object.values(VERDICTS));
 
-/** The three verdicts that CLEAR. Every other BEARING member of the closed set is a HOLD. A hold is only ever
+/** The verdicts that CLEAR. Every other BEARING member of the closed set is a HOLD. A hold is only ever
  *  ended by a LATER clearing record — never by removing a row, which this format makes impossible anyway. */
-const CLEARING = new Set([VERDICTS.ACCEPTED, VERDICTS.CLEAR_HUMAN, VERDICTS.RESTAMPED]);
+const CLEARING = new Set([VERDICTS.ACCEPTED, VERDICTS.CLEAR_HUMAN, VERDICTS.RESTAMPED, VERDICTS.CARRIED]);
 
 /**
  * THE NON-BEARING MEMBERS (#3329). A non-bearing row is written into `history` and is INVISIBLE to every
@@ -256,9 +258,11 @@ export function verdictLabel(verdict) {
     case VERDICTS.ACCEPTED:
     case VERDICTS.CLEAR_HUMAN:
     case VERDICTS.RESTAMPED:
+    case VERDICTS.CARRIED:
       return REVIEW_LABELS.accepted;
     case VERDICTS.CHANGES: return REVIEW_LABELS.changes;
     case VERDICTS.HUMAN: return REVIEW_LABELS.human;
+    case VERDICTS.HEAD_MOVED:
     case VERDICTS.PENDING: return REVIEW_LABELS.pending;
     // #3329 — EXPLICIT, not a fallthrough. A non-bearing row mirrors no label; see the doc above.
     case VERDICTS.OBSERVED: return null;
@@ -369,7 +373,7 @@ export function buildVerdictRecord({
   repo, pr, verdict, at, reason = '',
   headSha = null, reviewedDiff = null, reviewedContribution = null,
   declaredActor = '', session = '', channel = '', independence = null,
-  source, writer = '', findingCount = null, mode, wouldClear,
+  source, writer = '', findingCount = null, mode, wouldClear, fromHead = null, carryRule = null, state,
 } = {}) {
   if (typeof repo !== 'string' || !REPO_RE.test(repo)) {
     throw new TypeError(`verdict-ledger: \`repo\` must be <owner/name>, got ${JSON.stringify(repo)}`);
@@ -415,6 +419,9 @@ export function buildVerdictRecord({
     source: oneLine(source, 64),
     writer: oneLine(writer || processWriterId(), 128),
   };
+  if (fromHead) record.fromHead = shaOrNull(fromHead);
+  if (carryRule) record.carryRule = oneLine(carryRule, 100);
+  if (state) record.state = oneLine(state, 100);
   if (Number.isInteger(findingCount) && findingCount >= 0) record.findingCount = findingCount;
   if (mode !== undefined || wouldClear !== undefined) {
     if (mode !== 'shadow' || verdict !== VERDICTS.OBSERVED || typeof wouldClear !== 'boolean') {
@@ -449,6 +456,8 @@ export function validateVerdictRecord(raw) {
     || typeof raw.wouldClear !== 'boolean' || raw.applied !== false || raw.mutated !== false)) {
     errors.push('shadow predictions must be observed, with boolean wouldClear, applied: false and mutated: false');
   }
+  if (['head-moved', 'carried'].includes(raw.verdict) && (!shaOrNull(raw.fromHead) || !shaOrNull(raw.coverage?.headSha))) errors.push('head transition requires both heads');
+  if (raw.verdict === 'carried' && !['numbering-only', 'tree-identical', 'identical-net-patch'].includes(raw.carryRule)) errors.push('unknown carry rule');
   if (errors.length) return { valid: false, errors, record: null };
 
   const coverage = raw.coverage && typeof raw.coverage === 'object' ? raw.coverage : {};
@@ -479,6 +488,9 @@ export function validateVerdictRecord(raw) {
     source: typeof raw.source === 'string' ? raw.source : '',
     writer: typeof raw.writer === 'string' ? raw.writer : '',
   };
+  if (raw.fromHead) record.fromHead = shaOrNull(raw.fromHead);
+  if (raw.carryRule) record.carryRule = raw.carryRule;
+  if (raw.state) record.state = oneLine(raw.state, 100);
   if (Number.isInteger(raw.findingCount) && raw.findingCount >= 0) record.findingCount = raw.findingCount;
   if (raw.unlocked === true) record.unlocked = true;
   if (shadow) Object.assign(record, { mode: 'shadow', wouldClear: raw.wouldClear, applied: false, mutated: false });
@@ -756,6 +768,32 @@ export function ledgerEventId(row) {
   return `sha256:${createHash('sha256').update(JSON.stringify(canonical(record))).digest('hex')}`;
 }
 
+/** Latest witnessed head; late review-run/referral events do not rewind a lifecycle boundary. */
+export function observedLedgerHead(events) {
+  const pr = events.at(-1)?.pr;
+  const { byPr, witnessedHeads } = foldWithWitness(events);
+  return witnessedHeads.get(pr) || byPr.get(pr)?.current?.coverage?.headSha
+    || events.filter(e => e.source === 'first-seen').at(-1)?.coverage?.headSha
+    || events.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1)?.headSha
+    || events.map(e => e.headSha).filter(Boolean).at(-1);
+}
+
+/** Lifecycle observations are conditional at the locked/transport tip, never against a stale snapshot. */
+export function ledgerObservationApplies(row, existing) {
+  const mine = existing.filter(e => e.repo.toLowerCase() === row.repo.toLowerCase() && e.pr === row.pr);
+  if (row.source === 'first-seen') return mine.length === 0;
+  if (['head-moved', 'carried'].includes(row.verdict)) {
+    const head = observedLedgerHead(mine);
+    if (head !== row.fromHead) return false;
+    if (row.verdict === 'carried') {
+      const current = foldVerdictLedger(mine).get(row.pr)?.current;
+      return current?.clears === true && current.coverage?.headSha === row.fromHead;
+    }
+    return true;
+  }
+  return true;
+}
+
 /**
  * The store contract's pre-write check, shared by every adapter (card xsij7u6): `rows` is a non-empty array, every
  * row is valid AS GIVEN (a row's own identity is never repaired from `ctx.repo`), and every row belongs to the ONE
@@ -816,16 +854,20 @@ export function parseLedgerEvents(text) {
  *   only place a non-bearing row is visible, and it is where "a review happened" is read back from.
  * @property {VerdictRecord[]} outstandingHolds - BEARING holds appended after the last clearing record. Empty
  *   when the live verdict clears. This is the card's *"no unanswered hold may exist"* in its computed form.
+ * @property {VerdictRecord} [lastHeadMove] - latest applied invalidation; absent until a head move applies, preserving legacy fold output.
  */
 
 /**
  * THE FOLD (#3007). Replay the append-only stream into the current verdict per PR. PURE + total.
  *
- * THE ONLY RULE IS LATEST-WINS PER PR, and it is deliberately the whole rule:
+ * LATEST-WINS PER PR among bearing rows that have not been superseded by a witnessed head:
  *   • "a newer verdict supersedes an older one" → the last record for a PR is the live one;
  *   • "a hold is cleared by a later clearing record, never by deleting anything" → the clearing record is
  *     simply a later row, and there is no delete in this format to begin with.
- * Nothing is keyed on a content hash, so no rebase can make a row unreachable — see the file header.
+ * A fresh review witnesses its own head even when an observation append missed or was disabled.
+ * A delayed CLEAR for a previously superseded head, or with no head, remains history; such a HOLD still applies
+ * (fail closed) without moving the witnessed head. An explicit live transition
+ * can return to a previous head; a review completion alone cannot rewind to it.
  *
  * LATEST-WINS RUNS OVER THE **BEARING** ROWS ONLY (#3329), AND THIS IS WHERE NON-BEARING IS ENFORCED. An
  * `observed` row is pushed to `history` and then skipped: it never becomes `current`, never sets `clears`, and
@@ -839,29 +881,64 @@ export function parseLedgerEvents(text) {
  * @returns {Map<number, FoldedPr>} pr → state, in first-seen order.
  */
 export function foldVerdictLedger(records) {
+  return foldWithWitness(records).byPr;
+}
+
+/** The fold plus each PR's witnessed head, which a headless current hold does not carry on its own row. */
+function foldWithWitness(records) {
   /** @type {Map<number, FoldedPr>} */
   const byPr = new Map();
+  const witnessedHeads = new Map();
+  const supersededHeads = new Map();
+  const bearingByPr = new Map();
   for (const r of Array.isArray(records) ? records : []) {
     if (!r || !Number.isInteger(r.pr)) continue;
+    if (r.type !== undefined && r.type !== EVENT_TYPES.VERDICT) continue;
     let entry = byPr.get(r.pr);
     if (!entry) {
       entry = { pr: r.pr, repo: r.repo, current: null, clears: false, history: [], outstandingHolds: [] };
       byPr.set(r.pr, entry);
+      supersededHeads.set(r.pr, new Set());
+      bearingByPr.set(r.pr, []);
     }
     entry.history.push(r);
     entry.repo = r.repo;
+    const witnessed = witnessedHeads.get(r.pr);
+    const head = r.coverage?.headSha;
+    const superseded = supersededHeads.get(r.pr);
+    const transition = ['head-moved', 'carried'].includes(r.verdict);
+    // A late baseline never moves the witness; a hold it imported from the label still applies.
+    const lateFirstSeen = r.source === 'first-seen' && Boolean(witnessed);
+    if (lateFirstSeen && (r.clears || !verdictBears(r.verdict))) continue;
+    if (transition) {
+      // A review may already have witnessed the destination before this observation arrived.
+      if (witnessed && r.fromHead !== witnessed) continue;
+      if (r.fromHead) superseded.add(r.fromHead);
+      superseded.delete(head); // a live transition may deliberately return to an earlier head
+    }
+    // A headless or superseded-head HOLD still applies (fail closed): the drain's park writers may lack a head or
+    // name a stale snapshot head, and the label they set holds whatever head is live. Such a CLEAR stays history:
+    // it cannot vouch for the witnessed head. Neither moves the witness.
+    const offWitness = lateFirstSeen || (!transition && witnessed && (!head || superseded.has(head)));
+    if (offWitness && r.clears) continue;
+    if (head && !offWitness && (verdictBears(r.verdict) || r.source === 'first-seen')) {
+      if (witnessed && witnessed !== head) superseded.add(witnessed);
+      witnessedHeads.set(r.pr, head);
+    }
     // #3329 — the non-bearing skip. `history` above is the ONLY thing an `observed` row touches.
     if (!verdictBears(r.verdict)) continue;
+    if (r.verdict === 'head-moved') entry.lastHeadMove = r;
+    bearingByPr.get(r.pr).push(r);
     entry.current = r;
     entry.clears = r.clears;
   }
   for (const entry of byPr.values()) {
-    const bearing = entry.history.filter((r) => verdictBears(r.verdict));
+    const bearing = bearingByPr.get(entry.pr);
     let lastClearAt = -1;
     bearing.forEach((r, i) => { if (r.clears) lastClearAt = i; });
     entry.outstandingHolds = bearing.slice(lastClearAt + 1).filter((r) => !r.clears);
   }
-  return byPr;
+  return { byPr, witnessedHeads };
 }
 
 /**
@@ -1529,7 +1606,8 @@ function appendVerdictHome(record, { appendFile = appendFileSync } = {}) {
     let existing;
     try { existing = readFileSync(path, 'utf8'); }
     catch (e) { if (e?.code !== 'ENOENT') throw e; existing = ''; }
-    if (parseLedgerEvents(existing).some((row) => ledgerEventId(row) === normalized.id)) {
+    const prior = parseLedgerEvents(existing);
+    if (!ledgerObservationApplies(normalized, prior) || prior.some((row) => ledgerEventId(row) === normalized.id)) {
       return { ok: true, path, record: normalized, locked, errors: [], duplicate: true };
     }
     mkdirSync(dirname(path), { recursive: true });

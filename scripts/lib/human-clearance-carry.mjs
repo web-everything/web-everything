@@ -196,6 +196,17 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
   return { carry: true, fromSha: clearance.sha.toLowerCase(), toSha: h, fingerprint: match.fingerprint, actor: clearance.actor, tier: match.tier };
 }
 
+/** Shared exact root-tree proof, including every blob, path and mode. Missing output never equals a tree. */
+export function proveIdenticalHeadTrees({ exec, cwd, fromSha, toSha } = {}) {
+  try {
+    if (![fromSha, toSha].every(sha => /^[0-9a-f]{40}$/i.test(sha ?? ''))) return { ok: false };
+    const tree = sha => String(exec('git', ['rev-parse', '--verify', `${sha}^{tree}`],
+      { ...(cwd === undefined ? {} : { cwd }), encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+    const before = tree(fromSha), after = tree(toSha);
+    return { ok: /^[0-9a-f]{40}$/.test(before) && before === after };
+  } catch { return { ok: false }; }
+}
+
 /**
  * IO: shared carry proof for the drain and CI. Check the pinned diff before touching git;
  * unreadable evidence or history never grants a carry. A fingerprinted exact tree match also permits an
@@ -246,15 +257,10 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     if (pre.carry) {
       // Exact root tree identity includes every blob, path and mode, including the manifest.
       // Empty commits need no merge/replay exception. Never equate missing/invalid git output.
-      try {
-        const tree = sha => String(gitExec('git', ['rev-parse', '--verify', `${sha}^{tree}`],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-        const fromTree = tree(clearance.sha), toTree = tree(evidence.headSha);
-        if (/^[0-9a-f]{40}$/.test(fromTree) && fromTree === toTree) {
-          return { ...pre, applicable: true, tier: 'tree', mechanicalReason: 'identical cleared and live head trees',
-            reason: 'identical cleared and live head trees' };
-        }
-      } catch { /* No tree proof; the existing mechanical/numbering proofs must stand on their own. */ }
+      if (proveIdenticalHeadTrees({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha }).ok) {
+        return { ...pre, applicable: true, tier: 'tree', mechanicalReason: 'identical cleared and live head trees',
+          reason: 'identical cleared and live head trees' };
+      }
     }
 
     if (!pre.carry || numberingOnly) {

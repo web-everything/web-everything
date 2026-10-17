@@ -49,15 +49,19 @@ function scopedEvents(events, scope) {
 /** Fold ONE PR's events (this repo, this number; never "all PRs") into the view every hold rule reads. Throws `ledgerUnreadable` on an invalid row. */
 export function ledgerView(events, facts) {
   const scope = scopeOf(facts);
-  const mine = scope ? scopedEvents(events, scope) : [];
+  let mine = scope ? scopedEvents(events, scope) : [];
+  // Fold the complete stream so a delayed transition cannot erase a review that already witnessed its head.
   const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
+  // Approvals have legacy implicit head scope. A movement boundary ends that scope.
+  const boundary = mine.indexOf(folded?.lastHeadMove);
+  if (boundary >= 0) mine = mine.filter((e, i) => i >= boundary || ![EVENT_TYPES.APPROVAL, EVENT_TYPES.REVIEW_EXEMPT, EVENT_TYPES.VERDICT].includes(e.type));
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
   if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now)) clears = true;
   const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
   const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
-  const reviewExempt = !cur && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
+  const reviewExempt = (!cur || (cur.verdict === 'head-moved' && mine.indexOf(lastExempt) > mine.indexOf(cur))) && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
     && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
   clears = clears || reviewExempt;
   return { events: mine, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };

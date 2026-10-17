@@ -64,6 +64,33 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     expect(retries).toEqual([1, 2]);
   });
 
+  it.each(['first-seen', 'head-moved', 'carried'])('rechecks a delayed %s against the new transport tip on retry', (kind) => {
+    const a = 'a'.repeat(40), b = 'b'.repeat(40), c = 'c'.repeat(40);
+    const prior = kind === 'first-seen' ? [] : [row(1, { headSha: a })];
+    const pending = row(1, kind === 'first-seen'
+      ? { source: kind, verdict: 'observed', headSha: b }
+      : { verdict: kind, headSha: b, fromHead: a, ...(kind === 'carried' ? { carryRule: 'tree-identical' } : {}) });
+    const newer = row(1, { headSha: c });
+    let tip = prior.map(r => JSON.stringify(r) + '\n').join('');
+    let staged = '', pushes = 0, reads = 0;
+    const run = args => {
+      if (args[0] === 'diff') return staged === tip ? '' : ledgerGitPath(REPO);
+      if (args[0] === 'push') {
+        pushes += 1;
+        tip += JSON.stringify(newer) + '\n';
+        throw Error('rejected: newer tip');
+      }
+      return '';
+    };
+    const result = appendLedgerRows(base({ records: [pending], run,
+      read: path => { if (!path.endsWith(ledgerGitPath(REPO))) return null; reads += 1; return tip; },
+      write: (path, text) => { if (path.endsWith(ledgerGitPath(REPO))) staged = text; } }));
+    expect(result).toMatchObject({ attempts: 2, rows: 0 });
+    expect(pushes).toBe(1);
+    expect(reads).toBe(2);
+    expect(staged).toBe(tip);
+  });
+
   it('THROWS LedgerAppendExhaustedError when every attempt fails (never a quiet value)', () => {
     const f = failing(99);
     expect(() => appendLedgerRows(base({ run: f.run, attempts: 3 }))).toThrow(LedgerAppendExhaustedError);

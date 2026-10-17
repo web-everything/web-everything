@@ -1347,7 +1347,7 @@ describe('PR 4311 operator ruling: the default dual reaches git in production, a
   const FLAGS = ['VITEST', 'WE_UNDER_TEST', 'WE_VERDICT_LEDGER_STORE', 'WE_VERDICT_LEDGER_BOARD'];
   const saved = {};
   const REPO = 'web-everything/web-everything';
-  const mk = (verdict, pr = 61) => buildVerdictRecord({ repo: REPO, pr, verdict, at: '2026-10-07T12:00:00.000Z', source: 'test' });
+  const mk = (verdict, pr = 61) => buildVerdictRecord({ repo: REPO, pr, verdict, ...(verdict === 'carried' ? { headSha: 'b'.repeat(40), fromHead: 'a'.repeat(40), carryRule: 'numbering-only' } : {}), at: '2026-10-07T12:00:00.000Z', source: 'test' });
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-ruling-'));
     for (const k of [...FLAGS, 'WE_VERDICT_LEDGER_DIR']) saved[k] = process.env[k];
