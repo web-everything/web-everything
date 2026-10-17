@@ -1,10 +1,12 @@
+import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
+export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
   uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
-import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
+import { seatProviderDirective, shadowSeatStatus } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
@@ -796,7 +798,54 @@ export function seatSettingsForRun(record, settings) {
   if (!settings) return settings;
   const seated = Boolean(record && typeof record === 'object' && record.findings && typeof record.findings === 'object'
     && Object.prototype.hasOwnProperty.call(record.findings, AGY_CORRECTNESS_SEAT.step));
-  return { ...settings, agyCorrectnessAdvisory: seated };
+  return { ...settings, agyCorrectnessAdvisory: seated, preserveSavedRoster: true };
+}
+
+const OPTIONAL_SEATS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT, AGY_CORRECTNESS_SEAT]);
+
+/**
+ * Rebuild a saved run's roster for a resume at ANY cursor position, independently of current flags and minimums.
+ * New runs persist it in `findings.read.seatSteps`. A run saved before that keeps every seat it answered or is
+ * parked on, drops a seat its progress already passed, and asks `live` (the requests a new run would make,
+ * never the minimum) only about seats it has not reached. A run with no `read` finding has judged nothing, so
+ * it gets the live roster, minimum included.
+ * @param {object|null|undefined} record
+ * @param {object|null} settings - the live resolved settings.
+ * @param {{codexAdvisory?: boolean, correctnessAdvisory?: boolean, antigravityReview?: boolean}} [live]
+ */
+export function reviewSeatOptionsForRun(record, settings, live = {}) {
+  const findings = record?.findings && typeof record.findings === 'object' ? record.findings : {};
+  const read = findings.read && typeof findings.read === 'object' ? findings.read : null;
+  const liveFlags = { [ADVISORY_JUDGE_SEAT.step]: live.codexAdvisory === true,
+    [CORRECTNESS_ADVISORY_SEAT.step]: live.correctnessAdvisory === true,
+    [ANTIGRAVITY_REVIEW_SEAT.step]: live.antigravityReview === true,
+    [AGY_CORRECTNESS_SEAT.step]: settings?.agyCorrectnessAdvisory === true };
+  if (!read) {
+    return { securitySeat: securitySeatFromRun(record), codexAdvisory: liveFlags.judgeAdvisory,
+      correctnessAdvisory: liveFlags.judgeCorrectnessAdvisory, antigravityReview: liveFlags.judgeAntigravityReview,
+      seatSettings: settings ?? null };
+  }
+  const saved = Array.isArray(read.seatSteps) ? read.seatSteps : null;
+  // Historical runs: the furthest point reached. Every step after the optional seats (verifier, reduce, confirm…)
+  // means all of them were passed.
+  const reached = [...Object.keys(findings), ...(record.pending?.step ? [record.pending.step] : [])];
+  const rank = (step) => {
+    const i = OPTIONAL_SEATS.findIndex((seat) => seat.step === step);
+    return i >= 0 ? i : (['read', ...JUDGE_SEATS.map((seat) => seat.step)].includes(step) ? -1 : OPTIONAL_SEATS.length);
+  };
+  const furthest = Math.max(-1, ...reached.map(rank));
+  // A parallel batch may have saved a later seat's answer while an earlier seat is still owed (`prefilledSeats`):
+  // that proves the later seat was seated, but not that the seats before it were passed.
+  const prefilled = (Array.isArray(record.prefilledSeats) ? record.prefilledSeats : []).map((p) => p?.step);
+  const seated = (seat, i) => (saved ? saved.includes(seat.step)
+    : reached.includes(seat.step) || prefilled.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
+  const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
+  return {
+    securitySeat: securitySeatFromRun(record),
+    codexAdvisory, correctnessAdvisory, antigravityReview,
+    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0 ? { minNonClaudeSeats: read.minNonClaudeSeats } : {}),
+    seatSettings: { ...(settings ?? {}), agyCorrectnessAdvisory, preserveSavedRoster: true },
+  };
 }
 
 /**
@@ -1907,6 +1956,7 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
       + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
   return [
     body,
+    ...(verdict.nonClaudeSeatShortfall ? ['', verdict.nonClaudeSeatShortfall] : []),
     ...renderDeferredAdvisorySection({ read, verdict }),
     '',
     '---',
@@ -2148,56 +2198,6 @@ export function listRetirementReasons(retirements) {
 }
 
 /**
- * THE ADVISORY'S OWN OUTCOME — `accept` or `changes` — with the human gate FACTORED OUT. PURE.
- *
- * `verdict.verdict` cannot be used: `derivePanelVerdict` returns `needs-human` for EVERY gate-self PR before it
- * looks at a single finding, so it is identical for a clean advisory and a blocked one. This re-runs the SAME
- * reducer over the SAME admitted findings and lens verdicts with `humanRequired` off, i.e. "what would the panel
- * have said if this PR were not human-gated" — the honest answer to "did the advisory find anything blocking".
- * `accept` only when every mandatory lens accepts and no guard is owed; anything else is `changes`.
- *
- * `null` when no outcome can be honestly derived (no mandatory lens seated, a mandatory lens with no verdict) —
- * the caller then posts the note with no outcome line and applies no label, exactly like before this existed.
- *
- * @param {object} verdict the `reduce` step's output.
- * @returns {'accept'|'changes'|null}
- */
-export function deriveAdvisoryOutcome(verdict) {
-  const v = verdict && typeof verdict === 'object' ? verdict : {};
-  if (v.blockedReferrals?.length) return ADVISORY_OUTCOMES.CHANGES;
-  // Unruled mandatory referrals mean the panel is not done: no outcome (so no `advisory:*` label) rather than a
-  // clean `accept`. Not `changes` either: nothing is broken, a ruling is owed, and `changes` would dispatch a fixer.
-  if (v.pendingReferrals?.length) return null;
-  const lensVerdicts = v.lensVerdicts && typeof v.lensVerdicts === 'object' ? v.lensVerdicts : {};
-  const lenses = Array.isArray(v.lenses) && v.lenses.length ? v.lenses : Object.keys(lensVerdicts);
-  try {
-    const reduced = derivePanelVerdict({
-      lensVerdicts,
-      humanRequired: false,
-      mandatoryLenses: MANDATORY_LENSES.filter((l) => lenses.includes(l)),
-      // The ADMITTED set, exactly as `reduce` reduced it — an off-scope (unverifiable) citation must not block
-      // here any more than it did there (#x6t2z6h). Falls back to the published list for a record that predates it.
-      findings: v.admittedFindings ?? v.findings ?? [],
-    });
-    return reduced === VERDICTS.ACCEPT ? ADVISORY_OUTCOMES.ACCEPT : ADVISORY_OUTCOMES.CHANGES;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * THE OUTCOME THE NOTE STATES AND THE LABEL APPLIES — {@link deriveAdvisoryOutcome}, but only when the panel judged
- * a PINNED commit. An unpinned or degraded basis (`netBasis.rev` null) names no head, so there is no head for a
- * label to describe and no `Net basis: <base>..<head>` line a reader could compare against — the note then carries
- * no outcome line and no label is applied, rather than a label nothing can ever verify. PURE.
- * @returns {'accept'|'changes'|null}
- */
-export function advisoryLabelOutcome({ read, verdict } = {}) {
-  if (!read || read.degraded || !read.netBasis?.rev) return null;
-  return operatorSendBackVerdict(deriveAdvisoryOutcome(verdict), read.openOperatorSendBacks);
-}
-
-/**
  * THE PRE-HUMAN-CEREMONY ADVISORY NOTE (#xlw02hw) — the `advise` step's comment body. PURE.
  *
  * DELIBERATELY SHARES NO SHAPE WITH `renderVerdictWriteUp`'s output beyond the findings table itself
@@ -2263,6 +2263,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     '',
     ...renderAwaitingRulingSection(v),
     body,
+    ...(v.nonClaudeSeatShortfall ? ['', v.nonClaudeSeatShortfall] : []),
     ...renderDeferredAdvisorySection({ read, verdict: v }),
     // PR #5025 review — the human signing off is told which claims were disputed by one verifier answer, not only that it accepts.
     ...(Array.isArray(v.uncorroboratedRetirements) && v.uncorroboratedRetirements.length
@@ -2300,20 +2301,13 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
  * the real one and tests supply a stub. Built per call so nothing leaks between registries.
  *
  * @param {{readPr: (o: {pr: number, repo: string}) => object, codexAdvisory?: boolean, correctnessAdvisory?: boolean, antigravityReview?: boolean}} deps
- * @param {boolean} [deps.codexAdvisory] - #xqa9ttq — OPT-IN THIRD SEAT. `false` by default: the declaration is
- *   BYTE-IDENTICAL to before this card when omitted, which is deliberate (see the rationale below the roster
- *   check at the bottom of this function, and the file header's "THE THIRD SEAT" section). `true` appends
- *   {@link ADVISORY_JUDGE_SEAT} — a tool-free Codex juror on `ADVISORY_JUDGE_LENS` — as a THIRD `judge` step.
- *   The real binding (`we:scripts/operations/run.mjs`) reads this off `REVIEW_PR_CODEX_ADVISORY=1` in the
- *   environment (mirroring `JUDGE_PROVIDER`'s existing env-fallback shape, since a CLI `--flag` cannot reach
- *   here — the step list is fixed at REGISTRATION, before any run's argv is parsed).
- * @param {boolean} [deps.correctnessAdvisory] - #x8n4crp — OPT-IN FOURTH SEAT, INDEPENDENT of `codexAdvisory`.
- *   `false` by default, for the identical reason. `true` appends {@link CORRECTNESS_ADVISORY_SEAT} — a
- *   read-only-shell Codex juror judging under a correctness-flavoured mandate on {@link CORRECTNESS_ADVISORY_LENS}
- *   (never the literal `'correctness'` — see that constant's own docblock for why) — as a further `judge` step,
- *   after `judgeAdvisory` when both are seated. The real binding reads this off
- *   `REVIEW_PR_CODEX_CORRECTNESS_ADVISORY=1` (`correctnessAdvisoryFromEnv`), a SEPARATE env var from the third
- *   seat's own, so the two Codex seats are toggled independently.
+ * @param {boolean} [deps.codexAdvisory] - Requests the tool-free Codex simplicity advisory seat.
+ *   The non-Claude minimum also enables this seat when no Codex seat was requested. The live binding
+ *   reads REVIEW_PR_CODEX_ADVISORY, then applies the minimum from the resolved review settings.
+ * @param {boolean} [deps.correctnessAdvisory] - Requests the independent Codex correctness advisory seat.
+ *   REVIEW_PR_CODEX_CORRECTNESS_ADVISORY controls the request; a minimum of two also enables it.
+ * @param {number} [deps.minNonClaudeSeats=1] - Minimum answered non-Claude advisory seats. New runs add
+ *   the available Codex lenses; unavailable answers or insufficient capacity leave a visible shortfall.
  * @param {boolean} [deps.antigravityReview] - #3383 — OPT-IN FIFTH SEAT, INDEPENDENT of both Codex seats above.
  *   `false` by default, for the identical reason. `true` appends {@link ANTIGRAVITY_REVIEW_SEAT} — a genuinely
  *   tool-free Antigravity (`agy`) juror judging under a correctness-flavoured mandate on
@@ -2331,18 +2325,27 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
 export function reviewPrOperation({
   readPr, codexAdvisory = false, correctnessAdvisory = false, antigravityReview = false,
   // Card 84 — the resolved `review.*` seat settings (`we:scripts/lib/review-seat-provider.mjs`). `null` = every seat
-  // on Claude and no agy seat, i.e. exactly the declaration before this card.
+  // on Claude and no agy seat. The Codex advisory minimum still applies.
   seatSettings = null,
   // `review.seatsByTouchSet` — whether this build seats the security juror. `true` (the default) is the declaration
   // as it always was. Only a CALLER that has read the PR's touch-set before the run starts may pass `false` (see
   // `seatSecurityForTouchSet`); a resume reads it off the saved run (`securitySeatFromRun`), never re-derives it.
   securitySeat = true,
+  // Zero is reserved for historical declaration fixtures; operational settings require at least one.
+  minNonClaudeSeats = seatSettings?.minNonClaudeSeats ?? 1,
 } = {}) {
+  if (!Number.isSafeInteger(minNonClaudeSeats) || minNonClaudeSeats < 0) throw new TypeError('review-pr: invalid minNonClaudeSeats');
+  // New reviews always include a separate Codex session. Saved runs keep their original step roster;
+  // the reducer reports their shortfall rather than inventing an answer during resume.
+  if (!seatSettings?.preserveSavedRoster) {
+    if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) codexAdvisory = true;
+    if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) correctnessAdvisory = true;
+  }
   const agyCorrectness = seatSettings?.agyCorrectnessAdvisory === true;
   if (agyCorrectness && (MANDATORY_LENSES.includes(AGY_CORRECTNESS_LENS) || PANEL_LENSES.includes(AGY_CORRECTNESS_LENS))) {
     throw new Error(`review-pr: \`AGY_CORRECTNESS_LENS\` (${AGY_CORRECTNESS_LENS}) must stay outside MANDATORY_LENSES/PANEL_LENSES — it is advisory only.`);
   }
-  const directiveFor = (lens) => (seatSettings ? seatProviderDirective(seatSettings, lens) : null);
+  const directiveFor = (lens, read) => (seatSettings ? seatProviderDirective(seatSettings, lens, read) : null);
   if (typeof readPr !== 'function') {
     throw new TypeError(
       'review-pr: needs a `readPr({pr, repo})` reader — the io is INJECTED so the declaration stays testable '
@@ -2585,8 +2588,9 @@ export function reviewPrOperation({
           lens: view.input.lens, pr: view.input.pr, repo: view.input.repo, diffScored: finding.diffScored,
         });
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
-        // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it.
-        return { ...finding, securitySeat: securitySeat !== false };
+        // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
+        // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
+        return { ...finding, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
@@ -2603,7 +2607,7 @@ export function reviewPrOperation({
         // above: a step that consumes an input without declaring it is reading state the run record does not
         // record it as depending on.
         aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-        seatProvider: directiveFor(view.input.lens),
+        seatProvider: directiveFor(view.input.lens, view.findings.read),
       }),
     }),
 
@@ -2636,7 +2640,7 @@ export function reviewPrOperation({
           read: view.findings.read,
           lens: SECURITY_LENS,
           aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-          seatProvider: directiveFor(SECURITY_LENS),
+          seatProvider: directiveFor(SECURITY_LENS, view.findings.read),
         }),
       }),
     } : {}),
@@ -2974,11 +2978,18 @@ export function reviewPrOperation({
         // #xqa9ttq — WHICH LENS RAN ON A NON-CLAUDE PROVIDER, keyed the same way as `lensVerdicts` so the
         // renderer can zip the two together. Built straight off `seats` (never re-derived from the lens name),
         // so a future non-codex provider seat carries its own label for free.
+        const nonClaudeSeats = seats.filter((s) => s.provider?.startsWith('codex') && s.answer
+          && !s.answer.skipped && typeof s.answer.summary === 'string' && s.answer.summary.trim()
+          && Array.isArray(s.answer.findings)).length;
+        const nonClaudeSeatShortfall = nonClaudeSeats < minNonClaudeSeats
+          ? `⚠️ NON-CLAUDE SEAT SHORTFALL: ${nonClaudeSeats}/${minNonClaudeSeats} advisory seats answered; review diversity minimum was not met.` : null;
         const lensProviders = Object.fromEntries([
           ...seats.filter((s) => s.provider).map((s) => [s.lens, s.provider]),
           // Card 84 — a mandatory seat that ran on agy (`review.seatProvider.<lens>: agy`) or had an agy shadow says
           // so in the panel table; a fallback to Claude reads as plain Claude.
           ...seats.filter((s) => !s.provider && s.answer?.seatProvider?.provider === 'agy').map((s) => [s.lens, 'agy']),
+          ...seats.filter((s) => !s.provider && seatSettings?.seatProvider?.[s.lens] === 'shadow'
+            && shadowSeatStatus(seatSettings, read) !== 'sampled').map((s) => [s.lens, `claude; agy shadow ${shadowSeatStatus(seatSettings, read)}`]),
           ...seats.filter((s) => !s.provider && s.answer?.shadow).map((s) => [s.lens, `claude; agy shadow ${isQuotaHeldShadow(s.answer.shadow) ? 'held (agy quota)' : s.answer.shadow.status}`]),
         ]);
         // Card 84 — THE SHADOW RESULTS, recorded beside the verdict and never reduced into it.
@@ -3053,6 +3064,7 @@ export function reviewPrOperation({
           // #xqa9ttq — carried beside `lensVerdicts` so both render call sites (`renderVerdictWriteUp`,
           // `renderAdvisoryNote`) can pass it straight to `renderPanelComment`/`renderPanelVerdictTable`.
           lensProviders,
+          nonClaudeSeats, minNonClaudeSeats, nonClaudeSeatShortfall,
           findings,
           // #x6t2z6h — WHAT THE VERDICT WAS ACTUALLY REDUCED FROM, declared rather than left to be inferred by
           // subtracting two lists. A reader that wants "why is this an accept when the comment shows a blocker"

@@ -2,7 +2,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
@@ -59,7 +59,7 @@ import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
-import { isValidRoundBudget, resolveReviewSettings, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
+import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
 import { sharedRunsDir } from './run-store.mjs';
@@ -880,9 +880,18 @@ export function createReviewPrSinks({
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
+      const { recheckCarriedReferrals } = resolveReviewSettings({ env });
+      out(`review.recheckCarriedReferrals=${recheckCarriedReferrals} (source: ${resolveReviewSettingSource('recheckCarriedReferrals', { env })})`);
+      const rechecks = new Map();
       // Cache comparisons only for this invocation, including failures. Missing patches cannot prove clearance.
-      const changedLines = readChangedLines ?? createChangedLinesReader(args => JSON.parse(execFileSyncThrottled('gh', args,
+      const lineReader = readChangedLines ?? createChangedLinesReader(args => JSON.parse(execFileSyncThrottled('gh', args,
         { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })));
+      const comparisons = new Map();
+      const changedLines = async (...args) => {
+        const key = JSON.stringify(args);
+        if (!comparisons.has(key)) comparisons.set(key, Promise.resolve().then(() => lineReader(...args)).catch(() => null));
+        return comparisons.get(key);
+      };
       const commentBudget = 60_000;
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
@@ -980,12 +989,23 @@ export function createReviewPrSinks({
           }
         }
         const sources = [...payload.referrals, ...prior.records.filter(r => r.repo === read.repo && r.pr === read.pr).flatMap(activeReferrals)];
+        if (recheckCarriedReferrals) for (const old of prior.records) {
+          if (old.repo !== read.repo || old.pr !== read.pr || old.head === read.netBasis.rev) continue;
+          for (const f of activeReferrals(old)) {
+            rechecks.set(f.key, { status: 'needs re-check on live head', fromHead: old.head, head: read.netBasis.rev,
+              reason: 'historical claim requires live-head verification',
+              sourceFinding: f.finding,
+              instruction: 'Verify the finding text against the live net diff. Check function replacements, resolved settings, completed splits and present test controls. Do not copy an earlier block.' });
+          }
+        }
         const additions = new Map();
         for (const f of sources) {
           const key = referralFindingKey(f.seat, f.original);
           if (!covered.has(key)) {
             const original = boundedReferral(f.original, sourceByOriginal.get(JSON.stringify(f.original)) ?? prUrl);
-            additions.set(key, { key, seat: f.seat, original, finding: normalizeFinding(original) });
+            additions.set(key, { key, seat: f.seat, original, finding: normalizeFinding(original),
+              ...(rechecks.has(key) ? { recheck: { status: 'needs re-check on live head',
+                fromHead: rechecks.get(key).fromHead, head: read.netBasis.rev } } : {}) });
           }
         }
         // #4815 — what the confirmation turn concluded this run, keyed like a referral. A `reproduced` claim is already in
@@ -1132,6 +1152,27 @@ export function createReviewPrSinks({
             }
           }
         }
+        // The re-check must be durable, not only on the prompt copy: an omitted or interrupted answer (or a record a
+        // run before this one already attempted) leaves the finding pending, and only a persisted marker keeps automatic
+        // policy from blocking it. An existing record never changes its `referrals`, so the marker goes to `rechecks`.
+        // Every matching key is marked, settled or not: a carry withdrawn later makes it pending again between review
+        // runs, and readers only act on the marker while the gate holds the key pending.
+        if (rechecks.size) {
+          for (let i = 0; i < existing.length; i++) {
+            const record = existing[i];
+            const unmarked = activeReferrals(record)
+              .filter(f => rechecks.has(f.key) && !referralRecheck(record, f.key))
+              .map(f => ({ key: f.key, status: rechecks.get(f.key).status, fromHead: rechecks.get(f.key).fromHead, head: record.head }));
+            if (!unmarked.length) continue;
+            const updated = { ...record, rechecks: [...(record.rechecks ?? []), ...unmarked] };
+            if (renderReferralRecord(updated).length > commentBudget) {
+              overflow(`historical run ${record.runId} re-check marker exceeds ${commentBudget} characters; original record retained`);
+              continue;
+            }
+            state = persist(updated);
+            existing[i] = updated;
+          }
+        }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.
         for (const initial of existing) {
           // A record already attempted (or parked on a failure) is never re-asked wholesale; only a carried finding
@@ -1156,8 +1197,19 @@ export function createReviewPrSinks({
           const identityTable = findingIdentityTable(records);
           const linkedKeys = new Set(initialState.rulings.filter(r => r.linked).map(r => r.key));
           const ask = askable.filter(f => !linkedKeys.has(f.key))
-            .map(f => ({ ...f, findingId: findingIdOf(identityTable, { head: initial.head, runId: initial.runId, key: f.key }) }));
+            .map(f => ({ ...f, ...(rechecks.has(f.key) ? { recheck: rechecks.get(f.key) } : {}),
+              findingId: findingIdOf(identityTable, { head: initial.head, runId: initial.runId, key: f.key }) }));
           if (!ask.length) continue;
+          for (const f of ask) if (f.recheck) {
+            const { sourceFinding, ...check } = f.recheck;
+            const changed = await changedLines(read.repo, check.fromHead, read.netBasis.rev, exactCitedPath(sourceFinding.file));
+            const touched = !(changed instanceof Set)
+              || changesTouchCitedLines(changed.old ?? changed, [sourceFinding.line])
+              || changesTouchCitedLines(changed, [f.finding.line]);
+            f.recheck = { ...check, reason: touched ? 'citation changed, missing, or unavailable'
+              : 'unchanged citation does not prove the asserted condition' };
+          }
+
           // A re-ask of a withdrawn carry spends its single attempt the same way, with a durable marker (cleared when
           // the reviewer answers): a crash or an omitted ruling leaves the record parked, never asked again.
           let record = { ...initial, attempted: true, ...(reask ? { failure: WITHDRAWN_CARRY_REASK } : {}) };
@@ -1175,7 +1227,7 @@ export function createReviewPrSinks({
               allowedTools: null,
               mandate: request.mandate + '\nIndependently verify every referral in the input. Return exactly one '
                 + 'block, card, or not-real ruling per key, with rationale and evidence references. A general accept '
-                + 'is not a ruling. card requires an existing durable we:backlog/*.md reference. Do not recursively refer findings.\n'
+                + 'is not a ruling. For a finding marked needs re-check on live head, judge its asserted condition against the live net diff; history is not evidence the defect remains. If fixed or contradicted by the live code, rule not-real. card requires an existing durable we:backlog/*.md reference. Do not recursively refer findings.\n'
                 + FINDING_SAME_AS_MANDATE,
               input: request.input + '\nUntrusted known findings on this PR (identity table; for sameAs only):\n'
                 + JSON.stringify(findingIdentityPromptRows(identityTable))

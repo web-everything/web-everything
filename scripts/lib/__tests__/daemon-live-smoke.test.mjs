@@ -417,28 +417,23 @@ describe('classifySmokeFailure — pure, transient vs. code', () => {
     const runChildFor = () => vi.fn(async (cmd, args) => {
       if (args[1] === 'list') return '[]';
       if (args[1] === 'acquire') return JSON.stringify({ lane: 2 });
+      if (cmd === 'node') return JSON.stringify({ ok: true });
       return '';
     });
     const ran = (runChild) => runChild.mock.calls.map(([cmd, args]) => (cmd === 'gh' ? `gh ${args[0]}` : `${args[0]} ${args[1] ?? ''}`.trim()));
-    it('a backlog-only move runs only the gh checks; the rest report skipped + ok — tree-stays-clean still runs (never skipped) and so does the beforePorcelain snapshot', async () => {
+    it('a backlog-only move still runs every env check, skipping only unchanged code checks', async () => {
       const runChild = runChildFor();
       const smoke = await runLiveSmoke({ root: '/x', env: {}, runChild, changedFiles: ['backlog/4143.md'], closureOf });
       expect(smoke.pass).toBe(true);
-      // xp4lw2v — `dispatch-dry-run`'s codeEntries fall into the SAME `closureOf` else-branch as
-      // `reconcile-dry-run` in this fixture (its own `entries[0]` is never `scripts/lane-pool.mjs`), so a
-      // backlog-only move skips it too — correct: neither runs code the diff touched. `tree-stays-clean`
-      // has no `codeEntries` at all, so it (and the `beforePorcelain` snapshot `runLiveSmoke` takes up front,
-      // unconditionally, before any skip logic) both still call through to `runChild` with a real `git status`.
-      expect(ran(runChild)).toEqual(['status --porcelain', 'gh api', 'gh pr', 'status --porcelain']);
-      // #4468 — `daemon-entries-boot`'s codeEntries (DAEMON_ENTRY_MODULES) fall into this fixture's SAME
-      // else-branch as reconcile-dry-run/dispatch-dry-run (its own `entries[0]` is never `scripts/lane-pool.mjs`),
-      // so a backlog-only move skips it too — correct: it runs no code the diff touched either.
-      expect(smoke.results.filter((r) => r.skipped).map((r) => r.name)).toEqual(['lane-pool-list', 'lane-acquire-release', 'reconcile-dry-run', 'dispatch-dry-run', 'daemon-entries-boot']);
+      expect(ran(runChild)).toContain('gh api');
+      expect(ran(runChild)).toContain('gh pr');
+      expect(smoke.results.filter(row => row.skipped).map(row => row.name)).toEqual(['reconcile-dry-run', 'dispatch-dry-run']);
+      expect(smoke.results.filter(row => !row.skipped).map(row => row.name)).toEqual(SMOKE_CHECKS.filter(row => row.kind === 'env').map(row => row.name));
     });
     it('a move touching lane-pool code re-runs the lane checks (and only those tree checks)', async () => {
       const runChild = runChildFor();
       const smoke = await runLiveSmoke({ root: '/x', env: {}, runChild, changedFiles: ['scripts/lib/lane-pool-paths.mjs'], closureOf });
-      expect(smoke.results.filter((r) => r.skipped).map((r) => r.name)).toEqual(['reconcile-dry-run', 'dispatch-dry-run', 'daemon-entries-boot']);
+      expect(smoke.results.filter((r) => r.skipped).map((r) => r.name)).toEqual(['reconcile-dry-run', 'dispatch-dry-run']);
     });
     it('an unknown diff (null) or an incomplete closure runs everything, as before', async () => {
       for (const opts of [{ changedFiles: null, closureOf }, { changedFiles: ['backlog/1.md'], closureOf: () => ({ files: new Set(), complete: false, bareDeps: false, jsonNames: new Set() }) }]) {
@@ -448,13 +443,10 @@ describe('classifySmokeFailure — pure, transient vs. code', () => {
     });
     it('runLiveSmokeWithRetry forwards changedFiles', async () => {
       const runChild = runChildFor();
-      // Real closure of this repo: a backlog-only change touches none of the five tree-code checks
-      // (lane-pool-list, lane-acquire-release, reconcile-dry-run, dispatch-dry-run, daemon-entries-boot — #4468)
-      // — `tree-stays-clean` has no `codeEntries` and is never skipped.
       const root = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
       const r = await runLiveSmokeWithRetry({ root, env: {}, runChild, changedFiles: ['backlog/4143.md'] });
       expect(r.verdict).toBe('pass');
-      expect(r.smoke.results.filter((x) => x.skipped)).toHaveLength(5);
+      expect(r.smoke.results.filter((x) => x.skipped)).toHaveLength(2);
     });
   });
 
@@ -1234,7 +1226,7 @@ describe('dispatch-dry-run — injected runChild', () => {
     expect(dispatchRow.skipped).toBe(true);
     expect(dispatchRow.ok).toBe(true);
     expect(treeRow.skipped).toBeUndefined();
-    expect(runChild.mock.calls.some(([cmd, args]) => cmd === 'node' && args[0] === '--input-type=module')).toBe(false);
+    expect(runChild.mock.calls.some(([cmd, args]) => cmd === 'node' && args[2] === DISPATCH_DRY_RUN_SCRIPT)).toBe(false);
     expect(runChild.mock.calls.some(([cmd, args]) => cmd === 'git' && args[0] === 'status')).toBe(true);
   });
 

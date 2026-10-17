@@ -728,6 +728,15 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   return unchanged(carry.reason, carry.retryable === true);
 }
 
+/** The production tamper-park callback, shared with the carry wiring regression tests. */
+export function createTamperParkCarryCallback({ pr, repo, exec, dryRun = false, ...options } = {}) {
+  return evidence => applyHumanClearanceCarry({ ...options, evidence, pr, repo, exec, dryRun,
+    numberingOnly: !!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
+    readNumberingLiveEvidence: options.readNumberingLiveEvidence
+      ?? (() => readLiveDrainCarryEvidence({ pr, repo, exec })),
+  });
+}
+
 /**
  * May a marker-less accept's fingerprint be derived from git at all (PR #4631 round 7, red-team)? Only when that accept
  * still stands: it is the latest trusted accept record, nothing after it on the thread is a verdict, a possible hold or a
@@ -5090,6 +5099,7 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
+  for (const listing of listings) mergeStrategy.dequeueSendBacks(listing.rows, listing.repo);
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5752,10 +5762,7 @@ async function runCli() {
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
-              applyNumberingCarry: (carryEvidence) => applyHumanClearanceCarry({ evidence: carryEvidence,
-                pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN, numberingOnly: true,
-                readNumberingLiveEvidence: () => readLiveDrainCarryEvidence({ pr: v.num, repo: slug, exec: diffExec }),
-              }),
+              applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: DRY_RUN }),
             });
             humanClearedSha = carried.humanClearedSha;
             carryRetryable = carried.retryable === true;

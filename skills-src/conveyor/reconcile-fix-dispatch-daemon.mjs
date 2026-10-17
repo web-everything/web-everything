@@ -44,6 +44,8 @@
  */
 
 import { createFixHandoffSleep, createFixHandoffProbe } from '../../scripts/lib/fix-handoff.mjs';
+import { publishAttention } from '../../scripts/operations/needs-you-feed.mjs';
+import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
@@ -381,9 +383,11 @@ let loggedNeedsHumanVoidSetting = false;
 
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
+  publish = publishAttention, safety = resolveFixSafety(),
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   ...tickOpts
 } = {}) {
+  process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
   if (!loggedNeedsHumanVoidSetting) {
     process.stderr.write(`ciHealVerdict.voidNeedsHumanWhenCiGreen=${verdictSettings.voidNeedsHumanWhenCiGreen ? 'on' : 'off'} source=${verdictSettings.voidNeedsHumanSource ?? 'caller'}\n`);
     loggedNeedsHumanVoidSetting = true;
@@ -403,6 +407,11 @@ export function runReconcileNotesAllRepos({
       const tagged = { ...n, repo };
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
+      if (!dryRun && safety.value.alertAtRoundCap && ['round-cap-exhausted', 'ci-heal-exhausted', 'ruling-dispute', 'ci-heal-escalated'].includes(n.kind)) {
+        try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: n.prNumber,
+          head: pr?.headRefOid ?? '', kind: ['round-cap-exhausted', 'ci-heal-exhausted'].includes(n.kind) ? 'at-round-limit' : 'escalated', reason: n.text }); }
+        catch (e) { process.stderr.write(`needs-you publication failed: ${e.message}\n`); }
+      }
       // card x9zznl9 (live #4535) — a `not-a-ci-break` verdict a required check has since contradicted is voided
       // (once per VERDICT — a later verdict on the same head owes its own void, up to MAX_VERDICT_VOIDS_PER_HEAD) instead
       // of telling the operator it needs a decision; the ordinary ci-heal path resumes.

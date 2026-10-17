@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
  * @file scripts/operations/fix-run.mjs
  * @description Card 87 follow-up — ONE BORROWED FIX, IN ITS OWN PROCESS, ON A NON-CLAUDE EXECUTOR. The per-dispatch
@@ -586,12 +588,21 @@ export async function runFixCli(argv = [], {
     if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     let prContext;
+    let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
+      const safety = resolveFixSafety();
+      for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
+      repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
+      if (repeatPlan.action === 'stand-down') {
+        const body = buildStandDownComment({ reason: 'repeated-finding', head: prHeadSha, detail: 'Record scope-baseline: <full sha> in an operator decision comment before another repair.' });
+        withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        throw new LauncherError('repeated finding: operator scope-baseline required');
+      }
       prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, comments });
@@ -761,7 +772,20 @@ export async function runFixCli(argv = [], {
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
     let spawned;
-    try {
+    if (repeatPlan.action === 'reset') {
+      if (target) throw new LauncherError('repeated finding: resolve base conflict before scope reset');
+      const scope = String(launch.scope ?? '').split(',').map(p => p.trim().replace(/^[a-z][\w-]*:/i, '')).filter(Boolean);
+      let reset;
+      try { reset = applyScopeReset({ ...repeatPlan, scope, git }); }
+      catch {
+        const body = buildStandDownComment({ reason: 'repeated-finding', head: prHeadSha,
+          detail: 'Scope reset could not be proven or replayed safely; operator intervention required.' });
+        withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        throw new LauncherError('repeated finding: scope reset refused');
+      }
+      finalMessage = `repeated finding: restored scope-baseline ${reset.baseline} plus ${reset.replay.length} in-scope commits`;
+      write(`fix-run: ${finalMessage}\n`);
+    } else try {
       spawned = await provider.spawn({
         taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
         sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'

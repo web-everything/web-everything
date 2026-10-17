@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   ACCEPTED_LABEL, OPEN_PR_CAP_SCOPE_DEFAULTS, resolveOpenPrCapScope, readOpenPrCapScope,
-  countOpenPrsForCap, formatOpenPrCap,
+  countOpenPrsForCap, formatOpenPrCap, readBuilderPrCapSettings, isBuilderPr,
 } from '../open-pr-cap-scope.mjs';
 import { REVIEW_LABELS } from '../review-escalation.mjs';
 import * as settings from '../settings-files.mjs';
@@ -76,5 +76,31 @@ describe('open PR cap scope', () => {
   });
   it('omits the counted list when no PRs are counted', () => {
     expect(formatOpenPrCap(countOpenPrsForCap([]))).toBe('0 of 0 open PRs counted (not counted: 0 card-only, 0 review:accepted)');
+  });
+  it('names PRs the builder filter excluded from the total', () => {
+    const c = { ...countOpenPrsForCap([pr(1, ['src/a.js'])]), total: 4, nonBuilder: 3 };
+    expect(formatOpenPrCap(c)).toBe('1 of 4 open PRs counted (not counted: 3 non-builder, 0 card-only, 0 review:accepted) — counted: #1');
+    expect(formatOpenPrCap({ ...c, total: 1, nonBuilder: 0 })).toBe('1 of 1 open PRs counted (not counted: 0 card-only, 0 review:accepted) — counted: #1');
+  });
+});
+
+describe('builder cap policy', () => {
+  it('defaults to builder and logs its source', () => {
+    const log = vi.fn();
+    expect(readBuilderPrCapSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, platform: {}, read: () => ({}), log }))
+      .toEqual({ maxOpenPrsCounts: 'builder', maxOpenPrsCountsSource: 'standard' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('maxOpenPrsCounts="builder" (standard)'));
+  });
+  it.each([
+    [{ platform: { maxOpenPrsCounts: 'all' } }, 'all', 'platform'],
+    [{ platform: { maxOpenPrsCounts: 'all' }, read: () => ({ build: { maxOpenPrsCounts: 'builder' } }) }, 'builder', 'tool'],
+    [{ read: () => ({ build: { maxOpenPrsCounts: 'all' } }), env: { WE_BUILD_MAX_OPEN_PRS_COUNTS: 'builder' } }, 'builder', 'env'],
+    [{ read: () => ({ build: { maxOpenPrsCounts: 'invalid' } }) }, 'builder', 'standard'],
+  ])('resolves population and source', (options, value, source) => {
+    expect(readBuilderPrCapSettings({ env: {}, platform: {}, read: () => ({}), log: () => {}, ...options }))
+      .toEqual({ maxOpenPrsCounts: value, maxOpenPrsCountsSource: source });
+  });
+  it.each(['lane/42-fix-bug', 'lane/operator-work', 'codex/42-build-work', 'lane/42-building-work'])('does not infer builder ownership from %s', headRefName => {
+    expect(isBuilderPr({ headRefName })).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,15 +45,20 @@ export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
  * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions
  * under NEEDS YOU. `stood-down` keeps the legacy section. Env: WE_REVIEW_STAND_DOWN_QUEUE_SECTION.
  */
-export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
+export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
   takeoverReviewAttempts: 1, rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
-export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
+export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
+  autoPolicyRespectsNotReal: 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
   roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS',
   rulingResolvesStandDown: 'WE_REVIEW_RULING_RESOLVES_STAND_DOWN', standDownQueueSection: 'WE_REVIEW_STAND_DOWN_QUEUE_SECTION' });
 const ALLOWED = Object.freeze({ referralDefault: REFERRAL_DEFAULTS, scopedRereview: SCOPED_REREVIEW_MODES,
   rulingResolvesStandDown: ['on', 'off'], standDownQueueSection: ['needs-you', 'stood-down'] });
 /** Each key's parser: the valid value, or `undefined` to keep the lower layer. `fromEnv` reads a string. */
+const parseBoolean = (v, { fromEnv = false } = {}) => fromEnv
+  ? (v === 'true' ? true : v === 'false' ? false : undefined)
+  : (typeof v === 'boolean' ? v : undefined);
 const PARSERS = Object.freeze({
+  recheckCarriedReferrals: parseBoolean, autoPolicyRespectsNotReal: parseBoolean,
   ...Object.fromEntries(Object.entries(ALLOWED).map(([key, allowed]) => [key, (v) => (allowed.includes(v) ? v : undefined)])),
   roundBudget: (v, { fromEnv = false } = {}) => {
     if (v === ROUND_BUDGET_OFF) return v;
@@ -84,18 +90,32 @@ export function loadReviewSettingsFile(path = defaultReviewSettingsPath()) {
   catch { return validateReviewSettings(null); }
 }
 
-/** Env wins over the file; an invalid override keeps the file/default value. */
-export function resolveReviewSettings({ fileConfig = loadReviewSettingsFile(), env = process.env } = {}) {
+const rawReviewSettings = () => { try { return JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); } catch { return null; } };
+const REFERRAL_SAFETY_KEYS = ['recheckCarriedReferrals', 'autoPolicyRespectsNotReal'];
+/** New referral safeguards use the shared standard → platform → tool → env cascade, with provenance. */
+export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
+  const pick = value => Object.fromEntries(REFERRAL_SAFETY_KEYS.filter(key => value?.[key] !== undefined).map(key => [key, value[key]]));
+  return cascadePolicy('review', pick(fileConfig), {
+    standard: { recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true },
+    platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env, log,
+    valid: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, value => typeof value === 'boolean'])),
+    envValues: Object.fromEntries(REFERRAL_SAFETY_KEYS.map(key => [key, parseBoolean(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true })])),
+  });
+}
+
+/** Env wins over the file; an invalid override keeps the lower layer. */
+export function resolveReviewSettings({ fileConfig = rawReviewSettings(), platform, env = process.env } = {}) {
   const values = { ...validateReviewSettings(fileConfig) };
   for (const [key, parse] of Object.entries(PARSERS)) {
     const override = parse(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true });
     if (override !== undefined) values[key] = override;
   }
-  return values;
+  return { ...values, ...resolveReferralSafetySettings({ fileConfig, platform, env }).value };
 }
 
 /** Source of the winning valid layer, using raw file data so defaults never masquerade as file values. */
-export function resolveReviewSettingSource(key, { fileRaw, env = process.env } = {}) {
+export function resolveReviewSettingSource(key, { fileRaw, platform, env = process.env } = {}) {
+  if (REFERRAL_SAFETY_KEYS.includes(key)) return resolveReferralSafetySettings({ fileConfig: fileRaw, platform, env }).sources[key];
   const parse = PARSERS[key];
   if (!parse) throw new Error(`unknown review setting: ${key}`);
   if (parse(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true }) !== undefined) return 'env';

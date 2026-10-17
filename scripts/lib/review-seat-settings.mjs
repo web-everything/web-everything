@@ -22,6 +22,7 @@
  *   Unknown values fall through to the next layer. `true`/`false` (booleans or strings) are accepted as on/off so a
  *   JSON settings file can use either spelling. PURE except the settings-file read.
  */
+import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,4 +111,58 @@ export function resolveShadowTrialReviews({ env = process.env, file = REVIEW_SET
     if (f) return { value: f, source: 'settings' };
   } catch { /* built-in */ }
   return { value: null, source: 'default' };
+}
+
+/** Operational panel safeguards. Standard → platform review → tool review.json → env.
+ * enabled: false; scope: high-care; dailyCap: 100 (New York day); sampleRate: 0.1 in [0,1) (1 is refused).
+ * minNonClaudeSeats: positive integer, default 1.
+ * Invalid layers fall through and are logged. Sources are logged even in the short review CLI.
+ */
+const loggedSafeguards = new Set();
+export function resolveReviewSeatSafeguards({ env = process.env, file = REVIEW_SETTINGS_FILE,
+  readFile = (p) => readFileSync(p, 'utf8'), platform, log = (m) => console.error(m) } = {}) {
+  let tool = {};
+  try { tool = JSON.parse(readFile(file)); } catch { /* standard/platform still apply */ }
+  const valid = {
+    shadowEnabled: (v) => typeof v === 'boolean',
+    sampleRate: (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1,
+    scope: (v) => ['high-care', 'sampled'].includes(v),
+    dailyCap: (v) => Number.isSafeInteger(v) && v >= 0,
+    minNonClaudeSeats: (v) => Number.isSafeInteger(v) && v >= 1,
+  };
+  const invalid = [];
+  // These settings are scalars: reject the entire value before the cascade flattens objects into leaves.
+  const project = (v, layer) => Object.fromEntries(Object.entries({
+    shadowEnabled: v?.shadowSeats?.antigravity?.enabled,
+    sampleRate: v?.shadowSeats?.antigravity?.sampleRate,
+    scope: v?.shadowSeats?.antigravity?.scope,
+    dailyCap: v?.shadowSeats?.antigravity?.dailyCap,
+    minNonClaudeSeats: v?.minNonClaudeSeats,
+  }).filter(([key, value]) => {
+    if (value === undefined) return false;
+    if (valid[key](value)) return true;
+    invalid.push(`${layer}.${key}=${JSON.stringify(value)}`);
+    return false;
+  }));
+  const plat = platform ?? platformPreference('review', { env });
+  const platformValues = project(plat, 'platform');
+  const toolValues = project(tool, 'tool');
+  const numeric = (v) => typeof v === 'string' && v.trim() ? Number(v) : v;
+  const result = cascadePolicy('review.seatSafeguards', toolValues, {
+    standard: { shadowEnabled: false, scope: 'high-care', dailyCap: 100, sampleRate: 0.1, minNonClaudeSeats: 1 },
+    platform: platformValues, env,
+    envValues: {
+      shadowEnabled: env.WE_REVIEW_SHADOW_AGY_ENABLED === undefined ? undefined : normOnOff(env.WE_REVIEW_SHADOW_AGY_ENABLED) === 'on'
+        ? true : normOnOff(env.WE_REVIEW_SHADOW_AGY_ENABLED) === 'off' ? false : env.WE_REVIEW_SHADOW_AGY_ENABLED,
+      sampleRate: numeric(env.WE_REVIEW_SHADOW_AGY_SAMPLE_RATE),
+      minNonClaudeSeats: numeric(env.WE_REVIEW_MIN_NON_CLAUDE_SEATS),
+      scope: env.WE_REVIEW_SHADOW_AGY_SCOPE,
+      dailyCap: numeric(env.WE_REVIEW_SHADOW_AGY_DAILY_CAP),
+    },
+    valid,
+  });
+  result.invalid.unshift(...invalid);
+  const line = formatCascadeSourcesLine('review.seatSafeguards', result).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  if (!loggedSafeguards.has(line)) { loggedSafeguards.add(line); log(line); }
+  return result;
 }

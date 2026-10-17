@@ -63,11 +63,11 @@ const sectionReasons = {
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
-  for (const [field, baseKind] of [['ready', 'needs-you'], ['needsYourMerge', 'needs-you'], ['rulingNeeded', 'ruling-needed'], ['stoodDown', 'stood-down']]) {
+  for (const [field, baseKind] of [['ready', 'needs-you'], ['needsYourMerge', 'needs-you'], ['rulingNeeded', 'ruling-needed'], ['stoodDown', 'stood-down'], ['needsPerson', 'ruling-needed']]) {
     for (const row of report[field] ?? []) {
       const clues = [row.kind, row.reason, ...(row.findings ?? []).map(f => f.reason)].filter(Boolean).join(' ');
-      const kind = baseKind !== 'ruling-needed' ? baseKind : /round-cap|at-round-limit/.test(clues) ? 'at-round-limit' : /escalat|dispute/.test(clues) ? 'escalated' : baseKind;
-      const reason = row.reason || sectionReasons[field];
+      const kind = baseKind !== 'ruling-needed' ? baseKind : /round-cap|at-round-limit|ci-heal-exhausted/.test(clues) ? 'at-round-limit' : /escalat|dispute/.test(clues) ? 'escalated' : baseKind;
+      const reason = row.reason || row.detail || row.headline || sectionReasons[field];
       const pr = row.number ?? row.pr;
       const command = row.command || (field === 'ready' || field === 'rulingNeeded'
         ? `node scripts/operations/run.mjs review-pr --pr=${shellArg(pr)} --repo=${shellArg(row.repo)}` : undefined);
@@ -195,6 +195,19 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const result = diffFeed(prev.openKeys, items, now);
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
+    return result;
+  });
+}
+/** Immediate escalation publisher. Same lock/state as polling; never gated by quiet hours. */
+export function publishAttention(item, { path = feedPath(), now = Date.now() } = {}) {
+  path = checkedFeedPath(path);
+  const statePath = statePathOf(path);
+  mkdirSync(dirname(statePath), { recursive: true });
+  return withFileLock(`${statePath}.lock`, () => {
+    const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
+    const result = diffFeed(prev.openKeys, [item], now, { incomplete: true });
+    appendLines(path, result.lines);
+    writeJsonAtomic(statePath, { ...prev, openKeys: result.openKeys });
     return result;
   });
 }

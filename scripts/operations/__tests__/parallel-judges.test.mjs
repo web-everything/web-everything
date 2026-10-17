@@ -136,6 +136,15 @@ describe('review.parallelSeats — concurrency and an identical record', () => {
     expect(lastStart).toBeLessThan(firstEnd);
     const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
     expect(wall).toBeLessThan(sum * 0.75);
+    expect(run.seatTimings).toHaveLength(4);
+    for (const row of run.seatTimings) {
+      expect(Object.keys(row).sort()).toEqual(['seat', 'lens', 'provider', 'model', 'startedAt', 'finishedAt', 'verdict', 'findingsCount'].sort());
+      const call = judge.calls.find(c => c.lens === row.lens);
+      expect(Math.abs(Date.parse(row.startedAt) - call.start)).toBeLessThan(20);
+      expect(Math.abs(Date.parse(row.finishedAt) - call.end)).toBeLessThan(20);
+      expect(row.verdict).toBe(row.lens === 'security' ? 'changes' : 'accept');
+      expect(row.findingsCount).toBe(row.lens === 'security' ? 1 : 0);
+    }
     // The run record's own step timings show the overlap too.
     const seats = run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
     expect(seats).toHaveLength(4);

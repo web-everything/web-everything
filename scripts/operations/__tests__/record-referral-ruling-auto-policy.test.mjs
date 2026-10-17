@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding,
   referralFindingKey, renderReferralRecord, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
-import { recordReferralRulingOperation } from '../record-referral-ruling.mjs';
+import { OPEN_FINDING_STATES, planRulingFollowUp, recordReferralRulingOperation } from '../record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -29,16 +29,16 @@ function ruling(rec, result = 'not-real', extra = {}) {
     actor: 'chalbert', channel: 'chat', reason: 'Operator decision', at: now, clearerId: 'operator-session',
     rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result, ...(result === 'card' ? { card } : {}) }], ...extra }));
 }
-function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true } = {}) {
-  const comments = [...initial], trace = [], warnings = [];
+function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {} } = {}) {
+  const comments = [...initial], trace = [], warnings = [], logs = [];
   let liveHead = head;
   const readJson = (args) => args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
     : args[1].includes('/compare/') ? (compare instanceof Error ? (() => { throw compare; })() : compare) : { type: fileExists ? 'file' : 'dir' };
   const reader = createRecordReferralRulingReader({ readJson, changedLines, assertFresh: () => {},
-    readable: () => true, now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session' } });
+    readable: () => true, log: (m) => logs.push(m), now: () => now, env: { CLAUDE_SESSION_ID: 'auto-session', ...env } });
   const operation = recordReferralRulingOperation({ readRulingContext: reader });
   const inputFor = (extra) => ({ repo, pr, finding: 'all-open', actor: 'auto-policy', ruling: 'block', channel: 'policy', reason: 'Policy', ...extra });
-  const sinks = createRecordReferralRulingSinks({ readJson, changedLines, readable: () => true,
+  const sinks = createRecordReferralRulingSinks({ readJson, changedLines, readable: () => true, env,
     appendEvents: async (events) => trace.push(['ledger', events]),
     post: (_repo, _pr, text) => { trace.push(['post', text]); comments.push(comment(text)); },
     warn: (text) => warnings.push(text), readPr: () => ({ headRefOid: liveHead, labels: [] }),
@@ -60,7 +60,7 @@ function harness(initial, { changedLines, compare = { status: 'identical', files
     const store = createMemoryRunStore(); store.write(run);
     return applyPendingEffects(run, { sinks, store });
   };
-  return { comments, trace, warnings, plan, execute, enginePlan, engineExecute, moveHead: () => { liveHead = oldHead; } };
+  return { comments, trace, warnings, logs, plan, execute, enginePlan, engineExecute, moveHead: () => { liveHead = oldHead; } };
 }
 const thread = (...records) => records.map((r) => comment(renderReferralRecord(r)));
 
@@ -165,14 +165,96 @@ describe('automatic policy respects authenticated operator decisions', () => {
     const h = harness([...thread(source), ruling(source), ...thread(target), ruling(target)], { compare: new Error('unavailable') });
     expect(h.plan().verdict.noop).toBe(true);
   });
-  it('never turns a reviewer-only carry into operator protection', () => {
+  it('protects a counted reviewer not-real behind a reviewer-only carry', () => {
     const source = record({ h: oldHead, reviewerResult: 'not-real' }), carried = record({ runId: 'review-pr-carried' });
     carried.carried = [{ key: carried.referrals[0].key, result: 'not-real', reason: REFERRAL_CARRY_REASON,
       from: { head: oldHead, runId: source.runId, key: source.referrals[0].key, rulingId: source.rulings[0].id } }];
     const fresh = record({ runId: 'review-pr-fresh', line: 21 });
     const planned = harness(thread(source, carried, fresh)).plan({ finding: fresh.referrals[0].key });
-    expect(planned.verdict.skipped).toEqual([]);
-    expect(planned.verdict.record.rulings).toEqual([{ runId: fresh.runId, key: fresh.referrals[0].key, result: 'block' }]);
+    expect(planned.verdict.skipped).toHaveLength(1);
+    expect(planned.verdict.noop).toBe(true);
+    expect(planned.effects).toEqual([]);
+  });
+  it.each(['', '(no file)'])('does not auto-block the %j copy of a reviewer or operator not-real', async (file) => {
+    for (const actor of ['reviewer', 'operator']) for (const sourceHead of [head, oldHead]) {
+      const source = record({ h: sourceHead, reviewerResult: actor === 'reviewer' ? 'not-real' : undefined });
+      const target = record({ runId: 'review-pr-copy', file });
+      const h = harness([...thread(source), ...(actor === 'operator' ? [ruling(source)] : []), ...thread(target)]);
+      const planned = h.plan({ finding: target.referrals[0].key });
+      expect(planned.verdict.noop).toBe(true);
+      await h.execute(planned);
+      expect(h.trace).toEqual([]);
+    }
+  });
+  it.each(['', '(no file)'])('a new citation never stands in for a %j original citation in the comparison', (file) => {
+    for (const actor of ['reviewer', 'operator']) {
+      const source = record({ h: oldHead, file, reviewerResult: actor === 'reviewer' ? 'not-real' : undefined });
+      const target = record({ runId: 'review-pr-copy' });
+      // The new file changed at the old line: that says nothing about where the original claim pointed.
+      const changed = new Set([20]); changed.old = new Set([20]);
+      const comments = [...thread(source), ...(actor === 'operator' ? [ruling(source)] : []), ...thread(target)];
+      expect(() => harness(comments, { changedLines: () => changed }).plan({ finding: target.referrals[0].key }))
+        .toThrow(/protection.*unknown/i);
+    }
+  });
+  it.each(['', '(no file)'])('a %j target line is never compared in the original file it does not cite', (file) => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' }), target = record({ runId: 'review-pr-copy', file });
+    // Only the new side changed at line 20: the original citation is intact, so its not-real still protects.
+    const changed = new Set([20]); changed.old = new Set();
+    expect(harness(thread(source, target), { changedLines: () => changed }).plan({ finding: target.referrals[0].key }).verdict.noop).toBe(true);
+  });
+  it('only renewed citation changes allow auto-block after an older reviewer not-real (#5399)', async () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real', summary: 'forged-author and quoted-marker controls absent' });
+    const target = record({ runId: 'review-pr-copy', summary: source.referrals[0].finding.summary });
+    const comments = thread(source, target);
+    const unchanged = harness(comments);
+    expect(unchanged.plan().effects).toEqual([]);
+    const changed = new Set([20]); changed.old = new Set([20]);
+    const renewed = harness(comments, { changedLines: () => changed });
+    expect(renewed.plan().verdict.record.rulings).toHaveLength(1);
+    expect(() => harness(comments, { compare: new Error('unavailable') }).plan()).toThrow(/protection.*unknown/i);
+  });
+  it('an old auto-block cannot erase the reviewer not-real that should have prevented it', () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' });
+    const target = record({ runId: 'review-pr-copy' });
+    const h = harness([...thread(source), ruling(source, 'block', { actor: 'auto-policy' }), ...thread(target)]);
+    expect(h.plan().effects).toEqual([]);
+  });
+  it('refuses to auto-block an interrupted historical re-check', () => {
+    const target = record();
+    target.referrals[0].recheck = { status: 'needs re-check on live head', fromHead: oldHead, head };
+    expect(() => harness(thread(target)).plan()).toThrow(/needs re-check on live head/);
+    const ruled = record({ reviewerResult: 'block' });
+    ruled.referrals[0].recheck = target.referrals[0].recheck;
+    expect(harness(thread(ruled)).plan().verdict.record.rulings).toHaveLength(1);
+  });
+  it('autoPolicyRespectsNotReal=false restores the old auto-block over a reviewer not-real, through reader and sinks', async () => {
+    const source = record({ h: oldHead, reviewerResult: 'not-real' }), target = record({ runId: 'review-pr-copy' });
+    const off = harness(thread(source, target), { env: { WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL: 'false' } });
+    const planned = off.plan();
+    expect(planned.verdict.record.rulings).toEqual([{ runId: target.runId, key: target.referrals[0].key, result: 'block' }]);
+    expect(off.logs).toContainEqual(expect.stringMatching(/^review\.autoPolicyRespectsNotReal=false \(source: [^)]*env/));
+    await off.execute(planned); // The writer's fresh read must honour the same switch, or the snapshot check refuses.
+    expect(off.trace.map(([kind]) => kind)).toContain('post');
+    expect(harness(thread(source, target)).plan().effects).toEqual([]);
+  });
+  it('an operator ruling on another finding re-arms while an interrupted re-check still waits', () => {
+    const recheck = record(), other = record({ runId: 'review-pr-other', summary: 'unrelated claim' });
+    recheck.referrals[0].recheck = { status: 'needs re-check on live head', fromHead: oldHead, head };
+    const h = harness(thread(recheck, other));
+    for (const ruling of ['not-real', 'block']) {
+      const planned = h.plan({ actor: 'chalbert', ruling, finding: other.referrals[0].key });
+      expect(planned.verdict.open.find((o) => o.runId === recheck.runId).state).toBe('needs-recheck');
+      expect(planned.verdict.followUp).toMatchObject({ action: 'rearm',
+        remaining: [{ seat: recheck.referrals[0].seat, file: 'scripts/x.mjs', line: 20, summary: 'protected list misses edits' }] });
+    }
+  });
+  it('a late reviewer not-real stops the writer before any mutation', async () => {
+    const target = record(), h = harness(thread(target));
+    const planned = h.plan();
+    h.comments.push(...thread(record({ runId: 'review-pr-late', reviewerResult: 'not-real' })));
+    await expect(h.execute(planned)).rejects.toThrow(/protection.*changed/i);
+    expect(h.trace).toEqual([]);
   });
   it('skips an operator-backed carried block without implicitly superseding it', () => {
     const source = record({ h: oldHead }), target = record({ runId: 'review-pr-target' });
@@ -238,5 +320,17 @@ describe('automatic policy respects authenticated operator decisions', () => {
     const moved = harness(thread(target)), planned = moved.plan(); moved.moveHead();
     await expect(moved.execute(planned)).rejects.toThrow(/head moved/);
     expect(moved.trace).toEqual([]);
+  });
+});
+
+describe('the ruling follow-up handles every open-finding state', () => {
+  // A new state without a row here fails the lookup, so the follow-up cannot silently skip it.
+  const expected = { pending: 'rearm', 'needs-recheck': 'rearm', blocked: 'send-back' };
+  it.each(Object.values(OPEN_FINDING_STATES))('an unselected %s finding decides the follow-up', (state) => {
+    const ruled = { state: 'pending', runId: 'r', key: 'a', seat: 's', file: 'f', line: 1, summary: 'ruled' };
+    const other = { state, runId: 'r', key: 'b', seat: 's', file: 'g', line: 2, summary: 'other', rationale: 'held' };
+    expect(Object.keys(expected)).toContain(state);
+    expect(planRulingFollowUp({ open: [ruled, other], selected: [ruled], ruling: 'not-real', reason: 'x', enabled: true, head }))
+      .toMatchObject({ action: expected[state] });
   });
 });

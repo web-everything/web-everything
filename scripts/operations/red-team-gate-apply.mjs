@@ -29,7 +29,8 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  *   Called by `review-job.mjs` right after the red team ran (the review daemon owns the decision), and by its CLI:
  *     node scripts/operations/red-team-gate-apply.mjs --pr=<n> --repo=<owner/repo> [--dry-run]
  */
-import { spawnSync } from 'node:child_process';
+import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -129,6 +130,7 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
     const priorSend = gateOutcomeForHead(view.comments, pr, head);
     const sendPending = plan.sendBack.length > 0 && !priorSend;
     const cardPending = plan.card.length > 0 && !recorded.has(GATE_OUTCOMES.CARD_QUEUED);
+    if (!dryRun && priorSend === GATE_OUTCOMES.SENT_BACK && sendBackReason(view.labels)) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
     if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The round is the only bound on send-backs, so an unreadable one is the cap (the operator rules), never "round 1".
@@ -162,6 +164,7 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
           try { await io.appendSendBackEvent({ repo, pr, head }); } catch (e) { io.log(`red-team gate: send-back of #${pr} applied but the ledger event missed: ${e.message}`); }
         }
       }
+      if (outcome === GATE_OUTCOMES.SENT_BACK) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
       marker = record(outcome, { ...plan, card: [] }, { sendBackResult });
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
@@ -202,8 +205,10 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
+  const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
     signalFix: signalFixDispatch,
+    dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },
     // The COMPLETE thread (paginated): a one-page read could miss the red-team comment or the gate's own record.
     readPr: ({ repo, pr }) => ({
       ...JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,labels'])),

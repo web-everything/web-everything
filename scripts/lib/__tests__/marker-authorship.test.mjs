@@ -24,6 +24,14 @@ describe('isAutomationAuthored — author.login against AUTOMATION_LOGINS, or Gi
     expect(isAutomationAuthored({ author: { login: 'web-everything[bot]' } })).toBe(true);
   });
 
+  it('reads REST user.login with the same exact trust list and case normalization', () => {
+    expect(isAutomationAuthored({ user: { login: 'WEB-EVERYTHING[BOT]' } })).toBe(true);
+    expect(isTrustedMarkerAuthor({ user: { login: 'chalbert' } })).toBe(true);
+    expect(isTrustedMarkerAuthor({ user: { login: 'mallory[bot]' } })).toBe(false);
+    expect(isTrustedMarkerAuthor({ author: { login: 'mallory' }, user: { login: 'web-everything[bot]' } })).toBe(false);
+    expect(isTrustedMarkerAuthor({ user: { login: 123 } })).toBe(false);
+  });
+
   it('accepts viewerDidAuthor:true as an ADDITIONAL path, even with a different login', () => {
     expect(isAutomationAuthored({ viewerDidAuthor: true, author: { login: 'someone-else' } })).toBe(true);
   });

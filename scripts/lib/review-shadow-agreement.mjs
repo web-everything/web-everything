@@ -146,18 +146,19 @@ export function readShadowRows({ path = resolveShadowAgreementPath(), read = rea
 
 /**
  * The agreement report, per seat (lens). PURE.
- * @returns {Array<{lens: string, runs: number, compared: number, voided: number, failed: number,
+ * @returns {Array<{lens: string, runs: number, compared: number, voided: number, failed: number, held: number, skipped: number,
  *   verdictAgreement: number|null, meanFindingOverlap: number|null, prs: number}>}
  */
 export function summarizeShadowAgreement(rows = []) {
   const byLens = new Map();
   for (const row of rows) {
     if (!row || typeof row.lens !== 'string' || Object.hasOwn(row, 'fellBackTo')) continue;
-    const s = byLens.get(row.lens) ?? { lens: row.lens, runs: 0, compared: 0, voided: 0, failed: 0, held: 0, agree: 0, overlapSum: 0, prs: new Set() };
+    const s = byLens.get(row.lens) ?? { lens: row.lens, runs: 0, compared: 0, voided: 0, failed: 0, held: 0, skipped: 0, agree: 0, overlapSum: 0, prs: new Set() };
     s.runs += 1;
     if (row.pr != null) s.prs.add(`${row.repo}#${row.pr}`);
     if (row.status === 'voided') s.voided += 1;
     else if (isQuotaHeldShadow(row)) s.held += 1;
+    else if (row.status === 'skipped') s.skipped += 1;
     else if (row.status !== 'ok') s.failed += 1;
     else if (row.overlap) {
       s.compared += 1;
@@ -173,6 +174,7 @@ export function summarizeShadowAgreement(rows = []) {
     voided: s.voided,
     failed: s.failed,
     held: s.held,
+    skipped: s.skipped,
     verdictAgreement: s.compared ? Number((s.agree / s.compared).toFixed(3)) : null,
     meanFindingOverlap: s.compared ? Number((s.overlapSum / s.compared).toFixed(3)) : null,
     prs: s.prs.size,
@@ -186,7 +188,7 @@ export function renderShadowReport(summary) {
   return [
     'agy shadow agreement, per seat (only the Claude verdict counted on these runs):',
     ...summary.map((s) => `  ${s.lens}: ${s.runs} run(s) on ${s.prs} PR(s) — ${s.compared} compared, `
-      + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota); verdict agreement ${pct(s.verdictAgreement)}, `
+      + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota), ${s.skipped} skipped; verdict agreement ${pct(s.verdictAgreement)}, `
       + `mean finding overlap ${pct(s.meanFindingOverlap)}`),
   ];
 }

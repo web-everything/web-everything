@@ -20,23 +20,45 @@ import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './cand
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
 /** Identity of a proven tree and the dependencies of its full smoke. */
-export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash }) {
-  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash }));
+export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon' }) {
+  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind }));
 }
 
-/** Lifetime of a full smoke proof; invalid settings retain the two-hour default. */
+/** Reuse policy and per-leaf provenance through the shared settings cascade. */
+export function resolveSmokeReuse(env = process.env) {
+  const standard = { reuseEnabled: true, reuseHours: 12 };
+  const enabled = env.WE_REBUILD_SMOKE_REUSE_ENABLED;
+  const hours = env.WE_REBUILD_SMOKE_REUSE_HOURS;
+  const r = cascadePolicy('rebuildSmoke', readDeclaredSettings().settings?.rebuildSmoke, {
+    env, standard,
+    envValues: { reuseEnabled: enabled === '0' ? false : enabled === '1' ? true : undefined,
+      reuseHours: hours != null && String(hours).trim() !== '' ? Number(hours) : undefined },
+    valid: { reuseEnabled: v => typeof v === 'boolean', reuseHours: v => Number.isFinite(v) && v >= 0 },
+  });
+  return { ...r.value, sources: r.sources };
+}
+
 export function smokePassTtlMs(env = process.env) {
-  const ttl = Number(env.WE_DAEMON_SMOKE_PASS_TTL_MS ?? 2 * 60 * 60_000);
-  return Number.isFinite(ttl) && ttl >= 0 ? ttl : 2 * 60 * 60_000;
+  return resolveSmokeReuse(env).reuseHours * 60 * 60_000;
+}
+
+/** Only a full, successful, unskipped table is durable evidence. */
+export function completeSmokePass(result) {
+  const rows = result?.smoke?.results;
+  return result?.verdict === 'pass' && !result.disabled && !result.cached && Array.isArray(rows)
+    && rows.length === SMOKE_CHECKS.length && SMOKE_CHECKS.every(check =>
+      rows.filter(row => row?.name === check.name && row.ok === true && !row.skipped && !row.skipReason).length === 1);
 }
 
 /** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree. */
-export function smokePassIdentity(git, sha) {
+export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
   try {
     const tree = verifyRev(git, `${sha}^{tree}`);
     if (!tree) return null;
@@ -48,7 +70,7 @@ export function smokePassIdentity(git, sha) {
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
     const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
-    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash }) };
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind }) };
   } catch {
     return null;
   }
@@ -351,6 +373,11 @@ export async function smokeAndAdopt({
   };
   const git = makeGit({ run, cwd: root, env });
   const smokeEnv = candidateSmokeEnv({ root, env });
+  // The per-clone state already isolates kinds (drain, review, etc.); include it in the proof as well.
+  const cloneKind = posix.basename(root.replace(/\\/g, '/')) === 'code'
+    ? posix.basename(posix.dirname(root.replace(/\\/g, '/'))) : posix.basename(root);
+  const reuse = resolveSmokeReuse(env);
+  log.error?.(`daemon-rebuild: smoke-reuse ${JSON.stringify(reuse)}`);
   // One total budget for every smoke of this build (A, plain main, confirm, last-good) — see budgetedRunChild.
   const budget = resolveRebuildSmokeBudget(env);
   const deadline = now() + budget.totalMs;
@@ -421,6 +448,17 @@ export async function smokeAndAdopt({
 
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
+    // Recovery compares failures in this run. Historical passes (including unchanged-code skips)
+    // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
+    const freshComparison = label != null;
+    if (freshComparison) changedFiles = null;
+    const identity = smokePassIdentity(git, sha, cloneKind);
+    const passes = readRebuildState(root, stEnv).smokePassed;
+    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+      const age = now() - Date.parse(entry?.passedAt);
+      return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
+    });
+    if (proven) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
       root, sha, run, env, path: lease.path,
@@ -432,7 +470,7 @@ export async function smokeAndAdopt({
     const t0 = now();
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles, runChild });
+      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
     } catch (e) {
       threw = e;
     }
@@ -458,16 +496,15 @@ export async function smokeAndAdopt({
         ...passTimings,
       });
     }
-    if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null && (!dispatch || dispatch.result.ok)
+    if (!threw && !proven && completeSmokePass(smokeResult) && changedFiles === null && (!dispatch || dispatch.result.ok)
       && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
-      const identity = smokePassIdentity(git, sha);
       if (identity) await locked((st) => {
         const prior = Array.isArray(st.smokePassed) ? st.smokePassed : [];
         st.smokePassed = [{ ...identity, passedAt: nowIso() }, ...prior.filter((entry) => entry?.key !== identity.key)].slice(0, 5);
       });
     }
     return {
-      smokeResult, threw, ms, dispatch,
+      smokeResult, threw, ms, dispatch, reused: !!proven,
     };
   };
 
@@ -602,25 +639,6 @@ export async function smokeAndAdopt({
 
   // ── Candidate A: main + every overlay ──────────────────────────────────────────────────────────────────
   const aSuspects = suspectsFor(plan.applied);
-  const identity = smokePassIdentity(git, plan.finalSha);
-  const passes = readRebuildState(root, stEnv).smokePassed;
-  const proven = identity && Array.isArray(passes) && passes.find((entry) => {
-    const age = now() - Date.parse(entry?.passedAt);
-    return entry?.key === identity.key && age >= 0 && age <= smokePassTtlMs(env);
-  });
-  if (proven) {
-    alert('smoke-skipped-proven-tree', {
-      tree: identity.tree, provenAt: proven.passedAt,
-      reason: 'tree already passed a full smoke (same lock, node, harness)',
-    });
-    // xhiqxz3 — a proven tree still owes the dispatch smoke for an overlay the adopted build does not carry.
-    if (aSuspects.length) {
-      const d = await dispatchOnly(plan.finalSha, aSuspects);
-      if (!d.result.ok) return dispatchFailed(d);
-      dispatchPassedAlert(d);
-    }
-    return finalize(plan, undefined, undefined, { verdict: 'pass', cached: true, smoke: { results: [] } });
-  }
   const a = await smokeSha(plan.finalSha, changedSince(plan.finalSha), null, aSuspects);
   if (a.worktreeFailed) {
     await locked(null, { release: true });
@@ -643,6 +661,10 @@ export async function smokeAndAdopt({
   }
 
   const failedA = failedRows(a.smokeResult);
+  if (a.reused) {
+    await hold('smoke-reused-env-failed', failedA);
+    return { moved: false, reason: 'smoke-reused-env-failed', plan, alerts: [...prepAlerts, ...alertsList] };
+  }
   for (const verdict of SMOKE_ENVIRONMENT_VERDICTS) {
     if (verdict.matches(a.smokeResult.verdict)) return verdict.run({ a, failedA, alert, hold, plan, prepAlerts, alertsList });
   }
@@ -770,13 +792,7 @@ export async function smokeAndAdopt({
         // itself did not (matchReadyCandidate's `fallback-main-moved`).
         kind: 'fallback', forInputsKey: plan.inputsKey, dropRefs: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, sha: ap.sha })), failed: failedNames,
       };
-      // Plain main IS the build already running (an overlay was just added onto an otherwise-current clone) and
-      // that build is the smoke-verified one: nothing to smoke, just drop the suspect(s).
-      // A load-shaped failure never takes this shortcut: an earlier pass is not a SAME-RUN differential.
-      if (!loadOnly && planB.finalSha === prevHead && adoptedHead === prevHead) {
-        const fin = await finalize(planB, dropSuspects, fallbackReady);
-        return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
-      }
+      // Even the currently adopted head needs a fresh comparison before blaming an overlay.
       // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.
       const b = budgetAllows('plain-main')
         ? await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied), { failFast: failedA.map((r) => r.name) })
@@ -840,7 +856,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);

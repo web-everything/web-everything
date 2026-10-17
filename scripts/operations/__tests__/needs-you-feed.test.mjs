@@ -280,3 +280,8 @@ describe('feed', () => {
     });
   });
 });
+
+it('keeps round-cap operator notes in the feed while the cap still needs a person', () => {
+  expect(Array.from(itemsFromReport({ needsPerson: [{ repo: 'o/r', number: 5403, kind: 'round-cap-exhausted', detail: 'round cap exhausted' }] })))
+    .toEqual([expect.objectContaining({ pr: 5403, kind: 'at-round-limit', reason: 'round cap exhausted' })]);
+});

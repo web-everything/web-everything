@@ -1,0 +1,4 @@
+{
+  "$comment": "review.carryAcrossIdenticalNetPatch permits the existing sanctioned carry writers to restamp an approval across identical nonempty net git patch-id --stable values plus equal contribution fingerprints and exact added/removed line bytes, each against its own merge-base with main. Differences and unreadable evidence decline this route without invalidating independent proofs. Default true; WE_REVIEW_CARRY_ACROSS_IDENTICAL_NET_PATCH overrides; value and source are logged.",
+  "review": { "carryAcrossIdenticalNetPatch": true }
+}
