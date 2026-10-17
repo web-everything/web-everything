@@ -58,6 +58,18 @@ it('review regressions: a definitive net-patch miss never settles a head the num
     expect(writes).toEqual([]);
   }
 });
+it('review regressions: a refusal while the numbering proof is switched off is not memoized', () => {
+  const comments = [{ author: { login: 'chalbert' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${a} -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(diff)} -->\n<!-- cleared-human: chalbert -->` }];
+  const state = { headRefOid: b, labels: ['review:pending'], comments };
+  const step = numbering => restampAfterNumbering({ repo: 'owner/repo', pr: 54710, exec: exec(), state, reviews: [],
+    numberingSetting: { value: numbering, source: 'test' }, netPatchSetting: { value: true, source: 'test' },
+    prove: () => ({ ok: false, reason: 'not a numbering-only move' }), guardReferrals: () => {},
+    readNetDiff: () => ({ scored: true, text: diff }), readLiveState: () => ({ state, reviews: [] }), provider: {} });
+  expect(step(false)).toMatchObject({ action: 'refused', reason: expect.stringContaining('numbering carry disabled') });
+  // Switching the numbering proof on is judged on the next pass, then the definitive verdict settles.
+  expect(step(true)).toMatchObject({ action: 'refused', reason: expect.stringContaining('not a numbering-only move') });
+  expect(step(true)).toBeNull();
+});
 it('refuses offset-only net patches on an unchanged base despite matching stable patch ids', () => {
   expect(proveIdenticalNetPatch({ exec: exec(), fromSha: a, toSha: b })).toMatchObject({ ok: false, different: true });
 });

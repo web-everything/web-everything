@@ -149,6 +149,15 @@ it('review regressions: refuses a baseline that is not an ancestor of the lane h
     return { baseline: foreign, paths: ['main-file', 'allowed', 'creep'], error: /is-ancestor/ };
   });
 });
+it('review regressions: refuses a baseline with no net change or one that conflicts with main before any mutation', () => {
+  resetFixture('scope-reset-empty-', ({ git }) =>
+    ({ baseline: git('rev-parse', 'origin/main'), paths: ['main-file', 'allowed', 'creep'], error: 'baseline has no scoped net change' }));
+  resetFixture('scope-reset-conflict-', ({ git, commit, baseline }) => {
+    git('checkout', '-qb', 'advanced-main', 'origin/main'); commit('allowed', 'main took this path differently\n');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('checkout', '-q', 'lane');
+    return { baseline, paths: ['main-file', 'allowed', 'creep'], error: 'baseline conflicts with main' };
+  });
+});
 it('publishes caps during quiet hours once, retaining the opening time for morning idle duration', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cap-feed-')), path = join(dir, 'events.jsonl');
   const event = { repo: 'owner/repo', pr: 5403, head: 'a'.repeat(40), kind: 'at-round-limit', reason: 'round cap exhausted' };

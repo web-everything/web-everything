@@ -75,7 +75,10 @@ export function applyScopeReset({ baseline, scope, git }) {
   if (!baselineFiles.length) throw Error('repeated finding: baseline has no scoped net change');
   const allowed = file => scope.some(p => file === p || (p.endsWith('/') && file.startsWith(p)));
   // Project the baseline onto today's main so the reset cannot undo other PRs that have landed since.
-  const tree = git('merge-tree', '--write-tree', `--merge-base=${base}`, main, baseline).trim();
+  // merge-tree exits 1 on a conflict; any other failure stays the raw read error.
+  let tree;
+  try { tree = git('merge-tree', '--write-tree', `--merge-base=${base}`, main, baseline).trim(); }
+  catch (e) { if (e?.status === 1) throw Error('repeated finding: baseline conflicts with main'); throw e; }
   if (!/^[0-9a-f]{40}$/.test(tree)) throw Error('repeated finding: baseline conflicts with main');
   const rows = git('rev-list', '--reverse', '--parents', 'HEAD', `^${baseline}`, `^${main}`).trim().split('\n').filter(Boolean);
   const replay = [];
