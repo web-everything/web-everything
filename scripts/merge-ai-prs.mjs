@@ -5020,7 +5020,8 @@ async function runCli() {
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
           'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
-        return attachLiveFixClaim(JSON.parse(stdout), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
+        return attachLiveFixClaim(await resolveChecks(null, JSON.parse(stdout)), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),

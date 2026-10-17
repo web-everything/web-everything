@@ -265,6 +265,7 @@ describe('CI pre-stage', () => {
     expect(prestageRequiredChecks(['test'], 'smoke')).toEqual(['test', 'smoke']);
     expect(prestageRequiredChecks(['test'], 'test')).toEqual(['test']);
     expect(prestageRequiredChecks(['test'], undefined)).toEqual(['test']);
+    expect(prestageRequiredChecks(['test'], '')).toEqual(['test', '']);
     expect(prestageRequiredChecks([], 'smoke')).toEqual([]);
     expect(prestageRequiredChecks(null, 'smoke')).toBeNull();
   });
@@ -277,6 +278,16 @@ describe('CI pre-stage', () => {
     green(f);
     if (row) f.pr.statusCheckRollup.push(row);
     expect(await f.run()).toMatchObject(expected);
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+  it('an empty --check never prepares, as the full drain never lands', () => {
+    expect(classifyPr(pending(), { preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: '' }).decision).toBe('skip');
+  });
+  it('an unread --check (failed full read past the rollup cap) falls back without enqueuing', async () => {
+    const f = fixture({ requiredCheck: 'test' });
+    green(f);
+    f.pr.requiredCheckReadError = 'required check "test" direct read failed; deferred this pass: boom';
+    expect(await f.run()).toEqual({ fallback: true });
     expect(f.enqueue).not.toHaveBeenCalled();
   });
   it('a cached enqueue with a green drain check still enqueues', async () => {

@@ -18,7 +18,8 @@ const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
-const out = x => { if (a.includes('-i')) process.stdout.write('HTTP/2 200 OK\\n\\n'); process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
+// Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
+const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 const page = ${openPrPageFixture};
 if (a[0] === 'repo') out('main');
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
@@ -32,6 +33,7 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
     if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
@@ -146,6 +148,19 @@ describe('real drain pre-stage path', () => {
     const next = run(true, { args:['--check=smoke'] });
     expect(next.report.prestaged, next.stderr).toBe(true);
     expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'not-enqueued',reason:'required checks red'}]);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+  }));
+  it('a green event reads the selected --check past the 100-context rollup cap, as the full drain does', () => world(({pr,run}) => {
+    const filler = Array.from({length:98}, (_, i) => ({name:`lint-${i}`,status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}));
+    const smokeRun = (id, status, conclusion) => [{check_runs:[{id,name:'smoke',head_sha:sha,status,conclusion}]}];
+    pr.statusCheckRollup.push({name:'smoke',status:'IN_PROGRESS',conclusion:null,head_sha:sha});
+    expect(run(false, { args:['--check=smoke'] }).stderr).toContain('eligible=true');
+    // The capped rollup still shows an older passing smoke run; the newer failing one is only in the full read.
+    pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha},
+      {__typename:'CheckRun',databaseId:1,name:'smoke',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}, ...filler];
+    pr.checkRuns = smokeRun(2, 'completed', 'failure');
+    const next = run(true, { args:['--check=smoke'] });
+    expect(next.calls.some(a => a[0] === 'api' && a.some(x => x.includes('/check-runs?check_name=smoke')))).toBe(true);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
   }));
   it('a green event under a different --check than preparation still checks it', () => world(({pr,run}) => {

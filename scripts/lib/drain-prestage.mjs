@@ -24,7 +24,8 @@ export const labelSignature = labels => Array.isArray(labels)
  *  full drain also gates on. Without known queue checks there is nothing to prepare against, so none is invented. */
 export function prestageRequiredChecks(queueRequiredChecks, requiredCheck) {
   if (!Array.isArray(queueRequiredChecks) || !queueRequiredChecks.length) return queueRequiredChecks;
-  return [...new Set([...queueRequiredChecks, ...(requiredCheck ? [requiredCheck] : [])])];
+  // Any string counts, even `--check=` (''): no row carries that name, so it stays unknown, as the full drain skips.
+  return [...new Set([...queueRequiredChecks, ...(typeof requiredCheck === 'string' ? [requiredCheck] : [])])];
 }
 
 /** Require a real row for EVERY required context, even if another check normally implies it. */
@@ -102,6 +103,8 @@ export async function enqueuePrestage({ cache, repo, num, settings, readPr, enqu
     cache.drop(repo, num);
     return { enqueued: false, reason: 'CodeQL check failed' };
   }
+  // An unread `--check` (its full read past the 100-context cap failed) is unknown evidence, never a verdict.
+  if (pr.requiredCheckReadError) return { fallback: true };
   const ci = prestageCi(pr, prestageRequiredChecks(entry.requiredChecks, requiredCheck));
   if (ci === 'red') { cache.drop(repo, num); return { enqueued: false, reason: 'required checks red' }; }
   if (ci === 'unknown') return { fallback: true };
