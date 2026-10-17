@@ -19,7 +19,10 @@ export function ciRedOnHead({ headSha, checks } = {}) {
 }
 export function reviewStartGate({ headSha, checks, requiredChecks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
-  if (ciRedOnHead({ headSha, checks })) return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+  // Only required failures have a CI-heal owner. Optional failures must not strand review.
+  const healable = new Set(requiredChecks ?? []);
+  const requiredRows = (Array.isArray(checks) ? checks : []).filter(row => healable.has(row.name ?? row.context));
+  if (ciRedOnHead({ headSha, checks: requiredRows })) return { allowed: false, headSha, reason: 'ci-red', affected: [] };
   if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
   return reviewCiGate({ headSha, checks, requiredChecks: policy.startAfter === 'ci-green' ? requiredChecks : policy.fastChecks });
 }

@@ -30,7 +30,7 @@ import {
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
-const createReviewPrSinks = (o = {}) => createSinks({ publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
+const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -87,7 +87,7 @@ describe('the write-up sink', () => {
 
 describe('the label sink', () => {
   const payload = {
-    pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md',
+    pr: 7, repo: 'o/n', to: 'accepted', actor: 'operator', bodyFile: 'o-n-7-verdict.md', reviewedHead: 'a'.repeat(40),
     addLabel: 'review:accepted', removeLabels: ['review:pending'],
   };
 
@@ -508,7 +508,7 @@ describe('the advisory-note sink', () => {
     const calls = [];
     const sinks = createReviewPrSinks({ root, postComment: (repo, pr, body) => { calls.push({ repo, pr, body }); } });
     const result = await sinks[REVIEW_EFFECTS.ADVISORY_NOTE](
-      { pr: 9, repo: 'o/n', body: '⚠️ advisory only' },
+      { pr: 9, repo: 'o/n', body: '⚠️ advisory only', reviewedHead: 'a'.repeat(40) },
       { ...CTX, type: REVIEW_EFFECTS.ADVISORY_NOTE, step: 'advise' },
     );
     expect(calls).toEqual([{ repo: 'o/n', pr: 9, body: '⚠️ advisory only' }]);
@@ -2670,7 +2670,7 @@ describe('held item 177: the stack-hold sink', () => {
     const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
       runNode: (argv) => { shelled.push(argv); return '{}'; }, labelProvider: { setLabels: (...a) => labelled.push(a), readPrState: () => ({}) },
       setLabels: (...a) => labelled.push(a) });
-    const result = await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker }, { ...CTX, runId: 'run-1' });
+    const result = await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
     return { result, posted, shelled, labelled };
   };
 
@@ -2703,7 +2703,7 @@ describe('held item 177: the stack-hold sink', () => {
   it('still posts the note and marker when the staged write-up is missing', async () => {
     const posted = [];
     const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push(body); } });
-    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker }, { ...CTX, runId: 'run-none' });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' });
     expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0] }])).toHaveLength(1);
   });
 });

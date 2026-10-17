@@ -1,7 +1,7 @@
 import { reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
-import { readReviewCiGate } from '../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
@@ -863,6 +863,7 @@ export function createReviewPrSinks({
   env = process.env,
   referralJudge = judgeSpawn,
   publishGate = readReviewCiGate,
+  readPublishHead = readReviewHead,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -901,12 +902,24 @@ export function createReviewPrSinks({
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
   const assertPublishable = async payload => {
-    // Legacy persisted effects without a pinned head retain their existing refusal path.
-    if (!payload.reviewedHead) return;
+    if (!payload.reviewedHead) throw notApplied('review void: missing reviewed head');
     const policy = resolveTimingPolicy({ env }).review;
-    const ci = await publishGate({ repo: payload.repo, pr: payload.pr, policy, expectedHead: payload.reviewedHead });
-    if (!ci?.checks || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: ci.headSha, checks: ci.checks, policy }))
-      throw notApplied('review void: head moved, CI became red, or current CI could not be read');
+    const args = { repo: payload.repo, pr: payload.pr, expectedHead: payload.reviewedHead };
+    const assertHead = async () => {
+      let currentHead;
+      try { currentHead = await readPublishHead(args); } catch { /* An unreadable head cannot authorize publication. */ }
+      if (reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead }))
+        throw notApplied('review void: head moved or current head could not be read');
+    };
+    await assertHead();
+    if (!policy.cancelOnCiRed) return;
+    let ci;
+    try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
+    catch { /* CI read faults do not void a completed review. The head is checked independently. */ }
+    if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead)
+      || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks, policy }))
+      throw notApplied('review void: head moved or CI became red');
+    await assertHead();
   };
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {

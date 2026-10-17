@@ -1,4 +1,4 @@
-import { reviewStartGate } from './review-timing.mjs';
+import { ciRedOnHead, reviewStartGate } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
@@ -48,20 +48,30 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
   try {
     if (typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('explicit repo required');
     headSha = head({ repo, pr });
-    if (typeof headSha !== 'string' || !headSha.trim()) return reviewCiGate({ headSha });
-    const required = policy.startAfter === 'ci-green'
-      ? readRequired({ repo, ttlMs: 0 }) : { source: 'timing-policy', checks: policy.fastChecks };
+    if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
+    let checks;
+    let required = { source: 'timing-policy', checks: policy.fastChecks };
+    if (policy.startAfter === 'ci-green') required = readRequired({ repo, ttlMs: 0 });
+    else {
+      checks = readChecks({ repo, headSha });
+      // Early review needs branch-protection discovery only to identify an owner for red CI.
+      // Discovery faults retain the fast-check prerequisite, rather than stranding review.
+      if (ciRedOnHead({ headSha, checks })) {
+        try { required = readRequired({ repo, ttlMs: 0 }); } catch { /* Keep timing policy. */ }
+      }
+    }
     const stale = required?.source === 'stale-cache';
     const cacheAgeMs = required?.cacheAgeMs;
     const trustedStale = stale && Number.isFinite(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_STALE_CACHE_AGE_MS;
-    const withSource = result => ({ ...result, source: required?.source,
+    const withSource = result => ({ ...result, startAfter: policy.startAfter, source: required?.source,
       ...(stale ? { cacheAgeMs, reason: `${result.reason} (stale-cache cache-age-ms=${cacheAgeMs ?? 'unknown'})` } : {}),
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
-    if (!['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) && !trustedStale) {
+    const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
+    if (policy.startAfter === 'ci-green' && !trustedRequired) {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
-    let checks = readChecks({ repo, headSha });
+    checks ??= readChecks({ repo, headSha });
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     try {
@@ -73,9 +83,9 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
-    return withSource({ ...reviewStartGate({ headSha, requiredChecks: required.checks, checks, policy }), checks, startAfter: policy.startAfter });
+    return withSource({ ...reviewStartGate({ headSha, requiredChecks: trustedRequired && required.source !== 'timing-policy' ? required.checks : [], checks, policy }), checks });
   } catch (error) {
-    return { allowed: false, headSha, reason: 'unreadable-ci', error: String(error?.message ?? error) };
+    return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
 }
 

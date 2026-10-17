@@ -14,7 +14,7 @@ describe('parallel review start and void', () => {
   it('requires each fast check on the head and refuses a red non-fast check', () => {
     for (const checks of [[], [check('standards')], review.fastChecks.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
       [...review.fastChecks.map(n => check(n)), check('integration', 'failure')]])
-      expect(reviewStartGate({ headSha: head, checks }).allowed).toBe(false);
+      expect(reviewStartGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
     const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };
@@ -22,7 +22,17 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
     expect(reviewMustVoid({ ...args, currentHead: 'b'.repeat(40), policy: { ...review, cancelOnCiRed: false } })).toBe(true);
-    expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')] })).toBe(false);
+    expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
+  });
+  it.each(['fast-checks', 'push'])('ignores optional red checks under %s but blocks healable required failures', startAfter => {
+    const checks = [...review.fastChecks.map(n => check(n)), check('CodeQL', 'failure')];
+    const args = { headSha: head, checks, requiredChecks: ['integration'], policy: { ...review, startAfter } };
+    expect(reviewStartGate(args).allowed).toBe(true);
+    expect(reviewStartGate({ ...args, checks: [...checks, check('integration', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
+  });
+  it('push ignores optional failures even when their names are configured as fast checks', () => {
+    expect(reviewStartGate({ headSha: head, checks: [check('standards', 'failure'), check('integration')],
+      requiredChecks: ['integration'], policy: { ...review, startAfter: 'push' } }).allowed).toBe(true);
   });
 });
 describe('delta review and mechanical carry', () => {

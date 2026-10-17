@@ -6,6 +6,22 @@ import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
 const headSha = 'a'.repeat(40);
+it.each(['fast-checks', 'push'])('uses required CI ownership under %s and reports policy on read failures', startAfter => {
+  const policy = { startAfter, fastChecks: ['standards'] };
+  const args = { repo: 'other/product', pr: 7, policy, readHead: () => headSha,
+    readRequired: () => ({ source: 'live', checks: ['test'] }),
+    readChecks: () => [{ name: 'standards', status: 'completed', conclusion: 'success' },
+      { context: 'optional-status', state: 'failure' }] };
+  expect(readGate(args)).toMatchObject({ allowed: true, startAfter });
+  expect(readGate({ ...args, readRequired: () => { throw Error('protection unavailable'); } }))
+    .toMatchObject({ allowed: true, startAfter, source: 'timing-policy' });
+  expect(readGate({ ...args, readChecks: () => [...args.readChecks(), { name: 'test', status: 'completed', conclusion: 'failure' }] }))
+    .toMatchObject({ allowed: false, reason: 'ci-red', startAfter });
+  expect(readGate({ ...args, readHead: () => null })).toMatchObject({ allowed: false, startAfter });
+  expect(readGate({ ...args, readChecks: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci', startAfter });
+  expect(readGate({ ...args, policy: { ...policy, startAfter: 'ci-green' }, readRequired: () => ({ source: 'fallback', checks: [] }) }))
+    .toMatchObject({ allowed: false, reason: 'untrusted-required-set', startAfter: 'ci-green' });
+});
 function fixture(over = {}) {
   return { policy: { startAfter: 'ci-green' }, repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
     readRequired: vi.fn(() => ({ source: 'live', checks: ['custom'] })),

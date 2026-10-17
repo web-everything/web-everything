@@ -845,7 +845,7 @@ describe('x6n7c2p session-mode CLI report for a skipped dispatch', () => {
 describe('card 273 advisory CI waiver at session dispatch', () => {
   it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('%s head', state => {
     let spawns = 0;
-    const out = dispatchReview({ pr: 5157, repo: 'web-everything/web-everything', root: '/repo',
+    const out = dispatchReview({ pr: 5157, repo: 'web-everything/web-everything', root: '/repo', env: { WE_REVIEW_START_AFTER: 'ci-green' },
       ciGate: () => ({ allowed: false, headSha: state === 'missing' ? null : (state === 'mismatched' ? 'b' : 'a').repeat(40),
         reason: state === 'unreadable' ? 'unreadable-ci' : state === 'head-changed' ? 'head-changed' : 'required-checks-not-successful' }),
       advisoryCiWaiver: { head: 'A'.repeat(40), reason: 'human-handoff' },

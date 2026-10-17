@@ -390,6 +390,14 @@ head. A missing, pending or wrong-head fast check cannot release review. With
 the publication sink voids a running review's verdict when CI turns red; a changed head always voids it. The merge
 requirements remain enforced by the merge gate.
 
+Outside the configured fast-check prerequisite, only required CI failures block
+early review; optional failures have no CI-heal
+owner and must not strand a pending review. Every new review refusal needs an
+identified dispatcher or external event that clears it. Review-dependent gates
+(`review-gate`, `merge-gate`) never cancel a review. Publication requires a pinned,
+unchanged head even when CI is unreadable; CI reads are skipped with cancellation
+off, and CI read faults alone do not discard a completed verdict.
+
 A changed head gets a delta review when additions plus deletions are at most
 `review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3). Binary or
 unreadable deltas get full review. Jurors judge the delta and its prior findings;
@@ -399,12 +407,19 @@ identical-contribution carry writers. Commit subjects alone never prove a carry:
 JIT numbering needs the existing exact rewrite proof, a drain rebase needs the
 same contribution, and an empty recovery commit preserves that contribution.
 A refused carry falls back to review, preserving existing human/referral holds.
+The independent carry controls still apply: `WE_ACCEPT_CARRY_FORWARD` and
+`scripts/settings/accept-carry-forward.json` govern accept/numbering carry;
+`WE_REVIEW_CARRY_ACROSS_REBASE` and `scripts/settings/review.json`'s
+`carryAcrossRebase` govern rebase carry. Disabling either writer's own control
+prevents it from carrying even when `skipDrainMechanical` is true.
 
 `fix.joinCiAndReview` defaults true. When CI failures and head-local review
 findings are both ready, one existing fix worker gets both inputs. When the
 counterpart is pending, `fix.joinWaitMaxMin` (15) caps the wait from the first
 result timestamp. Polls never reset it; missing timestamps do not create an
 unbounded wait. The same policy applies with CI or review finishing first.
+A pending label alone is not a running review. When red CI prevents review from
+dispatching and no reviewer is live, CI healing starts immediately.
 
 Timing settings resolve per leaf through standard defaults, platform `review` /
 `fix` preferences, tool settings (`scripts/review-settings.json` and the `fix`

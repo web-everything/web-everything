@@ -3875,7 +3875,7 @@ describe('xfkqowg historical ruling replay', () => {
       editComment: (id, body) => { trace.push('referral'); state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; } };
     const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
-      publishGate: () => ({ headSha: head, checks: [] }),
+      readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }),
       mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
     const first = records[0];
     let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: runId,
@@ -4322,7 +4322,7 @@ describe('held item 177: a stacked accept declares and applies only the stack ho
     const root = mkdtempSync(joinPath(tmpdir(), 'stack-hold-effects-'));
     try {
       const posted = []; const shelled = [];
-      const sinks = createReviewPrSinks({ root, out: () => {}, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+      const sinks = createReviewPrSinks({ root, out: () => {}, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
         runNode: (argv) => { shelled.push(argv); return '{"ok":true}'; } });
       const { declared } = await drive({ answer: 'accept', id: 'run-stack-apply' });
       const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);

@@ -268,7 +268,7 @@ describe('dispatchReviewJob — what the daemon calls', () => {
 
   it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('advisory CI waiver: %s', state => {
     let spawns = 0;
-    const out = dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null,
+    const out = dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null, env: { WE_REVIEW_START_AFTER: 'ci-green' },
       advisoryCiWaiver: { head: 'A'.repeat(40), reason: 'human-handoff' },
       ciGate: () => ({ allowed: false, headSha: state === 'missing' ? null : (state === 'mismatched' ? 'b' : 'a').repeat(40),
         reason: state === 'unreadable' ? 'unreadable-ci' : state === 'head-changed' ? 'head-changed' : 'required-checks-not-successful' }),

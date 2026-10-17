@@ -36,9 +36,13 @@ it('waits for pending CI after findings, but never resets the cap when polled', 
 });
 it('does not join findings on a different reviewed head', () => {
   const row = pr({ labels: labels('review:pending'), comments: [{ ...finding, body: finding.body.replaceAll(head, 'b'.repeat(40)) }], statusCheckRollup: [check('test', 'FAILURE')] });
-  expect(plan(row).dispatch).toEqual([]);
-  expect(plan(row, { now: now + 15 * 60_000 }).dispatch[0]).toMatchObject({ kind: 'ci-heal' });
-  expect(plan(row, { now: now + 15 * 60_000 }).dispatch[0].joinedInputs).toBeUndefined();
+  expect(plan(row).dispatch[0]).toMatchObject({ kind: 'ci-heal' });
+  expect(plan(row).dispatch[0].joinedInputs).toBeUndefined();
+});
+it('heals red CI immediately when review is refused and no reviewer is live', () => {
+  const result = plan(pr({ statusCheckRollup: [check('test', 'FAILURE')] }));
+  expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  expect(result.refusals.some(r => r.kind === 'fix-join-wait')).toBe(false);
 });
 it('caps waiting even when a reviewer is still live, while retaining fixer liveness protection', () => {
   const row = pr({ statusCheckRollup: [check('test', 'FAILURE')] });
