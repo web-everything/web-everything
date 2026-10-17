@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 import { dayWindow, classifyPaths, snapshot, writeHistory, backfillDates, protocolProgress, collectMerged, resolveSettings, collectDay, collectAgreement, main } from '../delivery-metrics.mjs';
 import { collectExecutorLogs } from '../coroner-executors.mjs';
 
@@ -20,8 +21,13 @@ vi.mock('node:fs', async importOriginal => {
 
 const traceFs = () => {
   for (const key of ['openSync', 'closeSync', 'readSync', 'readFileSync', 'writeFileSync', 'renameSync', 'unlinkSync']) vi.spyOn(fs, key);
+  // Cached/native helpers can retain Node's named exports outside Vitest's mock.
+  syncBuiltinESMExports();
 };
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+});
 
 const settings = { delivery: { metrics: { deliveryPaths: ['scripts/conveyor/', 'scripts/operations/'], protocols: [] } } };
 const available = rows => ({ rows, source: 'fixture' });
