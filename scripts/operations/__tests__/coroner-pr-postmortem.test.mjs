@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
 import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
@@ -30,6 +31,161 @@ function collectorGh(overrides = {}) {
 }
 const collectWith = gh => collectPrTimeline('example/repo',1,{gh,comments:() => fixture().comments,env:{WE_FIX_LOOP_LEDGER:join(process.cwd(),'.absent-coroner-ledger')}});
 describe('per PR postmortem', () => {
+  it('retries a removed quarantine entry after cursor advancement', async () => {
+    const dir = temp(); const reads = []; let fail = true;
+    const file = join(dir,'merge-cursor-example%2Frepo.json');
+    const args = { repo:'example/repo',dir,settings,
+      listMerged:(_repo,since) => at(600) >= since ? [{number:2,merged_at:at(600)}] : [],
+      collect:(_repo,pr) => { reads.push(pr); if (fail) throw Error('temporarily unavailable'); return fixture(pr); } };
+    try {
+      for (const now of [at(700),at(701)]) await expect(runPostmortemPass({...args,now})).rejects.toThrow('unavailable');
+      await runPostmortemPass({...args,now:at(730)});
+      await runPostmortemPass({...args,now:at(740)});
+      expect(reads).toEqual([2,2,2]);
+      const state = JSON.parse(fs.readFileSync(file)); state.quarantined = [];
+      fs.writeFileSync(file,JSON.stringify(state));
+      fail = false;
+      await runPostmortemPass({...args,now:at(741)});
+      expect(reads).toEqual([2,2,2,2]);
+      expect(JSON.parse(fs.readFileSync(file))).toMatchObject({done:[2],failures:{},quarantined:[]});
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('keeps rapid collection failures retryable across restarts until the minimum duration', async () => {
+    const dir = temp(); let fail = true;
+    const file = join(dir,'merge-cursor-example%2Frepo.json');
+    const args = { repo:'example/repo',dir,settings,listMerged:() => [{number:2}],
+      collect:() => { if (fail) throw Error('rate limited'); return fixture(2); } };
+    try {
+      for (const now of [at(700),new Date(Date.parse(at(700))+15000).toISOString(),new Date(Date.parse(at(700))+30000).toISOString(),at(701)]) {
+        await expect(runPostmortemPass({...args,now})).rejects.toThrow('rate limited');
+        expect(JSON.parse(fs.readFileSync(file))).toMatchObject({quarantined:[],failures:{2:{firstFailedAt:at(700)}}});
+      }
+      fail = false;
+      await runPostmortemPass({...args,now:at(702)});
+      expect(JSON.parse(fs.readFileSync(file))).toMatchObject({done:[2],failures:{},quarantined:[]});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('upgrades legacy quarantine subjects and retries after operator removal', async () => {
+    const dir = temp(); const file = join(dir,'merge-cursor-example%2Frepo.json'); const reads = [];
+    const failure = {pr:2,attempts:3,at:at(702),incomplete:true,error:'old collection failure'};
+    const args = {repo:'example/repo',dir,settings,listMerged:() => [],collect:(_repo,pr) => {reads.push(pr); return fixture(pr);}};
+    try {
+      fs.writeFileSync(file,JSON.stringify({cursor:at(740),done:[],failures:{},quarantined:[failure]}));
+      await runPostmortemPass({...args,now:at(741)});
+      expect(reads).toEqual([]);
+      const state = JSON.parse(fs.readFileSync(file));
+      expect(state.failures[2]).toEqual(failure);
+      state.quarantined = []; fs.writeFileSync(file,JSON.stringify(state));
+      await runPostmortemPass({...args,now:at(742)});
+      expect(reads).toEqual([2]);
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('preserves the elapsed failure budget when upgrading a retry without firstFailedAt', async () => {
+    const dir = temp(); const file = join(dir,'merge-cursor-example%2Frepo.json');
+    try {
+      fs.writeFileSync(file,JSON.stringify({cursor:at(650),done:[],failures:{2:{pr:2,attempts:2,at:at(700)}}}));
+      const args = {repo:'example/repo',dir,settings,listMerged:() => [],collect:() => {throw Error('unavailable');}};
+      await expect(runPostmortemPass({...args,now:at(701)})).rejects.toThrow('unavailable');
+      expect(JSON.parse(fs.readFileSync(file))).toMatchObject({quarantined:[],failures:{2:{attempts:3,firstFailedAt:at(700)}}});
+      await runPostmortemPass({...args,now:at(730)});
+      expect(JSON.parse(fs.readFileSync(file)).quarantined).toMatchObject([{pr:2,attempts:4,firstFailedAt:at(700)}]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['labeled','unlabeled','added_to_merge_queue','removed_from_merge_queue'])('rejects %s events with invalid timestamps', event => {
+    for (const stamp of [undefined,null,'','invalid']) {
+      const labels = [...fixture().labels,{event,created_at:stamp,label:{name:'checking'}}];
+      expect(() => collectWith(collectorGh({'/events?':[labels]}))).toThrow(/incomplete.*timestamp/);
+      expect(() => buildPostmortem({...fixture(),labels})).toThrow(/timestamp/);
+    }
+  });
+  it.each(['labeled','unlabeled'])('rejects %s events with invalid label names', event => {
+    for (const label of [undefined,null,{}, {name:''}, {name:' '}, {name:42}]) {
+      const labels = [{event,created_at:at(10),label}];
+      expect(() => collectWith(collectorGh({'/events?':[labels]}))).toThrow(/incomplete.*label/);
+      expect(() => buildPostmortem({...fixture(),labels})).toThrow(/label/);
+    }
+  });
+  it('preserves ambiguous legacy files and starts fresh encoded discovery', async () => {
+    const dir = temp(); const legacy = {
+      'merge-cursor-a-b-c.json':JSON.stringify({cursor:at(690),done:[1]}),
+      'postmortem-a-b-c-1.json':'legacy json', 'postmortem-a-b-c-1.md':'legacy markdown',
+    };
+    const windows = [];
+    try {
+      for (const [name,contents] of Object.entries(legacy)) fs.writeFileSync(join(dir,name),contents);
+      for (const repo of ['a-b/c','a/b-c']) await runPostmortemPass({repo,dir,now:at(700),settings,
+        listMerged:(subject,since,until) => { windows.push([subject,since,until]); return [{number:1}]; },
+        collect:() => ({...fixture(),repo})});
+      expect(windows).toEqual(['a-b/c','a/b-c'].map(repo => [repo,at(700-1440-1),at(700)]));
+      for (const [name,contents] of Object.entries(legacy)) expect(fs.readFileSync(join(dir,name),'utf8')).toBe(contents);
+      for (const key of ['a-b%2Fc','a%2Fb-c']) expect(fs.existsSync(join(dir,`postmortem-${key}-1.md`))).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('bounds local ledger read ranges', () => {
+    const dir = temp(); const file = join(dir,'ledger.jsonl'); const cap = 1024*1024;
+    try {
+      fs.writeFileSync(file,' '.repeat(cap*2)+'\n'+JSON.stringify({v:1,repo:'example/repo',pr:1,kind:'fix',head:'a'.repeat(40),at:at(20)})+'\n');
+      const size = fs.statSync(file).size; const reads = []; const original = fs.readSync;
+      const spy = vi.spyOn(fs,'readSync').mockImplementation((fd,buffer,offset,length,position) => {
+        reads.push({length,position}); return original(fd,buffer,offset,length,position);
+      });
+      syncBuiltinESMExports();
+      let raw;
+      try { raw = collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}}); }
+      finally { spy.mockRestore(); syncBuiltinESMExports(); }
+      expect(raw.fixLoop).toHaveLength(1);
+      expect(reads.length).toBeGreaterThan(0);
+      expect(reads.reduce((sum,r) => sum+r.length,0)).toBeLessThanOrEqual(cap);
+      expect(reads.every(r => r.position >= size-cap && r.position+r.length <= size)).toBe(true);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('refuses oversized journals before publication', () => {
+    const dir = temp(); const file = join(dir,'incidents.jsonl'); const cap = 64*1024*1024;
+    try {
+      fs.writeFileSync(file,''); fs.truncateSync(file,cap+1);
+      const spy = vi.spyOn(fs,'readSync');
+      try {
+        expect(() => publishPostmortem(buildPostmortem(fixture()),{dir})).toThrow(/exceeds read cap/);
+        expect(spy.mock.calls.reduce((sum,args) => sum+args[3],0)).toBeLessThanOrEqual(cap);
+      } finally { spy.mockRestore(); }
+      expect(fs.statSync(file).size).toBe(cap+1);
+      expect(fs.readdirSync(dir)).toEqual(['incidents.jsonl']);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['journal','report'])('retains cursor and retries publication failures without quarantine: %s', async target => {
+    const dir = temp(); const cursor = join(dir,'merge-cursor-example%2Frepo.json');
+    const report = join(dir,'postmortem-example%2Frepo-2.md');
+    const blocked = target === 'journal' ? join(dir,'incidents.jsonl') : report;
+    const initial = {cursor:at(650),done:[],failures:{},quarantined:[]};
+    const args = {repo:'example/repo',dir,settings,now:at(700),listMerged:() => [{number:2}],collect:() => fixture(2)};
+    try {
+      fs.writeFileSync(cursor,JSON.stringify(initial)); fs.mkdirSync(blocked);
+      await expect(runPostmortemPass(args)).rejects.toThrow();
+      expect(JSON.parse(fs.readFileSync(cursor))).toEqual(initial);
+      fs.rmSync(blocked,{recursive:true});
+      await runPostmortemPass({...args,now:at(701)});
+      expect(JSON.parse(fs.readFileSync(cursor))).toMatchObject({cursor:at(701),done:[2],failures:{},quarantined:[]});
+      expect(fs.existsSync(report)).toBe(true);
+      const rows = fs.readFileSync(join(dir,'incidents.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows.filter(r => r.cause === 'review-finding')).toHaveLength(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it.each(['minLeadHours','minFixRounds','minLostApprovals'])('honors nondefault numeric thresholds: %s', async key => {
+    const value = {...settings.value,minLeadHours:1000,minFixRounds:1000,minLostApprovals:1000,onStandDown:false,[key]:key === 'minLeadHours' ? 12 : 7};
+    const boundary = value[key];
+    const r = {leadHours:0,rounds:[],approvals:{lost:0},standDowns:[]};
+    const set = n => key === 'minLeadHours' ? {...r,leadHours:n} : key === 'minFixRounds' ? {...r,rounds:Array(n)} : {...r,approvals:{lost:n}};
+    expect(shouldPostmortem(set(boundary-1),value)).toBe(false);
+    expect(shouldPostmortem(set(boundary),value)).toBe(true);
+    const dir = temp();
+    try {
+      // Pin the pass wiring as well as the predicate: fixture lead time is ten hours.
+      await runPostmortemPass({repo:'example/repo',dir,settings:{value},now:at(700),listMerged:() => [{number:1}],collect:() => fixture()});
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-1.md'))).toBe(false);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
   it('marks missing phase evidence unknown while retaining observed fields', () => {
     const r = buildPostmortem({ ...fixture(), labels:[], scope:null, prepares:[{ref:'undated'}] });
     expect(r.phases).toEqual([{phase:'unknown',minutes:600}]);
@@ -83,9 +239,15 @@ describe('per PR postmortem', () => {
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
   it('marks malformed verdict ledger rows incomplete rather than reporting zero lost approvals', () => {
-    const raw = collectWith(collectorGh({'/contents/':{content:Buffer.from('{"truncated":\n').toString('base64')}}));
+    const raw = collectWith(collectorGh({'/events?':[fixture().labels],'/contents/':{content:Buffer.from('{"truncated":\n').toString('base64')}}));
     expect(raw.completeness.verdicts).toBe('incomplete');
-    expect(buildPostmortem(raw).approvals.lost).toBeNull();
+    const r = buildPostmortem(raw);
+    expect(r.approvals.lost).toBeNull();
+    expect(raw.comments).toEqual(fixture().comments);
+    expect(r.checks).toHaveLength(1);
+    expect(r.checks[0]).toMatchObject({waitMinutes:10,runMinutes:10});
+    expect(r.phases).toEqual(buildPostmortem(fixture()).phases);
+    expect(r.rounds).toHaveLength(1);
   });
   it('marks failed card history incomplete while preserving core evidence', () => {
     const gh = collectorGh({
@@ -145,10 +307,10 @@ describe('per PR postmortem', () => {
         expect(state.cursor).toBe(at(-740));
         expect(state.done).toContain(3);
       }
-      const result = await runPostmortemPass({ repo:'example/repo', dir, now:at(702), settings, collect, listMerged });
-      expect(result).toMatchObject({ cursor:at(702), quarantined:[{ pr:2, attempts:3, error:'invalid check-run pages' }] });
+      const result = await runPostmortemPass({ repo:'example/repo', dir, now:at(730), settings, collect, listMerged });
+      expect(result).toMatchObject({ cursor:at(730), quarantined:[{ pr:2, attempts:3, error:'invalid check-run pages' }] });
       expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-3.md'))).toBe(true);
-      await runPostmortemPass({ repo:'example/repo', dir, now:at(703), settings, collect, listMerged });
+      await runPostmortemPass({ repo:'example/repo', dir, now:at(731), settings, collect, listMerged });
       expect(reads).toEqual([2,3,2,2]);
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });

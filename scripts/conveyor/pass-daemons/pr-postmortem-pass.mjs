@@ -11,6 +11,7 @@ import { buildPostmortem, shouldPostmortem, publishPostmortem, collectPrTimeline
   coronerStateDir, readOptionalJson, atomicJson, ghJson, validateSubject, withCoronerLock, repoFilenameKey } from '../../operations/coroner-pr-postmortem.mjs';
 
 const MAX_COLLECTION_ATTEMPTS = 3;
+const MIN_COLLECTION_FAILURE_SPAN_MS = 30*60000;
 
 /** Updated-order REST listing avoids search-index lag and its separate rate budget.
  * A failed/capped listing never advances the cursor. Recent closed-but-unmerged PRs are ignored.
@@ -35,7 +36,12 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
     state.failures ??= {};
     state.quarantined ??= [];
     if (!state.failures || typeof state.failures !== 'object' || Array.isArray(state.failures) || !Array.isArray(state.quarantined)
-      || Object.entries(state.failures).some(([pr,f]) => !/^[1-9]\d*$/.test(pr) || !Number.isInteger(f?.attempts) || f.attempts < 1 || f.attempts >= MAX_COLLECTION_ATTEMPTS)) throw Error('invalid merge retry state');
+      || Object.entries(state.failures).some(([pr,f]) => !/^[1-9]\d*$/.test(pr) || !Number.isSafeInteger(f?.attempts) || f.attempts < 1
+        || !Number.isFinite(Date.parse(f.at)) || Date.parse(f.at) > Date.parse(now)
+        || (f.firstFailedAt !== undefined && (!Number.isFinite(Date.parse(f.firstFailedAt)) || Date.parse(f.firstFailedAt) > Date.parse(f.at))))) throw Error('invalid merge retry state');
+    // Upgrade old quarantines that discarded their retry subject. Keep the subject when
+    // quarantining so removing only the quarantine row works after cursor advancement.
+    for (const failure of state.quarantined) state.failures[failure.pr] ??= failure;
     const config = settings.value ?? settings;
     let published = 0;
     const prs = await listMerged(repo,new Date(Date.parse(state.cursor)-60000).toISOString(),now);
@@ -50,12 +56,14 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
         r = { ...buildPostmortem(await collect(repo,p.number)), settings };
         if (r.repo !== repo || r.pr !== p.number || Date.parse(r.mergedAt) > Date.parse(now)) throw Error('timeline subject or merge time disagrees with listing');
       } catch (error) {
-        const failure = { pr:p.number, attempts:(state.failures[p.number]?.attempts ?? 0)+1, at:now, incomplete:true, error:String(error?.message ?? error).slice(0,2000) };
-        if (failure.attempts >= MAX_COLLECTION_ATTEMPTS) {
+        const previous = state.failures[p.number];
+        const failure = { pr:p.number, attempts:(previous?.attempts ?? 0)+1,
+          firstFailedAt:previous?.firstFailedAt ?? previous?.at ?? now,
+          at:now, incomplete:true, error:String(error?.message ?? error).slice(0,2000) };
+        state.failures[p.number] = failure;
+        if (failure.attempts >= MAX_COLLECTION_ATTEMPTS && Date.parse(now)-Date.parse(failure.firstFailedAt) >= MIN_COLLECTION_FAILURE_SPAN_MS) {
           state.quarantined.push(failure);
-          delete state.failures[p.number];
         } else {
-          state.failures[p.number] = failure;
           errors.push(`PR ${p.number}: ${failure.error}`);
         }
         atomicJson(file,state);

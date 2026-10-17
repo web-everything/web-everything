@@ -56,6 +56,13 @@ const PHASES = [
   ['fix-wait', ['review:changes', 'status:sent-back-review', 'status:answered-waiting-fixer']], ['queue-checks', ['merge-queue', 'status:enqueued', 'merge:queued']],
   ['ready-enqueued', ['ready-to-merge', 'status:ready-to-merge']], ['review-dispatch', ['review:queued', 'review:pending', 'review:needed', 'status:awaiting-review']],
 ];
+function validateTimelineEvents(events) {
+  for (const event of events) {
+    const stamp = event.created_at ?? event.createdAt;
+    if (typeof stamp !== 'string' || !Number.isFinite(time(stamp))) throw Error('invalid timeline event timestamp');
+    if (['labeled','unlabeled'].includes(event.event) && (typeof event.label?.name !== 'string' || !event.label.name.trim())) throw Error('invalid timeline event label');
+  }
+}
 export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes } = {}) {
   const { repo, pr, openedAt, mergedAt, verdicts = null, fixLoop = [], scope = null, prepares = [] } = input;
   const comments = (input.comments ?? []).filter(c => time(c.created_at ?? c.createdAt) <= time(mergedAt));
@@ -63,6 +70,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   const checks = [...new Map((input.checks ?? []).filter(c => time(c.created_at ?? c.started_at ?? c.completed_at) <= time(mergedAt)).map(c => [c.id ?? JSON.stringify(c), c])).values()].map(c => time(c.completed_at) > time(mergedAt) ? { ...c, completed_at: null, conclusion: null } : c);
   validateSubject(repo, pr);
   if (!Number.isFinite(time(openedAt)) || !Number.isFinite(time(mergedAt)) || time(mergedAt) < time(openedAt)) throw Error('postmortem requires a merged PR with valid timestamps');
+  validateTimelineEvents(input.labels ?? []);
   const trusted = comments.map(c => ({ ...normalizeComment(c), ref: c.url ?? c.id ?? c.createdAt ?? c.created_at })).filter(c => c.trusted && time(c.at) >= time(openedAt) && time(c.at) <= time(mergedAt));
   const queueEvents = (input.labels ?? []).filter(e => ['added_to_merge_queue','removed_from_merge_queue'].includes(e.event)).map(e => ({ ...e, event: e.event === 'added_to_merge_queue' ? 'labeled' : 'unlabeled', label: { name: 'merge-queue' } }));
   const events = sorted([...(input.labels ?? []), ...queueEvents].filter(e => ['labeled', 'unlabeled'].includes(e.event)).map(e => ({ at: e.created_at ?? e.createdAt, name: e.label?.name, add: e.event === 'labeled', ref: e.url ?? e.id ?? e.created_at })));
@@ -253,6 +261,7 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
   };
   const commits = ghPages(`${root}/pulls/${pr}/commits?per_page=100`,gh);
   const labels = ghPages(`${root}/issues/${pr}/events?per_page=100`,gh);
+  validateTimelineEvents(labels);
   const thread = comments({number:pr,repo});
   if (!Array.isArray(thread) || thread.some(c => !c || typeof c !== 'object' || Array.isArray(c))) throw Error('invalid comment pages');
   // Check every observed head, including force-push timeline heads. Caps fail instead of silently omitting history.
