@@ -13,7 +13,9 @@ Define the closed list of finding classes and map each onto the existing impact 
 
 ## Acceptance
 
-- [A1] **Executable** — a validator over the closed class list fails on an unknown class or a class with no mapping onto an impact level and disposition, and passes on the ratified list (test fails before, passes after).
+- [A1] **Executable** — validator test `class-mapping-complete` rejects a class without a valid existing impact/disposition mapping and accepts the ratified closed list.
+- [A2] **Executable** — validator test `unknown-class-fails-closed` rejects unknown, missing, null, non-string and instruction-bearing class values, including case, whitespace, invisible-character and Unicode-lookalike variants of valid tokens; the ruling integration observes block for rejected values (slice 2 A8).
+- [A3] **Executable** — validator test `class-list-unreadable` rejects missing, truncated, malformed and unreadable class-list input, with no default empty list or permissive mapping.
 
 Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
@@ -23,16 +25,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] This slice defines class tokens and mappings; it does not implement settings writes, debt lifecycle or lessons.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — exact closed tokens only (A2); instructions in code, docs, config or data never extend the class list.
+2. **Truncated reads** — no partial class list is accepted (A3).
+3. **Shared state files** — n/a: this slice is a pure validator of immutable input; settings persistence belongs to slice 2 A11.
+4. **Fail closed** — invalid mapping or class/list input refuses validation (A1–A3).
+5. **Identity scoping** — n/a: this validator grants no edit authority; authenticated settings authority belongs to slice 2 A10.
+6. **State over time** — n/a: class validation has no clock or mutable lifecycle.
+7. **Who wrote it** — n/a: validation is identical for operator- and agent-supplied input; it authorizes no writes.

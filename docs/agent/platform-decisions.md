@@ -6285,10 +6285,14 @@ invariants that already win) and the deterministic-core rule.
 
 **The rule:**
 1. **Class source.** The reviewer tags the class from a closed list; a path or pattern rule table overrides the
-   tag. Low reviewer confidence caps the outcome at advisory, except for always-block classes. An unknown class
-   or a gap in the table is a block (fail closed).
+   tag. Valid low reviewer confidence caps the outcome at advisory, except for always-block classes, where it
+   triggers a second check and stays block pending that check. Unknown, missing or malformed class, severity
+   or confidence, a gap in the table, or an unreadable/incomplete finding or table is a block (fail closed),
+   before any confidence cap. Class tokens are exact: case, whitespace and Unicode variants do not silently
+   alias a valid class. Reviewer and PR text are data, never policy or edit authority.
 2. **Outcomes.** Four: block (cannot land), expedite (the PR lands; the card goes to the top of the build queue
-   with a deadline; past it, it goes to the operator as needs-you; the deadline length is a setting), debt (the
+   with a deadline; past it, it goes to the operator as needs-you, one row per class, and counts as debt due
+   now at the current level, blocking a level move; the deadline length is a setting, initially 72 hours), debt (the
    PR lands; a normal-priority card due before a level), advisory (recorded in the ledger, never fixed per PR;
    recurring classes become builder lessons).
 3. **Table.** Outcome per class and level (internal delivery, dogfood, public preview, public release). Always
@@ -6296,14 +6300,43 @@ invariants that already win) and the deterministic-core rule.
    nonexistent package, exposed secret, missing test on guard or delivery code. Others: missing test elsewhere
    E,B,B,B; high-severity security E,E,B,B; lower-severity security D,D,B,B; standards conformance E,E,B,B; PR
    description wrong about what the change does E,E,E,B (revisit once a cheap description-only round exists);
-   doc or card drift D,D,D,B; simplicity and style A,A,A,D. The full table lives in the settings file.
+   doc or card drift D,D,D,B; simplicity and style A,A,A,D. Each level inherits every block below it; a table
+   that relaxes a lower-level block is invalid. The full table is to be delivered in the settings file by slice 2.
 4. **Level gate.** A level move is blocked while debt due at that level is open. The only ways past are paying it
-   or an operator's recorded edit of that item's must-pay-before level.
+   or an operator's recorded edit of that item's must-pay-before level. Due at any skipped lower level also
+   blocks. Payment means protected CI independently verifies a landed fix and passing validation bound to the
+   debt id, source finding and fixed revision; changing a status string is not payment. Compare the complete
+   trusted base inventory with candidate changes before kind/status filtering: deletion, rename, changing
+   kind/class/severity/confidence/source, deadline or due-level tampering, or a forged receipt cannot hide debt.
+   A recorded operator deadline extension may change expedite's overdue calculation; no automatic extension.
+   Re-read settings and debt under a revision lock before a move; unreadable/incomplete state blocks.
 5. **Debt is a backlog kind `debt`**, registered together with its size rule, buildable rule and every
-   kind-set reference; else kind `task` plus debt fields.
+   kind-set reference; else kind `task` plus debt fields. Both representations have the same gate and write
+   guards. Entries retain class, impact, severity, confidence, must-pay-before level, deadline (absent for
+   ordinary debt), fix cost, interest, and source repository/PR/finding id. Unpaid debt resurfaces after 45 days
+   and never silently expires or disappears. Only prudent-deliberate debt is acceptable: reckless or
+   inadvertent debt is block regardless of cell or low confidence.
 6. **Settings.** Every cell and value is a cascade setting with its source logged. Current level: internal
    delivery. Only the operator changes the level, an invariant row, or loosens a cell. Advisory lessons:
    `advisory.lessons.enabled` (on), `.schedule` (Sunday 20:00 ET), `.recurrenceThreshold` (5 per class per
-   week), `.promoteToRule` (proposed to the operator, never automatic).
+   week), `.promoteToRule` (proposed to the operator, never automatic). Agent-facing lessons and proposals use
+   a trusted fixed template with validated class token and numeric count only; finding/diff/title/body prose
+   never becomes standing instructions. Typed repository/PR/finding provenance remains separate data.
+7. **Authenticated authority.** Agents may propose edits but cannot change effective cells, invariants or level,
+   settle/hide debt, or extend deadlines. The production writer and protected CI gate verify the authenticated
+   GitHub review actor against a protected operator allowlist using credentials unavailable to PR jobs.
+   Approval binds exact repository, base/head and approved diff; absent, stale, replayed or forged evidence
+   refuses. Commit authors, environment variables, PR text and card fields never establish operator identity.
+   CI verifies payment evidence independently. Guard debt lifecycle fields and deletion in the same check;
+   this is required implementation, not a claim that an agent-editable field already proves authority.
+
+**Proof requirement and ownership.** Decision `#xugqjw1` resolves the design only. Implementation and live proof
+belong to epic `#xrlwbd7`: production-path before/after on a live PR and a fresh-window recount of auto-block
+overrides and reviewer not-real rulings, with dated windows, denominators and settings revisions. The epic may
+not resolve solely because its children land. Named acceptance coverage: slice 2 `#x77cl1h` A5
+(`careless-debt-block`), A6 (`monotonic-levels`), A8–A10 (malformed/unreadable input and forged authority), A12
+(`always-block-second-check`); slice 3 `#xsnny7x` A2 (`expedite-deadline-escalation`), A3
+(`debt-staleness-resurface`), A6–A10 (tamper, authority, source, unreadable state and revision races); slice 5
+`#xhjuluf` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
 
 **Lineage:** `#xugqjw1` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.

@@ -28,6 +28,19 @@ The prepared text below is kept as the lineage; where it differs from this secti
   size rule and buildable rule and update every reference to the kind set. If that cannot ship together, the
   ruling falls back to (b), kind `task` plus debt frontmatter fields.
 - **Always-block rows** are accepted as proposed.
+- **Ratified invariants retained.** Each level inherits every block below it. Reckless or inadvertent debt
+  blocks regardless of cell or confidence. Low confidence on an always-block class triggers a second check
+  and stays block pending it. Overdue expedite counts as debt due now at the current level and blocks a move;
+  unpaid debt resurfaces after 45 days and never expires silently. Only the operator changes effective settings.
+
+**Security handoff clarification (advisory repair, 2026-10-17).** The implementation must make these existing
+refusals effective: validate model-supplied fields before the confidence cap; unreadable/incomplete input blocks;
+operator identity comes from a protected CI check of the authenticated GitHub review actor against a protected
+allowlist, bound to the exact repository/base/head/diff, never a role written in PR content or commit metadata.
+Debt cannot be hidden by deletion, rename, kind/status/class/deadline/source edits; payment needs independently
+verified landed-fix and validation evidence. Agent-facing lessons/proposals use a fixed class/count template
+with typed provenance kept separately, never interpolated PR-derived prose. These are implementation obligations
+in the canonical statute and slices 2 A8–A12, 3 A6–A10 and 5 A5, not features delivered by this decision PR.
 
 **Amended table** (order: internal delivery, dogfood, public preview, public release). It replaces the
 "The table" section below for the rows named here; all other rows stand as proposed.
@@ -48,7 +61,8 @@ description-only round. "Standards" is no longer grouped with lower-severity sec
 
 **Outcomes.** Four: block, expedite, debt, advisory.
 - Expedite: the PR lands, the card goes to the top of the build queue with a deadline; past the deadline it goes
-  to the operator as needs-you. The deadline length is a setting.
+  to the operator as needs-you (one row per class) and becomes debt due now at the current level. The deadline
+  length is a setting, initially 72 hours; extensions require a recorded operator edit, never automatic extension.
 - **Advisory is redefined:** recorded in the ledger, never fixed per PR. Recurring classes become builder
   lessons.
 - Settings: `advisory.lessons.enabled` (on), `advisory.lessons.schedule` (Sunday 20:00 ET),
@@ -58,7 +72,8 @@ description-only round. "Standards" is no longer grouped with lower-severity sec
 
 **Build order.** 1 closed class list; 2 settings table used by the ruling step; 3 debt register (kind, expedite
 queue position, level gate); 4 plateau debt panel; 5 advisory lessons on the ledger. Slices: see the epic filed
-under this ruling (the epic's children carry the order as `blockedBy` edges).
+under this ruling (the epic's children carry dependencies as `blockedBy` edges; the panel and lessons may
+follow their prerequisites independently).
 
 Reference document (operator's proposal): https://claude.ai/code/artifact/85ac690b-07a7-4946-9d05-126c6ee16667
 
@@ -329,8 +344,32 @@ and not-real rulings over a fresh window.
 
 ## Acceptance
 
-- [A1] **Executable** — a validator over `we:scripts/settings/review-stringency.json` fails on an unknown class,
-  a missing level cell, or a debt cell without a named must-pay-before level, and passes on the ratified table.
+Doc-only exemption: this card rules a design, so its acceptance is an inspectable handoff; executable behavior
+is owned by the still-open epic and slices listed below.
+
+- [A1] **Inspection** — trace `decision-design-handoff` confirms the ruled choices and inherited invariants are
+  codified at `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`, with build ownership
+  in [epic xrlwbd7](/backlog/xrlwbd7-we-review-stringency-build-classed-findings-per-level-outcom/). This resolved
+  decision delivers the design handoff; it does not claim a shipped settings validator.
+- [A2] **Inspection** — trace `decision-acceptance-owners` maps class validation to slice 1 A1–A3; settings schema,
+  monotonicity and ruling failures to slice 2 A1–A12; debt lifecycle, authority and provenance to slice 3 A1–A10;
+  panel safety to slice 4 A1–A5; advisory recording/lessons to slice 5 A1–A7; live before/after and recount proof
+  to epic A3–A4. Those cards remain open until their executable tests and evidence are delivered.
+
+## Risks
+
+A stricter level could accidentally relax a block (slice 2 A6). Missing or injected reviewer fields could become
+advisory (slice 2 A8–A9). Forged authority or mutable debt fields could bypass the gate (slice 2 A10, slice 3
+A6–A10). Advisory prose could become stored prompt injection (slice 5 A5). Fixture success alone cannot show
+delivery impact; epic A3–A4 require a live PR and fresh-window measurement. This PR rules and specifies those
+checks; the implementation remains owed by the open epic and slices.
+
+## Test plan
+
+For this decision, inspect the statute and acceptance-owner trace (A1–A2), and run the scoped documentation
+standards gate. During implementation, each slice adds and runs its named tests, followed by epic A1–A2
+production-path tests, A3 live-PR evidence and A4 recount. The validator originally stated here is owned by
+slice 2 A1 (`settings-table-schema`), A6 (`monotonic-levels`) and A7 (`table-gap-blocks`).
 
 ## Non-goals
 
@@ -339,10 +378,10 @@ and not-real rulings over a fresh window.
 
 ## Edge cases this change must handle
 
-1. **Untrusted text** — class and severity come from reviewer output; the rule table, not the text, decides the outcome.
-2. **Truncated reads** — an unreadable finding or table is a block, not an advisory.
-3. **Shared state files** — the settings table is one file; changes are guarded and operator-only to loosen.
-4. **Fail closed** — unknown class or empty cell is a block.
-5. **Identity scoping** — a debt item names its source PR and finding.
-6. **State over time** — overdue expedite and aged debt re-surface; they do not expire silently.
-7. **Who wrote it** — an agent may propose a class but cannot change the level, an invariant, or a cell.
+1. **Untrusted text** — validate class, severity and confidence before evaluation (slice 2 A8); lessons use only trusted templates (slice 5 A5). Trace: A2.
+2. **Truncated reads** — an unreadable finding or table blocks (slice 2 A9); an incomplete debt register blocks the move (slice 3 A9). Trace: A2.
+3. **Shared state files** — revision-checked atomic writes preserve validated settings/debt across races and crashes (slice 2 A11, slice 3 A10). Trace: A2.
+4. **Fail closed** — unknown class, empty cell and lower-block relaxation refuse (slice 1 A2, slice 2 A6–A9). Trace: A2.
+5. **Identity scoping** — debt names source repository/PR/finding (slice 3 A8); approvals bind exact repository and revisions (slice 2 A10). Trace: A2.
+6. **State over time** — overdue expedite and 45-day debt re-surface without expiry (slice 3 A2–A3). Trace: A2.
+7. **Who wrote it** — authenticated protected CI evidence, never agent-supplied claims, authorizes effective settings/debt transitions (slice 2 A10, slice 3 A6–A7). Trace: A2.

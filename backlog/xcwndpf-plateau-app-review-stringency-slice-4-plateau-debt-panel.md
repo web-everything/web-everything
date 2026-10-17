@@ -14,7 +14,11 @@ A read-only plateau-app panel over the debt items: class, severity, must-pay-bef
 
 ## Acceptance
 
-- [A1] **Executable** — a plateau-app test renders the debt panel from fixture debt items and fails before the panel exists.
+- [A1] **Executable** — plateau-app rendering test `debt-panel-fields` displays class, severity, must-pay-before level, deadline and source PR/finding for ordinary debt and overdue expedite fixtures, using the register's effective state rather than recalculating payment from status.
+- [A2] **Executable** — rendering test `debt-panel-untrusted-content` supplies instruction strings, markup, quotes, backticks, newlines, invisible characters and unsafe source URLs; text renders inert, links allow only validated source repository/PR destinations, and no debt content becomes HTML, script or an agent instruction.
+- [A3] **Executable** — panel integration test `debt-panel-unavailable` supplies an unreadable or incomplete register and shows unavailable with its last successful revision/time, never a zero-debt or paid indication; paginated fixtures render all entries before the view is labelled complete.
+- [A4] **Executable** — panel integration test `debt-panel-read-only-scope` uses the existing authenticated repository access boundary: unauthorized repositories refuse before returning debt, authorized reads remain read-only, and crafted requests expose no payment, level-change or deadline-change action.
+- [A5] **Executable** — panel integration test `debt-panel-revision-refresh` replaces a snapshot during refresh; only one complete revision renders, older responses cannot overwrite newer state, and source/provenance links retain the matching repository and finding.
 
 Ruling and amended table: [we:backlog/xugqjw1](/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/) and the statute `we:docs/agent/platform-decisions.md#review-stringency-classified-outcomes`.
 
@@ -24,16 +28,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] This panel grants no debt or settings write authority and does not implement gate decisions. Slice 5 may follow the register independently; this is the last core delivery surface.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — inert rendering and validated source links (A2); content never supplies authority (A4).
+2. **Truncated reads** — incomplete pages and unreadable snapshots show unavailable, never zero debt (A3).
+3. **Shared state files** — the panel reads revisioned snapshots and writes no register files (A4–A5).
+4. **Fail closed** — unavailable data cannot claim a clear gate (A3); the authoritative gate remains slice 3.
+5. **Identity scoping** — repository access is checked before data disclosure (A4); source PR/finding remains attached (A1, A5).
+6. **State over time** — stale responses cannot replace newer state and unavailable data is labelled with its last successful revision/time (A3, A5).
+7. **Who wrote it** — no browser or agent claim authorizes a write through this read-only view (A4).
