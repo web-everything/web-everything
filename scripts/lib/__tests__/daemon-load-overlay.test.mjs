@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync, existsSync, readSync,
+  mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, readSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -307,7 +307,6 @@ import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
   rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS, readFileTail,
 } from '../daemon-load-overlay.mjs';
-import { CUT_MARKER, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 const quietLog = { error: () => {}, log: () => {} };
 
@@ -416,6 +415,13 @@ describe('judgeDispatchSmoke — the pass/fail rule for one real worker', () => 
     const r = judgeDispatchSmoke({ nonce: 'n1', marker: null, record, denials: ['This command requires approval'] });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('commands-denied');
+    expect(r.detail).toBe('1 denied tool call(s) in the transcript');
+  });
+
+  it('a worker-written blocker kind reaches the detail only as a plain token', () => {
+    const record = (kind) => ({ status: 'done', result: { blocker: { kind } } });
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: record('permission-wall'), denials: [] }).detail).toBe('blocker=permission-wall');
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: record('permission "mikeword13x"'), denials: [] }).detail).toBe('blocker=unrecognised');
   });
 
   it('a done record without the marker fails even with no transcript to read', () => {
@@ -546,8 +552,10 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     expect(r).toMatchObject({ adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed', dispatchSmoke: { phase: 'candidate', result: { reason: 'commands-denied' } } });
   });
 
-  it('the rollback path redacts and bounds a worker-supplied detail before the event log, the thrown error and the log', async () => {
-    const secrets = ['ghp_secretAAAA', 'ANTHROPIC_API_KEY=sk-ant-api03-secretCCCC', 'DB_PASSWORD=hunter2hunter2', 'https://bot:pa55word@example.com'];
+  // The real smoke builds `detail` from an allow-listed summary (the runRealDispatchSmoke tests below); this sink only
+  // bounds whatever detail an injected smoke returns and redacts token shapes.
+  it('the rollback path bounds a smoke-supplied detail before the event log, the thrown error and the log', async () => {
+    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB'];
     const appendEventFn = vi.fn();
     const log = { error: vi.fn(), log: () => {} };
     const thrown = [];
@@ -568,7 +576,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const reason = appendEventFn.mock.calls[0][1].reason;
     expect(reason.length).toBeLessThanOrEqual(500);
     const sinks = [reason, thrown.join('\n'), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
-    for (const s of ['secretAAAA', 'secretCCCC', 'hunter2hunter2', 'pa55word']) for (const sink of sinks) expect(sink).not.toContain(s);
+    for (const s of ['secretAAAA', 'secretBBBB']) for (const sink of sinks) expect(sink).not.toContain(s);
   });
 
   it('a candidate worker launch that THROWS removes ONLY this overlay and rebuilds without it — it is not left registered with a not-in-tree warning', async () => {
@@ -935,7 +943,10 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     writeFileSync(marker, nonce);
     writeFileSync(join(store, `${slug}.json`), JSON.stringify({ status: 'done' }));
   };
-  const smoke = (spawn, extra = {}) => runRealDispatchSmoke({ tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false, ...extra });
+  const smoke = (spawn, extra = {}) => runRealDispatchSmoke({
+    tree: '.', env: {}, settings: fastSettings(), spawn, home: join(work, 'home'), log: quietLog, probeAlive: () => false,
+    diagnosticsDir: join(work, 'diag'), ...extra,
+  });
 
   it('retries a launch timeout once with fresh evidence, then accepts the passing worker', async () => {
     const spawn = launchFixture((a) => { if (spawn.mock.calls.length === 2) finish(a); });
@@ -956,32 +967,43 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(spawn).toHaveBeenCalledTimes(2);
     expect(stopWrapper).toHaveBeenCalledTimes(2);
     expect(r).toMatchObject({ ok: false, reason: 'timeout', diagnostics: { wrapperPid: 12345, wrapperAliveAtTimeout: true, sessionAppeared: false, transcriptAppeared: false, firstOutputMs: 17 } });
-    expect(r.diagnostics.stderrTail.split('\n')).toHaveLength(30);
     expect(r.diagnostics.launchStartedAt).toMatch(/^\d{4}-/);
-    expect(r.diagnostics.stderrTail).toContain('line 39');
+    expect(r.diagnostics).not.toHaveProperty('stderrTail');
+    // Each attempt's last 30 stderr lines are in its own 0600 file under the diagnostics dir; the capture is gone.
     expect(r.attempts).toHaveLength(2);
+    for (const a of r.attempts) {
+      const file = a.diagnostics.stderrFile;
+      expect(file.startsWith(join(work, 'diag'))).toBe(true);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      expect(readFileSync(file, 'utf8').trimEnd().split('\n')).toEqual(Array.from({ length: 30 }, (_, n) => `line ${n + 10}`));
+    }
+    expect(r.detail).toContain(`stderrFile=${r.diagnostics.stderrFile}`);
+    for (const call of spawn.mock.calls) expect(existsSync(join(call[1][8], 'wrapper.stderr'))).toBe(false);
   });
 
-  it('keeps wrapper stderr out of detail and logs, and redacts and bounds it at the source', async () => {
-    const secrets = ['ghp_secretAAAA', 'github_pat_secretBBBB', 'sk-ant-api03-secretCCCC', 'npm_secretDDDDDDDDDDDDDDDDDDDD', 'Bearer secretEEEE',
-      'secretFFFF', 'hunter2hunter2', 'pa55word', 'opaqueCredential123'];
-    const spawn = launchFixture(({ scratch }) => {
-      writeFileSync(join(scratch, 'wrapper.stderr'), [...secrets.slice(0, 5).map((s) => `token ${s}`),
-        'OPENAI_API_KEY=secretFFFF', 'SERVICE_KEY=opaqueCredential123', 'progress\rDB_PASSWORD=hunter2hunter2', 'clone https://bot:pa55word@example.com/x', 'y'.repeat(20_000)].join('\n'));
-    });
+  it('never carries wrapper stderr text beyond its error class in detail, diagnostics, attempts or logs', async () => {
+    // Not secret-shaped: only the design (the allow-listed summary), never a redactor, keeps these out.
+    const lines = ['booting alphaword1x', 'TypeError: cannot read "password: bravoword2x', 'charlieword3x deltaword4x"',
+      'API_KEY="echoword5x', 'foxtrotword6x"', 'progress\rgolfword7x', 'y'.repeat(20_000)];
+    const spawn = launchFixture(({ scratch }) => writeFileSync(join(scratch, 'wrapper.stderr'), lines.join('\n')));
     const log = { error: vi.fn() };
     const r = await smoke(spawn, { log });
     expect(r).toMatchObject({ ok: false, reason: 'timeout' });
-    const logged = log.error.mock.calls.map((c) => c.join(' ')).join('\n');
-    for (const s of secrets) {
-      expect(r.detail).not.toContain(s);
-      expect(r.diagnostics.stderrTail).not.toContain(s);
-      expect(JSON.stringify(r.attempts)).not.toContain(s);
-      expect(logged).not.toContain(s);
+    expect(r.diagnostics.errorClass).toBe('TypeError: cannot read <…>');
+    const sinks = [JSON.stringify(r), log.error.mock.calls.map((c) => c.join(' ')).join('\n')];
+    for (const w of ['alphaword1x', 'bravoword2x', 'charlieword3x', 'deltaword4x', 'echoword5x', 'foxtrotword6x', 'golfword7x', 'yyyyyyyy']) {
+      for (const sink of sinks) expect(sink).not.toContain(w);
     }
-    expect(r.detail).not.toContain('token ');
-    expect(r.diagnostics.stderrTail).toContain('token ghp_<redacted>');
-    expect(Math.max(...r.diagnostics.stderrTail.split('\n').map((l) => l.length))).toBeLessThanOrEqual(500);
+    expect(readFileSync(r.diagnostics.stderrFile, 'utf8')).toContain('golfword7x');
+  });
+
+  it('a launch-harness failure carries its signal, exit code and class, with its stderr only in the 0600 file', async () => {
+    const spawn = vi.fn(() => ({ status: 3, signal: null, stderr: 'loading hotelword8x\nSyntaxError: Unexpected token "indiaword9x"\n    at julietword10x\n' }));
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: false, reason: 'launch-failed', diagnostics: { exitCode: 3, signal: null, errorClass: 'SyntaxError: Unexpected token <…>' } });
+    for (const w of ['hotelword8x', 'indiaword9x', 'julietword10x']) expect(JSON.stringify(r)).not.toContain(w);
+    expect(statSync(r.diagnostics.stderrFile).mode & 0o777).toBe(0o600);
+    expect(readFileSync(r.diagnostics.stderrFile, 'utf8')).toContain('julietword10x');
   });
 
   it('retries a launch timeout whose only record is the wrapper\'s own started record', async () => {
@@ -1008,36 +1030,22 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     }
     expect(tail).not.toContain('line 0000');
     expect(tail.endsWith(text.split('\n').pop())).toBe(true);
-    // A mid-file read is marked cut, then holds whole lines only.
-    expect(tail.startsWith(`${CUT_MARKER}\nline `)).toBe(true);
-    expect(text.endsWith(tail.slice(CUT_MARKER.length + 1))).toBe(true);
+    // A mid-file read holds whole lines only.
+    expect(tail.startsWith('line ')).toBe(true);
+    expect(text.endsWith(tail)).toBe(true);
   });
 
-  it('a mid-file read that opens inside a multiline quoted value never leaks the value', () => {
-    const file = join(work, 'multiline.stderr');
-    // The 64 KiB read starts inside the opener's line, so its first whole line (`bravo`) is inside the value.
-    const tail = Array.from({ length: 1_500 }, (_, n) => `tail line ${n} ${'x'.repeat(28)}`).join('\n');
-    const text = `DB_PASSWORD="${'y'.repeat(4_000)} alpha\nbravo\ncharlie delta" FATAL\n${tail}`;
-    writeFileSync(file, text);
-    expect(text.length - 64 * 1024).toBeLessThan(text.indexOf('bravo'));
-    const out = redactedTail(readFileTail(file), 5_000);
-    for (const w of ['alpha', 'bravo', 'charlie', 'delta']) expect(out).not.toContain(w);
-    expect(out).toContain('tail line 0');
-  });
-
-  it('never returns a mid-line window: drops to the first break of any kind, and withholds a window with none', () => {
+  it('never returns a mid-line window: drops to the first break of any kind, and a window with none is empty', () => {
     const cr = join(work, 'cr.stderr');
     writeFileSync(cr, 'progress 50%\r'.repeat(6_000));
-    expect(readFileTail(cr).startsWith(`${CUT_MARKER}\nprogress 50%`)).toBe(true);
+    expect(readFileTail(cr).startsWith('progress 50%')).toBe(true);
     const oneLine = join(work, 'one-line.stderr');
     writeFileSync(oneLine, `export DB_PASSWORD="${'secretword '.repeat(8_000)}" FATAL`);
-    expect(redactedTail(readFileTail(oneLine))).not.toContain('secretword');
+    expect(readFileTail(oneLine)).toBe('');
   });
 
-  it('redacts a transcript denial before cutting it, so a quoted secret past 200 chars never leaks', async () => {
-    const body = `This command requires approval: ${'x'.repeat(150)} --password "aa bb cc dd ee ff"`;
-    expect(body.indexOf('bb')).toBeLessThan(199);
-    expect(body.indexOf('ff')).toBeGreaterThan(200);
+  it('a transcript denial is counted, never quoted, in the detail', async () => {
+    const body = 'This command requires approval: deploy --password "kiloword11x limaword12x"';
     const spawn = launchFixture(({ sessionId }) => {
       const dir = join(work, 'home', '.claude', 'projects', 'test');
       mkdirSync(dir, { recursive: true });
@@ -1045,7 +1053,8 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     });
     const r = await smoke(spawn);
     expect(r).toMatchObject({ ok: false, reason: 'commands-denied' });
-    for (const w of ['bb', 'cc', 'ff']) expect(r.detail).not.toContain(w);
+    expect(r.detail).toMatch(/^1 denied tool call\(s\) in the transcript; /);
+    for (const w of ['requires approval', 'deploy', 'kiloword11x', 'limaword12x']) expect(JSON.stringify(r)).not.toContain(w);
   });
 
   it.skipIf(process.platform === 'win32')('never blocks on a FIFO left at the wrapper stderr path', () => {
@@ -1153,9 +1162,11 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
 
   it('a launch that exits non-zero fails the smoke with launch-failed, without waiting for a record', async () => {
     const settings = { ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 5_000 };
-    const spawn = vi.fn(() => ({ status: 1, stdout: '', stderr: 'boom\n' }));
-    const r = await runRealDispatchSmoke({ tree: '/tree', env: {}, settings, spawn, pollMs: 1, home: join(work, 'home'), log: quietLog });
-    expect(r).toMatchObject({ ok: false, reason: 'launch-failed', detail: 'boom' });
+    const spawn = vi.fn(() => ({ status: 1, stdout: '', stderr: 'boomword\n' }));
+    const r = await runRealDispatchSmoke({ tree: '/tree', env: {}, settings, spawn, pollMs: 1, home: join(work, 'home'), log: quietLog, diagnosticsDir: join(work, 'diag') });
+    expect(r).toMatchObject({ ok: false, reason: 'launch-failed' });
+    expect(r.detail).toMatch(/^the launch harness failed; .*exitCode=1/);
+    expect(JSON.stringify(r)).not.toContain('boomword');
   });
 });
 

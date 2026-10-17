@@ -6,7 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
-import { redactSecrets } from './smoke-classify/redact-detail.mjs';
+import { pickSmokeDiagnostics } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -524,9 +524,10 @@ export async function smokeAndAdopt({
     const why = redactDetail(`dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`);
     alert('dispatch-smoke-failed', {
       reason: result.reason, detail: redactDetail(result.detail ?? ''),
-      // A tail is redacted whole (each line still capped): split first, a multiline quoted value would leak.
-      diagnostics: result.diagnostics ? { ...result.diagnostics, stderrTail: redactSecrets(result.diagnostics.stderrTail ?? '') } : null,
-      attempts: result.attempts?.map((a) => ({ ...a, diagnostics: a.diagnostics ? { ...a.diagnostics, stderrTail: redactSecrets(a.diagnostics.stderrTail ?? '') } : null })) ?? [],
+      // The allow-listed summary only (typed fields, the error class, the 0600 stderr file's path) — never child text.
+      diagnostics: pickSmokeDiagnostics(result.diagnostics),
+      attempts: Array.isArray(result.attempts)
+        ? result.attempts.map((a) => ({ reason: typeof a?.reason === 'string' ? a.reason : null, diagnostics: pickSmokeDiagnostics(a?.diagnostics) })) : [],
       suspects: suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
       evidence: result.scratch ?? null, transcript: result.transcript ?? null,
       action: definite ? 'dropped-suspects' : 'retry-with-backoff',

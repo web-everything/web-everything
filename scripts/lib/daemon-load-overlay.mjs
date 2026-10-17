@@ -55,13 +55,15 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { homedir, tmpdir } from 'node:os';
 import {
-  closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync,
+  closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync,
 } from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { strictEnvInteger } from './daemon-boot-smoke.mjs';
-import { CUT_MARKER, redactDetail, redactedTail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import {
+  pickSmokeDiagnostics, smokeDiagnosticsDir, smokeErrorClass, smokeExitCode, smokeSignal, strictEnvInteger, writeStderrTail,
+} from './daemon-boot-smoke.mjs';
+import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -311,7 +313,11 @@ export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedO
   const blocker = record?.result?.blocker ?? null;
   const blockerKind = typeof blocker === 'string' ? blocker : blocker?.kind;
   if (denials.length || (blockerKind && PERMISSION_BLOCKER.test(String(blockerKind))) || record?.denied) {
-    return { ok: false, reason: 'commands-denied', detail: redactDetail(denials[0] || blockerKind || String(record?.denied)) };
+    // A count or a kind token, never the denial text: the transcript stays a local file the result names.
+    const detail = denials.length ? `${denials.length} denied tool call(s) in the transcript`
+      : blockerKind ? `blocker=${/^[A-Za-z0-9_.:-]{1,64}$/.test(String(blockerKind)) ? blockerKind : 'unrecognised'}`
+        : 'the completion record is marked denied';
+    return { ok: false, reason: 'commands-denied', detail };
   }
   if (record?.status === 'done') {
     return marker === nonce ? { ok: true, reason: 'passed' } : { ok: false, reason: 'no-commands-ran', detail: 'the worker finished without running its smoke commands' };
@@ -332,8 +338,7 @@ function transcriptDenials(file) {
     for (const item of Array.isArray(row?.message?.content) ? row.message.content : []) {
       if (item?.type !== 'tool_result' || !item.is_error) continue;
       const body = typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? '');
-      // Redacted whole, then cut (redactDetail keeps 500 chars): a cut first could split a quoted secret.
-      if (/requires approval|permission/i.test(body)) out.push(redactDetail(body));
+      if (/requires approval|permission/i.test(body)) out.push(body);
     }
   }
   return out;
@@ -352,8 +357,7 @@ function findTranscript(ids, home = homedir()) {
   return null;
 }
 
-/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file,
- *  and the text then opens with `CUT_MARKER`.
+/** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file.
  *  One read of at most `bytes`, positioned at the final window (`read` is injectable so a test can pin that range). */
 const LINE_BREAK = new RegExp(`[\\n\\r${String.fromCharCode(0x85, 0x2028, 0x2029)}]`);
 export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
@@ -369,16 +373,21 @@ export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
     const n = read(fd, buf, 0, buf.length, start);
     const text = buf.subarray(0, n).toString('utf8');
     if (start === 0) return text;
-    // A mid-file read starts inside a line: drop it up to the first break of any kind, so redaction never sees a
-    // cut-open quoted secret; a window with no break at all is one partial line and is withheld. The next whole line
-    // may still be inside a multiline value, so the text is marked cut for `redactedTail`.
+    // A mid-file read starts inside a line: drop it up to the first break of any kind; a window with no break at all
+    // is one partial line and is dropped too.
     const br = text.search(LINE_BREAK);
-    return br >= 0 ? `${CUT_MARKER}\n${text.slice(br + 1)}` : '';
+    return br >= 0 ? text.slice(br + 1) : '';
   } catch {
     return '';
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+}
+
+/** A failed attempt's `detail`: a fixed verdict phrase plus the allow-listed diagnostics — never child text. */
+function dispatchSummary(what, diagnostics) {
+  const picked = pickSmokeDiagnostics(diagnostics) ?? {};
+  return `${what}; ${Object.entries(picked).filter(([, v]) => v !== null).map(([k, v]) => `${k}=${v}`).join(', ')}`;
 }
 
 function readJson(file) {
@@ -418,8 +427,10 @@ export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr
 async function runRealDispatchSmokeAttempt({
   tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
   routingPolicy = readRoutingPolicy(), probeAlive = isAlive, stopWrapper = (pid) => process.kill(pid, 'SIGTERM'),
+  diagnosticsDir = smokeDiagnosticsDir(env),
 }) {
   const t0 = Date.now();
+  const launchStartedAt = new Date(t0).toISOString();
   const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
   const store = join(scratch, 'completions');
   mkdirSync(store, { recursive: true });
@@ -438,7 +449,13 @@ async function runRealDispatchSmokeAttempt({
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
-    return { ...base, ok: false, reason: 'launch-failed', detail: redactedTail(String(launch.stderr || launch.error?.message || '').trim(), 3).split('\n').join(' | '), ms: Date.now() - t0 };
+    const stderr = String(launch.stderr || launch.error?.message || '');
+    const diagnostics = {
+      launchStartedAt, signal: smokeSignal(launch.signal), exitCode: smokeExitCode(launch.status),
+      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(String(launch.error ?? '')),
+      stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}-launch` }),
+    };
+    return { ...base, ok: false, reason: 'launch-failed', detail: dispatchSummary('the launch harness failed', diagnostics), diagnostics, ms: Date.now() - t0 };
   }
   let launched = {};
   try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
@@ -482,22 +499,24 @@ async function runRealDispatchSmokeAttempt({
     verdict = observe(false);
     if (verdict.pending) verdict = { ok: true, reason: 'passed' };
   }
-  const diagnostics = {
-    wrapperPid, wrapperAliveAtTimeout: verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null,
-    launchStartedAt: new Date(t0).toISOString(),
-    // Redacted and line-bounded at the source, so no consumer of the result can persist a raw token.
-    stderrTail: redactedTail(readFileTail(join(scratch, 'wrapper.stderr'))),
-    sessionAppeared: !!session, transcriptAppeared: !!transcript,
-    firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
-  };
-  if (!verdict.ok && verdict.reason === 'timeout' && diagnostics.wrapperAliveAtTimeout) {
+  const wrapperAliveAtTimeout = verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null;
+  if (!verdict.ok && verdict.reason === 'timeout' && wrapperAliveAtTimeout) {
     try { stopWrapper(wrapperPid); } catch { /* already gone */ }
   }
+  // The wrapper's raw stderr capture lives only for the attempt: a failure keeps its last 30 lines in the 0600 file
+  // under the daemon state dir, and the capture itself is removed either way.
+  const captured = join(scratch, 'wrapper.stderr');
+  const stderr = verdict.ok ? '' : readFileTail(captured);
+  try { rmSync(captured, { force: true }); } catch { /* best effort */ }
+  const diagnostics = {
+    wrapperPid, wrapperAliveAtTimeout, launchStartedAt, signal: null, exitCode: null,
+    sessionAppeared: !!session, transcriptAppeared: !!transcript,
+    firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
+    errorClass: smokeErrorClass(stderr),
+    stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}` }),
+  };
   const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
-  // The stderr tail stays in the structured `diagnostics` field only; `detail` carries flags, never stderr.
-  if (!verdict.ok) {
-    verdict.detail = `${verdict.detail || verdict.reason}; wrapperAliveAtTimeout=${diagnostics.wrapperAliveAtTimeout}, sessionAppeared=${diagnostics.sessionAppeared}, transcriptAppeared=${diagnostics.transcriptAppeared}, firstOutputMs=${diagnostics.firstOutputMs}`;
-  }
+  if (!verdict.ok) verdict.detail = dispatchSummary(verdict.detail || verdict.reason, diagnostics);
   return {
     ...base, ...verdict, handle, wrapperPid, transcript, diagnostics, launchTimeout, ms: Date.now() - t0,
   };
@@ -519,7 +538,7 @@ export async function runRealDispatchSmoke(args) {
         result.detail = `${result.detail ?? result.reason}; ${result.note}; attempts=${attempts.map((r) => r.reason).join(',')}`;
         log.error?.(`daemon-load-overlay: dispatch smoke ${result.reason} — ${result.note}`);
       }
-      return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: r.diagnostics })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
+      return { ...result, attempts: attempts.map((r) => ({ reason: r.reason, diagnostics: pickSmokeDiagnostics(r.diagnostics) })), ms: attempts.reduce((n, r) => n + r.ms, 0) };
     }
     log.error?.(`daemon-load-overlay: retrying dispatch smoke after launch timeout — ${result.detail}`);
   }
@@ -539,9 +558,10 @@ async function runDispatchSmokeSafely(dispatchSmoke, args) {
     const r = await dispatchSmoke(args);
     // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
     if (!(r && typeof r === 'object' && typeof r.ok === 'boolean')) return { ok: false, reason: 'smoke-bad-result' };
-    // Every rollback, event-log and thrown-error sink reads `detail`: make it safe once, here.
+    // Every rollback, event-log and thrown-error sink reads `detail` (allow-listed at the source); bound it once, here.
     return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail) };
   } catch (e) {
+    // The daemon's own exception (a spawn error), not child output: its first line, bounded.
     return { ok: false, reason: 'smoke-threw', detail: redactDetail(String((e && e.message) || e).split('\n')[0]) };
   }
 }

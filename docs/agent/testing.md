@@ -7,20 +7,19 @@ Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.b
 (default 1; zero disables) retries only SIGTRAP/SIGSEGV/SIGABRT/SIGBUS/SIGILL deaths, serially.
 Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
 `scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
-`WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Retain per-attempt signal,
-exit code and the last 30 stderr lines in the smoke result. Rebuild rejection/held/stale alerts
-must preserve boot tails beyond the ordinary detail caps while still redacting secrets: redact
-stderr where it is read (`redactSecrets`: the `ci-heal-mark.mjs` secret shapes plus generic
-`*_KEY=` names, `*PASSWORD=` pairs, URL credentials and PEM keys, including a body whose BEGIN line
-was cut off; NFKC and invisible characters folded first; CR/U+2028 split lines; 500-char lines).
-Always redact first and cut after, so a cut never splits a quoted secret; fail closed when
-redaction cannot run (a line over 256 KiB, input over 1 MiB, or a throw emits a withheld marker).
-A boot detail names every failed entry and its signal in its header and gives each failure an
-equal share of a 12 KB budget (16 KB backstop). A dispatch-smoke stderr tail stays in the
-structured `diagnostics` field only, never in `detail`; `detail` is redacted where the verdict is
-made, so the overlay event log, held state, thrown errors and logs never carry raw worker text.
-The wrapper's captured stderr compacts past 1 MiB, and only its last 64 KiB is read. Env integers
-are strict digits; empty is unset.
+`WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Env integers are strict
+digits; empty is unset.
+
+Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
+dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
+allow-listed summary (`daemon-boot-smoke.mjs#pickSmokeDiagnostics`): entry name, signal, exit
+code, attempts, launch start time, session/transcript presence, and an error class. The class is
+the first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with every quoted string
+(an unterminated one runs to the line end) replaced by `<…>`; a bare `Error:` line has none. The
+raw output's last 30 lines go only to a new owner-only (0600) file under
+`<daemon state dir>/smoke-diagnostics` (0700, newest 50 kept), and the summary names its path.
+A transcript denial is counted, never quoted. Test with sentinel words that are not
+secret-shaped, so only the design can keep them out of every sink.
 Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
 exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
 
@@ -1455,7 +1454,9 @@ scratch store and session ID, retain both attempts' diagnostics, and report
 “retried after launch timeout” on recovery. Assertion failures never retry.
 The smoke opts into wrapper stderr capture and first-byte timing; missing output is
 represented by `firstOutputMs: null`, not zero. Failure alerts retain the wrapper PID,
-liveness at timeout, launch time, session/transcript presence and the last 30 stderr lines.
+liveness at timeout, launch time, session/transcript presence, the error class and the path of
+the 0600 file holding the last 30 stderr lines; the wrapper's raw capture is removed after each
+attempt (see *Daemon entry boot smoke* above).
 Exercise the launch with injected processes and isolated homes; wrapper output capture
 also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.

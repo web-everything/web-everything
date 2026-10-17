@@ -31,7 +31,6 @@ import { appendFileSync, closeSync, constants, fstatSync, mkdirSync, openSync, r
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CUT_MARKER } from '../lib/daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { finishEnvelopeRecord, isValidSessionSlug, newEnvelopeRecord, redactFreeText } from './completion-record.mjs';
 import { resolveCompletionsDir, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { claudeWorkerResultSchema } from './worker-result.mjs';
@@ -328,17 +327,15 @@ async function runWorkerOnce(spec, io, stop) {
                 bytes = bytes.subarray(br + 1);
                 discardStderrLine = false;
               }
-              appendFileSync(file, bytes);
+              // Raw worker text: owner-only on disk. The smoke reads its tail into a 0600 file and removes this capture.
+              appendFileSync(file, bytes, { mode: 0o600 });
               stderrBytes += bytes.length;
-              // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB
-              // (a byte cut would leave a partial first line, which a reader could redact from a cut-open secret).
+              // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB.
               if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
                 const kept = readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES);
                 const br = firstLineBreak(kept);
-                // The kept lines may start inside a multiline value, so the file opens with the cut marker its reader
-                // (`redactedTail`) redacts against.
-                const whole = Buffer.concat([Buffer.from(`${CUT_MARKER}\n`), br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0)]);
-                writeFileSync(file, whole);
+                const whole = br >= 0 ? kept.subarray(br + 1) : Buffer.alloc(0);
+                writeFileSync(file, whole, { mode: 0o600 });
                 stderrBytes = whole.length;
                 // No break in the window: it was all one unfinished line, so its remainder must not start the file.
                 if (br < 0) discardStderrLine = true;

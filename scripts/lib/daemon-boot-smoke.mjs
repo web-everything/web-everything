@@ -52,10 +52,127 @@
  * runtime call.
  */
 
+import { randomBytes } from 'node:crypto';
+import { closeSync, constants, fchmodSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
+import { daemonStateDir } from './daemon-last-good.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { redactSecrets, redactedTail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+
+// ── smoke diagnostics: an allow-listed summary out, raw child text only into an owner-only local file ──
+// Operator decision (PR 5460, 2026-10-17): smoke failure details, self-sync alerts and PR comments never carry raw
+// child stderr or stdout. They carry typed fields and an error CLASS; the raw tail goes to a 0600 file whose path the
+// summary names.
+
+/** `<daemon state dir>/smoke-diagnostics` — where the raw stderr tails live (never in a git tree, never in an alert). */
+export function smokeDiagnosticsDir(env = process.env) {
+  return join(daemonStateDir(env), 'smoke-diagnostics');
+}
+
+const ERROR_CLASS_LINE = /^[A-Z][A-Za-z]*Error:/;
+const LINE_SPLIT = new RegExp(`\\r\\n|[\\n\\r${String.fromCharCode(0x85, 0x2028, 0x2029)}]`);
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+const QUOTES = new Set(['"', "'", '`']);
+
+/** Every quoted string (backslash escapes honoured) replaced with `<…>`; an unterminated one runs to the end. */
+function maskQuoted(line) {
+  let out = '';
+  for (let i = 0; i < line.length; i++) {
+    if (!QUOTES.has(line[i])) { out += line[i]; continue; }
+    let j = i + 1;
+    while (j < line.length && line[j] !== line[i]) j += line[j] === '\\' ? 2 : 1;
+    out += '<…>';
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * The error class of untrusted child output: its first line matching `^[A-Z][A-Za-z]*Error:`, cut to 80 chars, with
+ * every quoted string replaced by `<…>` (a quote left open by the line end or the cut hides the rest). Null when no
+ * line matches. This is the ONLY child text a smoke summary carries.
+ */
+export function smokeErrorClass(text) {
+  try {
+    const line = String(text ?? '').split(LINE_SPLIT).find((l) => ERROR_CLASS_LINE.test(l));
+    return line === undefined ? null : maskQuoted(line.slice(0, 80)).replace(CONTROL_CHARS, '');
+  } catch {
+    return null;
+  }
+}
+
+/** A signal name, an integer exit code: anything else from a child-shaped error object reads as null. */
+export const smokeSignal = (v) => (typeof v === 'string' && /^SIG[A-Z0-9]{1,12}$/.test(v) ? v : null);
+export const smokeExitCode = (v) => (Number.isSafeInteger(v) ? v : null);
+
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const PATH_TEXT = /^[^\n\r\u0000]{1,1024}$/;
+const isBool = (v) => typeof v === 'boolean';
+const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
+/** The smoke summary's allow-list: each field and the one type it may hold. Anything else is dropped. */
+const SUMMARY_FIELDS = Object.freeze({
+  launchStartedAt: (v) => typeof v === 'string' && ISO_TIME.test(v),
+  signal: (v) => smokeSignal(v) !== null,
+  exitCode: (v) => smokeExitCode(v) !== null,
+  wrapperPid: (v) => Number.isSafeInteger(v) && v > 0,
+  wrapperAliveAtTimeout: isBool,
+  sessionAppeared: isBool,
+  transcriptAppeared: isBool,
+  firstOutputMs: (v) => Number.isFinite(v) && v >= 0,
+  attempts: isCount,
+  errorClass: (v) => typeof v === 'string' && v.length <= 120 && ERROR_CLASS_LINE.test(v) && !LINE_SPLIT.test(v),
+  stderrFile: (v) => typeof v === 'string' && PATH_TEXT.test(v),
+});
+
+/** The allow-listed form of a smoke diagnostics object (null for a non-object): typed fields only, every other
+ *  value null. A sink calls this, so even a hand-built or injected result cannot carry raw child text through. */
+export function pickSmokeDiagnostics(d) {
+  if (!d || typeof d !== 'object') return null;
+  return Object.fromEntries(Object.entries(SUMMARY_FIELDS).map(([k, ok]) => [k, ok(d[k]) ? d[k] : null]));
+}
+
+const TAIL_LINES = 30;
+const TAIL_READ_CHARS = 64 * 1024;
+const KEEP_DIAGNOSTICS = 50;
+
+/** Keep the newest {@link KEEP_DIAGNOSTICS} entries of the diagnostics dir, so failed smokes never grow it unbounded. */
+function pruneDiagnostics(dir) {
+  try {
+    const rows = readdirSync(dir).map((name) => {
+      try { return { name, at: statSync(join(dir, name)).mtimeMs }; } catch { return null; }
+    }).filter(Boolean).sort((a, b) => b.at - a.at);
+    for (const row of rows.slice(KEEP_DIAGNOSTICS)) rmSync(join(dir, row.name), { recursive: true, force: true });
+  } catch { /* pruning is best effort */ }
+}
+
+/**
+ * Write the last 30 lines of raw child output to a NEW owner-only (0600) file under `dir` (created 0700) and return
+ * its path; null when there is nothing to write or the write fails (the text is then dropped, never inlined).
+ */
+export function writeStderrTail(text, { dir, label = 'smoke', now = Date.now } = {}) {
+  try {
+    const raw = String(text ?? '').slice(-TAIL_READ_CHARS).trimEnd();
+    if (!raw || !dir) return null;
+    const tail = raw.split(/\r\n|[\n\r]/).slice(-TAIL_LINES).join('\n');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stamp = new Date(now()).toISOString().replace(/[:.]/g, '-');
+    const file = join(dir, `${String(label).replace(/[^A-Za-z0-9.-]+/g, '_').slice(0, 80)}-${stamp}-${randomBytes(4).toString('hex')}.log`);
+    // O_EXCL + O_NOFOLLOW: always a fresh file, so its 0600 mode is the one set here, never an existing file's.
+    const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    try {
+      fchmodSync(fd, 0o600);
+      writeSync(fd, `${tail}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    pruneDiagnostics(dir);
+    return file;
+  } catch {
+    return null;
+  }
+}
 
 /** An env integer, strictly decimal digits; empty, blank, signed or hex values read as unset (never as 0). */
 export const strictEnvInteger = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v) : undefined);
@@ -174,54 +291,50 @@ export function buildEntryBootScript(entry) {
   return lines.join('\n');
 }
 
-const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
-
 /** Boot ONE entry in its OWN fresh child — never throws; a child failure (killed, unparsable output) is
- *  reported the same shape as an entry that threw on import, so the caller has one uniform per-entry result. */
-async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
+ *  reported the same shape as an entry that threw on import, so the caller has one uniform per-entry result.
+ *  The result is the allow-listed summary only: raw child output goes to {@link writeStderrTail}'s 0600 file. */
+async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnosticsDir, now }) {
+  const startedAt = new Date(now()).toISOString();
+  const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
   let out;
   try {
     out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
   } catch (e) {
-    const signal = e?.signal ?? null;
-    const exitCode = e?.status ?? e?.code ?? null;
-    // Redacted before the 30-line cut, so the cut never splits a secret; signal/exitCode lead, ahead of the line cap.
-    const stderrTail = redactedTail(e?.stderr);
-    return { entry, ok: false, signal, exitCode, stderrTail,
-      error: `child failed (signal=${signal}, exitCode=${exitCode}): ${redactSecrets(firstLine(e))}${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
+    const stderr = String(e?.stderr ?? '');
+    return { entry, ok: false, kind: 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
+      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), stderrFile: keep(stderr || e?.message) };
   }
   let parsed;
   try {
     parsed = JSON.parse(out);
   } catch (e) {
-    // V8 quotes the unparsable output in its message, so it is redacted like every other child-text path.
-    return { entry, ok: false, error: `unparsable child output: ${redactSecrets(firstLine(e))}` };
+    // V8 quotes the unparsable output in its message; the class masks the quote, the output itself goes to the file.
+    return { entry, ok: false, kind: 'unparsable child output', startedAt, signal: null, exitCode: null,
+      errorClass: smokeErrorClass(String(e)), stderrFile: keep(out) };
   }
-  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : boundHead(redactSecrets(parsed.error)) };
+  if (parsed?.ok) return { entry, ok: true, startedAt };
+  // The boot script joins its stack lines with ' | '.
+  const error = String(parsed?.error ?? '').split(' | ').join('\n');
+  return { entry, ok: false, kind: 'import failed', startedAt, signal: null, exitCode: null,
+    errorClass: smokeErrorClass(error), stderrFile: keep(error) };
 }
 
-/** Each failed entry gets an equal share of the detail budget (its first and newest lines), so the redaction
- *  backstop's 16 KB cap never drops a later entry's name or signal. */
-const BOOT_DETAIL_BUDGET = 12_000;
-/** The first 8 KB of a child's own error text, cut back to a line end when it has one (a single line is kept). */
-function boundHead(text) {
-  const raw = String(text);
-  if (raw.length <= 8_000) return raw;
-  const head = raw.slice(0, 8_000);
-  const nl = head.lastIndexOf('\n');
-  return nl > 0 ? head.slice(0, nl) : head;
-}
-function budgetedError(error, budget) {
-  const text = String(error ?? '');
-  return text.length > budget ? `${text.slice(0, 300)}\n…\n${text.slice(-(budget - 305))}` : text;
+/** One failed entry's summary line: typed fields, the error class and the local file — never child text. */
+function entrySummary(r) {
+  return `- ${r.entry}: ${r.kind} (signal=${r.signal}, exitCode=${r.exitCode}, attempts=${r.attempts.length}, startedAt=${r.startedAt})`
+    + ` class=${r.errorClass ?? 'none'} stderr=${r.stderrFile ?? 'none'}`;
 }
 
 /**
  * THE CHECK — same `(ctx) -> {ok, detail}` contract as every row in `daemon-live-smoke.mjs#SMOKE_CHECKS`.
- * @param {{root:string, budgets?:Record<string,number>, runChild?:typeof runBounded, env?:NodeJS.ProcessEnv, log?:Console}} ctx
+ * @param {{root:string, budgets?:Record<string,number>, runChild?:typeof runBounded, env?:NodeJS.ProcessEnv, log?:Console,
+ *   diagnosticsDir?:string, now?:() => number}} ctx
  * @returns {Promise<{ok:boolean, detail:string, entries?:Array<object>}>}
  */
-export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = runBounded, env = process.env, log = console }) {
+export async function checkDaemonEntriesBoot({
+  root, budgets = {}, runChild = runBounded, env = process.env, log = console, diagnosticsDir = smokeDiagnosticsDir(env), now = Date.now,
+}) {
   const settings = resolveBootSettings(env);
   try {
     if (!process.env.VITEST || log !== console) {
@@ -238,7 +351,7 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
   }
   const overrideMarker = overridden ? `⚠ WE_SMOKE_DAEMON_ENTRIES override active (${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}, real list bypassed) — ` : '';
   const timeoutMs = budgets.daemonBootMs ?? resolveChildTimeoutMs(env);
-  const options = { root, timeoutMs, runChild, env };
+  const options = { root, timeoutMs, runChild, env, diagnosticsDir, now };
   const results = new Array(entries.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(settings.bootConcurrency, entries.length) }, async () => {
@@ -261,13 +374,9 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
   const notes = retryNotes ? ` — ${retryNotes}` : '';
   const failures = results.filter((r) => !r.ok);
   if (failures.length) {
-    // One header line per failed entry (name + signal survive the 500-char line cap), then each failure's own lines.
-    const header = failures.map((f) => `- ${f.signal || f.exitCode != null ? `${f.entry} (signal=${f.signal ?? null}, exitCode=${f.exitCode ?? null})` : f.entry}`);
-    const budget = Math.max(1_000, Math.floor(BOOT_DETAIL_BUDGET / failures.length));
-    const detail = failures.map((f) => `${f.entry}: ${budgetedError(f.error, budget)}`);
     const retryLines = results.filter(r => r.attempts.length > 1)
       .map(r => `${r.entry}: retried after ${r.attempts.slice(0, -1).map(a => a.signal).join(', ')}`);
-    return { ok: false, entries: results, detail: [`${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot:`, ...header, ...retryLines, ...detail].join('\n') };
+    return { ok: false, entries: results, detail: [`${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot:`, ...failures.map(entrySummary), ...retryLines].join('\n') };
   }
   return { ok: true, entries: results, detail: `${overrideMarker}all ${results.length} daemon entries booted clean: ${results.map((r) => r.entry).join(', ')}${notes}` };
 }
