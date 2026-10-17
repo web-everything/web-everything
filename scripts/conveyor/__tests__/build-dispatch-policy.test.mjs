@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
-  BUILD_DISPATCH_POLICY, parseScopeEntry, pathsOverlap, firstScopeOverlap, branchRefPolicy, plannedBuildRef,
+  BUILD_DISPATCH_POLICY as DEFAULT_POLICY, parseScopeEntry, pathsOverlap, firstScopeOverlap, branchRefPolicy, plannedBuildRef,
   prDeliversNum, normalizeOpenPrs, planBuildDispatch, reportOpenItems,
   prepareAheadNums, daysBetween, stampCoversClaim, collectBuildHolds,
 } from '../build-dispatch-policy.mjs';
+import { formatOpenPrCap } from '../../lib/open-pr-cap-scope.mjs';
+
+const BUILD_DISPATCH_POLICY = { ...DEFAULT_POLICY, maxOpenPrsCounts: 'all' };
 
 const cand = (num, scope) => ({ num, lane: null, scope });
 const pr = (repo, number, files = [], labels = [], headRefName = 'lane/other-x') => ({ repo, number, files: files.map((p) => ({ repo, path: p })), labels, headRefName });
@@ -107,7 +110,7 @@ describe('planBuildDispatch', () => {
   });
   it('freezes on too many open PRs or the operator\'s manual daemon-bug flag', () => {
     const many = Array.from({ length: 13 }, (_, i) => pr('we', i + 1));
-    expect(planBuildDispatch({ candidates: [cand('1', ['we:a'])], openPrs: many }).hold[0].rule).toBe('landing-freeze');
+    expect(planBuildDispatch({ candidates: [cand('1', ['we:a'])], openPrs: many, policy: BUILD_DISPATCH_POLICY }).hold[0].rule).toBe('landing-freeze');
     const stuck = planBuildDispatch({ candidates: [cand('1', ['we:a'])], openPrs: [pr('we', 5, [], ['blocked:daemon-bug'])] });
     expect(stuck.freeze.frozen).toBe(true);
     expect(stuck.hold[0].reason).toMatch(/we#5 is labelled blocked:daemon-bug/);
@@ -195,7 +198,7 @@ describe('planBuildDispatch', () => {
   });
   it('normalizes open PRs from the gh shape', () => {
     expect(normalizeOpenPrs([{ repo: 'we', prs: [{ number: 1, headRefName: 'lane/1-x', labels: [{ name: 'l' }], files: [{ path: 'a' }] }] }]))
-      .toEqual([{ repo: 'we', number: 1, headRefName: 'lane/1-x', labels: ['l'], files: [{ repo: 'we', path: 'a' }] }]);
+      .toEqual([{ repo: 'we', number: 1, headRefName: 'lane/1-x', body: '', labels: ['l'], files: [{ repo: 'we', path: 'a' }] }]);
   });
   it('declares every operator rule with who enforces it', () => {
     expect(BUILD_DISPATCH_POLICY.rules.map((r) => r.id)).toEqual(['cap', 'wip-cap', 'landing-freeze', 'main-red', 'scope-vs-open-prs', 'hot-file', 'branch-name', 'scratch-prefix', 'draft-first', 'needs-prepare', 'prepare-ahead-window', 'prepare-stale']);
@@ -583,4 +586,25 @@ it('prepareAheadNums prioritizes P0 then the operator list before class', () => 
     { num: '3', priorityClass: 'P0' }, { num: '4', priorityClass: 'P3', buildPriority: 0 }];
   const launch = queue.map(({ num }) => ({ num }));
   expect([...prepareAheadNums({ queue, launch, window: 3 })]).toEqual(['3', '4', '2']);
+});
+
+describe('builder PR cap ownership', () => {
+  it.each([['builder', false, 3], ['all', true, 16]])('%s counts only its chosen population', (mode, frozen, count) => {
+    const raw = Array.from({ length: 16 }, (_, i) => ({ number: i + 1,
+      headRefName: i === 0 ? 'lane/100-build-feature' : i === 1 ? 'lane/101-prepare-design' : `lane/operator-${i}`,
+      body: i === 2 ? 'Delivered by the #3627 minimal delivery-agent pipeline' : '',
+      files: [{ path: `scripts/file${i}.mjs` }] }));
+    const openPrs = normalizeOpenPrs([{ repo: 'we', prs: raw }]);
+    const result = planBuildDispatch({ candidates: [cand('999', ['we:independent'])], openPrs,
+      policy: { ...BUILD_DISPATCH_POLICY, maxOpenPrs: 6, maxOpenPrsCounts: mode } });
+    expect(result.freeze.frozen).toBe(frozen);
+    expect(result.openPrCap).toMatchObject({ total: 16, counted: count });
+    expect(result.dispatch).toHaveLength(frozen ? 0 : 1);
+    // The cap message accounts for every open PR: the builder filter's exclusions are named, not silently lost.
+    const c = result.openPrCap;
+    expect(c.counted + c.cardOnly + c.accepted + (c.nonBuilder ?? 0)).toBe(c.total);
+    if (mode === 'builder') {
+      expect(formatOpenPrCap(c)).toBe('3 of 16 open PRs counted (not counted: 13 non-builder, 0 card-only, 0 review:accepted) — counted: #1 #2 #3');
+    }
+  });
 });

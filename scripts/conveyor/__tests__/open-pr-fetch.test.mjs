@@ -73,8 +73,14 @@ describe('shared open-PR discovery', () => {
 });
 
 describe('fetchOpenPrsRest — build-dispatch daemon field parity (#4351 follow-up, guided by #4309 spend accounting)', () => {
-  it('BUILD_DISPATCH_PR_FIELDS pins the five fields supplied by the REST mapper', () => {
-    expect(BUILD_DISPATCH_PR_FIELDS).toEqual(['number', 'headRefName', 'labels', 'files', 'isDraft']);
+  it('BUILD_DISPATCH_PR_FIELDS pins the fields supplied by the REST mapper', () => {
+    expect(BUILD_DISPATCH_PR_FIELDS).toEqual(['number', 'headRefName', 'body', 'labels', 'files', 'isDraft']);
+  });
+
+  it('preserves the mechanical body provenance through the REST fetch and normalization', () => {
+    const body = 'Delivered by the #3627 minimal delivery-agent pipeline';
+    const row = restPullToBuildDispatchShape({ number: 1, head: { ref: 'lane/42-feature' }, body });
+    expect(normalizeOpenPrs([{ repo: 'we', prs: [row] }])[0].body).toBe(body);
   });
 
   it('guards the real normalizer against reads outside the REST producer contract', () => {
@@ -87,15 +93,15 @@ describe('fetchOpenPrsRest — build-dispatch daemon field parity (#4351 follow-
     const normalized = normalizeOpenPrs([{ repo: 'we', prs }]);
     expect(normalized.length).toBeGreaterThan(0);
     expect(normalized).toEqual(normalizeOpenPrs([{ repo: 'we', prs: FIXTURE.graphql }]));
-    expect([...reads].sort()).toEqual(['files', 'headRefName', 'labels', 'number']);
+    expect([...reads].sort()).toEqual(['body', 'files', 'headRefName', 'labels', 'number']);
   });
 
   it('rejects an undeclared optional read and records the offending field', () => {
     const p = FIXTURE.restPulls[0];
     const reads = new Set();
     const row = guardPrReads(restPullToBuildDispatchShape(p, FIXTURE.restFiles[String(p.number)]), reads);
-    expect(() => row.body).toThrow('PR field body is outside the supplied contract');
-    expect([...reads]).toEqual(['body']);
+    expect(() => row.title).toThrow('PR field title is outside the supplied contract');
+    expect([...reads]).toEqual(['title']);
   });
 
   it('rejects a missing own field even when normalization would tolerate undefined', () => {
@@ -111,7 +117,7 @@ describe('fetchOpenPrsRest — build-dispatch daemon field parity (#4351 follow-
 
   it('maps a REST pulls item + its own files page to exactly what the old GraphQL query returned', () => {
     const mapped = FIXTURE.restPulls.map((p) => restPullToBuildDispatchShape(p, FIXTURE.restFiles[String(p.number)]));
-    expect(mapped).toEqual(FIXTURE.graphql);
+    expect(mapped).toEqual(FIXTURE.graphql.map(p => ({ ...p, body: p.body ?? '' })));
   });
 
   it('normalizeOpenPrs reads the REST-mapped rows identically to the old GraphQL rows', () => {
@@ -141,7 +147,7 @@ describe('fetchOpenPrsRest — build-dispatch daemon field parity (#4351 follow-
       httpOk(JSON.stringify(FIXTURE.restFiles['2902'])),
     ]);
     const rows = fetchOpenPrsRest({ repo: 'web-everything/web-everything', exec, env: { VITEST: '1' } });
-    expect(rows).toEqual(FIXTURE.graphql);
+    expect(rows).toEqual(FIXTURE.graphql.map(p => ({ ...p, body: p.body ?? '' })));
     expect(calls).toEqual([
       ['api', '-i', 'repos/web-everything/web-everything/pulls?state=open&per_page=100&page=1'],
       ['api', '-i', 'repos/web-everything/web-everything/pulls/2901/files?per_page=100&page=1'],

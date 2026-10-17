@@ -8,19 +8,26 @@
  * resume spawn itself, the pid probe) injected — so this suite never spawns a real detached process, never
  * shells `lane-pool.mjs`, and never depends on a real delivery-report sidecar on disk.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
-  adoptOrphanedBuildClaims as adoptOrphanedBuildClaimsReal, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
+  adoptOrphanedBuildClaims, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
 } from '../build-dispatch-orphan-adopt.mjs';
 
-// The real pass reads GitHub and the harness job records by default; these tests inject everything else, so the
-// two new evidence reads default to "nothing found" and each xykwe0h test overrides them explicitly.
-const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, releaseLaneLease: () => {}, ...o });
+// Keep the real reader call and all live seams explicit for the static hermetic scan. Tests supply their
+// own claims and resume spawns; an omitted fixture must fail before reaching host state or a real worker.
+const adoptFixtureClaims = (o = {}) => adoptOrphanedBuildClaims({
+  readDelivery: () => null, sessionLivenessFor: () => null,
+  recordFailure: () => {}, clearFailure: () => {}, releaseLaneLease: () => {},
+  listClaims: () => { throw new Error('inject fixture claims'); },
+  spawnResume: () => { throw new Error('inject fixture resume spawn'); },
+  ...o,
+});
+import * as claimModule from '../build-dispatch-claim.mjs';
 import {
   acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim,
   markBuildDispatchResume, readBuildDispatchResume, releaseBuildDispatchResume,
@@ -362,7 +369,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       ...(num !== '7101' ? { groupLead: '7101' } : {}) });
     const row = buildRow({ num: '7101', handle: mode === 'resume' ? 'pid:888' : mode });
     row.entry.payload.groupMembers = ['7102', 'xabc123'];
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: pid => pid === 999,
       findRow: num => num === '7101' ? row : null,
@@ -390,7 +397,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     const row = buildRow({ num: '7101', handle: 'pid:888' });
     row.entry.payload.groupMembers = ['7102', 'xabc123'];
     const spawned = [];
-    const results = await adoptOrphanedBuildClaims({ listClaims: () => claims, isPidAlive: () => false,
+    const results = await adoptFixtureClaims({ listClaims: () => claims, isPidAlive: () => false,
       readDelivery: () => null, sessionLivenessFor: () => null,
       recordFailure: () => {}, releaseLaneLease: () => {},
       findRow: num => num === '7101' ? row : null, readResumeMarker: () => null,
@@ -409,7 +416,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
 
   it('LEAVES a claim whose recorded dispatch is still alive', async () => {
     acquireBuildDispatchClaim({ num: '4295', scope: [], lockRoot, pid: 17711 });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => true,
       findRow: () => buildRow({ num: '4295', handle: 'pid:999' }),
@@ -431,7 +438,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 74142 });
     let spawnedWith = null;
     let markedWith = null;
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false, // the daemon-owner pid the claim was minted under is long dead
       findRow: () => buildRow({ num: '4131', handle: 'pid:74142', lane: 9, sessionSlug: 'conveyor-4131' }),
@@ -462,7 +469,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     + 'run-store row settled', async () => {
     acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 98761 });
     let settledWith = null;
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
       findRow: () => buildRow({ num: '4382', handle: 'pid:98761' }),
@@ -487,7 +494,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     + '(never left stuck forever)', async () => {
     acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 98761 });
     let settledWith = 'not-called';
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: (pid) => pid !== 98761, // the claim's own owner (the daemon that took it) is dead
       findRow: () => null, // no run-store trace was ever found
@@ -509,7 +516,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   it('a claim with no run-store row whose owner pid is STILL ALIVE is left alone — too early to tell (the '
     + 'daemon may have only just taken it)', async () => {
     acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 98761 });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: (pid) => pid === 98761,
       findRow: () => null,
@@ -528,28 +535,32 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     const past = Date.now() + 300 * 60_000;
     expect(listBuildDispatchClaims({ lockRoot, nowMs: past })).toEqual([]); // the ORDINARY read: invisible.
     expect(listBuildDispatchClaims({ lockRoot, nowMs: past, ignoreExpiry: true })).toHaveLength(1); // adoption's own read: still there.
-    // No `listClaims` override at all here — proving `ignoreExpiry: true` really is this function's own default.
-    const nowFrozen = () => past;
-    const results = await adoptOrphanedBuildClaims({
-      now: nowFrozen,
-      isPidAlive: () => false,
-      findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
-      readResumeMarker: () => null,
-      resolveResumability: () => ({ resumable: false, reason: 'lane-lease-moved-on' }),
-      releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
-      releaseResumeMarker: () => {},
-      settleRow: () => {},
-    });
-    // The default `listClaims` reads the REAL coordination root, not our temp `lockRoot` — so it will not see
-    // our fixture claim at all in this sandbox; what matters here is that the call did not throw and that the
-    // temp-root assertions above already proved `ignoreExpiry: true` is what the default composes with.
-    expect(Array.isArray(results)).toBe(true);
+    // Exercise the production default, redirecting only its underlying disk reader into this fixture.
+    const readClaims = listBuildDispatchClaims;
+    const listSpy = vi.spyOn(claimModule, 'listBuildDispatchClaims').mockImplementation(options =>
+      readClaims({ ...options, lockRoot, nowMs: past }));
+    try {
+      const results = await adoptFixtureClaims({
+        listClaims: undefined,
+        now: () => past,
+        isPidAlive: () => false,
+        findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
+        readResumeMarker: () => null,
+        resolveResumability: () => ({ resumable: false, reason: 'lane-lease-moved-on' }),
+        releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
+        releaseResumeMarker: () => {},
+        settleRow: () => {},
+      });
+      expect(listSpy).toHaveBeenCalledWith({ ignoreExpiry: true });
+      expect(results).toEqual([expect.objectContaining({ num: '4131', action: 'release' })]);
+      expect(readClaims({ lockRoot, ignoreExpiry: true })).toEqual([]);
+    } finally { listSpy.mockRestore(); }
   });
 
   it('LEAVES alone once a resume is already under way (a live resume marker) — never double-resumes', async () => {
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 74142 });
     markBuildDispatchResume({ num: '4131', pid: 55555, runId: 'dispatch-lane-x', rowKey: 'step:1:0', lockRoot: resumeRoot });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: (pid) => pid === 55555, // the resume's own pid is alive; the original dispatch's pid never asked
       findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
@@ -566,7 +577,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
 
   it('LEAVES a claim already settled to a non-`pr-opened` outcome — `doneWhy`\'s own job, never contested here', async () => {
     acquireBuildDispatchClaim({ num: '4295', scope: [], lockRoot, pid: 17711 });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
       findRow: () => buildRow({ num: '4295', handle: null, status: 'applied', result: { outcome: 'gate-red' } }),
@@ -582,7 +593,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     let released = null;
     const older = buildRow({ num: '4688', handle: null, status: 'failed', result: { outcome: 'gate-red' } });
     older.entry.startedAt = '2000-01-01T00:00:00.000Z';
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
       findRow: () => older,
@@ -603,7 +614,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 1 });
     // The OLD resume (bound to an older row) is dead; the fresh re-dispatch's own wrapper (pid 777) is alive.
     markBuildDispatchResume({ num: '4131', pid: 55555, runId: 'dispatch-lane-OLD', rowKey: 'step:1:0', lockRoot: resumeRoot });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: (pid) => pid === 777,
       findRow: () => buildRow({ num: '4131', handle: 'pid:777' }),
@@ -626,7 +637,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     const spawned = [];
     const holds = [];
     const settled = [];
-    const pass = () => adoptOrphanedBuildClaims({
+    const pass = () => adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false, // every resume dies immediately
       findRow: () => buildRow({ num: '4131', handle: 'pid:74142', lane: 9 }),
@@ -670,7 +681,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       markResume,
     });
     // pass 1: the pending mark lands, the spawn happens, then the post-spawn mark THROWS (fs error / crash).
-    const r1 = await adoptOrphanedBuildClaims(opts((o) => {
+    const r1 = await adoptFixtureClaims(opts((o) => {
       markCalls += 1;
       if (markCalls === 2) throw new Error('disk full');
       return markBuildDispatchResume({ ...o, lockRoot: resumeRoot });
@@ -678,7 +689,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     expect(spawns).toBe(1);
     expect(r1).toEqual([expect.objectContaining({ num: '4131', action: 'error', reason: expect.stringContaining('disk full') })]);
     // pass 2, moments later: the PENDING marker is inside its spawn grace — no second resume.
-    const r2 = await adoptOrphanedBuildClaims(opts((o) => markBuildDispatchResume({ ...o, lockRoot: resumeRoot })));
+    const r2 = await adoptFixtureClaims(opts((o) => markBuildDispatchResume({ ...o, lockRoot: resumeRoot })));
     expect(spawns).toBe(1);
     expect(r2).toEqual([{ num: '4131', action: 'leave', reason: 'alive' }]);
   });
@@ -699,10 +710,10 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       spawnResume,
       markResume: (o) => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }),
     });
-    const r1 = await adoptOrphanedBuildClaims(opts(() => { spawns += 1; throw new Error('EAGAIN'); }));
+    const r1 = await adoptFixtureClaims(opts(() => { spawns += 1; throw new Error('EAGAIN'); }));
     expect(r1).toEqual([expect.objectContaining({ action: 'error', reason: 'EAGAIN' })]);
     expect(readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot }).meta).toMatchObject({ spawnFailed: true, attempts: 1 });
-    const r2 = await adoptOrphanedBuildClaims(opts(() => { spawns += 1; return 777; }));
+    const r2 = await adoptFixtureClaims(opts(() => { spawns += 1; return 777; }));
     expect(r2).toEqual([expect.objectContaining({ action: 'resume', pid: 777 })]);
     expect(readBuildDispatchResume({ num: '4131', lockRoot: resumeRoot }).meta).toMatchObject({ pid: 777, attempts: 2, spawnFailed: false });
     expect(spawns).toBe(2);
@@ -712,7 +723,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 1 });
     markBuildDispatchResume({ num: '4131', pid: 1, runId: 'dispatch-lane-x', rowKey: 'step:1:0', attempts: MAX_RESUME_ATTEMPTS, lockRoot: resumeRoot });
     const order = [];
-    await adoptOrphanedBuildClaims({
+    await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
       findRow: () => buildRow({ num: '4131', handle: 'pid:74142' }),
@@ -729,7 +740,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   it('one throwing claim never aborts adoption of the claims after it', async () => {
     acquireBuildDispatchClaim({ num: '1', scope: [], lockRoot, pid: 1 });
     acquireBuildDispatchClaim({ num: '2', scope: [], lockRoot, pid: 1 });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
       findRow: (num) => { if (num === '1') throw new Error('boom'); return buildRow({ num, handle: 'pid:5' }); },
@@ -745,7 +756,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
 
   it('allowResume:false (kill switch / freeze) never spawns a resume — the claim is left for a later tick', async () => {
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 1 });
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       allowResume: false,
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => false,
@@ -765,7 +776,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   it('reads the run store ONCE per pass, however many claims there are', async () => {
     for (const n of ['1', '2', '3']) acquireBuildDispatchClaim({ num: n, scope: [], lockRoot, pid: 1 });
     let listRunsCalls = 0;
-    await adoptOrphanedBuildClaims({
+    await adoptFixtureClaims({
       listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
       isPidAlive: () => true,
       listRuns: () => { listRunsCalls += 1; return []; },
@@ -775,7 +786,7 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   });
 
   it('ignores a non-`build`-kind claim entirely (never reached, but defensive)', async () => {
-    const results = await adoptOrphanedBuildClaims({
+    const results = await adoptFixtureClaims({
       listClaims: () => [{ owner: 'x', meta: { num: '1', kind: 'not-build' } }],
       isPidAlive: () => { throw new Error('must never be consulted for a non-build claim'); },
     });
@@ -821,7 +832,7 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
   it('replay #4388 -> PR #4339: a dead agy dispatch whose session opened a PR settles as pr-opened with that PR', async () => {
     acquireBuildDispatchClaim({ num: '4388', scope: [], lockRoot, pid: 111 });
     let settled = 'not-called'; let released = 'not-called';
-    const results = await adoptOrphanedBuildClaims(common('4388', {
+    const results = await adoptFixtureClaims(common('4388', {
       findRow: () => claudeRow('4388', 'pid:10940'),
       readDelivery: () => ({ outcome: 'pr-open', pr: 4339, reason: 'PR #4339 is open' }),
       settleDelivered: (o) => { settled = o; },
@@ -836,7 +847,7 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
   it('replay #4382: a dead build whose PR already merged settles as pr-merged', async () => {
     acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 111 });
     let settled = null;
-    const results = await adoptOrphanedBuildClaims(common('4382', {
+    const results = await adoptFixtureClaims(common('4382', {
       findRow: () => claudeRow('4382', 'c7a15fe4'),
       readDelivery: () => ({ outcome: 'pr-merged', pr: 4288, reason: 'PR #4288 merged' }),
       settleDelivered: (o) => { settled = o; },
@@ -848,7 +859,7 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
 
   it('a resolved card settles as card-resolved', async () => {
     acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 111 });
-    const results = await adoptOrphanedBuildClaims(common('4382', {
+    const results = await adoptFixtureClaims(common('4382', {
       findRow: () => claudeRow('4382', 'c7a15fe4'),
       readDelivery: () => ({ outcome: 'card-resolved', pr: null, reason: 'card #4382 is resolved' }),
       settleDelivered: () => {},
@@ -858,13 +869,13 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
 
   it('no delivery evidence still releases as orphan-released (unchanged)', async () => {
     acquireBuildDispatchClaim({ num: '4400', scope: [], lockRoot, pid: 111 });
-    const results = await adoptOrphanedBuildClaims(common('4400', { findRow: () => claudeRow('4400', 'pid:9'), settleRow: () => {} }));
+    const results = await adoptFixtureClaims(common('4400', { findRow: () => claudeRow('4400', 'pid:9'), settleRow: () => {} }));
     expect(results[0]).toMatchObject({ action: 'release' });
   });
 
   it('#5189: a claude-bg session paused awaiting verify is ALIVE, not orphaned, even with a dead owner pid', async () => {
     acquireBuildDispatchClaim({ num: '5189', scope: [], lockRoot, pid: 111 });
-    const results = await adoptOrphanedBuildClaims(common('5189', {
+    const results = await adoptFixtureClaims(common('5189', {
       findRow: () => claudeRow('5189', '14cd6f08'),
       sessionLivenessFor: ({ handle }) => (handle === '14cd6f08' ? { alive: true, reason: 'awaiting-verify' } : null),
       readDelivery: () => { throw new Error('a live session is never checked for delivery'); },
@@ -887,7 +898,7 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
   it.each([undefined, '', 'completed', 'exited', 'frobnicating'])('a job record with state %j and a dead owner pid is released, not left as alive', async (state) => {
     acquireBuildDispatchClaim({ num: '5190', scope: [], lockRoot, pid: 111 });
     const readFile = () => JSON.stringify({ state, updatedAt: new Date().toISOString(), sessionId: '14cd6f08-4ed4-4ec4-8745-8020ef0e58cf', name: 'conveyor-5190', cwd: '/x' });
-    const results = await adoptOrphanedBuildClaims(common('5190', {
+    const results = await adoptFixtureClaims(common('5190', {
       findRow: () => claudeRow('5190', '14cd6f08'),
       sessionLivenessFor: (o) => defaultSessionLiveness({ ...o, jobsDir: '/jobs', readdir: () => ['14cd6f08-4ed4-4ec4-8745-8020ef0e58cf'], readFile, awaitingFor: () => null }),
       readDelivery: () => null,
@@ -979,18 +990,53 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
   });
   it('records a build failure for the card and releases the lane lease by session slug', async () => {
     const failures = []; const leases = [];
-    await adoptOrphanedBuildClaims(dead('5189', { recordFailure: (o) => failures.push(o), releaseLaneLease: (o) => leases.push(o) }));
+    await adoptFixtureClaims(dead('5189', { recordFailure: (o) => failures.push(o), releaseLaneLease: (o) => leases.push(o) }));
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ num: '5189', reason: expect.stringContaining('build-not-started') });
     expect(leases).toHaveLength(1);
     expect(leases[0].sessionSlug).toBeTruthy();
   });
+  it('keeps #4413 claimed and unsettled when the durable failure write fails', async () => {
+    const releaseClaim = vi.fn();
+    const settleRow = vi.fn();
+    const releaseLaneLease = vi.fn();
+    const result = await adoptFixtureClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      readDelivery: () => null,
+      sessionLivenessFor: () => null,
+      spawnResume: () => { throw new Error('must not resume after a failed failure write'); },
+      recordFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim, settleRow, releaseLaneLease,
+    });
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
+    expect(settleRow).not.toHaveBeenCalled();
+    expect(releaseLaneLease).not.toHaveBeenCalled();
+  });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
-    await adoptOrphanedBuildClaims(dead('4388', {
+    await adoptFixtureClaims(dead('4388', {
       readDelivery: () => ({ outcome: 'pr-opened', reason: 'PR #4339' }), settleDelivered: () => {},
       recordFailure: (o) => failures.push(o),
     }));
     expect(failures).toEqual([]);
+  });
+  it.each(['pr-open', 'pr-merged', 'card-resolved'])('clears the card\'s failure history on observed delivery (%s), before releasing the claim', async (outcome) => {
+    const order = [];
+    const result = await adoptFixtureClaims(dead('4413', {
+      readDelivery: () => ({ outcome, reason: outcome }), settleDelivered: () => {},
+      clearFailure: (o) => order.push(['clear', o.num]), releaseClaim: (o) => order.push(['release', o.num]),
+    }));
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
+    expect(order).toEqual([['clear', '4413'], ['release', '4413']]);
+  });
+  it('keeps #4413 claimed when clearing its failure history fails, so a later pass retries the clear', async () => {
+    const releaseClaim = vi.fn();
+    const result = await adoptFixtureClaims(dead('4413', {
+      readDelivery: () => ({ outcome: 'pr-open', reason: 'PR #9001 is open' }), settleDelivered: () => {},
+      clearFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim,
+    }));
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
   });
 });
