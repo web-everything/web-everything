@@ -8,6 +8,9 @@ export function markFixPushAwaitingCi({ repo, pr, head }, { run = defaultRun, re
   const repoArgs = repo ? [`--repo=${repo}`] : [];
   const view = JSON.parse(run('gh', ['pr', 'view', String(pr), ...repoArgs, '--json', 'headRefOid,labels']));
   if (!head || view.headRefOid !== head) return false;
+  // Like fix-end, provision both labels before applying them: a repository may not have either yet.
+  run('gh', ['label', 'create', 'checking', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI', '--force']);
+  run('gh', ['label', 'create', 'status:awaiting-ci', ...repoArgs, '--color', 'fbca04', '--description', 'Waiting for CI — auto-managed', '--force']);
   const stale = new Set(['ci:failed', 'status:ci-red', 'status:fixing', 'status:takeover-running', 'status:awaiting-review']);
   const remove = (view.labels ?? []).map(l => l.name ?? l).filter(l => stale.has(l));
   run('gh', ['pr', 'edit', String(pr), ...repoArgs, '--add-label', 'checking', '--add-label', 'status:awaiting-ci', ...remove.flatMap(l => ['--remove-label', l])]);

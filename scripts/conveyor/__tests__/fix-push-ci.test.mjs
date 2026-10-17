@@ -1,13 +1,56 @@
 import { it, expect } from 'vitest';
 import { markFixPushAwaitingCi } from '../fix-push-ci.mjs';
 import { resolveHandoffSettings } from '../../lib/handoff-settings.mjs';
+it('creates missing CI labels before applying them and supports a same-head retry', () => {
+  const labels = new Set();
+  let edits = 0;
+  const run = (cmd, args) => {
+    expect(cmd).toBe('gh');
+    expect(args).toContain('--repo=o/r');
+    if (args[0] === 'label' && args[1] === 'create') {
+      expect(args).toContain('--force');
+      labels.add(args[2]);
+      return '';
+    }
+    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels: [] });
+    if (args[1] === 'edit') {
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i] === '--add-label' && !labels.has(args[i + 1])) {
+          throw new Error(`could not add label: '${args[i + 1]}' not found`);
+        }
+      }
+      edits += 1;
+      return '';
+    }
+    throw new Error(`unexpected command: ${args.join(' ')}`);
+  };
+  const push = { repo: 'o/r', pr: 7, head: 'abc' };
+  const deps = { run, recordPush: () => {} };
+  expect(markFixPushAwaitingCi(push, deps)).toBe(true);
+  expect(markFixPushAwaitingCi(push, deps)).toBe(true);
+  expect(labels).toEqual(new Set(['checking', 'status:awaiting-ci']));
+  expect(edits).toBe(2);
+});
 it('labels the pushed head awaiting CI and removes stale red labels', () => {
   const calls = [];
   const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }); };
   expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(true);
-  expect(calls[1]).toEqual(expect.arrayContaining(['--add-label', 'checking', '--add-label', 'status:awaiting-ci', '--remove-label', 'ci:failed', '--remove-label', 'status:ci-red']));
+  expect(calls[3]).toEqual(expect.arrayContaining(['--add-label', 'checking', '--add-label', 'status:awaiting-ci', '--remove-label', 'ci:failed', '--remove-label', 'status:ci-red']));
   expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'moved' }, { run, recordPush: () => {} })).toBe(false);
-  expect(calls).toHaveLength(3);
+  expect(calls).toHaveLength(5);
+});
+it('retains the push record and stops before editing when label creation fails', () => {
+  const push = { repo: 'o/r', pr: 7, head: 'abc' };
+  const recorded = [];
+  const calls = [];
+  const run = (cmd, args) => {
+    calls.push(args);
+    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels: [] });
+    throw new Error('label creation unavailable');
+  };
+  expect(() => markFixPushAwaitingCi(push, { run, recordPush: value => recorded.push(value) })).toThrow('label creation unavailable');
+  expect(recorded).toEqual([push]);
+  expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create']]);
 });
 it('resolves missing-CI timing per leaf through the cascade', () => {
   const out = resolveHandoffSettings('fix', { tool: { ciMissingAfterPushMin: 12 }, platform: { ciMissingAfterPushMin: 15, sendBackReservedSlots: 2 }, env: {} });

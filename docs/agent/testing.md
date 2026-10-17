@@ -1502,7 +1502,9 @@ The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
 daemons. Ordinary repairs cannot consume reserved slots, even after memory pressure
 reduces the effective cap; a send-back still needs host admission.
 
-The fixer pusher marks its new head `checking` / `status:awaiting-ci`; the existing
+The fixer pusher ensures `checking` and `status:awaiting-ci` exist before marking its new
+head with them. Test an initially empty repository label catalog and a same-head retry;
+`gh pr edit --add-label` refuses labels that have not been created. The existing
 `ci-red-recovery-watch` missing-run pass re-requests absent CI after the configured
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
