@@ -20,7 +20,7 @@ import { clearScopeAndAppendFinding, sanitizeHoldReason } from '../build-dispatc
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
 import { buildCodexDirectTaskArgv } from '../../codex-direct-task.mjs';
-import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
+import { gateFailureDetail, captureWorkerMessage, lightWorkerArgv, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
 
 describe('realIo().blockedByGraph', () => {
   it('includes hash-named cards and validates their parsed proposals against the loaded graph', async () => {
@@ -726,6 +726,33 @@ describe('standalone task types and workers', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('launches the light worker through the real codex launcher in the read-only, no-network sandbox', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-light-argv-'));
+    const git = (...a) => execFileSync('git', a, { cwd: join(dir, 'lane'), stdio: 'ignore' });
+    try {
+      mkdirSync(join(dir, 'lane'));
+      mkdirSync(join(dir, 'bin'));
+      git('init', '--quiet');
+      git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--quiet', '--allow-empty', '-m', 'base');
+      writeFileSync(join(dir, 'task.md'), 'Return JSON.');
+      // A stand-in `codex` that records the argv it was given and answers like a finished turn.
+      writeFileSync(join(dir, 'bin', 'codex'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\nprev=""\n'
+        + 'for a in "$@"; do [ "$prev" = "-o" ] && printf "{}" > "$a"; prev="$a"; done\ncat > /dev/null\n'
+        + 'echo \'{"type":"turn.completed"}\'\n', { mode: 0o755 });
+      const worker = { ...codex, model: 'gpt-6.1-sol', effort: 'low', taskType: 'prepare' };
+      const argv = lightWorkerArgv({ worker, lanePath: '/lanes/22', taskFile: join(dir, 'task.md'), card: 1 })
+        .map(a => a === '/lanes/22/scripts/codex-direct-task.mjs' ? resolve('scripts/codex-direct-task.mjs')
+          : a === '--dir=/lanes/22' ? `--dir=${join(dir, 'lane')}` : a);
+      execFileSync(process.execPath, argv, { stdio: 'ignore', timeout: 60_000, env: { ...process.env,
+        PATH: `${join(dir, 'bin')}:${process.env.PATH}`, ARGV_OUT: join(dir, 'argv.txt'), CODEX_HOME: join(dir, 'codex-home'),
+        WE_CODEX_USAGE_LEDGER: join(dir, 'usage.jsonl'), CONVEYOR_STATE_ROOT: join(dir, 'state') } });
+      const seen = readFileSync(join(dir, 'argv.txt'), 'utf8').split('\n');
+      expect(seen[seen.indexOf('-s') + 1]).toBe('read-only');
+      expect(seen).toEqual(expect.arrayContaining(['-m', 'gpt-6.1-sol']));
+      expect(seen.join(' ')).not.toMatch(/network_access|writable_roots/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
   it('fingerprints gitignored lane files so a light worker edit to one is visible', () => {
     const dir = mkdtempSync(join(tmpdir(), 'probation-ignored-'));
     const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
@@ -914,8 +941,9 @@ describe('standalone prepare', () => {
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
   it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
     'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini',
-    'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-changed'])(
+    'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-changed', 'ignored-pre-throw', 'ignored-post-throw'])(
     'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
+      const skipped = ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-pre-throw'].includes(mode);
       const { io, calls } = prepareIo();
       const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
       let current = initial;
@@ -938,7 +966,10 @@ describe('standalone prepare', () => {
       io.headSha = () => mode === 'head-moved' && runs > 0 ? 'worker-commit' : 'base-sha';
       // A gitignored file (.env.local, node_modules) is invisible to HEAD, card, hook and numstat checks.
       // The task count stands in for the runner's own writes: a snapshot taken before them would mismatch.
-      io.snapshotIgnored = () => `tasks=${tasks.length}:.env.local=${mode === 'ignored-changed' && runs > 0 ? 'changed' : 'base'}`;
+      io.snapshotIgnored = () => {
+        if (mode === (runs ? 'ignored-post-throw' : 'ignored-pre-throw')) throw new Error('ls-files failed');
+        return `tasks=${tasks.length}:.env.local=${mode === 'ignored-changed' && runs > 0 ? 'changed' : 'base'}`;
+      };
       io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
       io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
       io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
@@ -979,12 +1010,13 @@ describe('standalone prepare', () => {
         return { ok: true };
       };
       const result = await runProbationBuild({ ...prepareArgs(), worker: originalWorker, lightRevalidate: true }, io);
-      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed', 'ignored-changed'].includes(mode)) {
-        const detail = { 'hooks-changed': 'revalidation changed hooks', 'ignored-changed': 'revalidation changed ignored files' }[mode]
-          ?? 'revalidation changed the checkout';
-        expect(result).toMatchObject({ outcome: ['hooks-changed', 'ignored-changed'].includes(mode) ? 'escalated-needs-human' : 'gate-red',
+      const ignored = ['ignored-changed', 'ignored-post-throw'].includes(mode);
+      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode) || ignored) {
+        const detail = mode === 'hooks-changed' ? 'revalidation changed hooks'
+          : ignored ? 'revalidation changed ignored files' : 'revalidation changed the checkout';
+        expect(result).toMatchObject({ outcome: mode === 'hooks-changed' || ignored ? 'escalated-needs-human' : 'gate-red',
           detail: expect.stringContaining(detail) });
-        if (mode === 'ignored-changed') expect(result.detail).toContain('quarantine');
+        if (ignored) expect(result.detail).toContain('quarantine');
         expect(calls.some(c => ['stamp', 'commit', 'openPr'].includes(c[0]))).toBe(false);
         expect(calls.some(c => c[0] === 'discard')).toBe(true);
         expect(runs).toBe(1);
@@ -1006,10 +1038,10 @@ describe('standalone prepare', () => {
           prepDrift: { stale: false } }, { today: '2026-10-17', maxAgeDays: 3 })).toBeNull();
       } else {
         expect(current).toContain('Full preparation revised.');
-        const skipped = ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable'].includes(mode);
         expect(runs).toBe(skipped ? 1 : 2);
         if (skipped) {
-          expect(tasks.some(t => t.name === 'prepare-light-revalidate.md')).toBe(false);
+          // The pre-run snapshot follows the runner's own task-file write, so only that mode wrote one.
+          expect(tasks.some(t => t.name === 'prepare-light-revalidate.md')).toBe(mode === 'ignored-pre-throw');
           expect(workerArgv[0]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--task-file=probation-build-task.md']));
           expect(workerArgv.flat()).not.toContain('--model=gpt-6.1-sol');
           expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
@@ -1024,8 +1056,7 @@ describe('standalone prepare', () => {
         expect(prWorkers[0]).toEqual(originalWorker);
       }
       expect(calls.find(c => c[0] === 'commit')[1]).toEqual([path]);
-      expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text ?? '').toContain(
-        ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable'].includes(mode) ? '' : 'aaaa1111');
+      if (!skipped) expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text).toContain('aaaa1111');
     });
   it('writes grouped prepare and per-member refusal lines in the actual PR body', () => {
     const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));

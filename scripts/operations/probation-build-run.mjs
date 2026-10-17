@@ -497,9 +497,7 @@ export async function runProbationBuild(args, io) {
         }
         if (input && !refusal) {
           resultWorker = lightWorker;
-          // `--review` runs Codex in its `-s read-only` sandbox with no network: the validator only reads.
-          const answer = io.runWorker([...buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
-            taskFile: lightTask, card: num, caller: 'prepare-light-revalidate' }), '--review'], lanePath);
+          const answer = io.runWorker(lightWorkerArgv({ worker: lightWorker, lanePath, taskFile: lightTask, card: num }), lanePath);
           workerRan = true;
           const lightHooks = hookSurfaceChanged(preHookSurface, io.snapshotHookSurface(lanePath));
           if (lightHooks.changed) {
@@ -899,6 +897,14 @@ function sh(bin, args, opts = {}) {
 }
 function trySh(bin, args, opts = {}) {
   try { return { ok: true, out: sh(bin, args, opts) }; } catch (e) { return { ok: false, stdout: String(e?.stdout ?? ''), out: `${e?.stdout ?? ''}${e?.stderr ?? e?.message ?? ''}` }; }
+}
+
+/**
+ * argv (after `node`) for the light revalidation worker. PURE. `--review` makes `codex-direct-task.mjs` run Codex
+ * in its `-s read-only` sandbox with no network, so the validator can only read the lane.
+ */
+export function lightWorkerArgv({ worker, lanePath, taskFile, card }) {
+  return [...buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card, caller: 'prepare-light-revalidate' }), '--review'];
 }
 
 /**
