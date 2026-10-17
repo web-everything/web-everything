@@ -666,6 +666,19 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at(`echo ${'${'.repeat(40000)}`)).toBe(REPORTED);
     expect(Date.now() - started).toBeLessThan(2000);
   });
+  it('arithmetic outside (( )), an IFS change, a trap or a pathological name keeps main\'s resolution', () => {
+    for (const rebind of [': $[D=5]', 'x[D=6]=1', ': ${x[D=7]}', 'y=${D:0:D=9}']) {
+      expect(at(`D=~/x; ${rebind}; cd $D`), rebind).toBe(`${REPORTED}/~/x`);
+    }
+    expect(at('HOME=/clone; x[HOME=1]=1; cd ~')).toBe(`${REPORTED}/~`);
+    expect(at('D=~/cloneZjunk; IFS=Z; cd $D')).toBe(`${REPORTED}/~/cloneZjunk`);
+    expect(at('IFS=/; cd $HOME/x')).toBe(REPORTED);
+    expect(at("trap 'HOME=/clone' ERR; false; cd ~")).toBe(`${REPORTED}/~`);
+    // reading IFS or $IFS changes nothing
+    expect(at('echo "$IFS" ${IFS}; cd ~/x')).toBe(`${HOME}/x`);
+    // a huge variable name never throws out of the resolver (the hook would then fail open)
+    expect(at(`true; cd $${'V'.repeat(40000)}`)).toBe(REPORTED);
+  });
   it('every rebinding scanner stays linear on hostile runs', () => {
     const n = 40000;
     for (const cmd of [

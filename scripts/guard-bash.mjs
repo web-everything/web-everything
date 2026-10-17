@@ -2737,7 +2737,8 @@ function rebindsUnreadably(s, name, p) {
 function rebindsInArithmetic(s, p) {
   const masked = maskQuotedKeepingExpansions(s);
   if (p.descriptor.test(masked)) return true;
-  return /\(\(|\[\[/.test(masked) && arithmeticOutsideChild(masked, p.arithmetic);
+  // `$[…]`, an array subscript (`x[D=6]=1`, `${x[D=7]}`) and a `${D:off:len}` offset are arithmetic too.
+  return /\(\(|\[|\$\{/.test(masked) && arithmeticOutsideChild(masked, p.arithmetic);
 }
 
 // Does `re` (global) match `masked` anywhere outside a child shell (`( … )`, `$( … )`, backticks)? `((` and `$((`
@@ -2846,8 +2847,10 @@ function homeAfter(stmt, home) {
 // (a subshell, a `$( … )`, a pipeline member) never changes the parent's HOME or variables. Anything before
 // the cd whose scope or whether it runs cannot be read here — `&&`/`||`, a background `&`, a compound command
 // or function body, a backtick, a `${…}` paren — keeps main's resolution.
-const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\w\\s*\\(\\s*\\)'
-  + '|(?:^|[\\s;&|()])(?:if|then|else|elif|fi|while|until|for|select|do|done|function|case|esac|coproc|[{}])(?=[\\s;&|()]|$)');
+// An IFS change (word splitting no longer reads as whitespace) or a `trap` (code run between statements) is
+// shell state this reader does not model, so either keeps main's resolution too.
+const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\w\\s*\\(\\s*\\)|(?<![\\w${])IFS(?!\\w)'
+  + '|(?:^|[\\s;&|()])(?:if|then|else|elif|fi|while|until|for|select|do|done|function|case|esac|coproc|trap|[{}])(?=[\\s;&|()]|$)');
 
 // Is there a paren between a `${` and the next `}`? One pass: a regex (`\$\{[^}]*[()]`) rescans to the end
 // from every unclosed `${`, which is quadratic on hostile text.
@@ -2898,7 +2901,7 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
     const raw = cd[1].trim();
     if (/^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw)) return expandCdTarget(raw, currentHome);
     const v = raw.split(/\s+/)[0].replace(/^(['"])(.*)\1$/, '$2').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
-    if (!v) return null;
+    if (!v || v[1].length > 64) return null;                  // a pathological name never reaches a RegExp
     let value = null;
     let literal = null;                                       // the same chain with nothing home-expanded
     for (const [j, before] of segments.slice(0, i).entries()) {
@@ -2932,7 +2935,9 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const parsed = parseSegments(cmd);
   if (parsed.unterminated) return reportedCwd;
   // #5957 — a home-expanded target first; anything it cannot expand keeps the resolution below unchanged.
-  const homed = homeCdTarget(cmd, parsed, home);
+  let homed = null;
+  try { homed = homeCdTarget(cmd, parsed, home); } catch { homed = null; } // never fail the hook open
+
   if (homed) return homed.startsWith('/') ? homed : resolvePath(reportedCwd || '.', homed);
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
