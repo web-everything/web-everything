@@ -1,3 +1,4 @@
+import { readTestsFirstPolicy, GUARANTEE_TEST_RULE } from './tests-first-policy.mjs';
 /**
  * review-core.mjs — the shared "read a diff, judge it" contract (#2325, under epic #2285).
  *
@@ -327,6 +328,7 @@ export function buildMandate({ contextIsolation = 'diff-only', mandate = DEFAULT
     round,
     fenced,
     bodyLines: [
+      ...(readTestsFirstPolicy().value.guaranteesMapToTests ? [GUARANTEE_TEST_RULE] : []),
       'Work from the diff text alone — do NOT `git checkout`, `git switch`, `git fetch`+checkout, or otherwise',
       'move HEAD onto the PR branch: you are running inside a shared checkout and that would derail the drain. If',
       'you have tools and genuinely must run the code (tests, a repro), do it in a throwaway `git clone` under a',

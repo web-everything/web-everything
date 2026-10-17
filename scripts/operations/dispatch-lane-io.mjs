@@ -1,4 +1,5 @@
 import { renderBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
@@ -593,7 +594,7 @@ export function readTick({
     dispatchedGuard,
     item,
     groupItems,
-    briefTemplate: composeOperatorTaskBrief(String(readText(briefPath(root, launchKind))) + (['build', 'fix', 'ci-heal'].includes(launchKind) ? '\n\n' + renderBuildRequirements({ policy: resolveBuildPolicy({ log: line => console.error(line) }) }) : ''), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+    briefTemplate: composeOperatorTaskBrief(applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))) + (['build', 'fix', 'ci-heal'].includes(launchKind) ? '\n\n' + renderBuildRequirements({ policy: resolveBuildPolicy({ log: line => console.error(line) }) }) : ''), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
     // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
     operatorPostBuild: operatorSteps.length > 0,
     nextState,

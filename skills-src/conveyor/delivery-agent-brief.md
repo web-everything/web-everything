@@ -131,6 +131,10 @@ from under its spec is exactly the kind of thing worth surfacing. The conveyor h
 **re-prepare / re-check / drop**; it **never silently builds a stale card**. No PR is opened — nothing was
 built (this is the one pre-build stop; see *Escalations*).
 
+<!-- tests-first:redFirst -->
+The FIRST commit must contain only new or updated acceptance tests. Run them through `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>` before implementation and record the failure (command, test names, output). Commit the failing tests first; implement in later commits. Include red-then-green evidence with test names, commands, and observed results in the final report.
+<!-- /tests-first -->
+
 ### 4. Build it to spec
 
 Do the actual work in `$LANE`: implement `{{ITEM_SPEC_PATH}}`, keep `## Progress` synced, capture any
@@ -246,7 +250,7 @@ the build's one and only merge.
 A WE item's gate is `npm run check:standards`. For a cross-locus item, run **that** locus's gate
 (look up `LOCI[item.locus]` in `check-standards-rules.mjs`). **The gate must be green before you push** — a red
 gate is a hard stop (see *Escalations*). **Do NOT `resolve` the card here** — the card is resolved in step 8, once
-the diff has converged (steps 6–7) and just before the one commit, so the flip rides the PR (see step 8):
+the diff has converged (steps 6–7) and just before the implementation commit, so the flip rides the PR (see step 8):
 
 **You cannot run the gate yourself — request it, then WAIT for it (#3105/#4358).** The gate legitimately takes
 150–350s, well past this tool's ~120s foreground window: a direct run (foreground OR backgrounded) gets silently
@@ -401,7 +405,7 @@ steps over one is recorded rather than warned about. The drain's own post-land f
 so you author it.
 
 Then commit only this item's files — **including the item's own `backlog/` card, which now carries the claim and
-the resolve** (explicit paths, never `git add -A`; one commit) on the lane's **current branch**
+the resolve** (explicit paths, never `git add -A`; implementation commit) on the lane's **current branch**
 (its local `main`) — do **NOT** `git checkout -b lane/...`; the single-branch hook blocks branch creation even
 inside a lane clone. You never create the `lane/...` branch locally: `pr-land` **publishes HEAD** to that ref
 for you via `--ref=... --sha=HEAD`. Then open the PR through the canonical producer — **never a hand-rolled
@@ -702,7 +706,7 @@ never self-clear a review, and never build a card that failed the readiness gate
 - **Never resolve before the work is built, converged and about to be committed** — `resolve` runs once, in step 8,
   in the lane clone, and rides the same PR as the claim; it is never run at the gate (step 5) and never after the
   merge (you never merge).
-- **Work only through the normal verbs** (claim → lane clone → build → resolve in the lane → one commit → PR →
+- **Work only through the normal verbs** (claim → lane clone → build → resolve in the lane → commits → PR →
   daemon merge; the claim and the resolve ride that PR) — those are exactly the channels the lane board reads, so state is reflected **for free**. No parallel
   state store, ever (#2612 ruling).
 
