@@ -16,6 +16,14 @@ import {
   probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
+import { replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
+import { sweepReviewTmp, probeDiskSpace } from '../review-tmp-health.mjs';
+import diskSpaceSmell from '../health-smells/disk-space.mjs';
+
+vi.mock('../review-tmp-health.mjs', async original => {
+  const real = await original();
+  return { ...real, sweepReviewTmp: vi.fn(real.sweepReviewTmp), probeDiskSpace: vi.fn(real.probeDiskSpace) };
+});
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1508,3 +1516,58 @@ it('attempts needs-you feed supervision through injected deps and contains error
     expect(ensureNeedsYouFeedJob).toHaveBeenCalledTimes(1);
   } finally { sealTestRoot.path = null; }
 });
+
+it('wires each review sweep and disk probe into tick and publishes distinct opening events', async () => {
+  sealTestRoot.path = dir;
+  const hd = healthDir(dir); mkdirSync(hd, { recursive: true });
+  const path = join(dir, 'attention.jsonl');
+  vi.stubEnv('WE_NEEDS_YOU_FEED', path);
+  const now = Date.parse('2026-10-17T12:00:00Z');
+  writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepEnabled: true, claudeJobsArchiveEnabled: false, closeAfter: 1 }));
+  writeFileSync(join(hd, 'state.json'), JSON.stringify({ tmpSweep: { completedAt: now } }));
+  const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
+  const flags = { 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'tmp-sweep-root': dir,
+    'no-gh': true, 'no-diagnose': true };
+  sweepReviewTmp.mockClear(); probeDiskSpace.mockClear();
+  sweepReviewTmp.mockReturnValue({ directories: 0, files: 0, bytesFreed: 0, busy: 0, errors: 0 });
+  probeDiskSpace.mockReturnValue({ freeGb: 9 });
+  const deps = { smells: [diskSpaceSmell], ensureNeedsYouFeedJob: () => ({ enqueued: false }) };
+  try {
+    const first = await tick({ ...flags, now: new Date(now).toISOString() }, deps);
+    expect(first.transitions.some(t => t.type === 'opened' && t.key === 'disk-space::data-volume')).toBe(true);
+    expect(sweepReviewTmp).toHaveBeenCalledWith(expect.objectContaining({ tmpRoot: dir, now, dryRun: false }));
+    expect(probeDiskSpace).toHaveBeenCalledTimes(1);
+    expect(replay({ path })).toHaveLength(1);
+    await tick({ ...flags, now: new Date(now + 1000).toISOString() }, deps);
+    expect(replay({ path })).toHaveLength(1); // still open, no duplicate
+    probeDiskSpace.mockReturnValue({ freeGb: 40 });
+    const closed = await tick({ ...flags, now: new Date(now + 2000).toISOString() }, deps);
+    expect(closed.transitions.some(t => t.type === 'closed')).toBe(true);
+    probeDiskSpace.mockReturnValue({ freeGb: 9 });
+    await tick({ ...flags, now: new Date(now + 3000).toISOString() }, deps);
+    expect(replay({ path })).toHaveLength(2);
+    const events = unacknowledged({ path });
+    expect(events).toHaveLength(2); // separate openings within the same minute
+    expect(new Set(events.map(e => `${e.repo}#${e.pr}@${e.head}:${e.kind}`)).size).toBe(2);
+    for (const e of events) expect(e).toMatchObject({ repo: expect.any(String), pr: 0, head: expect.any(String), kind: 'disk-space' });
+    probeDiskSpace.mockReturnValue({ freeGb: 40 });
+    await tick({ ...flags, now: new Date(now + 4000).toISOString() }, deps);
+    probeDiskSpace.mockReturnValue({ freeGb: 9 });
+    const sweepCalls = sweepReviewTmp.mock.calls.length;
+    const dry = await tick({ ...flags, 'dry-run': true, now: new Date(now + 5000).toISOString() }, deps);
+    expect(dry.transitions.some(t => t.type === 'opened')).toBe(true);
+    expect(replay({ path })).toHaveLength(2);
+    expect(sweepReviewTmp).toHaveBeenCalledTimes(sweepCalls + 1);
+    expect(sweepReviewTmp).toHaveBeenLastCalledWith(expect.objectContaining({ dryRun: true }));
+    const fixture = await tick({ ...flags, 'tmp-sweep-root': undefined, 'state-root': dir, now: new Date(now + 6000).toISOString() }, deps);
+    expect(fixture.transitions.some(t => t.type === 'opened')).toBe(true);
+    expect(replay({ path })).toHaveLength(2);
+    expect(sweepReviewTmp).toHaveBeenCalledTimes(sweepCalls + 1);
+  } finally {
+    sealTestRoot.path = null; vi.unstubAllEnvs();
+    sweepReviewTmp.mockReset(); probeDiskSpace.mockReset();
+    const real = await vi.importActual('../review-tmp-health.mjs');
+    sweepReviewTmp.mockImplementation(real.sweepReviewTmp); probeDiskSpace.mockImplementation(real.probeDiskSpace);
+  }
+}, 30000);
