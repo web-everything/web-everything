@@ -2446,7 +2446,7 @@ export function hasDestructiveLaneOp(command) {
 // #5957 (review r10) — the child-shell depth before every offset of every segment, carried across segments: an
 // assignment inside `( … )`, `$( … )`, `<( … )`, backticks, a `coproc` command or a pipeline / `&` element runs
 // in a child shell and never changes the parent's value. Only a subshell `(` counts. `((` / `$((` arithmetic
-// (and a `(` inside it) assigns in THIS shell, and a `(` in quotes, an escape, `${…}` or a comment opens
+// (and a `(` inside it) assigns in THIS shell, unless bash falls back to two subshells (see subshellDepths), and a `(` in quotes, an escape, `${…}` or a comment opens
 // nothing. A mis-scan errs toward depth 0, where a binding counts: an unmatched `)` only lowers the depth, never
 // below zero, a closing backtick (or `esac`) ends whatever opened inside it, `{ … }` is tracked only inside a
 // `coproc { … }` body, and a piped segment inside `case … esac` (`a|b)` is a pattern) stays as scanned. The
@@ -2458,14 +2458,24 @@ const GROUP_SPAN = 64;
 const CMD_WORDS = ['then', 'do', 'else', 'elif', 'if', 'while', 'until', 'time', '{'];
 const CMD_CHAIN = 8;
 const COPROC_HEAD = /coproc[ \t]+(?:[A-Za-z_]\w*[ \t]+)?([{(])(?=[\s(]|$)/y;
+// review r11 — `((` / `$((` is arithmetic only when the pair its second `(` opens is closed by an adjacent
+// `))`; otherwise bash falls back to two nested subshells (`((cd /P; true) )`, `$((D=1; true) )`). The first
+// pass reads every `((` as arithmetic and records how each one closed; a second pass, run only when one fell
+// back, reads those as two child shells. An unclosed `((` stays arithmetic.
 function subshellDepths(segs, commented, seps = [], lastpipe = false) {
+  const closed = new Map();
+  const first = scanDepths(segs, commented, seps, lastpipe, new Set(), closed);
+  const fallback = new Set([...closed].filter(([, adjacent]) => !adjacent).map(([key]) => key));
+  return fallback.size ? scanDepths(segs, commented, seps, lastpipe, fallback, new Map()) : first;
+}
+function scanDepths(segs, commented, seps, lastpipe, fallback, closed) {
   // { kind: sub | arith | tick | param | seg (a simple coproc command, to its segment end) | cobrace | brace |
-  //   case, sub: is a child shell, dq: the quoting it opened in }
+  //   case, sub: is a child shell, dq: the quoting it opened in, id: the `((` an inner arith frame belongs to }
   const stack = [];
   const open = { tick: 0, seg: 0, cobrace: 0, case: 0 };
   let d = 0;
-  const push = (kind, sub, dq) => {
-    stack.push({ kind, sub, dq });
+  const push = (kind, sub, dq, id) => {
+    stack.push({ kind, sub, dq, id });
     if (sub) d += 1;
     if (kind in open) open[kind] += 1;
   };
@@ -2505,6 +2515,11 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
       return w !== undefined && cmdStart(j - w.length + 1, CMD_WORDS, chain + 1);
     };
     const braceAt = new Set();                                // offsets of the `{` frames opened in this segment
+    // a `((` at offset i: two child shells where it falls back, else two arith frames (the inner one keyed)
+    const dparen = (i, dq) => {
+      const id = `${k}:${i}`;
+      if (fallback.has(id)) { push('sub', true, dq); push('sub', true, dq); } else { push('arith', false, dq); push('arith', false, dq, id); }
+    };
     for (let i = 0; i < s.length; i++) {
       out[i] = d;
       const ch = s[i];
@@ -2520,7 +2535,7 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
         dq = false;
         skip = i + 1;
       } else if (ch === '$' && s[i + 1] === '(') {
-        if (s[i + 2] === '(') { push('arith', false, dq); push('arith', false, dq); skip = i + 2; } else { push('sub', true, dq); skip = i + 1; }
+        if (s[i + 2] === '(') { dparen(i + 1, dq); skip = i + 2; } else { push('sub', true, dq); skip = i + 1; }
         dq = false;
       } else if (dq) {
         if (ch === '"') dq = false;
@@ -2538,12 +2553,16 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
       else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(s[i - 1]))) skip = s.length;
       else if (ch === '(') {
         const arith = top?.kind === 'arith';
-        if (!arith && s[i + 1] === '(') { push('arith', false, dq); push('arith', false, dq); skip = i + 1; }
+        if (!arith && s[i + 1] === '(') { dparen(i, dq); skip = i + 1; }
         else push(arith ? 'arith' : 'sub', !arith, dq);
       } else if (ch === ')') {
         // a `)` right inside `case … esac` ends a pattern (`x) D=1;;`), not a subshell
         while (stack.at(-1)?.kind === 'seg') pop();
-        if (stack.at(-1)?.kind === 'sub' || stack.at(-1)?.kind === 'arith') dq = pop().dq;
+        if (stack.at(-1)?.kind === 'sub' || stack.at(-1)?.kind === 'arith') {
+          const f = pop();
+          dq = f.dq;
+          if (f.id !== undefined) closed.set(f.id, s[i + 1] === ')');
+        }
       } else if (ch === 'c' && s.startsWith('case', i) && /\s/.test(s[i + 4] ?? '') && cmdStart(i)) {
         push('case', false, dq);
         skip = i + 3;
@@ -2686,6 +2705,121 @@ function expandCdTarget(rest, home) {
   return out || null;
 }
 
+// #5957 (review r11) — the names a statement binds, read word by word as bash reads them, so argument text
+// (`echo D=5`, `git commit -m "fix for D"`) binds nothing. A binding is: a leading run of `NAME=` / `NAME+=` /
+// `NAME[…]=` words with no command word after it (`A=1 D=/x true` binds only for `true`), a declaration
+// builtin's `NAME=` operand, a `NAME=` / `NAME++` inside arithmetic (`((…))`, `$((…))`, `$[…]`, an assignment's
+// subscript) and `${NAME=…}` / `${NAME:=…}`. A binding builtin (`read`, `for`, `eval`, …) in command position
+// lands in `any`: it may bind any name, and `eval` / `source` / `.` (opaque) even names the text never shows.
+// Offsets are into `text`; the caller drops the ones inside a child shell. One linear pass.
+const DECLARATION_BUILTINS = new Set(['declare', 'typeset', 'export', 'readonly', 'local']);
+const BINDING_BUILTINS = new Set(['local', 'read', 'for', 'select', 'mapfile', 'readarray', 'unset', 'let', 'getopts', 'eval', 'source', '.']);
+const OPAQUE_BUILTINS = new Set(['eval', 'source', '.']);
+// words after which the next word is still in command position
+const LEAD_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', 'time', '!', 'command', 'builtin', 'coproc', 'function']);
+const ARITH_SITE = /([A-Za-z_]\w*)[ \t]*(?:\+\+|--|(?:<<|>>|[-+*/%&|^])?=(?!=))|(?:\+\+|--)[ \t]*([A-Za-z_]\w*)/y;
+const PARAM_SITE = /([A-Za-z_]\w*)(?:\[[^\]]{0,256}\])?[:+]?=(?!=)/y;
+const ASSIGN_WORD = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?\+?=/;
+const PRINTF_V = /[ \t]+-v/y;
+function boundNames(text) {
+  const s = String(text);
+  const sites = [];
+  const any = [];
+  const stack = [];                   // dq | tick | sub | param | arith | arithb (`$[…]`)
+  let mode = 'cmd';                   // cmd: a word here is an assignment or the command word; decl; arg
+  let pending = [];                   // leading assignments: bound only when no command word follows
+  let target = false;                 // the next word is a redirection target
+  let start = -1;                     // where the current top-level word began
+  const site = (re, i) => {
+    if (/[\w$]/.test(s[i - 1] ?? ' ')) return;
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (m) sites.push({ name: m[1] ?? m[2], at: i });
+  };
+  const opener = (i) => {             // a `$…` / backtick opener at i: the last offset it consumed
+    if (s[i] === '`') { stack.push('tick'); return i; }
+    const n = s[i + 1];
+    if (n === '(' && s[i + 2] === '(') { stack.push('arith', 'arith'); return i + 2; }
+    if (n === '(') { stack.push('sub'); return i + 1; }
+    if (n === '{') { stack.push('param'); return i + 1; }
+    if (n === '[') { stack.push('arithb'); return i + 1; }
+    return i;
+  };
+  const single = (i) => { const j = s.indexOf("'", i + 1); return j < 0 ? s.length : j; };
+  const ansi = (i) => { let j = i + 2; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; return j; };
+  const endCommand = () => { sites.push(...pending); pending = []; mode = 'cmd'; target = false; };
+  const finish = (end) => {
+    if (start < 0) return;
+    const at = start;
+    const raw = s.slice(at, end);
+    start = -1;
+    if (target) { target = false; return; }
+    if (raw === '{' || raw === '}') { mode = 'cmd'; return; }
+    const a = raw.match(ASSIGN_WORD);
+    if (a && mode !== 'arg' && a[2] !== undefined) {
+      for (let j = at + a[1].length + 1; j < at + a[1].length + 1 + a[2].length; j++) site(ARITH_SITE, j);
+    }
+    if (mode === 'cmd') {
+      if (a) { pending.push({ name: a[1], at }); return; }
+      if (LEAD_WORDS.has(raw)) return;
+      pending = [];
+      const word = raw.replace(/['"\\]/g, '');
+      mode = DECLARATION_BUILTINS.has(word) ? 'decl' : 'arg';
+      PRINTF_V.lastIndex = end;
+      if (BINDING_BUILTINS.has(word) || (word === 'printf' && PRINTF_V.test(s))) any.push({ at, opaque: OPAQUE_BUILTINS.has(word) });
+    } else if (mode === 'decl' && a) sites.push({ name: a[1], at });
+  };
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const top = stack.at(-1);
+    if (top === 'tick') { if (ch === '\\') i += 1; else if (ch === '`') stack.pop(); continue; }
+    if (top === 'dq') {
+      if (ch === '\\') i += 1;
+      else if (ch === '"') stack.pop();
+      else if (ch === '$' || ch === '`') i = opener(i);
+      continue;
+    }
+    if (top) {
+      if (ch === '\\') i += 1;
+      else if (ch === "'") i = single(i);
+      else if (ch === '"') stack.push('dq');
+      else if ((ch === '$' && '({['.includes(s[i + 1] ?? ' ')) || ch === '`') i = opener(i);
+      else if (top === 'param') { if (ch === '}') stack.pop(); else site(PARAM_SITE, i); }
+      else if (top === 'arithb') { if (ch === ']') stack.pop(); else if (ch === '[') stack.push('arithb'); else site(ARITH_SITE, i); }
+      else if (ch === '(') stack.push(top);
+      else if (ch === ')') stack.pop();
+      else if (top === 'arith') site(ARITH_SITE, i);
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') { finish(i); continue; }
+    if (ch === '\n' || ch === ';' || ch === '&' || ch === '|') { finish(i); endCommand(); continue; }
+    if (ch === ')') { finish(i); endCommand(); continue; }
+    if (ch === '(' && start < 0) {
+      endCommand();
+      if (s[i + 1] === '(') { stack.push('arith', 'arith'); i += 1; }
+      continue;
+    }
+    if (ch === '#' && start < 0) break;                          // a comment
+    if ((ch === '<' || ch === '>') && s[i + 1] !== '(') {
+      if (start >= 0 && /^\d+$/.test(s.slice(start, i))) start = -1;   // an fd number (`2>f`)
+      else finish(i);
+      while ('<>&|'.includes(s[i + 1] ?? ' ') && s[i + 2] !== '(') i += 1;
+      target = true;
+      continue;
+    }
+    if (start < 0) start = i;
+    if (ch === '\\') i += 1;
+    else if (ch === "'") i = single(i);
+    else if (ch === '$' && s[i + 1] === "'") i = ansi(i);
+    else if (ch === '"') stack.push('dq');
+    else if (ch === '$' || ch === '`') i = opener(i);
+    else if (ch === '(' || ch === '<' || ch === '>') { stack.push('sub'); if (ch !== '(') i += 1; }  // `a=(…)`, `<(…)`
+  }
+  finish(s.length);
+  endCommand();
+  return { sites, any };
+}
+
 // #2335 — the harness resets the reported Bash cwd to the PRIMARY checkout between tool calls, so the
 // standard lane invocation `cd <lane> && node …/backlog.mjs claim` reports cwd=primary and gets misclassified
 // as a primary mutation (denied) AND makes the #2323 git call run in the primary (a false "behind" count).
@@ -2698,14 +2832,28 @@ function expandCdTarget(rest, home) {
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
 export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
+  return analyzeCwd(command, reportedCwd, resolvePath, home, null).cwd;
+}
+
+// #5957 (review r11) — every OTHER directory the command's commands may run in: a `cd` inside a child shell
+// (`( … )`, the two subshells a `((…) )` falls back to, `$( … )`, backticks), behind a grouping or compound
+// word (`{ cd`, `if cd`, `! cd`), or in a re-executed string (`eval "cd …"`, `bash -c "cd …"`). The effective
+// cwd above keeps main's single answer; this set only ever ADDS directories a daemon-clone write is checked
+// against, so it over-approximates on purpose (`(cd <clone>; ls); git commit` is refused too).
+export function resolveCdLandings(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
+  return [...new Set(analyzeCwd(command, reportedCwd, resolvePath, home, { left: { n: NESTED_NODE_CAP }, depth: 0 }).landings)];
+}
+
+// `nest` (null: the effective cwd only) carries the shared budget (`left.n`) and depth of the re-executed-string walk
+function analyzeCwd(command, reportedCwd, resolvePath, home, nest) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
   // is the conservative answer (the primary-cwd arms stay armed) — and `decide` denies it outright anyway.
   const cmd = stripHeredocBodies(String(command || ''));
-  if (!cmd) return reportedCwd;
+  if (!cmd) return { cwd: reportedCwd, landings: [] };
   const parsed = parseSegments(cmd);
-  if (parsed.unterminated) return reportedCwd;
+  if (parsed.unterminated) return { cwd: reportedCwd, landings: [] };
   // bash splits words on space, tab and newline only; trim() and \s also drop CR, NBSP and other Unicode
   // spaces, which bash keeps inside the word (an NBSP before `cd` makes it no cd, `D=~/x\r` keeps the CR).
   const oddSpace = (s) => /[^\S \t\n]/.test(s);
@@ -2740,7 +2888,12 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const homeAfter = (stmt, h, at) => {
     if (commented[at] || inChild(at)) return h;               // comment text (`true # ; HOME=/x`) binds nothing
     const assignment = stmt.trim().match(/^(?:export\s+)?HOME=(.*)$/);
-    if (!assignment) return h;
+    if (!assignment) {
+      // a HOME binding the plain reading below cannot follow (`HOME+=/x`, `{ HOME=/x; }`, `read HOME`, an
+      // `eval` / `source` that may set it unseen) leaves home unknown (review r11)
+      const b = rebound(at);
+      return b.opaque || b.names.includes('HOME') ? null : h;
+    }
     const val = assignment[1].trim();
     if (oddSpace(stmt) || /[ \t]/.test(val) || !plain(at)) return null;
     return usableHome(expandCdTarget(val, h));
@@ -2757,17 +2910,24 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     else vars[name] = value;
     (history[name] ??= []).push({ at, value });
   };
-  // Names a statement may bind in a form the literal walk does not read (`{ D=/x; }`, `then D=/x`, `A=1 D=/x`,
+  // Names a statement binds in a form the literal walk does not read (`{ D=/x; }`, `then D=/x`, `A=1 D=/x`,
   // `D+=x`, `D[0]=x`, `declare D=/x`, `read D`, `for D in …`): a home-derived name learns it changed there.
-  // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`.
-  // A binding inside a child shell (`( D=/tmp )`, `X=$(D=/tmp)`) leaves the parent's value alone; a binding word
-  // in this shell (`eval "$(…)"`) still counts every name it may bind, a substitution's included.
-  const BINDING_WORDS = /(?:^|[\s;&|(){}!])(local|read|for|select|mapfile|readarray|printf\s+-v|unset|let|getopts|eval|source|\.)(?=\s)/dg;
-  const reboundNames = (text, at, base) => {
-    const here = (i) => depths[at][base + i] === 0;
-    if ([...text.matchAll(BINDING_WORDS)].some((w) => here(w.indices[1][0]))) return text.match(/[A-Za-z_]\w*/g) ?? [];
-    return [...text.matchAll(/(?:^|[^\w$])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/dg)]
-      .filter((r) => here(r.indices[1][0])).map((r) => r[1]);
+  // A bare `export D` / `readonly D` keeps the value, so declaration words count only through `D=`; argument
+  // text (`echo D=5`) binds nothing (boundNames). A binding inside a child shell (`( D=/tmp )`, `X=$(D=/tmp)`)
+  // leaves the parent's value alone; a binding builtin in this shell (`eval "$(…)"`) still counts every name
+  // the statement mentions. `lead` is the offset of the statement's leading `NAME=` word, which the walk reads
+  // itself: `leadBound` says whether bash binds it (no command word follows it).
+  const scanned = [];
+  const rebound = (at, lead = -1) => {
+    const here = (i) => depths[at][i] === 0;
+    const b = (scanned[at] ??= boundNames(segs[at]));
+    const builtins = b.any.filter((w) => here(w.at));
+    const sites = b.sites.filter((x) => here(x.at));
+    return {
+      names: builtins.length ? (segs[at].match(/[A-Za-z_]\w*/g) ?? []) : sites.filter((x) => x.at !== lead).map((x) => x.name),
+      opaque: builtins.some((w) => w.opaque),
+      leadBound: sites.some((x) => x.at === lead),
+    };
   };
   parsed.segments.forEach((stmt, at) => {
     if (commented[at]) {
@@ -2785,12 +2945,14 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       if (!/[`$(~]/.test(m[2]) && !/\s/.test(literal)) vars[m[1]] = literal;
       return;
     }
-    const valueAt = m ? stmt.trimEnd().length - m[2].length : 0;
-    for (const name of reboundNames(m ? m[2] : stmt, at, valueAt)) (history[name] ??= []).push({ at, value: undefined });
+    const b = rebound(at, m ? stmt.indexOf(`${m[1]}=`) : -1);
+    for (const name of b.names) (history[name] ??= []).push({ at, value: undefined });
     // `coproc NAME { … }` binds NAME (to the coprocess's file descriptors) in this shell
     const co = !inChild(at) && stmt.match(/^\s*coproc[ \t]+([A-Za-z_]\w*)[ \t]+[{(]/);
     if (co) (history[co[1]] ??= []).push({ at, value: undefined });
-    if (m) {
+    // a leading assignment with a command word after it (`D=/x true`) binds only for that command: main
+    // skipped it as multi-word, and it changes nothing here either
+    if (m && b.leadBound) {
       const val = m[2].trim();
       const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes
       // main skips a substitution / multi-word value; a home-derived name still learns that it changed
@@ -2817,27 +2979,22 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   // Only HOME gains expansion semantics here. Keep the base's literal-variable collection above:
   // declarations without values and assignments inside subshells must not erase a known parent value.
   let currentHome = initialHome;
-  for (const [at, stmt] of parsed.segments.entries()) {
-    currentHome = homeAfter(stmt, currentHome, at);
-    const cd = stmt.trim().match(/^cd\s+(.+)$/);
-    if (!cd) continue;
-    const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
+  const homeSpelled = (raw) => /^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw);
+  const usable = (target, quoted) => target && !/[`$(*?]/.test(target) && (quoted || !target.includes('['));
+  const absolute = (target) => (target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target));
+  // the directory a `cd` in segment `at` lands in, or null when unresolved; `raw` is its trimmed operand text
+  // and `rest` the operand as bash splits it after the cd word (null when bash would not split it there)
+  const cdTarget = (at, raw, rest) => {
     // Expand only home spellings; ordinary targets keep the base resolver's interpretation.
-    const raw = cd[1].trim();
-    const homeSpelled = /^(?:~|\$HOME(?:\W|$)|\$\{HOME\}|"\$(?:HOME(?:\W|$)|\{HOME\}))/.test(raw);
-    // a `cd` inside comment text (`true # ; cd ~/x`) never runs; a home-spelled one is not this PR's to resolve
-    if (commented[at] && (homeSpelled || homeNames.has(raw.match(/^"?\$\{?([A-Za-z_]\w*)/)?.[1]))) continue;
-    if (homeSpelled) {
-      if (!bashCd) return reportedCwd;
-      const target = expandCdTarget(bashCd[1], currentHome);
-      if (target) return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
+    if (homeSpelled(raw)) {
+      if (rest === null) return null;
+      const target = expandCdTarget(rest, currentHome);
+      if (target) return absolute(target);
       // never answer less than main: with HOME unknown, a whole-target `$HOME` still resolves through the
       // literal-variable map as it did there
-      if (currentHome !== null || !/^"?\$(?:HOME|\{HOME\})"?(?:\s|$)/.test(raw) || vars.HOME === undefined) {
-        return reportedCwd;
-      }
+      if (currentHome !== null || !/^"?\$(?:HOME|\{HOME\})"?(?:\s|$)/.test(raw) || vars.HOME === undefined) return null;
     }
-    const word = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
+    const word = raw.split(/\s+/)[0];                         // first arg only (ignore trailing redirs/opts)
     const quoted = /^'[^']*'$|^"[^"]*"$/.test(word);          // one quoted run, nothing glued on
     let target = word.replace(/^(['"])(.*)\1$/, '$2');        // strip surrounding quotes
     // whole target is $VAR / ${VAR} — never inside single quotes, where `$D` is literal text
@@ -2845,14 +3002,54 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     if (v && homeNames.has(v[1])) {
       // a home-derived name: the value assigned last BEFORE this cd, in a cd word bash reads as one word
       const before = history[v[1]].filter((e) => e.at < at).at(-1);
-      if (!before || !bashCd || oddSpace(bashCd[1].match(/^[^ \t\n]*/)[0])) return reportedCwd;
+      if (!before || rest === null || oddSpace(rest.match(/^[^ \t\n]*/)[0])) return null;
       target = before.value ?? '';
     } else if (v) target = vars[v[1]] ?? '';
     // still unexpanded / globby → fail safe; a `[` is a glob only outside quotes
-    if (!target || /[`$(*?]/.test(target) || (!quoted && target.includes('['))) return reportedCwd;
-    return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
+    return usable(target, quoted) ? absolute(target) : null;
+  };
+  // the landings of segment `at` (resolveCdLandings): a cd behind openers (`(cd`, `((cd`, `{ cd`, `if cd`, …),
+  // read against what the walk knows here, plus the first cd of each re-executed string in it, read after this
+  // command's earlier plain assignments. A home-derived name a child shell may have set also lands on its
+  // literal reading.
+  const landingsOf = (at) => {
+    const out = [];
+    const opened = segs[at].match(/^[ \t\n]*(?:(?:\(|(?:\{|!|if|then|else|elif|while|until|do|time)[ \t\n])[ \t\n]*)+cd[ \t]+([^]*)$/);
+    if (opened) {
+      const cut = maskQuoted(opened[1]).search(/[)`]/);     // `(cd /P)`: the operand ends at an unquoted `)`
+      const rest = cut < 0 ? opened[1] : opened[1].slice(0, cut);
+      const target = cdTarget(at, rest.trim(), rest);
+      if (target) out.push(target);
+      const v = rest.trim().split(/\s+/)[0].replace(/^"(.*)"$/, '$1').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
+      if (v && homeNames.has(v[1]) && usable(vars[v[1]], false)) out.push(absolute(vars[v[1]]));
+    }
+    const prefix = () => segs.slice(0, at).filter((s, k) => !commented[k] && !inChild(k)
+      && /^\s*(?:export\s+)?[A-Za-z_]\w*=/.test(s)).join('\n');
+    for (const text of nestedCommandStrings(segs[at])) {
+      if (nest.left.n <= 0 || nest.depth >= NESTED_DEPTH_CAP || !/(?:^|[\s;&|(`{!])cd[ \t]/.test(text)) continue;
+      nest.left.n -= 1;
+      const inner = analyzeCwd(`${prefix()}\n${text}`, reportedCwd, resolvePath, home, { left: nest.left, depth: nest.depth + 1 });
+      if (inner.cwd !== reportedCwd) out.push(inner.cwd);
+      out.push(...inner.landings);
+    }
+    return out;
+  };
+  let cwd;
+  const landings = [];
+  for (const [at, stmt] of segs.entries()) {
+    currentHome = homeAfter(stmt, currentHome, at);
+    if (nest && !commented[at]) landings.push(...landingsOf(at));
+    if (cwd !== undefined) continue;
+    const cd = stmt.trim().match(/^cd\s+(.+)$/);
+    if (!cd) continue;
+    const bashCd = stmt.match(/^[ \t\n]*cd[ \t]+([^]*)$/);   // the cd word and its operand, as bash splits them
+    const raw = cd[1].trim();
+    // a `cd` inside comment text (`true # ; cd ~/x`) never runs; a home-spelled one is not this PR's to resolve
+    if (commented[at] && (homeSpelled(raw) || homeNames.has(raw.match(/^"?\$\{?([A-Za-z_]\w*)/)?.[1]))) continue;
+    cwd = cdTarget(at, raw, bashCd ? bashCd[1] : null) ?? reportedCwd;
+    if (!nest) break;
   }
-  return reportedCwd;
+  return { cwd: cwd ?? reportedCwd, landings };
 }
 
 // ── #2968 — `git add` of an ENUMERATED path set, matched by EFFECT not flag spelling ──────────────────────
@@ -3684,7 +3881,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, landingCwds = [], daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3696,7 +3893,9 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
+  // #5957 (review r11) — and against every other directory a `cd` in the command may land a command in
+  // (`resolveCdLandings`: a child shell, a group, a re-executed string)
+  const daemonWrite = [cwd, ...landingCwds].reduce((r, dir) => r ?? daemonCloneWriteReason(s, { cwd: dir, roots: daemonCloneRoots }), null);
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4690,6 +4889,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
+  let landingCwds = [];
   let daemonRoots = [];
   let hookSessionId = null;
   try {
@@ -4726,6 +4926,8 @@ if (IS_CLI) {
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
     const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
+    // only ever adds directories to check; a fault here must not take the rest of the guard down with it
+    try { landingCwds = resolveCdLandings(cmd, ev.cwd || process.cwd()).map(rp); } catch { landingCwds = []; }
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
@@ -4748,7 +4950,7 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, landingCwds, daemonCloneRoots: daemonRoots, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
-  decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd,
+  decide, reason, isBacklogMutation, isPrimaryCwd, isLaneCwd, resolveEffectiveCwd, resolveCdLandings,
   siblingLaneLeases,
   laneRootFromCwd, isDestructiveLaneGitOp, hasDestructiveLaneOp, canonicalGitOp,
   isVerificationRun, isBackgrounded, backgroundedVerificationReason, dispatchedAgentVerificationReason,
@@ -727,8 +727,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     for (const cmd of [
       'D=~/x; D=/clone; case x in x) D=1;; esac; cd "$D" && ls',   // a this-shell case arm
       'D=~/x; D=/clone; coproc D { true; }; cd "$D" && ls',        // coproc NAME binds NAME here
-      'D=~/x; D=/clone; echo coproc { D=/tmp; }; cd "$D" && ls',   // not a coproc word
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    // not a coproc word: no child shell opens, so the later statement binds here
+    expect(at('D=~/x; D=/clone; echo coproc { true; D=/tmp; }; cd "$D" && ls')).toBe('/tmp');
   });
   // r11 self-review — quoting the scan must read as bash does, so a this-shell assignment is never taken for a
   // child's (the dangerous direction: a stale value kept)
@@ -813,6 +814,113 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; echo `echo "("`; D=/clone; cd "$D" && ls',
       'D=~/x; true # (\nD=/clone; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+  });
+  // review r11 — only a word bash binds counts: a leading assignment run with no command after it, a
+  // declaration's operand, a binding builtin in command position, an arithmetic or `${…=…}` expansion
+  it('argument text that only looks like a binding never rebinds a home-derived name', () => {
+    for (const cmd of [
+      'D=~/x; D=/clone; echo D=5; cd "$D" && ls',
+      'D=~/x; D=/clone; git commit -m "D=5"; cd "$D" && ls',
+      "D=~/x; D=/clone; echo 'D=5'; cd \"$D\" && ls",
+      'D=~/x; D=/clone; echo x"D=5"; cd "$D" && ls',
+      'D=~/x; D=/clone; git commit -m "fix for D"; cd "$D" && ls',
+      'D=~/x; D=/clone; echo read D; cd "$D" && ls',
+      'D=~/x; D=/clone; git add . D; cd "$D" && ls',
+      'D=~/x; D=/clone; A=1 D=/x true; cd "$D" && ls',
+      'D=~/x; D=/clone; env D=/x true; cd "$D" && ls',
+      'D=~/x; D=/clone; D=/tmp :; cd "$D" && ls',      // a prefix binds only for its command (bash, not posix mode)
+      'D=~/x; D=/clone; [[ D=5 ]]; cd "$D" && ls',
+      'D=~/x; D=/clone; case D=5 in x) :;; esac; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    for (const cmd of [
+      'D=~/x; D=/clone; echo "$((D=5))"; cd "$D" && ls',
+      'D=~/x; D=/clone; echo $(( D = 5 )); cd "$D" && ls',
+      'D=~/x; D=/clone; echo ${D:=/tmp}; cd "$D" && ls',
+      'D=~/x; D=/clone; echo "${D=/tmp}"; cd "$D" && ls',
+      'D=~/x; D=/clone; echo ${a[D=5]}; cd "$D" && ls',
+      'D=~/x; D=/clone; a[D=5]=1; cd "$D" && ls',
+      'D=~/x; D=/clone; command read D; cd "$D" && ls',
+      'D=~/x; D=/clone; >f D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; 2>f D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; declare -x D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; export A=1 D+=/x; cd "$D" && ls',
+      'D=~/x; D=/clone; A="x y" D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; let D=5; cd "$D" && ls',
+      'D=~/x; D=/clone; f() { D=/tmp; }; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+  });
+  it('a HOME rebinding the plain walk cannot read leaves home unknown', () => {
+    for (const cmd of [
+      'HOME=/a; HOME+=/b; cd ~/clone && ls',
+      'HOME=/a; export HOME+=/b; cd ~/clone && ls',
+      'HOME=/a; { HOME=/b; }; cd ~/clone && ls',
+      'HOME=/a; if true; then HOME=/b; fi; cd ~/clone && ls',
+      'HOME=/a; time HOME=/b; cd ~/clone && ls',
+      'HOME=/a; ! HOME=/b; cd ~/clone && ls',
+      'HOME=/a; read HOME; cd ~/clone && ls',
+      'HOME=/a; case x in x) HOME=/b;; esac; cd ~/clone && ls',
+      'HOME=/a; D=/x HOME=/b; cd ~/clone && ls',
+      'HOME=/a; declare HOME=/b; cd ~/clone && ls',
+      'HOME=/a; unset HOME; cd ~/clone && ls',
+      'HOME=/a; eval "$X"; cd ~/clone && ls',
+      'HOME=/a; source ./env; cd ~/clone && ls',
+      'HOME=/a; HOME+=/b; D=~/clone; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    // text that binds nothing here keeps the home this shell has
+    expect(at('HOME=/a; echo HOME=/b; cd ~/clone && ls')).toBe('/a/clone');
+    expect(at('HOME=/a; ( HOME+=/b ); cd ~/clone && ls')).toBe('/a/clone');
+    expect(at('HOME=/a; git commit -m "unset HOME"; cd ~/clone && ls')).toBe('/a/clone');
+  });
+  it('a `((` that bash reads as two subshells is a child shell; a real `((…))` still binds here', () => {
+    for (const cmd of [
+      'D=~/x; D=/clone; ((D=/tmp; true) ); cd "$D" && ls',
+      'D=~/x; D=/clone; ((D=/tmp) ); cd "$D" && ls',
+      'D=~/x; D=/clone; (( D=/tmp ) ); cd "$D" && ls',
+      'D=~/x; D=/clone; X=$((D=/tmp; true) ); cd "$D" && ls',
+      'D=~/unused; D=/clone; ( D=/tmp; true ); cd "$D" && git checkout --detach',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
+    expect(at('HOME=/h; ((HOME=/z; true) ); cd ~/clone && ls')).toBe('/h/clone');
+    for (const cmd of [
+      'D=~/x; D=/clone; ((D=5)); cd "$D" && ls',
+      'D=~/x; D=/clone; (( (D=5) )); cd "$D" && ls',
+      'D=~/x; D=/clone; : $(( (D=5) + 1 )); cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    const started = Date.now();
+    at(`${'(('.repeat(20000)}${') )'.repeat(20000)}`);
+    at(`${'$(('.repeat(20000)}`);
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+  it('a `cd` in a child shell, a group or a re-executed string is a landing; the first cd stays the answer', () => {
+    const lands = (cmd) => resolveCdLandings(cmd, REPORTED, undefined, HOME);
+    for (const cmd of [
+      '((cd /P; git checkout --detach) )',
+      '((cd /P; true) ); git checkout --detach',
+      '(cd /P; git checkout --detach)',
+      '( (cd /P; true) )',
+      'true && (cd /P && git checkout)',
+      'X=$(cd /P; git checkout)',
+      'echo "$(cd /P)"',
+      'echo `cd /P`',
+      'eval "cd /P"; git checkout',
+      'bash -c "cd /P && git checkout"',
+      '{ cd /P; git checkout; }',
+      'if cd /P; then git checkout; fi',
+      'true && ! cd /P',
+      'time cd /P',
+      'D=/P; (cd "$D"; git checkout)',
+      'D=~/x; D=/P; (cd "$D"; git checkout)',
+    ]) expect(lands(cmd), JSON.stringify(cmd)).toContain('/P');
+    expect(lands('HOME=/h; (cd ~/P; git checkout)')).toContain('/h/P');
+    expect(lands('(cd ~/clone; ls)')).toContain(`${HOME}/clone`);
+    for (const cmd of [
+      'echo "(cd /P)"',
+      "echo '$(cd /P)'",
+      'true # (cd /P)',
+      'echo cd /P',
+      'cd /lane && git status',
+    ]) expect(lands(cmd), JSON.stringify(cmd)).not.toContain('/P');
+    // the effective cwd keeps main's reading
+    expect(at('(cd /P; git checkout --detach)')).toBe(REPORTED);
   });
   it('a HOME assignment that is conditional, prefixes a command or is glob-shaped leaves home unknown', () => {
     for (const cmd of [
@@ -3859,12 +3967,40 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     ['subshell assignment', `D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
     // review r10 — the operator's exact command: a home-derived name, then a literal, then a child-shell assignment
     ['subshell assignment after a home-derived one', `D=~/x; D=${fakeClone}; ( D=/tmp ); cd "$D" && git checkout --detach`, false],
+    // review r11 — the ruling's exact shape, and argument text that only looks like a binding
+    ['a two-statement subshell after a home-derived one', `D=~/unused; D=${fakeClone}; ( D=/tmp; true ); cd "$D" && git checkout --detach`, false],
+    ['argument text `D=5` after a home-derived one', `D=~/x; D=${fakeClone}; echo D=5; cd "$D" && git checkout --detach`, false],
+    ['a quoted message `-m "D=5"` after a home-derived one', `D=~/x; D=${fakeClone}; git commit -m "D=5"; cd "$D" && git checkout --detach`, false],
+    // a HOME append makes home unknown: the reported clone stays the answer, never the stale `/elsewhere/…`
+    ['a HOME append', 'HOME=/elsewhere; HOME+=/x; cd ~/some-new-daemon-clone && git checkout --detach', true],
+    ['a braced HOME rebinding', 'HOME=/elsewhere; { HOME=/x; }; cd ~/some-new-daemon-clone && git checkout --detach', true],
     ['readonly without a value', `D=${fakeClone}; readonly D; cd "$D" && git checkout --detach`, false],
     ['export without a value', `D=${fakeClone}; export D; cd "$D" && git checkout --detach`, false],
   ])('retains the main refusal for %s', (_name, command, startsProtected) => {
     const out = runHook(command, startsProtected ? fakeClone : lane);
     expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
     expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  // review r11 — a `cd` inside a child shell (`( … )`, the `((…) )` bash falls back to, `$( … )`, an `eval` or
+  // `bash -c` string) still lands its commands in the clone; run from a lane, the mutation is refused
+  it.each([
+    ['a subshell', `(cd ${fakeClone}; git checkout --detach)`],
+    ['the nested-subshell fallback of `((`', `((cd ${fakeClone}; git checkout --detach) )`],
+    ['a command substitution', `X=$(cd ${fakeClone} && git checkout --detach)`],
+    ['an eval string', `eval "cd ${fakeClone}"; git checkout --detach`],
+    ['a bash -c string', `bash -c "cd ${fakeClone} && git checkout --detach"`],
+    ['a brace group', `{ cd ${fakeClone}; git checkout --detach; }`],
+    ['a subshell cd of a literal variable', `D=${fakeClone}; (cd "$D"; git checkout --detach)`],
+    ['a subshell cd of a home spelling', '(cd ~/some-new-daemon-clone; git checkout --detach)'],
+  ])('DENIES a mutation after a child-shell cd into the clone: %s', (_name, command) => {
+    const out = runHook(command, lane, root);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+  it('a read-only command after a child-shell cd into the clone stays allowed', () => {
+    expect(runHook(`(cd ${fakeClone}; git status)`, lane, root)).toBeNull();
+    expect(runHook(`((cd ${fakeClone}; git log) )`, lane, root)).toBeNull();
   });
 
   // #5957 — a leading `cd` written with home shorthand must hit the same guard as its absolute spelling.
