@@ -68,6 +68,9 @@ and the recorded disposition on the live head, never grant clearance. The convey
 label sweep removes stale head labels and repairs missed status writes. Re-arm removes merge
 readiness and stale status labels atomically; missing-only re-arm preserves readiness only
 when a trusted acceptance marker still names the unchanged live head.
+CI-heal missing-only recovery carries `--expect-no-readiness` into the child command. Readiness
+first observed by the child, or at its final pre-write read, supersedes the parent's earlier
+observation of missing routing, even when no acceptance marker accompanies it.
 
 Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
 Read the live head's recorded per-finding gate actions before consulting current policy:

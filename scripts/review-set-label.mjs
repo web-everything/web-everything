@@ -1106,6 +1106,7 @@ export function runReviewLabelCli({
   // #4333 — `--only-if=accepted` (rearm only): the child's own fresh read must still show `review:accepted`.
   const onlyIfArg = argv.find((a) => a.startsWith('--only-if='));
   const onlyIf = onlyIfArg === undefined ? null : onlyIfArg.slice('--only-if='.length);
+  const expectNoReadiness = argv.includes('--expect-no-readiness');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — validate every input BEFORE any gh call (fail closed).
   const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -1124,6 +1125,9 @@ export function runReviewLabelCli({
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
+  }
+  if (expectNoReadiness && (to !== 'rearm' || onlyIf !== 'missing')) {
+    fail('--expect-no-readiness requires --only-if=missing on the rearm target');
   }
   if (newHeadArg && !/^[0-9a-f]{7,40}$/i.test(newHeadArg)) {
     fail('invalid --new-head — expected a git commit SHA (7-40 hex chars)');
@@ -1277,6 +1281,9 @@ export function runReviewLabelCli({
   }
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
+    fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
+  }
 
   // #x9krtkb (bug 2) — THE OVERRIDE. `restamp` alone trusts an explicit `--new-head` over the `headRefOid` this
   // process just re-read, because for `restamp` alone that read can be racing the very push that produced the
@@ -1828,10 +1835,16 @@ export function runReviewLabelCli({
       }
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
+        // A producer can restore readiness after our missing-routing observation. That new
+        // decision supersedes this recovery, even without a reviewed-sha marker. Readiness
+        // already present on the initial read still follows the stale-head re-arm policy.
+        const readinessArrived = (expectNoReadiness || !hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL))
+          && hasReviewLabel(fresh.labels, READY_TO_MERGE_LABEL);
         if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead
+          || readinessArrived
           || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
             acceptanceStillCoversHead: parseReviewedSha((fresh.comments ?? []).filter(isTrustedMarkerAuthor)) === fresh.headRefOid }).allowed) {
-          throw new Error('missing review handoff refused: state, draft status, head or review family changed before write');
+          throw new Error('missing review handoff refused: state, draft status, head, readiness or review family changed before write');
         }
         removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
       }

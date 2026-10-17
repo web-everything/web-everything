@@ -403,7 +403,9 @@ export function spawnCiHealRearm({ pr, repo, cwd, actor = 'conveyor CI-heal agen
   if (repo) args.push(`--repo=${repo}`);
   // #4333 — validated at the CHILD's mutation boundary: both callers only ever re-arm a stale acceptance, so a
   // `review:changes` verdict that lands between the caller's read and the child's read is never overwritten.
-  if (onlyIf === 'missing') args.push('--only-if=missing', `--expect-head=${headSha || ''}`);
+  // Missing routing was observed without producer readiness. Carry that precondition
+  // across the process boundary so a concurrent producer decision always wins.
+  if (onlyIf === 'missing') args.push('--only-if=missing', `--expect-head=${headSha || ''}`, '--expect-no-readiness');
   else if (onlyIfAccepted) args.push('--only-if=accepted');
   try {
     // `spawnSync`-shaped (mirrors `restampAcceptance`'s own seam exactly) — NEVER throws on a non-zero exit, so
