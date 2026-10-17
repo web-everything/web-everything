@@ -1559,14 +1559,18 @@ must return JSON `{ "verdict": "still-valid" | "needs-reprepare", "reason": "one
 and leave the checkout unchanged. Only `still-valid` allows the runner to append
 `revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
 answers, disabled policy, and diffs above the cap use full preparation. A worker
-that changes files, HEAD, or hooks is refused. Re-stamps use the existing verified
+that changes files, HEAD, or hooks is refused. The worker runs in Codex's `--review`
+read-only sandbox with no network. A fingerprint of every gitignored entry (content for
+files up to 1 MiB, metadata for collapsed directories) is compared after the run. A
+change there escalates for a human because a discard does not restore ignored files.
+Re-stamps use the existing verified
 card-only prepare PR lane; the builder waits for the stamp to land on main before
 building. Light candidates are excluded from grouped prepares so each verdict
 covers exactly the card and diff inspected. No direct write to main is permitted.
 
 Regression coverage must pair dispatch eligibility with age-stale and policy-disabled
 false cases, and exercise light candidates in both group-lead and group-member positions.
-Drive each read-only refusal guard independently (card text, HEAD, hooks, and numstat),
+Drive each read-only refusal guard independently (card text, HEAD, hooks, ignored files, and numstat),
 asserting discard and no stamp, commit, or PR. A failed stamp after `still-valid` must
 retry full preparation with the original dispatched provider, model, and effort; the
 result's scorecard and PR attribution follow whichever worker completed preparation.

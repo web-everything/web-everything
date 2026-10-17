@@ -725,6 +725,29 @@ describe('standalone task types and workers', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('fingerprints gitignored lane files so a light worker edit to one is visible', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probation-ignored-'));
+    const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+    try {
+      git('init', '--quiet');
+      writeFileSync(join(dir, '.gitignore'), '.env.local\ndeps/\n');
+      writeFileSync(join(dir, '.env.local'), 'TOKEN=a\n');
+      mkdirSync(join(dir, 'deps'));
+      writeFileSync(join(dir, 'deps', 'x.js'), 'a');
+      const snap = () => realIo({ session: 's' }).snapshotIgnored(dir);
+      const base = snap();
+      expect(snap()).toBe(base);
+      writeFileSync(join(dir, '.env.local'), 'TOKEN=b\n');
+      const edited = snap();
+      expect(edited).not.toBe(base);
+      writeFileSync(join(dir, '.env.cache'), 'x');
+      writeFileSync(join(dir, '.gitignore'), '.env.local\ndeps/\n.env.cache\n');
+      expect(snap()).not.toBe(edited);
+      writeFileSync(join(dir, 'deps', 'y.js'), 'b');
+      expect(snap()).not.toBe(edited);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('reads the light worker trial history from the shared store and throws when it is unusable', () => {
     const dir = mkdtempSync(join(tmpdir(), 'probation-scorecard-read-'));
     const store = join(dir, '.conveyor', 'run-scorecards.json');
@@ -890,7 +913,7 @@ describe('standalone prepare', () => {
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
   it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
     'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini',
-    'light-vetoed', 'light-quota-held', 'scorecards-unreadable'])(
+    'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-changed'])(
     'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
       const { io, calls } = prepareIo();
       const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
@@ -912,6 +935,8 @@ describe('standalone prepare', () => {
       io.snapshotHookSurface = (...a) => mode === 'hooks-changed' && runs > 0
         ? { configHash: 'clean', files: { 'pre-commit': 'planted' } } : snapshot(...a);
       io.headSha = () => mode === 'head-moved' && runs > 0 ? 'worker-commit' : 'base-sha';
+      // A gitignored file (.env.local, node_modules) is invisible to HEAD, card, hook and numstat checks.
+      io.snapshotIgnored = () => mode === 'ignored-changed' && runs > 0 ? 'ignored:.env.local=changed' : 'ignored:.env.local=base';
       io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
       io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
       io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
@@ -933,6 +958,8 @@ describe('standalone prepare', () => {
         if (argv.includes('--task-file=prepare-light-revalidate.md')) {
           expect(argv).toContain('--effort=low');
           expect(argv).toContain('--model=gpt-6.1-sol');
+          // Read-only sandbox (codex `-s read-only`, no network): the validator never gets write access.
+          expect(argv).toContain('--review');
           if (mode === 'tampered') current += '\nunauthorized edit';
           return { ok: true, lastMessage: mode === 'invalid' ? 'yes' : JSON.stringify({
             verdict: mode === 'needs-reprepare' ? 'needs-reprepare' : 'still-valid', reason: 'Scope changes preserve the plan.' }) };
@@ -947,9 +974,12 @@ describe('standalone prepare', () => {
         return { ok: true };
       };
       const result = await runProbationBuild({ ...prepareArgs(), worker: originalWorker, lightRevalidate: true }, io);
-      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode)) {
-        expect(result).toMatchObject({ outcome: mode === 'hooks-changed' ? 'escalated-needs-human' : 'gate-red',
-          detail: expect.stringContaining(mode === 'hooks-changed' ? 'revalidation changed hooks' : 'revalidation changed the checkout') });
+      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed', 'ignored-changed'].includes(mode)) {
+        const detail = { 'hooks-changed': 'revalidation changed hooks', 'ignored-changed': 'revalidation changed ignored files' }[mode]
+          ?? 'revalidation changed the checkout';
+        expect(result).toMatchObject({ outcome: ['hooks-changed', 'ignored-changed'].includes(mode) ? 'escalated-needs-human' : 'gate-red',
+          detail: expect.stringContaining(detail) });
+        if (mode === 'ignored-changed') expect(result.detail).toContain('quarantine');
         expect(calls.some(c => ['stamp', 'commit', 'openPr'].includes(c[0]))).toBe(false);
         expect(calls.some(c => c[0] === 'discard')).toBe(true);
         expect(runs).toBe(1);
@@ -984,6 +1014,7 @@ describe('standalone prepare', () => {
         expect(workerArgv[1][0]).toBe(`/lanes/22/${originalWorker.launcher}`);
         expect(workerArgv[1]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--effort=high',
           '--task-file=probation-build-task.md']));
+        expect(workerArgv[1]).not.toContain('--review');
         expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
         expect(prWorkers[0]).toEqual(originalWorker);
       }

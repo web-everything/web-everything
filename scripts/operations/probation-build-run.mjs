@@ -72,9 +72,9 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
  * real processes.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -485,21 +485,31 @@ export async function runProbationBuild(args, io) {
         const input = lightRevalidationInput({ raw: item.raw, scope: item.scope, baseSha, policy: preparePolicy,
           diff: (sha, base, paths) => io.prepareScopeDiff(lanePath, sha, base, paths) });
         const lightWorker = input && { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
-        let refusal = null;
+        let refusal = null, preIgnored = null;
         if (input) {
           try { refusal = lightWorkerRefusal({ worker: lightWorker, records: io.readScorecards() }); } catch { refusal = 'trial history unreadable'; }
+          if (!refusal) {
+            try { preIgnored = io.snapshotIgnored(lanePath); } catch { refusal = 'ignored-file snapshot unavailable'; }
+          }
           if (refusal) log(`light revalidation skipped: ${refusal}; full prepare`);
         }
         if (input && !refusal) {
           const lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
           resultWorker = lightWorker;
-          const answer = io.runWorker(buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
-            taskFile: lightTask, card: num, caller: 'prepare-light-revalidate' }), lanePath);
+          // `--review` runs Codex in its `-s read-only` sandbox with no network: the validator only reads.
+          const answer = io.runWorker([...buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
+            taskFile: lightTask, card: num, caller: 'prepare-light-revalidate' }), '--review'], lanePath);
           workerRan = true;
           const lightHooks = hookSurfaceChanged(preHookSurface, io.snapshotHookSurface(lanePath));
           if (lightHooks.changed) {
             if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
             return abandon('escalated-needs-human', `refused: revalidation changed hooks: ${lightHooks.reason}`);
+          }
+          // Gitignored files (.env.local, node_modules) escape every git-based check below and survive a discard.
+          let ignoredSame = false;
+          try { ignoredSame = io.snapshotIgnored(lanePath) === preIgnored; } catch { /* unverifiable: refuse */ }
+          if (!ignoredSame) {
+            return abandon('escalated-needs-human', 'refused: revalidation changed ignored files, which a discard does not restore; quarantine the lane');
           }
           if (io.headSha(lanePath) !== baseSha || io.findItem(num, lanePath)?.raw !== item.raw
             || summarizeNumstat(io.diffNumstat(lanePath, baseSha, [])).files) {
@@ -958,6 +968,18 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
   const node = (script, args, opts) => trySh(process.execPath, [join(opts.cwd, script), ...args], opts);
   return {
     log: (m) => console.error(m),
+    // One fingerprint of every gitignored entry (collapsed directories by mode/size/mtime, files by content up
+    // to 1 MiB). Codex's read-only sandbox is the real guard inside large ignored trees such as node_modules.
+    snapshotIgnored: (dir) => {
+      const listed = sh('git', ['-C', dir, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], { cwd: dir, env: laneEnv });
+      const hash = createHash('sha256');
+      for (const rel of listed.split('\0').filter(Boolean).sort()) {
+        const st = lstatSync(join(dir, rel));
+        hash.update(`${rel}\0${st.mode}\0${st.size}\0${st.mtimeMs}\0`);
+        if (st.isFile() && st.size <= 1024 * 1024) hash.update(readFileSync(join(dir, rel)));
+      }
+      return hash.digest('hex');
+    },
     // Read-only, and unlike `readStore` a corrupt store throws: the light worker's veto check fails closed.
     readScorecards: () => {
       const file = resolveScorecardStorePath(env);
