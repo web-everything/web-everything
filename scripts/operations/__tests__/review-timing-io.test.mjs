@@ -7,6 +7,8 @@ import { dispatchReview } from '../review-dispatch.mjs';
 import { dispatchReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readPr, createReviewPrSinks } from '../review-pr-io.mjs';
 import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS } from '../review-pr.mjs';
+import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 const head = 'a'.repeat(40);
 it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red and cancellation is enabled', async effect => {
   const runNode = vi.fn(); const postComment = vi.fn();
@@ -97,6 +99,43 @@ it('reads a real small fix as a delta while keeping the full net diff and head f
     expect(shaped.netBasis.rev).toBe(current);
     expect(readPr({ ...options, timingPolicy: { deltaMaxLines: 0, deltaMaxFiles: 3 } }).deltaReview).toBeNull();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/** A prior head A (reviewed), then a one-line head B; `comments(prior)` is the PR thread at B. */
+function readDeltaFixture(comments) {
+  const root = mkdtempSync(join(tmpdir(), 'review-timing-'));
+  const git = (...args) => String(execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+  try {
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.test'); git('config', 'user.name', 'Fixture');
+    writeFileSync(join(root, 'file.txt'), 'base\n'); git('add', '.'); git('commit', '-qm', 'base');
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    writeFileSync(join(root, 'file.txt'), 'base\nvulnerable code\n'); git('commit', '-qam', 'feature');
+    const prior = git('rev-parse', 'HEAD');
+    writeFileSync(join(root, 'file.txt'), 'base\nvulnerable code\ndocs line\n'); git('commit', '-qam', 'docs');
+    const current = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', current);
+    return readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
+      exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+      readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: current,
+        labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: comments(prior) }) });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+const bot = (body, createdAt) => ({ author: { login: 'web-everything' }, body, ...(createdAt ? { createdAt } : {}) });
+const acceptAt = (prior, createdAt) => bot(buildVerdictComment({ to: 'accepted', actor: 'agent (review)', headSha: prior, body: 'accepted' }), createdAt);
+const redTeamBounce = createdAt => bot(buildVerdictComment({ to: 'changes', actor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL,
+  body: buildSendBackBody({ pr: 7, head: 'a'.repeat(40), findings: [{ file: 'file.txt', line: 2, category: 'edge-case', impact: 'broken', summary: 'vulnerable code' }] }) }), createdAt);
+it('requires a full review when a confirmed post-accept red-team break is still outstanding', () => {
+  expect(readDeltaFixture(prior => [acceptAt(prior, '2026-10-17T10:00:00Z')]).deltaReview).not.toBeNull();
+  for (const comments of [
+    prior => [acceptAt(prior, '2026-10-17T10:00:00Z'), redTeamBounce('2026-10-17T10:05:00Z')],
+    prior => [redTeamBounce('2026-10-17T10:05:00Z'), acceptAt(prior, '2026-10-17T10:00:00Z')], // order-independent
+    prior => [acceptAt(prior), redTeamBounce()], // unreadable chronology fails closed
+  ]) {
+    const raw = readDeltaFixture(comments);
+    expect(raw.deltaReview).toBeNull();
+    expect(renderJudgeInput(shapeReadFinding(raw, { pr: 7, repo: 'o/n' }))).toContain('+vulnerable code');
+  }
+  // A bounce the prior-head review already superseded does not block the delta.
+  expect(readDeltaFixture(prior => [redTeamBounce('2026-10-17T09:00:00Z'), acceptAt(prior, '2026-10-17T10:00:00Z')]).deltaReview).not.toBeNull();
 });
 
 it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {

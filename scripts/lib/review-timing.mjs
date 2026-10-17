@@ -1,12 +1,25 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
+// fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
-  startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'], cancelOnCiRed: false,
+  startAfter: 'fast-checks', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
 });
+const checkNames = v => Array.isArray(v) && v.length > 0 && v.every(n => typeof n === 'string' && n.trim());
+/** A repo's fast checks (repo key or slug). An array applies to every repo; null means "use its required checks". */
+export function fastChecksFor(fastChecks, repo) {
+  if (Array.isArray(fastChecks)) return checkNames(fastChecks) ? fastChecks : null;
+  const key = repoKeyForSlug(repo);
+  const named = fastChecks && typeof fastChecks === 'object' && key ? fastChecks[key] : null;
+  return checkNames(named) ? named : null;
+}
+/** Is this a valid fastChecks setting: a non-empty name list, or a map of repo key → non-empty name list? */
+export const validFastChecks = v => checkNames(v) || (!!v && typeof v === 'object' && !Array.isArray(v)
+  && Object.keys(v).length > 0 && Object.entries(v).every(([key, names]) => repoKeyForSlug(key) === key && checkNames(names)));
 export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15 });
 const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_required', 'startup_failure']);
 /** Review-dependent gates are red while a review is owed; they are not CI failures. */
@@ -17,14 +30,14 @@ export function ciRedOnHead({ headSha, checks } = {}) {
     && (!row.head_sha || row.head_sha === headSha)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
 }
-export function reviewStartGate({ headSha, checks, requiredChecks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+export function reviewStartGate({ headSha, checks, requiredChecks, repo, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
   // Only required failures have a CI-heal owner. Optional failures must not strand review.
   const healable = new Set(requiredChecks ?? []);
   const requiredRows = (Array.isArray(checks) ? checks : []).filter(row => healable.has(row.name ?? row.context));
   if (ciRedOnHead({ headSha, checks: requiredRows })) return { allowed: false, headSha, reason: 'ci-red', affected: [] };
   if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
-  return reviewCiGate({ headSha, checks, requiredChecks: policy.startAfter === 'ci-green' ? requiredChecks : policy.fastChecks });
+  return reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks });
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks }));

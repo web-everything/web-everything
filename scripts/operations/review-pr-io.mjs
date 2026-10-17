@@ -1,4 +1,4 @@
-import { reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
+import { isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
@@ -314,7 +314,7 @@ export function readPr({
   }
   const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
   let deltaReview = null;
-  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha) {
+  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
     try {
       const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
         { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
@@ -503,6 +503,22 @@ export function recordScopedRereviewShadow({ payload, exec, readLedgerRows, appe
 export function resolveScopedRereviewMode(explicit = null, { settings = resolveReviewSettings } = {}) {
   if (SCOPED_REREVIEW_MODES.includes(explicit)) return explicit;
   try { return SCOPED_REREVIEW_MODES.includes(settings().scopedRereview) ? settings().scopedRereview : 'off'; } catch { return 'off'; }
+}
+
+const CHANGES_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
+/**
+ * Is a review verdict newer than the prior head's own review still outstanding? A post-accept red-team bounce (or any
+ * changes / advisory verdict) carries no reviewed-head marker for `priorHead`, so a delta review would drop its
+ * findings and the unchanged code they cite. Unreadable chronology counts as outstanding. Pure.
+ */
+export function outstandingVerdictSince(comments, priorHead) {
+  const trusted = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string');
+  const tied = c => reviewedHeadsOf(c).includes(priorHead);
+  const others = trusted.filter(c => !tied(c) && (isReviewVerdictComment(c) || CHANGES_HEADING_RE.test(c.body)));
+  if (!others.length) return false;
+  const at = c => Date.parse(c.createdAt ?? '');
+  const reviewedAt = Math.max(...trusted.filter(tied).map(at));
+  return !Number.isFinite(reviewedAt) || others.some(c => !(at(c) < reviewedAt));
 }
 
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */

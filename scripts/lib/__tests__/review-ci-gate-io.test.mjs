@@ -174,3 +174,21 @@ it('fast-check dispatch reads all head checks without waiting for branch-protect
   expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'timing-policy' });
   expect(readRequired).not.toHaveBeenCalled();
 });
+
+it('a repo without its own fast checks waits on its trusted required set', () => {
+  const policy = { startAfter: 'fast-checks', fastChecks: { we: ['standards', 'test-shard (1)'] } };
+  const green = name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' });
+  const io = fixture({ policy, repo: 'frontier-ui/frontierui', readRequired: vi.fn(() => ({ source: 'declared', checks: ['test'] })),
+    readChecks: () => [green('test')] });
+  expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'declared' });
+  expect(readGate({ ...io, readChecks: () => [{ ...green('test'), status: 'in_progress', conclusion: null }] }))
+    .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
+  expect(readGate({ ...io, readRequired: () => ({ source: 'fallback', checks: ['test'] }) }))
+    .toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
+  expect(readGate({ ...io, readRequired: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
+  // WE keeps its fast checks and never waits on discovery.
+  const we = fixture({ policy, repo: 'web-everything/web-everything', readRequired: vi.fn(),
+    readChecks: () => ['standards', 'test-shard (1)'].map(green) });
+  expect(readGate(we)).toMatchObject({ allowed: true, source: 'timing-policy' });
+  expect(we.readRequired).not.toHaveBeenCalled();
+});

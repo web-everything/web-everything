@@ -1,4 +1,4 @@
-import { ciRedOnHead, reviewStartGate } from './review-timing.mjs';
+import { ciRedOnHead, fastChecksFor, reviewStartGate } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
@@ -50,8 +50,11 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
     let checks;
-    let required = { source: 'timing-policy', checks: policy.fastChecks };
-    if (policy.startAfter === 'ci-green') required = readRequired({ repo, ttlMs: 0 });
+    const fast = policy.startAfter === 'fast-checks' ? fastChecksFor(policy.fastChecks, repo) : null;
+    // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
+    const needsRequired = policy.startAfter === 'ci-green' || (policy.startAfter === 'fast-checks' && !fast);
+    let required = { source: 'timing-policy', checks: fast ?? [] };
+    if (needsRequired) required = readRequired({ repo, ttlMs: 0 });
     else {
       checks = readChecks({ repo, headSha });
       // Early review needs branch-protection discovery only to identify an owner for red CI.
@@ -68,7 +71,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
     const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
-    if (policy.startAfter === 'ci-green' && !trustedRequired) {
+    if (needsRequired && !trustedRequired) {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });
@@ -83,7 +86,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
-    return withSource({ ...reviewStartGate({ headSha, requiredChecks: trustedRequired && required.source !== 'timing-policy' ? required.checks : [], checks, policy }), checks });
+    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks: trustedRequired && required.source !== 'timing-policy' ? required.checks : [], checks, policy }), checks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }

@@ -380,7 +380,10 @@ Daemon seam: a future daemon may consume the same `bootstrapPlan()` object inste
 ## Review timing and joined fixes
 
 Operator policy (2026-10-16): review overlaps CI. `review.startAfter` defaults to
-`fast-checks`; `review.fastChecks` defaults to `standards` and `test-shard (1)`.
+`fast-checks`; `review.fastChecks` is keyed by repo and defaults to `standards`
+and `test-shard (1)` for WE only. Only WE's CI publishes those names, so a repo
+without an entry (FrontierUI, Plateau App) waits on its own required checks, as
+`ci-green` does. A plain list instead applies to every repo.
 The independent standards CI job lets these finish before the aggregate gate.
 Card-only changes publish a green shard receipt for their intentionally empty unit
 scope, so skipped tests cannot strand review.
@@ -400,7 +403,9 @@ off, and CI read faults alone do not discard a completed verdict.
 
 A changed head gets a delta review when additions plus deletions are at most
 `review.deltaMaxLines` (50) across at most `review.deltaMaxFiles` (3). Binary or
-unreadable deltas get full review. Jurors judge the delta and its prior findings;
+unreadable deltas get full review. So does a head with a verdict newer than the
+prior head's review (a post-accept red-team bounce carries no reviewed-head
+marker, so a delta would drop its findings). Jurors judge the delta and its prior findings;
 the full contribution basis remains pinned for acceptance and roster checks.
 `review.skipDrainMechanical` (default true) enables existing proven numbering and
 identical-contribution carry writers. Commit subjects alone never prove a carry:

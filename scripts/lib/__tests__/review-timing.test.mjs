@@ -1,20 +1,40 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
-  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness } from '../review-timing.mjs';
+  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor } from '../review-timing.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
+const fast = review.fastChecks.we;
 describe('parallel review start and void', () => {
   it('starts after only fast checks, with full CI still pending', () => {
-    const checks = [...review.fastChecks.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
-    expect(reviewStartGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(true);
-    expect(reviewStartGate({ headSha: head, checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
+    const checks = [...fast.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
+    expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
+    expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
     expect(reviewStartGate({ headSha: head, checks: [], policy: { ...review, startAfter: 'push' } }).allowed).toBe(true);
   });
   it('requires each fast check on the head and refuses a red non-fast check', () => {
-    for (const checks of [[], [check('standards')], review.fastChecks.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
-      [...review.fastChecks.map(n => check(n)), check('integration', 'failure')]])
-      expect(reviewStartGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+    for (const checks of [[], [check('standards')], fast.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
+      [...fast.map(n => check(n)), check('integration', 'failure')]])
+      expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+  });
+  it('a repo whose CI publishes no fast checks waits on its own required checks', () => {
+    expect(fastChecksFor(review.fastChecks, 'web-everything/web-everything')).toEqual(fast);
+    for (const [repo, required] of [['frontierui', ['test']], ['plateauapp/plateau-app', ['test', 'e2e']], [undefined, ['test']]]) {
+      expect(fastChecksFor(review.fastChecks, repo)).toBeNull();
+      expect(reviewStartGate({ headSha: head, repo, checks: required.map(n => check(n)), requiredChecks: required }).allowed).toBe(true);
+      expect(reviewStartGate({ headSha: head, repo, checks: [check('test', null, { status: 'in_progress' }), check('e2e')], requiredChecks: required }))
+        .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
+    }
+    // An explicit list still applies to every repo.
+    expect(fastChecksFor(['lint'], 'frontierui')).toEqual(['lint']);
+  });
+  it('accepts only a name list or a map of known repo keys to name lists', () => {
+    const resolve = value => resolveTimingPolicy({ env: { WE_REVIEW_FAST_CHECKS: JSON.stringify(value) }, read: () => '{}', review: {}, fix: {},
+      platformReview: {}, platformFix: {}, log: () => {} }).review.fastChecks;
+    expect(resolve({ frontierui: ['test'] })).toEqual({ frontierui: ['test'] });
+    expect(resolve(['lint'])).toEqual(['lint']);
+    for (const bad of [{ nope: ['x'] }, { we: [] }, {}, [], { 'web-everything/web-everything': ['standards'] }])
+      expect(resolve(bad)).toEqual(review.fastChecks);
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
     const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };
@@ -25,8 +45,8 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
   });
   it.each(['fast-checks', 'push'])('ignores optional red checks under %s but blocks healable required failures', startAfter => {
-    const checks = [...review.fastChecks.map(n => check(n)), check('CodeQL', 'failure')];
-    const args = { headSha: head, checks, requiredChecks: ['integration'], policy: { ...review, startAfter } };
+    const checks = [...fast.map(n => check(n)), check('CodeQL', 'failure')];
+    const args = { headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter } };
     expect(reviewStartGate(args).allowed).toBe(true);
     expect(reviewStartGate({ ...args, checks: [...checks, check('integration', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
   });

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
-import { REVIEW_TIMING_DEFAULTS, FIX_TIMING_DEFAULTS } from './review-timing.mjs';
+import { REVIEW_TIMING_DEFAULTS, FIX_TIMING_DEFAULTS, validFastChecks } from './review-timing.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const readJson = (path, read) => { try { return JSON.parse(read(path, 'utf8')); } catch { return {}; } };
 const nonnegative = v => Number.isSafeInteger(v) && v >= 0;
@@ -24,7 +24,7 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
     standard: REVIEW_TIMING_DEFAULTS, platform: pick(platformReview ?? platformPreference('review', { env, readFile: read }), REVIEW_TIMING_DEFAULTS), env, log,
     envValues: reviewEnv, valid: {
       startAfter: v => ['fast-checks', 'ci-green', 'push'].includes(v),
-      fastChecks: v => Array.isArray(v) && v.length > 0 && v.every(n => typeof n === 'string' && n.trim()),
+      fastChecks: validFastChecks,
       cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
     },
   });

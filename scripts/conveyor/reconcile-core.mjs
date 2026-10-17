@@ -1,4 +1,4 @@
-import { reviewStartGate, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -1954,7 +1954,9 @@ export function planReconcile({
   // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
   mainRedPriority = null,
 } = {}) {
-  prs = prs.map(pr => ({ ...pr, reviewTiming }));
+  // Fast checks are per repo: a repo whose CI does not publish them (null) waits on its required checks instead.
+  const repoReviewTiming = { ...reviewTiming, fastChecks: fastChecksFor(reviewTiming?.fastChecks, repo) };
+  prs = prs.map(pr => ({ ...pr, reviewTiming: repoReviewTiming }));
   const isMainFixPriority = (n) => mainRedPriorityRank(n, mainRedPriority, { now, repo }) === 0;
   const dispatch = [];
   const refusals = [];
