@@ -23,7 +23,9 @@ export default {
     const pr = fx.pr;
     const merge = pr.statusCheckRollup.filter(r => r.name === 'merge-gate').at(-1);
     merge.mergeGateReviewHold = { holds: ['test-gaming'], jobId: 1 };
+    // The fixture models the full required-check set and the serial review→fix policy, not the production fast-check / joined-fix defaults.
     const options = { repo: 'we', prs: [pr], now: Date.parse(fx.observedAt),
+      reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false },
       requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'],
       advisoryReviewOnHumanHandoff: 'on' };
     const violations = [];

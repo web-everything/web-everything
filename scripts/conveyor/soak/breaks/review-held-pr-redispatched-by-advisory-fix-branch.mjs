@@ -42,7 +42,9 @@ const basePr = (over = {}) => ({ number: 3771, state: 'OPEN', headRefName: 'lane
   comments: [{ body: ADVISORY_NOTE_MARKER + '\\n\\nround 1', author: { login: 'web-everything' } },
     { body: buildAdvisoryFixComment({}), viewerDidAuthor: true }], ...over });
 const plan = (pr) => core.planReconcile({ prs: [{ ...pr, referralHold: hold.decideReferralHold(pr, [evidence], { repo, now: at + 400_000 }) }],
-  agents: [], now: at + 400_000, requiredChecks: ['gate'] });
+  agents: [], now: at + 400_000, requiredChecks: ['gate'],
+  // The fixture models the full required-check set and the serial review→fix policy, not the production defaults.
+  reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false } });
 const out = { heldReviews: 0, refusals: [], controlReviews: 0 };
 for (let tick = 0; tick < 3; tick++) {
   const p = plan(basePr());
