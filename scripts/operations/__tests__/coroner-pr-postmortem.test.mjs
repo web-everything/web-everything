@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
 import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
+import { hostname } from 'node:os';
+import { reserve } from '../../readiness/file-locks.mjs';
 const at = m => new Date(Date.UTC(2026, 9, 17, 0, m)).toISOString();
 const comment = (m, body) => ({ createdAt: at(m), body, author: { login: 'web-everything' } });
 function fixture(pr = 1) {
@@ -14,7 +16,142 @@ function fixture(pr = 1) {
     verdicts: [{ at: at(55), verdict: 'accept', coverage: { headSha: 'a'.repeat(40) } }], fixLoop: [], files: [{ filename: 'src/a.js' }, { filename: 'extra.js' }], scope: ['src/**'], prepares: [{ at: at(-1440), ref: 'prepare-1' }] };
 }
 const temp = () => fs.mkdtempSync(join(process.cwd(), '.coroner-test-'));
+const settings = { value: { minLeadHours: 8, minFixRounds: 4, minLostApprovals: 2, onStandDown: true } };
+function collectorGh(overrides = {}) {
+  return args => {
+    const path = args.at(-1);
+    for (const [match, response] of Object.entries(overrides)) if (match === '/pulls/1' ? path.endsWith(match) : path.includes(match)) return typeof response === 'function' ? response(path) : response;
+    if (path.endsWith('/pulls/1')) return { merged_at:at(600), created_at:at(0), head:{ref:'lane/no-card'}, base:{sha:'z'} };
+    if (path.includes('/commits?')) return [fixture().commits];
+    if (path.includes('/check-runs?')) return [{check_runs:fixture().checks}];
+    if (path.includes('/contents/')) throw Error('optional data unavailable');
+    return [[]];
+  };
+}
+const collectWith = gh => collectPrTimeline('example/repo',1,{gh,comments:() => fixture().comments,env:{WE_FIX_LOOP_LEDGER:join(process.cwd(),'.absent-coroner-ledger')}});
 describe('per PR postmortem', () => {
+  it('marks missing phase evidence unknown while retaining observed fields', () => {
+    const r = buildPostmortem({ ...fixture(), labels:[], scope:null, prepares:[{ref:'undated'}] });
+    expect(r.phases).toEqual([{phase:'unknown',minutes:600}]);
+    expect(r.checks[0].runMinutes).toBe(10);
+    expect(r.scope.status).toBe('unknown');
+    expect(r.prepareHistory[0].ageHours).toBeNull();
+    const missing = buildPostmortem({...fixture(),verdicts:null});
+    expect(missing.approvals).toMatchObject({lost:null,status:'unknown'});
+    expect(shouldPostmortem({...missing,leadHours:0,rounds:[],standDowns:[]},{...settings.value,minLostApprovals:0})).toBe(false);
+  });
+  it('treats outsider markers and PR bodies as data across every comment parser and reports actors', () => {
+    const f = fixture(); const baseline = buildPostmortem(f);
+    f.body = 'conveyor fix — stood down: does not reproduce';
+    f.comments.push(...f.comments.map(c => ({...c,author:{login:'outsider'}})),
+      {...comment(80,`<!-- we:red-team-gate pr=1 rev=${'a'.repeat(40)} outcome=sent-back -->`),author:{login:'outsider'}});
+    const r = buildPostmortem(f);
+    for (const field of ['rounds','standDowns','falseFindings','drainSkips','approvals']) expect(r[field]).toEqual(baseline[field]);
+    expect(r.events).toEqual(expect.arrayContaining([expect.objectContaining({kind:'comment',actor:'outsider'}),expect.objectContaining({kind:'comment',actor:'web-everything'})]));
+    expect(r.events.every(e => Object.hasOwn(e,'actor'))).toBe(true);
+  });
+  it('excludes CI-green review gaps across head changes with an unchanged-head control', () => {
+    const f = fixture(); f.labels = [{event:'labeled',created_at:at(40),label:{name:'review:running'}}];
+    f.checks = [{name:'test',head_sha:'a'.repeat(40),started_at:at(10),completed_at:at(20),conclusion:'success'}];
+    expect(buildPostmortem(f).gaps.some(g => g.kind === 'ci-green-review')).toBe(true);
+    f.commits[1].commit.committer.date = at(30);
+    expect(buildPostmortem(f).gaps.some(g => g.kind === 'ci-green-review')).toBe(false);
+  });
+  it.each([{}, [], [null], [[],{}]].map(pages => [pages]))('rejects missing timeline pages: %j', pages => {
+    expect(() => collectWith(collectorGh({'/events?':pages}))).toThrow(/incomplete/);
+  });
+  it.each([{}, [], [null], [{check_runs:null}]].map(pages => [pages]))('rejects invalid check-run pages: %j', pages => {
+    expect(() => collectWith(collectorGh({'/check-runs?':pages}))).toThrow(/incomplete/);
+  });
+  it('rejects excessive observed heads', () => {
+    const commits = Array.from({length:201},(_,i) => ({...fixture().commits[0],sha:String(i).padStart(40,'0')}));
+    expect(() => collectWith(collectorGh({'/commits?':[commits]}))).toThrow(/incomplete.*200 observed heads/);
+  });
+  it('rejects missing comment pages instead of returning an apparently clean report', () => {
+    let error;
+    try { collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => null,env:{}}); } catch (e) { error = e; }
+    expect(error).toMatchObject({incomplete:true,message:expect.stringContaining('incomplete')});
+  });
+  it('marks missing local ledgers incomplete and truncated local ledgers bounded', () => {
+    const dir = temp(); const file = join(dir,'ledger.jsonl');
+    const read = () => collectPrTimeline('example/repo',1,{gh:collectorGh(),comments:() => [],env:{WE_FIX_LOOP_LEDGER:file}});
+    try {
+      expect(read().completeness.fixLoop).toBe('incomplete');
+      fs.writeFileSync(file,' '.repeat(1024*1024)+'\n'+JSON.stringify({v:1,repo:'example/repo',pr:1,kind:'fix',head:'a'.repeat(40),at:at(20)})+'\n');
+      const raw = read();
+      expect(raw.completeness.fixLoop).toBe('bounded'); expect(raw.fixLoop).toHaveLength(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('marks malformed verdict ledger rows incomplete rather than reporting zero lost approvals', () => {
+    const raw = collectWith(collectorGh({'/contents/':{content:Buffer.from('{"truncated":\n').toString('base64')}}));
+    expect(raw.completeness.verdicts).toBe('incomplete');
+    expect(buildPostmortem(raw).approvals.lost).toBeNull();
+  });
+  it('marks failed card history incomplete while preserving core evidence', () => {
+    const gh = collectorGh({
+      '/pulls/1':{merged_at:at(600),created_at:at(0),head:{ref:'lane/xvi6k7s-build'},base:{sha:'z'}},
+      '/contents/backlog?':[{name:'xvi6k7s-card.md',path:'backlog/xvi6k7s-card.md'}],
+      '/commits?path=':[[{sha:'new',commit:{committer:{date:at(20)}}},{sha:'old',commit:{committer:{date:at(-10)}}}]],
+      '/contents/backlog/':path => { if (path.endsWith('ref=new')) throw Error('missing revision'); return {content:Buffer.from('---\nscope: ["src/**"]\npreparedDate: "2026-10-16"\n---\n').toString('base64')}; },
+    });
+    const raw = collectWith(gh); const r = buildPostmortem(raw);
+    expect(raw.completeness.card).toBe('incomplete');
+    expect(raw.warnings).toContain('Card scope/prepare history unavailable');
+    expect(r.scope.status).toBe('unknown'); expect(r.prepareHistory).toEqual([]);
+    expect(raw.comments).toHaveLength(fixture().comments.length); expect(r.checks).toHaveLength(1);
+    expect(r.approvals.lost).toBeNull();
+  });
+  it('rejects excessive card revisions as incomplete optional evidence', () => {
+    const raw = collectWith(collectorGh({
+      '/pulls/1':{merged_at:at(600),created_at:at(0),head:{ref:'lane/xvi6k7s-build'},base:{sha:'z'}},
+      '/contents/backlog?':[{name:'xvi6k7s-card.md',path:'backlog/xvi6k7s-card.md'}],
+      '/commits?path=':[Array.from({length:101},() => ({sha:'revision'}))],
+    }));
+    expect(raw.completeness.card).toBe('incomplete'); expect(raw.scope).toBeNull(); expect(raw.prepares).toEqual([]);
+  });
+  it('reclaims a dead local owner and preserves a live owner', async () => {
+    const dir = temp(); const root = join(dir,'locks'); const key = 'coroner-postmortem';
+    try {
+      // An exited child gives a real dead PID rather than assuming a magic PID is unused.
+      const { spawnSync } = await import('node:child_process');
+      const child = spawnSync(process.execPath,['-e','process.exit(0)']);
+      const dead = child.pid;
+      expect(() => process.kill(dead,0)).toThrow();
+      expect(reserve(root,key,`${hostname()}:${dead}:dead`,Date.now(),new Date().toISOString(),dead,() => 'dead',120,null,true).ok).toBe(true);
+      let called = 0;
+      await withCoronerLock(dir,async () => { called++; await expect(withCoronerLock(dir,() => {called++;})).rejects.toThrow('already running'); });
+      expect(called).toBe(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('keeps colliding repository slugs independent in cursor and report filenames', async () => {
+    const dir = temp();
+    try {
+      for (const repo of ['a-b/c','a/b-c']) await runPostmortemPass({repo,dir,now:at(700),settings,listMerged:() => [{number:1}],collect:() => ({...fixture(),repo})});
+      for (const key of ['a-b%2Fc','a%2Fb-c']) {
+        expect(JSON.parse(fs.readFileSync(join(dir,`merge-cursor-${key}.json`))).done).toEqual([1]);
+        expect(fs.existsSync(join(dir,`postmortem-${key}-1.md`))).toBe(true);
+      }
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('quarantines a permanently failing PR after three attempts without blocking later merges', async () => {
+    const dir = temp(); const reads = [];
+    const settings = { value: { minLeadHours: 8, minFixRounds: 4, minLostApprovals: 2, onStandDown: true } };
+    const collect = (_repo, pr) => { reads.push(pr); if (pr === 2) throw Error('invalid check-run pages'); return fixture(pr); };
+    const listMerged = (_repo, since) => [2, 3].filter(number => at(600) >= since).map(number => ({ number, merged_at: at(600) }));
+    try {
+      for (const now of [at(700), at(701)]) {
+        await expect(runPostmortemPass({ repo:'example/repo', dir, now, settings, collect, listMerged })).rejects.toThrow('invalid check-run pages');
+        const state = JSON.parse(fs.readFileSync(join(dir,'merge-cursor-example%2Frepo.json')));
+        expect(state.cursor).toBe(at(-740));
+        expect(state.done).toContain(3);
+      }
+      const result = await runPostmortemPass({ repo:'example/repo', dir, now:at(702), settings, collect, listMerged });
+      expect(result).toMatchObject({ cursor:at(702), quarantined:[{ pr:2, attempts:3, error:'invalid check-run pages' }] });
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-3.md'))).toBe(true);
+      await runPostmortemPass({ repo:'example/repo', dir, now:at(703), settings, collect, listMerged });
+      expect(reads).toEqual([2,3,2,2]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
   it('extracts deterministic phases, benchmark gaps, rounds, checks, approvals and scope', () => {
     const r = buildPostmortem(fixture());
     expect(r).toEqual(buildPostmortem(fixture()));
@@ -59,7 +196,7 @@ describe('per PR postmortem', () => {
       const rows = fs.readFileSync(join(dir, 'incidents.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows.filter(r => r.repo === 'example/repo' && r.pr === 1 && r.cause === 'review-finding')).toHaveLength(1);
       expect(rows.filter(r => r.kind === 'triage-candidate' && r.cause === 'review-finding')).toHaveLength(1);
-      expect(fs.existsSync(join(dir, 'postmortem-example-repo-1.md'))).toBe(true);
+      expect(fs.existsSync(join(dir, 'postmortem-example%2Frepo-1.md'))).toBe(true);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
   it('uses production labels and queue events, excludes outsiders and post-merge evidence', () => {
@@ -100,9 +237,9 @@ describe('per PR postmortem', () => {
         await expect(withCoronerLock(dir, () => {})).rejects.toThrow('already running');
         publishPostmortem(r,{dir});
       });
-      fs.unlinkSync(join(dir,'postmortem-example-repo-1.md'));
+      fs.unlinkSync(join(dir,'postmortem-example%2Frepo-1.md'));
       publishPostmortem(r,{dir});
-      expect(fs.existsSync(join(dir,'postmortem-example-repo-1.md'))).toBe(true);
+      expect(fs.existsSync(join(dir,'postmortem-example%2Frepo-1.md'))).toBe(true);
       publishPostmortem(buildPostmortem(fixture(2)),{dir});
       const later = fixture(3); later.mergedAt = at(2100);
       publishPostmortem(buildPostmortem(later),{dir});
@@ -137,16 +274,17 @@ describe('per PR postmortem', () => {
   });
   it('persists cursor and done set, skips short PRs, and retries a failed read after restart', async () => {
     const dir = temp(); let fail = true; const reads = [];
-    const listMerged = () => [{ number: 1, merged_at: at(600) }, { number: 2, merged_at: at(601) }];
+    const listMerged = (_repo,since) => [{ number: 1, merged_at: at(600) }, { number: 2, merged_at: at(601) }].filter(p => p.merged_at >= since);
     const collect = (_repo, pr) => { reads.push(pr); if (pr === 2 && fail) throw Error('read failed'); return { ...fixture(pr), ...(pr === 1 ? { mergedAt: at(1), comments: [], labels: [], checks: [], verdicts: [] } : {}) }; };
     try {
-      await expect(runPostmortemPass({ repo: 'example/repo', dir, now: at(700), listMerged, collect })).rejects.toThrow('read failed');
+      await expect(runPostmortemPass({ repo: 'example/repo', dir, now: at(700), settings, listMerged, collect })).rejects.toThrow('read failed');
+      expect(JSON.parse(fs.readFileSync(join(dir,'merge-cursor-example%2Frepo.json')))).toMatchObject({cursor:at(-740),done:[1],failures:{2:{attempts:1}}});
       fail = false;
-      await runPostmortemPass({ repo: 'example/repo', dir, now: at(701), listMerged, collect });
-      await runPostmortemPass({ repo: 'example/repo', dir, now: at(702), listMerged, collect });
+      await runPostmortemPass({ repo: 'example/repo', dir, now: at(701), settings, listMerged, collect });
+      await runPostmortemPass({ repo: 'example/repo', dir, now: at(702), settings, listMerged, collect });
       expect(reads).toEqual([1, 2, 2]);
-      expect(fs.existsSync(join(dir, 'postmortem-example-repo-1.md'))).toBe(false);
-      expect(JSON.parse(fs.readFileSync(join(dir, 'merge-cursor-example-repo.json'))).done).toEqual([1, 2]);
+      expect(fs.existsSync(join(dir, 'postmortem-example%2Frepo-1.md'))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(join(dir, 'merge-cursor-example%2Frepo.json')))).toMatchObject({cursor:at(702),done:[1,2],failures:{}});
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

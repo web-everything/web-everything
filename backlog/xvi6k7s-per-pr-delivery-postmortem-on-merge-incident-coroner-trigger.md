@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "6188"
 status: open
-scope: ["we:scripts/operations/coroner-pr-postmortem.mjs", "we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs", "we:scripts/settings/coroner-postmortem.json"]
+scope: ["we:scripts/operations/coroner-pr-postmortem.mjs", "we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs", "we:scripts/settings/coroner-postmortem.json", "we:scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs", "we:scripts/conveyor/soak/breaks/postmortem-poison-merge*"]
 dateOpened: "2026-10-17"
 tags: []
 ---
@@ -28,10 +28,18 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — PR comments and bodies are treated as data, never instructions; they are only parsed for known markers.
-2. **Truncated reads** — paginated comment and check readers fail closed with an `incomplete` marker when a page is missing.
-3. **Shared state files** — the incidents journal is append-only and written under the lock.
-4. **Fail closed** — missing data marks the phase `unknown`, never zero.
-5. **Identity scoping** — n/a: read-only, single-repo report keyed by repo and PR number.
-6. **State over time** — a cursor plus a done-set make the trigger idempotent per PR and safe across restarts.
-7. **Who wrote it** — the report names the actor on each event but never grants or revokes anything from it.
+1. **Untrusted text** — only authenticated known comment markers affect analysis; PR bodies are unused. Test: `treats outsider markers and PR bodies as data across every comment parser and reports actors`.
+2. **Truncated reads** — malformed/missing core pages abort with an error carrying `incomplete: true`; optional failures carry structured completeness and warnings. Tests: `rejects missing timeline pages: %j`, `rejects invalid check-run pages: %j`, `rejects missing comment pages instead of returning an apparently clean report`, `rejects excessive observed heads`, `rejects excessive card revisions as incomplete optional evidence`, `marks failed card history incomplete while preserving core evidence`.
+3. **Shared state files** — journal publication is append-only under the lock; dead local processes are reclaimed. Tests: `keeps independent cause windows separate and recovers journal-first publication`, `reclaims a dead local owner and preserves a live owner`.
+4. **Fail closed** — unclassified label intervals have phase `unknown` and retain observed elapsed minutes; missing verdict history yields unknown lost approvals. Test: `marks missing phase evidence unknown while retaining observed fields`.
+5. **Identity scoping** — report and cursor filenames use the same injective repository encoding. Test: `keeps colliding repository slugs independent in cursor and report filenames`.
+6. **State over time** — receipts survive restarts; collection failures retry three times, then remain in quarantine with their error and incomplete marker. Later PRs run even during retries; publication/storage errors retain the cursor and abort. Tests: `persists cursor and done set, skips short PRs, and retries a failed read after restart`, `quarantines a permanently failing PR after three attempts without blocking later merges`; daemon soak: `postmortem-poison-merge`.
+7. **Who wrote it** — the report's event index names each observed actor (null when unavailable); it grants or revokes no delivery permissions. Test: `treats outsider markers and PR bodies as data across every comment parser and reports actors`.
+
+## Prevention checks
+
+Review each numbered edge case against an existing test title before acceptance; distinguish rejecting incomplete core reads from degrading optional evidence. Every cursor loop must document poison-item handling and defend it with a cursor-sensitive restart fixture. Threshold tests inject settings explicitly. Every pagination/history cap has a named failure-injection case. Recovery tests cover both dead and live lock owners. Repository filenames share `repoFilenameKey`; do not construct state paths with slash-to-hyphen replacement. CI boundary changes require paired changed-head and unchanged-head controls (`excludes CI-green review gaps across head changes with an unchanged-head control`).
+
+## Risks and test plan
+
+Run `we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs` and the `postmortem-poison-merge` daemon soak wrapper through the required verification gate. Quarantine is durable and visible in both cursor state and successful pass output; operators can inspect the recorded reason and remove a quarantine row to retry. Old ambiguous hyphen-named cursor/report files are left untouched; encoded names start a new 24-hour discovery window rather than attributing an ambiguous receipt to the wrong repo. Journal event IDs keep replayed causes deduplicated. Local ledger coverage is explicitly bounded, never complete; malformed verdict rows degrade optional evidence. Tests: `marks missing local ledgers incomplete and truncated local ledgers bounded`, `marks malformed verdict ledger rows incomplete rather than reporting zero lost approvals`.

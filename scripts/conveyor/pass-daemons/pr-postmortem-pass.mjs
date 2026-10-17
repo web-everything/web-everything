@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /** Standalone merge watcher. --watch polls every minute; one-shot mode is scheduler-friendly.
  * GitHub merged_at is the landed confirmation; no drain mutation or shared conveyor-file edit.
- * Cursor advances only after a complete window succeeds; per-PR receipts survive partial failures.
+ * Cursor advances after each item succeeds or is quarantined; receipts and retries survive restarts.
  */
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, collectPrTimeline, resolvePostmortemSettings,
-  coronerStateDir, readOptionalJson, atomicJson, ghJson, validateSubject, withCoronerLock } from '../../operations/coroner-pr-postmortem.mjs';
+  coronerStateDir, readOptionalJson, atomicJson, ghJson, validateSubject, withCoronerLock, repoFilenameKey } from '../../operations/coroner-pr-postmortem.mjs';
+
+const MAX_COLLECTION_ATTEMPTS = 3;
 
 /** Updated-order REST listing avoids search-index lag and its separate rate budget.
  * A failed/capped listing never advances the cursor. Recent closed-but-unmerged PRs are ignored.
@@ -27,22 +29,47 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
   settings = resolvePostmortemSettings(), listMerged = listMergedSince, collect = collectPrTimeline } = {}) {
   validateSubject(repo,1);
   return withCoronerLock(dir, async () => {
-    const file = join(dir,`merge-cursor-${repo.replace('/','-')}.json`);
+    const file = join(dir,`merge-cursor-${repoFilenameKey(repo)}.json`);
     const state = readOptionalJson(file,{ cursor:new Date(Date.parse(now)-86400000).toISOString(), done:[] });
     if (!Array.isArray(state.done) || !Number.isFinite(Date.parse(state.cursor)) || Date.parse(now) < Date.parse(state.cursor)) throw Error('invalid merge cursor');
+    state.failures ??= {};
+    state.quarantined ??= [];
+    if (!state.failures || typeof state.failures !== 'object' || Array.isArray(state.failures) || !Array.isArray(state.quarantined)
+      || Object.entries(state.failures).some(([pr,f]) => !/^[1-9]\d*$/.test(pr) || !Number.isInteger(f?.attempts) || f.attempts < 1 || f.attempts >= MAX_COLLECTION_ATTEMPTS)) throw Error('invalid merge retry state');
     const config = settings.value ?? settings;
     let published = 0;
     const prs = await listMerged(repo,new Date(Date.parse(state.cursor)-60000).toISOString(),now);
-    for (const p of prs) {
-      if (state.done.includes(p.number)) continue;
-      const r = { ...buildPostmortem(await collect(repo,p.number)), settings };
-      if (Date.parse(r.mergedAt) > Date.parse(now)) continue;
+    // Retain failed subjects even if a later listing temporarily omits them.
+    const pending = new Map(prs.map(p => [p.number,p]));
+    for (const pr of Object.keys(state.failures)) if (!pending.has(Number(pr))) pending.set(Number(pr),{number:Number(pr)});
+    const errors = [];
+    for (const p of pending.values()) {
+      if (state.done.includes(p.number) || state.quarantined.some(q => q.pr === p.number)) continue;
+      let r;
+      try {
+        r = { ...buildPostmortem(await collect(repo,p.number)), settings };
+        if (r.repo !== repo || r.pr !== p.number || Date.parse(r.mergedAt) > Date.parse(now)) throw Error('timeline subject or merge time disagrees with listing');
+      } catch (error) {
+        const failure = { pr:p.number, attempts:(state.failures[p.number]?.attempts ?? 0)+1, at:now, incomplete:true, error:String(error?.message ?? error).slice(0,2000) };
+        if (failure.attempts >= MAX_COLLECTION_ATTEMPTS) {
+          state.quarantined.push(failure);
+          delete state.failures[p.number];
+        } else {
+          state.failures[p.number] = failure;
+          errors.push(`PR ${p.number}: ${failure.error}`);
+        }
+        atomicJson(file,state);
+        continue;
+      }
+      // Storage/publication failures are pass failures, never poison-item quarantines.
       if (shouldPostmortem(r,config)) { publishPostmortem(r,{dir}); published++; }
+      delete state.failures[p.number];
       state.done.push(p.number); state.done.sort((a,b) => a-b);
       atomicJson(file,state);
     }
+    if (errors.length) throw Error(`postmortem incomplete; cursor retained: ${errors.join('; ')}`);
     state.cursor = now; atomicJson(file,state);
-    return { published, cursor:state.cursor, done:state.done.length };
+    return { published, cursor:state.cursor, done:state.done.length, quarantined:state.quarantined };
   });
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

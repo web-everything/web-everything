@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
-import { readFixLoopRows } from '../conveyor/fix-loop-ledger.mjs';
+import { readFixLoopRows, fixLoopLedgerPath } from '../conveyor/fix-loop-ledger.mjs';
 import { buildPrRounds, normalizeComment, classifyEvent, headsOf, parseCard, cardIdOf } from './coroner-rounds.mjs';
 import { falseFindingsForPr } from './coroner-false-findings.mjs';
 import { readBounded } from './coroner-extract.mjs';
@@ -34,6 +34,8 @@ const same = (a,b) => Boolean(a && b && (a.startsWith(b) || b.startsWith(a)));
 export function validateSubject(repo, pr) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !Number.isSafeInteger(Number(pr)) || Number(pr) < 1) throw Error('expected --repo=owner/name --pr=positive-integer');
 }
+/** Encode the slash as well as owner/name punctuation without merging distinct repository slugs. */
+export function repoFilenameKey(repo) { validateSubject(repo,1); return encodeURIComponent(repo); }
 export function resolvePostmortemSettings({ tool = SETTINGS.coroner.postmortem, platform, env = process.env, log = console.error } = {}) {
   const envValues = {};
   for (const [k, suffix] of Object.entries({ minLeadHours: 'MIN_LEAD_HOURS', minFixRounds: 'MIN_FIX_ROUNDS', minLostApprovals: 'MIN_LOST_APPROVALS', onStandDown: 'ON_STAND_DOWN' })) {
@@ -55,7 +57,7 @@ const PHASES = [
   ['ready-enqueued', ['ready-to-merge', 'status:ready-to-merge']], ['review-dispatch', ['review:queued', 'review:pending', 'review:needed', 'status:awaiting-review']],
 ];
 export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes } = {}) {
-  const { repo, pr, openedAt, mergedAt, verdicts = [], fixLoop = [], scope = null, prepares = [] } = input;
+  const { repo, pr, openedAt, mergedAt, verdicts = null, fixLoop = [], scope = null, prepares = [] } = input;
   const comments = (input.comments ?? []).filter(c => time(c.created_at ?? c.createdAt) <= time(mergedAt));
   const commits = (input.commits ?? []).filter(c => time(c.commit?.committer?.date ?? c.commit?.author?.date) <= time(mergedAt));
   const checks = [...new Map((input.checks ?? []).filter(c => time(c.created_at ?? c.started_at ?? c.completed_at) <= time(mergedAt)).map(c => [c.id ?? JSON.stringify(c), c])).values()].map(c => time(c.completed_at) > time(mergedAt) ? { ...c, completed_at: null, conclusion: null } : c);
@@ -65,7 +67,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   const queueEvents = (input.labels ?? []).filter(e => ['added_to_merge_queue','removed_from_merge_queue'].includes(e.event)).map(e => ({ ...e, event: e.event === 'added_to_merge_queue' ? 'labeled' : 'unlabeled', label: { name: 'merge-queue' } }));
   const events = sorted([...(input.labels ?? []), ...queueEvents].filter(e => ['labeled', 'unlabeled'].includes(e.event)).map(e => ({ at: e.created_at ?? e.createdAt, name: e.label?.name, add: e.event === 'labeled', ref: e.url ?? e.id ?? e.created_at })));
   const live = new Set(), intervals = []; let start = openedAt;
-  const phase = () => PHASES.find(([, names]) => names.some(n => live.has(n)))?.[0] ?? 'other';
+  const phase = () => PHASES.find(([, names]) => names.some(n => live.has(n)))?.[0] ?? 'unknown';
   for (const e of [...events, { at: mergedAt, end: true }]) {
     if (time(e.at) < time(openedAt) || time(e.at) > time(mergedAt)) continue;
     if (time(e.at) > time(start)) intervals.push({ phase: phase(), from: start, to: e.at, minutes: minutes(start, e.at) });
@@ -135,7 +137,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     gaps.push({ kind, from: a.at, to: b.at, minutes: duration, p90, minutesLost: Math.round(Math.max(0,duration-p90)*10)/10, evidence: [a.evidence,b.evidence].filter(v => v !== undefined) });
   }
   const heads = headsOf(commits);
-  const approvals = sorted(verdicts.filter(v => ['accept','accepted','clear-human'].includes(v.verdict ?? v.action)).map(v => ({ at: v.at, head: v.coverage?.headSha ?? v.head, evidence: v.id ?? v.at })));
+  const approvals = sorted((verdicts ?? []).filter(v => ['accept','accepted','clear-human'].includes(v.verdict ?? v.action)).map(v => ({ at: v.at, head: v.coverage?.headSha ?? v.head, evidence: v.id ?? v.at })));
   for (const m of marks.filter(m => m.kind === 'accepted' || m.kind === 'clearance')) if (!approvals.some(a => Math.abs(time(a.at)-time(m.at)) < 60000)) approvals.push({ at: m.at, head: heads.filter(h => time(h.at) <= time(m.at)).at(-1)?.sha, evidence: m.evidence });
   const changes = approvals.flatMap(a => {
     const next = heads.find(h => time(h.at) > time(a.at) && !same(a.head,h.sha));
@@ -156,11 +158,23 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   if (prepareHistory.some(p => p.stale)) causes.push({ cause: 'stale-prepare', phase: 'prepare', minutesLost: null, evidence: prepareHistory.filter(p => p.stale).map(p => p.ref ?? p.at) });
   if (changes.length) causes.push({ cause: 'approval-head-change', phase: 'review', minutesLost: null, evidence: changes.map(c => c.changedAt) });
   if (outside?.length) causes.push({ cause: 'scope-creep', phase: 'fix-rounds', minutesLost: null, evidence: outside });
-  return { repo, pr: Number(pr), openedAt, mergedAt, leadHours: minutes(openedAt,mergedAt)/60, phases, intervals, checks: checks.map(c => ({ name: c.name, head: c.head_sha, waitMinutes: minutes(c.created_at,c.started_at), runMinutes: minutes(c.started_at,c.completed_at), conclusion: c.conclusion, evidence: c.html_url ?? c.id ?? null })), gaps, rounds, falseFindings, standDowns, approvals: { lost: changes.filter(c => c.carryApplied !== true).length, headChanges: changes }, scope: { patterns: scope, outside, status: outside === null ? 'unknown' : 'observed' }, prepareHistory, drainSkips, conflicts: extracted.conflicts, rebases: trusted.filter(c => /rebas|re-stamp/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, evidence: c.ref })), mechanicalMerges: heads.filter(h => h.parents.length > 1), fixLoop: ledger, causes,
+  // Actor metadata is evidence only. Existing shared author authentication still controls marker parsing.
+  const observations = (kind, rows, stamp, actor) => rows.map(e => ({kind,at:stamp(e),actor:actor(e) ?? null,evidence:e.html_url ?? e.url ?? e.id ?? e.sha ?? stamp(e)}));
+  const sourceEvents = sorted([
+    ...observations('comment',comments,c => c.created_at ?? c.createdAt,c => c.author?.login ?? c.user?.login),
+    ...observations('timeline',input.labels ?? [],e => e.created_at ?? e.createdAt,e => e.actor?.login),
+    ...observations('commit',commits,c => c.commit?.committer?.date ?? c.commit?.author?.date,c => c.committer?.login ?? c.author?.login),
+    ...observations('check',checks,c => c.created_at ?? c.started_at,c => c.app?.slug),
+    ...observations('verdict',verdicts ?? [],v => v.at,v => typeof v.actor === 'string' ? v.actor : v.actor?.login),
+    ...observations('fix-ledger',ledger,l => l.at,l => typeof l.actor === 'string' ? l.actor : l.actor?.login),
+    ...observations('prepare',prepares,p => p.at,p => p.actor),
+  ].filter(e => time(e.at) >= time(openedAt) && time(e.at) <= time(mergedAt)));
+  const observedLost = changes.filter(c => c.carryApplied !== true).length;
+  return { repo, pr: Number(pr), openedAt, mergedAt, leadHours: minutes(openedAt,mergedAt)/60, phases, intervals, events:sourceEvents, completeness:input.completeness ?? null, checks: checks.map(c => ({ name: c.name, head: c.head_sha, waitMinutes: minutes(c.created_at,c.started_at), runMinutes: minutes(c.started_at,c.completed_at), conclusion: c.conclusion, evidence: c.html_url ?? c.id ?? null })), gaps, rounds, falseFindings, standDowns, approvals: { lost: verdicts === null ? null : observedLost, observedLost, status:verdicts === null ? 'unknown' : 'observed', headChanges: changes }, scope: { patterns: scope, outside, status: outside === null ? 'unknown' : 'observed' }, prepareHistory, drainSkips, conflicts: extracted.conflicts, rebases: trusted.filter(c => /rebas|re-stamp/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, evidence: c.ref })), mechanicalMerges: heads.filter(h => h.parents.length > 1), fixLoop: ledger, causes,
     warnings: [...(input.warnings ?? []), 'Commit dates are a head-change proxy; force-pushed heads may be absent.', 'Drain skips are a lower bound; unknown carry evidence counts conservatively.', 'Cause times may overlap; null means no attributable duration.', 'REST check runs lack creation timestamps; check wait is unknown unless a creation stamp is supplied. Label phases still record CI wait.', 'Prepare staleness uses a configurable 24-hour heuristic, not an analysis benchmark.'] };
 }
 export function shouldPostmortem(r, s = DEFAULTS) {
-  return r.leadHours >= s.minLeadHours || r.rounds.length >= s.minFixRounds || r.approvals.lost >= s.minLostApprovals || (s.onStandDown && r.standDowns.length > 0);
+  return r.leadHours >= s.minLeadHours || r.rounds.length >= s.minFixRounds || (r.approvals.lost !== null && r.approvals.lost >= s.minLostApprovals) || (s.onStandDown && r.standDowns.length > 0);
 }
 
 export const coronerStateDir = (env = process.env) => env.WE_CORONER_STATE_DIR || dirname(env.WE_CORONER_STATE || join(homedir(), 'workspace/.operations/state/coroner-last.json'));
@@ -175,7 +189,7 @@ function atomicText(path, text) {
 }
 export function renderPostmortem(r) {
   return [`# Delivery postmortem — ${r.repo} #${r.pr}`, '', `${r.openedAt} → ${r.mergedAt} (${r.leadHours.toFixed(1)} hours)`, '',
-    `Fix rounds: ${r.rounds.length}. Approval head changes without observed carry: ${r.approvals.lost}. Stand-downs: ${r.standDowns.length}.`, '',
+    `Fix rounds: ${r.rounds.length}. Approval head changes without observed carry: ${r.approvals.lost ?? 'unknown'}. Stand-downs: ${r.standDowns.length}.`, '',
     '| Phase | Minutes |', '| --- | ---: |', ...r.phases.map(p => `| ${p.phase} | ${p.minutes} |`), '',
     '| Hand-off | Minutes | Benchmark p90 | Excess |', '| --- | ---: | ---: | ---: |', ...r.gaps.map(g => `| ${g.kind} | ${g.minutes} | ${g.p90} | ${g.minutesLost} |`), '',
     '## Fix rounds', '', ...r.rounds.map(x => `- Round ${x.round}, ${x.at}, head ${x.head ?? 'unknown'}: ${x.causes.map(c => [c.cause,c.check,c.lens,c.theme].filter(Boolean).join(' / ')).join('; ') || 'unclassified'}`), '',
@@ -210,45 +224,65 @@ export function publishPostmortem(r, { dir = coronerStateDir() } = {}) {
     if (prs.length >= 3 && !candidate) pending.push({ at: r.mergedAt, repo: r.repo, pr: r.pr, cause, phase: 'triage', minutesLost: null, evidence: prs, kind: 'triage-candidate', id: `triage-candidate:${cause}:${r.mergedAt}` });
   }
   if (pending.length) fs.appendFileSync(path, pending.map(row => JSON.stringify(row)).join('\n')+'\n');
-  const name = `postmortem-${r.repo.replace('/','-')}-${r.pr}`;
+  const name = `postmortem-${repoFilenameKey(r.repo)}-${r.pr}`;
   atomicJson(join(dir,`${name}.json`),r); atomicText(join(dir,`${name}.md`),renderPostmortem(r));
   return { report: `${name}.md`, incidents: pending.length };
 }
 export const ghJson = args => JSON.parse(execFileSyncThrottled('gh',args,{encoding:'utf8',timeout:60000,maxBuffer:32*1024*1024}));
-export function ghPages(path, gh = ghJson) { const pages = gh(['api','--paginate','--slurp',path]); if (!Array.isArray(pages)) throw Error('invalid paginated response'); return pages.flat(); }
+export function ghPages(path, gh = ghJson) {
+  const pages = gh(['api','--paginate','--slurp',path]);
+  if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p) || p.some(row => !row || typeof row !== 'object' || Array.isArray(row)))) throw Error('invalid paginated response');
+  return pages.flat();
+}
 /** All remote operations are GETs; comments use the shared paginated, throttled leaf reader.
  * Optional ledger/card reads are explicitly marked incomplete on failure. Core timeline failures abort.
  */
 export function collectPrTimeline(repo, pr, { gh = ghJson, comments = defaultListPrComments, env = process.env } = {}) {
+  try { return collectCompletePrTimeline(repo,pr,{gh,comments,env}); }
+  catch (cause) { const error = new Error(`incomplete PR timeline: ${cause?.message ?? cause}`,{cause}); error.incomplete = true; throw error; }
+}
+function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
   validateSubject(repo,pr);
   const root = `repos/${repo}`;
   const p = gh(['api',`${root}/pulls/${pr}`]);
   if (!p.merged_at) throw Error('PR has not merged');
-  const warnings = [], optional = (label, fn, fallback) => { try { return fn(); } catch { warnings.push(`${label} unavailable`); return fallback; } };
+  const completeness = {core:'complete',verdicts:'unknown',fixLoop:'unknown',card:'unknown'};
+  const warnings = [], optional = (label, key, fn, fallback) => {
+    try { const value = fn(); completeness[key] = 'complete'; return value; }
+    catch { warnings.push(`${label} unavailable`); completeness[key] = 'incomplete'; return fallback; }
+  };
   const commits = ghPages(`${root}/pulls/${pr}/commits?per_page=100`,gh);
   const labels = ghPages(`${root}/issues/${pr}/events?per_page=100`,gh);
   const thread = comments({number:pr,repo});
+  if (!Array.isArray(thread) || thread.some(c => !c || typeof c !== 'object' || Array.isArray(c))) throw Error('invalid comment pages');
   // Check every observed head, including force-push timeline heads. Caps fail instead of silently omitting history.
   const shas = [...new Set([...commits.map(c => c.sha), ...labels.filter(e => e.event === 'head_ref_force_pushed').map(e => e.commit_id)].filter(Boolean))];
   if (shas.length > 200) throw Error('PR exceeds 200 observed heads; refusing incomplete check history');
   const checks = shas.flatMap(sha => {
     const pages = gh(['api','--paginate','--slurp',`${root}/commits/${sha}/check-runs?filter=all&per_page=100`]);
-    if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p.check_runs))) throw Error('invalid check-run pages');
+    if (!Array.isArray(pages) || !pages.length || pages.some(p => !p || !Array.isArray(p.check_runs) || p.check_runs.some(c => !c || typeof c !== 'object' || Array.isArray(c)))) throw Error('invalid check-run pages');
     return pages.flatMap(p => p.check_runs);
   });
   const ledgerRepo = repo;
-  const verdicts = optional('Verdict ledger', () => {
+  const verdicts = optional('Verdict ledger', 'verdicts', () => {
     const data = gh(['api',`repos/${env.WE_CORONER_LEDGER_REPO || CONSTELLATION_REPOS.we.slug}/contents/${ledgerGitPath(ledgerRepo)}?ref=${LEDGER_TRANSPORT_BRANCH}`]);
     const text = data.content ? Buffer.from(data.content,'base64').toString('utf8') : gh === ghJson ? execFileSyncThrottled('gh', ['api','-H','Accept: application/vnd.github.raw+json', `repos/${env.WE_CORONER_LEDGER_REPO || CONSTELLATION_REPOS.we.slug}/contents/${ledgerGitPath(ledgerRepo)}?ref=${LEDGER_TRANSPORT_BRANCH}`], { encoding:'utf8', timeout:60000, maxBuffer:64*1024*1024 }) : '';
     if (!text) throw Error('missing ledger content');
-    return parseLedgerEvents(text).filter(v => v.pr === Number(pr) && v.repo === ledgerRepo);
+    const events = parseLedgerEvents(text);
+    if (events.length !== text.split('\n').filter(line => line.trim()).length) throw Error('invalid verdict ledger rows');
+    return events.filter(v => v.pr === Number(pr) && v.repo === ledgerRepo);
+  },null);
+  const fixLoop = optional('Fix-loop ledger','fixLoop',() => {
+    if (!fs.statSync(fixLoopLedgerPath(env)).isFile()) throw Error('fix-loop ledger is not a file');
+    return readFixLoopRows({env});
   },[]);
-  const fixLoop = optional('Fix-loop ledger',() => readFixLoopRows({env}),[]);
+  // The shared tolerant reader may omit old or malformed rows; never assert full coverage.
+  if (completeness.fixLoop === 'complete') completeness.fixLoop = 'bounded';
   warnings.push('Fix-loop ledger reader retains only its newest 1 MiB; older sessions may be absent.');
   let scope = null; const prepares = [];
   const id = cardIdOf(p.head?.ref) ?? p.head?.ref?.match(/(?:^|\/)(\d{3,}|x[a-z0-9]{6})(?:-|$)/)?.[1];
   if (!id) warnings.push('No unambiguous card ID in branch; scope and prepare history are unknown.');
-  if (id) optional('Card scope/prepare history', () => {
+  if (id) optional('Card scope/prepare history', 'card', () => {
     const entries = gh(['api',`${root}/contents/backlog?ref=${p.base.sha}`]);
     const file = entries.find(e => e.name.startsWith(`${id}-`));
     if (!file) throw Error('card absent');
@@ -260,14 +294,15 @@ export function collectPrTimeline(repo, pr, { gh = ghJson, comments = defaultLis
       if (time(c.commit.committer.date) > time(p.merged_at)) continue;
       const data = gh(['api',`${root}/contents/${file.path}?ref=${c.sha}`]);
       const card = parseCard(Buffer.from(data.content,'base64').toString('utf8'));
-      if (!card) continue;
+      if (!card) throw Error('invalid card revision');
       if (card.scope.length && (!scope || time(c.commit.committer.date) <= time(p.created_at))) scope = card.scope;
       if (card.preparedDate && card.preparedDate !== last) prepares.push({ at: `${card.preparedDate}T00:00:00Z`, recordedAt: c.commit.committer.date, ref: c.sha });
       last = card.preparedDate;
     }
   },null);
+  if (completeness.card === 'incomplete') { scope = null; prepares.length = 0; }
   return { repo, pr: Number(pr), openedAt:p.created_at, mergedAt:p.merged_at, url:p.html_url, labels, comments:thread, commits, checks, verdicts, fixLoop,
-    files: ghPages(`${root}/pulls/${pr}/files?per_page=100`,gh), scope, prepares, warnings };
+    files: ghPages(`${root}/pulls/${pr}/files?per_page=100`,gh), scope, prepares, warnings, completeness };
 }
 
 // Shared local serialization, with dead-process recovery, using the existing lease primitive.
