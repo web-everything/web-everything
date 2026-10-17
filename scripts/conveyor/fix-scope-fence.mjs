@@ -8,7 +8,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 export function resolveScopeFence({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|on|1)$/i.test(v) ? true : /^(false|off|0)$/i.test(v) ? false : v;
   const result = cascadePolicy('fix.scopeFence', tool?.scopeFence, {
-    standard: { enabled: true, mode: 'stand-down' },
+    standard: { enabled: true, mode: 'warn' },
     platform: (platform ?? platformPreference('fix', { env }))?.scopeFence ?? {}, env,
     envValues: { enabled: bool(env.WE_FIX_SCOPE_FENCE_ENABLED), mode: env.WE_FIX_SCOPE_FENCE_MODE },
     valid: { enabled: v => typeof v === 'boolean', mode: v => ['stand-down', 'warn'].includes(v) },
@@ -94,7 +94,7 @@ export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', a
   if (!violations.length) return { action: 'push', violations };
   const more = violations.length - LISTED_VIOLATIONS;
   const listed = [...violations.slice(0, LISTED_VIOLATIONS), ...(more > 0 ? [`and ${more} more`] : [])];
-  return { action: policy?.mode === 'warn' ? 'warn' : 'stand-down', violations,
+  return { action: policy?.mode === 'warn' ? 'warn' : 'stand-down', violations, files: outside, identifiers,
     reason: `scope-increase request: proposed repair ${listed.join('; ')}. Operator approval is required to widen this PR's scope.` };
 }
 
@@ -110,14 +110,22 @@ export class ScopeFenceEvidenceError extends Error {
   constructor(message, context) { super(message); this.context = context; }
 }
 
-/** The same gate wraps early, green and salvage pushes. Failures never fall through to the push sink. */
+/** The same gate wraps early, green and salvage pushes. Warn is observational, including evidence failures. */
 export function fencedPush({ readContext, readDiff, push, standDown, note, policy }) {
   if (policy.enabled === false) return push();
+  const warn = event => {
+    // Diagnostics must never turn advisory policy into a push refusal.
+    try { note({ event: 'fix.scopeFence.would-block', mode: 'warn', files: [], identifiers: [], ...event }); } catch {}
+  };
   let context, decision;
   try {
     context = readContext();
     decision = scopeFenceDecision({ ...context, ...readDiff(context), policy });
   } catch (e) {
+    if (policy.mode === 'warn') {
+      warn({ reason: String(e?.message ?? e), error: e?.constructor?.name ?? 'Unknown', evidenceUnavailable: true });
+      return push();
+    }
     if (e instanceof ScopeFenceHeadMovedError) return { ok: false, moved: true, terminal: true, reason: e.message };
     if (e instanceof ScopeFenceEvidenceError) {
       const reason = `scope-increase request: scope fence evidence cannot be read in full (${e.message}). Operator review is required before this repair is pushed.`;
@@ -130,6 +138,6 @@ export function fencedPush({ readContext, readDiff, push, standDown, note, polic
     standDown(decision.reason, context);
     return { ok: false, scopeFence: true, terminal: true, reason: decision.reason };
   }
-  if (decision.action === 'warn') note(`Scope fence warning: ${decision.reason}`, context);
+  if (decision.action === 'warn') warn({ reason: decision.reason, files: decision.files, identifiers: decision.identifiers, violations: decision.violations });
   return push();
 }

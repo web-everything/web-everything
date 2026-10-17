@@ -170,7 +170,9 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
     };
     const resolved = resolveScopeFence({ env });
     const policy = resolved.value.scopeFence;
-    log(`fix.scopeFence.enabled=${policy.enabled} (${resolved.sources['scopeFence.enabled']}); fix.scopeFence.mode=${policy.mode} (${resolved.sources['scopeFence.mode']})`);
+    try {
+      log(`fix.scopeFence.enabled=${policy.enabled} (${resolved.sources['scopeFence.enabled']}); fix.scopeFence.mode=${policy.mode} (${resolved.sources['scopeFence.mode']})`);
+    } catch (e) { if (policy.mode !== 'warn') throw e; }
     return fencedPush({ policy, push,
       readContext: () => {
         const key = repoKeyForSlug(repo);
@@ -211,10 +213,7 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         gh(['label', 'create', STAND_DOWN_LABEL, '--repo', repo, '--color', 'b60205', '--description', 'fixer stood down; needs-you', '--force']);
         gh(['pr', 'edit', String(pr), '--repo', repo, '--add-label', STAND_DOWN_LABEL]);
       },
-      note: (body, { comments }) => {
-        log(body);
-        if (!comments.some(c => c.body === body)) gh(['pr', 'comment', String(pr), '--repo', repo, '--body', body]);
-      },
+      note: event => log(JSON.stringify({ ...event, repo, pr, sha })),
     });
   };
 }

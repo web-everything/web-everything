@@ -47,7 +47,7 @@ export async function replay(root = ROOT) {
         if (args[0] === 'pr' && args[1] === 'comment') stoodDown = true;
         return '';
       };
-      const fence = createScopeFencedPush({ root, exec, env: {}, log: () => {}, readComments: () => [],
+      const fence = createScopeFencedPush({ root, exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {}, readComments: () => [],
         loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }] });
       const result = fence({ repo: ghRepoSlug('we'), pr: 5461, sha, git,
         push: () => { pushed = true; return { ok: true }; } });

@@ -116,7 +116,7 @@ function harness({ records = [rec()], session = { sessionId: rec().sessionId, na
 
 describe('scope fence default wiring regressions', () => {
   const ref = 'lane/scope-fence';
-  function fixture({ ancestry = 'ancestor', outside = true, evidenceError = null } = {}) {
+  function fixture({ ancestry = 'ancestor', outside = true, evidenceError = null, mode = 'stand-down' } = {}) {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, ...args]);
@@ -144,7 +144,7 @@ describe('scope fence default wiring regressions', () => {
       throw new Error(`unexpected command: ${cmd}`);
     };
     return { calls, build: () => defaultAwaitVerifyIo({
-      weRoot: '/we', exec, env: { WE_FIX_SCOPE_FENCE_ENABLED: 'true', WE_FIX_SCOPE_FENCE_MODE: 'stand-down' },
+      weRoot: '/we', exec, env: { WE_FIX_SCOPE_FENCE_ENABLED: 'true', WE_FIX_SCOPE_FENCE_MODE: mode },
       poolRoot: '/lanes', realpath: p => p, dispatchIo: {}, stopSessionFn: () => {},
       pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: ref } }),
     }) };
@@ -167,6 +167,22 @@ describe('scope fence default wiring regressions', () => {
       expect(f.calls.some(c => c[0] === 'git' && c.includes('diff'))).toBe(true);
       expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(false);
       expect(f.calls.some(c => c[0] === 'gh' && c.includes('comment') && c.at(-1).includes('scope-increase'))).toBe(true);
+    }, 20_000);
+  }
+  for (const phase of ['early', 'green', 'salvage']) {
+    it.each([{}, { ancestry: 'diverged' }, { evidenceError: 'fatal' }])(`warn continues through the real ${phase} port: %j`, async over => {
+      const f = fixture({ ...over, mode: 'warn' }), real = await f.build();
+      if (phase === 'salvage') {
+        expect(real.salvagePush(pushArg()).ok).toBe(true);
+      } else {
+        const h = harness({ records: [rec({ ref, sessionId: 'S' })] });
+        h.io.listSessions = () => [{ sessionId: 'S', state: 'done' }];
+        h.io.push = real.push;
+        h.state.marker = marker(phase === 'green' ? 'green' : 'running');
+        await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL, pushPolicy: { pushBeforeGate: phase === 'early' } });
+      }
+      expect(f.calls.some(c => c[0] === 'git' && c.includes('push'))).toBe(true);
+      expect(f.calls.some(c => c[0] === 'gh' && ['comment', 'edit', 'create'].includes(c[2]))).toBe(false);
     }, 20_000);
   }
   for (const ancestry of ['diverged', 'missing']) {

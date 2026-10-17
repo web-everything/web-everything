@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { fencedPush, operatorScope, removalMarkers, scopeBrief, resolveScopeFence, scopeFenceDecision } from '../fix-scope-fence.mjs';
+import { ScopeFenceEvidenceError, ScopeFenceHeadMovedError, fencedPush, operatorScope, removalMarkers, scopeBrief, resolveScopeFence, scopeFenceDecision } from '../fix-scope-fence.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 
 const policy = { enabled: true, mode: 'stand-down' };
@@ -97,10 +97,29 @@ describe('fix scope fence', () => {
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs/child.mjs'], policy }).action).toBe('stand-down');
     expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs-new'], policy }).action).toBe('stand-down');
   });
-  it('warn mode posts a note then pushes', () => {
-    const r = run({ policy: { ...policy, mode: 'warn' }, readDiff: () => ({ paths: ['other.mjs'], patch: '' }) });
-    expect(r.result.ok).toBe(true); expect(r.push).toHaveBeenCalledOnce(); expect(r.note).toHaveBeenCalledWith(expect.stringContaining('scope-increase request'), context);
+  it('warn mode logs structured files and identifiers then pushes', () => {
+    const r = run({ policy: { ...policy, mode: 'warn' }, readDiff: () => ({ paths: ['other.mjs'], patch: '+cdLandings();' }) });
+    expect(r.result.ok).toBe(true); expect(r.push).toHaveBeenCalledOnce(); expect(r.note).toHaveBeenCalledWith(expect.objectContaining({ event: 'fix.scopeFence.would-block', mode: 'warn', files: ['other.mjs'], identifiers: ['cdLandings'] }));
     expect(r.note.mock.invocationCallOrder[0]).toBeLessThan(r.push.mock.invocationCallOrder[0]);
+  });
+  it.each([
+    new Error('offline'),
+    new ScopeFenceEvidenceError('oversized marker', context),
+    new ScopeFenceHeadMovedError('a'.repeat(40), 'b'.repeat(40)),
+  ])('warn never blocks on evidence failure: %s', error => {
+    for (const stage of ['readContext', 'readDiff']) {
+      const r = run({ policy: { ...policy, mode: 'warn' }, [stage]: () => { throw error; } });
+      expect(r.result).toEqual({ ok: true });
+      expect(r.push).toHaveBeenCalledOnce();
+      expect(r.standDown).not.toHaveBeenCalled();
+      expect(r.note).toHaveBeenCalledWith(expect.objectContaining({ event: 'fix.scopeFence.would-block', evidenceUnavailable: true, reason: error.message }));
+    }
+  });
+  it('warn continues even if warning logging fails', () => {
+    const r = run({ policy: { ...policy, mode: 'warn' }, readDiff: () => ({ paths: ['other.mjs'] }), note: () => { throw new Error('log failed'); } });
+    expect(r.result.ok).toBe(true);
+    expect(r.push).toHaveBeenCalledOnce();
+    expect(r.standDown).not.toHaveBeenCalled();
   });
   it('fails closed on unavailable evidence and honors disabled policy', () => {
     expect(run({ readContext: () => { throw new Error('offline'); } }).result).toMatchObject({ ok: false, transient: true });
@@ -117,7 +136,8 @@ describe('fix scope fence', () => {
     expect(r.value.scopeFence).toEqual({ enabled: true, mode: 'warn' });
     expect(r.sources).toEqual({ 'scopeFence.enabled': 'tool', 'scopeFence.mode': 'env' });
     const defaults = resolveScopeFence({ env: {}, platform: {}, tool: {} });
-    expect(defaults.value.scopeFence).toEqual(policy);
+    expect(defaults.value.scopeFence).toEqual({ enabled: true, mode: 'warn' });
+    expect(resolveScopeFence({ env: {} }).value.scopeFence.mode).toBe('warn');
     expect(defaults.sources['scopeFence.enabled']).toBe('standard');
     const invalid = resolveScopeFence({ env: { WE_FIX_SCOPE_FENCE_ENABLED: 'nonsense', WE_FIX_SCOPE_FENCE_MODE: 'push' }, platform: { scopeFence: { mode: 'warn' } }, tool: { scopeFence: { enabled: 'yes', mode: false } } });
     expect(invalid.value.scopeFence).toEqual({ enabled: true, mode: 'warn' }); expect(invalid.invalid).toHaveLength(4);
@@ -144,16 +164,17 @@ describe('the live scope fence adapter', () => {
   let createScopeFencedPush;
   beforeAll(async () => { ({ createScopeFencedPush } = await import('../fix-scope-fence-io.mjs')); }, 60_000);
   /** One fake `gh`: PR view, the paginated GraphQL commit read (total count line, then one TSV row per commit), and writes. */
-  async function liveFence({ commits = [[head, 'build']], total = commits.length, comments = [comment], patch = '+function cdLandings() {}' } = {}) {
+  async function liveFence({ commits = [[head, 'build']], total = commits.length, comments = [comment], patch = '+function cdLandings() {}', mode = 'stand-down' } = {}) {
     const writes = [], logs = [], reads = [];
     const exec = (file, args) => {
       expect(file).toBe('gh');
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefName: 'lane/5957-leading-cd', headRefOid: head });
       if (args[0] === 'api' && args[1] === 'graphql') { reads.push(args); return [String(total), ...commits.map(([sha, msg]) => `${sha}\t${tsv(msg)}`)].join('\n') + '\n'; }
+      if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
       if (args[0] === 'api') return 'diff --git a/guard.mjs b/guard.mjs\n--- a/guard.mjs\n+++ b/guard.mjs\n';
       writes.push(args); return '';
     };
-    const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: line => logs.push(line),
+    const fence = createScopeFencedPush({ root: '.', exec, env: mode ? { WE_FIX_SCOPE_FENCE_MODE: mode } : {}, log: line => logs.push(line),
       loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => comments });
     const push = vi.fn(() => ({ ok: true }));
     const git = args => args.includes('merge-base') ? '' : args.includes('--no-merges') ? 'b'.repeat(40) + '\n'
@@ -162,13 +183,24 @@ describe('the live scope fence adapter', () => {
     return { result, push, writes, logs, reads };
   }
 
+  it.each([
+    {},
+    { total: 2 },
+    { comments: [{ ...comment, body: `${body}\n${'x'.repeat(17 * 1024)}` }] },
+  ])('default warn logs without PR writes and pushes (case %#)', async over => {
+    const r = await liveFence({ ...over, mode: null });
+    expect(r.result).toEqual({ ok: true });
+    expect(r.push).toHaveBeenCalledOnce();
+    expect(r.writes).toEqual([]);
+    expect(JSON.parse(r.logs[1])).toMatchObject({ event: 'fix.scopeFence.would-block', mode: 'warn', repo: 'web-everything/web-everything', pr: 5403, sha: 'b'.repeat(40) });
+  });
   it('resolves the card and authenticated marker before posting a needs-you stand-down', async () => {
     const { result, push, writes, logs } = await liveFence();
     expect(result).toMatchObject({ ok: false, scopeFence: true });
     expect(push).not.toHaveBeenCalled();
     expect(writes.find(args => args[1] === 'comment')?.at(-1)).toContain('stand-down reason=scope-increase');
     expect(writes.some(args => args.includes('review-status:stood-down'))).toBe(true);
-    expect(logs[0]).toMatch(/enabled=true \(tool\).*mode=stand-down \(tool\)/);
+    expect(logs[0]).toMatch(/enabled=true \(tool\).*mode=stand-down \(env\)/);
   });
   it('live adapter blocks identifiers marked only in PR removal commits', async () => {
     const commits = [['c'.repeat(40), 'initial'], [head, 'operator removal\n\nscope-removed: cdLandings, LANDING_BASES']];
@@ -247,7 +279,7 @@ describe('the live scope fence adapter over a real repository', () => {
       if (args[0] === 'pr' && args[1] === 'diff') return 'guard.mjs\n';
       writes.push(args); return '';
     };
-    const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: () => {},
+    const fence = createScopeFencedPush({ root: '.', exec, env: { WE_FIX_SCOPE_FENCE_MODE: 'stand-down' }, log: () => {},
       loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => [] });
     const push = vi.fn(() => ({ ok: true }));
     return { result: fence({ repo: 'web-everything/web-everything', pr: 5403, sha, git: port, push }), push, writes, compares };

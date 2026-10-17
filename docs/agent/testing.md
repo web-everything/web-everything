@@ -1493,8 +1493,13 @@ work), never the fixer's proposed diff. Operator-authored sanctioned changes-req
 prohibit added lines containing those identifier tokens. This is a lexical fence; renaming a subsystem
 is still forbidden by the scope brief even when the marker cannot identify it mechanically.
 
-The harness checks before early, green and saved-commit pushes. Unreadable scope/diff evidence withholds
-the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+The harness checks before early, green and saved-commit pushes. In enforcing `stand-down` mode, unreadable
+scope/diff evidence withholds the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+Default `warn` mode always continues to the push sink, including on unreadable evidence and moved heads.
+It emits a JSON `fix.scopeFence.would-block` event with the would-block `files` and `identifiers`,
+plus repo, PR and SHA. Evidence failures include `evidenceUnavailable`, error type and reason; unavailable
+file/identifier lists are empty. Diagnostic failures cannot block a warn-mode push. No PR comment or label is written.
+The refusal and stand-down behavior below applies only to enforcing `stand-down` mode.
 File scope checks union the paths of repair commits, including side branches and merge-authored edits,
 from the pre-fix PR head to the proposed push. Without a GitHub-verified merged base, the whole range
 diff also counts. Only commits reachable from a verified merged base are exempt as upstream history.
@@ -1527,10 +1532,10 @@ added prefix-increment statements inside hunks are checked like all other additi
 When the PR head diverged or its commit is absent locally, the fence refuses to push and returns a
 terminal moved-head result. Live waits use the existing `push-rejected` recovery prompt; salvage stops
 retrying the stale saved commit. Unexpected Git failures remain transient evidence failures.
-`fix.scopeFence.enabled` (true) and `fix.scopeFence.mode` (`stand-down` or `warn`, default `stand-down`)
+`fix.scopeFence.enabled` (true) and `fix.scopeFence.mode` (`stand-down` or `warn`, default `warn`; operator 2026-10-17: enforce later, once the follow-up card makes the fence merge-aware)
 resolve independently through standard → platform `fix.scopeFence` → tool settings →
-`WE_FIX_SCOPE_FENCE_ENABLED` / `WE_FIX_SCOPE_FENCE_MODE`; push logs name each source. Warn mode posts a
-PR note before pushing. Replay #5403 with a real temporary git removal/re-addition diff and injected
+`WE_FIX_SCOPE_FENCE_ENABLED` / `WE_FIX_SCOPE_FENCE_MODE`; push logs name each source. Warn mode logs a
+structured event before pushing. Replay #5403 with a real temporary git removal/re-addition diff and injected
 push/comment sinks in `fix-scope-fence.test.mjs`. The default-IO regressions in `await-verify-pass.test.mjs`
 keep the real fence enabled for early, green and salvage ports, assert stand-down and no Git push, and
 cover diverged/missing heads plus unexpected ancestry errors. Older push-port tests isolate unrelated
