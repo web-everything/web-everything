@@ -112,31 +112,39 @@ const stickyEnd = (re) => (text, at) => {
   return re.exec(text) ? re.lastIndex : -1;
 };
 
-// A shell-ish value: one leading token that may be a double-quoted string, then any concatenation of quoted
-// ('…', `…`, $'…') and bare parts — `'it'\''s secret'` is one value. An unclosed quote runs to the end.
-// A bare part stops at `"`, `]`, `}`, `,` and `;`, so a value inside JSON text never eats its closing quote.
-const SHELL_PART = String.raw`'[^']*(?:'|$)|\x60[^\x60]*(?:\x60|$)|\$'(?:[^'\\]|\\.)*(?:'|$)|\\[^"]|[^\s"'\x60\\\],};]`;
-const SHELL_VALUE = new RegExp(String.raw`(?:"(?:[^"\\]|\\.)*(?:"|$)|${SHELL_PART})(?:${SHELL_PART})*`, 'y');
+// A `"` (raw or escaped) followed by `,` `}` `]` `:` or the end closes the JSON string a value sits in; any
+// other `"` opens a quoted part of the value (`a=''"…"`, `sid="…"`), so a value never ends early at one.
+const NOT_JSON_CLOSE = String.raw`(?!\s*(?:[,}\]:]|$))`;
+// A shell-ish value: an optional leading double-quoted string, then any concatenation of quoted ('…', "…",
+// `…`, $'…', a JSON-escaped \"…\") and bare parts — `'it'\''s secret'` and `''"secret"` are one value. An
+// unclosed quote runs to the end. A bare part stops at `"`, `]`, `}`, `,` and `;`, and a `"` that closes the
+// surrounding JSON string ends the value, so a value inside JSON text never eats its closing quote.
+const SHELL_PART = String.raw`'[^']*(?:'|$)|\x60[^\x60]*(?:\x60|$)|\$'(?:[^'\\]|\\.)*(?:'|$)` +
+  String.raw`|"${NOT_JSON_CLOSE}(?:[^"\\]|\\.)*(?:"|$)|"[^"]*"(?=[\s;&|)]|$)` +
+  String.raw`|(\\+)"${NOT_JSON_CLOSE}(?:(?!\1")[^\r\n])*(?:\1"|(?=[\r\n])|$)|\\[^"]|[^\s"'\x60\\\],};]`;
+const SHELL_VALUE = new RegExp(String.raw`(?:"(?:[^"\\]|\\.)*(?:"|$))?(?:${SHELL_PART})*`, 'y');
 // Names are matched as ONE bounded identifier that starts where no identifier character precedes it, then
 // tested by `isCredName` — so a long run of identifier characters is scanned once, never quadratically.
 const IDENT = String.raw`(?<![A-Za-z0-9_.-])(?<name>[A-Za-z0-9_.-]{1,128})`;
 
-/** The value of a JSON key at `at`: a string at the key's own escape depth, else a bare scalar. */
+/** The value of a JSON key at `at`: a string at the key's own escape depth, a whole object or array
+ *  (`{"Authorization":["Basic …"]}`), else a bare scalar. */
 function jsonValueEnd(text, at, m) {
   const depth = m.groups.bs.length;
   if (text.startsWith(`${m.groups.bs}"`, at)) return quotedEnd(text, at, depth);
+  if (text[at] === '{' || text[at] === '[') return objectEnd(text, at);
   const bare = /[^,}\]\s\\"]+/y;
   bare.lastIndex = at;
   return bare.exec(text) ? bare.lastIndex : -1;
 }
 
 const HEADER_NAME = String.raw`(?:proxy-)?authorization|(?:set-)?cookie|x-[a-z0-9-]{0,64}(?:token|key|secret|auth)[a-z0-9-]{0,64}`;
-// A quoted cookie value is bounded (256), so a long line of unclosed quotes is rescanned a bounded amount, never
-// quadratically. The escaped form closes at the same backslash depth it opened with.
-// A quote right after `=`, `:` or a space opens a quoted part (`a="1"`, `x-api-key: "…"`, `Bearer "…"`). A raw
-// one holds no `,{}` and closes before `;`, a space or the end — so `{"e":"Cookie: a ","ok":1}`'s closing quote
-// is never read as an opening one.
-const HEADER_VALUE = String.raw`(?:(?<=[=:\s])"[^"\r\n,{}]{0,256}"(?=[;\s]|$)|(?<=[=:\s])(?<hb>\\+)"(?:(?!\k<hb>")[^\r\n]){0,256}\k<hb>"|\\\\|\\[^nr"'\\]|'\\''|\r?\n[ \t]+|(?:\\r)?\\n[ \t]+|[^\r\n"'\\])*`;
+// A quote right after `=`, `:` or a space opens a quoted part (`a="1"`, `x-api-key: "…"`, Digest's
+// `response="…"`), of ANY length: an unclosed one runs to the end of the line, so it never fails and is never
+// rescanned. A quote that closes the surrounding JSON string (NOT_JSON_CLOSE) opens nothing — so
+// `{"e":"Cookie: a ","ok":1}` keeps its `,"ok"` — unless its quoted part closes before `;`, `,`, a space or the
+// end (`sid=",…"`). The escaped form closes at the same backslash depth it opened with.
+const HEADER_VALUE = String.raw`(?:(?<=[=:\s])"${NOT_JSON_CLOSE}(?:[^"\r\n\\]|\\[^\r\n])*(?:"|(?=[\r\n])|$)|(?<=[=:\s])"[^"\r\n]*"(?=[;,\s]|$)|(?<=[=:\s])(?<hb>\\+)"${NOT_JSON_CLOSE}(?:(?!\k<hb>")[^\r\n])*(?:\k<hb>"|(?=[\r\n])|$)|\\\\|\\[^nr"'\\]|'\\''|\r?\n[ \t]+|(?:\\r)?\\n[ \t]+|[^\r\n"'\\])*`;
 // One cookie list: quoted or bare parts, carried across `; ` when another `name=` follows (an env dump's form).
 const COOKIE_LIST = String.raw`(?:'[^']{0,4096}'|"(?:[^"\\]|\\.){0,4096}"|;[ \t]+(?=[A-Za-z0-9_.%-]{1,64}=)|[^\s"'\\]){1,4096}`;
 
@@ -162,7 +170,7 @@ const NAMED_VALUES = [
   // `["Cookie","a=1; s=…"]`, `["--token","…"]` — a header list or argv array: the string after a credential name.
   // Only an ARRAY element that is a flag or a header name: an object value (after `:`), a key (before `:`) or a
   // subcommand word (`["gh","auth","login"]`) never matches.
-  namedValueRule(new RegExp(String.raw`(?<=[[,]\s{0,8})(?<bs>\\*)"(?<name>-{1,2}[A-Za-z0-9_.-]{1,128}|${HEADER_NAME})\k<bs>"\s*,\s*(?=\k<bs>")`, 'gi'),
+  namedValueRule(new RegExp(String.raw`(?<=[[,]\s{0,8})(?<bs>\\*)"(?<name>-{1,2}[A-Za-z0-9_.-]{1,128}|${HEADER_NAME})\k<bs>"\s*,\s*(?=\k<bs>"|[[{])`, 'gi'),
     jsonValueEnd, (m) => `${m[0]}${m.groups.bs}"<redacted-env>${m.groups.bs}"`),
   // `COOKIE=a=1; s=…`, `--cookie a=1;s=…`, curl's `-b 'a=1; s=…'` / `-b'…'`: a cookie list is one value, `;` included.
   // A space-separated value only follows a FLAG, so prose (`cookie consent`) is left alone.

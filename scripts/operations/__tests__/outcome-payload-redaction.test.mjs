@@ -31,6 +31,21 @@ const SHAPES = [
   ['multi-cookie header', `request failed; Cookie: theme=light; session=${OPAQUE}`],
   ['Set-Cookie header with attributes', `Set-Cookie: sid=${OPAQUE}; Path=/; HttpOnly`],
   ['credential header with a list value', `X-Auth-Token: a, ${OPAQUE}`],
+  // Round 5 red team, and their siblings: a value that ends early at a length bound, a quote or a container.
+  ['quoted cookie value past 256 characters', `Cookie: sid="${OPAQUE.padEnd(257, 'x')}"`],
+  ['JSON-escaped quoted cookie value past 256 characters', JSON.stringify({ e: `Cookie: sid="${OPAQUE.padEnd(300, 'x')}"` })],
+  ['Digest header with quoted parts', `Authorization: Digest username="bob", qop="auth,auth-int", response="${OPAQUE}"`],
+  ['quoted cookie value holding a comma', `Cookie: sid="a,${OPAQUE}"`],
+  ['credential-valued JSON array', `{"Authorization":["Basic ${OPAQUE}"]}`],
+  ['credential-valued JSON object', `{"Authorization":{"basic":"${OPAQUE}"}}`],
+  ['JSON-encoded credential-valued array', JSON.stringify({ e: `{"GH_TOKEN":["${OPAQUE}"]}` })],
+  ['env name/value pair with an array value', `{"name":"GH_TOKEN","value":["${OPAQUE}"]}`],
+  ['adjacent shell quotes', `GH_TOKEN=''"${OPAQUE}" node x`],
+  ['bare then double-quoted shell parts', `GH_TOKEN=a"${OPAQUE}" node x`],
+  ['two double-quoted shell parts', `GH_TOKEN="a""${OPAQUE}" node x`],
+  ['locale-quoted shell value', `GH_TOKEN=$"${OPAQUE}" node x`],
+  ['flag value with adjacent shell quotes', `claude --token ''"${OPAQUE}" x`],
+  ['JSON-escaped shell double quotes', JSON.stringify({ e: `GH_TOKEN="${OPAQUE}" node` })],
 ];
 
 const runOf = (text) => ({ op: 'dispatch-lane', id: 'r', cursor: 1, status: 'failed',

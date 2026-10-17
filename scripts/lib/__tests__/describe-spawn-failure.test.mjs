@@ -114,6 +114,23 @@ describe('redactSpawnText', () => {
     expect(redactSpawnText('git checkout -b lane/x failed', { env: {} })).toBe('git checkout -b lane/x failed');
     expect(redactSpawnText(JSON.stringify({ e: 'x', ok: 1, list: ['a', 'b'] }), { env: {} })).toBe('{"e":"x","ok":1,"list":["a","b"]}');
   });
+  it('never ends a value early at a length bound, a quoted part or a container (PR #5472 round 5)', () => {
+    const inputs = [`Cookie: sid="${'opaque1'.padEnd(257, 'x')}"`, JSON.stringify({ e: `Cookie: sid="${'opaque2'.padEnd(300, 'x')}"`, ok: 1 }),
+      'Authorization: Digest username="bob", qop="auth,auth-int", response="opaque3"', 'Cookie: sid="a,opaque4"',
+      '{"Authorization":["Basic opaque5"],"ok":1}', '{"GH_TOKEN":{"v":"opaque6"},"ok":1}', JSON.stringify({ e: '{"GH_TOKEN":["opaque7"]}', ok: 1 }),
+      '{"name":"GH_TOKEN","value":["opaque8"]}', '["--token",["opaque9"]]', `GH_TOKEN=''"opaqueA" node x`, 'GH_TOKEN=a"opaqueB" node x',
+      'GH_TOKEN="a""opaqueC" node x', 'GH_TOKEN=$"opaqueD" node x', `--token ''"opaqueE" x`, JSON.stringify({ e: 'GH_TOKEN="opaqueF" node', ok: 1 })];
+    for (const text of inputs) {
+      const out = redactSpawnText(text, { env: {} });
+      expect(out).not.toContain('opaque');
+      if (/^[[{]/.test(text)) expect(() => JSON.parse(out)).not.toThrow();
+    }
+    expect(redactSpawnText(`GH_TOKEN=''"opaque1" node x`, { env: {} })).toBe('GH_TOKEN=<redacted> node x');
+    expect(redactSpawnText('{"Authorization":["Basic opaque1"],"ok":1}', { env: {} })).toBe('{"Authorization":"<redacted-env>","ok":1}');
+    // A quote that closes the surrounding JSON string still ends the value.
+    expect(redactSpawnText('{"e":"GH_TOKEN=abc","ok":"1 2"}', { env: {} })).toBe('{"e":"GH_TOKEN=<redacted>","ok":"1 2"}');
+    expect(redactSpawnText('{"e":"Cookie: a=1","ok":"x y"}', { env: {} })).toBe('{"e":"Cookie: <redacted>","ok":"x y"}');
+  });
   it('keeps the key it redacts, and leaves effect keys and token counts alone', () => {
     expect(redactSpawnText('{"GH_TOKEN":"opaque1","key":"dispatch:3794","input_tokens":55}', { env: {} }))
       .toBe('{"GH_TOKEN":"<redacted-env>","key":"dispatch:3794","input_tokens":55}');
@@ -122,7 +139,9 @@ describe('redactSpawnText', () => {
   it('stays linear on long adversarial text', () => {
     const started = Date.now();
     for (const text of ['a.'.repeat(100000), 'a='.repeat(100000), 'a://'.repeat(50000), '"a":'.repeat(50000), '--settings {"'.repeat(20000),
-      ' '.repeat(300000), ' -b'.repeat(100000), 'cookie '.repeat(45000), 'Cookie: ="'.repeat(30000), 'Cookie: =\\\\"'.repeat(30000)]) {
+      ' '.repeat(300000), ' -b'.repeat(100000), 'cookie '.repeat(45000), 'Cookie: ="'.repeat(30000), 'Cookie: =\\\\"'.repeat(30000),
+      `Cookie: ${'a=" '.repeat(30000)}`, `GH_TOKEN=${'\\\\"x '.repeat(30000)}`, `GH_TOKEN=${'a"'.repeat(50000)}`, `${'x Cookie: '.repeat(20000)}"`,
+      `{"GH_TOKEN":${'['.repeat(50000)}`]) {
       redactSpawnText(text, { env: {} });
     }
     expect(Date.now() - started).toBeLessThan(2000);
