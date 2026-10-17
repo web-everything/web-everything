@@ -169,7 +169,7 @@ export function createEventWaker(o) {
     healthyIntervalMs = PR_EVENTS_DEFAULTS.healthyIntervalMs, pollEveryMs = PR_EVENTS_DEFAULTS.pollEveryMs,
     staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs, minWakeGapMs = PR_EVENTS_DEFAULTS.minWakeGapMs,
     poll = pollEvents, now = () => Date.now(), rawSleep = (ms) => new Promise((r) => { setTimeout(r, ms); }),
-    forward = [], log = console,
+    forward = [], localWake = () => false, log = console,
   } = o;
   const writeStatus = o.writeStatus !== undefined ? o.writeStatus : (stateDir ? (s) => writeStatusFile(stateDir, role, s) : null);
   const st = { cursor: null, lastOkAt: null, lastFailAt: null, lastDeliveryAt: null, lastEventAt: null, lastError: null, initialized: false };
@@ -231,6 +231,7 @@ export function createEventWaker(o) {
     const start = now();
     let pendingWake = null;
     for (;;) {
+      if (localWake()) return;
       if (!pendingWake) {
         const r = await pollOnce();
         if (r.wake) pendingWake = r.reason;

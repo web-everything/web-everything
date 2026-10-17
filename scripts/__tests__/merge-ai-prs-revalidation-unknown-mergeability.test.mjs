@@ -61,7 +61,7 @@ describe('tonight\'s skip records', () => {
 describe('setting', () => {
   it('defaults to a short bounded wait, and the env knob can only set sane bounded values', () => {
     expect(resolveUnknownMergeabilityRetry({})).toEqual(UNKNOWN_MERGEABILITY_RETRY);
-    expect(UNKNOWN_MERGEABILITY_RETRY.retries * UNKNOWN_MERGEABILITY_RETRY.delayMs).toBeLessThanOrEqual(30_000);
+    expect(UNKNOWN_MERGEABILITY_RETRY.retries * UNKNOWN_MERGEABILITY_RETRY.delayMs).toBeLessThanOrEqual(60_000);
     expect(resolveUnknownMergeabilityRetry({ [UNKNOWN_MERGEABILITY_RETRY_ENV]: '0' }).retries).toBe(0);
     expect(resolveUnknownMergeabilityRetry({ [UNKNOWN_MERGEABILITY_RETRY_ENV]: '2' }).retries).toBe(2);
     for (const bad of ['', 'x', '-1', '1.5', '99']) {
@@ -116,4 +116,22 @@ describe('revalidateWithUnknownRetry', () => {
     expect(off).toMatchObject({ reads: 1, slept: [] });
     expect(off.v.decision).toBe('skip');
   });
+});
+
+it('re-polls UNKNOWN listings inside the pass, waiting for each delay and refreshing head facts', async () => {
+  const { repollUnknownListings } = await import('../merge-ai-prs.mjs');
+  const rows = new Map([['o/r', [pr({ mergeable: 'UNKNOWN' }), pr({ number: 9 })]]]);
+  const calls = [];
+  await repollUnknownListings({ prsByRepo: rows, setting: { retries: 3, delayMs: 20_000 },
+    sleep: async ms => { await Promise.resolve(); calls.push(ms); },
+    read: async (repo, num) => { calls.push([repo, num]); return pr({ headRefOid: 'b'.repeat(40) }); } });
+  expect(calls).toEqual([20_000, ['o/r', 4602]]);
+  expect(rows.get('o/r')[0].headRefOid).toBe('b'.repeat(40));
+});
+it('bounds unresolved listings to three re-polls', async () => {
+  const { repollUnknownListings } = await import('../merge-ai-prs.mjs');
+  let reads = 0;
+  await repollUnknownListings({ prsByRepo: new Map([['o/r', [pr({ mergeable: 'UNKNOWN' })]]]),
+    read: async () => { reads++; return pr({ mergeable: 'UNKNOWN' }); }, sleep: async () => {} });
+  expect(reads).toBe(3);
 });

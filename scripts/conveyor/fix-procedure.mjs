@@ -51,6 +51,8 @@
  * holder is `who` (`WE_FIX_WHO`) PLUS that token (`WE_FIX_TOKEN`). Two workers passing the same conventional
  * `--who` are therefore still two authors. Anything else is "anyone else" and is refused.
  */
+import { recordFixPush } from './fix-push-state.mjs';
+import { markFixPushAwaitingCi } from './fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { hostname } from 'node:os';
@@ -705,7 +707,7 @@ export async function fixBegin({
 export async function fixEnd({
   repo, pr, who, sessionId = callerIdentity().sessionId, token = callerIdentity().token, gh = ghDefault, labels = null, lockRoot = fixDispatchClaimRoot(),
   readCompletion = readCompletionDefault, readSelfReview = readSelfReviewDefault, clearSelfReview = null,
-  selfRelease = null,
+  selfRelease = null, recordPush = recordFixPush,
 } = {}) {
   const repoKey = repoKeyOf(repo);
   const slug = CONSTELLATION_REPOS[repoKey].slug;
@@ -739,12 +741,25 @@ export async function fixEnd({
   const heldLabel = wasDraft && FIX_DRAFT_LABEL[draftReason] ? FIX_DRAFT_LABEL[draftReason] : FIXING_LABEL;
   const steps = [];
   let headSha = null;
-  try { headSha = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid']))).headRefOid ?? null; } catch { headSha = null; }
+  let headLabels = [];
+  try { const view = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid,labels']))); headSha = view.headRefOid ?? null; headLabels = (view.labels ?? []).map(l => l.name ?? l); } catch { headSha = null; }
   let infraStall = false;
   try {
     infraStall = isInfraStallCompletion(await readCompletion(who), { sessionId, claimedAt: rel.entry?.meta?.claimedAt ?? null });
   } catch { infraStall = false; }
   const provider = labels ?? await labelProviderDefault();
+  // Raw agent pushes also pass through fix-end. A changed head proves a push since fix-begin;
+  // an unchanged head or infrastructure stand-down must not reset CI state.
+  if (headSha && rel.entry?.meta?.headSha && headSha !== rel.entry.meta.headSha && !infraStall) {
+    try {
+      recordPush({ repo: slug, pr: Number(pr), head: headSha });
+      provider.ensureLabel(slug, 'checking', { color: 'fbca04', description: 'Waiting for CI' });
+      provider.ensureLabel(slug, 'status:awaiting-ci', { color: 'fbca04', description: 'Waiting for CI — auto-managed' });
+      provider.setLabels(slug, Number(pr), { add: 'checking', remove: headLabels.filter(l => l === 'ci:failed') });
+      provider.setLabels(slug, Number(pr), { add: 'status:awaiting-ci', remove: headLabels.filter(l => ['status:ci-red', 'status:fixing', 'status:takeover-running', 'status:awaiting-review'].includes(l)) });
+      steps.push('awaiting-ci');
+    } catch (e) { steps.push(`awaiting-ci-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+  }
   try { provider.setLabels(slug, Number(pr), { remove: [heldLabel] }); steps.push('unlabel'); } catch (e) { steps.push(`unlabel-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
   try { provider.postComment(slug, Number(pr), buildFixEndComment({ who, headSha, draft: wasDraft, infraStall })); steps.push('comment'); } catch (e) { steps.push(`comment-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
   return { ok: true, pr: Number(pr), repo: repoKey, who, headSha, draft: wasDraft, reason: draftReason, infraStall, steps };
@@ -809,6 +824,8 @@ if (IS_CLI) {
       if (cmd === 'push-check') out({ ok: true, branch, repo: repoKey });
       const src = typeof flags.src === 'string' ? flags.src : 'HEAD';
       execFileSync('git', ['push', remote, `${src}:refs/heads/${branch}`], { stdio: ['ignore', 'inherit', 'inherit'] });
+      const claim = listLiveFixClaims({ repo: repoKey }).find(e => e.meta?.branch === branch);
+      if (claim) markFixPushAwaitingCi({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: claim.meta.pr, head: execFileSync('git', ['rev-parse', src], { encoding: 'utf8' }).trim() });
       out({ ok: true, pushed: true, branch, repo: repoKey });
     }
     fail(USAGE);

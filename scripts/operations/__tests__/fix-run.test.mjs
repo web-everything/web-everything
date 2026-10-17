@@ -105,7 +105,7 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
   it.each([undefined, '42', '0'])('passes the acquire wait policy (%s)', async value => {
     if (value === undefined) vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', '');
@@ -185,7 +185,7 @@ describe('runFixCli', () => {
   it('two pre-lane CI refusals make the next routed repair choose Claude', async () => {
     const m = mk([]), head = 'a'.repeat(40), store = ledger(), rows = [];
     const run = (cmd, args, opts) => cmd === 'gh' ? JSON.stringify({ headRefOid: head }) : m.run(cmd, args, opts);
-    const io = { ...m.io, run, readCiHeal: () => ({ checks: [] }), appendLoopRow: row => rows.push(row),
+    const io = { recordPush: () => {}, ...m.io, run, readCiHeal: () => ({ checks: [] }), appendLoopRow: row => rows.push(row),
       recordRouted: entry => recordRoutedOutcome({ ...entry, store, readClaim: () => null }) };
     const routed = () => chooseFixExecutor({ launcherAvailable: true,
       codexUnproductive: consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head }) });
@@ -533,7 +533,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(args).toContain('title,body,baseRefName,mergeable,headRefOid');
+        expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
       }

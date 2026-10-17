@@ -600,6 +600,22 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     };
   };
 
+  it('fix-end hands a raw fixer push to CI when the claimed head changed', async () => {
+    const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40);
+    const claim = acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session',
+      branch: BRANCH, headSha: oldHead, lockRoot: root });
+    expect(claim.ok).toBe(true);
+    const labels = fakeLabels();
+    const pushes = [];
+    const result = await fixEnd({ repo: 'we', pr: 2811, who: 'fix-2811', sessionId: 'push-session', lockRoot: root,
+      gh: async () => JSON.stringify({ headRefOid: newHead, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }),
+      labels, readCompletion: async () => null, recordPush: push => pushes.push(push) });
+    expect(result.steps).toContain('awaiting-ci');
+    expect(pushes).toEqual([{ repo: 'web-everything/web-everything', pr: 2811, head: newHead }]);
+    expect(labels.log).toContainEqual(['set', { add: 'checking', remove: ['ci:failed'] }]);
+    expect(labels.log).toContainEqual(['set', { add: 'status:awaiting-ci', remove: ['status:ci-red'] }]);
+  });
+
   it('fix-begin DEFAULT (operator ruling 2026-09-27, draft-only-on-withdrawal): claim → NO draft → fixing label (stood-down removed) → marker; token-bound for a session-less caller; fix-end never relies on draft-first promotion', async () => {
     const { gh, calls } = fakeGh({ headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', labels: [{ name: STOOD_DOWN_LABEL }] });
     const labels = fakeLabels();

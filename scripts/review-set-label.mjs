@@ -1,3 +1,4 @@
+import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
@@ -1891,6 +1892,7 @@ export function runReviewLabelCli({
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  signalFixDispatch({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)

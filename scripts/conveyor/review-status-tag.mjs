@@ -26,6 +26,7 @@
  * 5748 (2026-10-11): legacy `review-status:*` writes stay on (LEGACY_REVIEW_STATUS_DEFAULT) until their readers
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
+import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -256,7 +257,7 @@ export function tagReviewStatus({
   // `null` (a standalone CLI call) leaves any `status:*` label untouched: without the plan it cannot be derived.
   planRows = null,
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
-  requiredChecks, prStatusSettings,
+  requiredChecks, prStatusSettings, signalFix = signalFixDispatch,
   readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
   excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
     repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
@@ -311,6 +312,7 @@ export function tagReviewStatus({
     if (sp.add || sp.remove.length) {
       if (sp.add) provider.ensureLabel(repo, sp.add, { color: 'fbca04', description: PR_STATUS_DESCRIPTIONS[state] ?? 'auto-managed PR status' });
       provider.setLabels(repo, pr, { add: sp.add ?? undefined, remove: sp.remove });
+      signalFix({ repo, pr, label: sp.add });
     }
   };
   const withStatus = (o) => (prStatus === undefined ? o : { ...o, prStatus });
