@@ -351,7 +351,9 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnostics
     out = await runChild('node', ['--input-type=module', '-e', buildEntryBootScript(entry)], { cwd: root, timeoutMs, env });
   } catch (e) {
     const stderr = String(e?.stderr ?? '');
-    return { entry, ok: false, kind: 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
+    // The rebuild's own budget wrapper refusing to spawn (never child text): kept verbatim, matched exactly.
+    const budget = BUDGET_REFUSAL.exec(String(e?.message ?? ''));
+    return { entry, ok: false, kind: budget ? `child failed: ${budget[0]}` : 'child failed', startedAt, signal: smokeSignal(e?.signal), exitCode: smokeExitCode(e?.status),
       errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(e?.message), files: filesIn(`${stderr}\n${e?.message ?? ''}`),
       stderrFile: keep(stderr || e?.message) };
   }
@@ -370,6 +372,8 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env, diagnostics
     errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
 }
 
+const BUDGET_REFUSAL = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/;
+
 /** One failed entry's summary line: typed fields, the local file, and the error class LAST (it is child text, so it
  *  cannot pose as a later field) — never other child text. */
 function entrySummary(r) {
@@ -380,11 +384,13 @@ function entrySummary(r) {
 /**
  * THE CHECK — same `(ctx) -> {ok, detail}` contract as every row in `daemon-live-smoke.mjs#SMOKE_CHECKS`.
  * @param {{root:string, budgets?:Record<string,number>, runChild?:typeof runBounded, env?:NodeJS.ProcessEnv, log?:Console,
- *   diagnosticsDir?:string, now?:() => number}} ctx
+ *   diagnosticsDir?:string, clock?:() => number, now?:() => number}} ctx
  * @returns {Promise<{ok:boolean, detail:string, entries?:Array<object>}>}
  */
 export async function checkDaemonEntriesBoot({
-  root, budgets = {}, runChild = runBounded, env = process.env, log = console, diagnosticsDir = smokeDiagnosticsDir(env), now = Date.now,
+  root, budgets = {}, runChild = runBounded, env = process.env, log = console, diagnosticsDir = smokeDiagnosticsDir(env), clock,
+  // The live smoke's injected clock (ctx.clock) times the attempts, so a replayed smoke reports the same start times.
+  now = typeof clock === 'function' ? clock : Date.now,
 }) {
   const settings = resolveBootSettings(env);
   try {
