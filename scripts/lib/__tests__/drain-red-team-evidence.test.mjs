@@ -28,16 +28,30 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const evidence = readDrainRedTeamEvidence(f);
     // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
     expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
-    // An accepting verdict alone is not a scheduled red-team run.
+    // A persisted accepting verdict holds before the job publishes its first status: the loop applies the labels
+    // before the job can write one. It is not a live queue entry, so the never-scheduled deadline still applies.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
     writeRun(run, f.runsDir);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toBeNull();
-  });
-  it('recognizes queued scheduling for the live head without inventing an in-flight process', () => {
-    const f = fixture();
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'queued' }, f);
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false, recorded: false });
+    expect(readDrainRedTeamEvidence(f).queued).toBeUndefined();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
+    // A disabled scheduler or a non-accepting run schedules nothing; the job's finished status supersedes the run.
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
+    writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
+    expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
+    writeRun(run, f.runsDir);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+  });
+  it('recognizes queued scheduling for the live head only while its writer is alive', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'queued' }, { ...f, readPidStart: () => 'start' });
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' })).toMatchObject({ scheduled: true, queued: true, inFlight: false, recorded: false });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
+    // A crashed job leaves a dead writer: still held, but not a live queue entry that blocks the deadline escape.
+    const dead = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(dead).toMatchObject({ scheduled: true, inFlight: false });
+    expect(dead.queued).toBeUndefined();
   });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();

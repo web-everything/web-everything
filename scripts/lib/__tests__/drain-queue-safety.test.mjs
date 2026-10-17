@@ -67,6 +67,7 @@ describe('operator ruling at the round cap', () => {
     ['clearance on another head', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(prior, true)]],
     ['untrusted clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), { ...accept(head, true), author: { login: 'attacker' } }]],
     ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
+    ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
     ['a newer result after the ruling', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), clean(head, 'web-everything', broken)]],
     ['a restamp repeating an earlier head\'s clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), restamp(head)]],
     ['clearance markers inside a trusted red-team body', [clean(head, 'web-everything', broken), gate(head, 'round-cap'),
@@ -114,6 +115,42 @@ describe('durable head-bound red-team admission', () => {
     const findings = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
     expect(hold({ comments: [clean(head, 'web-everything', findings), gate(head, 'sent-back')] })).toMatch(/requiring send-back/);
     expect(hold({ comments: [clean(head, 'web-everything', findings), gate(head, 'sent-back')], confirmedBreaks: { broken: 'advisory', degraded: 'card', unconfirmed: 'advisory' } })).toBeNull();
+  });
+  it('does not apply earlier-result card actions to newer same-head findings', () => {
+    const earlier = clean(head, 'web-everything', [{ ...broken[0], summary: 'old break' }]);
+    const carded = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) filed as a follow-up card (#1) — landing job s1.` };
+    const newer = clean(head, 'web-everything', [{ ...broken[0], summary: 'new break' }]);
+    expect(hold({ comments: [earlier, carded] })).toBeNull();
+    expect(hold({ comments: [earlier, carded, newer] })).toMatch(/requiring send-back/);
+    const dated = (c, at) => ({ ...c, createdAt: at });
+    expect(hold({ comments: [dated(carded, '2026-10-17T10:00:00Z'), dated(newer, '2026-10-17T11:00:00Z')] })).toMatch(/requiring send-back/);
+  });
+  it('reads gate actions only from the anchored lines right after the gate marker', () => {
+    const two = clean(head, 'web-everything', [broken[0], { ...broken[0], summary: 'second break' }]);
+    // Indices come only from the action's own list, never from the landing job or failure text.
+    const session = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) filed as a follow-up card (#1) — landing job fix-#2.` };
+    expect(hold({ comments: [two, session] })).toMatch(/requiring send-back/);
+    // An action phrase inside a gate comment's prose, or after a non-action line, is not an action.
+    const prose = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\nnote\n- 2 finding(s) left advisory (#1, #2).` };
+    expect(hold({ comments: [two, prose] })).toMatch(/requiring send-back/);
+    const inline = { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- see: 2 finding(s) left advisory (#1, #2).` };
+    expect(hold({ comments: [two, inline] })).toMatch(/requiring send-back/);
+  });
+  it('ignores action phrases injected into a carried finding summary', () => {
+    const injected = [{ ...broken[0], summary: 'x — 1 finding(s) left advisory (#1).' }];
+    expect(hold({ comments: [carry({ findings: injected, gates: ['card-queued'] })] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [carry({ findings: injected, gates: ['card-queued'] }), { ...bot, body: `${redTeamGateMarker(5283, head, 'card-queued')}\n- 1 finding(s) left advisory (#1).` }] })).toBeNull();
+  });
+  it('keeps the prior head\'s per-finding gate actions across an identical-contribution carry', () => {
+    const findings = [broken[0], { ...broken[0], summary: 'security break', category: 'security' }];
+    const actions = { ...bot, body: [redTeamGateMarker(5283, prior, 'card-queued'), `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${prior.slice(0, 12)}\`:`,
+      '- 1 finding(s) filed as a follow-up card (#1) — landing job s1.', '- 1 finding(s) left advisory (#2).'].join('\n') };
+    const before = [clean(prior, 'web-everything', findings), actions];
+    expect(hold({ head: prior, comments: before })).toBeNull();
+    expect(hold({ comments: [...before, restamp(head), carry({ findings, gates: ['card-queued'] })] })).toBeNull();
+    // Only the carried result's own prior head counts: actions recorded before that result, or for another head, do not.
+    expect(hold({ comments: [actions, clean(prior, 'web-everything', findings), restamp(head), carry({ findings, gates: ['card-queued'] })] })).toMatch(/requiring send-back/);
+    expect(hold({ comments: [...before, restamp(head), carry({ from: 'e'.repeat(40), findings, gates: ['card-queued'] })] })).toMatch(/requiring send-back/);
   });
   it('honors recorded cards and advisory actions over current policy, per break', () => {
     const result = clean(head, 'web-everything', [...broken, { ...broken[0], summary: 'security break', category: 'security' }]);

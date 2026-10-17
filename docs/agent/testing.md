@@ -55,10 +55,14 @@ negative answers without file reads remain unverifiable.
 ## Drain red-team disposition and retry evidence
 
 The drain owes a live-head red team only after a speculative or sequential pass is scheduled
-(recorded queued/running status or seat evidence). An accepting review payload alone does not
-schedule one. Card-only net diffs (including rename/copy sources) never owe a pass. A crashed
-scheduled pass without a result retains the 45-minute never-scheduled recovery path; active
-passes and recorded breaks cannot use it.
+(recorded queued/running status or seat evidence). The review job records the pass as queued as
+soon as the loop returns an owed accept, before the added seats. Before that status exists, the
+persisted accepting review run for the live head holds (the loop labels the accept first), while
+the red team is enabled; the job's later status supersedes it. Labels alone never schedule one.
+Card-only net diffs (including rename/copy sources) never owe a pass. A queued or running status
+is live only while its writer's pid is. A crashed scheduled pass, or an accepting run no job
+picked up, retains the 45-minute never-scheduled recovery path; live passes and recorded breaks
+cannot use it.
 
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
@@ -78,6 +82,12 @@ a card/advisory record releases that finding, while sent-back and round-cap reco
 only their unresolved findings. Without a recorded per-finding action, a policy send-back
 candidate still blocks enqueue and derives `red-team:blocked`, even if no run is currently
 owed. A card record for another finding (or a failed card action) cannot release it.
+An action binds to the result it was recorded against: only gate records after that result
+count, so an earlier same-head result's card cannot release a newer result's finding. Action
+lines are read only as whole `buildGateComment` lines right after the gate marker, with indices
+from the action's own `(#N, …)` list; text elsewhere (a carried finding summary, a landing-job
+name) is never an action. A proven identical-contribution carry keeps the actions bound to the
+result it was carried from; the new head's own records win.
 Legacy cap comments omit indices; exclude separately
 recorded card/advisory findings before surfacing the remaining confirmed breaks. Acceptance
 labels alone do not prove an operator ruled on a cap-held break; use the sanctioned

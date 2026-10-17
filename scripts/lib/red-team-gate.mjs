@@ -300,35 +300,68 @@ function operatorRuled(records, pr, head) {
 }
 
 
+/**
+ * buildGateComment's per-finding action lines, each matched as a whole line. Indices come only from the action's own
+ * `(#N, …)` list, never from a landing-job or failure text. A failed card filing matches nothing. A round-cap line
+ * without a list is the older record shape.
+ */
+const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
+const GATE_ACTION_LINES = [
+  ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
+  ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
+  ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
+];
+
+/** PURE: the action lines of ONE gate record, read only from the block right after its marker (and heading). */
+function gateActionLines(body) {
+  const lines = String(body ?? '').replace(/\r\n/g, '\n').trimStart().split('\n');
+  const found = [];
+  for (let i = lines[1]?.startsWith('**Red-team gate** ') ? 2 : 1; i < lines.length && lines[i].startsWith('- '); i++) {
+    const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
+    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
+  }
+  return found;
+}
+
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy.
  * Without a recorded action, policy send-back candidates still block admission while the gate acts.
  * Older round-cap records omit indices: all remaining send-back candidates belong to the operator.
+ * An action binds to the result it was recorded against: only gate records after that result (redTeamForHead's
+ * order) count, so a record for an earlier same-head result never releases a newer one's finding. A carried result
+ * also keeps the actions bound to the result it was carried from (the same findings, re-keyed); the newer head's
+ * own records win.
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env } = {}) {
-  const records = threadRecords(comments);
+  const live = String(head ?? '').toLowerCase();
+  const records = threadRecords(comments).map((r, i) => ({ ...r, i }));
   const thread = records.map(r => r.c);
-  const result = redTeamForHead(thread, pr, head);
+  const result = redTeamForHead(thread, pr, live);
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
+  const bodyOf = r => String(typeof r.c === 'string' ? r.c : r.c?.body ?? '');
+  const order = (a, b) => (Date.parse(a.c?.createdAt) || 0) - (Date.parse(b.c?.createdAt) || 0) || a.i - b.i;
+  const gateFor = (r, sha) => { const m = parseRedTeamGateMarker(bodyOf(r)); return m?.pr === Number(pr) && m.rev === sha ? m : null; };
   const actions = new Map();
-  let capRecord = null;
   let legacyHeld = false;
-  for (const c of thread) {
-    const body = String(typeof c === 'string' ? c : c?.body ?? '');
-    const marker = parseRedTeamGateMarker(body);
-    if (!marker || marker.pr !== Number(pr) || marker.rev !== String(head).toLowerCase()) continue;
-    for (const line of body.split('\n')) {
-      const action = /finding\(s\) filed as a follow-up card/.test(line) && !line.includes('FILING FAILED') ? 'card'
-        : /finding\(s\) left advisory/.test(line) ? 'advisory'
-        : /confirmed break\(s\) sent back to the fixer/.test(line) ? 'send-back'
-        : /confirmed break\(s\) NOT sent back:/.test(line) ? 'held' : null;
-      if (!action) continue;
-      if (action === 'held' && !/#\d+/.test(line)) legacyHeld = true;
-      for (const match of line.matchAll(/#(\d+)/g)) actions.set(Number(match[1]), action);
+  // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
+  for (let sha = live, rs = records; sha && rs.length;) {
+    const hit = rs.filter(r => { const p = parseRedTeamComment(bodyOf(r)); return p?.pr === Number(pr) && p.rev === sha; }).sort(order).at(-1);
+    if (!hit) break;
+    const own = new Map();
+    for (const r of rs.filter(r => gateFor(r, sha) && order(r, hit) > 0)) {
+      for (const { action, indices } of gateActionLines(bodyOf(r))) {
+        if (action === 'held' && !indices.length) legacyHeld = true;
+        for (const index of indices) own.set(index, action);
+      }
     }
-    if (marker.outcome === GATE_OUTCOMES.ROUND_CAP) capRecord = c;
+    for (const [index, action] of own) if (!actions.has(index)) actions.set(index, action);
+    if (!hit.from) break;
+    rs = rs.filter(r => r.at < hit.at);
+    sha = hit.from;
   }
+  const capRecord = records.filter(r => gateFor(r, live)?.outcome === GATE_OUTCOMES.ROUND_CAP).at(-1)?.c ?? null;
   const outcome = gateOutcomeForHead(thread, pr, head);
-  const ruled = operatorRuled(records, pr, String(head).toLowerCase());
+  const ruled = operatorRuled(records, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const action = actions.get(f.index) ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)

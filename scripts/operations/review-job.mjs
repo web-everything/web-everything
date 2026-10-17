@@ -636,6 +636,14 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     const observed = rows.filter(r => r?.startedAt).map(r => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
     try { io.recordSeatTimings?.(out.runId, observed); } catch (e) { io.log(`review-job: seat timing write failed (${e.message})`); }
   };
+  // Card xbizuci — under `review.speculativeRedTeam` the red team was already started beside the loop.
+  const spec = seatsBox.speculative ?? null;
+  // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
+  // per head is the pass's own `(pr, rev)` row + comment marker.
+  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  // The accept is already labelled, and the added seats below can take minutes: record the pass as queued now, so
+  // the drain holds the head until the pass records its result. The `finished` write at the end supersedes it.
+  if (accepted && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -656,10 +664,6 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
   // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
   // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
-  const spec = seatsBox.speculative ?? null;
-  // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
-  // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);

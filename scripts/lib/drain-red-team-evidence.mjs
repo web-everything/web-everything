@@ -6,6 +6,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
@@ -32,20 +33,25 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
     // so preserve the conservative liveness probe (also supports records written before this field).
-    let inFlight = false;
-    if (status.status === 'running') {
-      if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) inFlight = true;
+    // A queued pass is a live queue entry only while the job that queued it is alive (the same probe).
+    let live = false;
+    if (['queued', 'running'].includes(status.status)) {
+      if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
       else if (isAlive(status.pid)) {
         const start = status.pidStart ? readPidStart(status.pid) : null;
-        inFlight = !start || !status.pidStart || start === status.pidStart;
+        live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { loopPayload: status.loopPayload, inFlight, ...(status.status === 'queued' ? { queued: true } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
+    return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
   }
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
     .filter(({ run }) => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
       && run.findings?.read?.netBasis?.rev === head);
   hits.sort((a, b) => statSync(join(runsDir, `${b.id}.json`)).mtimeMs - statSync(join(runsDir, `${a.id}.json`)).mtimeMs);
-  return { loopPayload: hits[0]?.run ?? null, inFlight: false, scheduled: recorded, recorded };
+  // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
+  // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
+  // never-scheduled deadline still applies when no job ever picks it up.
+  const loopPayload = hits[0]?.run ?? null;
+  return { loopPayload, inFlight: false, scheduled: recorded || (redTeamEnabled(env) && redTeamOwedFor(loopPayload)), recorded };
 }
