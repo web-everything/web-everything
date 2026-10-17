@@ -114,8 +114,11 @@ describe('fix round history (card xx0055i)', () => {
     const on = briefWithRoundContext('BRIEF', { pr: 9 }, { repo: 'we', fixSettings: { roundHistory: 'on' }, readHistoryInputs: read });
     expect(on).toMatch(/^# Previous rounds[\s\S]*\nBRIEF$/);
     const off = briefWithRoundContext('BRIEF', { pr: 9 }, { repo: 'we', fixSettings: { roundHistory: 'off' }, readHistoryInputs: read });
-    expect(off).toBe('BRIEF');
+    expect(off).toContain('Declared repair scope');
+    expect(off).not.toContain('# Previous rounds');
+    expect(off).toMatch(/BRIEF$/);
     const unreadable = briefWithRoundContext('BRIEF', { pr: 9 }, { repo: 'we', fixSettings: { roundHistory: 'on' }, readHistoryInputs: () => { throw new Error('x'); } });
-    expect(unreadable).toBe('BRIEF');
+    expect(unreadable).toContain('Declared repair scope');
+    expect(unreadable).toMatch(/BRIEF$/);
   });
 });

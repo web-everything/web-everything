@@ -1494,6 +1494,65 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+### Fixer scope fence
+
+Repair scope comes from the card's `scope:` paths (the existing PR-diff fallback remains for item-less
+work), never the fixer's proposed diff. Operator-authored sanctioned changes-requested comments retain
+`Out of scope:`, `scopeNotes:` and `x<id> carries` lines verbatim in the brief. Explicit
+`scope-removed: identifier, functionName` markers in these comments or PR removal commit messages
+prohibit added lines containing those identifier tokens. This is a lexical fence; renaming a subsystem
+is still forbidden by the scope brief even when the marker cannot identify it mechanically.
+
+The harness checks before early, green and saved-commit pushes. In enforcing `stand-down` mode, unreadable
+scope/diff evidence withholds the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+Default `warn` mode always continues to the push sink, including on unreadable evidence and moved heads.
+It emits a JSON `fix.scopeFence.would-block` event with the would-block `files` and `identifiers`,
+plus repo, PR and SHA. Evidence failures include `evidenceUnavailable`, error type and reason; unavailable
+file/identifier lists are empty. Diagnostic failures cannot block a warn-mode push. No PR comment or label is written.
+The refusal and stand-down behavior below applies only to enforcing `stand-down` mode.
+File scope checks union the paths of repair commits, including side branches and merge-authored edits,
+from the pre-fix PR head to the proposed push. Without a GitHub-verified merged base, the whole range
+diff also counts. Only commits reachable from a verified merged base are exempt as upstream history.
+For merge paths, an unchanged upstream tree entry is exempt; existing PR edits may also carry forward
+when the patch from the merge base to the first parent exactly matches the patch from the upstream
+parent to the merge result (excluding blob IDs and section headings, retaining coordinates, whitespace and modes). This
+permits upstream edits to files the PR previously changed while rejecting extra merge amendments.
+Shifted or rewritten conflict resolutions that cannot be proved unchanged require declared scope.
+An out-of-scope fixer edit still counts if a later fixer commit reverts it. Operator-removed
+identifiers remain separately checked, including conflict resolutions. Repo-qualified scopes accept the repository key or GitHub slug as the repo context;
+trailing-slash directories cover their subtree and exact-file entries never cover replacement directories.
+The real-repository regressions in `fix-scope-fence.test.mjs` replay 13- and 40-file catch-ups over two
+main merges, a one-file repair, an outside edit followed by its revert, unverified side merges and
+amended catch-ups. The `fix-scope-merge-bypass` daemon soak break replays both merge bypass shapes
+through the live adapter with real repository history and injected GitHub/push sinks. These are the
+prevention regressions for PR #5461; accepting unchanged upstream content is a separate control.
+The complete Git diff/history read shares a 120-second deadline and a 2,000-command budget; exhaustion
+records a permanent evidence stand-down rather than blocking the daemon indefinitely or retrying forever.
+Marker parsing scans lines without a backtracking expression and rejects evidence over 1 MiB or a line
+over 16 KiB, withholding the push rather than silently truncating removal policy. Plain and HTML markers
+accept LF, CRLF, CR and Unicode line separators. PR commit messages are read through paginated GraphQL. A
+list that no longer ends at the PR head (a push raced the read) is retried; a stable list shorter than
+`totalCount`, or an oversized operator comment or commit-message marker, records a `scope-increase`
+stand-down for a person instead of a transient retry. The brief names incomplete operator evidence on
+every launch path (fresh, borrowed, round and conflict resume, and an unread thread), and tells the fixer
+to read commit-message markers, which the fence enforces too. Fixer-controlled paths in
+the stand-down reason are percent-encoded outside `[\w./+-]`, capped at 200 characters, and listed at most
+20 times. Diff file headers are excluded from identifier checks;
+added prefix-increment statements inside hunks are checked like all other additions.
+When the PR head diverged or its commit is absent locally, the fence refuses to push and returns a
+terminal moved-head result. Live waits use the existing `push-rejected` recovery prompt; salvage stops
+retrying the stale saved commit. Unexpected Git failures remain transient evidence failures.
+`fix.scopeFence.enabled` (true) and `fix.scopeFence.mode` (`stand-down` or `warn`, default `warn`; operator 2026-10-17: enforce later, once the follow-up card makes the fence merge-aware)
+resolve independently through standard → platform `fix.scopeFence` → tool settings →
+`WE_FIX_SCOPE_FENCE_ENABLED` / `WE_FIX_SCOPE_FENCE_MODE`; push logs name each source. Warn mode logs a
+structured event before pushing. Replay #5403 with a real temporary git removal/re-addition diff and injected
+push/comment sinks in `fix-scope-fence.test.mjs`. The default-IO regressions in `await-verify-pass.test.mjs`
+keep the real fence enabled for early, green and salvage ports, assert stand-down and no Git push, and
+cover diverged/missing heads plus unexpected ancestry errors. Older push-port tests isolate unrelated
+behavior via the explicit seam. Prompt regressions cover one scope header on fresh, borrowed and round
+resume launches, retaining historical exclusions. Run these and the round-history and operator-queue
+suites through heavy admission.
+
 ## Referral re-checks on the live head
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in

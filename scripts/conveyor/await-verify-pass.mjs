@@ -173,6 +173,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
         : `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. Follow your ${brief(record)}'s "push rejected because the branch moved" path (save to the alt branch, record the pause, fix-end). Never force-push.`;
     case 'push-transient':
       return `${head}\n\nVerify is GREEN, but GitHub kept failing the harness push of ${record.sha} to ${record.ref} even after retries: ${detail}. This is a temporary GitHub outage, not a moved branch, and the harness has kept the verified commit and keeps retrying the push itself. Do not push ${record.ref} yourself and do not use the alt branch. Take your ${brief(record)}'s blocked-on-infra exit with \`--cause=transient\` on the completion report (so the retry cool-off is short), then fix-end.`;
+    case 'scope-increase':
+      return `${head}\n\nThe harness did NOT push: ${detail}. A scope-increase request is recorded as a stand-down for needs-you. Do not retry, widen the scope or re-add removed code. Report blocked, release the fix claim with fix-end and stop.`;
     case 'push-refused':
       return `${head}\n\nVerify is GREEN, but the harness did NOT push ${record.sha} to ${record.ref}: ${detail}. This is not a moved branch, so rebasing or re-marking cannot help and you must not retry or push ${record.ref} yourself. Take your ${brief(record)}'s blocked-on-infra exit with that reason as the evidence, then fix-end.`;
     case 'red':
@@ -282,7 +284,7 @@ function runEarlyPush({ io, record, nowMs, policy, persist }) {
   const at = new Date(nowMs).toISOString();
   // A non-transient refusal is not retried early: the green push re-tries it and routes the outcome as it does today.
   const done = !!pushed.ok || !pushed.transient;
-  persist({ ...record, earlyPush: { sha: record.sha, attempts, done, ok: !!pushed.ok, at: pushed.ok ? at : null, ...(pushed.ok ? {} : { reason: String(pushed.reason ?? 'push failed').slice(0, 300) }) } });
+  persist({ ...record, ...(pushed.scopeFence && !pushed.transient ? { pendingResume: { kind: 'scope-increase', detail: pushed.reason } } : {}), earlyPush: { sha: record.sha, attempts, done, ok: !!pushed.ok, at: pushed.ok ? at : null, ...(pushed.ok ? {} : { reason: String(pushed.reason ?? 'push failed').slice(0, 300) }) } });
   return pushed.ok
     ? { ...base, result: `sent ${String(record.sha).slice(0, 8)} to ${record.ref} at ${at}, before the verify verdict; fix claim still held` }
     : { ...base, result: `not sent (${pushed.reason ?? 'push failed'})${done ? '' : '; retry next tick'}` };
@@ -391,6 +393,7 @@ export async function runAwaitVerifyPass({
         // `record` now carries `earlyPush`; the rest of this record's handling (re-request, resume) keeps it.
         if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
       }
+      if (record.pendingResume?.kind === 'scope-increase') Object.assign(d, { action: 'resume', reason: 'scope-increase', resume: 'scope-increase' });
       if (d.action === 'skip' || d.action === 'wait') { rows.push(row); continue; }
       if (d.action === 'rerequest') {
         if (!persist({ ...record, retries: (record.retries ?? 0) + 1, requestedAt: new Date(nowMs).toISOString(), lastRetry: d.reason })) { rows.push(row); continue; }
@@ -431,7 +434,7 @@ export async function runAwaitVerifyPass({
           ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
-            : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
+            : { kind: pushed?.scopeFence ? 'scope-increase' : pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
         row.result = pushed?.ok ? 'pushed' : (transientGone ? `push-transient${salvaged?.ok ? '; salvaged' : ''}` : (pushed?.moved ? 'push-rejected' : 'push-refused'));
         if (pushed?.ok && srNote) row.result += `; ${srNote}`;
         if (pushed?.ok && srOverdue) row.result += `; ${srOverdue} — OVERDUE, resumed with finish-the-review`;
@@ -656,7 +659,7 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
 export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
   dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
-  pidAliveFn = pidAlive,
+  pidAliveFn = pidAlive, scopeFencePush = null,
   listWrappedWorkers = listWrappedWorkerAgents, requestWrappedResumeFn = requestWrappedResume,
 } = {}) {
   /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
@@ -674,6 +677,8 @@ export async function defaultAwaitVerifyIo({
   const pushRefusal = pushRefusalFn ?? fixProcedure.pushRefusal;
   /** The raw (live or not) fix-claim entry for (repo key, pr), or null. */
   const readClaim = readClaimFn ?? ((repoKey, pr) => readFixDispatchClaim({ repo: repoKey, pr, kind: fixProcedure.FIXING_KIND }));
+  const { createScopeFencedPush } = await import('./fix-scope-fence-io.mjs');
+  const scopePush = scopeFencePush ?? createScopeFencedPush({ root: weRoot, exec, env });
   const hardening = laneGitConfigArgs();
   const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...hardening, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
   /**
@@ -773,6 +778,7 @@ export async function defaultAwaitVerifyIo({
       if (!head.remoteUrl) return { ok: false, reason: `PR #${pr}'s URL is not a github.com pull URL; refusing to push ${ref}` };
       let laneGitDir;
       try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
+      return scopePush({ repo, pr, sha, git: (args, { env: extra, ...opts } = {}) => git(lane, args, { ...opts, env: { ...env, ...extra } }), push: () => {
       try {
         // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
         const { remote, alreadyThere } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000, sleep });
@@ -788,6 +794,7 @@ export async function defaultAwaitVerifyIo({
         return { ok: false, reason: detail, transient: kind === 'unknown', moved: rejected };
       }
       return { ok: true };
+      } });
     },
     // ── salvage of a green-verified sha GitHub kept refusing (see verified-push-salvage.mjs) ──
     listSalvage: () => listSalvage(),
@@ -814,6 +821,9 @@ export async function defaultAwaitVerifyIo({
       if (head.ref !== record.ref) return { ok: false, terminal: true, reason: `${record.ref} is no longer PR #${record.pr}'s head (${head.ref})` };
       if (!head.open) return { ok: false, terminal: true, reason: `PR #${record.pr} is no longer open` };
       if (head.crossRepo || !head.remoteUrl) return { ok: false, terminal: true, reason: `PR #${record.pr} is not a same-repo github.com PR` };
+      return scopePush({ repo: record.repo, pr: record.pr, sha: record.sha,
+        git: (args, { env: extra, ...opts } = {}) => String(exec('git', ['--git-dir', join(salvageStoreDir(env), `${key}.git`), ...hardening, ...args], { encoding: 'utf8', ...opts, env: { ...env, ...extra } })),
+        push: () => {
       try {
         pushShaFromScratch({ laneGitDir: join(salvageStoreDir(env), `${key}.git`), url: head.remoteUrl, sha: record.sha, ref: record.ref, exec, env, timeout: 180_000, sleep });
         return { ok: true };
@@ -822,6 +832,7 @@ export async function defaultAwaitVerifyIo({
         if (e?.pushKind === 'transient' || e?.pushKind === 'unknown') return { ok: false, reason: `GitHub still failing: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
         return { ok: false, terminal: true, reason: `GitHub refused the push: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
       }
+      } });
     },
     // Both populations are listed, and a failure of either is RECORDED on the result (`incomplete`), never swallowed: the
     // pass reads a session's absence as "gone", so it must be told when the listing could not show it (`lookupSession`).
