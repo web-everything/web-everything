@@ -3,6 +3,7 @@ import { coversFile } from '../readiness/scope-lease.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isOperatorAuthored } from '../lib/marker-authorship.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 export function resolveScopeFence({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|on|1)$/i.test(v) ? true : /^(false|off|0)$/i.test(v) ? false : v;
@@ -83,8 +84,10 @@ export function addedLines(patch = '') {
 /** `additions` (lines) wins over `patch` when the caller already attributed the added lines. */
 export function scopeFenceDecision({ scope = [], repo, paths = [], patch = '', additions = addedLines(patch), removed = [], policy }) {
   if (policy?.enabled === false) return { action: 'push', violations: [] };
-  const allowed = scope.filter(s => !s.includes(':') || s.startsWith(`${repo}:`)).map(s => s.replace(/^[^:]+:/, '').split('#')[0]);
-  const outside = paths.filter(p => !allowed.some(s => coversFile(`${repo}:${s}`, `${repo}:${p}`) || (!/[*?]/.test(s) && p.startsWith(`${s.replace(/\/$/, '')}/`))));
+  const key = repoKeyForSlug(repo) ?? repo;
+  const allowed = scope.map(s => s.trim().split('#')[0]).filter(s => !s.includes(':') || s.startsWith(`${key}:`))
+    .map(s => s.replace(/^[^:]+:/, ''));
+  const outside = paths.filter(p => !allowed.some(s => coversFile(`${key}:${s}`, `${key}:${p}`)));
   const addedIdentifiers = new Set(additions.join('\n').match(/[A-Za-z_$][\w$]*/g) ?? []);
   const identifiers = [...new Set(removed)].filter(id => addedIdentifiers.has(id));
   const violations = [...outside.map(p => `outside declared scope: ${inertText(p)}`), ...identifiers.map(id => `re-adds operator-removed identifier: ${inertText(id)}`)];

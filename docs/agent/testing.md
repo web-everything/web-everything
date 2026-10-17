@@ -1477,6 +1477,15 @@ is still forbidden by the scope brief even when the marker cannot identify it me
 
 The harness checks before early, green and saved-commit pushes. Unreadable scope/diff evidence withholds
 the push; a violation records a head-bound `scope-increase` stand-down, surfaced in NEEDS YOU.
+File scope checks union the paths of each non-merge commit on the first-parent spine from the pre-fix
+PR head to the proposed push. Main catch-up merges and the commits reached through their side parents
+do not count as fixer file edits, including upstream edits to files the PR previously changed. An
+out-of-scope fixer edit still counts if a later fixer commit reverts it. Merge-only paths are outside
+this file-scope check; operator-removed identifiers remain separately checked, including conflict
+resolutions. Repo-qualified scopes accept the repository key or GitHub slug as the repo context;
+trailing-slash directories cover their subtree and exact-file entries never cover replacement directories.
+The real-repository regressions in `fix-scope-fence.test.mjs` replay 13- and 40-file catch-ups over two
+main merges, a one-file repair, and an outside edit followed by its revert.
 Marker parsing scans lines without a backtracking expression and rejects evidence over 1 MiB or a line
 over 16 KiB, withholding the push rather than silently truncating removal policy. Plain and HTML markers
 accept LF, CRLF, CR and Unicode line separators. PR commit messages are read through paginated GraphQL. A

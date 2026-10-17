@@ -138,6 +138,7 @@ describe('scope fence default wiring regressions', () => {
           if (ancestry !== 'ancestor') throw Object.assign(new Error('not an ancestor'), { status: ancestry === 'missing' ? 128 : 1 });
         }
         if (args.includes('diff')) return args.includes('--name-only') ? `${outside ? 'outside.mjs' : 'guard.mjs'}\0` : '+const repair = true;';
+        if (args.includes('--no-merges')) return `${SHA}\n`;
         return '';
       }
       throw new Error(`unexpected command: ${cmd}`);

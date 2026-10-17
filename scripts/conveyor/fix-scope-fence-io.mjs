@@ -87,14 +87,16 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
       const names = (from, to) => git([...FENCE_DIFF, '--name-only', '-z', from, to, '--']).split('\0').filter(Boolean);
       // Patches are read only when there is a removed identifier to look for.
       const added = (from, to, pathspec = []) => removed.length ? addedLines(git([...FENCE_DIFF, '-U0', from, to, '--', ...pathspec])) : [];
-      const changed = names(head, sha);
+      // Walk the fixer's first-parent spine only. A range diff includes upstream files (including files the
+      // PR previously changed); a plain --no-merges walk also includes commits reached through main's side.
+      // Union each non-merge patch so an out-of-scope edit still counts if a later commit reverts it.
+      const commits = git(['rev-list', '--first-parent', '--no-merges', `${head}..${sha}`]).split('\n').filter(Boolean);
+      const paths = [...new Set(commits.flatMap(c => names(`${c}^`, c)))];
       const merged = mergedBase({ git, gh, repo, head, sha, base });
-      if (!merged) return { paths: changed, additions: added(head, sha) };
-      // Attribution is by path, never by replaying a merge: a merge reads the lane's fixer-writable config and attributes.
-      // A path the PR changed (since any merge base) is judged against the PR head, so restoring a removal the base still
-      // holds counts, as does every line a conflict resolution keeps (upstream's included: fails closed). Any other path
-      // is upstream's file unless the push differs from the merged base, which also catches a revert of upstream's change.
-      // Upstream's rename of a PR path still holds what the PR removed there, so its new name is judged against head too.
+      if (!merged) return { paths, additions: added(head, sha) };
+      // Identifier exclusions also guard conflict resolutions that restore an operator removal. This is separate from
+      // the non-merge path scope above. Never replay a merge using the lane's fixer-writable config and attributes.
+      // Judge PR paths (and upstream renames of them) against the PR head; judge other additions against the merged base.
       const bases = git(['merge-base', '--all', head, merged]).split('\n').filter(Boolean);
       const pr = new Set(bases.flatMap(b => names(b, head)));
       for (const b of bases) {
@@ -105,8 +107,8 @@ export function createScopeFencedPush({ root, exec = execFileSync, env = process
         }
       }
       const literal = magic => p => `:(top,literal${magic})${p}`;
-      const prPaths = changed.filter(p => pr.has(p));
-      return { paths: [...prPaths, ...names(merged, sha).filter(p => !pr.has(p))],
+      const prPaths = names(head, sha).filter(p => pr.has(p));
+      return { paths,
         additions: [...(prPaths.length ? added(head, sha, prPaths.map(literal(''))) : []), ...added(merged, sha, [...pr].map(literal(',exclude')))] };
     };
     const resolved = resolveScopeFence({ env });

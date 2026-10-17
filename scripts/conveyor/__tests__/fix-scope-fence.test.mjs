@@ -86,6 +86,17 @@ describe('fix scope fence', () => {
     const r = run({ readDiff: () => ({ paths: ['new-subsystem.mjs'], patch: '+const subsystem = true;' }) });
     expect(r.result.reason).toContain('new-subsystem.mjs'); expect(r.push).not.toHaveBeenCalled(); expect(r.standDown).toHaveBeenCalledOnce();
   });
+  it.each(['we:scripts/conveyor/', 'scripts/conveyor/'])('matches the directory scope %s', scope => {
+    for (const repo of ['we', 'web-everything/web-everything']) {
+      expect(scopeFenceDecision({ scope: [scope], repo, paths: ['scripts/conveyor/fence.mjs'], policy }).action).toBe('push');
+      expect(scopeFenceDecision({ scope: [scope], repo, paths: ['scripts/conveyor-other/fence.mjs'], policy }).action).toBe('stand-down');
+    }
+  });
+  it.each(['we:guard.mjs', 'guard.mjs'])('keeps exact-file scope %s exact across a directory replacement', scope => {
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs'], policy }).action).toBe('push');
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs/child.mjs'], policy }).action).toBe('stand-down');
+    expect(scopeFenceDecision({ ...context, scope: [scope], paths: ['guard.mjs-new'], policy }).action).toBe('stand-down');
+  });
   it('warn mode posts a note then pushes', () => {
     const r = run({ policy: { ...policy, mode: 'warn' }, readDiff: () => ({ paths: ['other.mjs'], patch: '' }) });
     expect(r.result.ok).toBe(true); expect(r.push).toHaveBeenCalledOnce(); expect(r.note).toHaveBeenCalledWith(expect.stringContaining('scope-increase request'), context);
@@ -145,7 +156,8 @@ describe('the live scope fence adapter', () => {
     const fence = createScopeFencedPush({ root: '.', exec, env: {}, log: line => logs.push(line),
       loadItems: () => [{ num: '5957', slug: 'leading-cd', scope: ['we:guard.mjs'] }], readComments: () => comments });
     const push = vi.fn(() => ({ ok: true }));
-    const git = args => args[0] === 'merge-base' ? '' : args.includes('--name-only') ? 'guard.mjs\0' : patch;
+    const git = args => args.includes('merge-base') ? '' : args.includes('--no-merges') ? 'b'.repeat(40) + '\n'
+      : args.includes('--merges') ? '' : args.includes('--name-only') ? 'guard.mjs\0' : patch;
     const result = fence({ repo: 'web-everything/web-everything', pr: 5403, sha: 'b'.repeat(40), git, push });
     return { result, push, writes, logs, reads };
   }
@@ -261,6 +273,45 @@ describe('the live scope fence adapter over a real repository', () => {
   });
 
   /** The brief's sanctioned catch-up: repair on the PR head, then `git merge --no-edit <base sha>` of an upstream change. */
+  it.each([13, 40])('pushes a one-file fix after main merges bring in %i unrelated files', count => {
+    const r = realRepo();
+    try {
+      r.write('guard.mjs', 'function guard() {}\n');
+      for (let i = 0; i < count; i++) r.write(`upstream-${i}.mjs`, 'export const value = 0;\n');
+      r.commit('initial');
+      r.git(['checkout', '-qb', 'pr']);
+      // These files were part of the PR, but the fixer never edits them.
+      for (let i = 0; i < count; i++) r.write(`upstream-${i}.mjs`, 'export const value = 0;\n// PR context\n');
+      const head = r.commit('PR context');
+      for (let round = 1; round <= 2; round++) {
+        r.git(['checkout', '-q', 'main']);
+        for (let i = 0; i < count; i++) r.write(`upstream-${i}.mjs`, `export const value = ${round};\n`);
+        const base = r.commit('upstream');
+        r.git(['checkout', '-q', 'pr']);
+        // Keep both sides explicitly; upstream changes the first line, the PR adds the second.
+        try { r.git([...ident, 'merge', '-q', '--no-edit', base]); } catch {
+          for (let i = 0; i < count; i++) r.write(`upstream-${i}.mjs`, `export const value = ${round};\n// PR context\n`);
+          r.git(['add', '.']); r.git([...ident, 'commit', '-qm', 'resolve catch-up']);
+        }
+        if (round === 1) {
+          r.write('guard.mjs', 'function guard() { return 2; }\n'); r.commit('one-file fix');
+        }
+      }
+      const sha = r.git(['rev-parse', 'HEAD']).trim();
+      const base = r.git(['rev-parse', 'main']).trim();
+      expect(r.git(['diff', '--name-only', head, sha]).trim().split('\n')).toHaveLength(count + 1);
+      const { result, push } = liveFence(r, { head, sha, base, compare: 'identical' });
+      expect(result).toEqual({ ok: true }); expect(push).toHaveBeenCalledOnce();
+      r.write('outside.mjs', 'export const outside = true;\n'); r.commit('outside repair');
+      // A subsequent revert must not erase evidence that a fixer commit touched an outside path.
+      r.git(['rm', '-q', 'outside.mjs']); const proposed = r.commit('revert outside repair');
+      const blocked = liveFence(r, { head, sha: proposed, base, compare: 'identical' });
+      expect(blocked.result).toMatchObject({ ok: false, scopeFence: true, terminal: true });
+      expect(blocked.result.reason).toContain('outside declared scope: outside.mjs');
+      expect(blocked.push).not.toHaveBeenCalled();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
   function catchUp(r, { upstream = 'export const other = 2;\n', fixer = 'function guard() { return 2; }\n', smuggle = false } = {}) {
     r.write('guard.mjs', 'function guard() {}\n'); r.write('other.mjs', 'export const other = 1;\n'); r.commit('initial');
     r.git(['checkout', '-qb', 'pr']); r.write('guard.mjs', 'function guard() { return 1; }\n'); const head = r.commit('removal');
@@ -273,9 +324,9 @@ describe('the live scope fence adapter over a real repository', () => {
   it.each([
     ['an in-scope repair merged with the base', {}, 'identical', null],
     ['an upstream line that happens to name a removed identifier', { upstream: 'export const cdLandings = 2;\n' }, 'ahead', null],
-    ['an out-of-scope edit smuggled into the merge commit', { smuggle: true }, 'identical', 'outside declared scope: other.mjs'],
-    ['a merged commit GitHub does not place on the base', {}, 'diverged', 'outside declared scope: other.mjs'],
-    ['a merged commit GitHub does not know', {}, 404, 'outside declared scope: other.mjs'],
+    ['a merge-only path outside the non-merge repair', { smuggle: true }, 'identical', null],
+    ['a merged commit GitHub does not place on the base', {}, 'diverged', null],
+    ['a merged commit GitHub does not know', {}, 404, null],
     ['a removed identifier re-added alongside the catch-up', { fixer: 'function cdLandings() {}\n' }, 'identical', 're-adds operator-removed identifier: cdLandings'],
   ])('a base catch-up merge: %s', (_, shape, compare, violation) => {
     const r = realRepo();
@@ -315,7 +366,7 @@ describe('the live scope fence adapter over a real repository', () => {
     ['blocks keeping the base side of a conflict on a marked removal', { upstream: upstreamEdit, resolve: upstreamEdit[1] }, readded],
     ['blocks a lane merge=union attribute that merges the base side in cleanly', { upstream: upstreamEdit, setup: r => r.write('.git/info/attributes', '* merge=union\n') }, readded],
     ['blocks a restore under a literal-pathspec environment', { before: restored, port: literalEnv }, readded],
-    ['blocks a catch-up that reverts upstream outside the scope', { strategy: ['-s', 'ours'] }, 'outside declared scope: other.mjs'],
+    ['does not attribute a merge strategy to a non-merge repair', { strategy: ['-s', 'ours'] }, null],
     ['pushes an unrelated repair merged with a base that still holds the removal', { before: 'function guard() { return 2; }\n' }, null],
     ['pushes a conflict resolved by keeping the removal', { upstream: upstreamEdit, resolve: 'function guard() {}\n' }, null],
   ])('a catch-up over a removal the base still holds: %s', (_, { port, ...shape }, violation) => {
