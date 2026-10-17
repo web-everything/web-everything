@@ -21,8 +21,9 @@ export default {
     const check = name => ({ name, conclusion: 'SUCCESS', head_sha: head, status: 'COMPLETED', completedAt: new Date(now - 60000).toISOString() });
     const violations = [];
     // The checks each sibling workflow really publishes (we:scripts/lib/required-status-checks.mjs DECLARED set).
-    for (const [repo, slug, published] of [['frontierui', 'frontier-ui/frontierui', ['test']],
-      ['plateau-app', 'plateauapp/plateau-app', ['test', 'e2e']]]) {
+    const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
+    for (const [repo, published] of [['frontierui', ['test']], ['plateau-app', ['test', 'e2e']]]) {
+      const slug = CONSTELLATION_REPOS[repo].slug;
       const pr = { number: 9, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
         labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'src/example.ts' }],
         statusCheckRollup: published.map(check) };
