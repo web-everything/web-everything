@@ -1495,7 +1495,8 @@ Validate a build card against the fetched WE origin/main backlog before acquirin
 identities are permanent card refusals, while an unavailable Git read remains a retryable observation.
 
 Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
-unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+unions the complete results. The title is searched under both ids: a batch published before numbering
+names only the bornAs id, and its `lane/prepare-batch-<lead>-<n>` branch matches no per-id head search. Never use an unfiltered repository PR listing as the launch guard's proof
 of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
 `maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
 source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the

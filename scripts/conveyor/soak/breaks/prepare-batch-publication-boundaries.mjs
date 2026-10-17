@@ -18,7 +18,8 @@ export default {
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/conveyor/prepare-pr-match.mjs'), 'utf8').includes('batchMembers')
       && readFileSync(join(root, 'scripts/operations/probation-build-run.mjs'), 'utf8').includes('sanitizeForPublicComment(groupDropReasons')
-      && readFileSync(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs'), 'utf8').includes('const awaitingStampedPr');
+      && readFileSync(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs'), 'utf8').includes('const awaitingStampedPr')
+      && readFileSync(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs'), 'utf8').includes('ids.map(id => `in:title');
   },
   async run({ log } = {}) {
     const problems = [];
@@ -97,6 +98,36 @@ export default {
         if ([...released, ...tick.prepare.retired].some(row => ids.includes(row.num))) problems.push('successful open batch retired a prepare claim');
         if (dropped.some(num => !holds.some(row => row.num === num))) problems.push('failed card escaped its normal failure hold');
       }
+
+      // A batch published before numbering names only bornAs ids. GitHub answers each search by its own terms,
+      // so the numbered card's open batch is reachable only through a title search under its bornAs id.
+      const born = Buffer.from('---\nstatus: open\nbornAs: xabc12\n---\nNumbered after its batch opened.\n');
+      const bornSha = createHash('sha1').update(`blob ${born.length}\0`).update(born).digest('hex');
+      const early = { number: 97, state: 'OPEN', headRefName: 'lane/prepare-batch-xdef34-2', title: 'prepare: xdef34, xabc12',
+        headRefOid: '7'.repeat(40), createdAt: '2026-10-17T12:00:00Z', isCrossRepository: false };
+      const searched = createPrepareStatusReader({ exec(cmd, callArgs) {
+        if (cmd === 'git' && callArgs[0] === 'fetch') return '';
+        if (cmd === 'git' && callArgs[0] === 'ls-tree') return `100644 blob ${bornSha}\tbacklog/7301-card.md\n`;
+        if (cmd === 'git' && callArgs[0] === 'cat-file') return Buffer.concat([Buffer.from(`${bornSha} blob ${born.length}\n`), born, Buffer.from('\n')]);
+        if (cmd === 'gh' && callArgs[0] === 'pr') {
+          const search = callArgs[callArgs.indexOf('--search') + 1];
+          const head = /^head:(\S+)$/.exec(search)?.[1];
+          const phrases = [...search.matchAll(/"([^"]+)"/g)].map(m => m[1]);
+          const hit = head ? early.headRefName.startsWith(head) : phrases.length > 0 && phrases.every(p => early.title.includes(p));
+          return JSON.stringify(hit ? [early] : []);
+        }
+        if (cmd === 'gh' && callArgs[0] === 'api') return JSON.stringify({ content: prepared.toString('base64') });
+        throw new Error(`unexpected fixture command ${cmd}`);
+      } });
+      if (searched.read({ num: '7301' }).pr?.number !== early.number) problems.push('status reader missed a batch titled with the card\'s bornAs id');
+      const relaunch = await runBuildDispatchTick({ live: true, effects: {
+        planTick: () => ({ decisions: { itemPrepareSpawns: [{ num: '7301' }] }, nextState: {} }),
+        fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+        killSwitch: () => ({ engaged: false }), listPreparePrs: input => searched.listPrs(input),
+        readPreparedStamp: input => searched.stamp(input), acquirePrepareClaim: () => ({ ok: true }),
+        dispatch: () => problems.push('numbered card re-prepared while its bornAs batch is open'),
+      } });
+      if (!relaunch.prepare.refused.some(row => row.num === '7301')) problems.push('launch guard did not refuse the numbered card');
       log?.(JSON.stringify(problems));
       return { problems };
     } finally {

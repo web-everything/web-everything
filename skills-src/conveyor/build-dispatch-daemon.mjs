@@ -2205,12 +2205,16 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     if (!Array.isArray(result.list)) throw new Error('prepare PR listing unavailable');
     return result.list;
   }
-  /** Per-card branch and title searches. Every component must be complete; saturation fails closed. */
+  /**
+   * Per-card branch and title searches. Every component must be complete; saturation fails closed.
+   * Titles are searched under every alias: a batch published before numbering names only the bornAs id, and its
+   * `lane/prepare-batch-<lead>-<n>` branch never matches a per-id head search.
+   */
   function itemQuery(num, bornAs) {
     const ids = [...new Set([normNum(num), normNum(bornAs)].filter(Boolean))];
     if (!ids.length || ids.some(id => !/^[a-z0-9._-]+$/.test(id))) throw new Error('invalid prepare PR search identity');
     return { key: JSON.stringify(ids), searches: [
-      ...ids.map(id => `head:lane/${id}`), `in:title "prepare" "${normNum(num)}"`,
+      ...ids.map(id => `head:lane/${id}`), ...ids.map(id => `in:title "prepare" "${id}"`),
     ] };
   }
   const uniquePrs = prs => [...new Map(prs.map(pr => [pr.number ?? pr.headRefName, pr])).values()];

@@ -142,6 +142,9 @@ describe('prepare status batched', () => {
       ['lane/1234d-prepare-x', 'ordinary', '1234'],
       ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12'],
       ['lane/abc.12d-prepare-x', 'ordinary', 'abc.12', true],
+      // A batch published before numbering names only the bornAs id; neither head search reaches its branch.
+      ['lane/prepare-batch-xabc12-2', 'prepare: xabc12, xdef34', 'xabc12'],
+      ['lane/prepare-batch-xdef34-2', 'prepare: xdef34, xabc12', 'xabc12', true],
     ]) {
       const identity = fromCard ? undefined : bornAs;
       const card = `---\nstatus: open\n${fromCard ? `bornAs: ${bornAs}\n` : ''}---\nquery-aware`;
@@ -153,9 +156,9 @@ describe('prepare status batched', () => {
         if (cmd !== 'gh') return git(cmd, args, opts);
         const search = args[args.indexOf('--search') + 1] ?? '';
         const head = /head:([^ ]+)/.exec(search)?.[1];
-        const phrase = /"([^"]+)"/.exec(search)?.[1];
+        const phrases = [...search.matchAll(/"([^"]+)"/g)].map(m => m[1]);
         const floor = /created:>=(\S+)/.exec(search)?.[1];
-        const matches = (!head || headRefName.startsWith(head)) && (!phrase || title.includes(phrase))
+        const matches = (!head || headRefName.startsWith(head)) && phrases.every(phrase => title.includes(phrase))
           && (!floor || pr.createdAt >= floor);
         const perItem = /^head:lane\/\S+$/.test(search) || search.includes('in:title');
         if (['saturated', 'prefetched'].includes(mode) && !perItem) {
@@ -1823,7 +1826,7 @@ describe('automatic item preparation', () => {
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(tick.prepare.refused).toEqual([]);
     expect(tick.prepare.launched.map(row => row.num)).toEqual(['8058', '8059']);
-    expect(searches).toHaveLength(6);
+    expect(searches).toHaveLength(8);
     expect(effects.dispatch).toHaveBeenCalledTimes(2);
   });
   it.each([3, 60])('bounds replanning through %s consecutive guarded picks and still evaluates the final pick', async guardedCount => {
@@ -1837,7 +1840,7 @@ describe('automatic item preparation', () => {
       const search = args[args.indexOf('--search') + 1];
       searches.push(search);
       const row = rows.find(row => search === `head:lane/${row.num}` || search === `head:lane/${row.bornAs}`
-        || search === `in:title "prepare" "${row.num}"`);
+        || search === `in:title "prepare" "${row.num}"` || search === `in:title "prepare" "${row.bornAs}"`);
       return JSON.stringify(row !== rows.at(-1) ? [{ number: Number(row.num), state: 'MERGED',
         headRefName: `lane/${row.num}-prepare-design`, mergedAt: '2026-10-16T22:40:00Z' }] : []);
     } });
@@ -1852,7 +1855,7 @@ describe('automatic item preparation', () => {
       const tick = await runBuildDispatchTick({ live: true, effects });
       expect(tick.prepare.skippedInPlanning).toHaveLength(Math.min(guardedCount, 8));
       // The successor outside the planning window must still get a complete final guard observation.
-      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 3);
+      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 4);
       if (guardedCount === 3) {
         expect(tick.prepare.launched.map(row => row.num)).toEqual(['8103']);
         expect(tick.prepare.refused).toEqual([]);
@@ -4286,7 +4289,7 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.refused).toEqual([]);
     expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).toEqual(['7201', '7202', '7204', '7205', '7206', '7207']);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ groupMembers: ['7202', '7204', '7205', '7206', '7207'] }));
-    expect(searches).toHaveLength(21); // Seven selected cards, three searches each; launch admission reuses the reader cache.
+    expect(searches).toHaveLength(28); // Seven selected cards, four searches each; launch admission reuses the reader cache.
   });
 
   it('shares the eight-card planning budget with group members and guards uninspected replacements at launch', async () => {
@@ -4497,15 +4500,15 @@ describe('prepare discovery under repository PR volume', () => {
       return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes('prepare') && pr.title.includes(title))
         .slice(0, Number(args[args.indexOf('--limit') + 1])));
     };
-    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,
+    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 16,
       ...(prefetch ? { execAsync: async (...args) => answer(...args) } : {}) });
     await reader.prime(nums.map(num => ({ num })));
     for (const [i, num] of nums.entries()) expect(reader.listPrs({ num }).map(pr => pr.number)).toEqual([9000 + i]);
-    expect(searches).toHaveLength(12);
+    expect(searches).toHaveLength(16);
     // A second read uses the same complete observations; a new identity fails closed without another gh call.
     for (const num of nums) reader.listPrs({ num });
     expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
-    expect(searches).toHaveLength(12);
+    expect(searches).toHaveLength(16);
   });
 
   it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {

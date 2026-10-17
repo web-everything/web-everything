@@ -36,7 +36,7 @@ export function isPreparePrFor(pr, { num, bornAs }) {
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
   const batch = batchMembers(pr);
-  if (batch?.includes(key)) return true;
+  if (key && [key, normNum(bornAs)].filter(Boolean).some(id => batch?.includes(id))) return true;
   return Boolean(key) && new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
 }
 
