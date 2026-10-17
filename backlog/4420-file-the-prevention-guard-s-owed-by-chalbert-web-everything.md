@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-10-11"
-preparedAgainstSha: "0726047008980bcce058960120cd5d03a6224e6c"
+preparedDate: "2026-10-17"
+preparedAgainstSha: "6585e918c78551181559fe97261f19918d8b323b"
 tags: []
 ---
 
@@ -21,11 +21,10 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
-- Premise checked against the current checkout: the original review citation, `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:59`, still points to the gap assertion. The missing-checkout case starts at `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:51`; despite its title, it does not observe child-process attempts. The guard is still owed, not already delivered.
-- Original scope: add a deterministic missing-checkout test with an injected run spy while retaining the real filesystem existence check. Corrected implementation scope: strengthen the existing missing-checkout case, rather than duplicate it. The production seam already exists at `we:scripts/operations/pr-ownership-io.mjs:105`, and checkout resolution is at `we:scripts/operations/pr-ownership-io.mjs:157`, and the existence gate is at `we:scripts/operations/pr-ownership-io.mjs:158`. No production change is needed.
-- Scope remains the existing test file, `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs`, which is itself the matching test scope; the production reader is investigation evidence only. Size remains 3. No prerequisite change or unresolved policy choice was identified.
-
-- Rechecked for this preparation: the old premise remains an unobserved no-child claim at `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:51`, with only a gap assertion at line 59 of that same file. The corrected premise is specifically missing regression coverage, not a broken production gate: `we:scripts/operations/pr-ownership-io.mjs:158` skips the lane read when the checkout is absent, and `we:scripts/operations/pr-ownership-io.mjs:109` routes that read through the injectable runner. The prior gate citation pointed at checkout resolution (line 157); it is corrected above. Old and retained scope are the single existing test file; no source or matching-test path has moved. The injected ownership suite at `we:scripts/operations/__tests__/pr-ownership.test.mjs:75` forces existence true and does not supply this real-absence guard. Existing preparation stamps are left untouched for the runner. No tests or mutation proof were run during this preparation.
+- Current-checkout inspection confirms the guard is still owed. Original premise/scope: add a deterministic missing-checkout test with an injected runner spy, retaining the real filesystem check. Corrected premise/scope: strengthen the existing case in `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:51`, whose only assertion remains the gap message at `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:59`. Its title claims no child is spawned without observing that claim. No additional test file or production fix is needed.
+- Source evidence: `we:scripts/operations/pr-ownership-io.mjs:81` maps the WE checkout to the supplied root; `we:scripts/operations/pr-ownership-io.mjs:105` supplies injectable `run` and the real default `pathExists`; `we:scripts/operations/pr-ownership-io.mjs:109` invokes that runner. Checkout resolution is at `we:scripts/operations/pr-ownership-io.mjs:157`; the actual existence gate is at `we:scripts/operations/pr-ownership-io.mjs:158`. The latter corrects the earlier preparation's gate citation. The injected suite at `we:scripts/operations/__tests__/pr-ownership.test.mjs:75` forces existence true, so it does not cover real absence.
+- Old and retained scope: only `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs`, itself the matching test file. Old size 3; retained size 3. Estimated touch set: one file × approximately 15–25 changed lines for imports/header at `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:3` and the existing case at `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs:51`, plus the mutation-proof work described below. This remains a story, so no `estimatedLoc` field is added.
+- No unresolved policy fork or prerequisite change was found. Preparation is based on source inspection, not executed regression or mutation results. Existing preparation stamps remain untouched; the runner owns stamping and checks.
 
 ## Design
 
@@ -37,7 +36,7 @@ Update the file-level description at `we:scripts/operations/__tests__/pr-ownersh
 
 ## MVP
 
-1. Edit only `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs`: add the filesystem/spy imports, strengthen the existing missing-checkout test, and correct its descriptive comment.
+1. Edit only `we:scripts/operations/__tests__/pr-ownership-io-real.test.mjs`: add `existsSync` to the filesystem import and `vi` to the Vitest import, strengthen the existing missing-checkout test, and correct its descriptive comment and title.
 2. Retain fixture cleanup, the existing reader doubles, and both real-child cases. Do not modify the reader, shared fixture helper, or ownership policy.
 3. Deliver the no-call assertion together with the real absence and gap assertions; none alone proves the whole guard.
 
@@ -51,7 +50,7 @@ Verify all three cases pass: real child success, real child nonzero exit convert
 
 The current reader already has the correct gate, so an ordinary baseline suite is expected to pass; that alone does not demonstrate the missing prevention coverage. During implementation, temporarily mutate the missing-checkout branch at `we:scripts/operations/pr-ownership-io.mjs:158` to attempt `readLanes(checkout)` inside a caught try/catch before retaining the existing gap message. Discard the return value of that extra call and leave `lanes` unchanged. This models an attempted child spawn whose failure is swallowed and preserves the old assertion's observable output; with the returning spy it still preserves the empty lanes, isolating the no-call assertion as the mutation detector.
 
-Run the focused suite through the queue with the original test and this mutation: the missing-checkout case should remain green. With the strengthened test and the same mutation, it must fail specifically on the nonzero spy call count. Restore the production reader, rerun the suite, and retain the green result plus the targeted mutation failure as review evidence. No mutation belongs in the delivered diff. This preparation records the proof procedure; it does not claim those runs have occurred.
+First capture a green focused baseline with the unmodified reader. Run the focused suite through the queue with the original test and this mutation: the missing-checkout case should remain green. With the strengthened test and the same mutation, it must fail specifically on the nonzero spy call count. Restore the production reader, rerun the suite, and retain the green result plus the targeted mutation failure as review evidence. Capture the command, exit status, and relevant assertion output for each run. If the original test rejects the mutation for another reason, revise the experiment before claiming the new assertion detects the gap. No mutation belongs in the delivered diff. This preparation records the proof procedure; it does not claim those runs have occurred.
 
 ## Done when
 
