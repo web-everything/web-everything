@@ -64,7 +64,7 @@ describe('operation routing policy', () => {
     expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'security', policy })).toMatchObject({ provider: 'agy-claude', model: 'claude-opus-4-6-thinking' });
   });
   it('keeps the critical gate ahead of an explicit provider override, even if the policy omits the operation kind', () => {
-    const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
+    const policy = copy(); policy.operations['build:build-new-feature'] = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
     const dispatch = { kind: 'build', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' };
     expect(decideDispatchRoute(dispatch, { routingPolicy: policy }).policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
     policy.criticalWorkGate.kinds = [];
@@ -112,7 +112,7 @@ it('a critical-miss veto removes the exact model from the whole fallback chain',
 
 
 it('treats an edit to the routing policy itself as critical work', () => {
-  const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
+  const policy = copy(); policy.operations['build:build-new-feature'] = { provider: 'codex', model: 'default', fallback: [{ provider: 'claude', model: 'opus' }] };
   const route = decideDispatchRoute({ kind: 'build', scopePaths: ['we:scripts/lib/dispatch-routing-policy.json'], risk: 'low', size: 1 }, { routingPolicy: policy });
   expect(route.policyRoute).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
 });
@@ -269,33 +269,20 @@ it('preserves Claude build and documentation effort and fallback', () => {
   expect(resolveOperationRoute({ operation: 'build', taskType: 'doc-fix', available: ['claude'] }).effort).toBe('low');
 });
 
-it('inherits feature probation by default and preserves explicit operator pins and fallback', () => {
-  const policy = copy();
-  expect(policy.taskTypes['build-new-feature']).toEqual({ inherit: true });
-  expect(policy.operations['build:build-new-feature']).toEqual({ inherit: true });
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toBeNull();
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, policy })).toMatchObject({
-    provider: 'claude', model: 'claude-sonnet-5-5', fallback: [],
+it('routes 5209 scope as a feature build to Codex sol, preserving effort and Claude fallback', async () => {
+  const { taskTypeFor } = await import('../dispatch-task-type.mjs');
+  const scopePaths = ['we:scripts/conveyor/queue-prune.mjs', 'we:scripts/conveyor/queue.mjs',
+    'we:scripts/conveyor/__tests__/queue-prune.test.mjs', 'we:scripts/conveyor/__tests__/queue.test.mjs'];
+  const { taskType } = taskTypeFor({ kind: 'build', scopePaths });
+  expect(taskType).toBe('build-new-feature');
+  expect(resolveOperationRoute({ operation: 'build', taskType })).toMatchObject({
+    provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium',
+    fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'high' }],
   });
-  expect(() => resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', gateClosed: true, availability: { claude: 'held' }, policy })).toThrow(/no available route/);
-  policy.taskTypes['build-new-feature'] = {
-    provider: 'codex', model: 'sol',
-    effort: { claude: 'medium', codex: 'medium', antigravity: 'medium', 'agy-claude': 'medium', 'agy-gemini': 'medium' },
-    fallback: [{ provider: 'claude', model: 'sonnet', effort: 'medium' }],
-  };
-  expect(policy.taskTypes['build-new-feature']).toMatchObject({
-    provider: policy.operations.build.provider, model: policy.operations.build.model,
-    effort: { codex: policy.operations.build.effort.codex },
-  });
-  const buildRoute = resolveOperationRoute({ operation: 'build', policy });
-  policy.operations.build = { inherit: true };
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', policy })).toMatchObject({
-    provider: buildRoute.provider, model: buildRoute.model, effort: buildRoute.effort, source: buildRoute.source,
-    fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium' }],
-  });
-  expect(resolveOperationRoute({ operation: 'build', taskType: 'build-new-feature', available: ['claude'], policy })).toMatchObject({
-    provider: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', fallback: [],
-  });
+  expect(resolveOperationRoute({ operation: 'build', taskType, available: ['claude'] }))
+    .toMatchObject({ provider: 'claude', effort: 'high' });
+  expect(resolveOperationRoute({ operation: 'build', taskType, gateClosed: true }))
+    .toMatchObject({ provider: 'claude', fallback: [] });
 });
 
 it('preserves operator-protected Astra and ruling escalation routes', () => {

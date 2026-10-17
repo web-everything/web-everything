@@ -1533,3 +1533,23 @@ reads the existing runs folder without migration or writes; `OPERATION_RUNS_DIR`
 it. `--since=<iso>` selects runs by earliest seat start. Incomplete runs are shown but
 excluded from median, nearest-rank p90 and the >5-minute early-change share denominator.
 Legacy runs without seat observations are omitted; absent times are never reconstructed.
+
+### Scope-only prepare re-validation
+
+The builder may send an individually dispatched `prepare-stale` card through a light
+re-validation before full preparation, only when the hold says scope changed (age
+holds still require full preparation). `prepare.lightRevalidate` defaults to true;
+`prepare.lightRevalidateMaxDiffLines` defaults to 400. Both use the prepare policy
+cascade and source logger, with `WE_PREPARE_LIGHT_REVALIDATE` and
+`WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES` environment overrides.
+
+The prepare runner supplies the existing card sections and the scope diff from
+`preparedAgainstSha` to the pinned main base to Codex sol at low effort. The worker
+must return JSON `{ "verdict": "still-valid" | "needs-reprepare", "reason": "one line" }`
+and leave the checkout unchanged. Only `still-valid` allows the runner to append
+`revalidated: <reason>` and refresh the sanctioned stamp. Missing evidence, invalid
+answers, disabled policy, and diffs above the cap use full preparation. A worker
+that changes files, HEAD, or hooks is refused. Re-stamps use the existing verified
+card-only prepare PR lane; the builder waits for the stamp to land on main before
+building. Light candidates are excluded from grouped prepares so each verdict
+covers exactly the card and diff inspected. No direct write to main is permitted.

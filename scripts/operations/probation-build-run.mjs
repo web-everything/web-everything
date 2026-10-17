@@ -79,6 +79,7 @@ import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
+import { lightRevalidationInput, parseLightVerdict } from './prepare-light-revalidate.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
 import { parseCard } from '../lib/priority-order.mjs';
@@ -262,6 +263,7 @@ export function parseArgs(argv) {
     lane: flags.lane ? Number(flags.lane) : null,
     scope: typeof flags.scope === 'string' && flags.scope ? flags.scope.split(',') : [],
     worker,
+    lightRevalidate: process.env.WE_PREPARE_LIGHT_REVALIDATE_ITEM === String(flags.num),
     groupMembers: parseGroupMembers(flags['group-members'] ?? ''),
   };
 }
@@ -287,7 +289,8 @@ function validateAndStampPrepare(num, card, lanePath, io, autoSize) {
  * @param {object} io - see {@link realIo} for the shape.
  */
 export async function runProbationBuild(args, io) {
-  const { num, session, worker } = args;
+  const { num, session } = args;
+  let { worker } = args;
   const taskType = args.taskType ?? 'doc-fix';
   if (!['doc-fix', 'bugfix', 'test-fix', 'prepare', 'build-new-feature'].includes(taskType)) throw new Error('unsupported probation build taskType');
   if (!num || !session || !worker?.id) throw new Error('probation-build-run: --num, --session and --worker are required');
@@ -295,7 +298,8 @@ export async function runProbationBuild(args, io) {
   if (!preparing && parseGroupMembers(args.groupMembers ?? []).length) {
     throw new Error('probation-build-run: grouped requests require prepare mode');
   }
-  const prepareAutoSize = preparing && (io.preparePolicy ?? readPreparePolicy()).autoSize;
+  const preparePolicy = preparing ? (io.preparePolicy ?? readPreparePolicy()) : {};
+  const prepareAutoSize = preparing && preparePolicy.autoSize;
   if (preparing && !['codex', 'antigravity-gemini'].includes(worker.id)) throw new Error('prepare requires codex or antigravity-gemini');
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);
   let declinedReason = null;
@@ -475,7 +479,35 @@ export async function runProbationBuild(args, io) {
     let memberReport = '';
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
-      const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
+      let run;
+      if (preparing && args.lightRevalidate && attempt === 0 && !groupMembers.length) {
+        const input = lightRevalidationInput({ raw: item.raw, scope: item.scope, baseSha, policy: preparePolicy,
+          diff: (sha, base, paths) => io.prepareScopeDiff(lanePath, sha, base, paths) });
+        if (input) {
+          const lightWorker = { ...PROBATION_WORKERS.codex, model: resolvePolicyModel('codex', 'sol'), effort: 'low', taskType: 'prepare' };
+          const lightTask = io.writeTaskFile(lanePath, 'prepare-light-revalidate.md', input);
+          const answer = io.runWorker(buildWorkerArgv({ worker: lightWorker, weRoot: lanePath, dir: lanePath,
+            taskFile: lightTask, card: num, caller: 'prepare-light-revalidate' }), lanePath);
+          workerRan = true;
+          const lightHooks = hookSurfaceChanged(preHookSurface, io.snapshotHookSurface(lanePath));
+          if (lightHooks.changed) {
+            if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
+            return abandon('escalated-needs-human', `refused: revalidation changed hooks: ${lightHooks.reason}`);
+          }
+          if (io.headSha(lanePath) !== baseSha || io.findItem(num, lanePath)?.raw !== item.raw
+            || summarizeNumstat(io.diffNumstat(lanePath, baseSha, [])).files) {
+            return abandon('gate-red', 'refused: revalidation changed the checkout');
+          }
+          const verdict = answer.ok ? parseLightVerdict(answer.lastMessage) : null;
+          log(`light revalidation: ${verdict?.verdict ?? 'invalid answer; full prepare'}${verdict ? `: ${verdict.reason}` : ''}`);
+          if (verdict?.verdict === 'still-valid') {
+            io.writeCard(lanePath, item.path, `${item.raw.trimEnd()}\n\nrevalidated: ${verdict.reason}\n`);
+            worker = lightWorker;
+            run = { ...answer, lastMessage: 'Preparation revalidated.' };
+          }
+        }
+      }
+      run ??= io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
       modelEvidence = run.modelEvidence ?? {};
       if (preparing) memberReport += `\n${run.lastMessage ?? ''}`;
       workerRan = true;
@@ -1049,6 +1081,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       try { return JSON.parse(r.out).lastMessage ?? ''; } catch { return ''; }
     },
     addedPaths: (dir, base) => sh('git', ['-C', dir, 'diff', '--no-renames', '--diff-filter=A', '--name-only', base], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
+    prepareScopeDiff: (dir, sha, base, paths) => sh('git', ['-C', dir, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', `${sha}..${base}`, '--', ...paths], { cwd: dir, env: laneEnv }),
     diffText: (dir, base, paths = []) => sh('git', ['-C', dir, 'diff', '--no-renames', base, ...(paths.length ? ['--', ...paths] : [])], { cwd: dir, env: laneEnv }),
     untracked: (dir) => sh('git', ['-C', dir, 'ls-files', '--others', '--exclude-standard'], { cwd: dir, env: laneEnv }).split('\n').filter(Boolean),
     diffNumstat: (dir, base, exclude = []) => {

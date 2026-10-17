@@ -871,6 +871,58 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
+  it.each(['still-valid', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered'])(
+    'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
+      const { io, calls } = prepareIo();
+      const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
+      let current = initial;
+      let runs = 0;
+      const tasks = [];
+      io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
+      io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
+      io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
+      io.diffNumstat = () => current === initial ? '' : `2\t0\t${path}`;
+      io.writeTaskFile = (_d, name, text) => { tasks.push({ name, text }); return name; };
+      io.writeCard = (_d, _p, text) => { current = text; };
+      io.runWorker = argv => {
+        runs++;
+        if (argv.includes('--task-file=prepare-light-revalidate.md')) {
+          expect(argv).toContain('--effort=low');
+          expect(argv).toContain('--model=gpt-6.1-sol');
+          if (mode === 'tampered') current += '\nunauthorized edit';
+          return { ok: true, lastMessage: mode === 'invalid' ? 'yes' : JSON.stringify({
+            verdict: mode === 'needs-reprepare' ? 'needs-reprepare' : 'still-valid', reason: 'Scope changes preserve the plan.' }) };
+        }
+        current += '\nFull preparation revised.';
+        return { ok: true, lastMessage: 'Prepared.' };
+      };
+      io.stampPrepare = () => {
+        calls.push(['stamp']);
+        current = current.replace('aaaa1111', 'base-sha');
+        return { ok: true };
+      };
+      const result = await runProbationBuild({ ...prepareArgs(), lightRevalidate: true }, io);
+      if (mode === 'tampered') {
+        expect(result.detail).toContain('revalidation changed the checkout');
+        expect(calls.some(c => ['stamp', 'commit', 'openPr'].includes(c[0]))).toBe(false);
+        return;
+      }
+      expect(result).toMatchObject({ outcome: 'opened-pr' });
+      expect(current).toContain('preparedAgainstSha: "base-sha"');
+      if (mode === 'still-valid') {
+        expect(runs).toBe(1);
+        expect(current).toContain('revalidated: Scope changes preserve the plan.');
+        const { prepareStaleness } = await import('../../readiness/dispatch-plan.mjs');
+        expect(prepareStaleness({ preparedDate: '2026-10-17', preparedAgainstSha: 'base-sha',
+          prepDrift: { stale: false } }, { today: '2026-10-17', maxAgeDays: 3 })).toBeNull();
+      } else {
+        expect(current).toContain('Full preparation revised.');
+        expect(runs).toBe(['over-cap', 'disabled'].includes(mode) ? 1 : 2);
+      }
+      expect(calls.find(c => c[0] === 'commit')[1]).toEqual([path]);
+      expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text ?? '').toContain(
+        ['over-cap', 'disabled'].includes(mode) ? '' : 'aaaa1111');
+    });
   it('writes grouped prepare and per-member refusal lines in the actual PR body', () => {
     const dir = mkdtempSync(join(tmpdir(), 'group-prepare-body-'));
     try {

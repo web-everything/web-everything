@@ -2,9 +2,9 @@
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy, resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 
-const standard = Object.freeze({ retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128 });
+const standard = Object.freeze({ lightRevalidate: true, lightRevalidateMaxDiffLines: 400, retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128 });
 const bool = v => typeof v === 'boolean';
-const valid = { maxPrListingCallsPerTick: v => Number.isInteger(v) && v >= 0 && v <= 1000, retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
+const valid = { lightRevalidate: bool, lightRevalidateMaxDiffLines: v => Number.isInteger(v) && v >= 0, maxPrListingCallsPerTick: v => Number.isInteger(v) && v >= 0 && v <= 1000, retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
   mergedGuardHours: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 };
 const parseBool = v => {
   if (bool(v)) return v;
@@ -16,6 +16,8 @@ const parseBool = v => {
 const block = value => Object.fromEntries(Object.keys(standard)
   .filter(key => valid[key](value?.[key])).map(key => [key, value[key]]));
 const envValues = env => ({
+  lightRevalidate: parseBool(env?.WE_PREPARE_LIGHT_REVALIDATE),
+  lightRevalidateMaxDiffLines: env?.WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES?.trim() ? Number(env.WE_PREPARE_LIGHT_REVALIDATE_MAX_DIFF_LINES) : undefined,
   retryUnstampedOnce: parseBool(env?.WE_PREPARE_RETRY_UNSTAMPED_ONCE),
   autoSize: parseBool(env?.WE_PREPARE_AUTO_SIZE),
   runner: env?.WE_PREPARE_RUNNER,
@@ -24,12 +26,16 @@ const envValues = env => ({
     && env.WE_PREPARE_MERGED_GUARD_HOURS.trim() !== '' ? Number(env.WE_PREPARE_MERGED_GUARD_HOURS) : undefined,
 });
 const result = resolved => ({
+  lightRevalidate: resolved.value.lightRevalidate,
+  lightRevalidateMaxDiffLines: resolved.value.lightRevalidateMaxDiffLines,
   retryUnstampedOnce: resolved.value.retryUnstampedOnce,
   autoSize: resolved.value.autoSize,
   runner: resolved.value.runner,
   maxPrListingCallsPerTick: resolved.value.maxPrListingCallsPerTick,
   mergedGuardHours: resolved.value.mergedGuardHours,
   sources: {
+    lightRevalidate: resolved.sources.lightRevalidate,
+    lightRevalidateMaxDiffLines: resolved.sources.lightRevalidateMaxDiffLines,
     retryUnstampedOnce: resolved.sources.retryUnstampedOnce,
     autoSize: resolved.sources.autoSize,
     runner: resolved.sources.runner,
