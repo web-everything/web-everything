@@ -620,6 +620,40 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
     expect(at('true;  \nHOME=/a; cd ~/clone && ls')).toBe('/a/clone');
     expect(at('# note\nHOME=/a; cd ~/clone && ls')).toBe('/a/clone');
+    expect(at('# a; b && c\nHOME=/a; cd ~/clone && ls')).toBe('/a/clone');
+  });
+  it('a comment holding `;` / `&&` / `&` / `|` after `||` still keeps the next line conditional', () => {
+    for (const cmd of [
+      'true || # a; b && c\nHOME=/a; cd ~/clone && ls',
+      'true || # a | b\nHOME=/a; cd ~/clone && ls',
+      'true || # a & b\nHOME=/a; cd ~/clone && ls',
+      'true && # x; y\nD=~/x; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+  });
+  it('after a compound or grouping word, a later home-derived assignment is not trusted', () => {
+    for (const cmd of [
+      'if false; then\nHOME=/a\nfi; cd ~/clone && ls',
+      'false && {\nHOME=/a\n}; cd ~/clone && ls',
+      'while false\ndo\nHOME=/a\ndone\ncd ~/clone && ls',
+      'if true; then :; else\nHOME=/a\nfi; cd ~/clone && ls',
+      'f() {\nHOME=/a\n}\ncd ~/clone && ls',
+      'if false; then\nD=~/x\nfi; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
+    // main's answer for an earlier literal is kept
+    expect(at('D=/clone; if false; then\nD=$HOME/x\nfi; cd "$D" && ls')).toBe('/clone');
+    // a plain `${NAME}` read is no grouping
+    expect(at('X=${Y}; D=~/x; cd "$D" && ls')).toBe(`${HOME}/x`);
+  });
+  it('a later unreadable reassignment of a home-derived name leaves it unknown', () => {
+    for (const cmd of [
+      'D=$HOME/a; D=$(pwd); cd "$D" && ls',
+      'D=~/a\nD=$(pwd)\ncd "$D" && ls',
+      'D=~/a; [ x ] && D=$HOME/b; cd "$D" && ls',
+      'D=~/a; D=$X; cd "$D" && ls',
+      'D=~/a; D=`pwd`; cd "$D" && ls',
+      'D=~/a; D="x y"; cd "$D" && ls',
+      'D=~/a; D=$HOME/b; [ x ] && D=$X; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
   });
   it('a HOME assignment that is conditional, prefixes a command or is glob-shaped leaves home unknown', () => {
     for (const cmd of [

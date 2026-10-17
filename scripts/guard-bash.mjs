@@ -1145,6 +1145,8 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   // `||` (logical or, not a pipe) is excluded: its second `|` is what the very next char test below reads.
   const pipedFrom = [];
   const separators = [];         // `separators[i]` — the operator text that ended `segs[i]` ('' when none)
+  const commented = [];          // `commented[i]` — did `segs[i]` begin INSIDE a `#` comment (`# a; b` → ` b`)?
+  let startedInComment = false;
   let pendingPiped = false;      // segs[0] (the first segment) has no predecessor
   let cur = '';
   let unterminated = false;
@@ -1153,7 +1155,10 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   let inComment = false;
   // A comment switches quoting off until END OF LINE — a separator does NOT end it (bash agrees: `# a; b`
   // is all comment). Only a newline clears it.
-  const cut = () => { segs.push(cur); pipedFrom.push(pendingPiped); separators.push(''); cur = ''; atWordStart = true; };
+  const cut = () => {
+    segs.push(cur); pipedFrom.push(pendingPiped); separators.push(''); commented.push(startedInComment);
+    cur = ''; atWordStart = true;
+  };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // Inside a `#` comment ONLY quoting is switched off; the comment TEXT and every separator in it are
@@ -1193,6 +1198,7 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
       const start = i;
       while (i + 1 < s.length && /[;&|\n]/.test(s[i + 1])) { if (s[i + 1] === '\n') inComment = false; i += 1; }
       separators[separators.length - 1] = s.slice(start, i + 1);
+      startedInComment = inComment;
       continue;
     }
     cur += ch;
@@ -1201,7 +1207,8 @@ export function parseSegments(command, { spliceContinuations = true } = {}) {
   segs.push(cur);
   pipedFrom.push(pendingPiped);
   separators.push('');
-  return { segments: segs, unterminated, continued, pipedFrom, separators };
+  commented.push(startedInComment);
+  return { segments: segs, unterminated, continued, pipedFrom, separators, commented };
 }
 
 /** The segments-only view of `parseSegments` (the raw text of each `&&`/`||`/`;`/`&`/`|`/newline-separated
@@ -2517,13 +2524,19 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const oddSpace = (s) => /[^\S \t\n]/.test(s);
   // A home-derived value is trusted only from a statement that surely runs in THIS shell: nothing but `;` /
   // newline before it, and no pipe or `&` after it (`a && D=~/x`, `D=~/x | true`, `HOME=/a & …` may not).
-  // bash lets blank and comment-only lines follow `&&` / `||` / `|`, so the walk back looks through them.
-  const { segments: segs, separators: seps } = parsed;
-  const blank = (seg) => /^[ \t]*(?:#.*)?$/.test(seg);
+  // bash lets blank and comment-only lines follow `&&` / `||` / `|`, so the walk back looks through them (a
+  // comment's own `;` / `&&` pieces included). And after any compound or grouping word (`if`, `then`, `do`,
+  // `{`, `(`, a function), whether a later line runs depends on structure the walk does not model: not plain.
+  const { segments: segs, separators: seps, commented } = parsed;
+  const blank = (k) => commented[k] || /^[ \t]*(?:#.*)?$/.test(segs[k]);
+  const compound = (k) => !blank(k) && (
+    /^\s*(?:if|then|else|elif|fi|do|done|while|until|for|case|esac|select|function|coproc|!)(?:\s|$)/.test(segs[k])
+    || /[(){}]/.test(segs[k].replace(/\$\{[A-Za-z_]\w*\}/g, '')));
   const plain = (at) => {
+    for (let k = 0; k < at; k++) if (compound(k)) return false;
     for (let k = at - 1; k >= 0; k--) {
-      if (!/^[;\n]+$/.test(seps[k])) return false;
-      if (!blank(segs[k])) break;
+      if (!commented[k + 1] && !/^[;\n]+$/.test(seps[k])) return false;  // a separator inside a comment is text
+      if (!blank(k)) break;
     }
     return /^(?:[;\n]*|&&\n*|\|\|\n*)$/.test(seps[at]);
   };
@@ -2553,7 +2566,10 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   parsed.segments.forEach((stmt, at) => {
     const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.+)$/);
     if (m) {
-      let val = m[2].trim();
+      const val = m[2].trim();
+      const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes
+      // main skips a substitution / multi-word value; a home-derived name still learns that it changed
+      const unknown = () => (history[m[1]] ??= []).push({ at, value: undefined });
       if (val.startsWith('~') || /\$(?:HOME(?!\w)|\{HOME\})/.test(val)) {
         // bash expands an unquoted leading `~` and `$HOME` / `${HOME}` in an assignment value (`D=~/clone`,
         // `D="$HOME/clone"`), against the home known at that statement. Anything it cannot expand exactly
@@ -2565,11 +2581,10 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
         if (value !== undefined || !/[`$(]/.test(val)) {
           homeNames.add(m[1]);
           record(m[1], at, value);
-        }
-      } else if (!/[`$(]/.test(val)) {                        // command-subst / nested expansion → skip
-        val = val.replace(/^(['"])(.*)\1$/, '$2');            // strip matching surrounding quotes
-        if (!/\s/.test(val)) record(m[1], at, val);           // single-token literal only
-      }
+        } else unknown();
+      } else if (!/[`$(]/.test(val) && !/\s/.test(literal)) {
+        record(m[1], at, literal);                            // single-token literal only
+      } else unknown();
     }
     assignHome = homeAfter(stmt, assignHome, at);
   });
