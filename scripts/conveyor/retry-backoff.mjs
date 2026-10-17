@@ -76,6 +76,7 @@ const RULES = [
   ['launch-spawn-failed', /launch-spawn-failed/i],
   ['launch-died', /launch-died/i],
   ['dispatch-command-failed', /^Command failed\b/i],
+  ['card-lookup-unavailable', /^build card lookup unavailable$/],
 ];
 export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
 /**
@@ -84,8 +85,9 @@ export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
  * burns its backoff budget on a condition it cannot cause (4701 went to `exhausted` on seven stale-clone refusals
  * overnight), and the daemon keeps re-picking it, so it is dispatched again and again while the clone lags. A
  * clone-wide failure is never charged to the card and never holds it; the clone's own self-sync clears the cause.
+ * `card-lookup-unavailable` is the pre-claim origin/main read failing (fetch/ls-tree outage): every card fails it alike.
  */
-export const CLONE_WIDE_REASON_CODES = Object.freeze(['checkout-behind-origin']);
+export const CLONE_WIDE_REASON_CODES = Object.freeze(['checkout-behind-origin', 'card-lookup-unavailable']);
 export const isCloneWideReasonCode = (code) => CLONE_WIDE_REASON_CODES.includes(code);
 /**
  * A CARD-LEVEL permanent refusal: a `dispatch-lane` step refused because of what the CARD says — a card-derived
@@ -102,7 +104,8 @@ const CARD_REFUSAL_RE = new RegExp(
   '^step-refused at `[^`]+`: dispatch-lane(?:: (?:no value for the brief placeholder|the value for) '
   + `\\{\\{(?:${CARD_PLACEHOLDERS})\\}\\}|\\.read: #\\S+ has no \`scope:\`)`,
 );
-export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''));
+export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''))
+  || /^build card #\S+ unavailable on origin\/main$/.test(String(text ?? ''));
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;

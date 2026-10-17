@@ -1221,6 +1221,27 @@ Failure counts/backoff live in that same state file; preserve them during follow
 membership, conflicting refusal, transient backoff across restarts, threshold provenance and stamp recovery
 with injected IO, never a live enqueue.
 
+### Build dispatch launch lifetime and prepare discovery
+
+Launch admission and launch confirmation do not prove delivery. Retain the build failure ledger across
+both, including daemon restarts; clear it only after observing a delivering PR. Before releasing an
+orphan claim, persist its failure so a failed ledger write keeps the claim. Regress the #4413 shape:
+pending launch → confirmed run → dead worker with no delivery → backed-off retry → exhausted attempts.
+Validate a build card against the fetched WE origin/main backlog before acquiring its claim; missing
+identities are permanent card refusals, while an unavailable Git read remains a retryable observation:
+the clone-wide `card-lookup-unavailable` code, never charged to the card's retry budget. Because history
+outlives a launch, late-launch (quick-schedule) attempts are counted apart from real failures, and the
+orphan pass keys its failure on the dead claim so a retried release never charges it twice.
+
+Prepare discovery searches each card's current lane identity, bornAs lane identity and title, then
+unions the complete results. Never use an unfiltered repository PR listing as the launch guard's proof
+of absence. Cache component failures for the tick as well as successes. The prepare policy leaf
+`maxPrListingCallsPerTick` defaults to 128, resolves through standard/platform/tool/env, and logs its
+source; `WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK` overrides it. Prefetch and lazy readers share the
+same budget, including failed commands. A component at its result cap or a spent budget refuses only
+that card. Test with over 500 unrelated PRs, all three identity forms, concurrency, repeated reads and
+budget exhaustion. GitHub calls use the shared throttle in both synchronous and asynchronous paths.
+
 ### Nightly coroner health job
 
 `nightly-coroner` is a detached health-watch job, independent of chat sessions and accounts.

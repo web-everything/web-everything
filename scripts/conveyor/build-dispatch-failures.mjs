@@ -3,12 +3,12 @@
  *
  * Before: a failing build card was re-dispatched every tick and left only an empty in-memory failure row. Now each
  * failure is persisted with its reason code and the child output, and the card is withheld until `retryAfter`.
- * After `maxAttempts` the card stays withheld (`exhausted`) until re-armed. A dispatched build clears its record.
+ * After `maxAttempts` the card stays withheld (`exhausted`) until re-armed. Only observed delivery clears its record; a launch retains the retry history.
  */
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE, QUICK_RETRY_REASON_CODES } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
@@ -28,11 +28,18 @@ function save(state, path) {
   renameSync(temp, path);
 }
 
-/** Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). */
-export function recordBuildFailure({ num, reason, output }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
+/**
+ * Record one failed build dispatch. `output` is the captured child output (falls back to `reason`). `attemptKey`
+ * names the attempt (e.g. the dead claim): a repeat with the same key charges nothing, so a step that records before
+ * a release it may retry never charges one attempt twice. Late-launch (quick-schedule) attempts are counted apart
+ * from real failures: the history is retained across a confirmed launch, and lateness must not spend the card's
+ * failure budget (PR #5453).
+ */
+export function recordBuildFailure({ num, reason, output, attemptKey }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
   const state = read(path);
   const key = String(num);
-  const attempts = (state.items[key]?.attempts ?? 0) + 1;
+  const prev = state.items[key];
+  if (attemptKey != null && prev?.attemptKey === String(attemptKey)) return prev;
   // Redact BEFORE cutting: a cut taken first can slice a credential's recognisable prefix off and leave its tail
   // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
   const rawText = String(output ?? reason ?? '').trim();
@@ -41,11 +48,18 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
   // builder-starved — a clone-wide refusal (the daemon's own clone is behind origin/main) is not the card's
   // failure: nothing is persisted, no attempt is charged, and the card is not withheld.
   if (isCloneWideReasonCode(reasonCode)) {
-    return { num: key, attempts: state.items[key]?.attempts ?? 0, reasonCode, cloneWide: true, reason: redactSpawnText(reason ?? '').slice(0, 400),
+    return { num: key, attempts: prev?.attempts ?? 0, reasonCode, cloneWide: true, reason: redactSpawnText(reason ?? '').slice(0, 400),
       output: text.slice(0, OUTPUT_CAP), recordedAt: new Date(now).toISOString(), retryAfter: null, exhausted: false };
   }
+  // A record written before the split carries one count: it belongs to its own code's schedule.
+  const scheduleOf = (code) => (QUICK_RETRY_REASON_CODES.includes(code) ? 'quick' : 'failure');
+  const counts = prev ? (prev.scheduleAttempts ?? { [scheduleOf(prev.reasonCode)]: prev.attempts ?? 0 }) : {};
+  const schedule = scheduleOf(reasonCode);
+  const attempts = (counts[schedule] ?? 0) + 1;
   const record = {
     num: key, attempts,
+    scheduleAttempts: { ...counts, [schedule]: attempts },
+    ...(attemptKey != null ? { attemptKey: String(attemptKey) } : {}),
     reasonCode,
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),

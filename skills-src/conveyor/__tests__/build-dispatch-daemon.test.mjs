@@ -53,8 +53,10 @@ import {
   EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
   // ruled-hold-release — the card-change reader and the clone-stale launch gate
   cliCardChangedSince, cliDispatcherFresh,
+  defaultExecAsync,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
+import { recordBuildFailure as recordBuildFailureAt, listBuildBackoffs } from '../../../scripts/conveyor/build-dispatch-failures.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -273,8 +275,8 @@ describe('prepare status batched', () => {
     expect(calls.filter(([, args]) => args.some(a => a.includes('contents/')))).toHaveLength(0);
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
-    expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', '500']);
+    expect(listings).toHaveLength(unstamped ? 100 : 0);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/6000', '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', '100']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -340,8 +342,8 @@ describe('prepare status batched', () => {
     expect(reader.read({ num: 7100 }).pr).toBeNull();
     expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
     const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
-    expect(args[args.indexOf('--search') + 1]).toBe('');
-    expect(args[args.indexOf('--limit') + 1]).toBe('1000');
+    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/7100');
+    expect(args[args.indexOf('--limit') + 1]).toBe('100');
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
     expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
   });
@@ -2721,7 +2723,7 @@ describe('automatic item preparation', () => {
       expect(effects.listPrepareClaims().map(c => c.meta.num)).toContain('4501');
       expect(effects.placePrepareHold).not.toHaveBeenCalled();
       expect(effects.primePrepareStatus).toHaveBeenCalledTimes(1);
-      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(1);
+      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(2);
     });
     it('falls back to individual reads after a failed prime', async () => {
       const effects = fixture();
@@ -3962,6 +3964,20 @@ describe('grouped BUILD daemon ticks', () => {
     expect(result.dispatched.some(r => r.num === '7101')).toBe(false);
   });
 
+  it('fail-group charges one dropped-member attempt once while its claims fail to release (PR #5453)', async () => {
+    vi.stubEnv('WE_BUILD_GROUP_MEMBER_FAILURE', 'fail-group');
+    const dir = mkdtempSync(join(tmpdir(), 'group-charge-once-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
+        settled: [{ num: '7101', runId: 'run-7101', startedAt: '2099-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
+      effects.recordBuildFailure = o => recordBuildFailureAt(o, { path, now: 0 });
+      effects.releaseClaim = () => { throw new Error('lock store unavailable'); };
+      for (let i = 0; i < 4; i++) await runBuildDispatchTick({ live: true, policy, effects }).catch(() => {});
+      expect(JSON.parse(readFileSync(path, 'utf8')).items['7101']).toMatchObject({ reasonCode: 'dispatch-failed', attempts: 1 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('ignores stale drop results from an older lead attempt', async () => {
     const effects = fixture({ claims: rows.map((r, i) => ({ ...r, ...(i ? { groupLead: '7101' } : {}) })),
       settled: [{ num: '7101', startedAt: '2000-01-01T00:00:00Z', outcome: 'pr-opened', groupDropped: ['7102'] }] });
@@ -4201,5 +4217,97 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.planned[0].groupMembers).toEqual(['7202', '7203', '7204']);
     expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
     expect(effects.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('prepare discovery under repository PR volume', () => {
+  it.each([false, true])('is complete above 500 PRs and bounds all listing calls (async=%s)', async prefetch => {
+    const nums = ['5694', '5919', '5745', '5940'];
+    const cards = Object.fromEntries(nums.map(num => [num, `---\nbornAs: xabc${num.slice(-3)}\nstatus: open\n---\nvolume ${num}`]));
+    const population = Array.from({ length: 750 }, (_, number) => ({ number, state: 'MERGED',
+      title: `unrelated ${number}`, headRefName: `feature/${number}`, isCrossRepository: false }));
+    for (const [i, num] of nums.entries()) population.push({ number: 9000 + i, state: 'OPEN',
+      title: i === 2 ? `WE #${num}: prepare scope` : 'prepare',
+      headRefName: i === 2 ? 'feature/title-only' : `lane/${i === 1 ? 'xabc919' : num}-prepare-volume`,
+      isCrossRepository: false });
+    const git = prepareGitFixture(cards);
+    const searches = [];
+    const answer = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const head = /^head:(.+)$/.exec(search)?.[1];
+      const title = /^in:title "(.+)"$/.exec(search)?.[1];
+      expect(Boolean(head || title)).toBe(true);
+      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes(title))
+        .slice(0, Number(args[args.indexOf('--limit') + 1])));
+    };
+    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,
+      ...(prefetch ? { execAsync: async (...args) => answer(...args) } : {}) });
+    await reader.prime(nums.map(num => ({ num })));
+    for (const [i, num] of nums.entries()) expect(reader.listPrs({ num }).map(pr => pr.number)).toEqual([9000 + i]);
+    expect(searches).toHaveLength(12);
+    // A second read uses the same complete observations; a new identity fails closed without another gh call.
+    for (const num of nums) reader.listPrs({ num });
+    expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
+    expect(searches).toHaveLength(12);
+  });
+
+  it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {
+    const reader = createPrepareStatusReader({ exec: prepareGitFixture({ 4413: '---\nbornAs: x56mcj7\n---\nlease reaper guard' }) });
+    expect(reader.resolveCard({ num: 4413 }).path).toBe('backlog/4413-card.md');
+    const dispatch = vi.fn();
+    const acquireClaim = vi.fn();
+    const recordBuildFailure = vi.fn();
+    const tick = () => runBuildDispatchTick({ live: true, effects: {
+      planTick: () => ({ decisions: { spawnBuilds: [{ num: '99999', lane: 1 }], admission: {
+        queue: [{ num: '99999', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '99999', ready: true }],
+      } }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+      dispatch, acquireClaim, recordBuildFailure,
+    } });
+    for (let i = 0; i < 2; i++) expect((await tick()).failures).toContainEqual({ num: '99999', stage: 'card', reason: 'build card #99999 unavailable on origin/main' });
+    expect(acquireClaim).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(recordBuildFailure).toHaveBeenCalledWith({ num: '99999', reason: 'build card #99999 unavailable on origin/main' });
+  });
+
+  it('routes async prepare discovery gh calls through the shared throttle', async () => {
+    const run = vi.fn((file, args, opts, done) => done(null, '[]'));
+    await expect(defaultExecAsync('gh', ['pr', 'list'], { cwd: '/x', maxBuffer: 9 }, run)).resolves.toBe('[]');
+    expect(run).toHaveBeenCalledWith(process.execPath, [expect.stringMatching(/[/\\]scripts[/\\]lib[/\\]gh-throttle\.mjs$/), 'pr', 'list'],
+      expect.objectContaining({ cwd: '/x', maxBuffer: 9 }), expect.any(Function));
+    await defaultExecAsync('git', ['ls-tree'], {}, run);
+    expect(run).toHaveBeenLastCalledWith('git', ['ls-tree'], expect.any(Object), expect.any(Function));
+  });
+
+  it('never charges a card for an origin/main read outage before its claim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-card-outage-'));
+    const path = join(dir, 'failures.json');
+    try {
+      const exec = vi.fn((cmd) => { if (cmd === 'git') throw new Error('fatal: unable to access origin'); throw new Error(`unexpected ${cmd}`); });
+      const acquireClaim = vi.fn();
+      const dispatch = vi.fn();
+      const tick = () => {
+        const reader = createPrepareStatusReader({ exec });
+        return runBuildDispatchTick({ live: true, effects: {
+          planTick: () => ({ decisions: { spawnBuilds: [{ num: '4413', lane: 1 }], admission: {
+            queue: [{ num: '4413', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '4413', ready: true }],
+          } }, nextState: {} }),
+          fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+          killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+          dispatch, acquireClaim, recordBuildFailure: o => recordBuildFailureAt(o, { path }),
+        } });
+      };
+      for (let i = 0; i < 8; i++) {
+        expect((await tick()).failures).toContainEqual(expect.objectContaining({ num: '4413', stage: 'card', reason: 'build card lookup unavailable' }));
+      }
+      expect(acquireClaim).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).items?.['4413'] : undefined).toBeUndefined();
+      expect(listBuildBackoffs({ path })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

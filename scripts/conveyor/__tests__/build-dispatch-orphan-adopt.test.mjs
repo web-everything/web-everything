@@ -8,11 +8,12 @@
  * resume spawn itself, the pid probe) injected — so this suite never spawns a real detached process, never
  * shells `lane-pool.mjs`, and never depends on a real delivery-report sidecar on disk.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
+import { recordBuildFailure, listBuildBackoffs } from '../build-dispatch-failures.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
   adoptOrphanedBuildClaims as adoptOrphanedBuildClaimsReal, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
@@ -20,7 +21,7 @@ import {
 
 // The real pass reads GitHub and the harness job records by default; these tests inject everything else, so the
 // two new evidence reads default to "nothing found" and each xykwe0h test overrides them explicitly.
-const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, releaseLaneLease: () => {}, ...o });
+const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, clearFailure: () => {}, releaseLaneLease: () => {}, ...o });
 import {
   acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim,
   markBuildDispatchResume, readBuildDispatchResume, releaseBuildDispatchResume,
@@ -985,6 +986,40 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
     expect(leases).toHaveLength(1);
     expect(leases[0].sessionSlug).toBeTruthy();
   });
+  it('keeps #4413 claimed and unsettled when the durable failure write fails', async () => {
+    const releaseClaim = vi.fn();
+    const settleRow = vi.fn();
+    const releaseLaneLease = vi.fn();
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      readDelivery: () => null,
+      sessionLivenessFor: () => null,
+      spawnResume: () => { throw new Error('must not resume after a failed failure write'); },
+      recordFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim, settleRow, releaseLaneLease,
+    });
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
+    expect(settleRow).not.toHaveBeenCalled();
+    expect(releaseLaneLease).not.toHaveBeenCalled();
+  });
+  it('charges a dead claim once even when its release keeps failing (PR #5453)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orphan-charge-once-'));
+    const path = join(dir, 'failures.json');
+    const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
+    try {
+      const pass = (claimedAt) => adoptOrphanedBuildClaims(dead('4413', {
+        listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413', claimedAt } }],
+        recordFailure: (o) => recordBuildFailure(o, { path, now: 0, settings }),
+        releaseClaim: () => { throw new Error('lock store unavailable'); },
+      }));
+      for (let i = 0; i < 5; i++) expect(await pass('2026-10-16T00:00:00.000Z')).toEqual([expect.objectContaining({ action: 'error' })]);
+      expect(listBuildBackoffs({ path, now: 0 })).toEqual([expect.objectContaining({ num: '4413', attempts: 1, reason: 'dispatch-backoff' })]);
+      // A NEW claim of the same card that dies again is a new attempt.
+      await pass('2026-10-16T01:00:00.000Z');
+      expect(listBuildBackoffs({ path, now: 0 })[0]).toMatchObject({ attempts: 2 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
     const failures = [];
     await adoptOrphanedBuildClaims(dead('4388', {
@@ -992,5 +1027,35 @@ describe('x87v3ed — orphan release charges the card a backoff failure and retu
       recordFailure: (o) => failures.push(o),
     }));
     expect(failures).toEqual([]);
+  });
+  it.each(['pr-open', 'pr-merged', 'card-resolved'])('clears the card\'s failure history on observed delivery (%s), before releasing the claim', async (outcome) => {
+    const order = [];
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
+      readDelivery: () => ({ outcome, reason: outcome }), settleDelivered: () => {},
+      clearFailure: (o) => order.push(['clear', o.num]), releaseClaim: (o) => order.push(['release', o.num]),
+    });
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'settled' })]);
+    expect(order).toEqual([['clear', '4413'], ['release', '4413']]);
+  });
+  it('keeps #4413 claimed when clearing its failure history fails, so a later pass retries the clear', async () => {
+    const releaseClaim = vi.fn();
+    const result = await adoptOrphanedBuildClaims({
+      ...dead('4413'),
+      listClaims: () => [{ pid: 98761, meta: { kind: 'build', num: '4413' } }],
+      sessionLivenessFor: () => null,
+      recordFailure: () => { throw new Error('delivered claim must not record a failure'); },
+      releaseLaneLease: () => { throw new Error('delivered claim must not release a reserved lane'); },
+      spawnResume: () => { throw new Error('delivered claim must not resume'); },
+      readDelivery: () => ({ outcome: 'pr-open', reason: 'PR #9001 is open' }), settleDelivered: () => {},
+      clearFailure: () => { throw new Error('ledger unavailable'); }, releaseClaim,
+    });
+    expect(result).toEqual([expect.objectContaining({ num: '4413', action: 'error', reason: expect.stringContaining('ledger unavailable') })]);
+    expect(releaseClaim).not.toHaveBeenCalled();
   });
 });
