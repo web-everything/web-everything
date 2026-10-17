@@ -46,10 +46,12 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
       } } } } });
       if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
       if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
-      mutated = true;
-      if (mutation) return JSON.stringify(mutation);
-      if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
-      return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+      const response = mutation ?? (enqueueFails
+        ? { errors: [{ message: 'Pull request is not mergeable' }] }
+        : { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+      // A refused mutation must not make the recovery attempt observe a queued PR.
+      if (!response.errors?.length && response.data?.enqueuePullRequest?.mergeQueueEntry?.id) mutated = true;
+      return JSON.stringify(response);
     }
     throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
   };
@@ -804,6 +806,8 @@ describe('drain pre-stage queue admission', () => {
     expect(state()).toBeNull();
     expect(() => s.enqueue(c, HEAD)).toThrow('enqueue FAILED');
     expect(calls.filter(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toHaveLength(2);
+    expect(state().enqueueFailures['cwd#42']).toMatchObject({ headSha: HEAD, count: 1 });
+    expect(state().pending).toEqual([]);
   });
   it('prepares without writes and rechecks red-team disposition at enqueue', () => {
     const { s, calls, state } = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence: { loopPayload: null } });

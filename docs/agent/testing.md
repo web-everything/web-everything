@@ -1562,6 +1562,10 @@ The provisional `merge` disposition is used only to evaluate gates: collision he
 review-label provisioning, clearance carry, baseline/ledger writes, parking and skip comments must suppress
 writes for `prestagePendingCi`; the actual merge set excludes these candidates.
 
+Source-contract tests for review writes must follow `candidateDryRun` and assert that it includes both
+`DRY_RUN` and `prestagePendingCi`. Queue fixtures must record membership only after a successful enqueue
+response; recording a refused mutation as queued masks the ordinary recovery attempt with an idempotent success.
+
 Prevention follow-up owed by this review: add an enqueue-call lint that recognizes both enclosing
 try/catch and callbacks protected by `enqueuePrestage`. It must flag unprotected `mergeStrategy.enqueue`
 calls without treating the protected callback as an uncaught call. The throwing-entry-point regression
