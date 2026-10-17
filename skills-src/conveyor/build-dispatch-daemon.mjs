@@ -495,13 +495,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const r = await effects.settleLaunches();
       for (const p of r.pending ?? []) (p.kind === 'prepare-item' ? pendingLaunch.prepare : pendingLaunch.build).add(normNum(p.num));
       launchSettlement.pending = r.pending ?? [];
+      // The claims this failure releases name its attempt: if a release throws, orphan adoption later charges the
+      // same dead claim under these keys, and the ledger dedupes it (PR #5472 red team). Expired claims too: orphan
+      // adoption reads past expiry, so a key missing here would charge twice there.
+      let settleClaims = [];
+      if ((r.settled ?? []).some(st => !st.outcome?.dispatching && st.kind !== 'prepare-item')) {
+        try { settleClaims = effects.listClaims?.({ ignoreExpiry: true }) ?? []; } catch { /* no keys: the charge stays unkeyed, as before */ }
+      }
       for (const st of r.settled ?? []) {
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
         if (st.outcome?.dispatching) continue;
         // Persist before planning/launching again: the threshold must suppress this tick's retry too.
-        const failureRecord = !isPrepare ? effects.recordBuildFailure?.({ num, reason: st.outcome?.reason ?? 'not dispatched', output: st.outcome?.output ?? st.outcome?.reason, base: st.base }) : null;
+        const attemptKey = isPrepare ? [] : claimAttemptKeys(settleClaims, num);
+        const failureRecord = !isPrepare ? effects.recordBuildFailure?.({ num, reason: st.outcome?.reason ?? 'not dispatched', output: st.outcome?.output ?? st.outcome?.reason, base: st.base,
+          ...(attemptKey.length ? { attemptKey } : {}) }) : null;
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
         deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt, failureRecord });
       }
@@ -2638,7 +2647,7 @@ export function cliEffects() {
     planTick: (payload, { config } = {}) => cliPlanTick(payload, { config }),
     predictRoute: cliPredictRoute,
     fetchOpenPrs: cliFetchOpenPrs,
-    listClaims: () => listBuildDispatchClaims(),
+    listClaims: ({ ignoreExpiry = false } = {}) => listBuildDispatchClaims({ ignoreExpiry }),
     listFixClaims: () => liveFixInFlight(),
     listBorrowedFixes: () => liveBorrowedFixInFlight(),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),

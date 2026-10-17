@@ -82,6 +82,14 @@ describe('redactSpawnText', () => {
     expect(out).not.toMatch(/opaque/);
     expect(out).toContain('--verbose');
   });
+  it('redacts a whole credential header value, every cookie included, without eating a JSON string close', () => {
+    expect(redactSpawnText('request failed; Cookie: theme=light; session=opaque1', { env: {} })).toBe('request failed; Cookie: <redacted>');
+    expect(redactSpawnText("curl -H 'Set-Cookie: sid=opaque2; Path=/' https://h", { env: {} })).toBe("curl -H 'Set-Cookie: <redacted>' https://h");
+    const json = JSON.stringify({ error: 'x Cookie: a=1; s=opaque3\nnext', ok: 1 });
+    const out = redactSpawnText(json, { env: {} });
+    expect(out).not.toContain('opaque3');
+    expect(JSON.parse(out)).toEqual({ error: 'x Cookie: <redacted>\nnext', ok: 1 });
+  });
   it('keeps the key it redacts, and leaves effect keys and token counts alone', () => {
     expect(redactSpawnText('{"GH_TOKEN":"opaque1","key":"dispatch:3794","input_tokens":55}', { env: {} }))
       .toBe('{"GH_TOKEN":"<redacted-env>","key":"dispatch:3794","input_tokens":55}');

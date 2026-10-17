@@ -143,7 +143,11 @@ const NAMED_VALUES = [
   // `{"name":"GH_TOKEN","value":"…"}` — an env entry given as a name/value pair.
   namedValueRule(/(?<!\\)(?<bs>\\*)"name\k<bs>"\s*:\s*\k<bs>"(?<name>[^"\\]{1,128})\k<bs>"\s*,\s*\k<bs>"value\k<bs>"\s*:\s*/g,
     jsonValueEnd, (m) => `${m[0]}${m.groups.bs}"<redacted-env>${m.groups.bs}"`),
-  [/\b((?:proxy-)?authorization)\s*:[^\r\n]*/gi, '$1: <redacted>'],
+  // A credential HEADER's whole value, not its first `;`/`,` part: `Cookie: theme=light; session=…` carries the
+  // secret in a later cookie (PR #5472 red team). It ends at the line, a quote, or an escaped newline/quote, so a
+  // header inside a JSON string never eats the string's own closing quote.
+  [/\b((?:proxy-)?authorization|(?:set-)?cookie|x-[a-z0-9-]{0,64}(?:token|key|secret|auth)[a-z0-9-]{0,64})[ \t]*:(?:[^\r\n"'\\]|\\[^nr"'\\])*/gi,
+    '$1: <redacted>'],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer <redacted>'],
   // `GH_TOKEN=…`, `export X_API_KEY=…`, `password: …`, `--token=…`.
   namedValueRule(new RegExp(String.raw`${IDENT}\s*[:=]\s*`, 'g'), stickyEnd(SHELL_VALUE), (m) => `${m[0]}<redacted>`),

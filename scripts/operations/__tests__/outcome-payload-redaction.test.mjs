@@ -27,6 +27,10 @@ const SHAPES = [
   ['env name/value pair', `{"name":"GH_TOKEN","value":"${OPAQUE}"}`],
   ['backtick-quoted value', `GH_TOKEN=\`x ${OPAQUE}\``],
   ['concatenated shell quoting', `GH_TOKEN='it'\\''s ${OPAQUE}'`],
+  // Round 4 red team: a later cookie in a multi-cookie header.
+  ['multi-cookie header', `request failed; Cookie: theme=light; session=${OPAQUE}`],
+  ['Set-Cookie header with attributes', `Set-Cookie: sid=${OPAQUE}; Path=/; HttpOnly`],
+  ['credential header with a list value', `X-Auth-Token: a, ${OPAQUE}`],
 ];
 
 const runOf = (text) => ({ op: 'dispatch-lane', id: 'r', cursor: 1, status: 'failed',

@@ -349,6 +349,44 @@ it('clears #4413 retry history when orphan adoption observes the dead worker\'s 
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
 
+// PR #5472 red team: the settled-launch failure is recorded BEFORE its claim is released. If that release throws,
+// orphan adoption then charges the same dead claim; both charges must share one attempt key.
+it('a failed claim release after a settled launch failure never lets orphan adoption charge the attempt twice', async () => {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-5472-release-'));
+  const path = join(lockRoot, 'failures.json');
+  const settings = { baseMs: 1000, maxMs: 5000, maxAttempts: 6 };
+  const record = (o) => recordBuildFailure(o, { path, now: 0, settings });
+  try {
+    for (let i = 0; i < 4; i += 1) record({ num: '3827', reason: 'launch-died: earlier' });
+    // A claim left by the dead prior daemon, with no run-store row.
+    acquireBuildDispatchClaim({ num: '3827', scope, owner: 'h:1', pid: 98762, lockRoot });
+    let releases = 0;
+    const releaseClaim = ({ num }) => {
+      releases += 1;
+      if (releases === 1) throw new Error('EBUSY: transient release failure');
+      return releaseBuildDispatchClaim({ num, lockRoot });
+    };
+    const out = tickOut();
+    out.decisions.spawnBuilds = [];
+    await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, {
+      planTick: () => out, releaseClaim, recordBuildFailure: record,
+      settleLaunches: () => ({ pending: [], settled: [{ num: '3827', kind: 'build', outcome: { dispatching: false, reason: 'launch-died: no output' } }] }),
+      adoptOrphans: () => adoptOrphanedBuildClaims({
+        listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
+        isPidAlive: () => false, findRow: () => null, readResumeMarker: () => null, sessionLivenessFor: () => null,
+        readDelivery: () => null, settleDelivered: () => {},
+        resolveResumability: () => ({ resumable: false, reason: 'no row' }),
+        releaseClaim, releaseResumeMarker: () => {}, settleRow: () => {}, placeHold: () => {},
+        recordFailure: record, clearFailure: () => {}, releaseLaneLease: () => {},
+        spawnResume: () => { throw new Error('must not resume'); },
+      }),
+    }) });
+    const [backoff] = listBuildBackoffs({ path, now: 0 });
+    expect(backoff).toMatchObject({ num: '3827', attempts: 5, reason: 'dispatch-backoff' });
+    expect(backoff.retryAfter).not.toBeNull();
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
 it('prepare discovery reads through the shared throttle by default on the sync path (PR #5453)', () => {
   const real = execFileSyncThrottled.getMockImplementation();
   execFileSyncThrottled.mockImplementation(() => { throw new Error('throttled-stub'); });
