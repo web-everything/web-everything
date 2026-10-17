@@ -741,6 +741,11 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/tmp; echo ${#D} ${D#/} ${D%(*}; D=/clone; cd "$D" && ls',
       'D=~/x; D=/tmp; X=$(echo | cat); D=/clone; cd "$D" && ls',
       'D=~/x; D=/tmp; ( echo ${X:-{} ); D=/clone; cd "$D" && git checkout --detach',  // `${…}` nests no `{`
+      // a listed word that is only an argument starts no command: no case frame opens
+      'D=~/x; D=/tmp; ( echo time case x ); D=/clone; cd "$D" && git checkout --detach',
+      'D=~/x; D=/tmp; ( echo do case x ); D=/clone; cd "$D" && ls',
+      'D=~/x; D=/tmp; ( echo { case ); D=/clone; cd "$D" && ls',
+      'D=~/x; D=/tmp; ( echo if while case ); D=/clone; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
     // a case arm's assignment runs in this shell however the `case` is reached: never a stale value
     for (const cmd of [
@@ -773,6 +778,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     for (const cmd of [
       'shopt -s lastpipe; D=~/x; D=/clone; true | D=/tmp; cd "$D" && ls',  // the last element runs here
       "shopt -s last''pipe; D=~/x; D=/clone; echo /t | read D; cd \"$D\" && ls",
+      "eval $'\\x73hopt -s \\x6castpipe'; D=~/x; D=/clone; echo /t | read D; cd \"$D\" && ls",
       'D=~/x; D=/clone; case x in a|b) D=/tmp;; esac; cd "$D" && ls',     // `a|b)` is a pattern
       'D=~/x; D=/clone; D=$(echo | cat); cd "$D" && ls',                  // the `|` is inside `$(…)`
       'D=~/x; D=/clone; { D=/tmp; }; { a; } | cat; cd "$D" && ls',        // only the piped group

@@ -2456,6 +2456,7 @@ const BG_SEP = /^&\n*$/;
 const GROUP_SPAN = 64;
 // words after which a command (so a reserved word) starts
 const CMD_WORDS = ['then', 'do', 'else', 'elif', 'if', 'while', 'until', 'time', '{'];
+const CMD_CHAIN = 8;
 const COPROC_HEAD = /coproc[ \t]+(?:[A-Za-z_]\w*[ \t]+)?([{(])(?=[\s(]|$)/y;
 function subshellDepths(segs, commented, seps = [], lastpipe = false) {
   // { kind: sub | arith | tick | param | seg (a simple coproc command, to its segment end) | cobrace | brace |
@@ -2490,14 +2491,20 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
     let dq = false;
     let coBrace = -1;                                         // the offset of a `coproc [NAME] {`'s brace
     // a reserved word's position: the start of a command (`{`, `}`, `case`, `esac` and `coproc` are words only
-    // there), or after one of `words`; the lookback stops at the first word
-    const cmdStart = (i, words = CMD_WORDS) => {
+    // there), or after one of `words` that itself starts a command (`echo time case` is no case). A chain longer
+    // than CMD_CHAIN words reads as no command start, which only leaves a frame unopened (depth 0).
+    const cmdStart = (i, words = CMD_WORDS, chain = 0) => {
       let j = i - 1;
       while (j >= 0 && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j -= 1;
       if (j < 0 || ';&|(!'.includes(s[j])) return true;
-      return words.some((w) => j - w.length + 1 >= 0 && s.startsWith(w, j - w.length + 1)
-        && (j - w.length < 0 || /[\s;&|(]/.test(s[j - w.length])));
+      if (chain >= CMD_CHAIN) return false;
+      const w = words.find((x) => j - x.length + 1 >= 0 && s.startsWith(x, j - x.length + 1)
+        && (j - x.length < 0 || /[\s;&|(]/.test(s[j - x.length])));
+      // `esac` after `in` only ever closes an open case frame; a `{` this scan opened is a command start
+      if (w === 'in' || (w === '{' && braceAt.has(j))) return true;
+      return w !== undefined && cmdStart(j - w.length + 1, CMD_WORDS, chain + 1);
     };
+    const braceAt = new Set();                                // offsets of the `{` frames opened in this segment
     for (let i = 0; i < s.length; i++) {
       out[i] = d;
       const ch = s[i];
@@ -2554,6 +2561,7 @@ function subshellDepths(segs, commented, seps = [], lastpipe = false) {
         skip = i + 5;
       } else if (ch === '{' && (i === coBrace || (open.cobrace > 0 && cmdStart(i))) && /\s/.test(s[i + 1] ?? ' ')) {
         push(i === coBrace ? 'cobrace' : 'brace', i === coBrace, dq);
+        braceAt.add(i);
       } else if (ch === '}' && open.cobrace > 0 && cmdStart(i) && /[\s;&|<>)]/.test(s[i + 1] ?? ' ')) {
         popTo(['brace', 'cobrace']);
       }
@@ -2725,8 +2733,9 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   const initialHome = usableHome(home);
   // the child-shell depth where a statement starts: an assignment there never reaches this shell (review r10)
   // `lastpipe` may run the last pipeline element here: any `shopt` / `lastpipe` / `BASH_ENV` spelling, however
-  // quoted, keeps that element as scanned
-  const depths = subshellDepths(segs, commented, seps, /shopt|lastpipe|BASH_ENV/.test(cmd.replace(/['"\\]/g, '')));
+  // quoted, or an `eval` / `source` / `.` that could set it unseen, keeps that element as scanned
+  const lastpipe = /shopt|lastpipe|BASH_ENV|\beval\b|\bsource\b|(?:^|[\s;&|(])\.\s/.test(cmd.replace(/['"\\]/g, ''));
+  const depths = subshellDepths(segs, commented, seps, lastpipe);
   const inChild = (at) => depths[at][String(segs[at]).search(/\S|$/)] > 0;
   const homeAfter = (stmt, h, at) => {
     if (commented[at] || inChild(at)) return h;               // comment text (`true # ; HOME=/x`) binds nothing
