@@ -88,7 +88,8 @@ export function routeTestGaming(pr, { repo, provider = createGhProvider(), readV
     }
   }
   // Complete only our own finding episode; never remove a newer panel's label.
-  const latestNote = comments.filter(c => trusted(c) && c.body.startsWith(ADVISORY_NOTE_MARKER)).at(-1);
+  const latestNote = comments.filter(c => isTrustedMarkerAuthor(c)
+    && typeof c?.body === 'string' && c.body.startsWith(ADVISORY_NOTE_MARKER)).at(-1);
   const ownsNote = plan.action === 'admit' || latestNote?.body === plan.body
     || (plan.action === 'needs-you' && /<!-- test-gaming-route: [a-f0-9]{40} -->/.test(latestNote?.body ?? ''));
   if (!ownsNote) return plan;
