@@ -47,6 +47,27 @@ it('real reset removes scope creep, preserves later scoped commits and published
     expect(git('rev-parse', 'HEAD')).toBe(originalHead);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+it('refuses non-main merges before changing the index or worktree', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scope-reset-merge-'));
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();
+  const commit = (file, text) => { writeFileSync(join(dir, file), text); git('add', file); git('commit', '-qm', 'fixture'); return git('rev-parse', 'HEAD'); };
+  try {
+    git('init', '-q', '-b', 'main'); commit('main-file', 'main\n');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git('checkout', '-qb', 'lane'); const baseline = commit('allowed', 'baseline\n');
+    git('checkout', '-qb', 'side'); commit('side-file', 'side work\n');
+    git('checkout', '-q', 'lane'); commit('allowed', 'later scoped work\n');
+    git('merge', '--no-ff', '--no-edit', 'side');
+    const snapshot = () => ({ head: git('rev-parse', 'HEAD'), index: readFileSync(join(dir, '.git/index')),
+      status: git('status', '--porcelain=v1', '--untracked-files=all'),
+      files: ['main-file', 'allowed', 'side-file'].map(file => readFileSync(join(dir, file))) });
+    const before = snapshot(), mutations = [];
+    const run = (...args) => { if (['read-tree', 'cherry-pick'].includes(args[0])) mutations.push(args); return git(...args); };
+    expect(() => applyScopeReset({ baseline, scope: ['allowed'], git: run })).toThrow('non-main merge needs operator');
+    expect(mutations).toEqual([]);
+    expect(snapshot()).toEqual(before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 it('publishes caps during quiet hours once, retaining the opening time for morning idle duration', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cap-feed-')), path = join(dir, 'events.jsonl');
   const event = { repo: 'owner/repo', pr: 5403, head: 'a'.repeat(40), kind: 'at-round-limit', reason: 'round cap exhausted' };

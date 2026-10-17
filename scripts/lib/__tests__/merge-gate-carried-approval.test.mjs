@@ -39,7 +39,7 @@ describe('shared carry proof against real git', () => {
   });
   it('refuses an author commit changing the PR diff', () => {
     const r = repository(); const c = r.commit('src/x.txt', 'new author change\n');
-    expect(r.prove(r.evidence(c))).toMatchObject({ carry: false, reason: expect.stringContaining('net patch-id differs') });
+    expect(r.prove(r.evidence(c))).toMatchObject({ carry: false, reason: expect.stringContaining('net diff changed') });
   });
   it('carries identical net patches after non-merge author commits only with the net-patch route enabled', () => {
     const r = repository();
@@ -52,9 +52,9 @@ describe('shared carry proof against real git', () => {
       .toMatchObject({ carry: false, reason: expect.stringContaining('not a merge') });
   });
   it('refuses conflict resolution changing the PR lines', () => {
-    expect(repository({ conflict: true }).prove()).toMatchObject({ carry: false, reason: expect.stringContaining('net patch-id differs') });
+    expect(repository({ conflict: true }).prove()).toMatchObject({ carry: false, reason: expect.stringContaining('net diff changed') });
   });
-  it.each([false, true])('carries an empty recovery commit through the writer; tree changed=%s', (changed) => {
+  it.each([false, true].flatMap(changed => [false, true].map(netPatch => [changed, netPatch])))('carries an empty recovery commit through the writer; tree changed=%s, net patch=%s', (changed, netPatch) => {
     const r = repository();
     r.git('checkout', '-q', '--detach', r.a);
     if (changed) r.commit('src/x.txt', 'unreviewed byte\n');
@@ -64,10 +64,16 @@ describe('shared carry proof against real git', () => {
     const comment = { viewerDidAuthor: true, body: [buildReviewedShaMarker(r.a),
       buildReviewedDiffMarker(r.evidence(r.a).headDiff), buildClearedHumanMarker('op')].join('\n') };
     const writer = vi.fn();
-    const exec = (cmd, args, opts) => cmd === 'git' ? execFileSync(cmd, args, opts) : writer(cmd, args);
+    let patchReads = 0;
+    const exec = (cmd, args, opts) => {
+      // Force a miss on the optional proof while retaining real Git tree/history evidence.
+      if (cmd === 'git' && args[0] === 'patch-id') return `${(++patchReads === 1 ? 'a' : 'b').repeat(40)} ${'0'.repeat(40)}\n`;
+      return cmd === 'git' ? execFileSync(cmd, args, opts) : writer(cmd, args);
+    };
     const result = applyHumanClearanceCarry({ evidence, exec, cwd: r.cwd, pr: 5414,
-      setting: { value: true, source: 'test' }, numberingOnly: true, log: () => {},
+      setting: { value: true, source: 'test' }, netPatchSetting: { value: netPatch, source: 'test' }, log: () => {},
       readNumberingLiveEvidence: () => ({ headSha: head, comments: [comment], reviews: [] }) });
+    expect(patchReads).toBe(netPatch ? 2 : 0);
     if (changed) {
       expect(result).toBeNull(); expect(writer).not.toHaveBeenCalled();
     } else {

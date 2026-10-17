@@ -224,7 +224,7 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
       return { carry: false, applicable: true, reason: 'unknown or disabled carry evidence' };
     }
     const inputs = { enabled, equivalence, clearance, headSha: evidence.headSha, headDiff: evidence.headDiff };
-    let pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
+    const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, kind: 'replay', reason: '(not yet checked)' } });
     const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
     // SHA-only records belong exclusively to the explicit numbering proof. General carry
     // never consults git (or reaches the writer) without a recorded fingerprint.
@@ -241,7 +241,7 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
             fingerprint: live.diff, actor: clearance.actor, tier: 'net-patch', mechanicalReason: patch.reason, reason: patch.reason };
         }
       }
-      if (patch.different) pre = { carry: false, reason: patch.reason };
+      // This is an alternative proof. A miss must leave independent tree/replay/numbering proofs intact.
     }
     if (pre.carry) {
       // Exact root tree identity includes every blob, path and mode, including the manifest.
@@ -294,7 +294,7 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
       + (tier === 'net-patch'
-        ? `the net change has the same git patch-id --stable against each head’s merge-base with main`
+        ? `the net change has the same git patch-id --stable and byte-identical contribution lines against each head’s merge-base with main`
         : tier === 'tree'
         ? 'the live head has exactly the cleared head’s tree (all paths, modes and blob bytes)'
         : tier === 'numbering'

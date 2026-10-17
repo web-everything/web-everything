@@ -43,13 +43,22 @@ requires a trusted completed fix between sightings, and accepts `scope-baseline:
 an operator comment. A corrective tree reset preserves published ancestry and replays only whole linear
 commits inside the declared scope; unreadable or ambiguous history stands down. Test real Git trees,
 untrusted markers, changed lens/text, no intervening fix, and the launcher path for every executor.
+A non-main merge fixture must reach history inspection with a valid scope and clean lane, then assert
+refusal before `read-tree` or `cherry-pick`, with identical index bytes, HEAD, status and worktree bytes.
 
 `review.carryAcrossIdenticalNetPatch` compares nonempty `git patch-id --stable` outputs for each head's
-net diff against its own merge-base with main. Context offsets can move; changed context bytes can change
-the patch-id and must refuse. Human carries bind both Git diffs to the recorded and pinned fingerprints,
+net diff against its own merge-base with main, then requires equal contribution fingerprints and
+byte-identical added/removed lines (including the root manifest). Patch-id alone discards meaningful
+whitespace. Read raw buffers and refuse lossy UTF-8 decoding before computing equality. Exercise
+non-UTF-8 source bytes, indentation, string whitespace, trailing spaces and CRLF through the writers,
+as well as a successful offset-only rebase. Changed context can decline this proof without disabling
+independent contribution/replay or tree proofs; test those with the setting both on and off.
+Human carries bind both Git diffs to the recorded and pinned fingerprints,
 then re-read the complete thread and formal reviews through the existing writer. Automated carries use
 the same guarded numbering-restamp writer. Keep numbering-only fixtures explicitly on that proof so they
-cannot silently reach real Git when the new fallback runs. Exercise real offset-only rebases and holds.
+cannot silently reach real Git when the new fallback runs. The tamper-park callback derives numbering-only
+mode from missing recorded fingerprints; exercise its production callback with fingerprinted and SHA-only
+clearances through the durable writer, including refusals and live holds.
 Pass the evidence repository's `cwd` into `proveIdenticalNetPatch` even with a cwd-bound exec wrapper:
 the reader supplies a `cwd` option, and an undefined value can otherwise override the wrapper's directory.
 

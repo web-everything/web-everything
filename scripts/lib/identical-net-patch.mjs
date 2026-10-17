@@ -1,6 +1,7 @@
 /** Read-only stable patch identity of each head's net change against its own merge-base with main. */
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
+import { normalizeContributionFingerprint } from './review-escalation.mjs';
 export function resolveIdenticalNetPatchSetting({ env = process.env, tool = readSettings().review, platform } = {}) {
   const key = 'carryAcrossIdenticalNetPatch', raw = env.WE_REVIEW_CARRY_ACROSS_IDENTICAL_NET_PATCH;
   const parsed = raw === undefined ? undefined : /^(on|true|1)$/i.test(raw) ? true : /^(off|false|0)$/i.test(raw) ? false : raw;
@@ -18,8 +19,14 @@ export function logIdenticalNetPatchSetting(setting, log = s => process.stderr.w
 export function proveIdenticalNetPatch({ exec, cwd, fromSha, toSha, mainRef = 'origin/main' } = {}) {
   try {
     if (![fromSha, toSha].every(s => /^[0-9a-f]{40}$/.test(s ?? ''))) throw Error('invalid head');
-    const git = (args, input) => String(exec('git', args, { cwd, encoding: 'utf8', timeout: 10000,
-      maxBuffer: 16 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], ...(input === undefined ? {} : { input }) }));
+    const git = (args, input) => {
+      const output = exec('git', args, { cwd, encoding: null, timeout: 10000,
+        maxBuffer: 16 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], ...(input === undefined ? {} : { input }) });
+      const decoded = String(output);
+      // UTF-8 replacement characters would collapse distinct non-UTF-8 source bytes.
+      if (Buffer.isBuffer(output) && !Buffer.from(decoded, 'utf8').equals(output)) throw Error('lossy net patch decoding');
+      return decoded;
+    };
     const read = sha => {
       const base = git(['merge-base', mainRef, sha]).trim();
       if (!/^[0-9a-f]{40}$/.test(base)) throw Error('unreadable merge-base');
@@ -32,7 +39,16 @@ export function proveIdenticalNetPatch({ exec, cwd, fromSha, toSha, mainRef = 'o
     };
     const from = read(fromSha), to = read(toSha);
     if (from.id !== to.id) return { ok: false, different: true, reason: 'net patch-id differs' };
+    // Stable patch-id discards whitespace, including indentation and string contents.
+    // Keep the shared path/mode/binary-aware proof and compare changed lines verbatim,
+    // including the root manifest that the contribution fingerprint deliberately ignores.
+    const changedLines = diff => JSON.stringify(diff.split('\n').filter(line => /^(?:diff --git |[+\-\\])/.test(line)));
+    const contribution = normalizeContributionFingerprint(from.diff);
+    if (!contribution || contribution !== normalizeContributionFingerprint(to.diff)
+      || changedLines(from.diff) !== changedLines(to.diff)) {
+      return { ok: false, different: true, reason: 'net patch contribution bytes differ' };
+    }
     return { ok: true, tier: 'net-patch', fingerprint: to.id, fromDiff: from.diff, toDiff: to.diff,
-      reason: `identical git patch-id --stable (${to.id}) against each head's merge-base with main` };
+      reason: `identical git patch-id --stable (${to.id}) and contribution bytes against each head's merge-base with main` };
   } catch { return { ok: false, retryable: true, reason: 'net patch identity unreadable' }; }
 }

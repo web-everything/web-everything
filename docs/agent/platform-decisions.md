@@ -5447,8 +5447,9 @@ tree at ratification and the ruling did not change. Full reasoning and the rejec
 
 **Operator amendment, 2026-10-16 (open-PR time-loss fixes):** the existing sanctioned carry writers may
 also carry a recorded approval across a rebase or merge of main when each head's nonempty net diff against
-its own merge-base with main has the same `git patch-id --stable`. A different or unreadable patch-id does
-not authorize this carry. `review.carryAcrossIdenticalNetPatch` defaults true, with its resolved source
+its own merge-base with main has the same `git patch-id --stable`, contribution fingerprint, and exact
+added/removed line bytes (including whitespace and the root manifest). A different or unreadable proof does
+not authorize this route and does not invalidate an independent carry proof. `review.carryAcrossIdenticalNetPatch` defaults true, with its resolved source
 logged. Complete-thread, formal-review, pinned-head and pre-write checks still apply; this adds a proof
 route rather than a new approval writer. The historical merge replay rule below remains a separate route.
 
