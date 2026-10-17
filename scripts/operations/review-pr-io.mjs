@@ -2,7 +2,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
@@ -1150,6 +1150,28 @@ export function createReviewPrSinks({
               const f = record.referrals.find(f => f.key === c.key).finding;
               out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — ${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
             }
+          }
+        }
+        // The re-check must be durable, not only on the prompt copy: an omitted or interrupted answer (or a record a
+        // run before this one already attempted) leaves the finding pending, and only a persisted marker keeps automatic
+        // policy from blocking it. An existing record never changes its `referrals`, so the marker goes to `rechecks`.
+        if (rechecks.size) {
+          const records = readReferralRecords(state.comments, context(state)).records;
+          const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
+          for (let i = 0; i < existing.length; i++) {
+            const record = existing[i];
+            const pending = new Set(referralRecordState(record, { ...context(state), records, operatorRulings }).pending);
+            const unmarked = activeReferrals(record)
+              .filter(f => rechecks.has(f.key) && pending.has(f.key) && !referralRecheck(record, f.key))
+              .map(f => ({ key: f.key, status: rechecks.get(f.key).status, fromHead: rechecks.get(f.key).fromHead, head: record.head }));
+            if (!unmarked.length) continue;
+            const updated = { ...record, rechecks: [...(record.rechecks ?? []), ...unmarked] };
+            if (renderReferralRecord(updated).length > commentBudget) {
+              overflow(`historical run ${record.runId} re-check marker exceeds ${commentBudget} characters; original record retained`);
+              continue;
+            }
+            state = persist(updated);
+            existing[i] = updated;
           }
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.

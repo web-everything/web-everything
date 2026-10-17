@@ -51,7 +51,7 @@ import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
   activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
-  readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy,
+  readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
@@ -90,7 +90,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
     const held = new Set([...s.pending, ...s.blocked]);
     for (const f of activeReferrals(record)) {
       const proof = operatorProtection(f, record, state, unchangedFinding, autoPolicyRespectsNotReal);
-      if (f.recheck && s.pending.includes(f.key)) proof.protectionUnknown.push('needs re-check on live head');
+      const recheck = referralRecheck(record, f.key);
+      if (recheck && s.pending.includes(f.key)) proof.protectionUnknown.push('needs re-check on live head');
       protection.set(JSON.stringify([record.runId, f.key]), proof);
       policyTargets.push({ runId: record.runId, key: f.key, seat: f.seat, file: f.finding?.file ?? '',
         line: Number.isInteger(f.finding?.line) ? f.finding.line : null, summary: f.finding?.summary ?? '' });
@@ -106,7 +107,7 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
         open.push({ index: open.length + 1, runId: record.runId, key: f.key, seat: f.seat,
           file: f.finding?.file ?? '', line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
           summary: f.finding?.summary ?? '',
-          state: blocked ? OPEN_FINDING_STATES.BLOCKED : f.recheck ? OPEN_FINDING_STATES.NEEDS_RECHECK : OPEN_FINDING_STATES.PENDING,
+          state: blocked ? OPEN_FINDING_STATES.BLOCKED : recheck ? OPEN_FINDING_STATES.NEEDS_RECHECK : OPEN_FINDING_STATES.PENDING,
           rationale: blocked ? (effective?.rationale ?? effective?.reason ?? '') : '' });
       }
     }

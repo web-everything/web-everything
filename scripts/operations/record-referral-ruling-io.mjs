@@ -137,7 +137,10 @@ function readProtectionContext(thread, { repo, pr, readJson, cardReadable, chang
     body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable,
     unchangedFinding: ({ repo, base, head, source, target }) => {
       const missing = path => !path || path === '(no file)';
-      const file = exactCitedPath(missing(source.file) ? target.file : source.file);
+      // Only the ORIGINAL citation can show the ruled claim unchanged. A new file the target cites says nothing about
+      // where an uncited original pointed, so a missing source path is unknown evidence, never a stand-in.
+      if (missing(source.file)) return null;
+      const file = exactCitedPath(source.file);
       if (!file || (!missing(target.file) && file !== exactCitedPath(target.file))) return null;
       const changed = linesFor(repo, base, head, file);
       if (!(changed instanceof Set) || (changed.size && !(changed.old instanceof Set))) return null;

@@ -186,6 +186,17 @@ describe('automatic policy respects authenticated operator decisions', () => {
       expect(h.trace).toEqual([]);
     }
   });
+  it.each(['', '(no file)'])('a new citation never stands in for a %j original citation in the comparison', (file) => {
+    for (const actor of ['reviewer', 'operator']) {
+      const source = record({ h: oldHead, file, reviewerResult: actor === 'reviewer' ? 'not-real' : undefined });
+      const target = record({ runId: 'review-pr-copy' });
+      // The new file changed at the old line: that says nothing about where the original claim pointed.
+      const changed = new Set([20]); changed.old = new Set([20]);
+      const comments = [...thread(source), ...(actor === 'operator' ? [ruling(source)] : []), ...thread(target)];
+      expect(() => harness(comments, { changedLines: () => changed }).plan({ finding: target.referrals[0].key }))
+        .toThrow(/protection.*unknown/i);
+    }
+  });
   it('only renewed citation changes allow auto-block after an older reviewer not-real (#5399)', async () => {
     const source = record({ h: oldHead, reviewerResult: 'not-real', summary: 'forged-author and quoted-marker controls absent' });
     const target = record({ runId: 'review-pr-copy', summary: source.referrals[0].finding.summary });

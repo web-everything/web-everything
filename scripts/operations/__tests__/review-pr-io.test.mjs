@@ -1377,6 +1377,41 @@ describe('#4315 durable referral effects', () => {
     expect(() => planOperatorRuling(read, { repo: 'o/r', pr: 7, finding: 'all-open', ruling: 'block',
       actor: 'auto-policy', channel: 'test', reason: 'test' })).toThrow(/needs re-check on live head/);
   });
+  it.each([false, true])('persists the re-check on an existing unmarked current-head copy (attempted=%s), so an omitted answer stays out of auto-policy', async (attempted) => {
+    const { openReferralFindings, planOperatorRuling } = await import('../record-referral-ruling.mjs');
+    const h = harness({ failure: 'omitted', readChangedLines: () => null });
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    // A pre-deployment run left this copy with no re-check marker on its referral entry: interrupted before dispatch
+    // (attempted=false, asked now) or already attempted with the answer omitted (never asked again).
+    const copy = { ...old, head: h.state.headRefOid, runId: 'current', reviewer: mandatoryReferralReviewer('current'),
+      attempted, rulings: [] };
+    h.state.comments.push({ body: renderReferralRecord(copy), author: { login: 'web-everything' } });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const key = copy.referrals[0].key;
+    expect(askedKeys(h).includes(key)).toBe(!attempted);
+    expect(result.pending).toContain(key);
+    const state = readReferralRecords(h.state.comments);
+    expect(state.malformed).toBe(false);
+    expect(currentOf(h).referrals).toEqual(copy.referrals); // A record's referral list never changes between snapshots.
+    expect(currentOf(h).rechecks).toEqual([{ key, status: 'needs re-check on live head', fromHead: old.head, head: h.state.headRefOid }]);
+    const read = { ...openReferralFindings({ comments: h.state.comments, repo: 'o/r', pr: 7,
+      head: h.state.headRefOid, body: h.state.body }), head: h.state.headRefOid };
+    expect(read.open.find(o => o.key === key).state).toBe('needs-recheck');
+    expect(() => planOperatorRuling(read, { repo: 'o/r', pr: 7, finding: 'all-open', ruling: 'block',
+      actor: 'auto-policy', channel: 'test', reason: 'test' })).toThrow(/needs re-check on live head/);
+  });
+  it('a re-check marker is append-only and must name a live-head finding from another head', () => {
+    const h = harness({});
+    const record = { ...seedReferrals(h, ['judgeCorrectnessAdvisory'], h.state.headRefOid), runId: 'current',
+      reviewer: mandatoryReferralReviewer('current') };
+    const key = record.referrals[0].key, mark = { key, status: 'needs re-check on live head', fromHead: 'b'.repeat(40), head: record.head };
+    for (const bad of [{ ...mark, key: 'other' }, { ...mark, fromHead: record.head }, { ...mark, head: 'b'.repeat(40) },
+      { ...mark, status: 'x' }]) expect(() => renderReferralRecord({ ...record, rechecks: [bad] })).toThrow(/invalid/);
+    expect(() => renderReferralRecord({ ...record, rechecks: [mark, mark] })).toThrow(/invalid/);
+    const post = r => ({ body: renderReferralRecord(r), author: { login: 'web-everything' } });
+    expect(readReferralRecords([post(record), post({ ...record, rechecks: [mark] })]).malformed).toBe(false);
+    expect(readReferralRecords([post({ ...record, rechecks: [mark] }), post(record)]).malformed).toBe(true);
+  });
   it('can disable historical re-check annotation through the settings cascade', async () => {
     const h = harness({ env: { WE_REVIEW_RECHECK_CARRIED_REFERRALS: 'false' } });
     seedReferrals(h, ['judgeCorrectnessAdvisory']);

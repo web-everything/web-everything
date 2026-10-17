@@ -3063,6 +3063,14 @@ export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
+/**
+ * A finding's live-head re-check marker. It rides on the referral entry when the record is created with it; an existing
+ * record gains it through the append-only `rechecks` list instead, because a record's `referrals` never change between
+ * snapshots (`readReferralRecords`).
+ */
+export const referralRecheck = (record, key) => record.referrals.find(f => f.key === key)?.recheck
+  ?? (record.rechecks ?? []).find(c => c.key === key);
+
 // `withdrawn` is the set of carried keys whose carry no longer stands at read time (`referralRecordState` holds them
 // pending): such a finding is live again, so the reviewer is asked about it instead of the hold having no owner.
 export const liveReferrals = (record, { withdrawn = null } = {}) => activeReferrals(record).filter(f => ![...(record.superseded ?? []),
@@ -3283,6 +3291,10 @@ export function validateReferralRecord(r) {
       || new Set(r.dropped.map(d => d.key)).size !== r.dropped.length
       || r.dropped.some(d => d.reason !== REFERRAL_DROP_REASON
         || !Object.hasOwn(REFERRAL_SEAT_PROVIDERS, r.referrals.find(f => f.key === d.key)?.seat)))) return false;
+    if (r.rechecks !== undefined && (!Array.isArray(r.rechecks)
+      || new Set(r.rechecks.map(c => c?.key)).size !== r.rechecks.length
+      || r.rechecks.some(c => !c || !keys.has(c.key) || c.status !== 'needs re-check on live head'
+        || !/^[a-f0-9]{40}$/.test(c.fromHead) || c.fromHead === r.head || c.head !== r.head))) return false;
     if (r.superseded !== undefined && (!Array.isArray(r.superseded)
       || new Set(r.superseded.map(s => s.key)).size !== r.superseded.length
       || r.superseded.some(s => s.reason !== REFERRAL_SUPERSEDE_REASON
@@ -3500,7 +3512,7 @@ export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
-    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${f.recheck && !record.rulings.some(r => r.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
+    + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${referralRecheck(record, f.key) && !record.rulings.some(r => r.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${carriedReasonText(c, { operatorRulings })} (${carriedActor(c, { operatorRulings })} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
@@ -3564,6 +3576,7 @@ export function readReferralRecords(comments, { head } = {}) {
           || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])
           || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
           || JSON.stringify((r.verified ?? []).slice(0, (previous.verified ?? []).length)) !== JSON.stringify(previous.verified ?? [])
+          || JSON.stringify((r.rechecks ?? []).slice(0, (previous.rechecks ?? []).length)) !== JSON.stringify(previous.rechecks ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }
