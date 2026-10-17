@@ -2444,19 +2444,26 @@ export function hasDestructiveLaneOp(command) {
 }
 
 // #5957 (review r10) — the child-shell depth before every offset of every segment, carried across segments: an
-// assignment inside `( … )`, `$( … )` or `<( … )` runs in a child shell and never changes the parent's value.
-// Only a subshell `(` counts. `((` / `$((` arithmetic (and a `(` inside it) assigns in THIS shell, and a `(` in
-// quotes, an escape, `${…}`, backticks or a comment opens nothing. A mis-scan errs toward depth 0, where a
-// binding counts: an unmatched `)` only lowers the depth, never below zero.
+// assignment inside `( … )`, `$( … )`, `<( … )`, backticks or a `coproc` command runs in a child shell and never
+// changes the parent's value. Only a subshell `(` counts. `((` / `$((` arithmetic (and a `(` inside it) assigns
+// in THIS shell, and a `(` in quotes, an escape, `${…}` or a comment opens nothing. A mis-scan errs toward depth
+// 0, where a binding counts: an unmatched `)` only lowers the depth, never below zero, a closing backtick (or
+// `esac`) ends whatever opened inside it, and `{ … }` is tracked only inside a `coproc { … }` body.
 function subshellDepths(segs, commented) {
-  const stack = [];                                          // { sub: is a child shell, dq: the quoting it opened in }
+  // { kind: sub | arith | tick | seg (a simple coproc command, to its segment end) | cobrace | brace | case,
+  //   sub: is a child shell, dq: the quoting it opened in }
+  const stack = [];
   let d = 0;
-  const push = (sub, dq) => { stack.push({ sub, dq }); if (sub) d += 1; };
+  const push = (kind, sub, dq) => { stack.push({ kind, sub, dq }); if (sub) d += 1; };
+  const pop = () => { const top = stack.pop(); if (top.sub) d -= 1; return top; };
   return segs.map((seg, k) => {
     const s = String(seg);
     const out = new Array(s.length + 1).fill(d);
     if (commented[k]) return out;
     let dq = false;
+    let coBrace = -1;                                         // the offset of a `coproc [NAME] {`'s brace
+    // a reserved word's position: the start of a command (`{`, `}` and `coproc` are words only there)
+    const cmdStart = (i) => /(?:^|[;&|(!]|(?:^|[\s;&|(])(?:then|do|else|\{))[ \t\n]*$/.test(s.slice(0, i));
     // the end of a `${…}` run (braces balanced, escapes and single quotes skipped), or s.length when unclosed
     const braceEnd = (from) => {
       for (let j = from, n = 0; j < s.length; j++) {
@@ -2467,16 +2474,19 @@ function subshellDepths(segs, commented) {
       }
       return s.length;
     };
-    const tickEnd = (from) => { const j = s.slice(from + 1).search(/(?<!\\)`/); return j < 0 ? s.length : from + 1 + j; };
+    const braced = () => stack.some((f) => f.kind === 'cobrace');
     for (let i = 0; i < s.length; i++) {
       out[i] = d;
       const ch = s[i];
       let skip = i;
       if (ch === '\\') skip = i + 1;
-      else if (ch === '`') skip = tickEnd(i);
-      else if (ch === '$' && s[i + 1] === '{') skip = braceEnd(i + 1);
+      else if (ch === '`') {
+        // a backtick substitution is a child shell; it may span segments (`X=\`D=/tmp; echo\``)
+        const open = stack.findLastIndex((f) => f.kind === 'tick');
+        if (open < 0) { push('tick', true, dq); dq = false; } else { while (stack.length > open) dq = pop().dq; }
+      } else if (ch === '$' && s[i + 1] === '{') skip = braceEnd(i + 1);
       else if (ch === '$' && s[i + 1] === '(') {
-        if (s[i + 2] === '(') { push(false, dq); push(false, dq); skip = i + 2; } else { push(true, dq); skip = i + 1; }
+        if (s[i + 2] === '(') { push('arith', false, dq); push('arith', false, dq); skip = i + 2; } else { push('sub', true, dq); skip = i + 1; }
         dq = false;
       } else if (dq) {
         if (ch === '"') dq = false;
@@ -2486,15 +2496,39 @@ function subshellDepths(segs, commented) {
         else skip = s.indexOf("'", i + 1) < 0 ? s.length : s.indexOf("'", i + 1);
       } else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(s[i - 1]))) skip = s.length;
       else if (ch === '(') {
-        const arith = stack.length > 0 && !stack.at(-1).sub;
-        if (!arith && s[i + 1] === '(') { push(false, dq); push(false, dq); skip = i + 1; } else push(!arith, dq);
-      } else if (ch === ')' && stack.length) {
-        const top = stack.pop();
-        if (top.sub) d -= 1;
-        dq = top.dq;
+        const arith = stack.at(-1)?.kind === 'arith';
+        if (!arith && s[i + 1] === '(') { push('arith', false, dq); push('arith', false, dq); skip = i + 1; }
+        else push(arith ? 'arith' : 'sub', !arith, dq);
+      } else if (ch === ')') {
+        // a `)` right inside `case … esac` ends a pattern (`x) D=1;;`), not a subshell
+        while (stack.at(-1)?.kind === 'seg') pop();
+        if (stack.at(-1)?.kind === 'sub' || stack.at(-1)?.kind === 'arith') dq = pop().dq;
+      } else if (ch === 'c' && s.startsWith('case', i) && /\s/.test(s[i + 4] ?? '') && cmdStart(i)) {
+        push('case', false, dq);
+        skip = i + 3;
+      } else if (ch === 'e' && s.startsWith('esac', i) && /^[\s;&|<>)]|^$/.test(s.slice(i + 4, i + 5)) && cmdStart(i)) {
+        const open = stack.findLastIndex((f) => f.kind === 'case');
+        if (open >= 0) while (stack.length > open) pop();
+        skip = i + 3;
+      } else if (ch === 'c' && s.startsWith('coproc', i) && /\s/.test(s[i + 6] ?? '') && cmdStart(i)) {
+        // `coproc [NAME] { … }` runs its body in a child shell up to the matching `}`; `coproc ( … )` is a
+        // subshell already; `coproc cmd …` runs cmd in a child shell to the end of its segment
+        const head = s.slice(i).match(/^coproc[ \t]+(?:[A-Za-z_]\w*[ \t]+)?([{(])(?=[\s(]|$)/);
+        if (!head) push('seg', true, dq);
+        else if (head[1] === '{') coBrace = i + head[0].length - 1;
+        skip = i + 5;
+      } else if (ch === '{' && (i === coBrace || (braced() && cmdStart(i))) && /^\{(?=\s|$)/.test(s.slice(i))) {
+        push(i === coBrace ? 'cobrace' : 'brace', i === coBrace, dq);
+      } else if (ch === '}' && braced() && cmdStart(i) && /^\}(?=[\s;&|<>)]|$)/.test(s.slice(i))) {
+        const open = stack.findLastIndex((f) => f.kind === 'brace' || f.kind === 'cobrace');
+        while (stack.length > open) pop();
       }
       for (let j = i + 1; j <= Math.min(skip, s.length); j++) out[j] = d;
       i = Math.max(i, Math.min(skip, s.length));
+    }
+    for (let f = stack.findLastIndex((x) => x.kind === 'seg'); f >= 0; f = stack.findLastIndex((x) => x.kind === 'seg')) {
+      if (stack[f].sub) d -= 1;
+      stack.splice(f, 1);
     }
     out[s.length] = d;
     return out;
@@ -2654,6 +2688,9 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     }
     const valueAt = m ? stmt.trimEnd().length - m[2].length : 0;
     for (const name of reboundNames(m ? m[2] : stmt, at, valueAt)) (history[name] ??= []).push({ at, value: undefined });
+    // `coproc NAME { … }` binds NAME (to the coprocess's file descriptors) in this shell
+    const co = !inChild(at) && stmt.match(/^\s*coproc[ \t]+([A-Za-z_]\w*)[ \t]+[{(]/);
+    if (co) (history[co[1]] ??= []).push({ at, value: undefined });
     if (m) {
       const val = m[2].trim();
       const literal = val.replace(/^(['"])(.*)\1$/, '$2');    // strip matching surrounding quotes

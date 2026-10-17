@@ -696,8 +696,39 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/clone; cat <(D=/tmp); cd "$D" && ls',
       'D=~/x; D=/clone; ( read D ); cd "$D" && ls',
       'D=/clone; ( true; D=~/y ); cd "$D" && ls',
+      // r11 — a backtick substitution (it may span `;`), a coproc body and a case pattern's `)` in a subshell
+      'D=~/x; D=/clone; X=`D=/tmp`; cd "$D" && ls',
+      'D=~/x; D=/clone; X=`D=/tmp; echo`; cd "$D" && ls',
+      'D=~/x; D=/clone; X="`D=/tmp`"; cd "$D" && ls',
+      'D=~/x; D=/clone; coproc { D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; coproc { { D=/a; }; D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; coproc N { D=/tmp; }; cd "$D" && ls',
+      'D=~/x; D=/clone; coproc ( D=/tmp ); cd "$D" && ls',
+      'D=~/x; D=/clone; coproc D=/tmp; cd "$D" && ls',
+      'D=~/x; D=/clone; ( case x in x) D=1;; esac ); cd "$D" && ls',
+      'D=~/x; D=/clone; (case x in a|b) D=1;; esac); cd "$D" && ls',
+      'D=~/x; D=/clone; X=$(case x in x) D=2;; esac); cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
     expect(at('HOME=/h; ( true; HOME=/z ); cd ~/clone && ls')).toBe('/h/clone');
+    expect(at('HOME=/h; X=`HOME=/z`; cd ~/clone && ls')).toBe('/h/clone');
+  });
+  it('the child shell ends where bash ends it: a closing backtick, `}` of a coproc body, `esac`, a segment', () => {
+    for (const cmd of [
+      'D=~/x; echo `x`; D=/b; cd "$D" && ls',
+      'D=~/x; echo `echo (`; D=/b; cd "$D" && ls',
+      "D=~/x; echo '`'; D=/b; cd \"$D\" && ls",
+      'D=~/x; echo \\`; D=/b; cd "$D" && ls',
+      'D=~/x; coproc { D=/tmp; }; D=/b; cd "$D" && ls',
+      'D=~/x; coproc D=/tmp; D=/b; cd "$D" && ls',
+      'D=~/x; coproc true & D=/b; cd "$D" && ls',
+      'D=~/x; ( case x in x) D=1;; esac ); D=/b; cd "$D" && ls',
+      'D=~/x; X=$(case x in x) echo;; esac); D=/b; cd "$D" && ls',
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/b');
+    for (const cmd of [
+      'D=~/x; D=/clone; case x in x) D=1;; esac; cd "$D" && ls',   // a this-shell case arm
+      'D=~/x; D=/clone; coproc D { true; }; cd "$D" && ls',        // coproc NAME binds NAME here
+      'D=~/x; D=/clone; echo coproc { D=/tmp; }; cd "$D" && ls',   // not a coproc word
+    ]) expect(at(cmd), JSON.stringify(cmd)).toBe(REPORTED);
   });
   it('a this-shell rebinding still counts, and a quoted, escaped or comment `(` opens no child shell', () => {
     for (const cmd of [
