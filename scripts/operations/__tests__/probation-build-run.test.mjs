@@ -953,7 +953,7 @@ describe('standalone prepare', () => {
     expect(picks).toEqual(['failed-card', 'failed-lead'].includes(mode) ? accepted : ids);
     expect(branches).toEqual([...ids.filter(n => !(['failed-card', 'failed-lead'].includes(mode) && n === (mode === 'failed-lead' ? '4291' : '4292'))).map(n => `lane/prep-${n}`), `lane/prepare-batch-4291-${accepted.length}`]);
     expect([...children.values()].flatMap(c => c.calls).filter(c => c[0] === 'commit')).toHaveLength(['failed-card', 'failed-lead'].includes(mode) ? 2 : 3);
-    expect(result.deferredToNextBatch).toEqual(accepted.length === 3 ? [] : [failed]);
+    expect(result.deferredToNextBatch).toEqual(mode === 'conflict' ? [failed] : []);
     if (mode === 'conflict') expect(result.groupDropReasons['4292']).toMatch(/conflict.*next batch/);
   });
   it.each([undefined, 0, -1, 1.5])('repairs a task missing a positive integer estimate (%s)', async estimate => {

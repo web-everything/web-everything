@@ -510,7 +510,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
   const preparePolicy = effects.preparePolicy?.() ?? readPreparePolicy();
-  let out = await effects.planTick(tickBookkeeping, { config: planConfigFrom({ ...policy, prepareAheadWindow: preparePolicy.aheadCount ?? policy.prepareAheadWindow }) });
+  // Explicit daemon controls beat the prepare cascade, including null (off). Older direct callers
+  // without provenance still override the cascade when they change the declared default.
+  const effectivePrepareAheadWindow = (policy.prepareAheadWindowExplicit
+    ?? (policy.prepareAheadWindow !== BUILD_DISPATCH_POLICY.prepareAheadWindow))
+    ? policy.prepareAheadWindow : (preparePolicy.aheadCount ?? policy.prepareAheadWindow);
+  const planConfig = planConfigFrom({ ...policy, prepareAheadWindow: effectivePrepareAheadWindow });
+  let out = await effects.planTick(tickBookkeeping, { config: planConfig });
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
   const planningSkipDetail = new Map();
@@ -556,7 +562,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     for (const candidate of candidates) await inspectPrepareCooldown(candidate);
     if (planningSkips.length === previousSkips) break;
     tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...planningSkips.map(r => r.num)])];
-    out = await effects.planTick(tickBookkeeping, { config: planConfigFrom({ ...policy, prepareAheadWindow: preparePolicy.aheadCount ?? policy.prepareAheadWindow }) });
+    out = await effects.planTick(tickBookkeeping, { config: planConfig });
   }
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
@@ -1000,10 +1006,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const runner = preparePolicy.runner;
   const runnerSource = preparePolicy.sources.runner;
   const fallback = runner === 'claude' || (configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases));
-  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource}) · batchSize=${preparePolicy.batchSize ?? 6} (from ${preparePolicy.sources.batchSize ?? 'standard'}) · batchParallel=${preparePolicy.batchParallel ?? true} (from ${preparePolicy.sources.batchParallel ?? 'standard'}) · batchMaxParallel=${preparePolicy.batchMaxParallel ?? 3} (from ${preparePolicy.sources.batchMaxParallel ?? 'standard'}) · aheadCount=${preparePolicy.aheadCount ?? policy.prepareAheadWindow} (from ${preparePolicy.sources.aheadCount ?? 'standard'}) · mergedGuardHours=${preparePolicy.mergedGuardHours} (from ${preparePolicy.sources.mergedGuardHours})`;
+  prepareRunnerNote = ` · runner=${fallback ? 'claude' : runner} (prepare.runner=${runner} from ${runnerSource}) · batchSize=${preparePolicy.batchSize ?? 6} (from ${preparePolicy.sources.batchSize ?? 'standard'}) · batchParallel=${preparePolicy.batchParallel ?? true} (from ${preparePolicy.sources.batchParallel ?? 'standard'}) · batchMaxParallel=${preparePolicy.batchMaxParallel ?? 3} (from ${preparePolicy.sources.batchMaxParallel ?? 'standard'}) · aheadCount=${effectivePrepareAheadWindow} (from ${policy.prepareAheadWindowExplicit ? 'daemon override' : preparePolicy.sources.aheadCount ?? 'standard'}) · mergedGuardHours=${preparePolicy.mergedGuardHours} (from ${preparePolicy.sources.mergedGuardHours})`;
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
-  const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: preparePolicy.aheadCount ?? policy.prepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: effectivePrepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
@@ -1254,7 +1260,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const settled = settledPrepares.get(lead);
     const deferred = settled?.deferredToNextBatch?.map(normNum).includes(num)
       && (!claim.meta.claimedAt || settled.startedAt >= claim.meta.claimedAt);
-    const why = deferred ? 'deferred-to-next-batch' : replaced ? 'prepared on main' : !leadTracked ? 'group-lead-gone' : null;
+    const dropped = settled?.groupDropped?.map(normNum).includes(num)
+      && (!claim.meta.claimedAt || settled.startedAt >= claim.meta.claimedAt);
+    const failed = dropped && !deferred && !replaced;
+    if (failed) {
+      // A dropped member is its own failed attempt, even when the lead opened the batch PR.
+      // Hold before releasing ownership, as the single-card retirement path does.
+      const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
+      const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped',
+        { reason: settled.groupDropReasons?.[num] ?? 'batch member preparation failed' }, settled.source);
+      if (failure.held) prepare.held.push({ num, reason: failure.holdReason ?? 'prepare-unstamped' });
+    }
+    const why = deferred ? 'deferred-to-next-batch' : replaced ? 'prepared on main' : failed ? 'prepare-unstamped' : !leadTracked ? 'group-lead-gone' : null;
     if (why) {
       if (live) effects.releasePrepareClaim({ num });
       prepare.retired.push({ num, why, released: live });
@@ -1311,7 +1328,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(h => !['needs-prepare', 'prepare-stale', ...(preparePolicy.autoSize ? ['no-size'] : [])].includes(h.reason)).map(h => normNum(h.num)));
   const windowNums = prepareAheadNums({ queue: admission.queue, launch: admission.planned ?? admission.launch,
     held: (admission.held ?? []).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
-    window: preparePolicy.aheadCount ?? policy.prepareAheadWindow, skip: bookkeeping.prepareHeldNums ?? [] });
+    // With the window off, every queued card is eligible for batching. The shared helper uses
+    // non-finite windows as its "no filter" sentinel, so give it the complete queue's size here.
+    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: bookkeeping.prepareHeldNums ?? [] });
   const windowOrder = new Map([...(windowNums ?? [])].map((num, i) => [num, i]));
   prepareSpawns.sort((a, b) => (windowOrder.get(normNum(a.num)) ?? Infinity) - (windowOrder.get(normNum(b.num)) ?? Infinity));
   const preparePool = [...(windowNums ?? [])].map(num => groupRowsByNum.get(num))
@@ -2727,6 +2746,7 @@ export function policyFrom(flags, env = process.env) {
     maxOpenItems: n(flags['max-open-items'], BUILD_DISPATCH_POLICY.maxOpenItems),
     // Card 80 — declared settings; `off` (or a negative value) disables the window / the staleness gate.
     prepareAheadWindow: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, readPreparePolicy({ env }).aheadCount),
+    prepareAheadWindowExplicit: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, undefined) !== undefined,
     preparedMaxAgeDays: offOr(flags['prepared-max-age-days'] ?? env.WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS, BUILD_DISPATCH_POLICY.preparedMaxAgeDays),
     // Card x60i0ie — declared cost-class admission settings (env + dispatch-settings.json); built-in `off`.
     costAdmission: readCostAdmissionSettings({ env }),

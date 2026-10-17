@@ -1,5 +1,6 @@
 import { resolveCostAdmissionSettings } from '../../../scripts/lib/cost-admission.mjs';
 import { resolvePreparePolicy } from '../../../scripts/conveyor/prepare-policy-settings.mjs';
+import { runPrepareBatch } from '../../../scripts/operations/prepare-batch.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { cliEffects } from '../build-dispatch-daemon.mjs';
@@ -4144,6 +4145,65 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.launched[0].groupMembers).toEqual(['7302', '7303', '7304', '7305', '7306']);
     expect(effects.listPrepareClaims()).toHaveLength(6);
     expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7307');
+  });
+
+  it.each([
+    ['flag', { 'prepare-ahead-window': '2' }, {}, 2],
+    ['env', {}, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: '2' }, 2],
+    ['flag off', { 'prepare-ahead-window': 'off' }, {}, null],
+    ['env off', {}, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: 'off' }, null],
+    ['flag negative', { 'prepare-ahead-window': '-1' }, {}, null],
+    ['flag over env', { 'prepare-ahead-window': '2' }, { WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW: 'off' }, 2],
+    ['flag at default over cascade', { 'prepare-ahead-window': '20' }, {}, 20, { aheadCount: 1 }],
+  ])('honors the explicit %s window in planning, replanning, and batch membership', async (_name, flags, env, window, tool) => {
+    const effects = fixture({ spawns: rows.slice(0, 2) });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool });
+    const plan = effects.planTick;
+    effects.planTick = vi.fn(plan);
+    // Force a replan after the first member's recent prepare is discovered.
+    effects.listPreparePrs = ({ num }) => num === '7202' ? [{ number: 94, state: 'MERGED',
+      headRefName: 'lane/7202-prepare-design', mergedAt: '2026-10-15T11:00:00Z' }] : [];
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    const tick = await runBuildDispatchTick({ live: true, effects, policy: policyFrom(flags, env) });
+    expect(effects.planTick.mock.calls.length).toBeGreaterThan(1);
+    for (const [, { config }] of effects.planTick.mock.calls) {
+      expect(config.prepareAheadWindow).toBe(window ?? undefined);
+    }
+    expect(tick.prepare.aheadCount).toBe(window);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual(window === 2 ? ['7203'] : ['7203', '7204', '7205']);
+  });
+
+  it.each(['declined', 'spec-defect', 'gate-red', 'could-not-prepare', 'throw', 'failed-lead', 'all-failed',
+    'assembled-gate-red', 'publication-failed', 'assembly-threw'])
+  ('accounts for a batch %s failure and holds failed cards on the next tick', async mode => {
+    const ids = ['7201', '7202'];
+    const assemblyFailed = ['assembled-gate-red', 'publication-failed', 'assembly-threw'].includes(mode);
+    const failed = mode === 'all-failed' || assemblyFailed ? ids : [mode === 'failed-lead' ? '7201' : '7202'];
+    const result = await runPrepareBatch({ num: ids[0], groupMembers: [ids[1]], session: 'failure-test' }, {
+      log: () => {}, findItem: num => ({ path: `backlog/${num}-card.md` }),
+      retainPrepareCommit: () => {}, startPrepareAssembly: () => { if (mode === 'assembly-threw') throw new Error('assembly failed'); },
+      cherryPickPrepare: () => ({ ok: true }), finishPrepareAssembly: () => {},
+      runGate: () => ({ pass: mode !== 'assembled-gate-red' }), writePrBody: () => '/tmp/body',
+      openPr: () => ({ ok: mode !== 'publication-failed', pr: 99 }),
+    }, resolvePreparePolicy(), async ({ num }) => {
+      if (!assemblyFailed && failed.includes(num)) {
+        if (mode === 'throw') throw new Error('worker crashed');
+        return { outcome: ['failed-lead', 'all-failed'].includes(mode) ? 'gate-red' : mode };
+      }
+      return { outcome: 'prepared-commit', num, lanePath: '/tmp/fixture-lane', baseSha: 'base', sha: 'commit' };
+    });
+    expect(result.groupDropped).toEqual(failed);
+    expect(result.deferredToNextBatch).toEqual([]);
+    const effects = fixture({ claims: [rows[0], { ...rows[1], groupLead: '7201' }], queue: rows.slice(0, 2), spawns: [] });
+    effects.listSettledPrepares = () => [{ ...result, num: '7201', startedAt: '9999-01-01T00:00:00Z' }];
+    effects.readPrepareStatus = ({ num }) => ({ preparedDate: failed.includes(num) ? null : '2026-10-17' });
+    const first = await runBuildDispatchTick({ live: true, effects });
+    for (const num of failed) expect(effects.placePrepareHold).toHaveBeenCalledWith(expect.objectContaining({ num }));
+    effects.listHolds = () => effects.placePrepareHold.mock.calls.map(([hold]) => hold);
+    effects.planTick = fixture({ queue: rows.slice(0, 2), spawns: rows.slice(0, 2) }).planTick;
+    await runBuildDispatchTick({ live: true, effects, bookkeeping: first.nextBookkeeping });
+    const readmitted = effects.dispatch.mock.calls.flatMap(([args]) => [args.num, ...(args.groupMembers ?? [])]);
+    for (const num of failed) expect(readmitted).not.toContain(num);
   });
 
   it('uses build.priority before queue order when choosing members and leaves overlaps for another batch', async () => {

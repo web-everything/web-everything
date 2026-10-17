@@ -39,16 +39,21 @@ export async function runPrepareBatch(args, io, policy, runCard) {
     }
   };
   await Promise.all(Array.from({ length: parallel ? Math.min(limit, ids.length) : 1 }, consume));
-  const groupDropped = [], groupDropReasons = {};
-  const defer = (num, reason) => { groupDropped.push(num); groupDropReasons[num] = reason; };
+  const groupDropped = [], groupDropReasons = {}, conflicts = [];
+  const drop = (num, reason) => { groupDropped.push(num); groupDropReasons[num] = reason; };
   const prepared = results.flatMap((r, i) => {
     if (r.outcome === 'prepared-commit') return [r];
-    defer(ids[i], r.detail ?? r.outcome);
+    drop(ids[i], r.detail ?? r.outcome);
     return [];
   });
   const settle = result => {
+    // A failed assembly/publication delivered none of the surviving commits. Account for each
+    // unsuccessful card; only an actual cherry-pick conflict gets a budget-free next batch.
+    if (result.outcome !== 'opened-pr') for (const num of ids) {
+      if (!conflicts.includes(num) && !groupDropped.includes(num)) drop(num, result.detail ?? result.outcome);
+    }
     result = { executor: args.worker?.executor ?? 'none', ...result, groupMembers: ids.slice(1), groupDropped, groupDropReasons,
-      deferredToNextBatch: [...groupDropped] };
+      deferredToNextBatch: [...conflicts] };
     try {
       io.settlePrepare?.({ runId: args.runId, key: args.effectKey,
         status: result.outcome === 'opened-pr' ? 'applied' : 'failed', result });
@@ -66,7 +71,8 @@ export async function runPrepareBatch(args, io, policy, runCard) {
       const picked = assemblyIo.cherryPickPrepare(lanePath, card);
       if (!picked.ok) {
         if (!picked.conflict) throw new Error('prepare assembly failed');
-        defer(card.num, 'cherry-pick conflict; deferred to next batch');
+        drop(card.num, 'cherry-pick conflict; deferred to next batch');
+        conflicts.push(card.num);
         continue;
       }
       assembled.push(card);
