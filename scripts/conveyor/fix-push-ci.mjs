@@ -5,13 +5,13 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 /**
- * Required, but gate evaluators rather than CI: `merge-gate` fails on review/freeze/candidacy holds too (the label
- * writers excuse those via `excusePrMergeGateHolds`), and the shared exclusion list names the advisory gates. Their
- * failure is never a CI verdict here; the real CI checks beside them decide.
+ * Required, but a gate evaluator rather than CI: `merge-gate` also fails on review/freeze/candidacy holds (the label
+ * writers excuse those via `excusePrMergeGateHolds`). Its failure never decides red here, but it does block green.
+ * Every other required check counts as CI: a given required set replaces the shared exclusion list, as in
+ * `reduceCheckState`.
  */
-export const FIX_PUSH_NOT_CI_CHECKS = Object.freeze(['merge-gate', ...CI_TRUTH_EXCLUDED_CHECKS]);
+export const FIX_PUSH_GATE_CHECK = 'merge-gate';
 const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs() });
 export const FIX_PUSH_RED_CI_LABELS = Object.freeze(['ci:failed', 'status:ci-red']);
 export const FIX_PUSH_FIXER_LABELS = Object.freeze(['status:fixing', 'status:takeover-running']);
@@ -31,11 +31,14 @@ const rowVerdict = row => {
  */
 export function headCiVerdict(rollup, requiredChecks) {
   const rows = collapseRollupToLatestPerName(rollup);
-  const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], rows)
-    .filter(name => !FIX_PUSH_NOT_CI_CHECKS.includes(name));
-  if (!rows.length || !required.length) return 'pending';
-  const verdicts = required.map(name => rowVerdict(rows.find(r => (r?.name || r?.context) === name)));
-  return verdicts.includes('red') ? 'red' : verdicts.every(v => v === 'green') ? 'green' : 'pending';
+  const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], rows);
+  const ci = required.filter(name => name !== FIX_PUSH_GATE_CHECK);
+  if (!rows.length || !ci.length) return 'pending';
+  const verdictOf = name => rowVerdict(rows.find(r => (r?.name || r?.context) === name));
+  const verdicts = ci.map(verdictOf);
+  if (verdicts.includes('red')) return 'red';
+  const gateGreen = !required.includes(FIX_PUSH_GATE_CHECK) || verdictOf(FIX_PUSH_GATE_CHECK) === 'green';
+  return gateGreen && verdicts.every(v => v === 'green') ? 'green' : 'pending';
 }
 /** The required set for a slug; any read failure is "unknown" (the caller hands off as if CI were pending). */
 export function readRequiredChecksSafe(repo, read = r => getRequiredStatusChecks({ repo: r }).checks) {

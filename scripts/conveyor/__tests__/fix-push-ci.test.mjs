@@ -88,10 +88,14 @@ it('a held merge-gate (a review or freeze hold, not CI) is never a red verdict u
   const live = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
   const row = (name, status, conclusion) => ({ __typename: 'CheckRun', name, status, ...(conclusion ? { conclusion } : {}) });
   const queued = [row('test', 'QUEUED'), row('smoke', 'QUEUED'), row('daemon-soak', 'QUEUED')];
-  expect(headCiVerdict([...queued, row('merge-gate', 'COMPLETED', 'FAILURE'), row('soak-replay-gate', 'COMPLETED', 'FAILURE')], live)).toBe('pending');
-  const green = ['test', 'smoke', 'daemon-soak'].map(n => row(n, 'COMPLETED', 'SUCCESS'));
-  expect(headCiVerdict([...green, row('merge-gate', 'COMPLETED', 'FAILURE')], live)).toBe('green');
+  expect(headCiVerdict([...queued, row('merge-gate', 'COMPLETED', 'FAILURE'), row('soak-replay-gate', 'IN_PROGRESS')], live)).toBe('pending');
+  const green = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(n => row(n, 'COMPLETED', 'SUCCESS'));
+  // A failing merge-gate never decides red, but blocks green: the head stays pending (an ordinary hand-off).
+  expect(headCiVerdict([...green, row('merge-gate', 'COMPLETED', 'FAILURE')], live)).toBe('pending');
+  expect(headCiVerdict([...green, row('merge-gate', 'COMPLETED', 'SUCCESS')], live)).toBe('green');
   expect(headCiVerdict([...green.slice(1), row('test', 'COMPLETED', 'FAILURE'), row('merge-gate', 'IN_PROGRESS')], live)).toBe('red');
+  // A required set replaces the shared exclusion list: a required soak-replay-gate failure is CI red.
+  expect(headCiVerdict([...green.slice(0, 3), row('soak-replay-gate', 'COMPLETED', 'FAILURE'), row('merge-gate', 'COMPLETED', 'SUCCESS')], live)).toBe('red');
 });
 it('a finished verdict also clears an earlier hand-off\'s waiting labels', async () => {
   const { fixPushLabelPlan } = await import('../fix-push-ci.mjs');
