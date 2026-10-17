@@ -1527,6 +1527,7 @@ it('cards 273/278 threads resolved ownership settings and keeps pure defaults on
   const { readFileSync } = await import('node:fs');
   const fx = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-ci-heal-escalated.json', 'utf8'));
   const options = { ...xxOptions(), readPrs: () => [fx.pr], readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
+    env: { WE_REVIEW_START_AFTER: 'ci-green' }, // Keep this ownership fixture independent of fast-check timing.
     now: Date.parse(fx.observedAt), excuseMergeGateHolds: prs => prs, enrichMechanicalRound: prs => prs,
     enrichReferralHolds: prs => prs, enrichLedgerHolds: prs => prs, enrichRulings: prs => prs,
     enrichScopeBloat: prs => prs, enrichCodeQL: prs => prs, enrichEscalationBase: prs => prs,
