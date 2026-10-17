@@ -12,7 +12,7 @@ tags: []
 # Prevention — Require a planned boundary test and observable side-effect assertion for each independently state… (from web-everything/web-everything#5481 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xl3a0ik-guards-quiet-hours-p0-budget-and-enforce-switch.md:14` — Require a planned boundary test and observable side-effect assertion for each independently stated budget or cooldown constraint during preparation review.
+1. `we:backlog/6189-guards-quiet-hours-p0-budget-and-enforce-switch.md:14` — Require a planned boundary test and observable side-effect assertion for each independently stated budget or cooldown constraint during preparation review.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5615.
 
