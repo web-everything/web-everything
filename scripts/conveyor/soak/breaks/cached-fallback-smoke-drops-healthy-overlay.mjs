@@ -32,7 +32,7 @@ export default {
         const { rebuildClone, readRebuildState } = await load('scripts/lib/daemon-rebuild.mjs');
         const { addOverlay, readOverlays } = await load('scripts/lib/daemon-overlays.mjs');
         const { runLiveSmoke, SMOKE_CHECKS } = await load('scripts/lib/daemon-live-smoke.mjs');
-        const git = args => execFileSync('git', args, { cwd: w.simCloneRoot, encoding: 'utf8', timeout: 20_000 }).trim();
+        const git = args => execFileSync('git', args, { cwd: w.simCloneRoot, encoding: 'utf8', timeout: 20_000, maxBuffer: 16 * 1024 * 1024 }).trim();
         const base = git(['rev-parse', 'HEAD']);
         const rebuild = runSmoke => rebuildClone({ root: w.simCloneRoot, env: w.env,
           runSmoke, prState: async () => null,
