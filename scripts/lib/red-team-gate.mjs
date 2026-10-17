@@ -126,9 +126,9 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
 }
 
 /** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
-export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true });
+export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true, statusLabels: true });
 export const RED_TEAM_PROBE_ENV = Object.freeze({
-  recheckReadsRepo: 'WE_RED_TEAM_RECHECK_READS_REPO', skipCardOnly: 'WE_RED_TEAM_SKIP_CARD_ONLY',
+  recheckReadsRepo: 'WE_RED_TEAM_RECHECK_READS_REPO', skipCardOnly: 'WE_RED_TEAM_SKIP_CARD_ONLY', statusLabels: 'WE_RED_TEAM_STATUS_LABELS',
 });
 export function resolveRedTeamProbes({ file = {}, platform, env = {} } = {}) {
   const envValues = {};

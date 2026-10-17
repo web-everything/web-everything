@@ -21,17 +21,23 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, inFlight: false });
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
     const evidence = readDrainRedTeamEvidence(f);
     // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
     expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
-    // A persisted accepting verdict holds even before the job publishes its first running status.
+    // An accepting verdict alone is not a scheduled red-team run.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
     writeRun(run, f.runsDir);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toBeNull();
+  });
+  it('recognizes queued scheduling for the live head without inventing an in-flight process', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'queued' }, f);
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false, recorded: false });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
   });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();

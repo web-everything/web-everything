@@ -1,3 +1,5 @@
+import { createGhProvider } from './review-label-provider.mjs';
+import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
  * @file scripts/lib/drain-merge-strategy.mjs
  * @description Card xtpxusq — the drain's side of the merge-delivery strategy (`./merge-delivery-policy.mjs`).
@@ -209,10 +211,11 @@ export function createDrainMergeStrategy({
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
-  env = process.env, queueSafety, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
+  env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
+  const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
@@ -324,7 +327,7 @@ export function createDrainMergeStrategy({
         const pending = before.redTeamPending?.[key];
         const sameHead = pending?.headSha === headSha;
         const overdue = sameHead && now() - pending.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000;
-        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [] })).digest('hex');
+        const observation = createHash('sha256').update(JSON.stringify({ comments, reviews: live.reviews ?? [], scheduled: !!evidence.scheduled, inFlight: !!evidence.inFlight, queued: !!evidence.queued, recorded: !!evidence.recorded })).digest('hex');
         const newComment = pending?.observation ? observation !== pending.observation
           : Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
@@ -336,7 +339,10 @@ export function createDrainMergeStrategy({
         }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        const reason = redTeamEnqueueHold({ loopPayload: evidence.loopPayload, comments: pages.flat(), pr: c.num, head: headSha, env });
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, env });
+        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env,
+          live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
+        catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
@@ -347,7 +353,7 @@ export function createDrainMergeStrategy({
           writeState(statePath, before);
           const outcome = pendingOutcome(c, wait);
           // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape.
-          if (!outcome.healthSmell || evidence.inFlight || evidence.recorded || reason.includes('requiring send-back')) return outcome;
+          if (!outcome.healthSmell || evidence.inFlight || evidence.queued || evidence.recorded || reason.includes('requiring send-back')) return outcome;
           let requested = false;
           if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
           if (wait.requestedAt == null && typeof requestRedTeam === 'function') {

@@ -40,12 +40,12 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         inFlight = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { loopPayload: status.loopPayload, inFlight, recorded: recorded || status.result === 'ran' };
+    return { loopPayload: status.loopPayload, inFlight, ...(status.status === 'queued' ? { queued: true } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
   }
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const hits = list(runsDir).filter(id => id.startsWith('review-pr-')).map(id => ({ id, run: read(id, runsDir) }))
     .filter(({ run }) => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
       && run.findings?.read?.netBasis?.rev === head);
   hits.sort((a, b) => statSync(join(runsDir, `${b.id}.json`)).mtimeMs - statSync(join(runsDir, `${a.id}.json`)).mtimeMs);
-  return { loopPayload: hits[0]?.run ?? null, inFlight: false, recorded };
+  return { loopPayload: hits[0]?.run ?? null, inFlight: false, scheduled: recorded, recorded };
 }

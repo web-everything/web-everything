@@ -1,3 +1,4 @@
+import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
@@ -361,7 +362,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, acceptanceStillCoversHead = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -469,9 +470,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       || currentLabels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:')))) {
       return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm requires a valid empty review family' };
     }
-    // A producer-cleared `ready-to-merge` PR is on the merge path by authority this restore never holds: the
-    // re-arm would strip that clearance and push it into an independent-review cycle it was not meant to take.
-    if (missing && currentLabels.some(l => (typeof l === 'string' ? l : l.name) === READY_TO_MERGE_LABEL)) {
+    // Preserve producer readiness only with a trusted acceptance of the unchanged live head.
+    // Without that proof, restoring a review hold must remove the old merge clearance atomically.
+    if (missing && acceptanceStillCoversHead && currentLabels.some(l => (typeof l === 'string' ? l : l.name) === READY_TO_MERGE_LABEL)) {
       return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm preserves the producer ready-to-merge clearance' };
     }
     const wasChanges = hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
@@ -517,7 +518,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // #2412 review-fix — a re-arm hands a repaired bounce back for a fresh, independent re-review (the #2630
       // invariant this function enforces); same reasoning as the `changes` branch below applies to any stale
       // `redteam:accepted` the PR still carries from before the fix.
-      removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL],
+      removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, ...RED_TEAM_STATUS_LABELS],
       keepsHuman: isHuman,
       rearmFrom: missing ? 'missing' : wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
       reason: missing ? 'missing review family restored to review:pending; independent review owed' : isHuman
@@ -1390,6 +1391,7 @@ export function runReviewLabelCli({
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
     humanOnlyHold,
+    acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
@@ -1562,7 +1564,7 @@ export function runReviewLabelCli({
         ...(overridesLiveClearance ? [] : ['', buildMechanicalHandoffMarker(headSha)]),
       ].join('\n'));
       if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
-      provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
+      provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: presentRemoveLabels([REVIEW_LABELS.heldMechanical, READY_TO_MERGE_LABEL], live) });
       // PR #5273: the same read-then-write race as the human-surface park. Read for a concurrent clear-human of this
       // head after the write; clear-human recognises this park by its marker for the mirror-image case.
       if (!overridesLiveClearance) withdrawParkOnLiveClearance({ provider, repo, pr, headSha });
@@ -1827,7 +1829,8 @@ export function runReviewLabelCli({
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead
-          || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels }).allowed) {
+          || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
+            acceptanceStillCoversHead: parseReviewedSha((fresh.comments ?? []).filter(isTrustedMarkerAuthor)) === fresh.headRefOid }).allowed) {
           throw new Error('missing review handoff refused: state, draft status, head or review family changed before write');
         }
         removals = presentRemoveLabels(decision.removeLabels, fresh.labels);

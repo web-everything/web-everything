@@ -10,7 +10,7 @@ const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const hold = (over = {}) => redTeamEnqueueHold({ loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
@@ -128,7 +128,8 @@ describe('durable head-bound red-team admission', () => {
     expect(hold({ comments: [clean(head, 'web-everything', broken)] })).toBeNull();
   });
   it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
-    expect(hold({ env: { [key]: '0' } })).toBeNull();
+    expect(hold({ scheduled: false, env: { [key]: '0' } })).toBeNull();
+    expect(hold({ scheduled: true, env: { [key]: '0' } })).toMatch(/no recorded result/);
   });
   it.each([5439, 5443])('labels alone do not schedule a red team for #%s', pr => {
     expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toBeNull();

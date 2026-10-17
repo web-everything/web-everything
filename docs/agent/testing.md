@@ -54,6 +54,21 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+The drain owes a live-head red team only after a speculative or sequential pass is scheduled
+(recorded queued/running status or seat evidence). An accepting review payload alone does not
+schedule one. Card-only net diffs (including rename/copy sources) never owe a pass. A crashed
+scheduled pass without a result retains the 45-minute never-scheduled recovery path; active
+passes and recorded breaks cannot use it.
+
+`redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
+`WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
+The existing label provider provisions the known metadata and writes the mutually exclusive
+`red-team:pending`, `red-team:clear`, and `red-team:blocked` labels. They describe scheduling
+and the recorded disposition on the live head, never grant clearance. The conveyor's existing
+label sweep removes stale head labels and repairs missed status writes. Re-arm removes merge
+readiness and stale status labels atomically; missing-only re-arm preserves readiness only
+when a trusted acceptance marker still names the unchanged live head.
+
 Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
 Read the live head's recorded per-finding gate actions before consulting current policy:
 a card/advisory record releases that finding, while sent-back and round-cap records retain

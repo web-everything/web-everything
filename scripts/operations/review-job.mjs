@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
@@ -277,7 +278,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   });
   return {
     redTeamStatus: input => {
-      try { recordRedTeamStatus(input, { env }); }
+      try {
+        recordRedTeamStatus(input, { env });
+        syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload?.findings?.read?.netBasis?.rev,
+          evidence: readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head: input.loopPayload?.findings?.read?.netBasis?.rev, env }), env,
+          log: line => process.stderr.write(`${line}\n`) });
+      }
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
@@ -654,7 +660,6 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
-  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
@@ -689,6 +694,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   return out;
 }
 

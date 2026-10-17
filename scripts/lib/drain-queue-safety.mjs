@@ -1,5 +1,5 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamCardOnly } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -27,17 +27,18 @@ export function sendBackReason(labels) {
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
-/** The review scheduler's decision over its actual head-bound payload, never inferred from labels. */
-export function postAcceptRedTeamOwed(loopPayload, env = process.env) {
-  return redTeamEnabled(env) && redTeamOwedFor(loopPayload);
+/** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
+export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
+  if (redTeamCardOnly(loopPayload?.findings?.read)) return false;
+  return !!(evidence.scheduled || evidence.inFlight || evidence.recorded);
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks } = {}) {
+export function redTeamEnqueueHold({ loopPayload, comments, pr, head, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks });
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
-  if (!postAcceptRedTeamOwed(loopPayload, env) || disposition.result) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded }) || disposition.result) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

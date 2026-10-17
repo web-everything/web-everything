@@ -90,16 +90,22 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     expect(redTeamEnqueueHold({ loopPayload: payload('accept'), comments, pr: 10, head, env: {} })).toBeNull();
   });
 
-  it.each([true, false])('publishes head-bound liveness around the accepted pass (speculative=%s)', enabled => {
+  it.each([true, false])('records completion without inventing scheduling before the seat dispatch (speculative=%s)', enabled => {
     const events = [];
     const { io } = jobIo({ setting: { enabled }, over: {
       redTeamStatus: row => events.push(row),
-      finishSpeculativeRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
-      runRedTeam: () => { expect(events.at(-1)?.status).toBe('running'); return { status: 'ran' }; },
+      finishSpeculativeRedTeam: () => { expect(events).toEqual([]); return { status: 'ran' }; },
+      runRedTeam: () => { expect(events).toEqual([]); return { status: 'ran' }; },
     } });
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
-    expect(events.map(row => row.status)).toEqual(['running', 'finished']);
+    expect(events.map(row => row.status)).toEqual(['finished']);
     expect(events[0]).toMatchObject({ repo: REPO, pr: 10, loopPayload: { findings: { read: { netBasis: { rev: REV } } } } });
+  });
+  it('clears scheduling status when the review rejects and discards speculation', () => {
+    const events = [];
+    const { io } = jobIo({ verdict: 'changes', over: { redTeamStatus: row => events.push(row) } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(events).toEqual([expect.objectContaining({ status: 'finished', result: 'not-owed' })]);
   });
   it('starts the red team BEFORE the loop, hands the loop the read sink, and logs the layer that set the setting', () => {
     const { io, calls } = jobIo();

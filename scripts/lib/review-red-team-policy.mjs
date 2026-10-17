@@ -1,3 +1,4 @@
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
@@ -41,3 +42,11 @@ export function redTeamOwedFor(loopPayload) {
   return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
 }
 
+
+/** Net diff includes rename/copy sources; unknown paths cannot justify skipping. */
+export function redTeamCardOnly(read) {
+  const paths = Array.isArray(read?.netChangedFiles) && read.netChangedFiles.length
+    && (read.netRenameSources == null || Array.isArray(read.netRenameSources))
+    ? [...read.netChangedFiles, ...(read.netRenameSources ?? [])] : null;
+  return isCardOnlyDiff(paths);
+}
