@@ -61,7 +61,7 @@ import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { strictEnvInteger } from './daemon-boot-smoke.mjs';
-import { redactDetail, redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactDetail, redactedTail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
@@ -426,7 +426,7 @@ async function runRealDispatchSmokeAttempt({
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {
-    return { ...base, ok: false, reason: 'launch-failed', detail: redactSecrets(String(launch.stderr || launch.error?.message || '').trim().split('\n').slice(-3).join(' | ')), ms: Date.now() - t0 };
+    return { ...base, ok: false, reason: 'launch-failed', detail: redactedTail(String(launch.stderr || launch.error?.message || '').trim(), 3).split('\n').join(' | '), ms: Date.now() - t0 };
   }
   let launched = {};
   try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
@@ -472,7 +472,7 @@ async function runRealDispatchSmokeAttempt({
     wrapperPid, wrapperAliveAtTimeout: verdict.reason === 'timeout' ? probeAlive(wrapperPid) : null,
     launchStartedAt: new Date(t0).toISOString(),
     // Redacted and line-bounded at the source, so no consumer of the result can persist a raw token.
-    stderrTail: redactSecrets(readFileTail(join(scratch, 'wrapper.stderr')).trimEnd().split('\n').slice(-30).join('\n')),
+    stderrTail: redactedTail(readFileTail(join(scratch, 'wrapper.stderr'))),
     sessionAppeared: !!session, transcriptAppeared: !!transcript,
     firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
   };

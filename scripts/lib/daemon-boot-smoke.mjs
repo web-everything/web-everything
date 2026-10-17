@@ -55,7 +55,7 @@
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { redactSecrets } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactSecrets, redactedTail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 /** An env integer, strictly decimal digits; empty, blank, signed or hex values read as unset (never as 0). */
 export const strictEnvInteger = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v) : undefined);
@@ -185,9 +185,10 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
   } catch (e) {
     const signal = e?.signal ?? null;
     const exitCode = e?.status ?? e?.code ?? null;
-    const stderrTail = redactSecrets(String(e?.stderr ?? '').trimEnd().split(/\r?\n/).slice(-30).join('\n'));
+    // Redacted before the 30-line cut, so the cut never splits a secret; signal/exitCode lead, ahead of the line cap.
+    const stderrTail = redactedTail(e?.stderr);
     return { entry, ok: false, signal, exitCode, stderrTail,
-      error: `child failed: ${redactSecrets(firstLine(e))} (signal=${signal}, exitCode=${exitCode})${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
+      error: `child failed (signal=${signal}, exitCode=${exitCode}): ${redactSecrets(firstLine(e))}${stderrTail ? `\nstderr tail:\n${stderrTail}` : ''}` };
   }
   let parsed;
   try {
@@ -195,12 +196,17 @@ async function bootOneEntry(entry, { root, timeoutMs, runChild, env }) {
   } catch (e) {
     return { entry, ok: false, error: `unparsable child output: ${firstLine(e)}` };
   }
-  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : redactSecrets(parsed.error) };
+  return { entry, ok: !!parsed?.ok, error: parsed?.error === undefined ? undefined : redactSecrets(boundHead(parsed.error)) };
 }
 
 /** Each failed entry gets an equal share of the detail budget (its first and newest lines), so the redaction
  *  backstop's 16 KB cap never drops a later entry's name or signal. */
 const BOOT_DETAIL_BUDGET = 12_000;
+/** The first 8 KB of a child's own error text, cut at a line end so redaction never sees half a line. */
+function boundHead(text) {
+  const raw = String(text);
+  return raw.length > 8_000 ? raw.slice(0, 8_000).replace(/\n?[^\n]*$/, '') : raw;
+}
 function budgetedError(error, budget) {
   const text = String(error ?? '');
   return text.length > budget ? `${text.slice(0, 300)}\n…\n${text.slice(-(budget - 305))}` : text;
@@ -251,11 +257,13 @@ export async function checkDaemonEntriesBoot({ root, budgets = {}, runChild = ru
   const notes = retryNotes ? ` — ${retryNotes}` : '';
   const failures = results.filter((r) => !r.ok);
   if (failures.length) {
-    // The header names every failed entry and its signal; each failure then starts its own line.
-    const header = failures.map((f) => (f.signal || f.exitCode != null ? `${f.entry} (signal=${f.signal ?? null}, exitCode=${f.exitCode ?? null})` : f.entry)).join(', ');
+    // One header line per failed entry (name + signal survive the 500-char line cap), then each failure's own lines.
+    const header = failures.map((f) => `- ${f.signal || f.exitCode != null ? `${f.entry} (signal=${f.signal ?? null}, exitCode=${f.exitCode ?? null})` : f.entry}`);
     const budget = Math.max(1_000, Math.floor(BOOT_DETAIL_BUDGET / failures.length));
-    const detail = failures.map((f) => `${f.entry}: ${budgetedError(f.error, budget)}`).join('\n');
-    return { ok: false, entries: results, detail: `${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot: ${header}${notes}\n${detail}` };
+    const detail = failures.map((f) => `${f.entry}: ${budgetedError(f.error, budget)}`);
+    const retryLines = results.filter(r => r.attempts.length > 1)
+      .map(r => `${r.entry}: retried after ${r.attempts.slice(0, -1).map(a => a.signal).join(', ')}`);
+    return { ok: false, entries: results, detail: [`${overrideMarker}${failures.length}/${results.length} daemon entr${failures.length === 1 ? 'y' : 'ies'} failed to boot:`, ...header, ...retryLines, ...detail].join('\n') };
   }
   return { ok: true, entries: results, detail: `${overrideMarker}all ${results.length} daemon entries booted clean: ${results.map((r) => r.entry).join(', ')}${notes}` };
 }

@@ -9,6 +9,7 @@ import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
 import { dispatchSmokeSuspects } from '../daemon-rebuild/smoke.mjs';
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
+import { redactSecrets, redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -149,16 +150,33 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const sinks = [JSON.stringify(events), JSON.stringify(readRebuildState(f.cloneDir, f.env)), JSON.stringify(r.alerts)];
     for (const s of secrets) for (const sink of sinks) expect(sink).not.toContain(s);
   });
+  it('redactedTail redacts before it cuts: an orphaned PEM body, CR runs, and a hostile key=value run stay bounded', () => {
+    const body = Array.from({ length: 40 }, () => 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ');
+    const orphan = [...body.slice(-20), '-----END PRIVATE KEY-----', 'after'].join('\n');
+    expect(redactSecrets(orphan)).not.toContain('MIIEvQ');
+    expect(redactSecrets(orphan)).toContain('after');
+    const cut = redactedTail(['-----BEGIN PRIVATE KEY-----', ...body, '-----END PRIVATE KEY-----', 'x'.repeat(70 * 1024)].join('\n'));
+    expect(cut).not.toContain('MIIEvQ');
+    const crs = redactedTail(Array.from({ length: 30 }, () => 'p\r'.repeat(500)).join('\n'));
+    expect(crs.split('\n')).toHaveLength(30);
+    const t0 = Date.now();
+    redactedTail(Array.from({ length: 200 }, () => 'token'.repeat(400)).join('\n'), 200);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+  });
   it('bounds and redacts daemon-entries-boot tails without losing the last frames', async () => {
     const f = makeFixture();
     addDispatchOverlay(f);
     const tail = Array.from({ length: 30 }, (_, i) => `frame ${i} ${'q'.repeat(5_000)}`).join('\n');
+    // Long real-shaped entry paths, a long first message line, and a PEM key whose BEGIN line falls outside the tail.
+    const entries = ['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `skills-src/conveyor/some-long-daemon-entry-name-${x}.mjs`);
+    const pem = ['-----BEGIN PRIVATE KEY-----', ...Array.from({ length: 40 }, () => 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ'), '-----END PRIVATE KEY-----'].join('\n');
     const boot = await checkDaemonEntriesBoot({ root: f.cloneDir,
-      env: { [DAEMON_ENTRIES_ENV]: 'a.mjs,b.mjs,c.mjs,d.mjs,e.mjs,f.mjs' }, log: { error() {} },
-      runChild: async () => { throw Object.assign(new Error('native abort'), {
-        signal: null, status: 1, stderr: `sk-ant-api03-secretCCCC npm_secretDDDDDDDDDDDDDDDDDDDD\n${tail}`,
+      env: { [DAEMON_ENTRIES_ENV]: entries.join(',') }, log: { error() {} },
+      runChild: async () => { throw Object.assign(new Error(`native abort ${'m'.repeat(900)}`), {
+        signal: null, status: 1, stderr: `sk-ant-api03-secretCCCC npm_secretDDDDDDDDDDDDDDDDDDDD\n${pem}\n${'cr\r'.repeat(5_000)}\n${tail}`,
       }); },
     });
+    for (const e of boot.entries) expect(e.stderrTail.split('\n').length).toBeLessThanOrEqual(30);
     const result = await rebuildClone({ root: f.cloneDir,
       env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
       prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
@@ -167,8 +185,10 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const held = readRebuildState(f.cloneDir, f.env).held;
     const text = held.details[0].detail;
     // Every failed entry keeps its name and exit code, even past the cap.
-    for (const entry of ['a.mjs', 'b.mjs', 'c.mjs', 'd.mjs', 'e.mjs', 'f.mjs']) expect(text).toContain(`${entry} (signal=null, exitCode=1)`);
+    for (const entry of entries) expect(text).toContain(`${entry} (signal=null, exitCode=1)`);
     expect(text.match(/frame 29/g)).toHaveLength(6);
+    expect(text.match(/child failed \(signal=null, exitCode=1\)/g)).toHaveLength(6);
+    expect(text).not.toContain('MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ');
     expect(text).not.toContain('sk-ant-api03-secretCCCC');
     expect(text).not.toContain('npm_secretDDDDDDDDDDDDDDDDDDDD');
     expect(text).toContain('frame 29');

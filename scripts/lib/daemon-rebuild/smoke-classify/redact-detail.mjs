@@ -19,7 +19,7 @@ function redactLine(line) {
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g,
       (m) => `${m.match(/^(?:gh[pousr]_|github_pat_|glpat-|npm_|sk-ant-|sk-|AKIA|xox[baprs]-|AIza|eyJ)/)?.[0] ?? ''}<redacted>`)
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <redacted>')
-    .replace(/(["']?)(--?)?([A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|auth|credential)[A-Za-z0-9_-]*)\1(\s*[=:]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi,
+    .replace(/(["']?)(--?)?([A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|auth|credential)[A-Za-z0-9_-]{0,48})\1(\s*[=:]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi,
       (m, _q, dashes, key, sep) => (dashes || /[=:]/.test(sep) ? `${dashes ?? ''}${key}=<redacted>` : m));
 }
 
@@ -30,11 +30,23 @@ function redactLine(line) {
  */
 export function redactSecrets(text) {
   const normalised = String(text ?? '').replace(LINE_BREAKS, '\n').replace(CONTROLS, '')
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '<redacted private key>');
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '<redacted private key>')
+    // A key whose BEGIN line was cut off upstream: its base64 body lines up to the orphaned END line.
+    .replace(/(?:^[A-Za-z0-9+/=]{16,}\n)*-----END [A-Z ]*PRIVATE KEY-----/gm, '<redacted private key>');
   return normalised.split('\n').map((raw) => {
     const line = redactLine(raw.length > MAX_LINE * 4 ? raw.slice(0, MAX_LINE * 4) : raw);
     return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE - 1)}…` : line;
   }).join('\n');
+}
+
+/**
+ * The newest `lines` lines of untrusted output, made safe: bounded to its last 64 KiB (dropping the partial first
+ * line), redacted, and only THEN cut to `lines` — so a cut never splits a secret or a CR run before redaction sees it.
+ */
+export function redactedTail(text, lines = 30) {
+  let raw = String(text ?? '');
+  if (raw.length > 64 * 1024) raw = raw.slice(-64 * 1024).replace(/^[^\n]*\n?/, '');
+  return redactSecrets(raw).trimEnd().split('\n').slice(-lines).join('\n');
 }
 
 /** Boot diagnostics keep their stderr tails (the check itself budgets each failed entry; this is the backstop:
