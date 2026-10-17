@@ -1,6 +1,7 @@
 /** Scope-only stale preparation: bounded input and a strict, read-only verdict. */
 import { readField } from '../backlog/frontmatter.mjs';
 import { prepareCardStatus } from '../conveyor/prepare-result.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 
 export function lightRevalidationInput({ raw, scope, baseSha, policy, diff }) {
   if (policy.lightRevalidate === false || !prepareCardStatus(raw).hasSections) return null;
@@ -21,7 +22,8 @@ export function lightRevalidationInput({ raw, scope, baseSha, policy, diff }) {
     'Return ONLY JSON: {"verdict":"still-valid"|"needs-reprepare","reason":"one-line reason describing validity or what changed"}.',
     'Choose needs-reprepare if any preparation premise, design, scope, or test/proof plan needs revision, or evidence is insufficient.',
     `Prepared against ${sha}; inspected main base ${baseSha}.`,
-    '<card>', raw, '</card>', '<scope-diff>', patch, '</scope-diff>',
+    FENCED_DATA_RULE,
+    fenceUntrusted('material', `Card:\n${raw}\nScope diff:\n${patch}`),
   ].join('\n');
 }
 

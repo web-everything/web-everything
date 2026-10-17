@@ -1564,6 +1564,15 @@ card-only prepare PR lane; the builder waits for the stamp to land on main befor
 building. Light candidates are excluded from grouped prepares so each verdict
 covers exactly the card and diff inspected. No direct write to main is permitted.
 
+Regression coverage must pair dispatch eligibility with age-stale and policy-disabled
+false cases, and exercise light candidates in both group-lead and group-member positions.
+Drive each read-only refusal guard independently (card text, HEAD, hooks, and numstat),
+asserting discard and no stamp, commit, or PR. A failed stamp after `still-valid` must
+retry full preparation with the original dispatched provider, model, and effort; the
+result's scorecard and PR attribution follow whichever worker completed preparation.
+Prompt evidence uses the shared `fenceUntrusted` helper and `FENCED_DATA_RULE`; test
+closing-tag injection in both the card and diff, including mixed case and whitespace.
+
 ## Review scratch disk retention
 
 Review seats use independent shallow pinned checkouts: a released lane's objects cannot be

@@ -2217,6 +2217,23 @@ describe('automatic item preparation', () => {
       }
     } finally { log.mockRestore(); }
   });
+  it.each([undefined, true, false].flatMap(enabled => [
+    ['scope changed since aaaa1111: scripts/a.mjs', enabled, enabled !== false],
+    ['prepared 2026-10-01 16d ago', enabled, false],
+  ]))('dispatches scope/age hold %s with light policy %s as light=%s', async (detail, enabled, lightRevalidate) => {
+    const effects = fixture();
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: enabled === undefined ? {} : { lightRevalidate: enabled } });
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966', preparedDate: '2026-10-01', preparedAgainstSha: 'aaaa1111' }],
+      held: [{ num: '5966', reason: 'prepare-stale', detail }],
+    } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched.map(r => r.num)).toEqual(['5966']);
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      num: '5966', launchKind: 'prepare-item', lightRevalidate,
+    }));
+  });
   it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
     const effects = fixture();
     effects.now = () => Date.parse('2026-10-16T20:53:36Z');
@@ -4230,6 +4247,26 @@ describe('grouped PREPARE daemon ticks', () => {
   }
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'bdd-group-prepare-')); });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+  it.each(['lead', 'member'])('excludes a scope-stale light candidate from grouped prepare as %s', async position => {
+    const effects = fixture();
+    const stale = position === 'lead' ? rows[0] : rows[1];
+    const spawns = position === 'lead' ? [stale, rows[1]] : [rows[0], stale];
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.loadGroupingCards = vi.fn(async () => rows.map(r => ({ ...r, kind: 'story', size: 1 })));
+    effects.planTick = () => ({ decisions: { spawnPrepareItems: spawns, admission: { queue: rows, held: rows.map(r => ({
+      num: r.num, reason: r === stale ? 'prepare-stale' : 'needs-prepare',
+      ...(r === stale ? { detail: 'scope changed since aaaa1111: scripts/a.mjs' } : {}),
+    })) } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toHaveLength(1);
+    expect(tick.prepare.groups[0].lead).not.toBe(stale.num);
+    expect(tick.prepare.groups[0].members).not.toContain(stale.num);
+    const launches = effects.dispatch.mock.calls.map(([request]) => request);
+    expect(launches.find(r => r.num === stale.num)).toMatchObject({ launchKind: 'prepare-item', lightRevalidate: true });
+    expect(launches.find(r => r.num === stale.num).groupMembers).toBeUndefined();
+    expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
+  });
 
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
     const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));

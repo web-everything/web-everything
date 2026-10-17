@@ -871,21 +871,39 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
-  it.each(['still-valid', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered'])(
+  it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
+    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini'])(
     'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
       const { io, calls } = prepareIo();
       const initial = prepared.replace('---\n', '---\npreparedDate: "2026-10-16"\npreparedAgainstSha: "aaaa1111"\n');
       let current = initial;
       let runs = 0;
       const tasks = [];
+      const workerArgv = [];
+      const scorecards = [];
+      const retry = mode.startsWith('stamp-retry-');
+      const originalWorker = ['stamp-retry-gemini', 'still-valid-gemini', 'tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode)
+        ? { ...args(undefined, { taskType: 'prepare', worker: 'antigravity-gemini' }).worker, effort: 'high' }
+        : { ...prepareArgs().worker, effort: 'high' };
+      io.appendScorecard = row => scorecards.push(row);
+      const prWorkers = [];
+      io.writePrBody = (_dir, data) => { prWorkers.push(data.worker); return '/lanes/22/.pr-body.md'; };
+      io.diffText = () => 'card preparation diff';
+      io.runChecker = () => 'APPROVE';
+      const snapshot = io.snapshotHookSurface;
+      io.snapshotHookSurface = (...a) => mode === 'hooks-changed' && runs > 0
+        ? { configHash: 'clean', files: { 'pre-commit': 'planted' } } : snapshot(...a);
+      io.headSha = () => mode === 'head-moved' && runs > 0 ? 'worker-commit' : 'base-sha';
       io.findItem = () => ({ path, raw: current, spec: current, scope: ['we:docs/probation/probation.md'], slug: 'example' });
       io.preparePolicy = { autoSize: false, lightRevalidate: mode !== 'disabled', lightRevalidateMaxDiffLines: 2 };
       io.prepareScopeDiff = () => mode === 'over-cap' ? 'a\nb\nc\n' : 'a\nb\n';
-      io.diffNumstat = () => current === initial ? '' : `2\t0\t${path}`;
+      io.diffNumstat = () => mode === 'numstat-changed' && runs > 0 ? '1\t0\tdocs/unauthorized.md'
+        : current === initial ? '' : `2\t0\t${path}`;
       io.writeTaskFile = (_d, name, text) => { tasks.push({ name, text }); return name; };
       io.writeCard = (_d, _p, text) => { current = text; };
       io.runWorker = argv => {
         runs++;
+        workerArgv.push(argv);
         if (argv.includes('--task-file=prepare-light-revalidate.md')) {
           expect(argv).toContain('--effort=low');
           expect(argv).toContain('--model=gpt-6.1-sol');
@@ -894,30 +912,47 @@ describe('standalone prepare', () => {
             verdict: mode === 'needs-reprepare' ? 'needs-reprepare' : 'still-valid', reason: 'Scope changes preserve the plan.' }) };
         }
         current += '\nFull preparation revised.';
-        return { ok: true, lastMessage: 'Prepared.' };
+        return { ok: true, lastMessage: 'Prepared.', modelEvidence: { servedModel: originalWorker.model } };
       };
       io.stampPrepare = () => {
         calls.push(['stamp']);
+        if (retry && calls.filter(c => c[0] === 'stamp').length === 1) return { ok: false, out: 'Missing test scope' };
         current = current.replace('aaaa1111', 'base-sha');
         return { ok: true };
       };
-      const result = await runProbationBuild({ ...prepareArgs(), lightRevalidate: true }, io);
-      if (mode === 'tampered') {
-        expect(result.detail).toContain('revalidation changed the checkout');
+      const result = await runProbationBuild({ ...prepareArgs(), worker: originalWorker, lightRevalidate: true }, io);
+      if (['tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode)) {
+        expect(result).toMatchObject({ outcome: mode === 'hooks-changed' ? 'escalated-needs-human' : 'gate-red',
+          detail: expect.stringContaining(mode === 'hooks-changed' ? 'revalidation changed hooks' : 'revalidation changed the checkout') });
         expect(calls.some(c => ['stamp', 'commit', 'openPr'].includes(c[0]))).toBe(false);
+        expect(calls.some(c => c[0] === 'discard')).toBe(true);
+        expect(runs).toBe(1);
+        expect(result.executor).toBe('codex');
+        expect(scorecards[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
+        if (mode === 'hooks-changed') expect(calls.filter(c => c[0] === 'reset-hooks')).toHaveLength(2);
         return;
       }
       expect(result).toMatchObject({ outcome: 'opened-pr' });
       expect(current).toContain('preparedAgainstSha: "base-sha"');
-      if (mode === 'still-valid') {
+      if (mode.startsWith('still-valid')) {
         expect(runs).toBe(1);
         expect(current).toContain('revalidated: Scope changes preserve the plan.');
+        expect(result.executor).toBe('codex');
+        expect(scorecards[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
+        expect(prWorkers[0]).toMatchObject({ executor: 'codex', model: 'gpt-6.1-sol', effort: 'low' });
         const { prepareStaleness } = await import('../../readiness/dispatch-plan.mjs');
         expect(prepareStaleness({ preparedDate: '2026-10-17', preparedAgainstSha: 'base-sha',
           prepDrift: { stale: false } }, { today: '2026-10-17', maxAgeDays: 3 })).toBeNull();
       } else {
         expect(current).toContain('Full preparation revised.');
         expect(runs).toBe(['over-cap', 'disabled'].includes(mode) ? 1 : 2);
+      }
+      if (retry) {
+        expect(workerArgv[1][0]).toBe(`/lanes/22/${originalWorker.launcher}`);
+        expect(workerArgv[1]).toEqual(expect.arrayContaining([`--model=${originalWorker.model}`, '--effort=high',
+          '--task-file=probation-build-task.md']));
+        expect(scorecards[0]).toMatchObject({ executor: originalWorker.executor, model: originalWorker.model });
+        expect(prWorkers[0]).toEqual(originalWorker);
       }
       expect(calls.find(c => c[0] === 'commit')[1]).toEqual([path]);
       expect(tasks.find(t => t.name === 'prepare-light-revalidate.md')?.text ?? '').toContain(
