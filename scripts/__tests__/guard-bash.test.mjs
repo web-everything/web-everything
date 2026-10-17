@@ -584,9 +584,19 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     // a paren in a comment, a case arm or a ${…} body cannot be counted: main's resolution
     expect(at('( case x in a) true;; esac\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
     expect(at('(\necho ${x//)/}\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
-    expect(at('( true # )\nHOME=/q\n)\ncd ~/x')).toBe(`${REPORTED}/~/x`);
-    expect(at('true # (\nHOME=/q\ntrue # )\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    // a comment's paren is comment text: the subshell stays open, or there is none
+    expect(at('( true # )\nHOME=/q\n)\ncd ~/x')).toBe(`${HOME}/x`);
+    expect(at('true # (\nHOME=/q\ntrue # )\ncd ~/x')).toBe('/q/x');
     expect(at('( case x in a) true;; esac\ncd ~/x\n)\ngit status')).toBe(`${REPORTED}/~/x`);
+    // a paren inside "$( … )" or backticks, a body that may never run, or a conditional: main's resolution
+    expect(at('echo "$(echo "(")"; HOME=/q; echo "$(echo ")")"; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('x=`(true`; HOME=/q; y=`)`; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('f() { true; HOME=/q; }; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('f() {\nHOME=/q\n}\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('while false; do\nHOME=/q\ndone\ncd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('false && HOME=/q; cd ~/x')).toBe(`${REPORTED}/~/x`);
+    expect(at('[ -d /q ] || D=~/x; cd "$D"')).toBe(`${REPORTED}/~/x`);
+    expect(at('cd ~/x & git status')).toBe(`${REPORTED}/~/x`);
     // text after the first cd never steers it
     expect(at('cd ~/x && git status # (note')).toBe(`${HOME}/x`);
     // a cd in a child shell, or a target that leaks an operator, is never home-expanded

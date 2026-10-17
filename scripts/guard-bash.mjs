@@ -2843,25 +2843,38 @@ function homeAfter(stmt, home) {
 // The first `cd`'s target when it is reached through a home expansion — a home-spelled target, or a whole
 // `$VAR` whose value expanded `~`/`$HOME` (each assignment reads the HOME in effect at its own statement) —
 // else null, and `resolveEffectiveCwd` keeps main's literal-variable resolution. A statement in a child shell
-// (a subshell, a `$( … )`, a pipeline member) never changes the parent's HOME or variables; a background `&`
-// is not visible in the segments, so a command with one keeps main's resolution.
+// (a subshell, a `$( … )`, a pipeline member) never changes the parent's HOME or variables. Anything before
+// the cd whose scope or whether it runs cannot be read here — `&&`/`||`, a background `&`, a compound command
+// or function body, a backtick, a `${…}` paren — keeps main's resolution.
+const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\$\\{[^}]*[()]|\\w\\s*\\(\\s*\\)'
+  + '|(?:^|[\\s;&|()])(?:if|then|else|elif|fi|while|until|for|select|do|done|function|case|esac|coproc|[{}])(?=[\\s;&|()]|$)');
 function homeCdTarget(cmd, { segments, pipedFrom }, home) {
-  const masked = maskQuotedKeepingExpansions(cmd);
-  if (/(?:^|[^&<>])&(?![&>])/.test(masked)) return null;
+  // Only plain statements up to the first cd are read: their spans in the text, quotes and comments blanked.
+  const masked = maskQuoted(cmd);
+  const spans = [];
+  for (const stmt of segments) {
+    const at = cmd.indexOf(stmt, spans.length ? spans.at(-1)[1] : 0);
+    if (at < 0) return null;
+    spans.push([at, at + stmt.length]);
+    if (/^cd\s/.test(stmt.trim())) break;                       // nothing after the first cd steers it
+  }
+  const end = spans.at(-1)?.[1] ?? 0;
+  const prefix = cmd.slice(0, spans.at(-1)?.[0] ?? 0);           // the statements before the cd
+  // A backtick, or a `$(` beside double quotes (whose nested quotes the mask cannot pair), hides its parens.
+  if (prefix.includes('`') || (prefix.includes('$(') && prefix.includes('"'))) return null;
+  if (UNREADABLE_SCOPE.test(masked.slice(0, end))) return null;
+  if (/^\s*&(?![&>])/.test(masked.slice(end))) return null;     // a backgrounded cd
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   const homes = [];
   const child = [];
   let depth = 0;
-  for (const [i, stmt] of segments.entries()) {
-    const text = maskQuotedKeepingExpansions(stmt).trim();
-    // A paren in a comment, a `case` arm or a `${…}` body is no child shell; the count cannot read those.
-    if (/#|(?:^|[^\w$])(?:case|esac)(?!\w)|\$\{[^}]*[()]/.test(text)) return null;
+  for (const [i, [from, to]] of spans.entries()) {
+    const text = masked.slice(from, to).trim();
     child.push(depth > 0 || /^\((?!\()/.test(text) || !!pipedFrom[i] || !!pipedFrom[i + 1]);
     for (const ch of text) {
       depth += ch === '(' ? 1 : ch === ')' ? -1 : 0;
       if (depth < 0) return null;
     }
-    if (/^cd\s/.test(stmt.trim())) break;                       // nothing after the first cd steers it
   }
   for (const [i, stmt] of segments.entries()) {
     homes.push(currentHome);
