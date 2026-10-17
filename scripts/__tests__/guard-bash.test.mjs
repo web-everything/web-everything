@@ -666,6 +666,18 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at(`echo ${'${'.repeat(40000)}`)).toBe(REPORTED);
     expect(Date.now() - started).toBeLessThan(2000);
   });
+  it('every rebinding scanner stays linear on hostile runs', () => {
+    const n = 40000;
+    for (const cmd of [
+      `D="${'${'.repeat(n)}"; cd ~/x`, `D="${'${x}'.repeat(n)}"; cd ~/x`, `D=1 ${'a '.repeat(n)}; cd ~/x`,
+      `(( ${'D=1,'.repeat(n)} )); cd ~/x`, `x=$((${'(D'.repeat(n)})); cd ~/x`, `HOME=/a ${'X=1 '.repeat(n)}; cd ~/x`,
+      `true ${'{D}'.repeat(n)}; cd "$D"`, `read ${'D '.repeat(n)}; cd "$D"`, `${'D=~/x; X=1; '.repeat(4000)}cd "$D"`,
+    ]) {
+      const started = Date.now();
+      at(cmd);
+      expect(Date.now() - started, cmd.slice(0, 20)).toBeLessThan(2000);
+    }
+  });
   it('an ordinary variable with no home-derived value keeps main\'s literal resolution, never erased', () => {
     for (const rebind of ['D+=/b', 'export D+=/b', 'D+=$(pwd)', 'X=1 D=/b', 'D[0]=/b', 'read D <f',
       'printf -v D %s /b', 'declare D=/b', 'unset D', 'eval "D=/b"', 'D=(/b)', 'D=/b true',
