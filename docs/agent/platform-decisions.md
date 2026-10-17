@@ -6274,3 +6274,36 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 
 **Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Review findings are classed from a closed list; the class and level pick one of four outcomes; debt gates the level move {#review-stringency-classified-outcomes}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
+(`#xugqjw1`).** The operator's words: *"Ok for your picks"*. Composes with, and does not replace,
+[claim-accuracy-advisory-blocks-on-impact](#claim-accuracy-advisory-blocks-on-impact),
+[delivery-decider-under-fixed-settings](#delivery-decider-under-fixed-settings) (the always-block rows are the
+invariants that already win) and the deterministic-core rule.
+
+**The rule:**
+1. **Class source.** The reviewer tags the class from a closed list; a path or pattern rule table overrides the
+   tag. Low reviewer confidence caps the outcome at advisory, except for always-block classes. An unknown class
+   or a gap in the table is a block (fail closed).
+2. **Outcomes.** Four: block (cannot land), expedite (the PR lands; the card goes to the top of the build queue
+   with a deadline; past it, it goes to the operator as needs-you; the deadline length is a setting), debt (the
+   PR lands; a normal-priority card due before a level), advisory (recorded in the ledger, never fixed per PR;
+   recurring classes become builder lessons).
+3. **Table.** Outcome per class and level (internal delivery, dogfood, public preview, public release). Always
+   block: delivery stability, weakened or fail-open guards, irreversible data loss or scope violation or
+   nonexistent package, exposed secret, missing test on guard or delivery code. Others: missing test elsewhere
+   E,B,B,B; high-severity security E,E,B,B; lower-severity security D,D,B,B; standards conformance E,E,B,B; PR
+   description wrong about what the change does E,E,E,B (revisit once a cheap description-only round exists);
+   doc or card drift D,D,D,B; simplicity and style A,A,A,D. The full table lives in the settings file.
+4. **Level gate.** A level move is blocked while debt due at that level is open. The only ways past are paying it
+   or an operator's recorded edit of that item's must-pay-before level.
+5. **Debt is a backlog kind `debt`**, registered together with its size rule, buildable rule and every
+   kind-set reference; else kind `task` plus debt fields.
+6. **Settings.** Every cell and value is a cascade setting with its source logged. Current level: internal
+   delivery. Only the operator changes the level, an invariant row, or loosens a cell. Advisory lessons:
+   `advisory.lessons.enabled` (on), `.schedule` (Sunday 20:00 ET), `.recurrenceThreshold` (5 per class per
+   week), `.promoteToRule` (proposed to the operator, never automatic).
+
+**Lineage:** `#xugqjw1` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
