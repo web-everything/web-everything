@@ -208,18 +208,19 @@ export function readDispatchOutcome(text) {
     }
     return { dispatching: false, reason: 'no verdict in dispatch-lane output' };
   }
-  const result = { dispatching: false, reason: verdict.reason ?? verdict.why ?? null,
+  const reason = verdict.reason ?? verdict.why;
+  const result = { dispatching: false, reason: reason == null ? null : redactSpawnText(reason),
     lane: verdict.lane ?? null, sessionSlug: verdict.sessionSlug ?? null };
   // A planner declining to launch (lane cap, plan re-read race, freeze) is a typed refusal, not a failed
   // prepare: the caller retries next tick instead of holding. Only launch/parse failures fall through untyped.
   if (!verdict.dispatching) return { ...result, refused: true };
   const effect = run.effects?.find(e => e.type === 'conveyor.dispatch-delivery-agent');
-  if (effect?.error) return { ...result, reason: effect.error };
+  if (effect?.error) return { ...result, reason: redactSpawnText(effect.error) };
   if (!effect || !['in-flight', 'applied'].includes(effect.status)
     || typeof effect.handle !== 'string' || !effect.handle.trim()) {
     return { ...result, reason: `dispatch launch not confirmed (${effect?.status ?? 'missing effect'}; no running session)` };
   }
-  return { ...result, dispatching: true, handle: effect.handle };
+  return { ...result, dispatching: true, handle: redactSpawnText(effect.handle) };
 }
 
 /**
@@ -499,10 +500,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
         if (st.outcome?.dispatching) continue;
-        // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
-        // `failPrepare`/`failures`, declared further down.
+        // Persist before planning/launching again: the threshold must suppress this tick's retry too.
+        const failureRecord = !isPrepare ? effects.recordBuildFailure?.({ num, reason: st.outcome?.reason ?? 'not dispatched', output: st.outcome?.output ?? st.outcome?.reason, base: st.base }) : null;
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
-        deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt });
+        deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt, failureRecord });
       }
     } catch (e) { launchSettlement.error = String(e?.message || e).split('\n')[0]; }
   }
@@ -823,6 +824,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
+  const surfaceUnconfirmed = (num, rec) => {
+    if (!rec?.unconfirmedCooldown) return;
+    if (needsYou.some(n => n.num === normNum(num) && n.step === 'launch-confirmation')) return;
+    needsYou.push({ num: normNum(num), step: 'launch-confirmation',
+      reason: `unconfirmed-launch-cooldown: #${normNum(num)} on base ${rec.base ?? 'unknown'} after ${rec.unconfirmedLaunches} unconfirmed launches; retry after ${rec.retryAfter}; last launch evidence: ${rec.output}` });
+  };
+  for (const rec of buildBackoffs) surfaceUnconfirmed(rec.num, rec);
   for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num) && !released.has(normNum(num))) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
@@ -970,7 +978,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           claimed = false;
           effects.releaseClaim({ num: pick.num });
           releaseMembers();
-          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
+          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason, base: res?.base });
+          surfaceUnconfirmed(pick.num, rec);
           if (live) surfaceCardRefusal(pick.num, rec, res);
           failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
         }
@@ -1075,7 +1084,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
-      const rec = live ? effects.recordBuildFailure?.({ num: f.num, reason: f.outcome?.reason ?? 'not dispatched', output: f.outcome?.output ?? f.outcome?.reason }) : null;
+      const rec = f.failureRecord;
+      surfaceUnconfirmed(f.num, rec);
       if (live) surfaceCardRefusal(f.num, rec, f.outcome);
       failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched', ...(f.outcome?.stepRefused ? { step: f.outcome.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
     }
@@ -1860,14 +1870,15 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
 
 export function cliDispatch(args, { exec = execFileSync } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
+  const base = launchBase();
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
     const text = exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT, env });
-    return readDispatchOutcome(text);
+    return { ...readDispatchOutcome(text), base };
   } catch (e) {
     if (e?.stdout) {
       const outcome = readDispatchOutcome(e.stdout);
-      if (!outcome.dispatching && outcome.reason && !['unparseable dispatch-lane output', 'no verdict in dispatch-lane output'].includes(outcome.reason)) return outcome;
+      if (!outcome.dispatching && outcome.reason && !['unparseable dispatch-lane output', 'no verdict in dispatch-lane output'].includes(outcome.reason)) return { ...outcome, base };
     }
     // Redact BEFORE cutting (a cut inside `--settings {"env":{"GH_TOKEN":"…` leaves a credential no pattern can match):
     // this reason is persisted in the failure ledgers and printed in the tick result.
@@ -1879,16 +1890,21 @@ export function cliDispatch(args, { exec = execFileSync } = {}) {
 
 const pendingLaunchesRoot = () => join(resolveCoordinationRoot(), PENDING_LAUNCHES_DIRNAME);
 
+function launchBase() {
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 5000, maxBuffer: 4096 }).trim(); }
+  catch { return null; } // unknown bases share a conservative bucket
+}
+
 /**
  * 78b — the NON-BLOCKING launch: spawn `dispatch-lane` detached, record it, return at once. The caller's claim stays
  * held; a later tick settles the launch ({@link cliSettleLaunches}). `pending: true` marks the result as "started,
  * not yet confirmed" — never a failure.
  */
-export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot() } = {}) {
+export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot(), readBase = launchBase } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
-    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
+    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', base: readBase(), argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
     return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
   } catch (e) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -1902,12 +1918,12 @@ export async function cliSettleLaunches({ root = pendingLaunchesRoot(), isPidAli
   for (const s of settled) {
     if (!s.outcome.dispatching && /launch not confirmed/.test(s.outcome.reason ?? '') && confirmed) {
       try {
-        if (await confirmed({ num: s.record.num, kind: s.record.kind })) s.outcome = { ...s.outcome, dispatching: true, confirmedBy: 'live-session' };
+        if (await confirmed({ num: s.record.num, kind: s.record.kind })) s.outcome = { ...s.outcome, dispatching: true, reason: null, confirmedBy: 'live-session' };
       } catch { /* an unreadable liveness stays a failure the next attempt retries */ }
     }
   }
   return { pending: pending.map((r) => ({ num: r.num, kind: r.kind, pid: r.pid, startedAt: r.startedAt })),
-    settled: settled.map((s) => ({ num: s.record.num, kind: s.record.kind, attempt: s.record.attempt, outcome: s.outcome })) };
+    settled: settled.map((s) => ({ num: s.record.num, kind: s.record.kind, base: s.record.base ?? null, attempt: s.record.attempt, outcome: s.outcome })) };
 }
 
 /** A launch whose result file said "not confirmed" still counts as launched when a live run-store row exists for it. */

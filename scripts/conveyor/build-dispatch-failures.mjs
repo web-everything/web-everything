@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE, QUICK_RETRY_REASON_CODES } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+import { readBuildUnconfirmedSettings } from '../lib/build-unconfirmed-settings.mjs';
 import { normNum } from './queue-store.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
@@ -66,7 +67,7 @@ export function claimAttemptKeys(claims, lead) {
  * charge. Late-launch (quick-schedule) attempts are counted apart from real failures: the history is retained across a
  * confirmed launch, and lateness must not spend the card's failure budget (PR #5453).
  */
-export function recordBuildFailure({ num, reason, output, attemptKey }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
+export function recordBuildFailure({ num, reason, output, base = null, attemptKey }, { path = buildFailurePath(), now = Date.now(), settings = readBackoffSettings(), unconfirmed = readBuildUnconfirmedSettings() } = {}) {
   const state = read(path);
   const key = String(num);
   const prev = state.items[key];
@@ -89,6 +90,11 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   const rawText = String(output ?? reason ?? '').trim();
   const text = redactSpawnText(rawText);
   const reasonCode = buildEvidenceReasonCode({ reason: reason ?? rawText }) ?? (rawText ? 'dispatch-failed' : 'empty-failure-output');
+  // Test the original diagnostic: effect-in-flight can otherwise classify this as a quick retry.
+  const notConfirmed = /^(?:dispatch )?launch not confirmed\b/i.test(reason ?? rawText);
+  const prior = state.items[key];
+  const unconfirmedLaunches = (prior?.base === base ? prior?.unconfirmedLaunches ?? 0 : 0) + (notConfirmed ? 1 : 0);
+  const cooldown = notConfirmed && unconfirmedLaunches >= unconfirmed.unconfirmedLaunchMax;
   // builder-starved — a clone-wide refusal (the daemon's own clone is behind origin/main) is not the card's
   // failure: nothing is persisted, no attempt is charged, and the card is not withheld.
   if (isCloneWideReasonCode(reasonCode)) {
@@ -100,8 +106,12 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
   const counts = prev ? (prev.scheduleAttempts ?? { [scheduleOf(prev.reasonCode)]: prev.attempts ?? 0 }) : {};
   const schedule = scheduleOf(reasonCode);
   const attempts = (counts[schedule] ?? 0) + 1;
+  // A cooldown may extend a retry window, but must never revive an exhausted card.
+  const verdict = reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true }
+    : backoffVerdict({ attempts, now, settings, code: reasonCode });
   const record = {
     num: key, attempts,
+    base, unconfirmedLaunches,
     scheduleAttempts: { ...counts, [schedule]: attempts },
     ...(aliases.length || chargedKeys.length ? { attemptKeys: keepKeys(aliases) } : {}),
     reasonCode,
@@ -109,7 +119,9 @@ export function recordBuildFailure({ num, reason, output, attemptKey }, { path =
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
     // A card-level refusal is permanent: it is withheld at once (exhausted), not re-tried on a cooldown.
-    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings, code: reasonCode })),
+    ...verdict,
+    ...(cooldown && !verdict.exhausted ? { unconfirmedCooldown: true,
+      retryAfter: new Date(now + unconfirmed.unconfirmedCooldownMin * 60_000).toISOString() } : {}),
   };
   state.items[key] = record;
   save(state, path);
@@ -131,7 +143,8 @@ export function listBuildBackoffs({ path = buildFailurePath(), now = Date.now() 
     .filter(r => !isCloneWideReasonCode(r.reasonCode))
     .filter(r => r.exhausted || (r.retryAfter && Date.parse(r.retryAfter) > now))
     .map(r => ({ num: r.num, reason: r.exhausted ? 'dispatch-backoff-exhausted' : 'dispatch-backoff', reasonCode: r.reasonCode,
-      attempts: r.attempts, retryAfter: r.retryAfter ?? null }));
+      attempts: r.attempts, retryAfter: r.retryAfter ?? null,
+      ...(r.unconfirmedCooldown ? { unconfirmedCooldown: true, base: r.base, unconfirmedLaunches: r.unconfirmedLaunches, output: r.output, reason: 'unconfirmed-launch-cooldown' } : {}) }));
 }
 
 /** Operator/product re-arm: drop exhausted (or all) build failure records so the cards dispatch again. */
