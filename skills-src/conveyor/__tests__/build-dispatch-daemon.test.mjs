@@ -1836,7 +1836,7 @@ describe('automatic item preparation', () => {
       const search = args[args.indexOf('--search') + 1];
       searches.push(search);
       const row = rows.find(row => search === `head:lane/${row.num}` || search === `head:lane/${row.bornAs}`
-        || search === `in:title "WE #${row.num}: prepare"`);
+        || search === `in:title "prepare" "${row.num}"`);
       return JSON.stringify(row !== rows.at(-1) ? [{ number: Number(row.num), state: 'MERGED',
         headRefName: `lane/${row.num}-prepare-design`, mergedAt: '2026-10-16T22:40:00Z' }] : []);
     } });
@@ -2269,7 +2269,7 @@ describe('automatic item preparation', () => {
         const kind = mode === 'on' ? 'prepare-item' : 'prepare';
         const prefix = `build-dispatch-daemon: ${kind} launch of #4501 ${admit ? 'admitted:' : 'deferred ('}`;
         expect(log.mock.calls.some(([line]) => line.startsWith(prefix)
-          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from}) · mergedGuardHours=24 (from standard)`))).toBe(true);
+          && line.endsWith(` · runner=${runner} (prepare.runner=${runner} from ${from}) · batchSize=6 (from standard) · batchParallel=true (from standard) · batchMaxParallel=3 (from standard) · aheadCount=20 (from standard) · mergedGuardHours=24 (from standard)`))).toBe(true);
       } finally { log.mockRestore(); }
     });
   it('passes its tick to dispatch-lane', async () => {
@@ -3526,13 +3526,13 @@ describe('runBuildDispatchTick — queue prune wiring', () => {
 
 describe('card 80 — prepare just in time (daemon wiring)', () => {
   it('policyFrom declares the two settings with defaults, flag/env overrides and an off switch', () => {
-    expect(policyFrom({}, {})).toMatchObject({ prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(policyFrom({}, {})).toMatchObject({ prepareAheadWindow: 20, preparedMaxAgeDays: 3 });
     expect(policyFrom({ 'prepare-ahead-window': '2' }, { WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS: '7' })).toMatchObject({ prepareAheadWindow: 2, preparedMaxAgeDays: 7 });
     expect(policyFrom({ 'prepare-ahead-window': 'off', 'prepared-max-age-days': 'off' }, {})).toMatchObject({ prepareAheadWindow: null, preparedMaxAgeDays: null });
   });
 
   it('planConfigFrom passes only the settings that are on', () => {
-    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ launchKinds: ['prepare-item'], prepareAheadWindow: 20, preparedMaxAgeDays: 3 });
     expect(planConfigFrom(policyFrom({ 'prepare-ahead-window': 'off' }, {}))).toEqual({ launchKinds: ['prepare-item'], preparedMaxAgeDays: 3 });
   });
 
@@ -3551,7 +3551,7 @@ describe('card 80 — prepare just in time (daemon wiring)', () => {
       killSwitch: () => ({ engaged: false }),
     };
     await runBuildDispatchTick({ live: false, effects, policy: policyFrom({}, {}) });
-    expect(seen).toEqual({ config: { launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 } });
+    expect(seen).toEqual({ config: { launchKinds: ['prepare-item'], prepareAheadWindow: 20, preparedMaxAgeDays: 3 } });
   });
 
   it('the status reader reads an older main stamp as UNPREPARED for a newer re-prepare claim, and looks for its PR', () => {
@@ -4087,7 +4087,8 @@ describe('grouped BUILD daemon ticks', () => {
 
   it.each(['build', 'prepare-item'])('threads groupMembers to dispatch-lane argv (%s)', launchKind => {
     const exec = vi.fn(() => JSON.stringify({ dispatching: true }));
-    cliDispatch({ num: '7101', groupMembers: ['7102', '7103'], launchKind }, { exec });
+    cliDispatch({ num: '7101', groupMembers: ['7102', '7103'], launchKind, batchExternalCap: 2 }, { exec });
+    expect(exec.mock.calls[0][2].env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL).toBe('2');
     expect(exec.mock.calls[0][1]).toContain('--groupMembers=7102,7103');
   });
 
@@ -4132,6 +4133,28 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204'] })]);
     expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ launchKind: 'prepare-item', groupMembers: ['7202', '7203', '7204'] }));
     expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches one six-card batch and keeps the seventh outside an aheadCount=6 window', async () => {
+    const queue = Array.from({ length: 7 }, (_, i) => ({ num: String(7301 + i), scope: [`we:scripts/batch${i}.mjs`] }));
+    const effects = fixture({ queue, spawns: [queue[0]] });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: { aheadCount: 6 } });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledTimes(1);
+    expect(tick.prepare.launched[0].groupMembers).toEqual(['7302', '7303', '7304', '7305', '7306']);
+    expect(effects.listPrepareClaims()).toHaveLength(6);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7307');
+  });
+
+  it('uses build.priority before queue order when choosing members and leaves overlaps for another batch', async () => {
+    const queue = rows.map(r => ({ ...r }));
+    queue[4].buildPriority = 0;
+    queue[2].scope = queue[4].scope;
+    const effects = fixture({ queue, spawns: [queue[4]] });
+    effects.preparePolicy = () => resolvePreparePolicy({ tool: { aheadCount: 3 } });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.launched[0]).toMatchObject({ num: '7205', groupMembers: ['7201', '7202'] });
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
   });
 
   // PR #5366 review round 5 self-review: a card held out of tick-core for a fresh launch refusal (an open prepare
@@ -4312,11 +4335,40 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.retired).toContainEqual({ num: '7202', why: 'prepared on main', released: true });
   });
 
-  it('drops failed member claims and releases members when the surviving group is too small', async () => {
+  it('drops a failed claim while keeping the remaining batch member', async () => {
     const effects = fixture({ queue: rows.slice(0, 3), refuse: ['7203'] });
     await runBuildDispatchTick({ live: true, effects });
-    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
-    expect(effects.listPrepareClaims().map(c => c.meta.num)).toEqual(['7201']);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers).toEqual(['7202']);
+    expect(effects.listPrepareClaims().map(c => c.meta.num).sort()).toEqual(['7201', '7202']);
+  });
+
+  it('preserves next-batch deferrals in the settled prepare reader', async () => {
+    const rows = await cliListSettledBuilds({ launchKind: 'prepare-item', records: [{ id: 'batch', run: {
+      effects: [{ type: DISPATCH_EFFECT, status: 'applied', payload: { launchKind: 'prepare-item', num: '7201' },
+        result: { outcome: 'opened-pr', deferredToNextBatch: ['7202'] } }],
+    } }] });
+    expect(rows[0]).toMatchObject({ num: '7201', deferredToNextBatch: ['7202'] });
+  });
+
+  it.each(['7201', '7202'])('requeues a deferred batch card without a failure hold: %s', async deferred => {
+    const effects = fixture({ claims: [
+      { num: '7201', scope: rows[0].scope },
+      { num: '7202', scope: rows[1].scope, groupLead: '7201' },
+    ], spawns: [], queue: rows.slice(0, 2) });
+    const settledAt = new Date().toISOString();
+    effects.listSettledPrepares = () => [{ num: '7201', startedAt: settledAt,
+      outcome: 'opened-pr', deferredToNextBatch: [deferred] }];
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null,
+      pr: { number: 900, state: 'OPEN', preparedDate: '2026-10-17', preparedAgainstSha: 'base' } }));
+    const first = await runBuildDispatchTick({ live: true, effects });
+    expect(first.prepare.retired).toContainEqual({ num: deferred, why: 'deferred-to-next-batch', released: true });
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+    expect(first.prepare.failures).toEqual([]);
+    // A retained settlement must not suppress the next batch after the claim was released.
+    effects.planTick = fixture({ spawns: [rows[Number(deferred) - 7201]], queue: [rows[Number(deferred) - 7201]] }).planTick;
+    effects.readPrepareStatus = vi.fn(() => ({ preparedDate: null }));
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: deferred, launchKind: 'prepare-item' }));
   });
 
   it('releases all member claims on failed dispatch', async () => {
@@ -4326,8 +4378,8 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(effects.listPrepareClaims()).toEqual([]);
   });
 
-  it.each(['per-card', 'off'])('preserves single-card launches with %s', async mode => {
-    vi.stubEnv(mode === 'off' ? 'WE_BUILD_GROUP_SMALL_FINDINGS' : 'WE_BUILD_GROUP_PREPARE', mode === 'off' ? 'false' : mode);
+  it('preserves single-card launches with prepare.batchSize=1', async () => {
+    vi.stubEnv('WE_PREPARE_BATCH_SIZE', '1');
     const effects = fixture({ spawns: rows.slice(0, 2) });
     await runBuildDispatchTick({ live: true, effects });
     expect(effects.dispatch).toHaveBeenCalledTimes(2);
@@ -4340,8 +4392,8 @@ describe('grouped PREPARE daemon ticks', () => {
     const plan = effects.planTick;
     effects.planTick = () => { const out = plan(); out.decisions.admission.held[4].reason = 'blocked'; return out; };
     await runBuildDispatchTick({ live: true, effects });
-    expect(effects.dispatch.mock.calls[0][0].groupMembers ?? []).toEqual([]);
-    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers).toEqual(['7204']);
+    expect(effects.acquirePrepareClaim).toHaveBeenCalledTimes(2);
   });
 
   it('retires members in the same tick the lead retires, regardless of claim order', async () => {
@@ -4380,9 +4432,9 @@ describe('prepare discovery under repository PR volume', () => {
       const search = args[args.indexOf('--search') + 1];
       searches.push(search);
       const head = /^head:(.+)$/.exec(search)?.[1];
-      const title = /^in:title "(.+)"$/.exec(search)?.[1];
+      const title = /^in:title "prepare" "(.+)"$/.exec(search)?.[1];
       expect(Boolean(head || title)).toBe(true);
-      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes(title))
+      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes('prepare') && pr.title.includes(title))
         .slice(0, Number(args[args.indexOf('--limit') + 1])));
     };
     const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,

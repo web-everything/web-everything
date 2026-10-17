@@ -72,8 +72,9 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
  * real processes.
  */
 
+import { runPrepareBatch } from './prepare-batch.mjs';
 import { randomBytes } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
@@ -295,22 +296,17 @@ export async function runProbationBuild(args, io) {
   if (!preparing && parseGroupMembers(args.groupMembers ?? []).length) {
     throw new Error('probation-build-run: grouped requests require prepare mode');
   }
-  const prepareAutoSize = preparing && (io.preparePolicy ?? readPreparePolicy()).autoSize;
+  const preparePolicy = preparing ? (io.preparePolicy ?? readPreparePolicy()) : null;
+  if (preparing && parseGroupMembers(args.groupMembers ?? []).length) {
+    return runPrepareBatch(args, io, preparePolicy, runProbationBuild);
+  }
+  const prepareAutoSize = preparePolicy?.autoSize;
   if (preparing && !['codex', 'antigravity-gemini'].includes(worker.id)) throw new Error('prepare requires codex or antigravity-gemini');
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);
   let declinedReason = null;
   let modelEvidence = {};
   let couldNotPrepare = false;
   const proposedEdges = [];
-  const groupMembers = preparing ? parseGroupMembers(args.groupMembers ?? []).filter(n => n !== String(num)) : [];
-  const groupDropped = [], groupDropReasons = {};
-  const memberCards = new Map();
-  const dropMember = (n, reason) => {
-    const card = memberCards.get(n);
-    if (card) io.writeCard(lanePath, card.path, card.raw);
-    if (!groupDropped.includes(n)) groupDropped.push(n);
-    groupDropReasons[n] = sanitizeHoldReason(reason, { max: 600 });
-  };
   const finish = (outcome, executor, detail, row = {}) => {
     const evidence = preparing && !['opened-pr', 'could-not-prepare', 'prepare-already-done', 'prepare-needs-you'].includes(outcome) ? {
       error: detail, sessionAbsent: !workerRan,
@@ -326,8 +322,7 @@ export async function runProbationBuild(args, io) {
     }
     if (declinedReason) detail = `worker-declined: ${declinedReason} — ${detail}`;
     log(`${outcome} — ${detail}`);
-    const result = { outcome, executor, pr: row.pr ?? null, detail, ...failure,
-      ...(groupMembers.length ? { groupMembers, groupDropped, groupDropReasons } : {}) };
+    const result = { outcome, executor, pr: row.pr ?? null, detail, ...failure };
     if (preparing) {
       try { io.settlePrepare?.({ runId: args.runId, key: args.effectKey,
         status: ['opened-pr', 'prepare-already-done'].includes(outcome) ? 'applied' : 'failed', result }); }
@@ -432,20 +427,8 @@ export async function runProbationBuild(args, io) {
     // lane, never the dispatch's `--scope` argument: a stale or overridden dispatch scope must not widen what
     // the worker may touch. `--scope` is what the lane LEASED, so a touched path must fall inside BOTH: the card
     // grants the edit, the lease keeps it off files a sibling lane may hold.
-    // Prepare never claims/resolves a card; members use the same open-card precondition as the lead.
-    for (const n of groupMembers) {
-      try {
-        const card = io.findItem(n, lanePath);
-        if (!card) { dropMember(n, 'card not found in the lane'); continue; }
-        memberCards.set(n, { ...card });
-        const blockers = io.openBlockers(n, lanePath);
-        if (blockers.length) dropMember(n, `blockedBy not resolved on main: ${blockers.join(', ')}`);
-        else if (parseYamlFrontmatter(card.raw).status !== 'open') dropMember(n, 'prepare requires an open card');
-      } catch (error) { dropMember(n, error.message ?? String(error)); }
-    }
-    const scopeEntries = preparing ? [item.path, ...[...memberCards.values()].map(c => c.path)] : declaredScopePaths(item.scope);
+    const scopeEntries = preparing ? [item.path] : declaredScopePaths(item.scope);
     const leasedEntries = declaredScopePaths(args.scope);
-    const otherCardPaths = scopeEntries.filter(p => p !== item.path);
     if (!scopeEntries.length) {
       return abandon('not-applicable', 'the item declares no scope: — refusing before running any worker; a probation build needs a declared scope to bound what the worker may touch', {}, 'none');
     }
@@ -459,11 +442,10 @@ export async function runProbationBuild(args, io) {
 
     const prepareBrief = preparing ? io.readPrepareBrief(lanePath) : null;
     const fillPrepareBrief = (n, card) => prepareBrief
-      .replaceAll('{{ITEM_NUM}}', String(n)).replaceAll('{{ITEM_SPEC_PATH}}', card.path) +
+      .replaceAll('{{ITEM_NUM}}', String(n)).replaceAll('{{ITEM_SPEC_PATH}}', card.path) + '\n\n## Your card\n' + card.raw +
       '\nTest scope is required before stamping: after any factual scope correction (#4658), the card scope must also list the existing or planned matching test file for each source entry (or one of the following narrow patterns).\n' +
       declaredScopePaths(card.scope).map(sourceTestPattern).filter(Boolean).map(p => `we:${p}`).join('\n');
-    const task = preparing ? fillPrepareBrief(num, item) + groupMembers.filter(n => !groupDropped.includes(n))
-      .map(n => `\n\n## Also prepare #${n}\n${fillPrepareBrief(n, memberCards.get(n))}`).join('') : buildDocFixTask({ num, title: item.title, spec: item.spec, scope: item.scope, taskType }) +
+    const task = preparing ? fillPrepareBrief(num, item) : buildDocFixTask({ num, title: item.title, spec: item.spec, scope: item.scope, taskType }) +
       '\nIf the work already exists, check every Done-when against main and find the delivering commit in git log. ' +
       'When all checks pass, report "spec already done on main: commit <sha>" with the actual delivering SHA.\n';
     let taskFile = io.writeTaskFile(lanePath, 'probation-build-task.md', task);
@@ -472,12 +454,10 @@ export async function runProbationBuild(args, io) {
     // A guarded stamp validates authored prose too (e.g. locus prefixes). Let the
     // same worker repair that concrete diagnostic before discarding its result.
     let rescoped = null;
-    let memberReport = '';
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
-      const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
+      const run = await io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
       modelEvidence = run.modelEvidence ?? {};
-      if (preparing) memberReport += `\n${run.lastMessage ?? ''}`;
       workerRan = true;
       // x55dojc — checked BEFORE the `run.ok` gate below on purpose: even a worker that crashed or timed out
       // could have planted a hook before it did, so this must never be skipped just because the run itself
@@ -519,11 +499,9 @@ export async function runProbationBuild(args, io) {
       // that changed nothing: it counts as "no worker diff" only while the card is still byte-for-byte what the
       // runner wrote and nothing else changed - otherwise a second decline would skip this branch and the
       // runner-authored edit would read as a prepared card (PR #4323 review).
-      const workerMadeNoChange = (groupMembers.length > 0 && postWorkerItem?.raw === item.raw) || !summary.files
+      const workerMadeNoChange = !summary.files
         || (rescoped !== null && postWorkerItem?.raw === item.raw && summary.paths.every((p) => p === item.path));
-      const leadReport = groupMembers.length ? String(run.lastMessage ?? '').split('\n')
-        .filter(line => !/^Not prepared: #/i.test(line.trim())).join('\n') : run.lastMessage;
-      const report = preparing && workerMadeNoChange ? classifyPrepareReport(leadReport) : null;
+      const report = preparing && workerMadeNoChange ? classifyPrepareReport(run.lastMessage) : null;
       if (report?.outcome === 'no-change' || (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect')) {
         if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', `refused: worker moved HEAD before ${report.outcome} routing`, { diff: diffRow });
       }
@@ -541,6 +519,7 @@ export async function runProbationBuild(args, io) {
         // Never resolve on the worker's word: the landing pass re-checks that the commit is on origin/main,
         // credits this card, touches real source, and that the tests it added pass on current main.
         if (!report.commit) return needsYou('already-done', 'the worker said the card is already done but cited no delivering commit');
+        if (args.prepareCommitOnly) return abandon('prepare-already-done', 'card already done; deferred outside batch', { diff: diffRow });
         const [done] = planHoldRouting([{ num, reason: `spec already done on main: commit ${report.commit}` }]);
         io.holdWorkerDecline(done);
         io.discardChanges(lanePath, baseSha, preexisting);
@@ -582,7 +561,7 @@ export async function runProbationBuild(args, io) {
         io.writeCard(lanePath, item.path, clearScopeAndAppendFinding(unstamped, route));
         break;
       }
-      if (preparing && (!summary.files || (groupMembers.length > 0 && postWorkerItem?.raw === item.raw) || summary.paths.some(p => !scopeEntries.includes(p)))) {
+      if (preparing && (!summary.files || summary.paths.some(p => !scopeEntries.includes(p)))) {
         return abandon('gate-red', `prepare requires a card-only diff; worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
       }
       if (!summary.files) {
@@ -625,9 +604,7 @@ export async function runProbationBuild(args, io) {
         const added = new Set(io.addedPaths?.(lanePath, baseSha) ?? []);
         const allowed = (p, entries) => pathInScope(p, entries)
           || (['bugfix', 'test-fix'].includes(taskType) && added.has(p) && !preexisting.includes(p) && ownedTest(p, entries));
-        // Member lease failures are isolated below; the lead still obeys its existing lease check.
-        const outOfScopePaths = summary.paths.filter((p) => !(preparing && otherCardPaths.includes(p))
-          && (!allowed(p, scopeEntries) || ((args.scope ?? []).length > 0 && !allowed(p, leasedEntries))));
+        const outOfScopePaths = summary.paths.filter((p) => (!allowed(p, scopeEntries) || ((args.scope ?? []).length > 0 && !allowed(p, leasedEntries))));
         if (outOfScopePaths.length) {
           return abandon('gate-red', `not built: touched path(s) outside the item's own declared scope — a probation worker may edit only what the item names: ${outOfScopePaths.join(', ')}`, { diff: diffRow });
         }
@@ -635,8 +612,7 @@ export async function runProbationBuild(args, io) {
         if (summary.paths.some(isStatuteTierPath)) {
           return abandon('gate-red', 'not built: statute-tier paths are refused', { diff: diffRow });
         }
-        const leadSummary = preparing && groupMembers.length ? summarizeNumstat(io.diffNumstat(lanePath, baseSha, otherCardPaths), { exclude: otherCardPaths }) : summary;
-        const fits = healDiffWithinEnvelope(leadSummary, PROVEN_TASK_ENVELOPES[taskType]);
+        const fits = healDiffWithinEnvelope(summary, PROVEN_TASK_ENVELOPES[taskType]);
         if (!fits.ok) {
           // A test-only boundary violation is still refused; only size overflow routes to the builder.
           if (fits.reason.startsWith('test-fix refused')) return abandon('gate-red', `not built: ${fits.reason}`, { diff: diffRow });
@@ -684,61 +660,6 @@ export async function runProbationBuild(args, io) {
       break;
     }
 
-    // A member failure restores only that card, before measuring/committing the surviving group.
-    for (const [n, card] of memberCards) {
-      if (groupDropped.includes(n)) { io.writeCard(lanePath, card.path, card.raw); continue; }
-      try {
-        const refusal = memberReport.split('\n').map(line => /^Not prepared: #([0-9a-z]+)\s*[—:-]\s*(.+)$/i.exec(line.trim()))
-          .find(match => match?.[1] === n);
-        if (refusal) { dropMember(n, refusal[2]); continue; }
-        if (couldNotPrepare) { dropMember(n, 'lead was not prepared'); continue; }
-        const current = io.findItem(n, lanePath);
-        if (!current || current.raw === card.raw) { dropMember(n, 'worker left no preparation diff'); continue; }
-        if (frontmatterTamperedBeyondClaim(card.raw, current.raw, PREPARE_OWNED_FRONTMATTER_KEYS)) {
-          dropMember(n, 'worker changed frontmatter outside the prepare allowlist'); continue;
-        }
-        if ((args.scope ?? []).length && !pathInScope(card.path, leasedEntries)) {
-          dropMember(n, 'card is outside the leased scope'); continue;
-        }
-        const memberSummary = summarizeNumstat(io.diffNumstat(lanePath, baseSha, scopeEntries.filter(p => p !== card.path)), { exclude: scopeEntries.filter(p => p !== card.path) });
-        const fits = healDiffWithinEnvelope(memberSummary, PROVEN_TASK_ENVELOPES.prepare);
-        if (!fits.ok) { dropMember(n, fits.reason); continue; }
-        if (worker.checker) {
-          const checkerTask = io.writeTaskFile(lanePath, 'probation-build-check.md', [
-            'Check this prepare against its spec. Answer APPROVE or REJECT on the first line, then reasons.',
-            'Reject scope creep, weakened tests, incorrect fixes, or work that is not simple and mechanical.',
-            card.spec, io.diffText(lanePath, baseSha, [card.path]),
-          ].join('\n\n'));
-          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: worker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask }), lanePath));
-          const checkerHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
-          if (checkerHooks.changed) {
-            if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
-            return abandon('escalated-needs-human', `refused: checker changed the git-hook surface: ${checkerHooks.reason}`, { diff: diffRow });
-          }
-          if (!verdict.approved) { dropMember(n, `the ${worker.checker} checker did not approve: ${verdict.reason}`); continue; }
-        }
-        const stamped = validateAndStampPrepare(n, current, lanePath, io, prepareAutoSize);
-        if (!stamped.ok) { dropMember(n, stamped.reason ?? stamped.out ?? 'stamp failed'); continue; }
-        const afterStamp = io.findItem(n, lanePath);
-        const fm = parseYamlFrontmatter(afterStamp?.raw ?? '');
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fm.preparedDate ?? '')) || fm.preparedAgainstSha !== baseSha
-          || frontmatterTamperedBeyondClaim(card.raw, afterStamp?.raw, PREPARE_OWNED_FRONTMATTER_KEYS)) {
-          dropMember(n, 'prepare-unstamped or changed fields outside its envelope'); continue;
-        }
-        const edges = parseProposedBlockedBy(afterStamp.raw);
-        if (edges.length) {
-          const graph = io.blockedByGraph?.(lanePath);
-          const bad = graph ? validateProposedBlockedBy(n, edges, graph) : ['the backlog graph could not be read'];
-          if (bad.length) { dropMember(n, `prepare proposed invalid blockedBy changes: ${bad.join('; ')}`); continue; }
-          proposedEdges.push(...edges.map(e => ({ ...e, line: `#${n}: ${e.line}` })));
-        }
-      } catch (error) { dropMember(n, error.message ?? String(error)); }
-    }
-    if (groupMembers.length) {
-      summary = summarizeNumstat(io.diffNumstat(lanePath, baseSha, excludeFromDiff), { exclude: excludeFromDiff });
-      diffRow = { files: summary.files, loc: summary.loc };
-    }
-
     if (preparing && !couldNotPrepare) {
       const stamped = io.findItem(num, lanePath);
       const fm = parseYamlFrontmatter(stamped?.raw ?? '');
@@ -782,12 +703,21 @@ export async function runProbationBuild(args, io) {
     if (!gate.pass) return abandon('gate-red', `the gate is red after the build and the resolve: ${gate.failureDetail ?? gateFailureDetail(gate.output)}`, { diff: diffRow });
 
     if (preparing && !couldNotPrepare) {
-      for (const path of [item.path, ...[...memberCards].filter(([n]) => !groupDropped.includes(n)).map(([, c]) => c.path)]) {
+      for (const path of [item.path]) {
         const committed = parseYamlFrontmatter(io.readCommittedCard(lanePath, path));
         if (!committed.preparedDate || committed.preparedAgainstSha !== baseSha) {
           return abandon('gate-red', 'prepare-unstamped at HEAD', { diff: diffRow });
         }
       }
+    }
+
+    if (args.prepareCommitOnly && preparing && couldNotPrepare) return abandon('could-not-prepare', 'card declined; deferred outside batch', { diff: diffRow });
+    if (args.prepareCommitOnly && preparing && !couldNotPrepare) {
+      io.appendScorecard(launchScorecardRow({ worker: { ...worker, taskType }, modelEvidence,
+        checker: checkerRow, pr: null, repo: REPO_SLUG, handle: session, item: num,
+        launchOutcome: 'prepared-commit', diff: diffRow }));
+      return { outcome: 'prepared-commit', num: String(num), lanePath, baseSha,
+        sha: io.headSha(lanePath), path: item.path, diff: diffRow, proposedEdges };
     }
 
     // #4291 plan-review finding (claim-accuracy, round 2) — a SEPARATE try/catch starts here, deliberately NOT
@@ -797,7 +727,7 @@ export async function runProbationBuild(args, io) {
     // `submitted.ok === false` case already handled explicitly. `writePrBody`/`openPr` therefore never reach
     // `abandon` — a throw here reports `escalated-needs-human` and stops, exactly like a `!submitted.ok` result.
     try {
-      const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges, groupMembers, groupDropped, groupDropReasons });
+      const bodyFile = io.writePrBody(lanePath, { num, worker, diff: diffRow, taskType, declinedReason, proposedEdges });
       const submit = attemptTag => io.openPr({ lanePath, num, slug: item.slug, attemptTag, bodyFile, taskType });
       const staleTip = result => !result.ok && /is not the tip of|push-rejected-stale-tip:/.test(result.reason ?? '');
       let submitted = submit(args.attemptTag);
@@ -857,11 +787,11 @@ function trySh(bin, args, opts = {}) {
  * @param {{num: string|number, attemptTag?: string, slug: string, bodyFile: string, taskType?: 'doc-fix'|'bugfix'}} o
  * @returns {string[]}
  */
-export function openPrArgv({ num, attemptTag, slug, bodyFile, taskType = 'doc-fix' }) {
-  const ref = `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
+export function openPrArgv({ num, attemptTag, slug, bodyFile, taskType = 'doc-fix', preparedIds = [] }) {
+  const ref = preparedIds.length ? `lane/prepare-batch-${num}-${preparedIds.length}` : `lane/${num}${attemptTag ?? ''}-${taskType === 'prepare' ? 'prepare-' : ''}${slug}`;
   return [
     'open-pr', `--ref=${ref}`, '--sha=HEAD', '--base=main', `--bodyFile=${bodyFile}`,
-    `--title=${machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
+    `--title=${preparedIds.length ? `prepare: ${preparedIds.join(', ')}` : machinePrTitle({ item: num, kind: taskType === 'prepare' ? 'prepare' : taskType === 'build-new-feature' ? 'build' : `${taskType}-build`, subject: slug.replace(/-/g, ' ') })}`,
     '--mode=park', '--parkLabel=review:pending', '--requireVerified=true', '--json',
   ];
 }
@@ -946,6 +876,26 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       }
       return realLane;
     },
+    forPrepareCard: ({ session: cardSession }) => realIo({ session: cardSession, taskType: 'prepare', env, repoRoot }),
+    batchExternalCap: Number(env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL ?? 4),
+    retainPrepareCommit: (dir, ref, sha) => {
+      sh('git', ['update-ref', `refs/heads/${ref}`, sha], { cwd: dir, env: laneEnv });
+    },
+    startPrepareAssembly: (dir, base) => {
+      sh('git', ['reset', '--hard', base], { cwd: dir, env: laneEnv });
+    },
+    cherryPickPrepare: (dir, card) => {
+      sh('git', ['fetch', '--no-tags', card.lanePath, card.sha], { cwd: dir, env: laneEnv });
+      const picked = trySh('git', ['-c', 'rerere.enabled=false', 'cherry-pick', card.sha], { cwd: dir, env: laneEnv });
+      if (picked.ok) return { ok: true };
+      const conflicts = sh('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: dir, env: laneEnv }).trim();
+      sh('git', ['cherry-pick', '--abort'], { cwd: dir, env: laneEnv });
+      if (!conflicts) throw new Error('prepare cherry-pick failed without a file conflict');
+      return { ok: false, conflict: true };
+    },
+    finishPrepareAssembly: (dir, ref) => {
+      sh('git', ['update-ref', `refs/heads/${ref}`, 'HEAD'], { cwd: dir, env: laneEnv });
+    },
     resetHookSurface: (dir, baseline) => resetHookSurface(dir, baseline),
     snapshotHookSurface: (dir) => snapshotHookSurface(dir),
     // The item's own backlog file, resolved by listing `backlog/` for `<num>-*.md` — never a hand-rolled loader
@@ -967,7 +917,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       } catch { return null; }
       return graph;
     },
-    findItem: (n, dir) => {
+    findItem: (n, dir = repoRoot) => {
       let names;
       try { names = readdirSync(join(dir, 'backlog')); } catch { return null; }
       const name = names.find((f) => f.startsWith(`${n}-`) && f.endsWith('.md'));
@@ -1023,8 +973,8 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       writeFileSync(p, text);
       return p;
     },
-    runWorker: (argv, dir = process.cwd()) => {
-      // SYNCHRONOUS on purpose: both launchers block until the model's turn ends (see their own headers).
+    runWorker: async (argv, dir = process.cwd()) => {
+      // Foreground and awaited: each launcher owns a fresh session; independent cards may run concurrently.
       // `workerEnv`, never `laneEnv`: the worker's own git use keeps the repo's guard hooks (see `realIo`).
       const launcher = argv.find((arg) => /(?:codex|gemini)-direct-task\.mjs$/.test(arg));
       const provider = launcher?.includes('gemini-direct-task') ? 'gemini' : 'codex';
@@ -1034,7 +984,11 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
         try { const s = statSync(path); return `${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; } catch { return null; }
       };
       const before = signature(logPath);
-      const r = trySh(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 70 * 60 * 1000 });
+      const r = await new Promise(resolveRun => {
+        execFile(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 70 * 60 * 1000,
+          killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) =>
+          resolveRun({ ok: !error, stdout, out: stdout + stderr }));
+      });
       // Capture now, before any lane cleanup. Never attribute an untouched previous run's log.
       const lastMessage = captureWorkerMessage(r.out, (reportedPath) => {
         const path = reportedPath ? resolve(dir, reportedPath) : logPath;
@@ -1099,7 +1053,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
     writePrBody: (dir, { num: n, worker: w, diff, taskType = 'doc-fix', declinedReason, proposedEdges = [], groupMembers = [], groupDropped = [], groupDropReasons = {} }) => {
       const bodyFile = join(dir, '.pr-body.md');
       const groupLines = groupMembers.length ? [
-        `Grouped prepare: ${[String(n), ...groupMembers.filter(m => !groupDropped.includes(m))].map(m => `#${m}`).join(', ')}`,
+        `Grouped prepare: ${[String(n), ...groupMembers].filter(m => !groupDropped.includes(m)).map(m => `#${m}`).join(', ')}`,
         ...groupDropped.map(m => `Not prepared: #${m} — ${groupDropReasons[m] ?? 'not prepared'}`), '',
       ] : [];
       writeFileSync(bodyFile, declinedReason ? [
@@ -1132,14 +1086,14 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       ].join('\n'));
       return bodyFile;
     },
-    openPr: ({ lanePath: dir, num: n, slug, attemptTag, bodyFile, taskType }) => {
-      const r = node('scripts/operations/run.mjs', openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType }), { cwd: dir, env: laneEnv });
+    openPr: ({ lanePath: dir, num: n, slug, attemptTag, bodyFile, taskType, preparedIds = [] }) => {
+      const r = node('scripts/operations/run.mjs', openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType, preparedIds }), { cwd: dir, env: laneEnv });
       // Detect before truncating the operation dump.
       const marker = taskType === 'prepare' && /is not the tip of/.test(r.out) ? 'push-rejected-stale-tip: ' : '';
       let submit;
       try { submit = extractSubmitResult(JSON.parse(r.stdout ?? r.out)); } catch { /* handled below */ }
       if (submit?.outcome === 'refused' && submit?.reason === 'pr-limit') {
-        const ref = openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType })[1].slice('--ref='.length);
+        const ref = openPrArgv({ num: n, attemptTag, slug, bodyFile, taskType, preparedIds })[1].slice('--ref='.length);
         return { ok: false, blockedOnInfra: false, reason: `open-pr reported no PR number: ref=${ref} ${JSON.stringify(submit)}` };
       }
       if (!r.ok) {

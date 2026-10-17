@@ -1,3 +1,4 @@
+import { assertMachineTitle } from '../machine-pr-title.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
@@ -55,6 +56,22 @@ describe('prepare PR publication', () => {
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
   }));
 
+  it('publishes exactly the surviving batch cards with one pinned title', () => fixture(({ cwd, git, snapshot, main, edit }) => {
+    edit('backlog/4368-card.md'); edit('backlog/4341-card.md');
+    const sha = snapshot([main]);
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{}' }));
+    const plan = planOpen(request({ title: 'prepare: 4368, 4341' }));
+    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: plan.argv });
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(spawn.mock.calls[0][1]).toContain('--title=prepare: 4368, 4341');
+    expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
+  }));
+  it('refuses an unlisted card in a batch before publication', () => fixture(({ cwd, git, snapshot, main, edit }) => {
+    edit('backlog/4368-card.md'); edit('backlog/4341-card.md'); snapshot([main]);
+    const spawn = vi.fn();
+    const result = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request({ title: 'prepare: 4368' })).argv });
+    expect(result.outcome).toBe('refused'); expect(spawn).not.toHaveBeenCalled();
+  }));
   it('refuses publication when the card content read fails', () => fixture(({ cwd, git, snapshot, main, edit }) => {
     edit('backlog/4368-card.md');
     snapshot([main]);
@@ -205,4 +222,11 @@ describe('item 98 — prepare-item brief runs the gate once, via the marker-writ
     expect(step4).not.toMatch(/(?<!un)scoped\s+`?check:standards/i);
     expect(step4).toMatch(/unscoped\s+`?check:standards/i);
   });
+});
+
+it('preserves every batch identity instead of truncating a title at the prose limit', () => {
+  const title = 'prepare: ' + Array.from({ length: 12 }, (_, i) => `xcard${i}`).join(', ');
+  expect(title.length).toBeGreaterThan(70);
+  expect(assertMachineTitle(title)).toBe(title);
+  expect(() => assertMachineTitle('prepare: ' + Array.from({ length: 100 }, (_, i) => `xcard${i}`).join(', '))).toThrow(/256/);
 });

@@ -440,6 +440,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/operations/scaffold-io.mjs', 'scripts/operations/step-kinds.mjs',
   // cli-adapter's submit outcome summary helpers
   'scripts/operations/open-pr.mjs',
+  // Shared card-only classification is a direct dependency of the review entry points.
+  'scripts/ci-card-only.mjs',
   // review-pr's remaining direct imports
   'scripts/codex-direct-task.mjs', 'scripts/review-core-cli.mjs', 'scripts/review-set-label.mjs',
   'scripts/lib/advisory-labels.mjs', 'scripts/lib/model-probation.mjs', 'scripts/lib/pr-liveness.mjs',

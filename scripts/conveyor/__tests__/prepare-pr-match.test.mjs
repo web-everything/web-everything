@@ -130,3 +130,11 @@ describe('prepare launch refusal', () => {
   });
   it('admits a card with no blocking evidence', () => expect(refuse({})).toBeNull());
 });
+
+it('refuses duplicate prepare batch members by exact title identity without granting write authority', () => {
+  const pr = { title: 'prepare: 7201, 7202, 7203', headRefName: 'lane/7201-prepare-batch', state: 'OPEN' };
+  expect(isPreparePrFor(pr, { num: '7202' })).toBe(true);
+  expect(isPreparePrFor(pr, { num: '720' })).toBe(false);
+  expect(isLanePreparePrFor(pr, { num: '7202' })).toBe(false);
+  expect(isPreparePrFor({ ...pr, isCrossRepository: true }, { num: '7202' })).toBe(false);
+});

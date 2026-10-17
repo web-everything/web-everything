@@ -22,6 +22,8 @@ export function isPreparePrFor(pr, { num, bornAs }) {
   if (isLanePreparePrFor(pr, { num, bornAs })) return true;
   if (!pr || pr.isCrossRepository) return false;
   const key = normNum(num);
+  const batch = /^prepare: ([a-z0-9]+(?:, [a-z0-9]+)*)$/.exec(pr.title ?? '');
+  if (batch && batch[1].split(', ').includes(key)) return true;
   return Boolean(key) && new RegExp(`^WE #${escapeRegex(key)}: prepare\\b`).test(pr.title ?? '');
 }
 

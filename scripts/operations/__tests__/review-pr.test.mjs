@@ -1,3 +1,4 @@
+import { reviewSeatOptionsForRun } from '../review-pr.mjs';
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -4795,5 +4796,43 @@ describe('disabled agy shadows at the launch boundary', () => {
     const text = renderVerdictWriteUp({ read, verdict, answer: 'accept', actor: 'operator' });
     expect(text).toContain('agy shadow off (setting)');
     expect(text).not.toContain('held (agy quota)');
+  });
+});
+
+describe('card-only light review', () => {
+  function registryForCards({ files = ['backlog/1-card.md'], securitySeat = false } = {}) {
+    const readPr = input => {
+      const read = stubReader()(input);
+      return { ...read, net: { ...read.net, paths: files } };
+    };
+    const declaration = reviewPrOperation({ readPr, cardOnlyLight: true, securitySeat,
+      codexAdvisory: true, correctnessAdvisory: true, antigravityReview: true });
+    const registry = createRegistry(); registry.register(declaration);
+    return { registry, declaration };
+  }
+  it('runs one blocking Codex correctness seat and preserves it on resume', () => {
+    const { registry } = registryForCards();
+    const { run, requests } = atConfirm({ registry, input: BASE_INPUT });
+    expect(Object.keys(requests)).toEqual(['judge']);
+    expect(requests.judge.providerName).toBe('codex');
+    expect(requests.judge.allowedTools).toBeUndefined();
+    expect(run.findings.read.cardOnlyLight).toBe(true);
+    expect(run.findings.reduce.nonClaudeSeats).toBe(1);
+    expect(run.findings.reduce.nonClaudeSeatShortfall).toBeNull();
+    expect(reviewSeatOptionsForRun(run, null)).toMatchObject({ cardOnlyLight: true, securitySeat: false });
+    const blocked = atConfirm({ registry, input: BASE_INPUT, answer: { ...BLOCKING_ANSWER, findings: [{ ...BLOCKING_ANSWER.findings[0], file: 'backlog/1-card.md' }] } }).run;
+    expect(blocked.findings.reduce.verdict).toBe('changes');
+  });
+  it('adds only a Claude security seat when requested', () => {
+    const { registry } = registryForCards({ securitySeat: true });
+    const { requests } = atConfirm({ registry, input: BASE_INPUT });
+    expect(Object.keys(requests)).toEqual(['judge', 'judgeSecurity']);
+    expect(requests.judge.providerName).toBe('codex');
+    expect(requests.judgeSecurity.providerName).toBeUndefined();
+  });
+  it('refuses a light roster when the pinned net diff includes code', () => {
+    const { registry } = registryForCards({ files: ['backlog/1-card.md', 'scripts/code.mjs'] });
+    expect(() => advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'card-race', input: BASE_INPUT, registry }), { registry }))
+      .toThrow(/card-only light lane/);
   });
 });
