@@ -218,6 +218,41 @@ writes, so they do not replace a sibling process's records.
 
 ## Shadow reviewer agreement evidence
 
+The agy mandatory-seat shadows are off by default (operator 2026-10-16).
+`review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
+`scope` / `WE_REVIEW_SHADOW_AGY_SCOPE` defaults to `high-care`: use the read's
+`earnedShape` from `review-core-cli.mjs shape`, seating elevated/high care and sensitive
+escalation reasons (including human-required surfaces). Routine PRs stay unseated.
+`sampled` restores the deterministic PR sample, with `sampleRate` / `WE_REVIEW_SHADOW_AGY_SAMPLE_RATE` defaulting to 0.1.
+Rates must be finite numbers in `[0, 1)`; 1 is refused and the invalid layer is logged.
+Selection uses SHA-256 of lowercase `owner/repo#pr` (first unsigned 32 bits below
+`floor(sampleRate * 2^32)`; at least one bucket always excluded), shared across lenses and rounds. Missing PR identity does not seat a shadow.
+Disabled panel rows say `agy shadow off (setting)`; unsampled rows say `off (sample)`.
+Routing-policy declarations and model/trial settings alone do not enable live shadows.
+
+`dailyCap` / `WE_REVIEW_SHADOW_AGY_DAILY_CAP` defaults to 100 sessions per
+America/New_York day (zero disables launches). The runner atomically reserves a
+numbered slot under `agy-shadow-agreement.jsonl.sessions/<day>/` before each
+attempt, including model retries. Reservations count starts rather than completions;
+quota refusals and crashes conservatively consume a slot. Slots are shared across
+lanes and survive process restarts; local midnight, including DST, selects a new day.
+A full budget logs `daily cap reached` and records a skipped shadow. An unreadable
+counter refuses admission. Neither a cap skip nor a quota hold retries on the
+routing model or adds a Claude fallback; the original mandatory Claude answer remains.
+Skipped shadows have their own count in agreement and trial reports; they are neither
+failures nor comparisons and do not advance the trial. A primary `agy` seat still
+falls back to Claude on quota or skip results when its `onEscape` policy is `claude`.
+Use temporary stores and injected admission/providers in tests, never host quota.
+
+Gemini admission settings preserve the caller's requested Codex advisory roster.
+Tests cover primary and shadow modes with each escape policy, quota holds, quota exhaustion, and cap skips,
+all runner statuses through the real row builder and both reports, unavailable
+budget storage, and reserving a second slot before a model retry at the cap.
+These settings resolve through standard → platform `review` → tool
+`scripts/settings/review.json` → env, logging effective values and sources.
+Test the actual judge request and panel reduction with injected providers, including
+zero agy calls when disabled and failed Codex answers, through heavy-admission.
+
 `review-runner.mjs` appends each shadow prediction through `appendVerdict` as `verdict: observed`,
 `mode: shadow`, boolean `wouldClear`, and `applied: false` / `mutated: false`. The builder and reader
 reject shadow metadata on bearing verdicts. The existing non-bearing fold keeps these rows in history
@@ -1227,3 +1262,26 @@ liveness at timeout, launch time, session/transcript presence and the last 30 st
 Exercise the launch with injected processes and isolated homes; wrapper output capture
 also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites through
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.
+
+## False-finding coroner pass
+
+`coroner-false-findings.mjs` reads PRs updated in the window (including older and closed PRs),
+complete comment threads through the shared reader, and the shadow agreement store. It never advances
+`WE_CORONER_STATE`; run it before the main extractor when using `--since=last`.
+`coroner-extract` also includes it as `errorRates.falseFindings`, feeding daily `perf-snapshot` counts.
+`WE_CORONER_NO_FALSE_FINDINGS=1` skips that census in the main extractor.
+
+Confirm or override each rule guess using the ruling reason, the red-team Re-check, and a bounded
+live-head probe when needed. Recorded `--cause` on `record-referral-ruling --ruling=not-real` takes
+precedence; the writer also preserves the finding lens. Allowed causes are `diff-only-recheck`,
+`stale-head-reraise`, `auto-policy-over-not-real`, `card-only-probe`, `config-prose`, `test-nit`, and `other`.
+A repeated not-real on another head is a stale hint, not proof the newer finding is false for the same reason.
+Report code and card-only separately and keep unknown PR types visible when file reads fail.
+
+Counts describe source events, not unique defects: a fixer stand-down can overlap a ruling.
+Unmatched agy findings are separately **unconfirmed**, never proven false by non-agreement alone.
+Capped PR discovery and failed reads are explicit; do not present such a census as exhaustive or infer
+false-findings / total-findings percentages without a matching denominator.
+For each confirmed cause, name a prevention, rank by frequency and mark NEW or COVERED-BY using the
+coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
+separate shadow count and read completeness.

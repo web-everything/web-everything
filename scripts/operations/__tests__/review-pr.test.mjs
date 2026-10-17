@@ -279,6 +279,7 @@ it('cannot reduce clean juror answers to accept while an operator send-back rema
 /** Card 84 — both mandatory seats shadowed by agy, plus the advisory agy seat. */
 const AGY_SEAT_SETTINGS = Object.freeze({
   seatProvider: { correctness: 'shadow', security: 'shadow' }, agyModel: 'claude-opus-5-5-high', agyCorrectnessAdvisory: true,
+  shadowPolicy: { shadowEnabled: true, scope: 'high-care', dailyCap: 100 },
 });
 
 // ── PROPERTY 1: THE DIFF ARRIVES ON THE NET BASIS ─────────────────────────────────────────────────────────
@@ -4714,5 +4715,49 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
         { antigravityReview: true, codexAdvisory: true }, { judgeAdvisory: { summary: 'x', findings: [claim] } });
       expect(requests[REFERRAL_VERIFIER_STEP].input).toContain('confirmed defect');
     });
+  });
+});
+
+describe('Gemini admission and the Codex roster', () => {
+  it('Gemini admission settings preserve the requested Codex roster', () => {
+    for (const securitySeat of [true, false]) {
+      for (const codexAdvisory of [false, true]) {
+        for (const correctnessAdvisory of [false, true]) {
+          for (const shadowPolicy of [undefined, { shadowEnabled: false, scope: 'high-care', dailyCap: 100 },
+            { shadowEnabled: true, scope: 'sampled', sampleRate: 0.1, dailyCap: 0 }]) {
+            const declaration = reviewPrOperation({ readPr: stubReader(), securitySeat, codexAdvisory,
+              correctnessAdvisory, seatSettings: { shadowPolicy } });
+            expect(declaration.steps.filter(s => ['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory']
+              .includes(s.name)).map(s => s.name)).toEqual([
+              'judge', ...(securitySeat ? ['judgeSecurity'] : []), ...(codexAdvisory ? ['judgeAdvisory'] : []),
+              ...(correctnessAdvisory ? ['judgeCorrectnessAdvisory'] : []),
+            ]);
+          }
+        }
+      }
+    }
+  });
+});
+
+describe('disabled agy shadows at the launch boundary', () => {
+  it('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner', async () => {
+    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1 } }, log: () => {} });
+    const declaration = reviewPrOperation({ readPr: stubReader(), seatSettings });
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
+    const judge = createDefaultJudge({ provider, seatRunner });
+    for (const name of ['judge', 'judgeSecurity']) {
+      const request = declaration.steps.find(s => s.name === name).step.request({ input: { lens: 'correctness' }, findings: { read } });
+      await judge(request);
+    }
+    expect(seatRunner).not.toHaveBeenCalled();
+    expect(provider).toHaveBeenCalledTimes(2);
+    const verdict = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER, judgeAgyCorrectness: CLEAN_ANSWER,
+    } });
+    const text = renderVerdictWriteUp({ read, verdict, answer: 'accept', actor: 'operator' });
+    expect(text).toContain('agy shadow off (setting)');
+    expect(text).not.toContain('held (agy quota)');
   });
 });

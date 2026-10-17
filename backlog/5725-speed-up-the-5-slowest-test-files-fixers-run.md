@@ -3,10 +3,11 @@ bornAs: xdayh3m
 kind: story
 size: 5
 priority: high
-status: active
+status: resolved
 scope: ["we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs", "we:scripts/conveyor/__tests__/session-reaper-cli.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs", "we:scripts/conveyor/session-reaper.mjs", "we:scripts/conveyor/__tests__/session-reaper.test.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-constants.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-constants.test.mjs"]
 dateOpened: "2026-10-10"
 dateStarted: "2026-10-16"
+dateResolved: "2026-10-16"
 preparedDate: "2026-10-15"
 preparedAgainstSha: "4e7914456dc4199144b7e050f86d27fa7d0f1186"
 tags: []
