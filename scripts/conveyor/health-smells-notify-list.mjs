@@ -26,6 +26,7 @@
  * (never approved to notify by any decision so far) stays record-only (shadow).
  */
 export const NOTIFY_EVEN_IN_SHADOW = new Set([
+  'nightly-coroner-failed', // Operator: missed nights and repeated probe errors must alert.
   // Previously approved (earlier operator decisions; the old scattered `notifyEvenInShadow: true` field) — kept.
   'claude-auth-expired',
   'daemon-held-on-last-good',
