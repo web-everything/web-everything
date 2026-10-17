@@ -147,9 +147,10 @@ import { buildCliDaemonEffects, fixDaemonPrEventsOptions } from '../../../skills
 it('the fix daemon\'s real effects sleep on the hand-off mailbox: a send-back wakes the interval sleep', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-daemon-'));
   try {
-    const pending = buildCliDaemonEffects({ owner: 'x', handoffDir: dir }).sleep(60_000);
+    // Signal between ticks, then sleep: the sleep's first read sees it, with no dependence on file-watch polling speed.
+    const { sleep } = buildCliDaemonEffects({ owner: 'x', handoffDir: dir });
     signalFixDispatch({ repo: 'o/r', pr: 3, label: 'review:changes' }, { dir });
-    await expect(pending).resolves.toBe('handoff');
+    await expect(sleep(60_000)).resolves.toBe('handoff');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 it('the fix daemon hands its pr-events waker a local hand-off probe for its role and repos', () => {
