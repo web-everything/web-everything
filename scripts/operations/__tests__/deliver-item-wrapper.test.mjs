@@ -3508,6 +3508,25 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('a.mjs:1 remaining defect');
   });
 
+  it('publishes an oversized diff with incomplete self-review notes in the PR body', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const originalExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args = [], ...rest) => {
+      if (cmd === 'git' && args.includes('origin/main...HEAD')) return 'x'.repeat(512 * 1024 + 1);
+      return originalExec(cmd, args, ...rest);
+    });
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed' },
+    );
+    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(provider.spawn).toHaveBeenCalledOnce();
+    const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+    expect(body).toContain('Self-review incomplete');
+    expect(body).toContain('human review of the full diff is required');
+  });
+
   it('a Claude-executed delivery (provider.vendor="claude", the real registered CLAUDE_RESTRICTED_PROVIDER shape) opens label-on-green (ready-to-merge)', async () => {
     const result = await deliverItem(
       { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },

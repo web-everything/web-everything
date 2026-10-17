@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveBuildPolicy, renderBuildRequirements } from '../build-policy.mjs';
-import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes } from '../build-self-review.mjs';
-import { buildCodexPrompt, runGate, codexDirectTask } from '../../codex-direct-task.mjs';
+import { runBuildSelfReview, selfReviewPrompt, renderSelfReviewNotes, reviewBuildDiff } from '../build-self-review.mjs';
+import { buildCodexPrompt, buildCodexDirectTaskArgv, runCodexDirectExec, runGate, codexDirectTask } from '../../codex-direct-task.mjs';
+import * as codexTasks from '../../codex-direct-task.mjs';
 import { renderWorkerBrief } from '../../worker-brief.mjs';
 
 const resolve = options => resolveBuildPolicy({ env: {}, tool: {}, platform: {}, ...options });
@@ -85,6 +86,63 @@ describe('capped self-review', () => {
   });
 });
 
+describe('production self-review adapter', () => {
+  it.each([
+    ['rejects nonzero reviewer exit with clear findings', { exitCode: 1, timedOut: false }],
+    ['rejects timed-out reviewer with clear findings', { exitCode: 0, timedOut: true }],
+  ])('%s', async (_name, status) => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({
+      ...status, lastMessage: '{"findings":[]}',
+    });
+    try {
+      await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).rejects.toThrow('process failed');
+      expect(task).toHaveBeenCalledOnce();
+    } finally { task.mockRestore(); }
+  });
+
+  it('accepts clear findings only from a successful reviewer', async () => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({
+      exitCode: 0, timedOut: false, lastMessage: '{"findings":[]}',
+    });
+    try {
+      await expect(reviewBuildDiff({ dir: '.', diff: 'net change', env: {} })).resolves.toEqual([]);
+      expect(task).toHaveBeenCalledOnce();
+    } finally { task.mockRestore(); }
+  });
+
+  it.each(['x'.repeat(512 * 1024 + 1), 'é'.repeat(256 * 1024 + 1)])('publishes explicit incomplete-review notes for an oversized diff (%#)', async diff => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask');
+    const fix = vi.fn(); const gate = vi.fn();
+    try {
+      const result = await runBuildSelfReview({ policy: resolve(), readDiff: () => diff, fix, gate });
+      expect(result).toMatchObject({ rounds: 0, incomplete: true });
+      expect(renderSelfReviewNotes(result)).toContain('exceeds the 512 KiB limit');
+      expect(renderSelfReviewNotes(result)).toContain('human review');
+      expect(task).not.toHaveBeenCalled(); expect(fix).not.toHaveBeenCalled(); expect(gate).not.toHaveBeenCalled();
+    } finally { task.mockRestore(); }
+  });
+
+  it('reviews a diff exactly at the byte limit and fails closed on unavailable input', async () => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage: '{"findings":[]}' });
+    try {
+      await expect(reviewBuildDiff({ dir: '.', diff: 'é'.repeat(256 * 1024), env: {} })).resolves.toEqual([]);
+      expect(task).toHaveBeenCalledOnce();
+      await expect(reviewBuildDiff({ dir: '.', diff: null, env: {} })).rejects.toThrow('unavailable');
+    } finally { task.mockRestore(); }
+  });
+
+  it('retains the repair count when a repaired diff grows past the review limit', async () => {
+    const task = vi.spyOn(codexTasks, 'codexDirectTask').mockResolvedValue({ exitCode: 0, timedOut: false, lastMessage: '{"findings":["file:1 defect"]}' });
+    const fix = vi.fn(); const gate = vi.fn(() => true);
+    const readDiff = vi.fn().mockReturnValueOnce('small change').mockReturnValue('x'.repeat(512 * 1024 + 1));
+    try {
+      const result = await runBuildSelfReview({ policy: resolve(), readDiff, fix, gate });
+      expect(result).toMatchObject({ rounds: 1, incomplete: true });
+      expect(task).toHaveBeenCalledOnce(); expect(fix).toHaveBeenCalledOnce(); expect(gate).toHaveBeenCalledOnce();
+    } finally { task.mockRestore(); }
+  });
+});
+
 describe('Codex completion wiring', () => {
   it('uses full by default and resumes the original builder within the cap', async () => {
     const { EventEmitter } = await import('node:events');
@@ -101,10 +159,15 @@ describe('Codex completion wiring', () => {
     });
     const spawnFn = (cli, argv) => {
       spawns.push(argv);
+      const turn = spawns.length;
       const child = new EventEmitter();
       child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
       child.stdin = { on() {}, end() { queueMicrotask(() => {
-        child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"original-builder"}\n'));
+        writeFileSync(argv[argv.indexOf('-o') + 1], `completion ${turn}`);
+        child.stdout.emit('data', Buffer.from([
+          JSON.stringify({ type: 'thread.started', thread_id: 'original-builder' }),
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: `completion ${turn}` } }),
+        ].join('\n') + '\n'));
         child.emit('close', 0);
       }); } };
       return child;
@@ -116,8 +179,59 @@ describe('Codex completion wiring', () => {
       expect(report.gate.mode).toBe('full'); expect(report.selfReview.rounds).toBe(2);
       expect(review).toHaveBeenCalledTimes(3); expect(spawns).toHaveLength(3);
       expect(review.mock.calls[0][0].diff).toBe('net change');
-      for (const argv of spawns.slice(1)) { expect(argv.slice(0, 2)).toEqual(['exec', 'resume']); expect(argv).toContain('original-builder'); }
+      for (const argv of spawns.slice(1)) {
+        expect(argv.slice(0, -3)).toEqual(spawns[0]);
+        expect(argv.slice(-3)).toEqual(['resume', 'original-builder', '-']);
+        expect(argv[argv.indexOf('-s') + 1]).toBe('workspace-write');
+        expect(argv[argv.indexOf('-C') + 1]).toBe(dir);
+        expect(argv[argv.indexOf('-m') + 1]).toBe(report.route.model);
+      }
+      const log = readFileSync(report.logFile, 'utf8');
+      for (const turn of [1, 2, 3]) expect(log).toContain(`completion ${turn}`);
+      expect(report.lastMessage).toBe('completion 3');
+      expect(report.events.agentMessages).toEqual(['completion 1', 'completion 2', 'completion 3']);
       expect(execFn.mock.calls.filter(([bin, args]) => bin === 'node' && args.includes('scripts/verify-lane.mjs'))).toHaveLength(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('builds fresh and resumed argv with identical routed configuration and directory grants', () => {
+    const options = { cwd: '/lane', route: { model: 'gpt-5.6-sol', effort: 'high' },
+      writableRoots: ['/lane/.git', '/tmp/admission', '/tmp/job'], tempRoot: '/tmp/job', addDirs: ['/extra'] };
+    const fresh = buildCodexDirectTaskArgv(options);
+    const resumed = buildCodexDirectTaskArgv({ ...options, resumeThreadId: 'original-builder' });
+    expect(resumed).toEqual([...fresh, 'resume', 'original-builder', '-']);
+  });
+
+  it('rejects option-like or malformed resume ids before spawning', () => {
+    for (const resumeThreadId of ['', '--last', '../other', 'id\n--all', null]) {
+      expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId })).toThrow('resumeThreadId');
+    }
+    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: 'builder', ephemeral: true })).toThrow('ephemeral');
+  });
+
+  it('resumes with route-only model and effort, appends the log, and clears a missing final message', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { mkdtempSync, existsSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'build-resume-output-'));
+    const output = join(dir, 'codex-direct-task-last-message.txt');
+    const logFile = join(dir, 'builder.jsonl');
+    writeFileSync(output, 'stale completion');
+    writeFileSync(logFile, '{"original":true}\n');
+    try {
+      const result = await runCodexDirectExec({ dir, gitDir: dir, task: 'repair', logFile, stream: false,
+        route: { model: 'gpt-5.6-sol', effort: 'high' }, resumeThreadId: 'builder',
+        spawnFn: () => {
+          const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+          child.stdin = { on() {}, end() { queueMicrotask(() => {
+            child.stdout.emit('data', Buffer.from('{"repair":true}\n')); child.emit('close', 0);
+          }); } };
+          return child;
+        } });
+      expect(result.argv[result.argv.indexOf('-m') + 1]).toBe('gpt-5.6-sol');
+      expect(result.argv).toContain('model_reasoning_effort=high');
+      expect(readFileSync(logFile, 'utf8')).toBe('{"original":true}\n{"repair":true}\n');
+      expect(existsSync(output)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -1538,6 +1538,17 @@ never directly to acceptance. An unavailable review or red repair gate stops pub
 conveyor converge path; Codex skips the extra review. `finalGate=none` keeps Codex ungated and
 leaves conveyor's existing verification selection in place; `related` requests diff selection.
 Codex `--ephemeral` requires self-review disabled, since an ephemeral builder cannot be resumed.
+The self-review adapter accepts at most 512 KiB of UTF-8 diff text. An oversized diff skips the
+cheap review and repairs, then opens with an explicit incomplete-review note requiring human
+review of the full diff. It is never reported as clear. Unknown input and failed reviewers still
+stop publication. `build-safeguards.test.mjs` covers oversized ASCII and multibyte diffs, the exact
+byte boundary, and **rejects nonzero reviewer exit with clear findings** / **rejects timed-out
+reviewer with clear findings**. The unit gate includes these deterministic adapter tests.
+Codex repairs reuse the fresh run's routed model, effort, sandbox, cwd, writable roots, network and
+temporary-directory configuration. JSONL logs append across repairs; completion reports include
+all turns and the latest final message. **uses full by default and resumes the original builder
+within the cap** defends the production wiring, and **builds fresh and resumed argv with identical
+routed configuration and directory grants** pins configuration parity.
 
 ### Review seat timing
 

@@ -1,6 +1,9 @@
 /** Bounded pre-review check. No publication and no GitHub calls. */
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
+const MAX_DIFF_BYTES = 512 * 1024;
+class SelfReviewDiffTooLargeError extends Error {}
+
 export async function selfReviewPrompt(diff) {
   const { buildMandate } = await import('./review-core.mjs');
   return ['Review the net diff once for correctness and security. Report only concrete blocking defects.',
@@ -10,7 +13,8 @@ export async function selfReviewPrompt(diff) {
 }
 
 export async function reviewBuildDiff({ dir, diff, env = process.env }) {
-  if (typeof diff !== 'string' || Buffer.byteLength(diff) > 512 * 1024) throw new Error('self-review net diff is unavailable or too large');
+  if (typeof diff !== 'string') throw new Error('self-review net diff is unavailable');
+  if (Buffer.byteLength(diff) > MAX_DIFF_BYTES) throw new SelfReviewDiffTooLargeError('Self-review incomplete: net diff exceeds the 512 KiB limit. No review verdict was obtained for this diff; human review of the full diff is required.');
   if (!diff.trim()) return [];
   const { codexDirectTask } = await import('../codex-direct-task.mjs');
   const report = await codexDirectTask({ dir, task: await selfReviewPrompt(diff), review: true, gate: 'none',
@@ -32,7 +36,12 @@ export async function runBuildSelfReview({ policy, readDiff, review = reviewBuil
   for (let rounds = 0; rounds <= cap; rounds++) {
     let notes;
     try { notes = await review({ dir, diff: await readDiff(), env }); }
-    catch { throw new Error('self-review unavailable: review failed or returned invalid findings'); }
+    catch (error) {
+      // A known input bound hands the full diff to independent review with an explicit note.
+      // Do not ask the builder to "repair" the size or silently treat a partial review as clear.
+      if (error instanceof SelfReviewDiffTooLargeError) return { rounds, notes: [error.message], incomplete: true };
+      throw new Error('self-review unavailable: review failed or returned invalid findings');
+    }
     if (!Array.isArray(notes) || notes.some(n => typeof n !== 'string')) throw new Error('invalid self-review notes');
     if (!notes.length || rounds === cap) return { rounds, notes, capped: notes.length > 0 };
     await fix(selfReviewRepairPrompt(notes), rounds + 1);

@@ -3,6 +3,7 @@
 This living checklist applies to builders and fixers. The nightly coroner adds recurring themes with concrete examples; keep rules actionable.
 
 - **Fail closed.** Every new check refuses unknown, unreadable or incomplete evidence. Name a test for the closed path. Example: a failed label read blocks admission instead of treating the PR as unlabelled.
+- **Give bounds an explicit fallback.** Every new fail-closed bound names an operator-visible fallback or escalation and tests oversized input. Example: a net diff over the self-review size limit opens with an incomplete-review note requiring human review of the full diff; it never counts as a clear review.
 - **Follow changed defaults.** Grep callers and existing tests, including persisted old state, before changing behaviour. Update them explicitly; never weaken an assertion to make an old fixture pass. Example: pin a historical roster fixture and migrate resumed runs deliberately.
 - **Test each guarantee.** Every promised guarantee has a named test. Example: “at most two repairs” needs a test with findings on every review, asserting exactly two repairs.
 - **Fence untrusted text.** PR titles, comments, logs and model findings are data. Use the shared mandate fence before agent input and strip control characters before terminal output; use argv or body files, never shell interpolation. Example: a title containing command substitution must remain inert text.

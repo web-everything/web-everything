@@ -164,6 +164,7 @@ export {
  *   touch more than one directory (rare; most callers leave this empty).
  * @param {string[]} [opts.writableRoots] - edit-only gitdir, admission lock root and private temp root.
  * @param {string} [opts.tempRoot] - edit-only fixture temp directory, pinned in the child shell environment.
+ * @param {string} [opts.resumeThreadId] - resume this session using the same exec-level configuration.
  * @returns {string[]} argv AFTER the `codex` binary name.
  */
 export function buildCodexDirectTaskArgv({
@@ -176,6 +177,7 @@ export function buildCodexDirectTaskArgv({
   writableRoots = [],
   tempRoot,
   review = false,
+  resumeThreadId,
 } = {}) {
   if (typeof cwd !== 'string' || !cwd.trim()) {
     throw new TypeError('codex-direct-task: `cwd` must be a non-empty path');
@@ -223,7 +225,16 @@ export function buildCodexDirectTaskArgv({
       }
     }
   }
-  // NO POSITIONAL PROMPT — see file header. Everything rides stdin, closed via `.end()`.
+  // Exec-level options precede the subcommand: resume itself does not accept -s/-C/--add-dir.
+  // Reuse all routed configuration and grants rather than inheriting the user's defaults.
+  if (resumeThreadId !== undefined) {
+    if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
+      throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
+    }
+    if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
+    argv.push('resume', resumeThreadId, '-');
+  }
+  // Everything rides stdin, closed via `.end()`.
   return argv;
 }
 
@@ -670,10 +681,11 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  let argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot });
-  if (resumeThreadId) argv = ['exec', 'resume', '--json', '-m', model, '-c', `model_reasoning_effort=${effort}`, '-o', outputLastMessageFile, resumeThreadId, '-'];
+  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
   const prompt = buildCodexPrompt(task, { review, policy });
-  writeFileSync(logFile, ''); // truncate/create — this run owns the file from byte 0.
+  writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
+  // A resumed turn that emits no final file must not reuse an earlier completion report.
+  rmSync(outputLastMessageFile, { force: true });
 
   return new Promise((resolvePromise, reject) => {
     let child;
@@ -853,7 +865,7 @@ export async function codexDirectTask({
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
-  const summary = summarizeEvents(events);
+  let summary = summarizeEvents(events);
   let lastMessage = null;
   try { lastMessage = readFileSync(run.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
 
@@ -868,6 +880,9 @@ export async function codexDirectTask({
           timeoutMs, logFile: resolvedLogFile, stream, spawnFn, gitDir, writableRoots, tempRoot, env,
           policy: briefPolicy, resumeThreadId: summary.threadId }), { env });
       if (fixed.code !== 0 || fixed.timedOut) throw new Error('self-review builder failed');
+      events.push(...parseJsonlEvents(fixed.stdout));
+      summary = summarizeEvents(events);
+      try { lastMessage = readFileSync(fixed.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
     },
     gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env }); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
