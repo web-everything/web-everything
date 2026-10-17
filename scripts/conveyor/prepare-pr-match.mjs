@@ -38,13 +38,8 @@ export function prepareLaunchRefusal({ num, bornAs, prs = [],
   if (open) return { reason: `open prepare PR #${open.number} (${open.headRefName})` };
   // A slow review does not consume the post-merge guard. Inspect every matching merge:
   // creation order need not match merge order, and dispatch history may not survive a restart.
-  const merged = matching.filter(pr => pr.state === 'MERGED')
-    .map(pr => ({ pr, at: Date.parse(pr.mergedAt ?? pr.closedAt ?? pr.createdAt) }))
-    .filter(({ at }) => mergedGuardHours > 0 && now - at >= 0 && now - at <= mergedGuardHours * 3_600_000)
-    .sort((a, b) => b.at - a.at)[0]?.pr;
-  if (merged) {
-    return { reason: `merged prepare PR #${merged.number} (within ${mergedGuardHours}h guard)` };
-  }
+  const merged = recentMergedPrepare({ num, bornAs, prs, now, mergedGuardHours });
+  if (merged) return { reason: `merged prepare PR #${merged.pr.number} (within ${mergedGuardHours}h guard)` };
   const key = normNum(num);
   const claim = claims.find(c => normNum(c.meta?.num) === key);
   if (claim) return { reason: `live prepare claim (${claim.owner})` };
@@ -59,4 +54,13 @@ export function prepareLaunchRefusal({ num, bornAs, prs = [],
     return { reason: `parked needs-you: ${latest.holdReason.slice(0, 120)}` };
   }
   return null;
+}
+
+/** Shared post-merge cooldown, measured from merge time rather than PR creation. */
+export function recentMergedPrepare({ num, bornAs, prs = [], now = Date.now(), mergedGuardHours = 24 }) {
+  const merged = prs.filter(pr => isPreparePrFor(pr, { num, bornAs })).filter(pr => pr.state === 'MERGED')
+    .map(pr => ({ pr, at: Date.parse(pr.mergedAt ?? pr.closedAt ?? pr.createdAt) }))
+    .filter(({ at }) => mergedGuardHours > 0 && now - at >= 0 && now - at <= mergedGuardHours * 3_600_000)
+    .sort((a, b) => b.at - a.at)[0];
+  return merged ? { pr: merged.pr, minutesAgo: Math.floor((now - merged.at) / 60_000) } : null;
 }

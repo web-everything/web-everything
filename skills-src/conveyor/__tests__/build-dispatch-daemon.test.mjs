@@ -273,8 +273,8 @@ describe('prepare status batched', () => {
     expect(calls.filter(([, args]) => args.some(a => a.includes('contents/')))).toHaveLength(0);
     for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
     const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
-    expect(listings).toHaveLength(unstamped ? 1 : 0);
-    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'created:>=2026-09-28', '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', '500']);
+    expect(listings).toHaveLength(unstamped ? 100 : 0);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/6000', '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', '100']);
     const second = createPrepareStatusReader({ exec });
     second.prime(items);
     second.read(items[0]);
@@ -340,8 +340,8 @@ describe('prepare status batched', () => {
     expect(reader.read({ num: 7100 }).pr).toBeNull();
     expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
     const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
-    expect(args[args.indexOf('--search') + 1]).toBe('');
-    expect(args[args.indexOf('--limit') + 1]).toBe('1000');
+    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/7100');
+    expect(args[args.indexOf('--limit') + 1]).toBe('100');
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
     expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
   });
@@ -808,7 +808,7 @@ describe('runBuildDispatchTick — #4131/#4382 build-orphan-adopt', () => {
 
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans } });
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans, killSwitch: () => ({ engaged: true, reason: 'operator' }) } });
-    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `x-${i}` }));
+    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `lane/${9000 + i}-build-test` }));
     await runBuildDispatchTick({ live: true, effects: { ...base, adoptOrphans, fetchOpenPrs: async () => [{ repo: 'we', prs: tooManyPrs }] } });
 
     expect(seen.map((o) => o?.allowResume)).toEqual([true, false, false]);
@@ -903,7 +903,7 @@ describe('runBuildDispatchTick — #4465 build-dispatch-hold-router wiring', () 
       ],
       routeHeldItems: async (plan) => { seen.push(plan.map((p) => p.num)); return plan.map((p) => ({ num: p.num, route: p.route, action: 'x' })); },
     };
-    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `x-${i}` }));
+    const tooManyPrs = Array.from({ length: BUILD_DISPATCH_POLICY.maxOpenPrs + 1 }, (_, i) => ({ number: 9000 + i, labels: [], files: [], headRefName: `lane/${9000 + i}-build-test` }));
 
     await runBuildDispatchTick({ live: true, effects: base });
     const killed = await runBuildDispatchTick({ live: true, effects: { ...base, killSwitch: () => ({ engaged: true, reason: 'operator' }) } });
@@ -1781,6 +1781,87 @@ describe('automatic item preparation', () => {
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
     };
   }
+  it('skips a prepare merged 20 minutes ago before allocating the next slot', async () => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T23:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    const rows = [{ num: '4501' }, { num: '4502' }];
+    effects.planTick = (bk) => ({ decisions: {
+      admission: { queue: rows, held: rows.map(r => ({ ...r, reason: 'needs-prepare' })) },
+      itemPrepareSpawns: planPrepareSpawns({ needsPrepare: rows, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = ({ num }) => num === '4501' ? [{ number: 91, state: 'MERGED',
+      headRefName: 'lane/4501-prepare-design', createdAt: '2026-10-14T00:00:00Z', mergedAt: '2026-10-16T22:40:00Z' }] : [];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '4501', reason: 'skipped in planning: prepared 20 min ago (#91)' }]);
+      expect(tick.prepare.planned.map(r => r.num)).toEqual(['4502']);
+      expect(tick.prepare.launched.map(r => r.num)).toEqual(['4502']);
+      expect(tick.prepare.refused).toEqual([]);
+    } finally { log.mockRestore(); }
+  });
+  it('reserves listing budget for actual picks behind more than 50 held prepare candidates', async () => {
+    const effects = fixture();
+    const rows = Array.from({ length: 60 }, (_, i) => ({ num: String(8000 + i), bornAs: `xabc${String(i).padStart(3, '0')}` }));
+    const git = prepareGitFixture(Object.fromEntries(rows.map(row => [row.num, `---\nbornAs: ${row.bornAs}\n---\nunprepared`])));
+    const searches = [];
+    const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      searches.push(args[args.indexOf('--search') + 1]);
+      return '[]';
+    } });
+    effects.planTick = bk => ({ decisions: {
+      admission: { queue: rows, held: rows.map((row, i) => ({ ...row,
+        reason: i < 58 ? ['needs-prepare', 'prepare-stale', 'no-size'][i % 3] : 'needs-prepare' })) },
+      itemPrepareSpawns: planPrepareSpawns({ needsPrepare: rows.slice(-2), prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1, 2], maxConcurrentItemPrepares: 2 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.refused).toEqual([]);
+    expect(tick.prepare.launched.map(row => row.num)).toEqual(['8058', '8059']);
+    expect(searches).toHaveLength(6);
+    expect(effects.dispatch).toHaveBeenCalledTimes(2);
+  });
+  it.each([3, 60])('bounds replanning through %s consecutive guarded picks and still evaluates the final pick', async guardedCount => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T23:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    const rows = Array.from({ length: guardedCount + 1 }, (_, i) => ({ num: String(8100 + i), bornAs: `xdef${String(i).padStart(3, '0')}` }));
+    const searches = [];
+    const reader = createPrepareStatusReader({ exec: (cmd, args) => {
+      expect(cmd).toBe('gh');
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const row = rows.find(row => search === `head:lane/${row.num}` || search === `head:lane/${row.bornAs}`
+        || search === `in:title "WE #${row.num}: prepare"`);
+      return JSON.stringify(row !== rows.at(-1) ? [{ number: Number(row.num), state: 'MERGED',
+        headRefName: `lane/${row.num}-prepare-design`, mergedAt: '2026-10-16T22:40:00Z' }] : []);
+    } });
+    effects.planTick = bk => ({ decisions: {
+      admission: { queue: rows, held: rows.map(row => ({ ...row, reason: 'needs-prepare' })) },
+      spawnPrepareItems: planPrepareSpawns({ needsPrepare: rows, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns,
+    }, nextState: {} });
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.skippedInPlanning).toHaveLength(Math.min(guardedCount, 8));
+      // The successor outside the planning window must still get a complete final guard observation.
+      expect(searches).toHaveLength((Math.min(guardedCount, 8) + 1) * 3);
+      if (guardedCount === 3) {
+        expect(tick.prepare.launched.map(row => row.num)).toEqual(['8103']);
+        expect(tick.prepare.refused).toEqual([]);
+      } else {
+        expect(tick.prepare.refused).toEqual([{ num: '8108', reason: 'merged prepare PR #8108 (within 24h guard)' }]);
+        expect(effects.listPrepareClaims()).toEqual([]);
+        expect(effects.dispatch).not.toHaveBeenCalled();
+      }
+    } finally { log.mockRestore(); }
+  });
   function claimed(effects, num = '4501', { age = 40, alive = false } = {}) {
     acquireBuildDispatchClaim({ num, lockRoot, owner: 'host:10', pid: 10,
       nowMs: Date.now() - age * 60_000 });
@@ -2048,7 +2129,7 @@ describe('automatic item preparation', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const tick = await runBuildDispatchTick({ live: true, effects });
-      expect(tick.prepare.refused).toEqual([{ num: '5028', reason }]);
+      expect(_name === 'merged after dispatch' ? tick.prepare.skippedInPlanning : tick.prepare.refused).toEqual(_name === 'merged after dispatch' ? [{ num: '5028', reason: expect.stringContaining('skipped in planning: prepared') }] : [{ num: '5028', reason }]);
       expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
       expect(effects.dispatch).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
@@ -2098,7 +2179,7 @@ describe('automatic item preparation', () => {
       const tick = await runBuildDispatchTick({ live: true, effects });
       expect(effects.preparePolicy).toHaveBeenCalledTimes(1);
       expect(effects.dispatch).toHaveBeenCalledTimes(launches ? 1 : 0);
-      expect(tick.prepare.refused).toHaveLength(launches ? 0 : 1);
+      expect(tick.prepare.skippedInPlanning).toHaveLength(launches ? 0 : 1);
     });
   it.each([
     ['2026-10-16T20:32:38Z', false],
@@ -2123,11 +2204,35 @@ describe('automatic item preparation', () => {
       if (launches) {
         expect(tick.prepare.refused).toEqual([]);
       } else {
+        // The planning skip carries the same reconciliation note and persisted refusal the launch guard writes.
         const note = `scope moved after prepare: ${detail}; build step must reconcile scope`;
-        expect(tick.prepare.refused).toEqual([{ num: '5966', reason: 'merged prepare PR #5399 (within 24h guard)', note }]);
-        expect(tick.nextBookkeeping.prepareRefusals).toEqual([expect.objectContaining({ num: '5966', pr: 5399, note })]);
+        expect(tick.prepare.refused).toEqual([]);
+        expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)'), note }]);
+        expect(tick.nextBookkeeping.prepareRefusals).toEqual([expect.objectContaining({ num: '5966', pr: 5399,
+          reason: 'merged prepare PR #5399 (within 24h guard)', note })]);
         expect(log).toHaveBeenCalledWith(expect.stringContaining(note));
       }
+    } finally { log.mockRestore(); }
+  });
+  it('a planning skip with an open duplicate beside the merge persists the open PR, as the launch guard does', async () => {
+    const effects = fixture();
+    effects.now = () => Date.parse('2026-10-16T20:53:36Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.planTick = () => ({ decisions: { itemPrepareSpawns: [{ num: '5966' }], admission: {
+      queue: [{ num: '5966' }], held: [{ num: '5966', reason: 'prepare-stale', detail: 'scope changed since 37d55ee6: a' }],
+    } }, nextState: {} });
+    effects.listPreparePrs = () => [
+      { number: 5399, state: 'MERGED', headRefName: 'lane/5966-prepare-a', createdAt: '2026-10-15T17:18:00Z', mergedAt: '2026-10-16T20:32:38Z' },
+      { number: 5438, state: 'OPEN', headRefName: 'lane/5966-prepare-b', createdAt: '2026-10-16T20:40:00Z' },
+    ];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '5966', reason: expect.stringContaining('(#5399)') }]);
+      // The open PR's record keeps the refusal probe pointed at it; the merge-only scope note does not apply.
+      expect(tick.nextBookkeeping.prepareRefusals).toEqual([{ num: '5966', at: '2026-10-16T20:53:36.000Z',
+        reason: 'open prepare PR #5438 (lane/5966-prepare-b)', pr: 5438, head: 'lane/5966-prepare-b' }]);
     } finally { log.mockRestore(); }
   });
   it('retires a merged unstamped PR without recording an unstamped failure', async () => {
@@ -2721,7 +2826,7 @@ describe('automatic item preparation', () => {
       expect(effects.listPrepareClaims().map(c => c.meta.num)).toContain('4501');
       expect(effects.placePrepareHold).not.toHaveBeenCalled();
       expect(effects.primePrepareStatus).toHaveBeenCalledTimes(1);
-      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(1);
+      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(2);
     });
     it('falls back to individual reads after a failed prime', async () => {
       const effects = fixture();
@@ -4052,11 +4157,16 @@ describe('grouped PREPARE daemon ticks', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const tick = await runBuildDispatchTick({ live: true, effects });
-      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7202', '7203', '7204', '7205'] })]);
+      expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: _name === 'merged prepare PR' ? ['7202', '7204', '7205'] : ['7202', '7203', '7204', '7205'] })]);
       expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7203');
       expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '7201', groupMembers: ['7202', '7204', '7205'] }));
-      expect(tick.prepare.refused).toEqual([{ num: '7203', reason }]);
+      expect(tick.prepare.refused).toEqual(_name === 'merged prepare PR' ? [] : [{ num: '7203', reason }]);
+      // A planning skip persists its merged-prepare refusal like a launch refusal does.
       expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7203']);
+      if (_name === 'merged prepare PR') {
+        expect(tick.nextBookkeeping.prepareRefusals[0]).toMatchObject({ pr: 94, head: 'lane/7203e-prepare-x', reason });
+      }
+      if (_name === 'merged prepare PR') expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7203', reason: 'skipped in planning: prepared 60 min ago (#94)' }]);
     } finally { log.mockRestore(); }
   });
 
@@ -4069,6 +4179,54 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201', members: ['7203', '7204', '7205'] })]);
     expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).not.toContain('7202');
     expect(tick.nextBookkeeping.prepareRefusals.map(r => r.num)).toEqual(['7202']);
+  });
+
+  it('refills a selected group after a cooldown skip without inspecting the held backlog', async () => {
+    const queue = Array.from({ length: 60 }, (_, i) => ({ ...rows[0], num: String(7201 + i),
+      bornAs: `xgrp${String(i).padStart(3, '0')}`, scope: [`we:scripts/prepare/file${i}.mjs`] }));
+    const effects = fixture({ queue, spawns: [queue[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    const searches = [];
+    const reader = createPrepareStatusReader({ exec: (cmd, args) => {
+      expect(cmd).toBe('gh');
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      return JSON.stringify(search === `head:lane/${queue[2].bornAs}` ? [{ number: 94, state: 'MERGED',
+        headRefName: `lane/${queue[2].bornAs}-prepare-design`, mergedAt: '2026-10-15T11:00:00Z' }] : []);
+    } });
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.groups).toEqual([expect.objectContaining({ lead: '7201',
+      members: ['7202', '7204', '7205', '7206', '7207'] })]);
+    expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7203', reason: 'skipped in planning: prepared 60 min ago (#94)' }]);
+    expect(tick.prepare.refused).toEqual([]);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).toEqual(['7201', '7202', '7204', '7205', '7206', '7207']);
+    expect(effects.dispatch).toHaveBeenCalledWith(expect.objectContaining({ groupMembers: ['7202', '7204', '7205', '7206', '7207'] }));
+    expect(searches).toHaveLength(21); // Seven selected cards, three searches each; launch admission reuses the reader cache.
+  });
+
+  it('shares the eight-card planning budget with group members and guards uninspected replacements at launch', async () => {
+    const queue = Array.from({ length: 60 }, (_, i) => ({ ...rows[0], num: String(7201 + i),
+      scope: [`we:scripts/prepare/file${i}.mjs`] }));
+    const effects = fixture({ queue, spawns: [queue[0]] });
+    effects.now = () => Date.parse('2026-10-15T12:00:00Z');
+    effects.preparePolicy = () => resolvePreparePolicy();
+    effects.listPreparePrs = vi.fn(({ num }) => num === '7201' ? [] : [{ number: Number(num), state: 'MERGED',
+      headRefName: `lane/${num}-prepare-design`, mergedAt: '2026-10-15T11:00:00Z' }]);
+    const acquire = effects.acquirePrepareClaim;
+    effects.acquirePrepareClaim = vi.fn(args => {
+      // Eight planning observations plus the lead's final launch guard, never a full held-backlog scan.
+      expect(effects.listPreparePrs).toHaveBeenCalledTimes(9);
+      return acquire(args);
+    });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.skippedInPlanning.map(r => r.num)).toEqual(['7202', '7203', '7204', '7205', '7206', '7207', '7208']);
+    expect(tick.prepare.refused.map(r => r.num)).toEqual(['7209', '7210', '7211', '7212', '7213']);
+    expect(effects.acquirePrepareClaim.mock.calls.map(([a]) => a.num)).toEqual(['7201']);
+    expect(tick.prepare.launched).toEqual([expect.objectContaining({ num: '7201' })]);
+    expect(effects.dispatch.mock.calls[0][0].groupMembers).toBeUndefined();
+    expect(effects.listPreparePrs).toHaveBeenCalledTimes(14);
   });
 
   it('keeps agent and unknown prepare routes single-card before claiming members', async () => {
@@ -4201,5 +4359,60 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(tick.prepare.planned[0].groupMembers).toEqual(['7202', '7203', '7204']);
     expect(effects.acquirePrepareClaim).not.toHaveBeenCalled();
     expect(effects.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('prepare discovery under repository PR volume', () => {
+  it.each([false, true])('is complete above 500 PRs and bounds all listing calls (async=%s)', async prefetch => {
+    const nums = ['5694', '5919', '5745', '5940'];
+    const cards = Object.fromEntries(nums.map(num => [num, `---\nbornAs: xabc${num.slice(-3)}\nstatus: open\n---\nvolume ${num}`]));
+    const population = Array.from({ length: 750 }, (_, number) => ({ number, state: 'MERGED',
+      title: `unrelated ${number}`, headRefName: `feature/${number}`, isCrossRepository: false }));
+    for (const [i, num] of nums.entries()) population.push({ number: 9000 + i, state: 'OPEN',
+      title: i === 2 ? `WE #${num}: prepare scope` : 'prepare',
+      headRefName: i === 2 ? 'feature/title-only' : `lane/${i === 1 ? 'xabc919' : num}-prepare-volume`,
+      isCrossRepository: false });
+    const git = prepareGitFixture(cards);
+    const searches = [];
+    const answer = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const head = /^head:(.+)$/.exec(search)?.[1];
+      const title = /^in:title "(.+)"$/.exec(search)?.[1];
+      expect(Boolean(head || title)).toBe(true);
+      return JSON.stringify(population.filter(pr => head ? pr.headRefName.startsWith(head) : pr.title.includes(title))
+        .slice(0, Number(args[args.indexOf('--limit') + 1])));
+    };
+    const reader = createPrepareStatusReader({ exec: answer, maxPrListingCalls: 12,
+      ...(prefetch ? { execAsync: async (...args) => answer(...args) } : {}) });
+    await reader.prime(nums.map(num => ({ num })));
+    for (const [i, num] of nums.entries()) expect(reader.listPrs({ num }).map(pr => pr.number)).toEqual([9000 + i]);
+    expect(searches).toHaveLength(12);
+    // A second read uses the same complete observations; a new identity fails closed without another gh call.
+    for (const num of nums) reader.listPrs({ num });
+    expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
+    expect(searches).toHaveLength(12);
+  });
+
+  it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {
+    const reader = createPrepareStatusReader({ exec: prepareGitFixture({ 4413: '---\nbornAs: x56mcj7\n---\nlease reaper guard' }) });
+    expect(reader.resolveCard({ num: 4413 }).path).toBe('backlog/4413-card.md');
+    const dispatch = vi.fn();
+    const acquireClaim = vi.fn();
+    const recordBuildFailure = vi.fn();
+    const tick = () => runBuildDispatchTick({ live: true, effects: {
+      planTick: () => ({ decisions: { spawnBuilds: [{ num: '99999', lane: 1 }], admission: {
+        queue: [{ num: '99999', scope: ['we:scripts/a.mjs'] }], cleared: [{ num: '99999', ready: true }],
+      } }, nextState: {} }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
+      killSwitch: () => ({ engaged: false }), resolveBuildCard: args => reader.resolveCard(args),
+      dispatch, acquireClaim, recordBuildFailure,
+    } });
+    for (let i = 0; i < 2; i++) expect((await tick()).failures).toContainEqual({ num: '99999', stage: 'card', reason: 'build card #99999 unavailable on origin/main' });
+    expect(acquireClaim).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(recordBuildFailure).toHaveBeenCalledWith({ num: '99999', reason: 'build card #99999 unavailable on origin/main' });
   });
 });

@@ -67,6 +67,7 @@ import { operatorScope, scopeBrief } from './fix-scope-fence.mjs';
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
@@ -1062,7 +1063,7 @@ export function tryResumeRoundFix(planned, {
   listAgentsAll = () => defaultListAgents({ all: true }),
   readInputs = readRoundResumeInputs,
   loadLadder = () => loadFixerLadder(),
-  readHistoryInputs = ({ repo: r, pr }) => readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled }),
+  readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postNotice = postRulingNotice,
   resume = resumeBgSession,
   resumeOptions = {},
@@ -1072,6 +1073,13 @@ export function tryResumeRoundFix(planned, {
   dryRun = false,
 } = {}) {
   if (!dryRun) assertNotALaneCheckout(root);
+  if (resolveFixSafety().value.resetOnRepeatedFinding) {
+    try {
+      if (repeatedFindingPlan(readHistoryInputs({ repo, pr: planned.pr })?.comments).action !== 'patch') {
+        return { resumed: false, decision: { resume: false, reason: 'repeated-finding' } };
+      }
+    } catch { /* ordinary resume guards below still apply */ }
+  }
   const slug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
   const declined = (decision) => ({ resumed: false, decision, resumeAttempt: { attempted: false, round: roundOf(planned), refused: decision.reason, why: decision.why } });
   if (fixSettings?.resumeAcrossRounds === 'off') return declined({ resume: false, reason: 'setting-off', why: 'fix.resumeAcrossRounds is off' });
@@ -1461,7 +1469,12 @@ export function dispatchFix(planned, {
       pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
     };
   }
-  const decision = borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
+  const safety = resolveFixSafety();
+  let repeat = { action: 'patch' };
+  if (safety.value.resetOnRepeatedFinding) {
+    try { repeat = repeatedFindingPlan(readHistoryInputs({ repo, pr: planned.pr })?.comments); } catch { /* launcher re-reads */ }
+  }
+  const decision = repeat.action !== 'patch' ? { executor: 'codex', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
     ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
   }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
   const claim = acquireClaim({
