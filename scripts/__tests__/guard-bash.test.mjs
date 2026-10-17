@@ -845,6 +845,13 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
       'D=~/x; D=/clone; read X <<< D=5; cd "$D" && ls',
       'D=~/x; D=/clone; read -p D X; cd "$D" && ls',
       'D=~/x; D=/clone; printf "%s" D; cd "$D" && ls',
+      // a trap that runs only at exit, a run-time command word's plain operands, `getopts`' option string
+      // and `unset -f` (a function) leave the value alone
+      "D=~/x; D=/clone; trap 'rm -f \"$D/x\"' EXIT; cd \"$D\" && ls",
+      'D=~/x; D=/clone; "$SHELL" -c true "$D"; cd "$D" && ls',
+      'D=~/x; D=/clone; `echo true` "$D"; cd "$D" && ls',
+      'D=~/x; D=/clone; getopts D x; cd "$D" && ls',
+      'D=~/x; D=/clone; unset -f D; cd "$D" && ls',
     ]) expect(at(cmd), JSON.stringify(cmd)).toBe('/clone');
     for (const cmd of [
       'D=~/x; D=/clone; echo "$((D=5))"; cd "$D" && ls',
@@ -899,6 +906,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('HOME=/a; echo HOME=/b; cd ~/clone && ls')).toBe('/a/clone');
     expect(at('HOME=/a; ( HOME+=/b ); cd ~/clone && ls')).toBe('/a/clone');
     expect(at('HOME=/a; git commit -m "unset HOME"; cd ~/clone && ls')).toBe('/a/clone');
+    expect(at('trap "rm -rf x" EXIT; cd ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('"$X" a; cd ~/clone && ls')).toBe(`${HOME}/clone`);
+    expect(at('`true`; cd ~/clone && ls')).toBe(`${HOME}/clone`);
   });
   it('a `((` that bash reads as two subshells is a child shell; a real `((…))` still binds here', () => {
     for (const cmd of [
@@ -962,6 +972,9 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     const started = Date.now();
     lands(`${'D=~/c; '.repeat(5000)}${'eval "cd /P"; '.repeat(64)}git checkout --detach`);
     lands(`${'D=/x; '.repeat(5000)}${'X=$(cd "$D"); '.repeat(200)}`);
+    lands(`D=~/c; ${'D=/x; cd "$D"; '.repeat(20000)}`);
+    // many child-shell homes neither slow the walk down nor crowd out a later landing
+    expect(lands(`${'(HOME=/h; cd ~); '.repeat(16000)}(cd /P; git checkout --detach)`)).toContain('/P');
     expect(Date.now() - started).toBeLessThan(8000);
     for (const cmd of [
       'echo "(cd /P)"',
