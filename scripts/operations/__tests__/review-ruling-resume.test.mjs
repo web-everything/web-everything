@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -267,6 +267,30 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('a bad run id or torn record reaches the adapter refusal, not the root-usage exit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-cli-bad-resume-'));
+    try {
+      vi.stubEnv('OPERATION_RUNS_DIR', dir);
+      writeFileSync(join(dir, 'torn.json'), '{"id":"torn","op":"review-pr",');
+      const live = resolveOperation('review-pr').declaration.steps.map(s => s.name);
+      const cliPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'run.mjs');
+      for (const [id, refusal] of [['../x', 'invalid run id "../x"'], ['torn', 'not parseable JSON'], ['missing-run', 'no run record for "missing-run"']]) {
+        // The builder falls back to the live roster instead of throwing out of resolveOperation.
+        expect(resolveOperation('review-pr', { resumeId: id }).declaration.steps.map(s => s.name)).toEqual(live);
+        const cli = spawnSync(process.execPath, [cliPath, 'review-pr', `--resume=${id}`], {
+          encoding: 'utf8', timeout: 30_000,
+          env: { ...process.env, WE_DAEMON_MANAGED_CLONE: '1', OPERATION_CALLS_DIR: join(dir, 'calls') },
+        });
+        expect(cli.error).toBeUndefined();
+        expect(cli.stdout + cli.stderr).toContain(refusal);
+        expect(cli.stdout + cli.stderr).not.toContain('usage: run.mjs <operation>');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe('rewindRunToStep', () => {

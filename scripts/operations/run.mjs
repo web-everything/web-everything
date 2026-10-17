@@ -202,7 +202,10 @@ export const OPERATIONS = Object.freeze({
   // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
   // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
   [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, resumeId = null } = {}) => {
-    const savedRun = resumeId ? createFileRunStore().read(resumeId) : null;
+    // A bad id or torn record falls back to the live roster, so the adapter's own resume read refuses it
+    // normally instead of this builder aborting resolveOperation with the root usage.
+    let savedRun = null;
+    if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
     const seatSettings = loadReviewSeatSettings();
     // Until reduce completes, missing answers can mean future/failed seats. Keep the live declaration
     // used by partial-run recovery; only completed panels can reconstruct every seat from their answers.
