@@ -646,7 +646,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       heldNums.add(lead);
       // Do not immediately launch the failed group's released members again in this same tick.
       for (const c of groupClaims) heldNums.add(normNum(c.meta.num));
-      const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}` }) : null;
+      // Keyed by the settled attempt: the claims are released below and a throw there re-runs this next tick.
+      const attemptKey = settled.startedAt ?? settled.runId;
+      const rec = live ? effects.recordBuildFailure?.({ num: lead, reason: 'group-member-dropped', output: `dropped members: ${settled.groupDropped.join(',')}`,
+        ...(attemptKey != null ? { attemptKey: `group:${attemptKey}` } : {}) }) : null;
       groupFailures.push({ num: lead, stage: 'group', reason: 'group-member-dropped', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts } : {}) });
     }
   }
