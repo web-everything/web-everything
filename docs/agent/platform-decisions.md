@@ -5445,6 +5445,14 @@ tree at ratification and the ruling did not change. Full reasoning and the rejec
 
 ### An approval carries across a push only when the drain replays the merge of main itself and gets the pushed tree; a conflict, a non-merge commit, or main touching the PR's files re-parks {#merge-only-push-approval-carry}
 
+**Operator amendment, 2026-10-16 (open-PR time-loss fixes):** the existing sanctioned carry writers may
+also carry a recorded approval across a rebase or merge of main when each head's nonempty net diff against
+its own merge-base with main has the same `git patch-id --stable`, contribution fingerprint, and exact
+added/removed line bytes (including whitespace and the root manifest). A different or unreadable proof does
+not authorize this route and does not invalidate an independent carry proof. `review.carryAcrossIdenticalNetPatch` defaults true, with its resolved source
+logged. Complete-thread, formal-review, pinned-head and pre-write checks still apply; this adds a proof
+route rather than a new approval writer. The historical merge replay rule below remains a separate route.
+
 **Ratified 2026-09-21 by the operator (Nicolas Gilbert), all four forks approved as prepared, with the
 prepared guardrails, no amendment (`#3735`).** The situation: a PR holds a `review:accepted` acceptance
 (including one turned from `review:human` by `--to=clear-human`), and its head then moves because someone

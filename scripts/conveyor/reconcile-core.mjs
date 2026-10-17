@@ -2722,8 +2722,7 @@ export function planReconcile({
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
     const latestMergeGate = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(r => r.name === 'merge-gate');
-    const reviewHoldRed = advisoryReviewOnHumanHandoff === 'on'
-      && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+    const reviewHoldRed = withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && heldGates.length > 0 && heldGates.every(name => name === 'review-gate'
         || (name === 'merge-gate' && latestMergeGate?.mergeGateReviewHold));
     if (reviewHoldRed) {
@@ -3014,7 +3013,7 @@ export function planReconcile({
       // ever started. The failed jobs of an unchanged head are re-run once (budget shared with the timeout re-run),
       // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
       const staleRetry = pr.owedCiRerunRetry;
-      if (staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+      if (!pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = staleRetry.jobs.length;

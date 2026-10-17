@@ -13,7 +13,7 @@ import {
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
-import { decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
+import { carryHumanClearanceOnIdenticalDiff, createTamperParkCarryCallback, decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\n-old\n+new\n';
 const FP = normalizeDiffFingerprint(DIFF);
@@ -559,7 +559,7 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
 });
 
 describe('PR #4715 context movement and manifest-drop replay', () => {
-  it.each(['strict', 'contribution', 'default', 'changed'])('%s policy through the durable carry', (mode) => {
+  it.each(['strict', 'contribution', 'default', 'changed'].flatMap(mode => [true, false].map(netPatch => [mode, netPatch])))('%s policy through the durable carry (net patch: %s)', (mode, netPatch) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-4715-'));
     const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     const content = 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n';
@@ -585,19 +585,35 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
         expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
         posted.push(args[args.indexOf('--body') + 1]); return '';
       };
-      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
-      if (mode === 'strict' || mode === 'changed') {
-        expect(result).toBe(null); expect(posted).toHaveLength(0);
-        expect(logs.join('')).toContain('net diff changed');
-      } else {
-        expect(result.carried).toMatchObject({ recorded: true, tier: 'contribution', mechanicalReason: expect.stringContaining('replay') });
+      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, netPatchSetting: { value: netPatch, source: 'test' }, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
+      if (mode === 'default' || mode === 'contribution') {
+        expect(result).toMatchObject({ carried: { recorded: true, tier: 'contribution', fromSha: cleared, toSha: headSha } });
         expect(posted).toHaveLength(1);
-        expect(posted[0]).toContain(`human-clearance-carried: from=${cleared} to=${headSha}`);
-        expect(posted[0]).toContain("added/removed lines are identical");
-        expect(posted[0]).not.toContain('byte-identical');
-        expect(logs.join('')).toContain('tier contribution');
+      } else {
+        expect(result).toBe(null); expect(posted).toHaveLength(0);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('tamper-park callback through the durable human carry writer', () => {
+  it.each([true, false].flatMap(fingerprint => ['valid', 'mixed change', 'live hold', 'numbering off', 'master off', 'unpinned'].map(shape => [fingerprint, shape])))('numbering callback with fingerprint=%s, %s', (fingerprint, shape) => {
+    const comments = [clearHumanComment(CLEARED, fingerprint ? FP : null)], posted = [];
+    const headDiff = DIFF.replace('+new', '+numbered');
+    const result = carryHumanClearanceOnIdenticalDiff({ setting: 'on', comments, reviews: [],
+      humanClearedSha: CLEARED, headSha: HEAD, pinnedHeadSha: shape === 'unpinned' ? CLEARED : HEAD,
+      readHeadDiff: () => ({ scored: true, text: headDiff, rev: HEAD }),
+      applyNumberingCarry: createTamperParkCarryCallback({ pr: 5463, repo: 'owner/repo',
+        setting: { value: shape !== 'master off', source: 'test' }, numberingSetting: { value: shape !== 'numbering off', source: 'test' }, log: quiet,
+        exec: (cmd, args) => { if (cmd === 'git') throw Error('no general git proof in fixture'); posted.push(args); return ''; },
+        proveNumbering: () => ({ ok: shape !== 'mixed change', reason: shape === 'mixed change' ? 'unrelated byte' : 'exact numbering' }),
+        readNumberingLiveEvidence: () => ({ headSha: HEAD, comments: shape === 'live hold'
+          ? [...comments, { author: { login: 'chalbert' }, body: 'Do not land this.' }] : comments, reviews: [] }),
+      }),
+    });
+    expect(result).toMatchObject({ carried: shape === 'valid', humanClearedSha: shape === 'valid' ? HEAD : CLEARED });
+    expect(posted).toHaveLength(shape === 'valid' ? 1 : 0);
+    if (shape === 'valid') expect(posted[0].at(-1)).toContain(`from=${CLEARED} to=${HEAD}`);
   });
 });
 

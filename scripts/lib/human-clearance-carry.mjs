@@ -40,6 +40,7 @@
  *   Live #5025: drain card-numbering changes fingerprints; a separate numbering-only proof carries the original clearance.
  *   Setting: `review.carryEquivalence` (contribution|strict), env `WE_REVIEW_CARRY_EQUIVALENCE`.
  */
+import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -205,7 +206,8 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
  */
 export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main',
   equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
-  numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false } = {}) {
+  numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false,
+  netPatchSetting = resolveIdenticalNetPatchSetting() } = {}) {
   try {
     const clearance = evidence?.humanClearance;
     if (!clearance || !evidence?.headSha) return { carry: false, applicable: false, reason: 'no recorded human clearance or live head' };
@@ -228,6 +230,19 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
     // never consults git (or reaches the writer) without a recorded fingerprint.
     const hasFingerprint = [clearance.diff, clearance.contribution].some(v => typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v));
     if (!hasFingerprint && !numberingOnly) return { ...pre, carry: false, applicable: true };
+    if (!numberingOnly && hasFingerprint && netPatchSetting.value) {
+      // The patch reader supplies its own cwd option; keep it bound to this evidence's repository.
+      const patch = proveIdenticalNetPatch({ exec: gitExec, cwd, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+      if (patch.ok) {
+        // The git objects must describe the recorded approval and the pinned live diff, not just each other.
+        const old = liveCarryFingerprints(patch.fromDiff), live = liveCarryFingerprints(patch.toDiff);
+        if (old.diff === clearance.diff && live.diff === liveCarryFingerprints(evidence.headDiff).diff) {
+          return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
+            fingerprint: live.diff, actor: clearance.actor, tier: 'net-patch', mechanicalReason: patch.reason, reason: patch.reason };
+        }
+      }
+      // This is an alternative proof. A miss must leave independent tree/replay/numbering proofs intact.
+    }
     if (pre.carry) {
       // Exact root tree identity includes every blob, path and mode, including the manifest.
       // Empty commits need no merge/replay exception. Never equate missing/invalid git output.
@@ -278,7 +293,9 @@ export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawAc
     '',
     `Recorded by drain via human-clearance-carry (#xnqxtdy). The HUMAN clearance ${actor} granted on `
       + `\`${fromSha.slice(0, 12)}\` is carried to \`${toSha.slice(0, 12)}\`: `
-      + (tier === 'tree'
+      + (tier === 'net-patch'
+        ? `the net change has the same git patch-id --stable, byte-identical contribution lines and verified hunk locations against each head’s merge-base with main (${mechanicalReason})`
+        : tier === 'tree'
         ? 'the live head has exactly the cleared head’s tree (all paths, modes and blob bytes)'
         : tier === 'numbering'
         ? `the head moved only by the drain's own card-numbering commit(s), verified mechanically (${mechanicalReason})`
@@ -353,11 +370,13 @@ export function applyHumanClearanceCarry({
   evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main', readLiveEvidence = null, readNumberingLiveEvidence = null,
   equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false,
+  netPatchSetting = resolveIdenticalNetPatchSetting(),
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
-  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering, numberingSetting, numberingOnly });
+  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering, numberingSetting, numberingOnly, netPatchSetting });
   if (!d.applicable) return null;
   logCarrySettingOnce(setting, log);
+  logIdenticalNetPatchSetting(netPatchSetting, log);
   log(`policy · review.carryHumanClearanceAcrossNumbering=${numberingSetting.value} (${numberingSetting.source})\n`);
   logEquivalenceSettingOnce(equivalence, log);
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
@@ -370,8 +389,8 @@ export function applyHumanClearanceCarry({
   // superseded. Numbering and tree identity never record without a live re-read — checked before the dry
   // run so a preview never reports a carry the real pass refuses; the older tiers re-read whenever the caller
   // supplies one.
-  if (['numbering', 'tree'].includes(d.tier) && readLiveEvidence == null) readLiveEvidence = readNumberingLiveEvidence;
-  if (['numbering', 'tree'].includes(d.tier) && typeof readLiveEvidence !== 'function') {
+  if (['numbering', 'tree', 'net-patch'].includes(d.tier) && readLiveEvidence == null) readLiveEvidence = readNumberingLiveEvidence;
+  if (['numbering', 'tree', 'net-patch'].includes(d.tier) && typeof readLiveEvidence !== 'function') {
     log(`  human-clearance-carry ${tag}: NOT carried ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} — the ${d.tier} tier records only after a live re-read\n`);
     return null;
   }
