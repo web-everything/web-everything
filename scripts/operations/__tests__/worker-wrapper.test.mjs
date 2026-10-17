@@ -57,6 +57,16 @@ describe('runWorker: the job record and the result channels', () => {
     expect(captured.endsWith('newest line\n')).toBe(true);
   });
 
+  it('compacts the captured smoke stderr at a line break, never mid-line', async () => {
+    const diagnosticsDir = tmp();
+    // 1,000-char lines that each start with `L`: a byte cut would leave the kept file starting inside a line.
+    const s = spec({ diagnosticsDir, argv: ['-e', `for (let i = 0; i < 1_200; i++) process.stderr.write('L' + 'y'.repeat(999) + '\\n'); process.stdout.write(${JSON.stringify(claudeStdout(DONE))})`] });
+    await runWorker(s);
+    const captured = readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8');
+    expect(captured.length).toBeLessThan(1_200 * 1_000);
+    expect(captured.split('\n').filter(Boolean).every((l) => l.startsWith('L'))).toBe(true);
+  });
+
   it('writes a started record with pid, timeout and deadline BEFORE the child exits, then a done envelope', async () => {
     const writes = [];
     const s = spec({ argv: ['-e', `setTimeout(()=>process.stdout.write(${JSON.stringify(claudeStdout(DONE))}), 150)`] });

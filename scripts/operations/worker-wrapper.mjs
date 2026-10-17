@@ -314,10 +314,14 @@ async function runWorkerOnce(spec, io, stop) {
               const file = join(spec.diagnosticsDir, name);
               appendFileSync(file, chunk);
               stderrBytes += Buffer.byteLength(chunk);
-              // Bounded on disk, newest bytes kept: past the cap, compact the file to its last 64 KiB.
+              // Bounded on disk, newest lines kept: past the cap, compact the file to the whole lines in its last 64 KiB
+              // (a byte cut would leave a partial first line, which a reader could redact from a cut-open secret).
               if (stderrBytes > DIAGNOSTIC_STDERR_MAX_BYTES) {
-                writeFileSync(file, readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES));
-                stderrBytes = DIAGNOSTIC_STDERR_KEEP_BYTES;
+                const kept = readFileSync(file).subarray(-DIAGNOSTIC_STDERR_KEEP_BYTES);
+                const breaks = [kept.indexOf(0x0a), kept.indexOf(0x0d)].filter((i) => i >= 0);
+                const whole = breaks.length ? kept.subarray(Math.min(...breaks) + 1) : Buffer.alloc(0);
+                writeFileSync(file, whole);
+                stderrBytes = whole.length;
               }
             }
           } catch { /* diagnostics cannot interrupt the worker */ }

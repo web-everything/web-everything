@@ -19,14 +19,14 @@ const INVISIBLE = new RegExp(`[${String.fromCharCode(0xad)}${String.fromCharCode
 function redactLine(line) {
   return redactAssignments(line
     .replace(/(\/\/)[^/\s@]+@/g, '$1<redacted>@')
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g,
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g,
       (m) => `${m.match(/^(?:gh[pousr]_|github_pat_|glpat-|npm_|sk-ant-|sk-|AKIA|xox[baprs]-|AIza|eyJ)/)?.[0] ?? ''}<redacted>`)
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <redacted>'));
 }
 
 // A whole word (one start per word, so a long line costs linear time) followed by its separator: `name=`, `name:`,
 // `"name": `, or `--name ` (a flag's value follows whitespace).
-const NAME_SEP = /(?<![A-Za-z0-9_-])(["']?)(--?)?([A-Za-z0-9_][A-Za-z0-9_-]{0,199})\1(\s*[=:]\s*|\s+)/g;
+const NAME_SEP = /(?<![A-Za-z0-9_-])(["']?)(--?)?([A-Za-z0-9_][A-Za-z0-9_-]*)\1(\s*[=:]\s*|\s+)/g;
 // A quoted value may hold spaces and escaped quotes.
 const VALUE = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+/y;
 // A secret word, or a generic key name (`KEY`, `*_KEY`, `*-key`, `PRIVATEKEY`, camelCase `serviceKey`) — never a
@@ -57,8 +57,9 @@ function redactAssignments(line) {
 const ORPHAN_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
 const B64 = /[A-Za-z0-9+/=]/;
 // A body line, bare or indented, quoted, `\n`-escaped or `+`-joined (Node's inspect form); the last may be short.
-const BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]{16,}(?:\\n)?['"`]?[\s+,]*$/;
-const LAST_BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]+(?:\\n)?['"`]?[\s+,]*$/;
+// The trailing `+` (a joined string) is a single optional char, so it never competes with the body's own `+` run.
+const BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]{16,}(?:\\n)?['"`]?[\s,]*(?:\+[\s,]*)?$/;
+const LAST_BODY_LINE = /^\s*['"`]?[A-Za-z0-9+/=]+(?:\\n)?['"`]?[\s,]*(?:\+[\s,]*)?$/;
 /** Where a `\n`-escaped body (JSON) that runs up to `end` on the same line starts. Linear: one backward walk. */
 function escapedBodyStart(line, end) {
   let i = end;
@@ -108,11 +109,13 @@ function lastBreakBefore(text, end, floor) {
  */
 export function redactSecrets(text) {
   try {
-    const source = String(text ?? '');
-    if (source.length > MAX_REDACT_INPUT) return `<detail withheld: ${source.length} chars exceeds the redaction bound>`;
+    const raw = String(text ?? '');
+    if (raw.length > MAX_REDACT_INPUT) return `<detail withheld: ${raw.length} chars exceeds the redaction bound>`;
     // NFKC folds fullwidth letters and invisible characters are dropped, so a fullwidth or zero-width-split `TOKEN=`
-    // still matches.
-    const normalised = redactOrphanedKeys(source.normalize('NFKC').replace(LINE_BREAKS, '\n').replace(CONTROLS, '').replace(INVISIBLE, '')
+    // still matches. NFKC can grow text many times over, so the bound is checked again on its result.
+    const source = raw.normalize('NFKC');
+    if (source.length > MAX_REDACT_INPUT) return `<detail withheld: ${source.length} chars exceeds the redaction bound>`;
+    const normalised = redactOrphanedKeys(source.replace(LINE_BREAKS, '\n').replace(CONTROLS, '').replace(INVISIBLE, '')
       .replace(/-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$)/g, '<redacted private key>'));
     return normalised.split('\n').map((raw) => {
       if (raw.length > MAX_REDACT_LINE) return `<line withheld: ${raw.length} chars is too long to redact>`;

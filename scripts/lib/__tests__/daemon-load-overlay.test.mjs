@@ -307,6 +307,7 @@ import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
   rollbackVersionIfCurrent, DISPATCH_PATH_DEFAULTS, readFileTail,
 } from '../daemon-load-overlay.mjs';
+import { redactedTail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 const quietLog = { error: () => {}, log: () => {} };
 
@@ -1009,6 +1010,29 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(tail.endsWith(text.split('\n').pop())).toBe(true);
     expect(text.endsWith(tail)).toBe(true);
     expect(tail.startsWith('line ')).toBe(true);
+  });
+
+  it('never returns a mid-line window: drops to the first break of any kind, and withholds a window with none', () => {
+    const cr = join(work, 'cr.stderr');
+    writeFileSync(cr, 'progress 50%\r'.repeat(6_000));
+    expect(readFileTail(cr).startsWith('progress 50%')).toBe(true);
+    const oneLine = join(work, 'one-line.stderr');
+    writeFileSync(oneLine, `export DB_PASSWORD="${'secretword '.repeat(8_000)}" FATAL`);
+    expect(redactedTail(readFileTail(oneLine))).not.toContain('secretword');
+  });
+
+  it('redacts a transcript denial before cutting it, so a quoted secret past 200 chars never leaks', async () => {
+    const body = `This command requires approval: ${'x'.repeat(150)} --password "aa bb cc dd ee ff"`;
+    expect(body.indexOf('bb')).toBeLessThan(199);
+    expect(body.indexOf('ff')).toBeGreaterThan(200);
+    const spawn = launchFixture(({ sessionId }) => {
+      const dir = join(work, 'home', '.claude', 'projects', 'test');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${sessionId}.jsonl`), JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: body }] } }));
+    });
+    const r = await smoke(spawn);
+    expect(r).toMatchObject({ ok: false, reason: 'commands-denied' });
+    for (const w of ['bb', 'cc', 'ff']) expect(r.detail).not.toContain(w);
   });
 
   it.skipIf(process.platform === 'win32')('never blocks on a FIFO left at the wrapper stderr path', () => {

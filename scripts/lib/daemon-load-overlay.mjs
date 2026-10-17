@@ -332,7 +332,8 @@ function transcriptDenials(file) {
     for (const item of Array.isArray(row?.message?.content) ? row.message.content : []) {
       if (item?.type !== 'tool_result' || !item.is_error) continue;
       const body = typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? '');
-      if (/requires approval|permission/i.test(body)) out.push(body.slice(0, 200));
+      // Redacted whole, then cut (redactDetail keeps 500 chars): a cut first could split a quoted secret.
+      if (/requires approval|permission/i.test(body)) out.push(redactDetail(body));
     }
   }
   return out;
@@ -353,6 +354,7 @@ function findTranscript(ids, home = homedir()) {
 
 /** The last `bytes` of a file as text ('' when unreadable); a partial first line is dropped when the read starts mid-file.
  *  One read of at most `bytes`, positioned at the final window (`read` is injectable so a test can pin that range). */
+const LINE_BREAK = new RegExp(`[\\n\\r${String.fromCharCode(0x85, 0x2028, 0x2029)}]`);
 export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
   let fd;
   try {
@@ -365,7 +367,11 @@ export function readFileTail(file, bytes = 64 * 1024, read = readSync) {
     const buf = Buffer.alloc(size - start);
     const n = read(fd, buf, 0, buf.length, start);
     const text = buf.subarray(0, n).toString('utf8');
-    return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+    if (start === 0) return text;
+    // A mid-file read starts inside a line: drop it up to the first break of any kind, so redaction never sees a
+    // cut-open quoted secret; a window with no break at all is one partial line and is withheld.
+    const br = text.search(LINE_BREAK);
+    return br >= 0 ? text.slice(br + 1) : '';
   } catch {
     return '';
   } finally {

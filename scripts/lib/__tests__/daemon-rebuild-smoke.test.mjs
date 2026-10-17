@@ -230,6 +230,17 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
       expect(out).not.toContain('secretword');
       expect(out).toMatch(/withheld/);
     });
+    it('redacts a secret assignment whose name is longer than 200 chars', () => {
+      expect(redactSecrets(`${'A'.repeat(195)}_TOKEN=abc123secret`)).not.toContain('abc123secret');
+    });
+    it('stays linear on whole long lines (JWT-shaped runs, orphaned-PEM tails, NFKC growth)', () => {
+      const t0 = Date.now();
+      redactSecrets('eyJ-'.repeat(16_384));
+      redactedTail(`${'A'.repeat(16)}${'+'.repeat(32_768)}!\n-----END PRIVATE KEY-----`);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+      // NFKC can grow text many times over; the bound applies to the normalised text too.
+      expect(redactSecrets(String.fromCharCode(0xfdfa).repeat(200_000))).toMatch(/withheld/);
+    });
     it('fails closed: when redaction cannot run, no detail is emitted', () => {
       const hostile = { toString() { throw new Error('boom ghp_secretAAAA'); } };
       for (const out of [redactSecrets(hostile), redactedTail(hostile), redactDetail(hostile), redactDetail(hostile, 'daemon-entries-boot')]) {
