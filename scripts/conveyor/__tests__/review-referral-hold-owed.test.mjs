@@ -75,12 +75,12 @@ describe('same-head hold when the post-accept red-team comment is owed', () => {
     expect(existsSync(opts.redTeam.stateDir)).toBe(false);
   });
   it('carries the owed-comment exception through the real reconcile planner', () => {
-    const [p] = enrichPrsWithReferralHolds([pr({ labels: ['review:pending'],
+    const [p] = enrichPrsWithReferralHolds([pr({ labels: [{ name: 'review:pending' }],
       headRefName: 'lane/redteam-comment-retry', state: 'OPEN', isDraft: false,
       mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     })], { ...opts, now: 3, readRuns: () => [run()] });
     expect(p.owedRedTeamReview).toEqual({ repo, pr: number, head });
-    const plan = planReconcile({ prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
+    const plan = planReconcile({ repo, prs: [p], agents: [], requiredChecks: ['test'], now: 3 });
     expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: number,
       owedRedTeamReview: p.owedRedTeamReview }));
   });

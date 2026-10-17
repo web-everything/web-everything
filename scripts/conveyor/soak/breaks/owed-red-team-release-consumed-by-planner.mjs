@@ -18,7 +18,7 @@ const { dispatchReviewByMode } = await load('scripts/operations/review-job.mjs')
 const { runRedTeam } = await load('scripts/operations/review-extra-seats.mjs');
 // Warm the old reader too: the incident is a long-lived notes daemon winning the receipt race.
 await hold.loadRedTeamHoldReaders?.();
-const repo = 'web-everything/web-everything', number = 5461;
+const repo = 'red-team-fixture/example', number = 5461;
 const head = '3373a3326ef2b649303f7b26b69efabfdfe179a6';
 const pr = { number, headRefOid: head, comments: [], labels: ['review:accepted'] };
 const row = { repo, pr: number, rev: head, dispatchKind: 'review-seat', seat: 'red-team', status: 'ok',
