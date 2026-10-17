@@ -608,6 +608,20 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     }
     expect(at('D=/a; D=/b true; cd "$D"')).toBe('/a');
     expect(at('cd "$D"; D=/b')).toBe(REPORTED);
+    for (const rebind of ['IFS= read -r D <<< /b', 'if read -r D <<< /b', '\\read D <f', 'command -p read D <f',
+      'x=$(D=1) D=/b', 'echo $(D=1) $((D=5))', 'f(){ D=/b', 'exec {D}>/dev/null', 'coproc D { cat; }',
+      'printf -v "$X" %s /b', 'while read D']) {
+      expect(at(`D=/a; ${rebind}; cd "$D"`), rebind).toBe(REPORTED);
+    }
+  });
+  it('a NAME= that is only an argument, or a prefix of another command, binds nothing', () => {
+    expect(at('LANE=/x; echo LANE=foo; cd $LANE')).toBe('/x');
+    expect(at('LANE=/x; env LANE=/y node -v; cd $LANE')).toBe('/x');
+    expect(at('lane=/x; node a.mjs --lane 5; cd $lane')).toBe('/x');
+    expect(at('src=/x; git add -- src; cd $src')).toBe('/x');
+    expect(at('HOME=/a; FOO=1 HOME=/y true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; env HOME=/y true; cd ~/clone')).toBe('/a/clone');
+    expect(at('HOME=/a; ( (HOME=/y) ); cd ~/clone')).toBe('/a/clone');
   });
   it('leaves unquoted bracket globs unresolved', () => {
     expect(at('cd ~/[c]lone')).toBe(REPORTED);

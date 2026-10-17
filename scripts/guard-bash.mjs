@@ -2493,12 +2493,14 @@ function expandWord(s, home) {
   return { text: out, end: i };
 }
 
-// A variable rebound by anything but a plain literal assignment — an arithmetic or array-element assignment,
-// `${NAME=…}`, `++NAME`, a later word of a multi-assignment, a name-binding builtin's operand, or text run by
-// eval/source — cannot be read here, so it becomes unknown, never the stale value. Every pattern is linear.
-const NAME_BINDER = /^(?:(?:builtin|command|time|!)\s+)*(read|mapfile|readarray|getopts|unset|for|select|wait|printf|declare|typeset|local|let|export|readonly)(?=\s|$)/;
-const RUNS_OPAQUE_TEXT = /^(?:(?:builtin|command|time|!)\s+)*(?:eval|source|\.)(?=\s|$)/;
+// A variable rebound by anything but a plain literal assignment — a later word of an assignment chain, a
+// function body, an array element, an arithmetic assignment, a name-binding builtin's operand, a `{NAME}>`
+// descriptor, or text run by eval/source — cannot be read here, so it becomes unknown, never the stale value.
+// Statements are read word by word, so a NAME= that is only an argument (`echo D=5`, `env D=5 cmd`) binds
+// nothing. Every scan is linear.
 const SPECIAL_BUILTIN = /^(?::|\.|break|continue|eval|exec|exit|export|readonly|return|set|shift|source|times|trap|unset)$/;
+const COMMAND_PREFIX = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', 'time', '!', '{', '}']);
+const ASSIGNMENT_WORD = /^([A-Za-z_]\w*)(?:\[[^\]\s]{0,64}\])?\+?=/;
 const REDIRECT_OP = /^(?:\d+|&)?(?:[<>]{1,2}|<>|>\||[<>]&)$/;
 const rebindPatterns = new Map();
 function rebindingOf(name) {
@@ -2506,14 +2508,112 @@ function rebindingOf(name) {
     const index = '(?:\\[[^\\]\\s]{0,64}\\])?';
     rebindPatterns.set(name, {
       assignment: new RegExp(`^(export\\s+)?${name}(\\+?)=(.*)$`),
-      lvalue: new RegExp(`(?:\\+\\+|--)\\s*${name}(?!\\w)|(?<![\\w{$./-])${name}${index}\\s*(?:\\+\\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))`),
+      arithmetic: new RegExp(`(?:\\+\\+|--)\\s*${name}(?!\\w)|(?<![\\w{$./-])${name}${index}\\s*(?:\\+\\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))`, 'g'),
       operand: new RegExp(`(?<![\\w{$./-])${name}(?!\\w)`),
-      valued: new RegExp(`(?<![\\w{$./-])${name}${index}\\+?=`),
-      printfTarget: new RegExp(`(?:^|\\s)-v\\s*${name}(?!\\w)`),
-      repeated: new RegExp(`^${name}(?:\\W|$)`),
+      valued: new RegExp(`^${name}${index}\\+?=`),
+      descriptor: new RegExp(`(?<![\\w$])\\{${name}\\}[<>]`),
     });
   }
   return rebindPatterns.get(name);
+}
+
+// A statement's words, split on unquoted whitespace outside `( … )`, `${ … }` and backticks. Linear.
+function shellWords(s) {
+  const words = [];
+  let start = -1;
+  let depth = 0;
+  let quote = null;
+  let tick = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (start < 0) {
+      if (/\s/.test(ch)) continue;
+      start = i;
+    }
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (ch === '\\') { i++; continue; }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === '$' && (s[i + 1] === '(' || s[i + 1] === '{')) { depth++; i++; }
+      else if ((ch === ')' || ch === '}') && depth > 0) depth--;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === '`') tick = !tick;
+    else if (ch === '(' || (ch === '{' && s[i - 1] === '$')) depth++;
+    else if ((ch === ')' || ch === '}') && depth > 0) depth--;
+    else if (/\s/.test(ch) && depth === 0 && !tick) { words.push(s.slice(start, i)); start = -1; }
+  }
+  if (start >= 0) words.push(s.slice(start));
+  return words;
+}
+
+const unquoted = (word) => word.replace(/[\\'"]/g, '');
+
+// Does this statement rebind `name` in the current shell in a way `valueAfter` cannot read?
+function rebindsUnreadably(s, name, p) {
+  const words = shellWords(s);
+  let chain = false;                                                        // `name` assigned in the prefix chain
+  let j = 0;
+  for (; j < words.length; j++) {
+    const word = unquoted(words[j]);
+    if (COMMAND_PREFIX.has(word) || /^[\w.:-]+\(\)\{?$/.test(words[j])) continue; // reserved word, function header
+    if (word === 'function') { j++; continue; }
+    if (word === 'builtin' || word === 'command') { while (words[j + 1] === '-p') j++; continue; }
+    const assigned = words[j].match(ASSIGNMENT_WORD);
+    if (assigned) { chain ||= assigned[1] === name; continue; }
+    break;
+  }
+  if (j >= words.length) return chain;                                      // assignments only: they persist
+  const command = unquoted(words[j]);
+  // A prefix assignment ends with its command, except a special builtin's under POSIX mode.
+  if (chain && SPECIAL_BUILTIN.test(command)) return true;
+  if (command === 'eval' || command === 'source' || command === '.') return true;
+  const operands = words.slice(j + 1).map(unquoted);
+  const named = (w) => w === name || w.startsWith('$');                    // `$X` may name anything
+  if (command === 'coproc') return named(operands[0] ?? '');
+  if (command === 'for' || command === 'select') return named(operands[0] ?? '');
+  if (command === 'printf') {
+    const v = operands.findIndex((w) => w.startsWith('-v'));
+    return v >= 0 && named(operands[v] === '-v' ? operands[v + 1] ?? '' : operands[v].slice(2));
+  }
+  if (command === 'export' || command === 'readonly') return operands.some((w) => p.valued.test(w) || w.startsWith('$'));
+  if (/^(?:read|mapfile|readarray|getopts|unset|wait|declare|typeset|local|let)$/.test(command)) {
+    return operands.some((w) => p.operand.test(w) || w.startsWith('$'));
+  }
+  const masked = maskQuotedKeepingExpansions(s);
+  if (p.descriptor.test(masked)) return true;
+  if (!/\(\(|\[\[/.test(masked)) return false;
+  // An arithmetic context: any assignment to `name` outside a child shell rebinds it.
+  return arithmeticOutsideChild(masked, p.arithmetic);
+}
+
+// Does `re` (global) match `masked` anywhere outside a child shell (`( … )`, `$( … )`, backticks)? `((` and `$((`
+// open arithmetic, which is no child shell. One pass over the text.
+function arithmeticOutsideChild(masked, re) {
+  const stack = [];
+  let children = 0;
+  let ticks = 0;
+  let at = 0;
+  re.lastIndex = 0;
+  for (let m = re.exec(masked); m; m = re.exec(masked)) {
+    for (; at < m.index; at++) {
+      const ch = masked[at];
+      if (ch === '`') ticks++;
+      else if (ch === '(') {
+        const arithmetic = masked[at + 1] === '(';
+        stack.push(arithmetic);
+        if (arithmetic) at++;
+        else children++;
+      } else if (ch === ')' && stack.length) {
+        if (stack.pop()) at += masked[at + 1] === ')' ? 1 : 0;
+        else children--;
+      }
+    }
+    if (children === 0 && ticks % 2 === 0) return true;
+    if (m[0] === '') re.lastIndex++;
+  }
+  return false;
 }
 
 // The statement with quoted text blanked to spaces (same length), keeping `$(…)`, `${…}` and backticks inside
@@ -2551,13 +2651,6 @@ function maskQuotedKeepingExpansions(s) {
   return out;
 }
 
-// Is a position whose preceding (masked) statement text is `prefix` inside a child shell (`( … )`, `$( … )`,
-// backticks)? Arithmetic `((` / `$((` opens none.
-function inChildShell(prefix) {
-  const p = prefix.replace(/\$?\(\(/g, '');
-  return (p.match(/\(/g) || []).length > (p.match(/\)/g) || []).length || (p.match(/`/g) || []).length % 2 === 1;
-}
-
 // `name`'s value after one statement runs: `value` unchanged, the newly assigned text, or null (unknown).
 // `home` expands a `~`/`$HOME` in the assigned word (null = expand nothing).
 function valueAfter(stmt, name, value, home) {
@@ -2568,15 +2661,15 @@ function valueAfter(stmt, name, value, home) {
     const [, exported, append, rest] = assignment;
     const word = rest.startsWith('(') ? null : expandWord(rest, home);      // `NAME=(…)` is an array
     if (!word) return null;
-    const after = rest.slice(word.end).trim();
-    if (exported && p.lvalue.test(maskQuotedKeepingExpansions(after))) return null;
-    if (!exported && after) {
-      const words = after.split(/\s+/);
+    const words = shellWords(rest.slice(word.end));
+    if (exported && words.some((w) => p.valued.test(unquoted(w)) || w.startsWith('$'))) return null;
+    if (!exported) {
       for (let j = 0; j < words.length; j++) {
         const w = words[j];
         if (REDIRECT_OP.test(w)) { j++; continue; }                         // an operator, then its target
         if (/^(?:\d+|&)?[<>]/.test(w)) continue;                            // an operator glued to its target
-        if (/^[A-Za-z_]\w*\+?=[^'"`$()\\<>]*$/.test(w) && !p.repeated.test(w)) continue;
+        const assigned = w.match(ASSIGNMENT_WORD);
+        if (assigned && assigned[1] !== name) continue;
         // A command follows, so this is a prefix assignment that ends with that command (a special builtin
         // keeps it under POSIX mode, so that one stays unknown).
         return /^[\w./:-]+$/.test(w) && !SPECIAL_BUILTIN.test(w) ? value : null;
@@ -2585,15 +2678,7 @@ function valueAfter(stmt, name, value, home) {
     if (!append) return word.text;
     return typeof value === 'string' ? value + word.text : null;
   }
-  if (RUNS_OPAQUE_TEXT.test(s)) return null;
-  const bare = s.replace(/['"]/g, '');                                      // `read "NAME"` binds NAME too
-  const binder = bare.match(NAME_BINDER)?.[1];
-  if (binder === 'printf' ? p.printfTarget.test(bare)
-    : binder === 'export' || binder === 'readonly' ? p.valued.test(bare)
-      : binder && p.operand.test(bare)) return null;
-  const masked = maskQuotedKeepingExpansions(s);
-  const lvalue = p.lvalue.exec(masked);
-  return lvalue && !inChildShell(masked.slice(0, lvalue.index)) ? null : value;
+  return rebindsUnreadably(s, name, p) ? null : value;
 }
 
 // HOME after one statement runs: unchanged, the newly assigned absolute path, or null (unknown).
