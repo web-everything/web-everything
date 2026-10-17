@@ -607,7 +607,7 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('cd ~/x && git status # (note')).toBe(`${HOME}/x`);
     // a cd in a child shell, or a target that leaks an operator, is never home-expanded
     expect(at('(true; cd ~/x); git status')).toBe(`${REPORTED}/~/x)`);
-    expect(at('D=/clone; (true; D=~/x); cd $D')).not.toMatch(new RegExp(`^${HOME}/`));
+    expect(at('D=/clone; (true; D=~/x); cd $D')).toBe(`${REPORTED}/~/x)`); // main's resolution, never the home
     // no home to expand, or a later literal assignment: main's resolution
     expect(at('D=~/x; cd "$D"', null)).toBe(`${REPORTED}/~/x`);
     expect(at('D=~/x; D=/clone; cd "$D"')).toBe('/clone');
@@ -642,14 +642,14 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
     expect(at('echo "HOME=$HOME"; cd ~/clone')).toBe(`${HOME}/clone`);
     expect(at(`printf '%s\\n' "\${HOME}"; cd ~/clone`)).toBe(`${HOME}/clone`);
     expect(at("echo 'HOME=/z'; cd ~/clone")).toBe(`${HOME}/clone`);
-    // an array append adds an element; $HOME is element 0 and is unchanged
-    expect(at('HOME=/a; HOME+=(/c); cd ~/clone')).not.toBe('/a(/c)/clone');
+    // an array append is not read here: home is unknown, never the appended text glued on
+    expect(at('HOME=/a; HOME+=(/c); cd ~/clone')).toBe(TILDE_CLONE);
     // a redirection after the assignment is not a command
     expect(at('HOME=/a; HOME=/b 2>/dev/null; cd ~/clone')).toBe('/b/clone');
     expect(at('HOME=/a; HOME=/b > /dev/null; cd ~/clone')).toBe('/b/clone');
-    // a quoted paren opens no child shell, so the real rebinding after it still counts
-    expect(at('HOME=/a; FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
-    expect(at('HOME=/a; export FOO="(" HOME=/b; cd ~/clone')).not.toBe('/a/clone');
+    // a quoted paren opens no child shell, so the rebinding after it still counts: home is unknown, never /a
+    expect(at('HOME=/a; FOO="(" HOME=/b; cd ~/clone')).toBe(TILDE_CLONE);
+    expect(at('HOME=/a; export FOO="(" HOME=/b; cd ~/clone')).toBe(TILDE_CLONE);
     expect(at('HOME=/a; read "HOME" <f; cd ~/clone')).toBe(TILDE_CLONE);
     expect(at('HOME=/a; let "HOME=1"; cd ~/clone')).toBe(TILDE_CLONE);
     // inside a child shell the parent keeps its value
@@ -658,6 +658,12 @@ describe('guard-bash — resolveEffectiveCwd expands home spellings of a leading
   it('a pathological HOME[ run stays linear', () => {
     const started = Date.now();
     expect(at(`${'HOME['.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it('a pathological run of unclosed `${` stays linear', () => {
+    const started = Date.now();
+    expect(at(`true ${'${'.repeat(40000)}; cd ~/clone`)).toBe(`${HOME}/clone`);
+    expect(at(`echo ${'${'.repeat(40000)}`)).toBe(REPORTED);
     expect(Date.now() - started).toBeLessThan(2000);
   });
   it('an ordinary variable with no home-derived value keeps main\'s literal resolution, never erased', () => {

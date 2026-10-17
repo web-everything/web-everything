@@ -2846,8 +2846,21 @@ function homeAfter(stmt, home) {
 // (a subshell, a `$( … )`, a pipeline member) never changes the parent's HOME or variables. Anything before
 // the cd whose scope or whether it runs cannot be read here — `&&`/`||`, a background `&`, a compound command
 // or function body, a backtick, a `${…}` paren — keeps main's resolution.
-const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\$\\{[^}]*[()]|\\w\\s*\\(\\s*\\)'
+const UNREADABLE_SCOPE = new RegExp('&&|\\|\\||(?:^|[^&<>])&(?![&>])|\\w\\s*\\(\\s*\\)'
   + '|(?:^|[\\s;&|()])(?:if|then|else|elif|fi|while|until|for|select|do|done|function|case|esac|coproc|[{}])(?=[\\s;&|()]|$)');
+
+// Is there a paren between a `${` and the next `}`? One pass: a regex (`\$\{[^}]*[()]`) rescans to the end
+// from every unclosed `${`, which is quadratic on hostile text.
+function bracedParen(s) {
+  let open = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '}') open = false;
+    else if (ch === '$' && s[i + 1] === '{') { open = true; i++; }
+    else if (open && (ch === '(' || ch === ')')) return true;
+  }
+  return false;
+}
 function homeCdTarget(cmd, { segments, pipedFrom }, home) {
   // Only plain statements up to the first cd are read: their spans in the text, quotes and comments blanked.
   const masked = maskQuoted(cmd).replace(/\\[\s\S]/g, (escape) => (escape[1] === '\n' ? ' \n' : '  ')); // `\(` is text
@@ -2863,7 +2876,7 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
   const prefix = cmd.slice(0, spans.at(-1)?.[0] ?? 0);           // the statements before the cd
   // A backtick, or a `$(` beside double quotes (whose nested quotes the mask cannot pair), hides its parens.
   if (prefix.includes('`') || (prefix.includes('$(') && prefix.includes('"'))) return null;
-  if (UNREADABLE_SCOPE.test(masked.slice(0, end))) return null;
+  if (UNREADABLE_SCOPE.test(masked.slice(0, end)) || bracedParen(masked.slice(0, end))) return null;
   if (/^\s*&(?![&>])/.test(masked.slice(end))) return null;     // a backgrounded cd
   let currentHome = typeof home === 'string' && home.startsWith('/') ? home : null;
   const homes = [];
