@@ -1,7 +1,7 @@
 ---
 kind: story
 size: 5
-parent: "xhwmyig"
+parent: "6188"
 status: open
 scope: ["we:scripts/operations/coroner-pr-postmortem.mjs", "we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs", "we:scripts/settings/coroner-postmortem.json"]
 dateOpened: "2026-10-17"
