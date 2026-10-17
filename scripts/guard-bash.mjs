@@ -2853,8 +2853,9 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
   const masked = maskQuoted(cmd).replace(/\\[\s\S]/g, (escape) => (escape[1] === '\n' ? ' \n' : '  ')); // `\(` is text
   const spans = [];
   for (const stmt of segments) {
-    const at = cmd.indexOf(stmt, spans.length ? spans.at(-1)[1] : 0);
-    if (at < 0) return null;
+    const from = spans.length ? spans.at(-1)[1] : 0;
+    const at = cmd.indexOf(stmt, from);
+    if (at < 0 || !/^[\s;&|]*$/.test(cmd.slice(from, at))) return null; // only operators between statements
     spans.push([at, at + stmt.length]);
     if (/^cd\s/.test(stmt.trim())) break;                       // nothing after the first cd steers it
   }
